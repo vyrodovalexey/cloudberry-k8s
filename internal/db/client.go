@@ -53,6 +53,18 @@ type Client interface {
 	GetReplicationLag(ctx context.Context) (int64, error)
 	// PromoteStandby promotes the standby to primary.
 	PromoteStandby(ctx context.Context) error
+	// GetActiveQueryCount returns the number of active, queued, and blocked queries.
+	GetActiveQueryCount(ctx context.Context) (active, queued, blocked int32, err error)
+	// GetResourceGroupUsage returns CPU and memory usage for a resource group.
+	GetResourceGroupUsage(ctx context.Context, group string) (cpu, memory float64, err error)
+	// CreateResourceGroup creates a new resource group.
+	CreateResourceGroup(ctx context.Context, opts ResourceGroupOptions) error
+	// AlterResourceGroup modifies an existing resource group.
+	AlterResourceGroup(ctx context.Context, opts ResourceGroupOptions) error
+	// DropResourceGroup drops a resource group.
+	DropResourceGroup(ctx context.Context, name string) error
+	// ListResourceGroups returns all resource groups.
+	ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo, error)
 }
 
 // ParameterScope defines the scope for parameter changes.
@@ -131,6 +143,27 @@ type DiskUsage struct {
 	Database  string `json:"database"`
 	SizeBytes int64  `json:"sizeBytes"`
 	SizeHuman string `json:"sizeHuman"`
+}
+
+// ResourceGroupOptions defines options for creating or altering a resource group.
+type ResourceGroupOptions struct {
+	Name          string
+	Concurrency   int32
+	CPUMaxPercent int32
+	CPUWeight     int32
+	MemoryLimit   int32
+	MinCost       int32
+}
+
+// ResourceGroupInfo represents a resource group.
+type ResourceGroupInfo struct {
+	Name          string  `json:"name"`
+	Concurrency   int32   `json:"concurrency"`
+	CPUMaxPercent int32   `json:"cpuMaxPercent"`
+	CPUWeight     int32   `json:"cpuWeight"`
+	MemoryLimit   int32   `json:"memoryLimit"`
+	CPUUsage      float64 `json:"cpuUsage"`
+	MemoryUsage   float64 `json:"memoryUsage"`
 }
 
 // Config holds database client configuration.
@@ -559,6 +592,115 @@ func (c *pgxClient) PromoteStandby(ctx context.Context) error {
 	}
 	c.logger.Info("standby promoted to primary")
 	return nil
+}
+
+// GetActiveQueryCount returns the number of active, queued, and blocked queries.
+func (c *pgxClient) GetActiveQueryCount(ctx context.Context) (active, queued, blocked int32, err error) {
+	query := `SELECT 
+		COUNT(*) FILTER (WHERE state = 'active') as active,
+		COUNT(*) FILTER (WHERE wait_event_type = 'Lock') as blocked,
+		COUNT(*) FILTER (WHERE state = 'idle in transaction') as queued
+		FROM pg_stat_activity WHERE pid != pg_backend_pid()`
+
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&active, &blocked, &queued); scanErr != nil {
+		return 0, 0, 0, fmt.Errorf("querying active query counts: %w", scanErr)
+	}
+	return active, queued, blocked, nil
+}
+
+// GetResourceGroupUsage returns CPU and memory usage for a resource group.
+func (c *pgxClient) GetResourceGroupUsage(
+	ctx context.Context,
+	group string,
+) (cpu, memory float64, err error) {
+	query := `SELECT 
+		COALESCE(cpu_usage, 0), COALESCE(memory_usage, 0)
+		FROM gp_toolkit.gp_resgroup_status 
+		WHERE rsgname = $1`
+
+	if scanErr := c.pool.QueryRow(ctx, query, group).Scan(&cpu, &memory); scanErr != nil {
+		return 0, 0, fmt.Errorf("querying resource group usage for %s: %w", group, scanErr)
+	}
+	return cpu, memory, nil
+}
+
+// CreateResourceGroup creates a new resource group.
+func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupOptions) error {
+	query := fmt.Sprintf("CREATE RESOURCE GROUP %s WITH (concurrency=%d, cpu_max_percent=%d, cpu_weight=%d)",
+		pgx.Identifier{opts.Name}.Sanitize(), opts.Concurrency, opts.CPUMaxPercent, opts.CPUWeight)
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("creating resource group %s: %w", opts.Name, err)
+	}
+	c.logger.Info("resource group created", "name", opts.Name)
+	return nil
+}
+
+// AlterResourceGroup modifies an existing resource group.
+func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOptions) error {
+	alterations := []struct {
+		param string
+		value int32
+	}{
+		{"concurrency", opts.Concurrency},
+		{"cpu_max_percent", opts.CPUMaxPercent},
+		{"cpu_weight", opts.CPUWeight},
+	}
+
+	for _, alt := range alterations {
+		if alt.value <= 0 {
+			continue
+		}
+		query := fmt.Sprintf("ALTER RESOURCE GROUP %s SET %s %d",
+			pgx.Identifier{opts.Name}.Sanitize(), alt.param, alt.value)
+		if _, err := c.pool.Exec(ctx, query); err != nil {
+			return fmt.Errorf("altering resource group %s param %s: %w", opts.Name, alt.param, err)
+		}
+	}
+
+	c.logger.Info("resource group altered", "name", opts.Name)
+	return nil
+}
+
+// DropResourceGroup drops a resource group.
+func (c *pgxClient) DropResourceGroup(ctx context.Context, name string) error {
+	query := fmt.Sprintf("DROP RESOURCE GROUP %s", pgx.Identifier{name}.Sanitize())
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("dropping resource group %s: %w", name, err)
+	}
+	c.logger.Info("resource group dropped", "name", name)
+	return nil
+}
+
+// ListResourceGroups returns all resource groups.
+func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo, error) {
+	query := `SELECT rsgname, 
+		COALESCE(num_running, 0), COALESCE(num_queueing, 0), 
+		COALESCE(cpu_usage, 0), COALESCE(memory_usage, 0)
+		FROM gp_toolkit.gp_resgroup_status ORDER BY rsgname`
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying resource groups: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []ResourceGroupInfo
+	for rows.Next() {
+		var g ResourceGroupInfo
+		var numRunning, numQueueing int32
+		if scanErr := rows.Scan(&g.Name, &numRunning, &numQueueing, &g.CPUUsage, &g.MemoryUsage); scanErr != nil {
+			return nil, fmt.Errorf("scanning resource group row: %w", scanErr)
+		}
+		g.Concurrency = numRunning + numQueueing
+		groups = append(groups, g)
+	}
+
+	if rowErr := rows.Err(); rowErr != nil {
+		return nil, fmt.Errorf("iterating resource group rows: %w", rowErr)
+	}
+
+	return groups, nil
 }
 
 // buildRoleOptions constructs the SQL options clause for role operations.

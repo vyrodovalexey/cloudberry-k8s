@@ -11,7 +11,7 @@ A Helm chart for deploying the Cloudberry Database Kubernetes Operator.
 
 ```bash
 # Add the chart repository (if published)
-# helm repo add cloudberry https://charts.cloudberry.example.com
+# helm repo add cloudberry https://charts.avsoft.io
 
 # Install with default values
 helm install cloudberry-operator deploy/helm/cloudberry-operator \

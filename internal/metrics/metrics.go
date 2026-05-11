@@ -58,6 +58,20 @@ type Recorder interface {
 	SetDiskUsageBytes(cluster, namespace, database string, bytes float64)
 	// RecordAuthAttempt records an authentication attempt.
 	RecordAuthAttempt(method, result string)
+	// SetActiveQueries sets the number of active queries.
+	SetActiveQueries(cluster, namespace string, count float64)
+	// SetQueuedQueries sets the number of queued queries.
+	SetQueuedQueries(cluster, namespace string, count float64)
+	// SetBlockedQueries sets the number of blocked queries.
+	SetBlockedQueries(cluster, namespace string, count float64)
+	// RecordWorkloadRuleAction records a workload rule action event.
+	RecordWorkloadRuleAction(cluster, namespace, rule, action string)
+	// SetResourceGroupUsage sets the resource group usage gauge.
+	SetResourceGroupUsage(cluster, namespace, group string, cpu, memory float64)
+	// RecordIdleSessionTermination records an idle session termination event.
+	RecordIdleSessionTermination(cluster, namespace, rule string)
+	// RecordSlowQuery records a slow query event.
+	RecordSlowQuery(cluster, namespace string)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -88,6 +102,15 @@ type PrometheusRecorder struct {
 	diskUsageBytes    *prometheus.GaugeVec
 
 	authAttempts *prometheus.CounterVec
+
+	activeQueries          *prometheus.GaugeVec
+	queuedQueries          *prometheus.GaugeVec
+	blockedQueries         *prometheus.GaugeVec
+	workloadRuleActions    *prometheus.CounterVec
+	resourceGroupCPU       *prometheus.GaugeVec
+	resourceGroupMemory    *prometheus.GaugeVec
+	idleSessionTermination *prometheus.CounterVec
+	slowQueries            *prometheus.CounterVec
 }
 
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
@@ -209,6 +232,47 @@ func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 			Name:      "auth_attempts_total",
 			Help:      "Total number of authentication attempts.",
 		}, []string{"method", labelResult}),
+
+		activeQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "active_queries",
+			Help:      "Number of currently active queries.",
+		}, []string{labelCluster, labelNamespace}),
+		queuedQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "queued_queries",
+			Help:      "Number of currently queued queries.",
+		}, []string{labelCluster, labelNamespace}),
+		blockedQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "blocked_queries",
+			Help:      "Number of currently blocked queries.",
+		}, []string{labelCluster, labelNamespace}),
+		workloadRuleActions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "workload_rule_actions_total",
+			Help:      "Total number of workload rule actions.",
+		}, []string{labelCluster, labelNamespace, "rule", "action"}),
+		resourceGroupCPU: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "resource_group_cpu_usage",
+			Help:      "CPU usage percentage per resource group.",
+		}, []string{labelCluster, labelNamespace, "group"}),
+		resourceGroupMemory: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "resource_group_memory_usage",
+			Help:      "Memory usage percentage per resource group.",
+		}, []string{labelCluster, labelNamespace, "group"}),
+		idleSessionTermination: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "idle_session_terminations_total",
+			Help:      "Total number of idle session terminations.",
+		}, []string{labelCluster, labelNamespace, "rule"}),
+		slowQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "slow_queries_total",
+			Help:      "Total number of slow queries detected.",
+		}, []string{labelCluster, labelNamespace}),
 	}
 
 	r.register(reg)
@@ -225,6 +289,9 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.ftsFailoverTotal, r.segmentStatus, r.replicationLag, r.standbyRepLag,
 		r.configReloadTotal, r.connectionsActive, r.connectionsMax, r.diskUsageBytes,
 		r.authAttempts,
+		r.activeQueries, r.queuedQueries, r.blockedQueries,
+		r.workloadRuleActions, r.resourceGroupCPU, r.resourceGroupMemory,
+		r.idleSessionTermination, r.slowQueries,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -329,6 +396,42 @@ func (r *PrometheusRecorder) RecordAuthAttempt(method, result string) {
 	r.authAttempts.WithLabelValues(method, result).Inc()
 }
 
+// SetActiveQueries sets the number of active queries.
+func (r *PrometheusRecorder) SetActiveQueries(cluster, namespace string, count float64) {
+	r.activeQueries.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// SetQueuedQueries sets the number of queued queries.
+func (r *PrometheusRecorder) SetQueuedQueries(cluster, namespace string, count float64) {
+	r.queuedQueries.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// SetBlockedQueries sets the number of blocked queries.
+func (r *PrometheusRecorder) SetBlockedQueries(cluster, namespace string, count float64) {
+	r.blockedQueries.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// RecordWorkloadRuleAction records a workload rule action event.
+func (r *PrometheusRecorder) RecordWorkloadRuleAction(cluster, namespace, rule, action string) {
+	r.workloadRuleActions.WithLabelValues(cluster, namespace, rule, action).Inc()
+}
+
+// SetResourceGroupUsage sets the resource group usage gauge.
+func (r *PrometheusRecorder) SetResourceGroupUsage(cluster, namespace, group string, cpu, memory float64) {
+	r.resourceGroupCPU.WithLabelValues(cluster, namespace, group).Set(cpu)
+	r.resourceGroupMemory.WithLabelValues(cluster, namespace, group).Set(memory)
+}
+
+// RecordIdleSessionTermination records an idle session termination event.
+func (r *PrometheusRecorder) RecordIdleSessionTermination(cluster, namespace, rule string) {
+	r.idleSessionTermination.WithLabelValues(cluster, namespace, rule).Inc()
+}
+
+// RecordSlowQuery records a slow query event.
+func (r *PrometheusRecorder) RecordSlowQuery(cluster, namespace string) {
+	r.slowQueries.WithLabelValues(cluster, namespace).Inc()
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -340,21 +443,28 @@ func boolToFloat64(b bool) float64 {
 // NoopRecorder is a no-op implementation of Recorder for testing.
 type NoopRecorder struct{}
 
-func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration) {}
-func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64)  {}
-func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool)            {}
-func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool)                {}
-func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64)         {}
-func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64)         {}
-func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64)        {}
-func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool)          {}
-func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration)  {}
-func (n *NoopRecorder) RecordFTSFailover(_, _ string)                   {}
-func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool)         {}
-func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64)     {}
-func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64) {}
-func (n *NoopRecorder) RecordConfigReload(_, _ string)                  {}
-func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64)     {}
-func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64)        {}
-func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64)     {}
-func (n *NoopRecorder) RecordAuthAttempt(_, _ string)                   {}
+func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration)    {}
+func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64)     {}
+func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool)               {}
+func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool)                   {}
+func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64)            {}
+func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64)            {}
+func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64)           {}
+func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool)             {}
+func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration)     {}
+func (n *NoopRecorder) RecordFTSFailover(_, _ string)                      {}
+func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool)            {}
+func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64)        {}
+func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64)    {}
+func (n *NoopRecorder) RecordConfigReload(_, _ string)                     {}
+func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64)        {}
+func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64)           {}
+func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64)        {}
+func (n *NoopRecorder) RecordAuthAttempt(_, _ string)                      {}
+func (n *NoopRecorder) SetActiveQueries(_, _ string, _ float64)            {}
+func (n *NoopRecorder) SetQueuedQueries(_, _ string, _ float64)            {}
+func (n *NoopRecorder) SetBlockedQueries(_, _ string, _ float64)           {}
+func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string)         {}
+func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64) {}
+func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string)        {}
+func (n *NoopRecorder) RecordSlowQuery(_, _ string)                        {}

@@ -37,6 +37,8 @@ func setClusterDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	setAuthDefaults(cluster)
 	setHADefaults(cluster)
 	setMonitoringDefaults(cluster)
+	setWorkloadDefaults(cluster)
+	setQueryMonitoringDefaults(cluster)
 
 	if cluster.Spec.DeletionPolicy == "" {
 		cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
@@ -153,5 +155,44 @@ func setMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	}
 	if cluster.Spec.Monitoring.MetricsPort == 0 {
 		cluster.Spec.Monitoring.MetricsPort = int32(util.DefaultMetricsPort)
+	}
+}
+
+// setWorkloadDefaults sets workload management defaults.
+func setWorkloadDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	if cluster.Spec.Workload == nil {
+		// Workload management is optional; no defaults needed when not specified.
+		return
+	}
+
+	for i := range cluster.Spec.Workload.ResourceGroups {
+		rg := &cluster.Spec.Workload.ResourceGroups[i]
+		if rg.Concurrency == 0 {
+			rg.Concurrency = 20
+		}
+		if rg.CPUMaxPercent == 0 {
+			rg.CPUMaxPercent = 100
+		}
+		if rg.CPUWeight == 0 {
+			rg.CPUWeight = 100
+		}
+	}
+}
+
+// setQueryMonitoringDefaults sets query monitoring defaults.
+func setQueryMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	if cluster.Spec.QueryMonitoring == nil {
+		// Query monitoring is optional; no defaults needed when not specified.
+		return
+	}
+
+	if cluster.Spec.QueryMonitoring.HistoryRetention == "" {
+		cluster.Spec.QueryMonitoring.HistoryRetention = "30d"
+	}
+	if cluster.Spec.QueryMonitoring.SamplingInterval == 0 {
+		cluster.Spec.QueryMonitoring.SamplingInterval = 15
+	}
+	if cluster.Spec.QueryMonitoring.SlowQueryThreshold == "" {
+		cluster.Spec.QueryMonitoring.SlowQueryThreshold = "1000ms"
 	}
 }

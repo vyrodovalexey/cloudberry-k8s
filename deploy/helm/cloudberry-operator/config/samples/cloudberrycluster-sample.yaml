@@ -1,4 +1,4 @@
-apiVersion: cloudberry.example.com/v1alpha1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: cloudberry-sample
@@ -65,6 +65,12 @@ spec:
     enabled: true
     metricsPort: 9187
     serviceMonitor: false
+
+  workload:
+    enabled: false
+
+  queryMonitoring:
+    enabled: false
 
   deletionPolicy: Retain
   backupOnDelete: false

@@ -101,6 +101,8 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newAuthCmd(),
 		newInspectCmd(),
 		newResourceGroupCmd(),
+		newWorkloadCmd(),
+		newQueryCmd(),
 		newCompletionCmd(),
 	)
 
@@ -840,6 +842,88 @@ func newResourceGroupCmd() *cobra.Command {
 			Short: "Assign role to group",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Assigning role to group...")
+				return nil
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newWorkloadCmd creates the workload command group.
+func newWorkloadCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "workload",
+		Short: "Workload management",
+	}
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdStatus,
+			Short: "Show workload management status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Workload management status...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "rules",
+			Short: "List workload rules",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing workload rules...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "idle-rules",
+			Short: "List idle session rules",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing idle session rules...")
+				return nil
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newQueryCmd creates the query monitoring command group.
+func newQueryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "queries",
+		Short: "Query monitoring and analysis",
+	}
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "active",
+			Short: "Show active queries",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Active queries...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "slow",
+			Short: "Show slow queries",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Slow queries...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "history",
+			Short: "Show query history",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Query history...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdStatus,
+			Short: "Show query monitoring status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Query monitoring status...")
 				return nil
 			},
 		},

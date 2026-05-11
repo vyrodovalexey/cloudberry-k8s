@@ -8,7 +8,7 @@ metadata:
 rules:
   # CloudberryCluster CRD management
   - apiGroups:
-      - cloudberry.example.com
+      - avsoft.io
     resources:
       - cloudberryclusters
     verbs:
@@ -20,7 +20,7 @@ rules:
       - update
       - watch
   - apiGroups:
-      - cloudberry.example.com
+      - avsoft.io
     resources:
       - cloudberryclusters/status
     verbs:
@@ -28,7 +28,7 @@ rules:
       - patch
       - update
   - apiGroups:
-      - cloudberry.example.com
+      - avsoft.io
     resources:
       - cloudberryclusters/finalizers
     verbs:

@@ -133,8 +133,8 @@ func (r *AuthReconciler) reconcileHBA(ctx context.Context, cluster *cbv1alpha1.C
 	}
 
 	// Check if content changed.
-	existingHash := existing.Annotations["cloudberry.example.com/config-hash"]
-	desiredHash := desired.Annotations["cloudberry.example.com/config-hash"]
+	existingHash := existing.Annotations[util.AnnotationConfigHash]
+	desiredHash := desired.Annotations[util.AnnotationConfigHash]
 
 	if existingHash != desiredHash {
 		existing.Data = desired.Data

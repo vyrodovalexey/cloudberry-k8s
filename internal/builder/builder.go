@@ -437,7 +437,7 @@ func (b *DefaultBuilder) BuildPostgresqlConfConfigMap(
 				ownerRef(cluster),
 			},
 			Annotations: map[string]string{
-				"cloudberry.example.com/config-hash": util.ComputeStringHash(confContent),
+				util.AnnotationConfigHash: util.ComputeStringHash(confContent),
 			},
 		},
 		Data: map[string]string{
@@ -460,7 +460,7 @@ func (b *DefaultBuilder) BuildPgHBAConfConfigMap(cluster *cbv1alpha1.CloudberryC
 				ownerRef(cluster),
 			},
 			Annotations: map[string]string{
-				"cloudberry.example.com/config-hash": util.ComputeStringHash(hbaContent),
+				util.AnnotationConfigHash: util.ComputeStringHash(hbaContent),
 			},
 		},
 		Data: map[string]string{

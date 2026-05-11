@@ -11,7 +11,7 @@ import (
 )
 
 func TestGroupVersion(t *testing.T) {
-	assert.Equal(t, "cloudberry.example.com", GroupVersion.Group)
+	assert.Equal(t, "avsoft.io", GroupVersion.Group)
 	assert.Equal(t, "v1alpha1", GroupVersion.Version)
 }
 
@@ -22,7 +22,7 @@ func TestAddToScheme(t *testing.T) {
 
 	// Verify types are registered
 	gvk := schema.GroupVersionKind{
-		Group:   "cloudberry.example.com",
+		Group:   "avsoft.io",
 		Version: "v1alpha1",
 		Kind:    "CloudberryCluster",
 	}
@@ -385,6 +385,11 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		{"Toleration", func() interface{} { var s *Toleration; return s.DeepCopy() }},
 		{"FailedSegment", func() interface{} { var s *FailedSegment; return s.DeepCopy() }},
 		{"ImagePullSecret", func() interface{} { var s *ImagePullSecret; return s.DeepCopy() }},
+		{"WorkloadSpec", func() interface{} { var s *WorkloadSpec; return s.DeepCopy() }},
+		{"ResourceGroupSpec", func() interface{} { var s *ResourceGroupSpec; return s.DeepCopy() }},
+		{"WorkloadRule", func() interface{} { var s *WorkloadRule; return s.DeepCopy() }},
+		{"IdleSessionRule", func() interface{} { var s *IdleSessionRule; return s.DeepCopy() }},
+		{"QueryMonitoringSpec", func() interface{} { var s *QueryMonitoringSpec; return s.DeepCopy() }},
 	}
 
 	for _, tt := range nilTests {

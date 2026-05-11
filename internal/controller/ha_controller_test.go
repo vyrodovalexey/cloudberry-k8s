@@ -67,6 +67,22 @@ func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) {
 	return m.replicationLag, m.repLagErr
 }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error { return nil }
+func (m *mockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
+	return 0, 0, 0, nil
+}
+func (m *mockDBClient) GetResourceGroupUsage(_ context.Context, _ string) (float64, float64, error) {
+	return 0, 0, nil
+}
+func (m *mockDBClient) CreateResourceGroup(_ context.Context, _ db.ResourceGroupOptions) error {
+	return nil
+}
+func (m *mockDBClient) AlterResourceGroup(_ context.Context, _ db.ResourceGroupOptions) error {
+	return nil
+}
+func (m *mockDBClient) DropResourceGroup(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) ListResourceGroups(_ context.Context) ([]db.ResourceGroupInfo, error) {
+	return nil, nil
+}
 
 func TestNewHAReconciler(t *testing.T) {
 	scheme := newTestScheme()

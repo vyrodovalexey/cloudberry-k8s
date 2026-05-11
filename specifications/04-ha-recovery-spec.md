@@ -115,7 +115,7 @@ The operator implements FTS probing:
 
 **Trigger**: `cloudberry-ctl recovery incremental --cluster my-cluster`
 
-Or CR annotation: `cloudberry.example.com/recovery: incremental`
+Or CR annotation: `avsoft.io/recovery: incremental`
 
 **Process**:
 1. Identify failed segments from CR status
@@ -132,7 +132,7 @@ Or CR annotation: `cloudberry.example.com/recovery: incremental`
 
 **Trigger**: `cloudberry-ctl recovery full --cluster my-cluster`
 
-Or CR annotation: `cloudberry.example.com/recovery: full`
+Or CR annotation: `avsoft.io/recovery: full`
 
 **Process**:
 1. Identify failed segments
@@ -176,7 +176,7 @@ Or CR annotation: `cloudberry.example.com/recovery: full`
 
 **Trigger**: `cloudberry-ctl rebalance --cluster my-cluster`
 
-Or CR annotation: `cloudberry.example.com/action: rebalance`
+Or CR annotation: `avsoft.io/action: rebalance`
 
 **Process**:
 1. Identify segments where mirror is acting as primary
@@ -218,7 +218,7 @@ cloudberry-ctl rebalance --cluster my-cluster --content-ids 0,1,2
 
 **Trigger**: `cloudberry-ctl standby activate --cluster my-cluster`
 
-Or CR annotation: `cloudberry.example.com/action: activate-standby`
+Or CR annotation: `avsoft.io/action: activate-standby`
 
 **Note**: Activation is NOT automatic - requires explicit administrator action.
 
@@ -315,8 +315,8 @@ metadata:
   namespace: {namespace}
   labels:
     app.kubernetes.io/managed-by: cloudberry-operator
-    cloudberry.example.com/cluster: {cluster}
-    cloudberry.example.com/operation: recovery
+    avsoft.io/cluster: {cluster}
+    avsoft.io/operation: recovery
 spec:
   backoffLimit: 3
   activeDeadlineSeconds: 3600

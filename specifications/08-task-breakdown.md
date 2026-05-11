@@ -35,7 +35,7 @@
 | Type | Greenfield Go project |
 | Operator | cloudberry-operator (controller-runtime / kubebuilder) |
 | CLI | cloudberry-ctl (cobra / viper) |
-| CRD | CloudberryCluster (v1alpha1, group: cloudberry.example.com) |
+| CRD | CloudberryCluster (v1alpha1, group: avsoft.io) |
 | Test Coverage Target | 90%+ unit test statement coverage |
 | Total Tasks | 59 |
 | Estimated Effort | 91-127 developer-days |
@@ -217,8 +217,8 @@ I.7 ──> J.1..J.3
 - `internal/util/constants.go`: API group, version, label keys, annotation keys
 - `internal/util/errors.go`: Custom error types (ClusterNotFoundError, SegmentNotFoundError, ValidationError, AuthenticationError, etc.)
 - Annotation keys for actions: start, stop, restart, recovery, rebalance, maintenance
-- Finalizer name: `cloudberry.example.com/finalizer`
-- Label keys: `app.kubernetes.io/managed-by`, `cloudberry.example.com/cluster`, etc.
+- Finalizer name: `avsoft.io/finalizer`
+- Label keys: `app.kubernetes.io/managed-by`, `avsoft.io/cluster`, etc.
 
 **Test Cases**:
 - Unit: Verify error types implement error interface
@@ -625,7 +625,7 @@ I.7 ──> J.1..J.3
   10. Apply configuration
   11. Update status subresource
 - Status transitions: `Pending` -> `Initializing` -> `Running`
-- Finalizer: `cloudberry.example.com/finalizer`
+- Finalizer: `avsoft.io/finalizer`
 - Deletion handling: backup-on-delete, PVC retention policy
 - Annotation-based actions: start, stop, restart
 - Image/version upgrade with rolling update

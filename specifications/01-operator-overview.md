@@ -1,7 +1,7 @@
 # Cloudberry Operator - Overview Specification
 
 **Version**: 1.0.0
-**API Group**: cloudberry.example.com
+**API Group**: avsoft.io
 **API Version**: v1alpha1
 
 ---
@@ -110,7 +110,7 @@ helm uninstall cloudberry-operator --namespace cloudberry-system
 
 # Full cleanup (including CRDs - DESTRUCTIVE)
 helm uninstall cloudberry-operator --namespace cloudberry-system
-kubectl delete crd cloudberryclusters.cloudberry.example.com
+kubectl delete crd cloudberryclusters.avsoft.io
 ```
 
 ## 4. Design Principles

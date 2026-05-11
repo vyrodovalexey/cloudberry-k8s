@@ -264,6 +264,14 @@ type CloudberryClusterSpec struct {
 	// +optional
 	Telemetry *TelemetrySpec `json:"telemetry,omitempty"`
 
+	// Workload defines workload management configuration.
+	// +optional
+	Workload *WorkloadSpec `json:"workload,omitempty"`
+
+	// QueryMonitoring defines query monitoring and analysis configuration.
+	// +optional
+	QueryMonitoring *QueryMonitoringSpec `json:"queryMonitoring,omitempty"`
+
 	// DeletionPolicy defines the PV reclaim policy on cluster deletion.
 	// +kubebuilder:validation:Enum=Retain;Delete
 	// +kubebuilder:default="Retain"
@@ -717,6 +725,151 @@ type Toleration struct {
 	TolerationSeconds *int64 `json:"tolerationSeconds,omitempty"`
 }
 
+// WorkloadSpec defines workload management configuration.
+type WorkloadSpec struct {
+	// Enabled controls whether workload management is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ResourceGroups defines the resource groups for workload management.
+	// +optional
+	ResourceGroups []ResourceGroupSpec `json:"resourceGroups,omitempty"`
+
+	// Rules defines workload management rules.
+	// +optional
+	Rules []WorkloadRule `json:"rules,omitempty"`
+
+	// IdleRules defines idle session termination rules.
+	// +optional
+	IdleRules []IdleSessionRule `json:"idleRules,omitempty"`
+}
+
+// ResourceGroupSpec defines a resource group for workload management.
+type ResourceGroupSpec struct {
+	// Name is the resource group name.
+	Name string `json:"name"`
+
+	// Concurrency is the maximum number of concurrent transactions.
+	// +optional
+	Concurrency int32 `json:"concurrency,omitempty"`
+
+	// CPUMaxPercent is the maximum CPU usage percentage.
+	// +optional
+	CPUMaxPercent int32 `json:"cpuMaxPercent,omitempty"`
+
+	// CPUWeight is the CPU scheduling weight.
+	// +optional
+	CPUWeight int32 `json:"cpuWeight,omitempty"`
+
+	// MemoryLimit is the memory limit in MB.
+	// +optional
+	MemoryLimit int32 `json:"memoryLimit,omitempty"`
+
+	// MinCost is the minimum query cost to be managed.
+	// +optional
+	MinCost int32 `json:"minCost,omitempty"`
+}
+
+// WorkloadRule defines a workload management rule.
+type WorkloadRule struct {
+	// Name is the rule name.
+	Name string `json:"name"`
+
+	// Enabled controls whether the rule is active.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ResourceGroup is the target resource group.
+	// +optional
+	ResourceGroup string `json:"resourceGroup,omitempty"`
+
+	// QueryTag is the query tag to match.
+	// +optional
+	QueryTag string `json:"queryTag,omitempty"`
+
+	// Role is the database role to match.
+	// +optional
+	Role string `json:"role,omitempty"`
+
+	// Action is the action to take (cancel, move, log).
+	// +kubebuilder:validation:Enum=cancel;move;log
+	Action string `json:"action"`
+
+	// MoveTarget is the target resource group for move actions.
+	// +optional
+	MoveTarget string `json:"moveTarget,omitempty"`
+
+	// Threshold is the threshold value for the rule.
+	// +optional
+	Threshold string `json:"threshold,omitempty"`
+
+	// ThresholdType is the type of threshold (cpu_skew, cpu_time, running_time, spill_size, etc.).
+	// +optional
+	ThresholdType string `json:"thresholdType,omitempty"`
+
+	// Priority is the rule evaluation priority.
+	// +optional
+	Priority int32 `json:"priority,omitempty"`
+}
+
+// IdleSessionRule defines an idle session termination rule.
+type IdleSessionRule struct {
+	// Name is the rule name.
+	Name string `json:"name"`
+
+	// Enabled controls whether the rule is active.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ResourceGroup is the target resource group.
+	ResourceGroup string `json:"resourceGroup"`
+
+	// IdleTimeout is the idle timeout duration (e.g. "30m", "1h").
+	IdleTimeout string `json:"idleTimeout"`
+
+	// ExcludeInTransaction excludes sessions that are in a transaction.
+	// +kubebuilder:default=false
+	// +optional
+	ExcludeInTransaction bool `json:"excludeInTransaction,omitempty"`
+
+	// TerminateMessage is the message sent to the client on termination.
+	// +optional
+	TerminateMessage string `json:"terminateMessage,omitempty"`
+}
+
+// QueryMonitoringSpec defines query monitoring and analysis configuration.
+type QueryMonitoringSpec struct {
+	// Enabled controls whether query monitoring is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// HistoryRetention is the query history retention period (e.g. "30d", "90d").
+	// +optional
+	HistoryRetention string `json:"historyRetention,omitempty"`
+
+	// SamplingInterval is the metrics sampling interval in seconds.
+	// +optional
+	SamplingInterval int32 `json:"samplingInterval,omitempty"`
+
+	// GuestAccess allows guest access to query monitoring data.
+	// +kubebuilder:default=false
+	// +optional
+	GuestAccess bool `json:"guestAccess,omitempty"`
+
+	// PlanCollection enables query plan collection.
+	// +kubebuilder:default=false
+	// +optional
+	PlanCollection bool `json:"planCollection,omitempty"`
+
+	// SlowQueryThreshold is the threshold for slow query detection (e.g. "1000ms").
+	// +optional
+	SlowQueryThreshold string `json:"slowQueryThreshold,omitempty"`
+}
+
 // CloudberryClusterStatus defines the observed state of CloudberryCluster.
 type CloudberryClusterStatus struct {
 	// Phase is the current cluster phase.
@@ -754,6 +907,18 @@ type CloudberryClusterStatus struct {
 	// LastConfigChangeTime is the timestamp of the last configuration change.
 	// +optional
 	LastConfigChangeTime *metav1.Time `json:"lastConfigChangeTime,omitempty"`
+
+	// ActiveQueries is the number of currently active queries.
+	// +optional
+	ActiveQueries int32 `json:"activeQueries,omitempty"`
+
+	// QueuedQueries is the number of currently queued queries.
+	// +optional
+	QueuedQueries int32 `json:"queuedQueries,omitempty"`
+
+	// BlockedQueries is the number of currently blocked queries.
+	// +optional
+	BlockedQueries int32 `json:"blockedQueries,omitempty"`
 
 	// ObservedGeneration is the most recent generation observed.
 	// +optional

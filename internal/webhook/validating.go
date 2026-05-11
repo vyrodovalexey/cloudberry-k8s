@@ -72,6 +72,12 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateStorage(cluster); err != nil {
 		return warnings, err
 	}
+	if err := validateWorkload(cluster); err != nil {
+		return warnings, err
+	}
+	if err := validateQueryMonitoring(cluster); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
 }
@@ -135,5 +141,54 @@ func validateStorage(cluster *cbv1alpha1.CloudberryCluster) error {
 	if cluster.Spec.Segments.Storage.Size == "" {
 		return fmt.Errorf("segments.storage.size is required")
 	}
+	return nil
+}
+
+// validateWorkload validates workload management configuration.
+func validateWorkload(cluster *cbv1alpha1.CloudberryCluster) error {
+	if cluster.Spec.Workload == nil || !cluster.Spec.Workload.Enabled {
+		return nil
+	}
+
+	for i, rg := range cluster.Spec.Workload.ResourceGroups {
+		if rg.Name == "" {
+			return fmt.Errorf("workload.resourceGroups[%d].name is required", i)
+		}
+	}
+
+	for i, rule := range cluster.Spec.Workload.Rules {
+		if rule.Name == "" {
+			return fmt.Errorf("workload.rules[%d].name is required", i)
+		}
+		if rule.Action == "" {
+			return fmt.Errorf("workload.rules[%d].action is required", i)
+		}
+	}
+
+	for i, rule := range cluster.Spec.Workload.IdleRules {
+		if rule.Name == "" {
+			return fmt.Errorf("workload.idleRules[%d].name is required", i)
+		}
+		if rule.ResourceGroup == "" {
+			return fmt.Errorf("workload.idleRules[%d].resourceGroup is required", i)
+		}
+		if rule.IdleTimeout == "" {
+			return fmt.Errorf("workload.idleRules[%d].idleTimeout is required", i)
+		}
+	}
+
+	return nil
+}
+
+// validateQueryMonitoring validates query monitoring configuration.
+func validateQueryMonitoring(cluster *cbv1alpha1.CloudberryCluster) error {
+	if cluster.Spec.QueryMonitoring == nil || !cluster.Spec.QueryMonitoring.Enabled {
+		return nil
+	}
+
+	if cluster.Spec.QueryMonitoring.SamplingInterval < 0 {
+		return fmt.Errorf("queryMonitoring.samplingInterval must be non-negative")
+	}
+
 	return nil
 }

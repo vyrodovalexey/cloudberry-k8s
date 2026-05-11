@@ -102,7 +102,87 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
+	// Reconcile workload management.
+	if err := r.reconcileWorkload(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile workload management", "error", err)
+	}
+
+	// Reconcile query monitoring status.
+	if err := r.reconcileQueryMonitoring(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile query monitoring", "error", err)
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// reconcileWorkload reconciles workload management configuration.
+func (r *AdminReconciler) reconcileWorkload(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if cluster.Spec.Workload == nil || !cluster.Spec.Workload.Enabled {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("reconciling workload management",
+		"resourceGroups", len(cluster.Spec.Workload.ResourceGroups),
+		"rules", len(cluster.Spec.Workload.Rules),
+		"idleRules", len(cluster.Spec.Workload.IdleRules),
+	)
+
+	r.recorder.Event(cluster, "Normal", "WorkloadReconciled",
+		fmt.Sprintf("Workload management reconciled: %d resource groups, %d rules",
+			len(cluster.Spec.Workload.ResourceGroups), len(cluster.Spec.Workload.Rules)))
+
+	// Update workload-related metrics for each resource group.
+	for _, rg := range cluster.Spec.Workload.ResourceGroups {
+		r.metrics.SetResourceGroupUsage(cluster.Name, cluster.Namespace, rg.Name, 0, 0)
+	}
+
+	// Persist workload reconciliation status.
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		"WorkloadConfigured",
+		metav1.ConditionTrue,
+		"WorkloadReconciled",
+		"Workload management is configured",
+	)
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating workload status: %w", err)
+	}
+
+	return nil
+}
+
+// reconcileQueryMonitoring reconciles query monitoring status.
+func (r *AdminReconciler) reconcileQueryMonitoring(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if cluster.Spec.QueryMonitoring == nil || !cluster.Spec.QueryMonitoring.Enabled {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("reconciling query monitoring",
+		"historyRetention", cluster.Spec.QueryMonitoring.HistoryRetention,
+		"samplingInterval", cluster.Spec.QueryMonitoring.SamplingInterval,
+	)
+
+	// Update query monitoring metrics.
+	r.metrics.SetActiveQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.ActiveQueries))
+	r.metrics.SetQueuedQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.QueuedQueries))
+	r.metrics.SetBlockedQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.BlockedQueries))
+
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating query monitoring status: %w", err)
+	}
+
+	r.recorder.Event(cluster, "Normal", "QueryMonitoringReconciled",
+		"Query monitoring configuration reconciled")
+
+	return nil
 }
 
 // reconcileConfig detects and applies configuration changes.

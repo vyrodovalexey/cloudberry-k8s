@@ -137,6 +137,12 @@ type MockDBClient struct {
 	GetDiskUsageFunc            func(ctx context.Context, database string) ([]db.DiskUsage, error)
 	GetReplicationLagFunc       func(ctx context.Context) (int64, error)
 	PromoteStandbyFunc          func(ctx context.Context) error
+	GetActiveQueryCountFunc     func(ctx context.Context) (int32, int32, int32, error)
+	GetResourceGroupUsageFunc   func(ctx context.Context, group string) (float64, float64, error)
+	CreateResourceGroupFunc     func(ctx context.Context, opts db.ResourceGroupOptions) error
+	AlterResourceGroupFunc      func(ctx context.Context, opts db.ResourceGroupOptions) error
+	DropResourceGroupFunc       func(ctx context.Context, name string) error
+	ListResourceGroupsFunc      func(ctx context.Context) ([]db.ResourceGroupInfo, error)
 	Closed                      bool
 }
 
@@ -306,6 +312,56 @@ func (m *MockDBClient) PromoteStandby(ctx context.Context) error {
 		return m.PromoteStandbyFunc(ctx)
 	}
 	return nil
+}
+
+// GetActiveQueryCount implements db.Client.
+func (m *MockDBClient) GetActiveQueryCount(ctx context.Context) (int32, int32, int32, error) {
+	if m.GetActiveQueryCountFunc != nil {
+		return m.GetActiveQueryCountFunc(ctx)
+	}
+	return 5, 0, 0, nil
+}
+
+// GetResourceGroupUsage implements db.Client.
+func (m *MockDBClient) GetResourceGroupUsage(ctx context.Context, group string) (float64, float64, error) {
+	if m.GetResourceGroupUsageFunc != nil {
+		return m.GetResourceGroupUsageFunc(ctx, group)
+	}
+	return 25.0, 50.0, nil
+}
+
+// CreateResourceGroup implements db.Client.
+func (m *MockDBClient) CreateResourceGroup(ctx context.Context, opts db.ResourceGroupOptions) error {
+	if m.CreateResourceGroupFunc != nil {
+		return m.CreateResourceGroupFunc(ctx, opts)
+	}
+	return nil
+}
+
+// AlterResourceGroup implements db.Client.
+func (m *MockDBClient) AlterResourceGroup(ctx context.Context, opts db.ResourceGroupOptions) error {
+	if m.AlterResourceGroupFunc != nil {
+		return m.AlterResourceGroupFunc(ctx, opts)
+	}
+	return nil
+}
+
+// DropResourceGroup implements db.Client.
+func (m *MockDBClient) DropResourceGroup(ctx context.Context, name string) error {
+	if m.DropResourceGroupFunc != nil {
+		return m.DropResourceGroupFunc(ctx, name)
+	}
+	return nil
+}
+
+// ListResourceGroups implements db.Client.
+func (m *MockDBClient) ListResourceGroups(ctx context.Context) ([]db.ResourceGroupInfo, error) {
+	if m.ListResourceGroupsFunc != nil {
+		return m.ListResourceGroupsFunc(ctx)
+	}
+	return []db.ResourceGroupInfo{
+		{Name: "default_group", Concurrency: 20, CPUUsage: 10.0, MemoryUsage: 30.0},
+	}, nil
 }
 
 // MockDBClientFactory implements controller.DBClientFactory for testing.

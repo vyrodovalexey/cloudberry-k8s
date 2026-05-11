@@ -119,7 +119,7 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 # 2. Create a minimal Cloudberry cluster
 kubectl apply -f - <<EOF
-apiVersion: cloudberry.example.com/v1alpha1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: my-cluster
@@ -220,7 +220,7 @@ See [docs/installation.md](docs/installation.md) for detailed installation instr
 Apply a `CloudberryCluster` manifest:
 
 ```yaml
-apiVersion: cloudberry.example.com/v1alpha1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: production-cluster

@@ -15,6 +15,7 @@ import (
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 const (
@@ -23,6 +24,7 @@ const (
 	maxPageSize     = 100
 
 	responseKeyStatus = "status"
+	responseKeyTotal  = "total"
 )
 
 // Server is the REST API server for the cloudberry operator.
@@ -130,6 +132,20 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStartRecovery)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/rebalance",
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleRebalance)))
+
+	// Workload management.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetWorkload)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-groups",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceGroups)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/rules",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListWorkloadRules)))
+
+	// Query monitoring.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetQueryMonitoring)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/active",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetActiveQueries)))
 }
 
 // withAuth wraps a handler with authentication middleware.
@@ -182,8 +198,8 @@ func (s *Server) handleListClusters(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"items": items,
-		"total": len(items),
+		"items":          items,
+		responseKeyTotal: len(items),
 	})
 }
 
@@ -346,8 +362,8 @@ func (s *Server) handleGetMirroring(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSessions(w http.ResponseWriter, _ *http.Request) {
 	// Sessions require a DB connection; return placeholder.
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"sessions": []interface{}{},
-		"total":    0,
+		"sessions":       []interface{}{},
+		responseKeyTotal: 0,
 	})
 }
 
@@ -436,7 +452,7 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 	if cluster.Annotations == nil {
 		cluster.Annotations = make(map[string]string)
 	}
-	cluster.Annotations["cloudberry.example.com/recovery"] = req.Type
+	cluster.Annotations[util.AnnotationRecovery] = req.Type
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
 		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
 			fmt.Sprintf("failed to start recovery: %v", updateErr))
@@ -449,6 +465,112 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 // handleRebalance starts a rebalance operation.
 func (s *Server) handleRebalance(w http.ResponseWriter, r *http.Request) {
 	s.setClusterAnnotation(w, r, "rebalance")
+}
+
+// handleGetWorkload gets the workload management configuration.
+func (s *Server) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if cluster.Spec.Workload == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"enabled": false,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cluster.Spec.Workload)
+}
+
+// handleListResourceGroups lists resource groups.
+func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var groups []interface{}
+	if cluster.Spec.Workload != nil {
+		for i := range cluster.Spec.Workload.ResourceGroups {
+			groups = append(groups, cluster.Spec.Workload.ResourceGroups[i])
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"resourceGroups": groups,
+		responseKeyTotal: len(groups),
+	})
+}
+
+// handleListWorkloadRules lists workload rules.
+func (s *Server) handleListWorkloadRules(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var rules []interface{}
+	if cluster.Spec.Workload != nil {
+		for i := range cluster.Spec.Workload.Rules {
+			rules = append(rules, cluster.Spec.Workload.Rules[i])
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"rules":          rules,
+		responseKeyTotal: len(rules),
+	})
+}
+
+// handleGetQueryMonitoring gets the query monitoring configuration and status.
+func (s *Server) handleGetQueryMonitoring(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	response := map[string]interface{}{
+		"activeQueries":  cluster.Status.ActiveQueries,
+		"queuedQueries":  cluster.Status.QueuedQueries,
+		"blockedQueries": cluster.Status.BlockedQueries,
+	}
+
+	if cluster.Spec.QueryMonitoring != nil {
+		response["config"] = cluster.Spec.QueryMonitoring
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleGetActiveQueries gets the active query counts.
+func (s *Server) handleGetActiveQueries(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"activeQueries":  cluster.Status.ActiveQueries,
+		"queuedQueries":  cluster.Status.QueuedQueries,
+		"blockedQueries": cluster.Status.BlockedQueries,
+	})
 }
 
 // setClusterAnnotation sets an action annotation on a cluster.
@@ -464,7 +586,7 @@ func (s *Server) setClusterAnnotation(w http.ResponseWriter, r *http.Request, ac
 	if cluster.Annotations == nil {
 		cluster.Annotations = make(map[string]string)
 	}
-	cluster.Annotations["cloudberry.example.com/action"] = action
+	cluster.Annotations[util.AnnotationAction] = action
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
 		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
 			fmt.Sprintf("failed to set action: %v", updateErr))
@@ -487,7 +609,7 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 	if cluster.Annotations == nil {
 		cluster.Annotations = make(map[string]string)
 	}
-	cluster.Annotations["cloudberry.example.com/maintenance"] = operation
+	cluster.Annotations[util.AnnotationMaintenance] = operation
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
 		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
 			fmt.Sprintf("failed to set maintenance: %v", updateErr))

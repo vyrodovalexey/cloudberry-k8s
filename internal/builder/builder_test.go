@@ -297,7 +297,7 @@ func TestBuildPostgresqlConfConfigMap(t *testing.T) {
 	assert.Equal(t, util.PostgresqlConfConfigMapName("test-cluster"), cm.Name)
 	assert.Contains(t, cm.Data["postgresql.conf"], "port = 5432")
 	assert.Contains(t, cm.Data["postgresql.conf"], "listen_addresses = '*'")
-	assert.NotEmpty(t, cm.Annotations["cloudberry.example.com/config-hash"])
+	assert.NotEmpty(t, cm.Annotations[util.AnnotationConfigHash])
 }
 
 func TestBuildPostgresqlConfConfigMap_WithSSL(t *testing.T) {

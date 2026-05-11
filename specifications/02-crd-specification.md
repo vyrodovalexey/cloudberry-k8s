@@ -1,7 +1,7 @@
 # Cloudberry Operator - CRD Specification
 
 **Version**: 1.0.0
-**API Group**: cloudberry.example.com
+**API Group**: avsoft.io
 **API Version**: v1alpha1
 
 ---
@@ -14,9 +14,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: cloudberryclusters.cloudberry.example.com
+  name: cloudberryclusters.avsoft.io
 spec:
-  group: cloudberry.example.com
+  group: avsoft.io
   versions:
     - name: v1alpha1
       served: true
@@ -476,7 +476,7 @@ spec:
 ### 2.1 Minimal Cluster
 
 ```yaml
-apiVersion: cloudberry.example.com/v1alpha1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: minimal-cluster
@@ -494,7 +494,7 @@ spec:
 ### 2.2 Production Cluster with HA and OIDC
 
 ```yaml
-apiVersion: cloudberry.example.com/v1alpha1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: production-cluster

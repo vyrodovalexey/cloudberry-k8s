@@ -38,7 +38,7 @@ The Administration specification covers the operator's capabilities for managing
 
 ### 2.2 Start Cluster
 
-**Trigger**: CR annotation `cloudberry.example.com/action: start`
+**Trigger**: CR annotation `avsoft.io/action: start`
 
 **Modes**:
 - **Normal**: Start all coordinator and segment processes
@@ -53,7 +53,7 @@ The Administration specification covers the operator's capabilities for managing
 
 ### 2.3 Stop Cluster
 
-**Trigger**: CR annotation `cloudberry.example.com/action: stop`
+**Trigger**: CR annotation `avsoft.io/action: stop`
 
 **Modes**:
 - **Smart** (default): Wait for clients to disconnect
@@ -67,7 +67,7 @@ The Administration specification covers the operator's capabilities for managing
 
 ### 2.4 Restart Cluster
 
-**Trigger**: CR annotation `cloudberry.example.com/action: restart`
+**Trigger**: CR annotation `avsoft.io/action: restart`
 
 **Process**:
 1. Stop cluster (fast mode)
@@ -224,7 +224,7 @@ Log levels:
 
 ### 5.1 Vacuum
 
-**Trigger**: CR annotation `cloudberry.example.com/maintenance: vacuum`
+**Trigger**: CR annotation `avsoft.io/maintenance: vacuum`
 
 **Options** (via annotation values):
 - `vacuum` - Regular vacuum
@@ -235,13 +235,13 @@ Log levels:
 
 ### 5.2 Analyze
 
-**Trigger**: CR annotation `cloudberry.example.com/maintenance: analyze`
+**Trigger**: CR annotation `avsoft.io/maintenance: analyze`
 
 Refreshes planner statistics on all tables or specified tables.
 
 ### 5.3 Reindex
 
-**Trigger**: CR annotation `cloudberry.example.com/maintenance: reindex`
+**Trigger**: CR annotation `avsoft.io/maintenance: reindex`
 
 Rebuilds indexes to recover from corruption or bloat.
 

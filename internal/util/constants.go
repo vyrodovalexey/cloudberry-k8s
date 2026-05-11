@@ -3,23 +3,23 @@ package util
 
 const (
 	// APIGroup is the API group for Cloudberry resources.
-	APIGroup = "cloudberry.example.com"
+	APIGroup = "avsoft.io"
 	// APIVersion is the API version for Cloudberry resources.
 	APIVersion = "v1alpha1"
 
 	// FinalizerName is the finalizer used by the operator.
-	FinalizerName = "cloudberry.example.com/finalizer"
+	FinalizerName = "avsoft.io/finalizer"
 
 	// LabelManagedBy is the standard managed-by label key.
 	LabelManagedBy = "app.kubernetes.io/managed-by"
 	// LabelManagedByValue is the value for the managed-by label.
 	LabelManagedByValue = "cloudberry-operator"
 	// LabelCluster is the label key for the cluster name.
-	LabelCluster = "cloudberry.example.com/cluster"
+	LabelCluster = "avsoft.io/cluster"
 	// LabelComponent is the label key for the component type.
-	LabelComponent = "cloudberry.example.com/component"
+	LabelComponent = "avsoft.io/component"
 	// LabelOperation is the label key for the operation type.
-	LabelOperation = "cloudberry.example.com/operation"
+	LabelOperation = "avsoft.io/operation"
 
 	// ComponentCoordinator is the component label value for the coordinator.
 	ComponentCoordinator = "coordinator"
@@ -31,11 +31,13 @@ const (
 	ComponentSegmentMirror = "segment-mirror"
 
 	// AnnotationAction is the annotation key for cluster actions.
-	AnnotationAction = "cloudberry.example.com/action"
+	AnnotationAction = "avsoft.io/action"
 	// AnnotationMaintenance is the annotation key for maintenance operations.
-	AnnotationMaintenance = "cloudberry.example.com/maintenance"
+	AnnotationMaintenance = "avsoft.io/maintenance"
 	// AnnotationRecovery is the annotation key for recovery operations.
-	AnnotationRecovery = "cloudberry.example.com/recovery"
+	AnnotationRecovery = "avsoft.io/recovery"
+	// AnnotationConfigHash is the annotation key for configuration hash.
+	AnnotationConfigHash = "avsoft.io/config-hash"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"
