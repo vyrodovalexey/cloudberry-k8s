@@ -801,6 +801,44 @@ spec:
                 backupOnDelete:
                   type: boolean
                   default: false
+                storage:
+                  description: Storage defines storage management configuration.
+                  type: object
+                  properties:
+                    diskMonitoring:
+                      type: boolean
+                      default: false
+                    recommendationScan:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: false
+                        schedule:
+                          type: string
+                        bloatThreshold:
+                          type: integer
+                          format: int32
+                        skewThreshold:
+                          type: integer
+                          format: int32
+                        ageThreshold:
+                          type: integer
+                          format: int64
+                        indexBloatThreshold:
+                          type: integer
+                          format: int32
+                        scanDuration:
+                          type: string
+                    usageReport:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: false
+                        monthly:
+                          type: boolean
+                          default: false
             status:
               description: CloudberryClusterStatus defines the observed state of CloudberryCluster.
               type: object
@@ -842,6 +880,12 @@ spec:
                 lastBackupStatus:
                   type: string
                 dataLoadingJobs:
+                  type: integer
+                  format: int32
+                diskUsagePercent:
+                  type: integer
+                  format: int32
+                recommendationCount:
                   type: integer
                   format: int32
                 observedGeneration:

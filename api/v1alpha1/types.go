@@ -280,6 +280,10 @@ type CloudberryClusterSpec struct {
 	// +optional
 	DataLoading *DataLoadingSpec `json:"dataLoading,omitempty"`
 
+	// Storage defines storage management configuration.
+	// +optional
+	Storage *StorageManagementSpec `json:"storage,omitempty"`
+
 	// DeletionPolicy defines the PV reclaim policy on cluster deletion.
 	// +kubebuilder:validation:Enum=Retain;Delete
 	// +kubebuilder:default="Retain"
@@ -1121,6 +1125,67 @@ type RabbitMQSourceSpec struct {
 	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
 }
 
+// StorageManagementSpec defines storage management configuration.
+type StorageManagementSpec struct {
+	// DiskMonitoring enables disk usage monitoring.
+	// +kubebuilder:default=false
+	// +optional
+	DiskMonitoring bool `json:"diskMonitoring,omitempty"`
+
+	// RecommendationScan defines recommendation scanning configuration.
+	// +optional
+	RecommendationScan *RecommendationScanSpec `json:"recommendationScan,omitempty"`
+
+	// UsageReport defines usage reporting configuration.
+	// +optional
+	UsageReport *UsageReportSpec `json:"usageReport,omitempty"`
+}
+
+// RecommendationScanSpec defines recommendation scanning configuration.
+type RecommendationScanSpec struct {
+	// Enabled controls whether recommendation scanning is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Schedule is the cron expression for scheduled scans.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+
+	// BloatThreshold is the dead tuple percentage threshold.
+	// +optional
+	BloatThreshold int32 `json:"bloatThreshold,omitempty"`
+
+	// SkewThreshold is the skew coefficient percentage threshold.
+	// +optional
+	SkewThreshold int32 `json:"skewThreshold,omitempty"`
+
+	// AgeThreshold is the XID age threshold.
+	// +optional
+	AgeThreshold int64 `json:"ageThreshold,omitempty"`
+
+	// IndexBloatThreshold is the index bloat percentage threshold.
+	// +optional
+	IndexBloatThreshold int32 `json:"indexBloatThreshold,omitempty"`
+
+	// ScanDuration is the maximum scan duration (e.g. "2h").
+	// +optional
+	ScanDuration string `json:"scanDuration,omitempty"`
+}
+
+// UsageReportSpec defines usage reporting configuration.
+type UsageReportSpec struct {
+	// Enabled controls whether usage reporting is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Monthly enables monthly usage reports.
+	// +kubebuilder:default=false
+	// +optional
+	Monthly bool `json:"monthly,omitempty"`
+}
+
 // CloudberryClusterStatus defines the observed state of CloudberryCluster.
 type CloudberryClusterStatus struct {
 	// Phase is the current cluster phase.
@@ -1182,6 +1247,14 @@ type CloudberryClusterStatus struct {
 	// DataLoadingJobs is the number of active data loading jobs.
 	// +optional
 	DataLoadingJobs int32 `json:"dataLoadingJobs,omitempty"`
+
+	// DiskUsagePercent is the current disk usage percentage.
+	// +optional
+	DiskUsagePercent int32 `json:"diskUsagePercent,omitempty"`
+
+	// RecommendationCount is the number of active recommendations.
+	// +optional
+	RecommendationCount int32 `json:"recommendationCount,omitempty"`
 
 	// ObservedGeneration is the most recent generation observed.
 	// +optional

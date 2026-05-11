@@ -92,5 +92,19 @@ spec:
   dataLoading:
     enabled: false
 
+  storage:
+    diskMonitoring: true
+    recommendationScan:
+      enabled: false
+      schedule: "0 3 * * 0"
+      bloatThreshold: 20
+      skewThreshold: 50
+      ageThreshold: 500000000
+      indexBloatThreshold: 30
+      scanDuration: "2h"
+    usageReport:
+      enabled: false
+      monthly: false
+
   deletionPolicy: Retain
   backupOnDelete: false

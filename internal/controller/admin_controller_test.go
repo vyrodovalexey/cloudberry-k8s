@@ -473,6 +473,92 @@ func TestAdminReconciler_Reconcile_WithAllFeatures(t *testing.T) {
 	assert.NotZero(t, result.RequeueAfter)
 }
 
+func TestAdminReconciler_ReconcileStorage_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileStorage(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ReconcileStorage_DiskMonitoringEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		DiskMonitoring: true,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileStorage(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Verify condition was set.
+	found := false
+	for _, c := range cluster.Status.Conditions {
+		if c.Type == "StorageConfigured" {
+			found = true
+			assert.Equal(t, "True", string(c.Status))
+			break
+		}
+	}
+	assert.True(t, found, "StorageConfigured condition should be set")
+}
+
+func TestAdminReconciler_ReconcileStorage_WithRecommendationScan(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.RecommendationCount = 5
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		DiskMonitoring: true,
+		RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+			Enabled:        true,
+			Schedule:       "0 3 * * 0",
+			BloatThreshold: 20,
+			SkewThreshold:  50,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileStorage(context.Background(), cluster)
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(5), cluster.Status.RecommendationCount)
+}
+
 func TestAdminReconciler_HandleMaintenance(t *testing.T) {
 	tests := []struct {
 		name        string

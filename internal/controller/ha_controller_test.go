@@ -99,6 +99,28 @@ func (m *mockDBClient) StopDataLoadingJob(_ context.Context, _ string) error  { 
 func (m *mockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJobStatus, error) {
 	return nil, nil
 }
+func (m *mockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return nil, nil
+}
+func (m *mockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return nil, nil
+}
+func (m *mockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return nil, nil
+}
+func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return nil, nil
+}
+func (m *mockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
+func (m *mockDBClient) GetTableDetails(_ context.Context, _, _ string) (*db.TableDetail, error) {
+	return nil, nil
+}
+func (m *mockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageReportEntry, error) {
+	return nil, nil
+}
 
 func TestNewHAReconciler(t *testing.T) {
 	scheme := newTestScheme()

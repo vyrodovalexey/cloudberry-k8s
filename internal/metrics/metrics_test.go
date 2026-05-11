@@ -245,6 +245,10 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.RecordRestore("c", "n", "success")
 	recorder.SetDataLoadingJobsActive("c", "n", 1)
 	recorder.RecordDataLoadingRows("c", "n", "job1", "s3", 100)
+	recorder.SetDiskUsagePercent("c", "n", 50)
+	recorder.SetRecommendationsTotal("c", "n", "bloat", 3)
+	recorder.ObserveRecommendationScanDuration("c", "n", time.Second)
+	recorder.SetTableBloatRatio("c", "n", "public.t", 0.1)
 }
 
 func TestRecordBackup(t *testing.T) {
@@ -282,6 +286,33 @@ func TestRecordDataLoadingRows(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
 	recorder.RecordDataLoadingRows("test", "default", "s3-loader", "s3", 1000)
+}
+
+func TestSetDiskUsagePercent(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetDiskUsagePercent("test", "default", 75.5)
+}
+
+func TestSetRecommendationsTotal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetRecommendationsTotal("test", "default", "bloat", 5)
+	recorder.SetRecommendationsTotal("test", "default", "skew", 3)
+	recorder.SetRecommendationsTotal("test", "default", "age", 1)
+	recorder.SetRecommendationsTotal("test", "default", "index_bloat", 2)
+}
+
+func TestObserveRecommendationScanDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveRecommendationScanDuration("test", "default", 45*time.Second)
+}
+
+func TestSetTableBloatRatio(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetTableBloatRatio("test", "default", "public.orders", 0.25)
 }
 
 func TestNoopRecorder_ImplementsInterface(t *testing.T) {

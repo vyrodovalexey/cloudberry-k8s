@@ -400,6 +400,9 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		{"S3SourceSpec", func() interface{} { var s *S3SourceSpec; return s.DeepCopy() }},
 		{"KafkaSourceSpec", func() interface{} { var s *KafkaSourceSpec; return s.DeepCopy() }},
 		{"RabbitMQSourceSpec", func() interface{} { var s *RabbitMQSourceSpec; return s.DeepCopy() }},
+		{"StorageManagementSpec", func() interface{} { var s *StorageManagementSpec; return s.DeepCopy() }},
+		{"RecommendationScanSpec", func() interface{} { var s *RecommendationScanSpec; return s.DeepCopy() }},
+		{"UsageReportSpec", func() interface{} { var s *UsageReportSpec; return s.DeepCopy() }},
 	}
 
 	for _, tt := range nilTests {

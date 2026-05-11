@@ -41,6 +41,7 @@ func setClusterDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	setQueryMonitoringDefaults(cluster)
 	setBackupDefaults(cluster)
 	setDataLoadingDefaults(cluster)
+	setStorageManagementDefaults(cluster)
 
 	if cluster.Spec.DeletionPolicy == "" {
 		cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
@@ -233,6 +234,36 @@ func setDataLoadingDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 		}
 		if cluster.Spec.DataLoading.StreamingServer.TLSMode == "" {
 			cluster.Spec.DataLoading.StreamingServer.TLSMode = "none"
+		}
+	}
+}
+
+// setStorageManagementDefaults sets storage management defaults.
+func setStorageManagementDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	if cluster.Spec.Storage == nil {
+		// Storage management is optional; no defaults needed when not specified.
+		return
+	}
+
+	scan := cluster.Spec.Storage.RecommendationScan
+	if scan != nil && scan.Enabled {
+		if scan.Schedule == "" {
+			scan.Schedule = "0 3 * * 0"
+		}
+		if scan.BloatThreshold == 0 {
+			scan.BloatThreshold = 20
+		}
+		if scan.SkewThreshold == 0 {
+			scan.SkewThreshold = 50
+		}
+		if scan.AgeThreshold == 0 {
+			scan.AgeThreshold = 500000000
+		}
+		if scan.IndexBloatThreshold == 0 {
+			scan.IndexBloatThreshold = 30
+		}
+		if scan.ScanDuration == "" {
+			scan.ScanDuration = "2h"
 		}
 	}
 }

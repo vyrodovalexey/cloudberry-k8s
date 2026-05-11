@@ -23,9 +23,10 @@ const (
 	defaultPageSize = 50
 	maxPageSize     = 100
 
-	responseKeyStatus = "status"
-	responseKeyTotal  = "total"
-	responseKeyJob    = "job"
+	responseKeyStatus  = "status"
+	responseKeyTotal   = "total"
+	responseKeyJob     = "job"
+	responseKeyCluster = "cluster"
 )
 
 // Server is the REST API server for the cloudberry operator.
@@ -159,6 +160,20 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteBackup)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups/{id}/restore",
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleRestoreBackup)))
+
+	// Storage and recommendations.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/disk-usage",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetDiskUsage)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/tables",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListTables)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/tables/{schema}/{table}",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetTableDetail)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/recommendations",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListRecommendations)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/storage/recommendations/scan",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleTriggerRecommendationScan)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/usage-report",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetUsageReport)))
 
 	// Data loading.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/jobs",
@@ -613,7 +628,7 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"cluster":          cluster.Name,
+		responseKeyCluster: cluster.Name,
 		"backups":          []interface{}{},
 		responseKeyTotal:   0,
 		"lastBackupTime":   cluster.Status.LastBackupTime,
@@ -638,8 +653,8 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus: "backup initiated",
-		"cluster":         cluster.Name,
+		responseKeyStatus:  "backup initiated",
+		responseKeyCluster: cluster.Name,
 	})
 }
 
@@ -818,6 +833,113 @@ func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		responseKeyStatus: "stopped",
 		responseKeyJob:    jobName,
+	})
+}
+
+// handleGetDiskUsage returns disk usage information for a cluster.
+func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyCluster: cluster.Name,
+		"diskUsagePercent": cluster.Status.DiskUsagePercent,
+		"diskUsage":        []interface{}{},
+	})
+}
+
+// handleListTables lists tables in a cluster.
+func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tables":         []interface{}{},
+		responseKeyTotal: 0,
+	})
+}
+
+// handleGetTableDetail returns detailed information about a specific table.
+func (s *Server) handleGetTableDetail(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	schema := r.PathValue("schema")
+	table := r.PathValue("table")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"schema": schema,
+		"table":  table,
+	})
+}
+
+// handleListRecommendations lists storage recommendations for a cluster.
+func (s *Server) handleListRecommendations(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyCluster:    cluster.Name,
+		"recommendations":     []interface{}{},
+		"recommendationCount": cluster.Status.RecommendationCount,
+		responseKeyTotal:      0,
+	})
+}
+
+// handleTriggerRecommendationScan triggers a recommendation scan.
+func (s *Server) handleTriggerRecommendationScan(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if cluster.Spec.Storage == nil || cluster.Spec.Storage.RecommendationScan == nil ||
+		!cluster.Spec.Storage.RecommendationScan.Enabled {
+		writeErrorJSON(w, http.StatusBadRequest, "RECOMMENDATION_SCAN_NOT_ENABLED",
+			"recommendation scanning is not enabled for this cluster")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus:  "scan initiated",
+		responseKeyCluster: cluster.Name,
+	})
+}
+
+// handleGetUsageReport returns a usage report for a cluster.
+func (s *Server) handleGetUsageReport(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	month := r.URL.Query().Get("month")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"month":          month,
+		"entries":        []interface{}{},
+		responseKeyTotal: 0,
 	})
 }
 

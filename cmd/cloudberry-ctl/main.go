@@ -107,6 +107,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newQueryCmd(),
 		newBackupCmd(),
 		newDataLoadingCmd(),
+		newStorageCmd(),
 		newCompletionCmd(),
 	)
 
@@ -989,6 +990,85 @@ func newBackupCmd() *cobra.Command {
 			Short: "Manage backup schedule",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Backup schedule...")
+				return nil
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newStorageCmd creates the storage management command group.
+func newStorageCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "storage",
+		Short: "Storage management and recommendations",
+	}
+
+	tablesCmd := &cobra.Command{
+		Use:   "tables",
+		Short: "Table storage management",
+	}
+
+	tablesCmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdList,
+			Short: "List tables with storage info",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing tables...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "detail",
+			Short: "Show table detail",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Table detail...")
+				return nil
+			},
+		},
+	)
+
+	recommendationsCmd := &cobra.Command{
+		Use:   "recommendations",
+		Short: "Storage recommendations",
+	}
+
+	recommendationsCmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdList,
+			Short: "List recommendations",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing recommendations...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "scan",
+			Short: "Trigger recommendation scan",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Triggering recommendation scan...")
+				return nil
+			},
+		},
+	)
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "disk-usage",
+			Short: "Show disk usage",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Disk usage...")
+				return nil
+			},
+		},
+		tablesCmd,
+		recommendationsCmd,
+		&cobra.Command{
+			Use:   "usage-report",
+			Short: "Show usage report",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Usage report...")
 				return nil
 			},
 		},

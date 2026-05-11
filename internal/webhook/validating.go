@@ -84,6 +84,9 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateDataLoading(cluster); err != nil {
 		return warnings, err
 	}
+	if err := validateStorageManagement(cluster); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
 }
@@ -216,6 +219,45 @@ func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
 	if cluster.Spec.Backup.Compression < 0 || cluster.Spec.Backup.Compression > 9 {
 		return fmt.Errorf("backup.compression must be between 0 and 9, got %d",
 			cluster.Spec.Backup.Compression)
+	}
+
+	return nil
+}
+
+// validateStorageManagement validates storage management configuration.
+func validateStorageManagement(cluster *cbv1alpha1.CloudberryCluster) error {
+	if cluster.Spec.Storage == nil {
+		return nil
+	}
+
+	scan := cluster.Spec.Storage.RecommendationScan
+	if scan == nil || !scan.Enabled {
+		return nil
+	}
+
+	if scan.BloatThreshold < 0 || scan.BloatThreshold > 100 {
+		return fmt.Errorf(
+			"storage.recommendationScan.bloatThreshold must be between 0 and 100, got %d",
+			scan.BloatThreshold,
+		)
+	}
+	if scan.SkewThreshold < 0 || scan.SkewThreshold > 100 {
+		return fmt.Errorf(
+			"storage.recommendationScan.skewThreshold must be between 0 and 100, got %d",
+			scan.SkewThreshold,
+		)
+	}
+	if scan.IndexBloatThreshold < 0 || scan.IndexBloatThreshold > 100 {
+		return fmt.Errorf(
+			"storage.recommendationScan.indexBloatThreshold must be between 0 and 100, got %d",
+			scan.IndexBloatThreshold,
+		)
+	}
+	if scan.AgeThreshold < 0 {
+		return fmt.Errorf(
+			"storage.recommendationScan.ageThreshold must be non-negative, got %d",
+			scan.AgeThreshold,
+		)
 	}
 
 	return nil

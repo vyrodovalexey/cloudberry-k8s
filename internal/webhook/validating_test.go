@@ -851,6 +851,138 @@ func TestValidateQueryMonitoring(t *testing.T) {
 	}
 }
 
+func TestValidateStorageManagement(t *testing.T) {
+	tests := []struct {
+		name        string
+		cluster     *cbv1alpha1.CloudberryCluster
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:      "no storage spec",
+			cluster:   newValidCluster(),
+			expectErr: false,
+		},
+		{
+			name: "storage with disk monitoring only",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					DiskMonitoring: true,
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "recommendation scan disabled",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled: false,
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "recommendation scan with valid thresholds",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					DiskMonitoring: true,
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled:             true,
+						Schedule:            "0 3 * * 0",
+						BloatThreshold:      20,
+						SkewThreshold:       50,
+						AgeThreshold:        500000000,
+						IndexBloatThreshold: 30,
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "recommendation scan bloat threshold too high",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled:        true,
+						BloatThreshold: 101,
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "bloatThreshold",
+		},
+		{
+			name: "recommendation scan skew threshold negative",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled:       true,
+						SkewThreshold: -1,
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "skewThreshold",
+		},
+		{
+			name: "recommendation scan index bloat threshold too high",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled:             true,
+						IndexBloatThreshold: 150,
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "indexBloatThreshold",
+		},
+		{
+			name: "recommendation scan negative age threshold",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+					RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+						Enabled:      true,
+						AgeThreshold: -1,
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "ageThreshold",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateStorageManagement(tt.cluster)
+			if tt.expectErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValidateStorage(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -453,6 +453,73 @@ func TestSetWorkloadDefaults(t *testing.T) {
 	})
 }
 
+func TestSetStorageManagementDefaults(t *testing.T) {
+	t.Run("nil storage does nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		setStorageManagementDefaults(cluster)
+		assert.Nil(t, cluster.Spec.Storage)
+	})
+
+	t.Run("recommendation scan gets defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+			DiskMonitoring: true,
+			RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+				Enabled: true,
+			},
+		}
+		setStorageManagementDefaults(cluster)
+
+		scan := cluster.Spec.Storage.RecommendationScan
+		assert.Equal(t, "0 3 * * 0", scan.Schedule)
+		assert.Equal(t, int32(20), scan.BloatThreshold)
+		assert.Equal(t, int32(50), scan.SkewThreshold)
+		assert.Equal(t, int64(500000000), scan.AgeThreshold)
+		assert.Equal(t, int32(30), scan.IndexBloatThreshold)
+		assert.Equal(t, "2h", scan.ScanDuration)
+	})
+
+	t.Run("existing recommendation scan values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+			DiskMonitoring: true,
+			RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+				Enabled:             true,
+				Schedule:            "0 1 * * *",
+				BloatThreshold:      10,
+				SkewThreshold:       25,
+				AgeThreshold:        100000000,
+				IndexBloatThreshold: 15,
+				ScanDuration:        "1h",
+			},
+		}
+		setStorageManagementDefaults(cluster)
+
+		scan := cluster.Spec.Storage.RecommendationScan
+		assert.Equal(t, "0 1 * * *", scan.Schedule)
+		assert.Equal(t, int32(10), scan.BloatThreshold)
+		assert.Equal(t, int32(25), scan.SkewThreshold)
+		assert.Equal(t, int64(100000000), scan.AgeThreshold)
+		assert.Equal(t, int32(15), scan.IndexBloatThreshold)
+		assert.Equal(t, "1h", scan.ScanDuration)
+	})
+
+	t.Run("disabled recommendation scan does not get defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+			DiskMonitoring: true,
+			RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+				Enabled: false,
+			},
+		}
+		setStorageManagementDefaults(cluster)
+
+		scan := cluster.Spec.Storage.RecommendationScan
+		assert.Equal(t, "", scan.Schedule)
+		assert.Equal(t, int32(0), scan.BloatThreshold)
+	})
+}
+
 func TestSetQueryMonitoringDefaults(t *testing.T) {
 	t.Run("nil query monitoring does nothing", func(t *testing.T) {
 		cluster := newMinimalCluster()

@@ -408,6 +408,46 @@ func (m *MockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJ
 	return []db.DataLoadingJobStatus{}, nil
 }
 
+// GetStorageDiskUsage implements db.Client.
+func (m *MockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInfo, error) {
+	return []db.DiskUsageInfo{}, nil
+}
+
+// GetBloatRecommendations implements db.Client.
+func (m *MockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return []db.Recommendation{}, nil
+}
+
+// GetSkewRecommendations implements db.Client.
+func (m *MockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return []db.Recommendation{}, nil
+}
+
+// GetAgeRecommendations implements db.Client.
+func (m *MockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return []db.Recommendation{}, nil
+}
+
+// GetIndexBloatRecommendations implements db.Client.
+func (m *MockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+	return []db.Recommendation{}, nil
+}
+
+// TriggerRecommendationScan implements db.Client.
+func (m *MockDBClient) TriggerRecommendationScan(_ context.Context) error {
+	return nil
+}
+
+// GetTableDetails implements db.Client.
+func (m *MockDBClient) GetTableDetails(_ context.Context, schema, table string) (*db.TableDetail, error) {
+	return &db.TableDetail{Schema: schema, Table: table}, nil
+}
+
+// GetUsageReport implements db.Client.
+func (m *MockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageReportEntry, error) {
+	return []db.UsageReportEntry{}, nil
+}
+
 // MockDBClientFactory implements controller.DBClientFactory for testing.
 type MockDBClientFactory struct {
 	Client *MockDBClient

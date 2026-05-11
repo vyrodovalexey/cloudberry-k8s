@@ -87,6 +87,14 @@ type Recorder interface {
 	SetDataLoadingJobsActive(cluster, namespace string, count float64)
 	// RecordDataLoadingRows records the number of rows loaded by a job.
 	RecordDataLoadingRows(cluster, namespace, job, sourceType string, count float64)
+	// SetDiskUsagePercent sets the disk usage percentage for a cluster.
+	SetDiskUsagePercent(cluster, namespace string, percent float64)
+	// SetRecommendationsTotal sets the total recommendations by type.
+	SetRecommendationsTotal(cluster, namespace, recType string, count float64)
+	// ObserveRecommendationScanDuration records the duration of a recommendation scan.
+	ObserveRecommendationScanDuration(cluster, namespace string, duration time.Duration)
+	// SetTableBloatRatio sets the bloat ratio for a table.
+	SetTableBloatRatio(cluster, namespace, table string, ratio float64)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -133,202 +141,250 @@ type PrometheusRecorder struct {
 	restoreTotal         *prometheus.CounterVec
 	dataLoadingJobsGauge *prometheus.GaugeVec
 	dataLoadingRows      *prometheus.CounterVec
+
+	diskUsagePercent      *prometheus.GaugeVec
+	recommendationsTotal  *prometheus.GaugeVec
+	recommendationScanDur *prometheus.HistogramVec
+	tableBloatRatio       *prometheus.GaugeVec
+}
+
+// initCoreMetrics initializes core reconciliation and cluster metrics.
+func (r *PrometheusRecorder) initCoreMetrics() {
+	r.reconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "reconcile_total",
+		Help:      "Total number of reconciliations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.reconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "reconcile_errors_total",
+		Help:      "Total number of reconciliation errors.",
+	}, []string{labelCluster, labelNamespace})
+	r.reconcileDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "reconcile_duration_seconds",
+		Help:      "Duration of reconciliations in seconds.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{labelCluster, labelNamespace})
+	r.clusterInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "cluster_info",
+		Help:      "Cluster metadata information.",
+	}, []string{labelCluster, labelNamespace, labelVersion, labelPhase})
+	r.coordinatorUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "coordinator_up",
+		Help:      "Coordinator availability (0/1).",
+	}, []string{labelCluster, labelNamespace})
+	r.standbyUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "standby_up",
+		Help:      "Standby coordinator availability (0/1).",
+	}, []string{labelCluster, labelNamespace})
+	r.segmentsReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "segments_ready",
+		Help:      "Number of ready segments.",
+	}, []string{labelCluster, labelNamespace})
+	r.segmentsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "segments_total",
+		Help:      "Total number of segments.",
+	}, []string{labelCluster, labelNamespace})
+	r.segmentsFailed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "segments_failed",
+		Help:      "Number of failed segments.",
+	}, []string{labelCluster, labelNamespace})
+	r.mirroringSync = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "mirroring_in_sync",
+		Help:      "Mirroring sync status (0/1).",
+	}, []string{labelCluster, labelNamespace})
+	r.authAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "auth_attempts_total",
+		Help:      "Total number of authentication attempts.",
+	}, []string{"method", labelResult})
+}
+
+// initHAMetrics initializes high availability and replication metrics.
+func (r *PrometheusRecorder) initHAMetrics() {
+	r.ftsProbeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "fts_probe_total",
+		Help:      "Total number of FTS probes.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.ftsProbeFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "fts_probe_failures_total",
+		Help:      "Total number of failed FTS probes.",
+	}, []string{labelCluster, labelNamespace})
+	r.ftsProbeDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "fts_probe_duration_seconds",
+		Help:      "Duration of FTS probes in seconds.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{labelCluster, labelNamespace})
+	r.ftsFailoverTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "fts_failover_total",
+		Help:      "Total number of FTS failovers.",
+	}, []string{labelCluster, labelNamespace})
+	r.segmentStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "segment_status",
+		Help:      "Per-segment status (1=up, 0=down).",
+	}, []string{labelCluster, labelNamespace, labelSegment})
+	r.replicationLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "replication_lag_bytes",
+		Help:      "Replication lag per segment in bytes.",
+	}, []string{labelCluster, labelNamespace, labelSegment})
+	r.standbyRepLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "standby_replication_lag_bytes",
+		Help:      "Standby coordinator replication lag in bytes.",
+	}, []string{labelCluster, labelNamespace})
+}
+
+// initOperationalMetrics initializes operational and connection metrics.
+func (r *PrometheusRecorder) initOperationalMetrics() {
+	r.configReloadTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "config_reload_total",
+		Help:      "Total number of configuration reloads.",
+	}, []string{labelCluster, labelNamespace})
+	r.connectionsActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "connections_active",
+		Help:      "Number of active database connections.",
+	}, []string{labelCluster, labelNamespace})
+	r.connectionsMax = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "connections_max",
+		Help:      "Maximum allowed database connections.",
+	}, []string{labelCluster, labelNamespace})
+	r.diskUsageBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "disk_usage_bytes",
+		Help:      "Disk usage per database in bytes.",
+	}, []string{labelCluster, labelNamespace, "database"})
+}
+
+// initWorkloadMetrics initializes workload management and query metrics.
+func (r *PrometheusRecorder) initWorkloadMetrics() {
+	r.activeQueries = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "active_queries",
+		Help:      "Number of currently active queries.",
+	}, []string{labelCluster, labelNamespace})
+	r.queuedQueries = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "queued_queries",
+		Help:      "Number of currently queued queries.",
+	}, []string{labelCluster, labelNamespace})
+	r.blockedQueries = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "blocked_queries",
+		Help:      "Number of currently blocked queries.",
+	}, []string{labelCluster, labelNamespace})
+	r.workloadRuleActions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "workload_rule_actions_total",
+		Help:      "Total number of workload rule actions.",
+	}, []string{labelCluster, labelNamespace, "rule", "action"})
+	r.resourceGroupCPU = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "resource_group_cpu_usage",
+		Help:      "CPU usage percentage per resource group.",
+	}, []string{labelCluster, labelNamespace, "group"})
+	r.resourceGroupMemory = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "resource_group_memory_usage",
+		Help:      "Memory usage percentage per resource group.",
+	}, []string{labelCluster, labelNamespace, "group"})
+	r.idleSessionTermination = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "idle_session_terminations_total",
+		Help:      "Total number of idle session terminations.",
+	}, []string{labelCluster, labelNamespace, "rule"})
+	r.slowQueries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "slow_queries_total",
+		Help:      "Total number of slow queries detected.",
+	}, []string{labelCluster, labelNamespace})
+}
+
+// initBackupMetrics initializes backup and data loading metrics.
+func (r *PrometheusRecorder) initBackupMetrics() {
+	r.backupTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_total",
+		Help:      "Total number of backup operations.",
+	}, []string{labelCluster, labelNamespace, labelType, labelResult})
+	r.backupDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_duration_seconds",
+		Help:      "Duration of backup operations in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+	}, []string{labelCluster, labelNamespace})
+	r.backupSizeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_size_bytes",
+		Help:      "Size of the last backup in bytes.",
+	}, []string{labelCluster, labelNamespace})
+	r.restoreTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "restore_total",
+		Help:      "Total number of restore operations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.dataLoadingJobsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_jobs_active",
+		Help:      "Number of active data loading jobs.",
+	}, []string{labelCluster, labelNamespace})
+	r.dataLoadingRows = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_rows_total",
+		Help:      "Total number of rows loaded by data loading jobs.",
+	}, []string{labelCluster, labelNamespace, labelJob, labelSourceType})
+}
+
+// initStorageMetrics initializes storage management and recommendation metrics.
+func (r *PrometheusRecorder) initStorageMetrics() {
+	r.diskUsagePercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "disk_usage_percent",
+		Help:      "Disk usage percentage per cluster.",
+	}, []string{labelCluster, labelNamespace})
+	r.recommendationsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "recommendations_total",
+		Help:      "Total number of recommendations by type.",
+	}, []string{labelCluster, labelNamespace, labelType})
+	r.recommendationScanDur = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "recommendation_scan_duration_seconds",
+		Help:      "Duration of recommendation scans in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 12),
+	}, []string{labelCluster, labelNamespace})
+	r.tableBloatRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "table_bloat_ratio",
+		Help:      "Bloat ratio for top tables.",
+	}, []string{labelCluster, labelNamespace, "table"})
 }
 
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
 func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
-	r := &PrometheusRecorder{
-		reconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "reconcile_total",
-			Help:      "Total number of reconciliations.",
-		}, []string{labelCluster, labelNamespace, labelResult}),
-		reconcileErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "reconcile_errors_total",
-			Help:      "Total number of reconciliation errors.",
-		}, []string{labelCluster, labelNamespace}),
-		reconcileDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Name:      "reconcile_duration_seconds",
-			Help:      "Duration of reconciliations in seconds.",
-			Buckets:   prometheus.DefBuckets,
-		}, []string{labelCluster, labelNamespace}),
-
-		clusterInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "cluster_info",
-			Help:      "Cluster metadata information.",
-		}, []string{labelCluster, labelNamespace, labelVersion, labelPhase}),
-		coordinatorUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "coordinator_up",
-			Help:      "Coordinator availability (0/1).",
-		}, []string{labelCluster, labelNamespace}),
-		standbyUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "standby_up",
-			Help:      "Standby coordinator availability (0/1).",
-		}, []string{labelCluster, labelNamespace}),
-		segmentsReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "segments_ready",
-			Help:      "Number of ready segments.",
-		}, []string{labelCluster, labelNamespace}),
-		segmentsTotal: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "segments_total",
-			Help:      "Total number of segments.",
-		}, []string{labelCluster, labelNamespace}),
-		segmentsFailed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "segments_failed",
-			Help:      "Number of failed segments.",
-		}, []string{labelCluster, labelNamespace}),
-		mirroringSync: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "mirroring_in_sync",
-			Help:      "Mirroring sync status (0/1).",
-		}, []string{labelCluster, labelNamespace}),
-
-		ftsProbeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "fts_probe_total",
-			Help:      "Total number of FTS probes.",
-		}, []string{labelCluster, labelNamespace, labelResult}),
-		ftsProbeFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "fts_probe_failures_total",
-			Help:      "Total number of failed FTS probes.",
-		}, []string{labelCluster, labelNamespace}),
-		ftsProbeDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Name:      "fts_probe_duration_seconds",
-			Help:      "Duration of FTS probes in seconds.",
-			Buckets:   prometheus.DefBuckets,
-		}, []string{labelCluster, labelNamespace}),
-		ftsFailoverTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "fts_failover_total",
-			Help:      "Total number of FTS failovers.",
-		}, []string{labelCluster, labelNamespace}),
-		segmentStatus: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "segment_status",
-			Help:      "Per-segment status (1=up, 0=down).",
-		}, []string{labelCluster, labelNamespace, labelSegment}),
-		replicationLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "replication_lag_bytes",
-			Help:      "Replication lag per segment in bytes.",
-		}, []string{labelCluster, labelNamespace, labelSegment}),
-		standbyRepLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "standby_replication_lag_bytes",
-			Help:      "Standby coordinator replication lag in bytes.",
-		}, []string{labelCluster, labelNamespace}),
-
-		configReloadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "config_reload_total",
-			Help:      "Total number of configuration reloads.",
-		}, []string{labelCluster, labelNamespace}),
-		connectionsActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "connections_active",
-			Help:      "Number of active database connections.",
-		}, []string{labelCluster, labelNamespace}),
-		connectionsMax: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "connections_max",
-			Help:      "Maximum allowed database connections.",
-		}, []string{labelCluster, labelNamespace}),
-		diskUsageBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "disk_usage_bytes",
-			Help:      "Disk usage per database in bytes.",
-		}, []string{labelCluster, labelNamespace, "database"}),
-
-		authAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "auth_attempts_total",
-			Help:      "Total number of authentication attempts.",
-		}, []string{"method", labelResult}),
-
-		activeQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "active_queries",
-			Help:      "Number of currently active queries.",
-		}, []string{labelCluster, labelNamespace}),
-		queuedQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "queued_queries",
-			Help:      "Number of currently queued queries.",
-		}, []string{labelCluster, labelNamespace}),
-		blockedQueries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "blocked_queries",
-			Help:      "Number of currently blocked queries.",
-		}, []string{labelCluster, labelNamespace}),
-		workloadRuleActions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "workload_rule_actions_total",
-			Help:      "Total number of workload rule actions.",
-		}, []string{labelCluster, labelNamespace, "rule", "action"}),
-		resourceGroupCPU: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "resource_group_cpu_usage",
-			Help:      "CPU usage percentage per resource group.",
-		}, []string{labelCluster, labelNamespace, "group"}),
-		resourceGroupMemory: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "resource_group_memory_usage",
-			Help:      "Memory usage percentage per resource group.",
-		}, []string{labelCluster, labelNamespace, "group"}),
-		idleSessionTermination: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "idle_session_terminations_total",
-			Help:      "Total number of idle session terminations.",
-		}, []string{labelCluster, labelNamespace, "rule"}),
-		slowQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "slow_queries_total",
-			Help:      "Total number of slow queries detected.",
-		}, []string{labelCluster, labelNamespace}),
-
-		backupTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "backup_total",
-			Help:      "Total number of backup operations.",
-		}, []string{labelCluster, labelNamespace, labelType, labelResult}),
-		backupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Name:      "backup_duration_seconds",
-			Help:      "Duration of backup operations in seconds.",
-			Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
-		}, []string{labelCluster, labelNamespace}),
-		backupSizeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "backup_size_bytes",
-			Help:      "Size of the last backup in bytes.",
-		}, []string{labelCluster, labelNamespace}),
-		restoreTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "restore_total",
-			Help:      "Total number of restore operations.",
-		}, []string{labelCluster, labelNamespace, labelResult}),
-		dataLoadingJobsGauge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "data_loading_jobs_active",
-			Help:      "Number of active data loading jobs.",
-		}, []string{labelCluster, labelNamespace}),
-		dataLoadingRows: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Name:      "data_loading_rows_total",
-			Help:      "Total number of rows loaded by data loading jobs.",
-		}, []string{labelCluster, labelNamespace, labelJob, labelSourceType}),
-	}
-
+	r := &PrometheusRecorder{}
+	r.initCoreMetrics()
+	r.initHAMetrics()
+	r.initOperationalMetrics()
+	r.initWorkloadMetrics()
+	r.initBackupMetrics()
+	r.initStorageMetrics()
 	r.register(reg)
 	return r
 }
@@ -348,6 +404,8 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.idleSessionTermination, r.slowQueries,
 		r.backupTotal, r.backupDuration, r.backupSizeBytes,
 		r.restoreTotal, r.dataLoadingJobsGauge, r.dataLoadingRows,
+		r.diskUsagePercent, r.recommendationsTotal,
+		r.recommendationScanDur, r.tableBloatRatio,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -521,6 +579,32 @@ func (r *PrometheusRecorder) RecordDataLoadingRows(
 	r.dataLoadingRows.WithLabelValues(cluster, namespace, job, sourceType).Add(count)
 }
 
+// SetDiskUsagePercent sets the disk usage percentage for a cluster.
+func (r *PrometheusRecorder) SetDiskUsagePercent(cluster, namespace string, percent float64) {
+	r.diskUsagePercent.WithLabelValues(cluster, namespace).Set(percent)
+}
+
+// SetRecommendationsTotal sets the total recommendations by type.
+func (r *PrometheusRecorder) SetRecommendationsTotal(
+	cluster, namespace, recType string,
+	count float64,
+) {
+	r.recommendationsTotal.WithLabelValues(cluster, namespace, recType).Set(count)
+}
+
+// ObserveRecommendationScanDuration records the duration of a recommendation scan.
+func (r *PrometheusRecorder) ObserveRecommendationScanDuration(
+	cluster, namespace string,
+	duration time.Duration,
+) {
+	r.recommendationScanDur.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// SetTableBloatRatio sets the bloat ratio for a table.
+func (r *PrometheusRecorder) SetTableBloatRatio(cluster, namespace, table string, ratio float64) {
+	r.tableBloatRatio.WithLabelValues(cluster, namespace, table).Set(ratio)
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -532,34 +616,38 @@ func boolToFloat64(b bool) float64 {
 // NoopRecorder is a no-op implementation of Recorder for testing.
 type NoopRecorder struct{}
 
-func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration)    {}
-func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64)     {}
-func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool)               {}
-func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool)                   {}
-func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64)            {}
-func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64)            {}
-func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64)           {}
-func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool)             {}
-func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration)     {}
-func (n *NoopRecorder) RecordFTSFailover(_, _ string)                      {}
-func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool)            {}
-func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64)        {}
-func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64)    {}
-func (n *NoopRecorder) RecordConfigReload(_, _ string)                     {}
-func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64)        {}
-func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64)           {}
-func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64)        {}
-func (n *NoopRecorder) RecordAuthAttempt(_, _ string)                      {}
-func (n *NoopRecorder) SetActiveQueries(_, _ string, _ float64)            {}
-func (n *NoopRecorder) SetQueuedQueries(_, _ string, _ float64)            {}
-func (n *NoopRecorder) SetBlockedQueries(_, _ string, _ float64)           {}
-func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string)         {}
-func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64) {}
-func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string)        {}
-func (n *NoopRecorder) RecordSlowQuery(_, _ string)                        {}
-func (n *NoopRecorder) RecordBackup(_, _, _, _ string)                     {}
-func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration) {}
-func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64)          {}
-func (n *NoopRecorder) RecordRestore(_, _, _ string)                       {}
-func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)    {}
-func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64) {}
+func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration)                {}
+func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64)                 {}
+func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool)                           {}
+func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool)                               {}
+func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64)                        {}
+func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64)                        {}
+func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64)                       {}
+func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool)                         {}
+func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration)                 {}
+func (n *NoopRecorder) RecordFTSFailover(_, _ string)                                  {}
+func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool)                        {}
+func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64)                    {}
+func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64)                {}
+func (n *NoopRecorder) RecordConfigReload(_, _ string)                                 {}
+func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64)                    {}
+func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64)                       {}
+func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64)                    {}
+func (n *NoopRecorder) RecordAuthAttempt(_, _ string)                                  {}
+func (n *NoopRecorder) SetActiveQueries(_, _ string, _ float64)                        {}
+func (n *NoopRecorder) SetQueuedQueries(_, _ string, _ float64)                        {}
+func (n *NoopRecorder) SetBlockedQueries(_, _ string, _ float64)                       {}
+func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string)                     {}
+func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64)             {}
+func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string)                    {}
+func (n *NoopRecorder) RecordSlowQuery(_, _ string)                                    {}
+func (n *NoopRecorder) RecordBackup(_, _, _, _ string)                                 {}
+func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration)             {}
+func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64)                      {}
+func (n *NoopRecorder) RecordRestore(_, _, _ string)                                   {}
+func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)                {}
+func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)             {}
+func (n *NoopRecorder) SetDiskUsagePercent(_, _ string, _ float64)                     {}
+func (n *NoopRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)              {}
+func (n *NoopRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {}
+func (n *NoopRecorder) SetTableBloatRatio(_, _, _ string, _ float64)                   {}

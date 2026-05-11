@@ -122,6 +122,11 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		logger.Error("failed to reconcile data loading", "error", err)
 	}
 
+	// Reconcile storage management.
+	if err := r.reconcileStorage(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile storage management", "error", err)
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }
 
@@ -272,6 +277,62 @@ func (r *AdminReconciler) reconcileDataLoading(
 	r.recorder.Event(cluster, "Normal", "DataLoadingReconciled",
 		fmt.Sprintf("Data loading reconciled: %d jobs configured, %d active",
 			len(cluster.Spec.DataLoading.Jobs), activeJobs))
+
+	return nil
+}
+
+// reconcileStorage reconciles storage management configuration and status.
+func (r *AdminReconciler) reconcileStorage(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if cluster.Spec.Storage == nil || !cluster.Spec.Storage.DiskMonitoring {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("reconciling storage management",
+		"diskMonitoring", cluster.Spec.Storage.DiskMonitoring,
+		"recommendationScanEnabled", cluster.Spec.Storage.RecommendationScan != nil &&
+			cluster.Spec.Storage.RecommendationScan.Enabled,
+		"usageReportEnabled", cluster.Spec.Storage.UsageReport != nil &&
+			cluster.Spec.Storage.UsageReport.Enabled,
+	)
+
+	// Update disk usage metrics.
+	r.metrics.SetDiskUsagePercent(
+		cluster.Name, cluster.Namespace, float64(cluster.Status.DiskUsagePercent),
+	)
+
+	// Process recommendation scan configuration.
+	recommendationCount := int32(0)
+	if cluster.Spec.Storage.RecommendationScan != nil &&
+		cluster.Spec.Storage.RecommendationScan.Enabled {
+		logger.Info("recommendation scan is configured",
+			"schedule", cluster.Spec.Storage.RecommendationScan.Schedule,
+			"bloatThreshold", cluster.Spec.Storage.RecommendationScan.BloatThreshold,
+			"skewThreshold", cluster.Spec.Storage.RecommendationScan.SkewThreshold,
+		)
+		recommendationCount = cluster.Status.RecommendationCount
+	}
+
+	// Update status fields.
+	cluster.Status.RecommendationCount = recommendationCount
+
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		"StorageConfigured",
+		metav1.ConditionTrue,
+		"StorageReconciled",
+		"Storage management is configured",
+	)
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating storage status: %w", err)
+	}
+
+	r.recorder.Event(cluster, "Normal", "StorageReconciled",
+		fmt.Sprintf("Storage management reconciled: diskMonitoring=%t, recommendations=%d",
+			cluster.Spec.Storage.DiskMonitoring, recommendationCount))
 
 	return nil
 }
