@@ -1,0 +1,155 @@
+version: '3.6'
+
+# =============================================================================
+# avapigw Test Environment
+# =============================================================================
+# Port allocation:
+#   8200       - Vault (dev mode, root token: myroot)
+#   8090/8091  - Keycloak (admin/admin)
+#   3200       - Tempo HTTP API
+#   4317/4318  - OTLP receivers
+#   8428       - VictoriaMetrics
+#   3000       - Grafana
+#
+# Setup order:
+#   1. docker compose up -d
+#   2. Wait for Vault and Keycloak to be ready
+#   3. Run scripts/setup-vault.sh   (configures PKI, issues certs)
+#   4. Run scripts/setup-keycloak.sh (creates realm, clients for service-to-service)
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # Vault - PKI for mTLS certificates
+  # ===========================================================================
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault
+    volumes:
+      - vault_data:/vault/file
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: myroot
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - 8200:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+
+  # ===========================================================================
+  # Keycloak - OIDC provider for authentication testing
+  # ===========================================================================
+  keycloak_web:
+    image: quay.io/keycloak/keycloak:26.5
+    container_name: keycloak_web
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: password
+
+      KC_HTTP_PORT: 8090
+      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_HTTP_ENABLED: true
+      KC_PROXY_HEADERS: xforwarded
+      KC_FEATURES: token-exchange,admin-fine-grained-authz
+      KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
+
+      KC_LOG_LEVEL: info
+      KC_METRICS_ENABLED: true
+      KC_HEALTH_ENABLED: true
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    command: start-dev
+    depends_on:
+      keycloakdb:
+        condition: service_healthy
+    ports:
+      - 8090:8090
+      - 8091:9000
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  keycloakdb:
+    image: postgres:16
+    container_name: keycloakdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # Observability stack
+  # ===========================================================================
+  tempo:
+    image: grafana/tempo:2.7.1
+    container_name: tempo
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - tempo_data:/var/tempo
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - 3200:3200    # Tempo HTTP API
+      - 4317:4317    # OTLP gRPC receiver
+      - 4318:4318    # OTLP HTTP receiver
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.108.1
+    container_name: victoriametrics
+    ports:
+      - 8428:8428
+    volumes:
+      - victoriametrics_data:/victoria-metrics-data
+      - ./victoriametrics/scrape.yml:/etc/victoriametrics/promscrape.yml:ro
+    command:
+      - --promscrape.config=/etc/victoriametrics/promscrape.yml
+      - --storageDataPath=/victoria-metrics-data
+      - --httpListenAddr=:8428
+      - --retentionPeriod=30d
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: grafana
+    ports:
+      - 3000:3000
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../monitoring/grafana:/var/lib/grafana/dashboards/avapigw:ro
+    depends_on:
+      - victoriametrics
+      - tempo
+
+volumes:
+  postgres_data:
+  vault_data:
+  victoriametrics_data:
+  grafana_data:
+  tempo_data:
+  mtls_certs:

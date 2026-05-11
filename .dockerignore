@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# IDE and editor files
+.idea/
+.vscode/
+.opencode/
+.Claude/
+*.swp
+*.swo
+*~
+
+# Documentation
+docs/
+gp_docs/
+md_docs/
+specifications/
+README.md
+
+# Test artifacts
+test/
+coverage/
+*.test
+*.out
+*.html
+*.out.txt
+
+# Build artifacts
+bin/
+
+# Docker
+.dockerignore
+Dockerfile
+Dockerfile.ctl
+
+# CI/CD
+.github/
+
+# Helm chart (not needed in Docker context)
+deploy/helm/
+
+# Misc
+.DS_Store
+.yandex-tank/
+.yandextank/

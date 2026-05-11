@@ -1,0 +1,14 @@
+[Host: localhost:8443]
+[Authorization: Basic YWRtaW46YWRtaW4=]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest]
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz

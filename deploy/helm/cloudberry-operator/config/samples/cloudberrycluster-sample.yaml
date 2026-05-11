@@ -1,0 +1,70 @@
+apiVersion: cloudberry.example.com/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-sample
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+spec:
+  version: "16"
+  image: "postgres:16"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    port: 5432
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+      adminPasswordSecret:
+        name: cloudberry-admin-password
+        key: password
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+    checksums: true
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  deletionPolicy: Retain
+  backupOnDelete: false

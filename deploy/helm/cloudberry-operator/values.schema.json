@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of operator replicas"
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Container image repository"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"],
+          "description": "Image pull policy"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Image tag override"
+        }
+      },
+      "required": ["repository"]
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" }
+        }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "installCRDs": { "type": "boolean" },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "name": { "type": "string" },
+        "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" }
+      }
+    },
+    "operator": {
+      "type": "object",
+      "properties": {
+        "logLevel": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error"]
+        },
+        "logFormat": {
+          "type": "string",
+          "enum": ["json", "text"]
+        },
+        "leaderElection": { "type": "boolean" },
+        "reconcileInterval": { "type": "string" },
+        "operationTimeout": { "type": "string" },
+        "watchNamespace": { "type": "string" },
+        "metricsAddress": { "type": "string" },
+        "healthProbeAddress": { "type": "string" },
+        "webhookPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "vault": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "address": { "type": "string" },
+        "authMethod": {
+          "type": "string",
+          "enum": ["token", "kubernetes", "approle"]
+        },
+        "authPath": { "type": "string" },
+        "role": { "type": "string" },
+        "secretPath": { "type": "string" },
+        "tlsSecretName": { "type": "string" }
+      }
+    },
+    "oidc": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "issuerURL": { "type": "string" },
+        "clientID": { "type": "string" },
+        "clientSecret": { "type": "string" },
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string" }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "otlpEndpoint": { "type": "string" },
+        "otlpProtocol": {
+          "type": "string",
+          "enum": ["grpc", "http"]
+        },
+        "samplingRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "serviceName": { "type": "string" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer" }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "type": "string" },
+        "labels": { "type": "object" },
+        "interval": { "type": "string" },
+        "scrapeTimeout": { "type": "string" },
+        "metricRelabelings": { "type": "array" },
+        "relabelings": { "type": "array" }
+      }
+    },
+    "webhook": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer" },
+        "targetPort": { "type": "integer" },
+        "failurePolicy": {
+          "type": "string",
+          "enum": ["Fail", "Ignore"]
+        },
+        "certSecretName": { "type": "string" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "additionalIngress": { "type": "array" },
+        "additionalEgress": { "type": "array" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": { "type": "string" },
+            "memory": { "type": "string" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": { "type": "string" },
+            "memory": { "type": "string" }
+          }
+        }
+      }
+    },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": "integer" },
+        "maxUnavailable": { "type": "integer" }
+      }
+    },
+    "livenessProbe": { "type": "object" },
+    "readinessProbe": { "type": "object" },
+    "extraEnv": { "type": "array" },
+    "extraVolumeMounts": { "type": "array" },
+    "extraVolumes": { "type": "array" }
+  },
+  "required": ["image", "replicaCount"]
+}

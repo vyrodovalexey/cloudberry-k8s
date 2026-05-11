@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "cloudberry-operator.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Testing health endpoint..."
+          wget -qO- --timeout=5 http://{{ include "cloudberry-operator.fullname" . }}.{{ .Release.Namespace }}.svc:8081/healthz && echo "Health check passed!" || exit 1
+          echo "Testing readiness endpoint..."
+          wget -qO- --timeout=5 http://{{ include "cloudberry-operator.fullname" . }}.{{ .Release.Namespace }}.svc:8081/readyz && echo "Readiness check passed!" || exit 1
+          {{- if .Values.metrics.enabled }}
+          echo "Testing metrics endpoint..."
+          wget -qO- --timeout=5 http://{{ include "cloudberry-operator.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.metrics.port }}/metrics | head -5 && echo "Metrics endpoint accessible!" || exit 1
+          {{- end }}
+          echo "All tests passed!"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 65534
+        capabilities:
+          drop:
+            - ALL

@@ -1,0 +1,38 @@
+===============================================================================
+  Cloudberry Operator has been installed!
+===============================================================================
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Version:   {{ .Chart.AppVersion }}
+
+{{- if .Values.installCRDs }}
+
+CRDs have been installed. The CloudberryCluster CRD is now available.
+{{- end }}
+
+To verify the operator is running:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l {{ include "cloudberry-operator.selectorLabels" . | replace ": " "=" | replace "\n" "," }}
+
+To check operator logs:
+
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "cloudberry-operator.name" . }} -f
+
+{{- if .Values.metrics.enabled }}
+
+Metrics are available at port {{ .Values.metrics.port }} on the /metrics endpoint.
+{{- end }}
+
+{{- if .Values.webhook.enabled }}
+
+Admission webhooks are enabled for CloudberryCluster validation and defaulting.
+{{- end }}
+
+To create a sample CloudberryCluster:
+
+  kubectl create namespace cloudberry-test
+  kubectl apply -f deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml -n cloudberry-test
+
+For more information, visit:
+  https://github.com/cloudberry-contrib/cloudberry-k8s

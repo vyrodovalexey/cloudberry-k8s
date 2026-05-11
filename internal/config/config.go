@@ -1,0 +1,228 @@
+// Package config provides configuration management for the cloudberry operator.
+// It supports loading configuration from environment variables, flags, and config files.
+// Environment variables have the highest priority, followed by flags, then config file, then defaults.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+)
+
+const (
+	envPrefix = "CLOUDBERRY"
+
+	// Default values for operator configuration.
+	defaultListenAddress      = ":8443"
+	defaultMetricsAddress     = ":8080"
+	defaultHealthProbeAddress = ":8081"
+	defaultWebhookPort        = 9443
+	defaultLogLevel           = "info"
+	defaultLogFormat          = "json"
+	defaultLeaderElection     = true
+	defaultReconcileInterval  = 30 * time.Second
+	defaultOperationTimeout   = 5 * time.Minute
+)
+
+// OperatorConfig holds all operator configuration settings.
+type OperatorConfig struct {
+	// ListenAddress is the address the API server listens on.
+	ListenAddress string `mapstructure:"listen-address"`
+	// MetricsAddress is the address the metrics server listens on.
+	MetricsAddress string `mapstructure:"metrics-address"`
+	// HealthProbeAddress is the address the health probe server listens on.
+	HealthProbeAddress string `mapstructure:"health-probe-address"`
+	// WebhookPort is the port the webhook server listens on.
+	WebhookPort int `mapstructure:"webhook-port"`
+	// LogLevel is the logging level (debug, info, warn, error).
+	LogLevel string `mapstructure:"log-level"`
+	// LogFormat is the logging format (json, text).
+	LogFormat string `mapstructure:"log-format"`
+	// LeaderElection enables leader election for the operator.
+	LeaderElection bool `mapstructure:"leader-election"`
+	// ReconcileInterval is the default reconciliation interval.
+	ReconcileInterval time.Duration `mapstructure:"reconcile-interval"`
+	// OperationTimeout is the default timeout for operations.
+	OperationTimeout time.Duration `mapstructure:"operation-timeout"`
+	// Namespace is the namespace the operator watches (empty for all namespaces).
+	Namespace string `mapstructure:"namespace"`
+
+	// Vault holds Vault client configuration.
+	Vault VaultConfig `mapstructure:"vault"`
+	// OIDC holds OIDC provider configuration.
+	OIDC OIDCConfig `mapstructure:"oidc"`
+	// Telemetry holds telemetry configuration.
+	Telemetry TelemetryConfig `mapstructure:"telemetry"`
+}
+
+// VaultConfig holds Vault client configuration.
+type VaultConfig struct {
+	// Enabled controls whether Vault integration is active.
+	Enabled bool `mapstructure:"enabled"`
+	// Address is the Vault server address.
+	Address string `mapstructure:"address"`
+	// AuthMethod is the Vault authentication method (token, kubernetes, approle).
+	AuthMethod string `mapstructure:"auth-method"`
+	// AuthPath is the Vault auth mount path.
+	AuthPath string `mapstructure:"auth-path"`
+	// Role is the Vault role name.
+	Role string `mapstructure:"role"`
+	// Token is the Vault token (for token auth method).
+	Token string `mapstructure:"token"`
+	// SecretPath is the base secret path.
+	SecretPath string `mapstructure:"secret-path"`
+}
+
+// OIDCConfig holds OIDC provider configuration.
+type OIDCConfig struct {
+	// Enabled controls whether OIDC authentication is active.
+	Enabled bool `mapstructure:"enabled"`
+	// IssuerURL is the OIDC issuer URL.
+	IssuerURL string `mapstructure:"issuer-url"`
+	// ClientID is the OIDC client identifier.
+	ClientID string `mapstructure:"client-id"`
+	// ClientSecret is the OIDC client secret.
+	ClientSecret string `mapstructure:"client-secret"`
+}
+
+// TelemetryConfig holds telemetry configuration.
+type TelemetryConfig struct {
+	// Enabled controls whether telemetry is active.
+	Enabled bool `mapstructure:"enabled"`
+	// OTLPEndpoint is the OTLP collector endpoint.
+	OTLPEndpoint string `mapstructure:"otlp-endpoint"`
+	// OTLPProtocol is the OTLP exporter protocol (grpc, http).
+	OTLPProtocol string `mapstructure:"otlp-protocol"`
+	// SamplingRate is the trace sampling rate (0.0 to 1.0).
+	SamplingRate float64 `mapstructure:"sampling-rate"`
+	// ServiceName is the service name for traces.
+	ServiceName string `mapstructure:"service-name"`
+}
+
+// Loader defines the interface for loading configuration.
+type Loader interface {
+	// Load reads configuration from all sources and returns the merged config.
+	Load() (*OperatorConfig, error)
+}
+
+// viperLoader implements Loader using viper.
+type viperLoader struct {
+	v          *viper.Viper
+	configFile string
+}
+
+// NewLoader creates a new configuration loader.
+func NewLoader(configFile string) Loader {
+	return &viperLoader{
+		v:          viper.New(),
+		configFile: configFile,
+	}
+}
+
+// Load reads configuration from environment variables, flags, and config file.
+func (l *viperLoader) Load() (*OperatorConfig, error) {
+	l.setDefaults()
+	l.bindEnv()
+
+	if l.configFile != "" {
+		l.v.SetConfigFile(l.configFile)
+		if err := l.v.ReadInConfig(); err != nil {
+			// Config file is optional; only return error if it was explicitly specified.
+			var configNotFoundErr viper.ConfigFileNotFoundError
+			if !errors.As(err, &configNotFoundErr) {
+				return nil, fmt.Errorf("reading config file: %w", err)
+			}
+		}
+	}
+
+	cfg := &OperatorConfig{}
+	if err := l.v.Unmarshal(cfg); err != nil {
+		return nil, fmt.Errorf("unmarshaling config: %w", err)
+	}
+
+	if err := validate(cfg); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// setDefaults sets default values for all configuration options.
+func (l *viperLoader) setDefaults() {
+	l.v.SetDefault("listen-address", defaultListenAddress)
+	l.v.SetDefault("metrics-address", defaultMetricsAddress)
+	l.v.SetDefault("health-probe-address", defaultHealthProbeAddress)
+	l.v.SetDefault("webhook-port", defaultWebhookPort)
+	l.v.SetDefault("log-level", defaultLogLevel)
+	l.v.SetDefault("log-format", defaultLogFormat)
+	l.v.SetDefault("leader-election", defaultLeaderElection)
+	l.v.SetDefault("reconcile-interval", defaultReconcileInterval)
+	l.v.SetDefault("operation-timeout", defaultOperationTimeout)
+	l.v.SetDefault("namespace", "")
+
+	l.v.SetDefault("vault.enabled", false)
+	l.v.SetDefault("vault.auth-method", "kubernetes")
+	l.v.SetDefault("vault.secret-path", "secret/data/cloudberry")
+
+	l.v.SetDefault("oidc.enabled", false)
+
+	l.v.SetDefault("telemetry.enabled", false)
+	l.v.SetDefault("telemetry.otlp-protocol", "grpc")
+	l.v.SetDefault("telemetry.sampling-rate", 1.0)
+	l.v.SetDefault("telemetry.service-name", "cloudberry-operator")
+}
+
+// bindEnv binds environment variables with the CLOUDBERRY_ prefix.
+func (l *viperLoader) bindEnv() {
+	l.v.SetEnvPrefix(envPrefix)
+	l.v.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))
+	l.v.AutomaticEnv()
+}
+
+// BindFlags binds command-line flags to viper configuration.
+func BindFlags(v *viper.Viper, flags *pflag.FlagSet) {
+	flags.VisitAll(func(f *pflag.Flag) {
+		// Bind the flag to viper, ignoring errors since flags are pre-validated.
+		_ = v.BindPFlag(f.Name, f)
+	})
+}
+
+// validate checks the configuration for required fields and valid values.
+func validate(cfg *OperatorConfig) error {
+	if cfg.WebhookPort <= 0 || cfg.WebhookPort > 65535 {
+		return fmt.Errorf("webhook-port must be between 1 and 65535, got %d", cfg.WebhookPort)
+	}
+
+	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if !validLogLevels[strings.ToLower(cfg.LogLevel)] {
+		return fmt.Errorf("log-level must be one of debug, info, warn, error; got %q", cfg.LogLevel)
+	}
+
+	validLogFormats := map[string]bool{"json": true, "text": true}
+	if !validLogFormats[strings.ToLower(cfg.LogFormat)] {
+		return fmt.Errorf("log-format must be one of json, text; got %q", cfg.LogFormat)
+	}
+
+	if cfg.Vault.Enabled && cfg.Vault.Address == "" {
+		return fmt.Errorf("vault.address is required when vault is enabled")
+	}
+
+	if cfg.OIDC.Enabled {
+		if cfg.OIDC.IssuerURL == "" {
+			return fmt.Errorf("oidc.issuer-url is required when OIDC is enabled")
+		}
+		if cfg.OIDC.ClientID == "" {
+			return fmt.Errorf("oidc.client-id is required when OIDC is enabled")
+		}
+	}
+
+	if cfg.Telemetry.Enabled && cfg.Telemetry.OTLPEndpoint == "" {
+		return fmt.Errorf("telemetry.otlp-endpoint is required when telemetry is enabled")
+	}
+
+	return nil
+}

@@ -1,0 +1,58 @@
+# =============================================================================
+# Baseline Performance Test Scenario
+# =============================================================================
+#
+# Purpose: Establish baseline performance metrics for the operator API.
+#          Results from this test serve as the reference point for future
+#          comparisons after code changes, infrastructure updates, etc.
+#
+# Profile: Ramp to 100 RPS over 1 minute, hold for 5 minutes
+# Expected: p95 < 200ms, p99 < 500ms, error rate < 0.1%
+# Duration: ~7 minutes (ramp-up + constant + cooldown)
+#
+# SLO Targets:
+#   - Availability: >= 99.9%
+#   - p50 latency:  < 50ms
+#   - p95 latency:  < 200ms
+#   - p99 latency:  < 500ms
+#   - Error rate:   < 0.1%
+#
+# Usage:
+#   ./run-perftest.sh --scenario baseline
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8443
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/api-read.txt
+  load_profile:
+    load_type: rps
+    # Warmup: ramp from 1 to 50 RPS over 30 seconds
+    # Ramp: increase from 50 to 100 RPS over 30 seconds
+    # Sustain: hold 100 RPS for 5 minutes (300 seconds)
+    schedule: line(1, 50, 30s) line(50, 100, 30s) const(100, 300s)
+  timeout: 5000
+  instances: 200
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    # Stop if average response time exceeds 1 second for 30 seconds
+    - time(1000, 30s)
+    # Stop if 5xx error rate exceeds 5% for 15 seconds
+    - http(5xx, 5%, 15s)
+    # Stop if 4xx error rate exceeds 30% for 15 seconds
+    - http(4xx, 30%, 15s)
+    # Stop if network errors exceed 3% for 10 seconds
+    - net(xx, 3%, 10s)
+    # Stop if 99th percentile exceeds 3 seconds for 30 seconds
+    - quantile(99, 3000, 30s)
+    # Stop if total 5xx count exceeds 200 in 60 seconds
+    - total_http(5xx, 200, 60s)
+
+console:
+  enabled: true
+  short_only: false

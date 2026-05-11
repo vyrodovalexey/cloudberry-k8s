@@ -1,0 +1,74 @@
+160 /api/v1alpha1/clusters
+GET /api/v1alpha1/clusters HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+173 /api/v1alpha1/clusters/test-cluster
+GET /api/v1alpha1/clusters/test-cluster HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+180 /api/v1alpha1/clusters/test-cluster/status
+GET /api/v1alpha1/clusters/test-cluster/status HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+182 /api/v1alpha1/clusters/test-cluster/segments
+GET /api/v1alpha1/clusters/test-cluster/segments HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+182 /api/v1alpha1/clusters/test-cluster/sessions
+GET /api/v1alpha1/clusters/test-cluster/sessions HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+180 /api/v1alpha1/clusters/test-cluster/config
+GET /api/v1alpha1/clusters/test-cluster/config HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+183 /api/v1alpha1/clusters/test-cluster/mirroring
+GET /api/v1alpha1/clusters/test-cluster/mirroring HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+181 /api/v1alpha1/clusters/test-cluster/standby
+GET /api/v1alpha1/clusters/test-cluster/standby HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+
+231 /api/v1alpha1/clusters/test-cluster/start
+POST /api/v1alpha1/clusters/test-cluster/start HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+Content-Type: application/json
+Content-Length: 0
+
+230 /api/v1alpha1/clusters/test-cluster/stop
+POST /api/v1alpha1/clusters/test-cluster/stop HTTP/1.1
+Host: localhost:8443
+Authorization: Basic YWRtaW46YWRtaW4=
+User-Agent: yandex-tank/perftest
+Accept: application/json
+Content-Type: application/json
+Content-Length: 0
+

@@ -1,0 +1,614 @@
+// Package db provides a Cloudberry/PostgreSQL database client for the cloudberry operator.
+package db
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
+)
+
+// Client defines the interface for Cloudberry database operations.
+type Client interface {
+	// Ping checks database connectivity.
+	Ping(ctx context.Context) error
+	// Close closes the database connection pool.
+	Close()
+	// GetSegmentConfiguration returns the segment configuration.
+	GetSegmentConfiguration(ctx context.Context) ([]SegmentInfo, error)
+	// GetClusterState returns the overall cluster health state.
+	GetClusterState(ctx context.Context) (*ClusterState, error)
+	// SetParameter sets a configuration parameter.
+	SetParameter(ctx context.Context, name, value string, scope ParameterScope) error
+	// ShowParameter returns the current value of a parameter.
+	ShowParameter(ctx context.Context, name string) (string, error)
+	// ReloadConfig triggers a configuration reload.
+	ReloadConfig(ctx context.Context) error
+	// ListSessions returns active database sessions.
+	ListSessions(ctx context.Context) ([]Session, error)
+	// CancelQuery cancels a running query by PID.
+	CancelQuery(ctx context.Context, pid int32) (bool, error)
+	// TerminateSession terminates a session by PID.
+	TerminateSession(ctx context.Context, pid int32) (bool, error)
+	// CreateRole creates a new database role.
+	CreateRole(ctx context.Context, opts RoleOptions) error
+	// AlterRole modifies an existing database role.
+	AlterRole(ctx context.Context, opts RoleOptions) error
+	// DropRole drops a database role.
+	DropRole(ctx context.Context, name string) error
+	// Vacuum runs a vacuum operation.
+	Vacuum(ctx context.Context, opts VacuumOptions) error
+	// Analyze runs an analyze operation.
+	Analyze(ctx context.Context, table string) error
+	// Reindex runs a reindex operation.
+	Reindex(ctx context.Context, opts ReindexOptions) error
+	// GetDiskUsage returns disk usage information.
+	GetDiskUsage(ctx context.Context, database string) ([]DiskUsage, error)
+	// GetReplicationLag returns the replication lag in bytes.
+	GetReplicationLag(ctx context.Context) (int64, error)
+	// PromoteStandby promotes the standby to primary.
+	PromoteStandby(ctx context.Context) error
+}
+
+// ParameterScope defines the scope for parameter changes.
+type ParameterScope struct {
+	// Level is the scope level (cluster, database, role).
+	Level string
+	// Target is the database or role name (for database/role scope).
+	Target string
+}
+
+// SegmentInfo represents a segment in the cluster configuration.
+type SegmentInfo struct {
+	ContentID      int32  `json:"contentID"`
+	DBID           int32  `json:"dbid"`
+	Role           string `json:"role"`
+	PreferredRole  string `json:"preferredRole"`
+	Mode           string `json:"mode"`
+	Status         string `json:"status"`
+	Hostname       string `json:"hostname"`
+	Address        string `json:"address"`
+	Port           int32  `json:"port"`
+	DataDirectory  string `json:"dataDirectory"`
+	ReplicationLag int64  `json:"replicationLag,omitempty"`
+}
+
+// ClusterState represents the overall cluster health.
+type ClusterState struct {
+	IsUp              bool
+	Version           string
+	SegmentsUp        int32
+	SegmentsDown      int32
+	SegmentsTotal     int32
+	MirroringInSync   bool
+	ActiveConnections int32
+	MaxConnections    int32
+}
+
+// Session represents an active database session.
+type Session struct {
+	PID           int32     `json:"pid"`
+	Username      string    `json:"username"`
+	Application   string    `json:"application"`
+	ClientAddress string    `json:"clientAddress"`
+	State         string    `json:"state"`
+	Query         string    `json:"query"`
+	QueryStart    time.Time `json:"queryStart"`
+	Duration      string    `json:"duration"`
+}
+
+// RoleOptions defines options for creating or altering a role.
+type RoleOptions struct {
+	Name       string
+	Password   string
+	Login      bool
+	SuperUser  bool
+	CreateDB   bool
+	CreateRole bool
+	ValidUntil string
+}
+
+// VacuumOptions defines options for vacuum operations.
+type VacuumOptions struct {
+	Full    bool
+	Analyze bool
+	Table   string
+}
+
+// ReindexOptions defines options for reindex operations.
+type ReindexOptions struct {
+	Database string
+	Table    string
+}
+
+// DiskUsage represents disk usage for a database.
+type DiskUsage struct {
+	Database  string `json:"database"`
+	SizeBytes int64  `json:"sizeBytes"`
+	SizeHuman string `json:"sizeHuman"`
+}
+
+// Config holds database client configuration.
+type Config struct {
+	// Host is the database host.
+	Host string
+	// Port is the database port.
+	Port int32
+	// Database is the database name.
+	Database string
+	// Username is the database username.
+	Username string
+	// Password is the database password.
+	Password string
+	// SSLMode is the SSL mode (disable, require, verify-ca, verify-full).
+	SSLMode string
+	// MaxConns is the maximum number of connections in the pool.
+	MaxConns int32
+	// RetryOpts configures retry behavior.
+	RetryOpts util.RetryOptions
+}
+
+// pgxClient implements Client using pgx.
+type pgxClient struct {
+	pool      *pgxpool.Pool
+	config    Config
+	retryOpts util.RetryOptions
+	logger    *slog.Logger
+}
+
+// NewClient creates a new database client with connection pooling.
+func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	retryOpts := cfg.RetryOpts
+	if retryOpts.MaxRetries == 0 {
+		retryOpts = util.DefaultRetryOptions()
+	}
+
+	connStr := buildConnectionString(cfg)
+
+	poolCfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing connection string: %w", err)
+	}
+
+	if cfg.MaxConns > 0 {
+		poolCfg.MaxConns = cfg.MaxConns
+	}
+
+	var pool *pgxpool.Pool
+	connectErr := util.RetryWithBackoff(ctx, retryOpts, func(ctx context.Context) error {
+		var poolErr error
+		pool, poolErr = pgxpool.NewWithConfig(ctx, poolCfg)
+		if poolErr != nil {
+			return fmt.Errorf("creating connection pool: %w", poolErr)
+		}
+		return pool.Ping(ctx)
+	})
+
+	if connectErr != nil {
+		return nil, fmt.Errorf("connecting to database: %w", connectErr)
+	}
+
+	logger.Info("database connection established",
+		"host", cfg.Host,
+		"port", cfg.Port,
+		"database", cfg.Database,
+	)
+
+	return &pgxClient{
+		pool:      pool,
+		config:    cfg,
+		retryOpts: retryOpts,
+		logger:    logger,
+	}, nil
+}
+
+// buildConnectionString constructs a PostgreSQL connection string.
+func buildConnectionString(cfg Config) string {
+	sslMode := cfg.SSLMode
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	return fmt.Sprintf(
+		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.Database, cfg.Username, cfg.Password, sslMode,
+	)
+}
+
+// Ping checks database connectivity.
+func (c *pgxClient) Ping(ctx context.Context) error {
+	return c.pool.Ping(ctx)
+}
+
+// Close closes the database connection pool.
+func (c *pgxClient) Close() {
+	c.pool.Close()
+}
+
+// GetSegmentConfiguration returns the segment configuration from gp_segment_configuration.
+func (c *pgxClient) GetSegmentConfiguration(ctx context.Context) ([]SegmentInfo, error) {
+	query := `SELECT content, dbid, role, preferred_role, mode, status, 
+		hostname, address, port, datadir 
+		FROM gp_segment_configuration ORDER BY content, role`
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying segment configuration: %w", err)
+	}
+	defer rows.Close()
+
+	var segments []SegmentInfo
+	for rows.Next() {
+		var seg SegmentInfo
+		if err := rows.Scan(
+			&seg.ContentID, &seg.DBID, &seg.Role, &seg.PreferredRole,
+			&seg.Mode, &seg.Status, &seg.Hostname, &seg.Address,
+			&seg.Port, &seg.DataDirectory,
+		); err != nil {
+			return nil, fmt.Errorf("scanning segment row: %w", err)
+		}
+		segments = append(segments, seg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating segment rows: %w", err)
+	}
+
+	return segments, nil
+}
+
+// GetClusterState returns the overall cluster health state.
+func (c *pgxClient) GetClusterState(ctx context.Context) (*ClusterState, error) {
+	state := &ClusterState{}
+
+	// Check if database is up.
+	if err := c.pool.Ping(ctx); err != nil {
+		state.IsUp = false
+		return state, fmt.Errorf("database ping failed: %w", err)
+	}
+	state.IsUp = true
+
+	// Get version.
+	if err := c.pool.QueryRow(ctx, "SHOW server_version").Scan(&state.Version); err != nil {
+		c.logger.Warn("failed to get server version", "error", err)
+	}
+
+	// Get segment counts.
+	segQuery := `SELECT 
+		COUNT(*) FILTER (WHERE status = 'u') as up,
+		COUNT(*) FILTER (WHERE status = 'd') as down,
+		COUNT(*) as total
+		FROM gp_segment_configuration WHERE content >= 0`
+
+	if err := c.pool.QueryRow(ctx, segQuery).Scan(
+		&state.SegmentsUp, &state.SegmentsDown, &state.SegmentsTotal,
+	); err != nil {
+		c.logger.Warn("failed to get segment counts", "error", err)
+	}
+
+	state.MirroringInSync = state.SegmentsDown == 0
+
+	// Get connection counts.
+	connQuery := `SELECT 
+		(SELECT count(*) FROM pg_stat_activity WHERE state != 'idle') as active,
+		(SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn`
+
+	if err := c.pool.QueryRow(ctx, connQuery).Scan(
+		&state.ActiveConnections, &state.MaxConnections,
+	); err != nil {
+		c.logger.Warn("failed to get connection counts", "error", err)
+	}
+
+	return state, nil
+}
+
+// SetParameter sets a configuration parameter at the specified scope.
+func (c *pgxClient) SetParameter(ctx context.Context, name, value string, scope ParameterScope) error {
+	var query string
+
+	switch scope.Level {
+	case "database":
+		query = fmt.Sprintf("ALTER DATABASE %s SET %s = %s",
+			pgx.Identifier{scope.Target}.Sanitize(),
+			pgx.Identifier{name}.Sanitize(),
+			quoteLiteral(value),
+		)
+	case "role":
+		query = fmt.Sprintf("ALTER ROLE %s SET %s = %s",
+			pgx.Identifier{scope.Target}.Sanitize(),
+			pgx.Identifier{name}.Sanitize(),
+			quoteLiteral(value),
+		)
+	default:
+		query = fmt.Sprintf("ALTER SYSTEM SET %s = %s",
+			pgx.Identifier{name}.Sanitize(),
+			quoteLiteral(value),
+		)
+	}
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("setting parameter %s=%s (scope=%s): %w", name, value, scope.Level, err)
+	}
+
+	c.logger.Info("parameter set", "name", name, "value", value, "scope", scope.Level)
+	return nil
+}
+
+// ShowParameter returns the current value of a parameter.
+func (c *pgxClient) ShowParameter(ctx context.Context, name string) (string, error) {
+	var value string
+	query := fmt.Sprintf("SHOW %s", pgx.Identifier{name}.Sanitize())
+	if err := c.pool.QueryRow(ctx, query).Scan(&value); err != nil {
+		return "", fmt.Errorf("showing parameter %s: %w", name, err)
+	}
+	return value, nil
+}
+
+// ReloadConfig triggers a configuration reload.
+func (c *pgxClient) ReloadConfig(ctx context.Context) error {
+	if _, err := c.pool.Exec(ctx, "SELECT pg_reload_conf()"); err != nil {
+		return fmt.Errorf("reloading configuration: %w", err)
+	}
+	c.logger.Info("configuration reloaded")
+	return nil
+}
+
+// ListSessions returns active database sessions.
+func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
+	query := `SELECT pid, usename, application_name, client_addr, state, 
+		COALESCE(query, ''), COALESCE(query_start, now()),
+		COALESCE(now() - query_start, interval '0')::text
+		FROM pg_stat_activity 
+		WHERE pid != pg_backend_pid()
+		ORDER BY query_start DESC NULLS LAST`
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		var clientAddr *string
+		if err := rows.Scan(
+			&s.PID, &s.Username, &s.Application, &clientAddr,
+			&s.State, &s.Query, &s.QueryStart, &s.Duration,
+		); err != nil {
+			return nil, fmt.Errorf("scanning session row: %w", err)
+		}
+		if clientAddr != nil {
+			s.ClientAddress = *clientAddr
+		}
+		sessions = append(sessions, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating session rows: %w", err)
+	}
+
+	return sessions, nil
+}
+
+// CancelQuery cancels a running query by PID.
+func (c *pgxClient) CancelQuery(ctx context.Context, pid int32) (bool, error) {
+	var result bool
+	if err := c.pool.QueryRow(ctx, "SELECT pg_cancel_backend($1)", pid).Scan(&result); err != nil {
+		return false, fmt.Errorf("canceling query for PID %d: %w", pid, err)
+	}
+	c.logger.Info("query canceled", "pid", pid, "result", result)
+	return result, nil
+}
+
+// TerminateSession terminates a session by PID.
+func (c *pgxClient) TerminateSession(ctx context.Context, pid int32) (bool, error) {
+	var result bool
+	if err := c.pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", pid).Scan(&result); err != nil {
+		return false, fmt.Errorf("terminating session for PID %d: %w", pid, err)
+	}
+	c.logger.Info("session terminated", "pid", pid, "result", result)
+	return result, nil
+}
+
+// CreateRole creates a new database role.
+func (c *pgxClient) CreateRole(ctx context.Context, opts RoleOptions) error {
+	query := fmt.Sprintf("CREATE ROLE %s", pgx.Identifier{opts.Name}.Sanitize())
+	query += buildRoleOptions(opts)
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("creating role %s: %w", opts.Name, err)
+	}
+	c.logger.Info("role created", "name", opts.Name)
+	return nil
+}
+
+// AlterRole modifies an existing database role.
+func (c *pgxClient) AlterRole(ctx context.Context, opts RoleOptions) error {
+	query := fmt.Sprintf("ALTER ROLE %s", pgx.Identifier{opts.Name}.Sanitize())
+	query += buildRoleOptions(opts)
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("altering role %s: %w", opts.Name, err)
+	}
+	c.logger.Info("role altered", "name", opts.Name)
+	return nil
+}
+
+// DropRole drops a database role.
+func (c *pgxClient) DropRole(ctx context.Context, name string) error {
+	query := fmt.Sprintf("DROP ROLE IF EXISTS %s", pgx.Identifier{name}.Sanitize())
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("dropping role %s: %w", name, err)
+	}
+	c.logger.Info("role dropped", "name", name)
+	return nil
+}
+
+// Vacuum runs a vacuum operation.
+func (c *pgxClient) Vacuum(ctx context.Context, opts VacuumOptions) error {
+	query := "VACUUM"
+	if opts.Full {
+		query += " FULL"
+	}
+	if opts.Analyze {
+		query += " ANALYZE"
+	}
+	if opts.Table != "" {
+		query += " " + pgx.Identifier{opts.Table}.Sanitize()
+	}
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("running vacuum: %w", err)
+	}
+	c.logger.Info("vacuum completed", "full", opts.Full, "analyze", opts.Analyze, "table", opts.Table)
+	return nil
+}
+
+// Analyze runs an analyze operation.
+func (c *pgxClient) Analyze(ctx context.Context, table string) error {
+	query := "ANALYZE"
+	if table != "" {
+		query += " " + pgx.Identifier{table}.Sanitize()
+	}
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("running analyze: %w", err)
+	}
+	c.logger.Info("analyze completed", "table", table)
+	return nil
+}
+
+// Reindex runs a reindex operation.
+func (c *pgxClient) Reindex(ctx context.Context, opts ReindexOptions) error {
+	var query string
+	switch {
+	case opts.Table != "":
+		query = fmt.Sprintf("REINDEX TABLE %s", pgx.Identifier{opts.Table}.Sanitize())
+	case opts.Database != "":
+		query = fmt.Sprintf("REINDEX DATABASE %s", pgx.Identifier{opts.Database}.Sanitize())
+	default:
+		return fmt.Errorf("either database or table must be specified for reindex")
+	}
+
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("running reindex: %w", err)
+	}
+	c.logger.Info("reindex completed", "database", opts.Database, "table", opts.Table)
+	return nil
+}
+
+// GetDiskUsage returns disk usage information.
+func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) ([]DiskUsage, error) {
+	query := `SELECT datname, pg_database_size(datname) as size_bytes,
+		pg_size_pretty(pg_database_size(datname)) as size_human
+		FROM pg_database WHERE datistemplate = false`
+
+	if database != "" {
+		query += fmt.Sprintf(" AND datname = %s", quoteLiteral(database))
+	}
+	query += " ORDER BY size_bytes DESC"
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying disk usage: %w", err)
+	}
+	defer rows.Close()
+
+	var usages []DiskUsage
+	for rows.Next() {
+		var du DiskUsage
+		if err := rows.Scan(&du.Database, &du.SizeBytes, &du.SizeHuman); err != nil {
+			return nil, fmt.Errorf("scanning disk usage row: %w", err)
+		}
+		usages = append(usages, du)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating disk usage rows: %w", err)
+	}
+
+	return usages, nil
+}
+
+// GetReplicationLag returns the replication lag in bytes.
+func (c *pgxClient) GetReplicationLag(ctx context.Context) (int64, error) {
+	var lag int64
+	query := `SELECT COALESCE(
+		pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0
+	) FROM pg_stat_replication LIMIT 1`
+
+	if err := c.pool.QueryRow(ctx, query).Scan(&lag); err != nil {
+		return 0, fmt.Errorf("querying replication lag: %w", err)
+	}
+	return lag, nil
+}
+
+// PromoteStandby promotes the standby to primary.
+func (c *pgxClient) PromoteStandby(ctx context.Context) error {
+	if _, err := c.pool.Exec(ctx, "SELECT pg_promote()"); err != nil {
+		return fmt.Errorf("promoting standby: %w", err)
+	}
+	c.logger.Info("standby promoted to primary")
+	return nil
+}
+
+// buildRoleOptions constructs the SQL options clause for role operations.
+func buildRoleOptions(opts RoleOptions) string {
+	var parts []string
+
+	if opts.Login {
+		parts = append(parts, "LOGIN")
+	}
+	if opts.SuperUser {
+		parts = append(parts, "SUPERUSER")
+	}
+	if opts.CreateDB {
+		parts = append(parts, "CREATEDB")
+	}
+	if opts.CreateRole {
+		parts = append(parts, "CREATEROLE")
+	}
+	if opts.Password != "" {
+		parts = append(parts, fmt.Sprintf("PASSWORD %s", quoteLiteral(opts.Password)))
+	}
+	if opts.ValidUntil != "" {
+		parts = append(parts, fmt.Sprintf("VALID UNTIL %s", quoteLiteral(opts.ValidUntil)))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	result := " WITH"
+	for _, p := range parts {
+		result += " " + p
+	}
+	return result
+}
+
+// quoteLiteral safely quotes a string literal for SQL.
+func quoteLiteral(s string) string {
+	return "'" + escapeQuotes(s) + "'"
+}
+
+// escapeQuotes escapes single quotes in a string.
+func escapeQuotes(s string) string {
+	result := make([]byte, 0, len(s))
+	for i := range len(s) {
+		if s[i] == '\'' {
+			result = append(result, '\'', '\'')
+		} else {
+			result = append(result, s[i])
+		}
+	}
+	return string(result)
+}

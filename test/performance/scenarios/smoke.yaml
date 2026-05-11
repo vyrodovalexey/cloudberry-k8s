@@ -1,0 +1,50 @@
+# =============================================================================
+# Smoke Test Scenario
+# =============================================================================
+#
+# Purpose: Quick validation that the API is responding under minimal load.
+#          Run this first to verify the test setup is working correctly.
+#
+# Profile: 10 RPS constant for 1 minute
+# Expected: All responses < 100ms, 0% errors
+# Duration: ~1.5 minutes (including ramp-up)
+#
+# Usage:
+#   ./run-perftest.sh --scenario smoke
+#   # or directly:
+#   docker run --rm -v $(pwd):/var/loadtest -v $(pwd)/.yandextank:/tmp/artifacts \
+#     --net host direvius/yandex-tank -c scenarios/smoke.yaml
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8443
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/health.txt
+  load_profile:
+    load_type: rps
+    # Gentle ramp from 1 to 10 RPS over 15 seconds, then hold 10 RPS for 60 seconds
+    schedule: line(1, 10, 15s) const(10, 60s)
+  timeout: 3000
+  instances: 20
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    # Very strict thresholds for smoke test
+    # Stop if average response time exceeds 500ms for 10 seconds
+    - time(500, 10s)
+    # Stop if any 5xx errors for 5 seconds
+    - http(5xx, 1%, 5s)
+    # Stop if any 4xx errors exceed 5% for 5 seconds
+    - http(4xx, 5%, 5s)
+    # Stop if network errors occur
+    - net(xx, 1%, 5s)
+    # Stop if 95th percentile exceeds 1 second
+    - quantile(95, 1000, 10s)
+
+console:
+  enabled: true
+  short_only: true
