@@ -299,6 +299,60 @@ jobs:
           retention-days: 7
 
   # ===========================================================================
+  # Sequential Jobs: SonarCloud, Build, Docker
+  # ===========================================================================
+
+  sonarcloud:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, govulncheck, unit-tests, service-tests]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0  # Required for SonarCloud
+
+      - name: Download unit coverage
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
+        with:
+          name: coverage-unit
+          path: coverage
+
+      - name: Download functional coverage
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
+        with:
+          name: coverage-functional
+          path: coverage
+
+      - name: Download integration/e2e coverage
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
+        with:
+          name: coverage-integration-e2e
+          path: coverage
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            "-Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}"
+            "-Dsonar.organization=${{ github.repository_owner }}"
+            "-Dsonar.go.coverage.reportPaths=coverage/unit.out,coverage/functional.out,coverage/integration.out,coverage/e2e.out"
+            "-Dsonar.sources=."
+            "-Dsonar.exclusions=**/vendor/**,**/test/**,**/*_test.go,**/mocks/**,**/testdata/**,**/bin/**,**/coverage/**,**/helm/**,**/api/**,**/proto/**"
+            "-Dsonar.tests=."
+            "-Dsonar.test.inclusions=**/*_test.go"
+            "-Dsonar.qualitygate.wait=${{ !startsWith(github.ref, 'refs/tags/') }}"
+
+
+
+
+  # ===========================================================================
   # Build (PR only)
   # ===========================================================================
 
@@ -306,7 +360,7 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [lint, govulncheck, unit-tests]
+    needs: [sonarcloud]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -400,7 +454,7 @@ jobs:
     name: Build & Release
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, govulncheck, unit-tests, service-tests]
+    needs: [sonarcloud]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
