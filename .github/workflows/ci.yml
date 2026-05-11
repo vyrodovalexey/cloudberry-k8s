@@ -10,7 +10,6 @@ on:
     branches:
       - main
 
-# Concurrency control - cancel in-progress runs for the same branch/tag
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,7 +24,7 @@ env:
 
 jobs:
   # ===========================================================================
-  # Parallel Jobs: Lint, Vulnerability Check, Unit Tests
+  # Parallel: Lint, Vulnerability Check, Unit Tests
   # ===========================================================================
 
   lint:
@@ -35,17 +34,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --timeout=5m
@@ -57,20 +51,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
 
   unit-tests:
     name: Unit Tests
@@ -79,36 +66,30 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
       - name: Run unit tests with coverage
         run: |
           mkdir -p coverage
           go test -race -coverprofile=coverage/unit.out -covermode=atomic \
             ./internal/... ./cmd/... ./api/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-unit
           path: coverage/unit.out
           retention-days: 7
 
   # ===========================================================================
-  # Functional Tests (with Vault + Keycloak services)
+  # Combined: Functional + Integration + E2E Tests (single service set)
   # ===========================================================================
 
-  functional-tests:
-    name: Functional Tests
+  service-tests:
+    name: Functional / Integration / E2E Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     services:
@@ -119,12 +100,14 @@ jobs:
         env:
           VAULT_DEV_ROOT_TOKEN_ID: myroot
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+          SKIP_SETCAP: "true"
         options: >-
+          --cap-add IPC_LOCK
           --health-cmd "vault status"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-          --health-start-period 5s
+          --health-start-period 10s
 
       keycloakdb:
         image: postgres:16
@@ -162,523 +145,158 @@ jobs:
           - 8090:8090
           - 8091:9000
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      minio:
+        image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+        ports:
+          - 9000:9000
+          - 9001:9001
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
 
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9094:9094
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          CLUSTER_ID: cloudberry-ci-kafka-cluster
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+          --health-start-period 30s
+
+      rabbitmq:
+        image: rabbitmq:3.13-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 15s
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Wait for services to be ready
+      - name: Wait for services
         run: |
-          echo "Waiting for Vault..."
+          echo "--- Vault ---"
           for i in {1..30}; do
-            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
-              echo "Vault is ready!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Vault..."
-            sleep 2
+            curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1 && echo "Vault ready" && break
+            echo "  attempt $i …"; sleep 2
           done
 
-          echo "Waiting for Keycloak..."
+          echo "--- Keycloak ---"
           for i in {1..60}; do
-            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
-              echo "Keycloak is ready!"
-              break
-            fi
-            # Fallback: try realm endpoint
-            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
-              echo "Keycloak is ready (via realm endpoint)!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Keycloak..."
-            sleep 5
+            curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1 && echo "Keycloak ready" && break
+            curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1 && echo "Keycloak ready (realm)" && break
+            echo "  attempt $i …"; sleep 5
           done
 
-      - name: Setup Vault for Testing
+          echo "--- MinIO ---"
+          for i in {1..30}; do
+            curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null 2>&1 && echo "MinIO ready" && break
+            echo "  attempt $i …"; sleep 2
+          done
+
+          echo "--- Kafka ---"
+          for i in {1..30}; do
+            echo "" | nc -w 3 127.0.0.1 9094 > /dev/null 2>&1 && echo "Kafka ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- RabbitMQ ---"
+          for i in {1..30}; do
+            curl -sf http://127.0.0.1:15672/api/health/checks/alarms -u guest:guest > /dev/null 2>&1 && echo "RabbitMQ ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+      - name: Setup Vault
         env:
           VAULT_ADDR: http://127.0.0.1:8200
           VAULT_TOKEN: myroot
         run: bash test/docker-compose/scripts/setup-vault.sh --ci
 
-      - name: Setup Keycloak for Testing
+      - name: Setup Keycloak
         env:
           KEYCLOAK_ADDR: http://127.0.0.1:8090
         run: bash test/docker-compose/scripts/setup-keycloak.sh
 
-      - name: Run functional tests with coverage
+      - name: Setup MinIO
         env:
+          MINIO_ADDR: http://127.0.0.1:9000
+        run: bash test/docker-compose/scripts/setup-minio.sh --ci
+
+      - name: Setup Kafka
+        env:
+          KAFKA_BROKERS: 127.0.0.1:9094
+        run: bash test/docker-compose/scripts/setup-kafka.sh --ci
+
+      - name: Setup RabbitMQ
+        env:
+          RABBITMQ_ADDR: http://127.0.0.1:15672
+        run: bash test/docker-compose/scripts/setup-rabbitmq.sh --ci
+
+      - name: Run functional tests
+        env: &test-env
           VAULT_ADDR: http://127.0.0.1:8200
           VAULT_TOKEN: myroot
           KEYCLOAK_ADDR: http://127.0.0.1:8090
           KEYCLOAK_ADMIN: admin
           KEYCLOAK_ADMIN_PASSWORD: admin
+          MINIO_ADDR: http://127.0.0.1:9000
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: minioadmin
+          KAFKA_BROKERS: 127.0.0.1:9094
+          RABBITMQ_ADDR: amqp://guest:guest@127.0.0.1:5672/
+          SKIP_DOCKER_COMPOSE: "true"
         run: |
           mkdir -p coverage
           go test -race -coverprofile=coverage/functional.out -covermode=atomic \
             -tags=functional -timeout 5m ./test/functional/...
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-functional
-          path: coverage/functional.out
-          retention-days: 7
-
-  # ===========================================================================
-  # Integration Tests (with Vault + Keycloak services)
-  # ===========================================================================
-
-  integration-tests:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    services:
-      vault:
-        image: hashicorp/vault:1.17
-        ports:
-          - 8200:8200
-        env:
-          VAULT_DEV_ROOT_TOKEN_ID: myroot
-          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-        options: >-
-          --health-cmd "vault status"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
-
-      keycloakdb:
-        image: postgres:16
-        env:
-          POSTGRES_DB: keycloak
-          POSTGRES_USER: keycloak
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd "pg_isready -U keycloak"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 10s
-
-      keycloak:
-        image: quay.io/keycloak/keycloak:26.5
-        env:
-          KC_DB: postgres
-          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
-          KC_DB_USERNAME: keycloak
-          KC_DB_PASSWORD: password
-          KC_HTTP_PORT: 8090
-          KC_HOSTNAME_STRICT: "false"
-          KC_HOSTNAME_STRICT_HTTPS: "false"
-          KC_HTTP_ENABLED: "true"
-          KC_PROXY_HEADERS: xforwarded
-          KC_FEATURES: token-exchange,admin-fine-grained-authz
-          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
-          KC_LOG_LEVEL: info
-          KC_METRICS_ENABLED: "true"
-          KC_HEALTH_ENABLED: "true"
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-        ports:
-          - 8090:8090
-          - 8091:9000
-
-      minio:
-        image: minio/minio:RELEASE.2024-11-07T00-52-20Z
-        ports:
-          - 9000:9000
-          - 9001:9001
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "mc ready local"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
-
-      kafka:
-        image: bitnami/kafka:3.9
-        ports:
-          - 9094:9094
-        env:
-          KAFKA_CFG_NODE_ID: 0
-          KAFKA_CFG_PROCESS_ROLES: controller,broker
-          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
-          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
-          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-        options: >-
-          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 15
-          --health-start-period 30s
-
-      rabbitmq:
-        image: rabbitmq:3.13-management
-        ports:
-          - 5672:5672
-          - 15672:15672
-        env:
-          RABBITMQ_DEFAULT_USER: guest
-          RABBITMQ_DEFAULT_PASS: guest
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 15s
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Wait for services to be ready
+      - name: Run integration tests
+        env: *test-env
         run: |
-          echo "Waiting for Vault..."
-          for i in {1..30}; do
-            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
-              echo "Vault is ready!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Vault..."
-            sleep 2
-          done
-
-          echo "Waiting for Keycloak..."
-          for i in {1..60}; do
-            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
-              echo "Keycloak is ready!"
-              break
-            fi
-            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
-              echo "Keycloak is ready (via realm endpoint)!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Keycloak..."
-            sleep 5
-          done
-
-      - name: Setup Vault for Testing
-        env:
-          VAULT_ADDR: http://127.0.0.1:8200
-          VAULT_TOKEN: myroot
-        run: bash test/docker-compose/scripts/setup-vault.sh --ci
-
-      - name: Setup Keycloak for Testing
-        env:
-          KEYCLOAK_ADDR: http://127.0.0.1:8090
-        run: bash test/docker-compose/scripts/setup-keycloak.sh
-
-      - name: Setup MinIO for Testing
-        env:
-          MINIO_ADDR: http://127.0.0.1:9000
-        run: bash test/docker-compose/scripts/setup-minio.sh --ci
-
-      - name: Setup Kafka for Testing
-        env:
-          KAFKA_BROKERS: 127.0.0.1:9094
-        run: bash test/docker-compose/scripts/setup-kafka.sh --ci
-
-      - name: Setup RabbitMQ for Testing
-        env:
-          RABBITMQ_ADDR: http://127.0.0.1:15672
-        run: bash test/docker-compose/scripts/setup-rabbitmq.sh --ci
-
-      - name: Run integration tests with coverage
-        env:
-          VAULT_ADDR: http://127.0.0.1:8200
-          VAULT_TOKEN: myroot
-          KEYCLOAK_ADDR: http://127.0.0.1:8090
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-          MINIO_ADDR: http://127.0.0.1:9000
-          MINIO_ACCESS_KEY: minioadmin
-          MINIO_SECRET_KEY: minioadmin
-          KAFKA_BROKERS: 127.0.0.1:9094
-          RABBITMQ_ADDR: amqp://guest:guest@127.0.0.1:5672/
-          SKIP_DOCKER_COMPOSE: "true"
-        run: |
-          mkdir -p coverage
           go test -race -coverprofile=coverage/integration.out -covermode=atomic \
             -tags=integration -v -timeout 10m ./test/integration/...
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-integration
-          path: coverage/integration.out
-          retention-days: 7
-
-  # ===========================================================================
-  # E2E Tests
-  # ===========================================================================
-
-  e2e-tests:
-    name: E2E Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    services:
-      vault:
-        image: hashicorp/vault:1.17
-        ports:
-          - 8200:8200
-        env:
-          VAULT_DEV_ROOT_TOKEN_ID: myroot
-          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-        options: >-
-          --health-cmd "vault status"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
-
-      keycloakdb:
-        image: postgres:16
-        env:
-          POSTGRES_DB: keycloak
-          POSTGRES_USER: keycloak
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd "pg_isready -U keycloak"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 10s
-
-      keycloak:
-        image: quay.io/keycloak/keycloak:26.5
-        env:
-          KC_DB: postgres
-          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
-          KC_DB_USERNAME: keycloak
-          KC_DB_PASSWORD: password
-          KC_HTTP_PORT: 8090
-          KC_HOSTNAME_STRICT: "false"
-          KC_HOSTNAME_STRICT_HTTPS: "false"
-          KC_HTTP_ENABLED: "true"
-          KC_PROXY_HEADERS: xforwarded
-          KC_FEATURES: token-exchange,admin-fine-grained-authz
-          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
-          KC_LOG_LEVEL: info
-          KC_METRICS_ENABLED: "true"
-          KC_HEALTH_ENABLED: "true"
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-        ports:
-          - 8090:8090
-          - 8091:9000
-
-      minio:
-        image: minio/minio:RELEASE.2024-11-07T00-52-20Z
-        ports:
-          - 9000:9000
-          - 9001:9001
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "mc ready local"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
-
-      kafka:
-        image: bitnami/kafka:3.9
-        ports:
-          - 9094:9094
-        env:
-          KAFKA_CFG_NODE_ID: 0
-          KAFKA_CFG_PROCESS_ROLES: controller,broker
-          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
-          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
-          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-        options: >-
-          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 15
-          --health-start-period 30s
-
-      rabbitmq:
-        image: rabbitmq:3.13-management
-        ports:
-          - 5672:5672
-          - 15672:15672
-        env:
-          RABBITMQ_DEFAULT_USER: guest
-          RABBITMQ_DEFAULT_PASS: guest
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 15s
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Wait for services to be ready
+      - name: Run e2e tests
+        env: *test-env
         run: |
-          echo "Waiting for Vault..."
-          for i in {1..30}; do
-            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
-              echo "Vault is ready!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Vault..."
-            sleep 2
-          done
-
-          echo "Waiting for Keycloak..."
-          for i in {1..60}; do
-            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
-              echo "Keycloak is ready!"
-              break
-            fi
-            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
-              echo "Keycloak is ready (via realm endpoint)!"
-              break
-            fi
-            echo "Attempt $i: Waiting for Keycloak..."
-            sleep 5
-          done
-
-      - name: Setup Vault for Testing
-        env:
-          VAULT_ADDR: http://127.0.0.1:8200
-          VAULT_TOKEN: myroot
-        run: bash test/docker-compose/scripts/setup-vault.sh --ci
-
-      - name: Setup Keycloak for Testing
-        env:
-          KEYCLOAK_ADDR: http://127.0.0.1:8090
-        run: bash test/docker-compose/scripts/setup-keycloak.sh
-
-      - name: Setup MinIO for Testing
-        env:
-          MINIO_ADDR: http://127.0.0.1:9000
-        run: bash test/docker-compose/scripts/setup-minio.sh --ci
-
-      - name: Setup Kafka for Testing
-        env:
-          KAFKA_BROKERS: 127.0.0.1:9094
-        run: bash test/docker-compose/scripts/setup-kafka.sh --ci
-
-      - name: Setup RabbitMQ for Testing
-        env:
-          RABBITMQ_ADDR: http://127.0.0.1:15672
-        run: bash test/docker-compose/scripts/setup-rabbitmq.sh --ci
-
-      - name: Run e2e tests with coverage
-        env:
-          VAULT_ADDR: http://127.0.0.1:8200
-          VAULT_TOKEN: myroot
-          KEYCLOAK_ADDR: http://127.0.0.1:8090
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-          MINIO_ADDR: http://127.0.0.1:9000
-          MINIO_ACCESS_KEY: minioadmin
-          MINIO_SECRET_KEY: minioadmin
-          KAFKA_BROKERS: 127.0.0.1:9094
-          RABBITMQ_ADDR: amqp://guest:guest@127.0.0.1:5672/
-          SKIP_DOCKER_COMPOSE: "true"
-        run: |
-          mkdir -p coverage
           go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
             -tags=e2e -v -timeout 15m ./test/e2e/...
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: coverage-e2e
-          path: coverage/e2e.out
+          name: coverage-service-tests
+          path: coverage/
           retention-days: 7
-
-
-  # ===========================================================================
-  # Sequential Jobs: SonarCloud, Build, Docker
-  # ===========================================================================
-
-  sonarcloud:
-    name: SonarCloud Analysis
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: [lint, govulncheck, unit-tests, functional-tests, integration-tests, e2e-tests]
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0  # Required for SonarCloud
-
-      - name: Download unit coverage
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
-        with:
-          name: coverage-unit
-          path: coverage
-
-      - name: Download functional coverage
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
-        with:
-          name: coverage-functional
-          path: coverage
-
-      - name: Download integration/e2e coverage
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
-        with:
-          name: coverage-integration-e2e
-          path: coverage
-
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # v7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            "-Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}"
-            "-Dsonar.organization=${{ github.repository_owner }}"
-            "-Dsonar.go.coverage.reportPaths=coverage/unit.out,coverage/functional.out,coverage/integration.out,coverage/e2e.out"
-            "-Dsonar.sources=."
-            "-Dsonar.exclusions=**/vendor/**,**/test/**,**/*_test.go,**/mocks/**,**/testdata/**,**/bin/**,**/coverage/**,**/helm/**,**/api/**,**/proto/**"
-            "-Dsonar.tests=."
-            "-Dsonar.test.inclusions=**/*_test.go"
-            "-Dsonar.qualitygate.wait=${{ !startsWith(github.ref, 'refs/tags/') }}"
-
 
   # ===========================================================================
   # Build (PR only)
@@ -688,39 +306,26 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [sonarcloud]
+    needs: [lint, govulncheck, unit-tests]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
-      - name: Build operator binary
+      - name: Build binaries
         run: |
           mkdir -p bin
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-operator ./cmd/operator/
-
-      - name: Build cloudberry-ctl binary
-        run: |
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-ctl ./cmd/cloudberry-ctl/
-
-      - name: Verify binaries
-        run: ls -la ./bin/
-
-      - name: Upload binary artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          ls -la ./bin/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries
-          path: |
-            bin/cloudberry-operator
-            bin/cloudberry-ctl
+          path: bin/
           retention-days: 7
 
   # ===========================================================================
@@ -728,14 +333,13 @@ jobs:
   # ===========================================================================
 
   docker-build:
-    name: Docker Build (PR)
+    name: Docker Build (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [build]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-      packages: read
     strategy:
       matrix:
         include:
@@ -746,33 +350,22 @@ jobs:
             dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Extract metadata
-        id: meta
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env[matrix.image_env] }}
           tags: |
             type=ref,event=pr
             type=sha,prefix=pr-
-
-      - name: Build Docker image (no push)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./${{ matrix.dockerfile }}
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ github.sha }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -784,37 +377,30 @@ jobs:
     name: Helm Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [sonarcloud]
+    needs: [lint, govulncheck, unit-tests]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: 'v3.14.0'
-
-      - name: Helm lint
-        run: helm lint ${{ env.HELM_CHART_PATH }}
-
-      - name: Helm template validation
-        run: |
+      - run: helm lint ${{ env.HELM_CHART_PATH }}
+      - run: |
           helm template cloudberry-operator ${{ env.HELM_CHART_PATH }} \
             --set installCRDs=true > /dev/null
           echo "Template validation successful!"
 
   # ===========================================================================
-  # Tag-only Jobs: Build & Release
+  # Tag-only: Build & Release
   # ===========================================================================
 
   build-release:
     name: Build & Release
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [sonarcloud]
+    needs: [lint, govulncheck, unit-tests, service-tests]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -822,92 +408,56 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-
       - name: Get version
         id: version
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Building version: ${VERSION}"
-
-      - name: Build operator binaries for multiple platforms
+      - name: Build multi-platform binaries
         run: |
           mkdir -p bin
-          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
-          for PAIR in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64"; do
-            OS="${PAIR%/*}"
-            ARCH="${PAIR#*/}"
-            echo "Building cloudberry-operator for ${OS}/${ARCH}..."
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build \
-              -ldflags="-s -w \
-                -X main.version=${{ steps.version.outputs.version }} \
-                -X main.buildTime=${BUILD_TIME} \
-                -X main.gitCommit=${{ github.sha }}" \
-              -trimpath \
-              -o bin/cloudberry-operator-${OS}-${ARCH} \
-              ./cmd/operator/
+          BT=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          VER=${{ steps.version.outputs.version }}
+          SHA=${{ github.sha }}
+          for PAIR in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            OS=${PAIR%/*}; ARCH=${PAIR#*/}
+            for CMD in operator cloudberry-ctl; do
+              BIN=cloudberry-${CMD}; [ "$CMD" = "operator" ] && BIN=cloudberry-operator
+              echo "Building ${BIN} ${OS}/${ARCH}"
+              CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -trimpath \
+                -ldflags="-s -w -X main.version=${VER} -X main.buildTime=${BT} -X main.gitCommit=${SHA}" \
+                -o "bin/${BIN}-${OS}-${ARCH}" "./cmd/${CMD}/"
+            done
           done
-
-      - name: Build cloudberry-ctl binaries for multiple platforms
-        run: |
-          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
-          for PAIR in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64"; do
-            OS="${PAIR%/*}"
-            ARCH="${PAIR#*/}"
-            echo "Building cloudberry-ctl for ${OS}/${ARCH}..."
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build \
-              -ldflags="-s -w \
-                -X main.appVersion=${{ steps.version.outputs.version }} \
-                -X main.buildTime=${BUILD_TIME} \
-                -X main.gitCommit=${{ github.sha }}" \
-              -trimpath \
-              -o bin/cloudberry-ctl-${OS}-${ARCH} \
-              ./cmd/cloudberry-ctl/
-          done
-
-      - name: Create checksums
-        run: |
-          cd bin
-          for f in cloudberry-operator-* cloudberry-ctl-*; do
-            sha256sum "$f" > "${f}.sha256"
-          done
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+          cd bin && for f in cloudberry-*; do sha256sum "$f" > "${f}.sha256"; done
+      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           name: Release ${{ steps.version.outputs.version }}
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           generate_release_notes: true
-          files: |
-            bin/cloudberry-operator-*
-            bin/cloudberry-ctl-*
+          files: bin/cloudberry-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload binary artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binaries
           path: bin/
           retention-days: 30
 
   # ===========================================================================
-  # Tag-only Jobs: Docker Build & Push
+  # Tag-only: Docker Build & Push
   # ===========================================================================
 
   docker-build-push:
-    name: Docker Build & Push
+    name: Docker Push (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [build-release]
@@ -925,40 +475,25 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_key: DOCKER_IMAGE_CTL
-    outputs:
-      operator-digest: ${{ steps.build.outputs.digest }}
-      operator-tag: ${{ steps.meta.outputs.version }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
+      - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env[matrix.image_key] }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,prefix=
             type=raw,value=latest
-
-      - name: Build and push Docker image
-        id: build
+      - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -967,48 +502,24 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.7.0
-
-      - name: Sign container image with Cosign
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.7.0
+      - name: Sign image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           images=""
-          for tag in ${TAGS}; do
-            images+="${tag}@${DIGEST} "
-          done
+          for tag in ${TAGS}; do images+="${tag}@${DIGEST} "; done
           cosign sign --yes ${images}
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0.22.2
-        with:
-          image: ${{ env[matrix.image_key] }}:${{ steps.meta.outputs.version }}
-          artifact-name: sbom-${{ matrix.name }}-${{ steps.meta.outputs.version }}.spdx.json
-          output-file: ./sbom-${{ matrix.name }}.spdx.json
-          upload-release-assets: false
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sbom-${{ matrix.name }}
-          path: ./sbom-${{ matrix.name }}.spdx.json
-          retention-days: 90
-
   # ===========================================================================
-  # Tag-only Jobs: Trivy Security Scan
+  # Tag-only: Trivy Scan
   # ===========================================================================
 
   trivy-scan:
-    name: Trivy Security Scan
+    name: Trivy (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [docker-build-push]
@@ -1024,49 +535,30 @@ jobs:
           - name: ctl
             image_key: DOCKER_IMAGE_CTL
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.0
+      - uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.0
         with:
           image-ref: '${{ env[matrix.image_key] }}:latest'
           format: 'sarif'
-          output: 'trivy-${{ matrix.name }}-results.sarif'
+          output: 'trivy-${{ matrix.name }}.sarif'
           severity: 'CRITICAL,HIGH'
-          vuln-type: 'os,library'
-
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98 # v4.32.5
+      - uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98 # v4.32.5
         with:
-          sarif_file: 'trivy-${{ matrix.name }}-results.sarif'
-
-      - name: Run Trivy vulnerability scanner (table output)
-        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.0
+          sarif_file: 'trivy-${{ matrix.name }}.sarif'
+      - uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.0
         with:
           image-ref: '${{ env[matrix.image_key] }}:latest'
           format: 'table'
           severity: 'CRITICAL,HIGH'
-          vuln-type: 'os,library'
           exit-code: '1'
 
-      - name: Upload Trivy results artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: trivy-${{ matrix.name }}-results
-          path: trivy-${{ matrix.name }}-results.sarif
-          retention-days: 30
-
   # ===========================================================================
-  # Tag-only Jobs: Helm Package
+  # Tag-only: Helm Package
   # ===========================================================================
 
   helm-package:
@@ -1078,24 +570,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: 'v3.14.0'
-
-      - name: Helm lint
-        run: helm lint ${{ env.HELM_CHART_PATH }}
-
-      - name: Helm package
+      - run: helm lint ${{ env.HELM_CHART_PATH }}
+      - name: Package
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           helm package ${{ env.HELM_CHART_PATH }} --version "${VERSION}" --app-version "${VERSION}"
-
-      - name: Upload Helm chart artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: helm-chart
           path: cloudberry-operator-*.tgz
