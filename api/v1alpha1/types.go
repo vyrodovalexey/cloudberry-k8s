@@ -272,6 +272,14 @@ type CloudberryClusterSpec struct {
 	// +optional
 	QueryMonitoring *QueryMonitoringSpec `json:"queryMonitoring,omitempty"`
 
+	// Backup defines backup and restore configuration.
+	// +optional
+	Backup *BackupSpec `json:"backup,omitempty"`
+
+	// DataLoading defines data loading configuration.
+	// +optional
+	DataLoading *DataLoadingSpec `json:"dataLoading,omitempty"`
+
 	// DeletionPolicy defines the PV reclaim policy on cluster deletion.
 	// +kubebuilder:validation:Enum=Retain;Delete
 	// +kubebuilder:default="Retain"
@@ -870,6 +878,249 @@ type QueryMonitoringSpec struct {
 	SlowQueryThreshold string `json:"slowQueryThreshold,omitempty"`
 }
 
+// BackupSpec defines backup and restore configuration.
+type BackupSpec struct {
+	// Enabled controls whether backup is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Schedule is the cron expression for scheduled backups.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+
+	// Retention defines backup retention policy.
+	// +optional
+	Retention BackupRetention `json:"retention,omitempty"`
+
+	// Destination defines where backups are stored.
+	Destination BackupDestination `json:"destination"`
+
+	// Compression is the compression level (0-9).
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=9
+	// +optional
+	Compression int32 `json:"compression,omitempty"`
+
+	// Parallelism is the number of parallel backup workers.
+	// +optional
+	Parallelism int32 `json:"parallelism,omitempty"`
+
+	// Incremental enables incremental backups.
+	// +kubebuilder:default=false
+	// +optional
+	Incremental bool `json:"incremental,omitempty"`
+}
+
+// BackupRetention defines backup retention policy.
+type BackupRetention struct {
+	// FullCount is the number of full backups to retain.
+	// +optional
+	FullCount int32 `json:"fullCount,omitempty"`
+
+	// IncrementalCount is the number of incremental backups to retain.
+	// +optional
+	IncrementalCount int32 `json:"incrementalCount,omitempty"`
+
+	// MaxAge is the maximum age of backups to retain (e.g. "30d").
+	// +optional
+	MaxAge string `json:"maxAge,omitempty"`
+}
+
+// BackupDestination defines where backups are stored.
+type BackupDestination struct {
+	// Type is the destination type (s3, local).
+	// +kubebuilder:validation:Enum=s3;local
+	Type string `json:"type"`
+
+	// Bucket is the S3 bucket name.
+	// +optional
+	Bucket string `json:"bucket,omitempty"`
+
+	// Endpoint is the S3-compatible endpoint (for MinIO).
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Region is the S3 region.
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// Path is the storage path prefix.
+	// +optional
+	Path string `json:"path,omitempty"`
+
+	// CredentialSecret references the secret containing storage credentials.
+	// +optional
+	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+
+	// ForcePathStyle enables path-style addressing for S3-compatible storage.
+	// +kubebuilder:default=false
+	// +optional
+	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+}
+
+// SecretReference references a Kubernetes secret.
+type SecretReference struct {
+	// Name is the name of the secret.
+	Name string `json:"name"`
+
+	// Key is the key within the secret.
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// DataLoadingSpec defines data loading configuration.
+type DataLoadingSpec struct {
+	// Enabled controls whether data loading is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// StreamingServer defines the streaming server configuration.
+	// +optional
+	StreamingServer *StreamingServerSpec `json:"streamingServer,omitempty"`
+
+	// Jobs defines data loading job configurations.
+	// +optional
+	Jobs []DataLoadingJob `json:"jobs,omitempty"`
+}
+
+// StreamingServerSpec defines the streaming server configuration.
+type StreamingServerSpec struct {
+	// Host is the streaming server hostname.
+	Host string `json:"host"`
+
+	// Port is the streaming server port.
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// TLSMode defines the TLS mode (none, tls, skip-verify).
+	// +kubebuilder:validation:Enum=none;tls;skip-verify
+	// +kubebuilder:default="none"
+	// +optional
+	TLSMode string `json:"tlsMode,omitempty"`
+
+	// CredentialSecret references the secret containing server credentials.
+	// +optional
+	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+}
+
+// DataLoadingJob defines a data loading job configuration.
+type DataLoadingJob struct {
+	// Name is the job name.
+	Name string `json:"name"`
+
+	// Type is the source type (s3, kafka, rabbitmq).
+	// +kubebuilder:validation:Enum=s3;kafka;rabbitmq
+	Type string `json:"type"`
+
+	// Enabled controls whether the job is active.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Schedule is the cron expression for scheduled jobs.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+
+	// TargetTable is the target database table.
+	TargetTable string `json:"targetTable"`
+
+	// S3Source defines the S3 source configuration.
+	// +optional
+	S3Source *S3SourceSpec `json:"s3Source,omitempty"`
+
+	// KafkaSource defines the Kafka source configuration.
+	// +optional
+	KafkaSource *KafkaSourceSpec `json:"kafkaSource,omitempty"`
+
+	// RabbitMQSource defines the RabbitMQ source configuration.
+	// +optional
+	RabbitMQSource *RabbitMQSourceSpec `json:"rabbitMQSource,omitempty"`
+}
+
+// S3SourceSpec defines an S3 data source.
+type S3SourceSpec struct {
+	// Bucket is the S3 bucket name.
+	Bucket string `json:"bucket"`
+
+	// Path is the object path prefix.
+	// +optional
+	Path string `json:"path,omitempty"`
+
+	// Endpoint is the S3-compatible endpoint.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Region is the S3 region.
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// Format is the data format (csv, json, avro).
+	// +kubebuilder:validation:Enum=csv;json;avro
+	// +optional
+	Format string `json:"format,omitempty"`
+
+	// CredentialSecret references the secret containing S3 credentials.
+	// +optional
+	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+
+	// ForcePathStyle enables path-style addressing for S3-compatible storage.
+	// +kubebuilder:default=false
+	// +optional
+	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+}
+
+// KafkaSourceSpec defines a Kafka data source.
+type KafkaSourceSpec struct {
+	// Brokers is the list of Kafka broker addresses.
+	Brokers []string `json:"brokers"`
+
+	// Topic is the Kafka topic to consume from.
+	Topic string `json:"topic"`
+
+	// GroupID is the consumer group ID.
+	// +optional
+	GroupID string `json:"groupId,omitempty"`
+
+	// Format is the message format (json, avro, csv).
+	// +kubebuilder:validation:Enum=json;avro;csv
+	// +optional
+	Format string `json:"format,omitempty"`
+
+	// StartOffset defines where to start consuming (earliest, latest).
+	// +kubebuilder:validation:Enum=earliest;latest
+	// +kubebuilder:default="earliest"
+	// +optional
+	StartOffset string `json:"startOffset,omitempty"`
+}
+
+// RabbitMQSourceSpec defines a RabbitMQ data source.
+type RabbitMQSourceSpec struct {
+	// Host is the RabbitMQ hostname.
+	Host string `json:"host"`
+
+	// Port is the RabbitMQ port.
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// VHost is the RabbitMQ virtual host.
+	// +optional
+	VHost string `json:"vhost,omitempty"`
+
+	// Queue is the RabbitMQ queue name.
+	Queue string `json:"queue"`
+
+	// Format is the message format (json, avro, csv).
+	// +kubebuilder:validation:Enum=json;avro;csv
+	// +optional
+	Format string `json:"format,omitempty"`
+
+	// CredentialSecret references the secret containing RabbitMQ credentials.
+	// +optional
+	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+}
+
 // CloudberryClusterStatus defines the observed state of CloudberryCluster.
 type CloudberryClusterStatus struct {
 	// Phase is the current cluster phase.
@@ -919,6 +1170,18 @@ type CloudberryClusterStatus struct {
 	// BlockedQueries is the number of currently blocked queries.
 	// +optional
 	BlockedQueries int32 `json:"blockedQueries,omitempty"`
+
+	// LastBackupTime is the timestamp of the last backup.
+	// +optional
+	LastBackupTime *metav1.Time `json:"lastBackupTime,omitempty"`
+
+	// LastBackupStatus is the status of the last backup (Success, Failed, InProgress).
+	// +optional
+	LastBackupStatus string `json:"lastBackupStatus,omitempty"`
+
+	// DataLoadingJobs is the number of active data loading jobs.
+	// +optional
+	DataLoadingJobs int32 `json:"dataLoadingJobs,omitempty"`
 
 	// ObservedGeneration is the most recent generation observed.
 	// +optional

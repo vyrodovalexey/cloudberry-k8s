@@ -586,6 +586,211 @@ spec:
                       default: false
                     slowQueryThreshold:
                       type: string
+                backup:
+                  description: Backup defines backup and restore configuration.
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    schedule:
+                      type: string
+                    retention:
+                      type: object
+                      properties:
+                        fullCount:
+                          type: integer
+                          format: int32
+                        incrementalCount:
+                          type: integer
+                          format: int32
+                        maxAge:
+                          type: string
+                    destination:
+                      type: object
+                      required:
+                        - type
+                      properties:
+                        type:
+                          type: string
+                          enum:
+                            - s3
+                            - local
+                        bucket:
+                          type: string
+                        endpoint:
+                          type: string
+                        region:
+                          type: string
+                        path:
+                          type: string
+                        credentialSecret:
+                          type: object
+                          required:
+                            - name
+                          properties:
+                            name:
+                              type: string
+                            key:
+                              type: string
+                        forcePathStyle:
+                          type: boolean
+                          default: false
+                    compression:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 9
+                    parallelism:
+                      type: integer
+                      format: int32
+                    incremental:
+                      type: boolean
+                      default: false
+                dataLoading:
+                  description: DataLoading defines data loading configuration.
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    streamingServer:
+                      type: object
+                      required:
+                        - host
+                      properties:
+                        host:
+                          type: string
+                        port:
+                          type: integer
+                          format: int32
+                        tlsMode:
+                          type: string
+                          enum:
+                            - none
+                            - tls
+                            - skip-verify
+                          default: none
+                        credentialSecret:
+                          type: object
+                          required:
+                            - name
+                          properties:
+                            name:
+                              type: string
+                            key:
+                              type: string
+                    jobs:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - name
+                          - type
+                          - targetTable
+                        properties:
+                          name:
+                            type: string
+                          type:
+                            type: string
+                            enum:
+                              - s3
+                              - kafka
+                              - rabbitmq
+                          enabled:
+                            type: boolean
+                            default: false
+                          schedule:
+                            type: string
+                          targetTable:
+                            type: string
+                          s3Source:
+                            type: object
+                            required:
+                              - bucket
+                            properties:
+                              bucket:
+                                type: string
+                              path:
+                                type: string
+                              endpoint:
+                                type: string
+                              region:
+                                type: string
+                              format:
+                                type: string
+                                enum:
+                                  - csv
+                                  - json
+                                  - avro
+                              credentialSecret:
+                                type: object
+                                required:
+                                  - name
+                                properties:
+                                  name:
+                                    type: string
+                                  key:
+                                    type: string
+                              forcePathStyle:
+                                type: boolean
+                                default: false
+                          kafkaSource:
+                            type: object
+                            required:
+                              - brokers
+                              - topic
+                            properties:
+                              brokers:
+                                type: array
+                                items:
+                                  type: string
+                              topic:
+                                type: string
+                              groupId:
+                                type: string
+                              format:
+                                type: string
+                                enum:
+                                  - json
+                                  - avro
+                                  - csv
+                              startOffset:
+                                type: string
+                                enum:
+                                  - earliest
+                                  - latest
+                                default: earliest
+                          rabbitMQSource:
+                            type: object
+                            required:
+                              - host
+                              - queue
+                            properties:
+                              host:
+                                type: string
+                              port:
+                                type: integer
+                                format: int32
+                              vhost:
+                                type: string
+                              queue:
+                                type: string
+                              format:
+                                type: string
+                                enum:
+                                  - json
+                                  - avro
+                                  - csv
+                              credentialSecret:
+                                type: object
+                                required:
+                                  - name
+                                properties:
+                                  name:
+                                    type: string
+                                  key:
+                                    type: string
                 deletionPolicy:
                   description: DeletionPolicy defines the PV reclaim policy on cluster deletion.
                   type: string
@@ -629,6 +834,14 @@ spec:
                   type: integer
                   format: int32
                 blockedQueries:
+                  type: integer
+                  format: int32
+                lastBackupTime:
+                  type: string
+                  format: date-time
+                lastBackupStatus:
+                  type: string
+                dataLoadingJobs:
                   type: integer
                   format: int32
                 observedGeneration:

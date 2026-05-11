@@ -364,6 +364,50 @@ func (m *MockDBClient) ListResourceGroups(ctx context.Context) ([]db.ResourceGro
 	}, nil
 }
 
+// CreateBackup implements db.Client.
+func (m *MockDBClient) CreateBackup(_ context.Context, opts db.BackupOptions) (*db.BackupInfo, error) {
+	return &db.BackupInfo{
+		ID:     "backup-test-1",
+		Type:   opts.Type,
+		Status: "InProgress",
+	}, nil
+}
+
+// RestoreBackup implements db.Client.
+func (m *MockDBClient) RestoreBackup(_ context.Context, _ db.RestoreOptions) error {
+	return nil
+}
+
+// ListBackups implements db.Client.
+func (m *MockDBClient) ListBackups(_ context.Context) ([]db.BackupInfo, error) {
+	return []db.BackupInfo{}, nil
+}
+
+// DeleteBackup implements db.Client.
+func (m *MockDBClient) DeleteBackup(_ context.Context, _ string) error {
+	return nil
+}
+
+// CreateDataLoadingJob implements db.Client.
+func (m *MockDBClient) CreateDataLoadingJob(_ context.Context, _ db.DataLoadingJobConfig) error {
+	return nil
+}
+
+// StartDataLoadingJob implements db.Client.
+func (m *MockDBClient) StartDataLoadingJob(_ context.Context, _ string) error {
+	return nil
+}
+
+// StopDataLoadingJob implements db.Client.
+func (m *MockDBClient) StopDataLoadingJob(_ context.Context, _ string) error {
+	return nil
+}
+
+// ListDataLoadingJobs implements db.Client.
+func (m *MockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJobStatus, error) {
+	return []db.DataLoadingJobStatus{}, nil
+}
+
 // MockDBClientFactory implements controller.DBClientFactory for testing.
 type MockDBClientFactory struct {
 	Client *MockDBClient

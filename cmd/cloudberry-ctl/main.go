@@ -33,6 +33,8 @@ const (
 	cmdCreate = "create"
 	cmdUpdate = "update"
 	cmdDelete = "delete"
+	cmdStart  = "start"
+	cmdStop   = "stop"
 )
 
 // globalFlags holds the global CLI flags.
@@ -103,6 +105,8 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newResourceGroupCmd(),
 		newWorkloadCmd(),
 		newQueryCmd(),
+		newBackupCmd(),
+		newDataLoadingCmd(),
 		newCompletionCmd(),
 	)
 
@@ -202,7 +206,7 @@ func newClusterCmd() *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:   "start",
+			Use:   cmdStart,
 			Short: "Start cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Starting cluster...")
@@ -210,7 +214,7 @@ func newClusterCmd() *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:   "stop",
+			Use:   cmdStop,
 			Short: "Stop cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Stopping cluster...")
@@ -445,7 +449,7 @@ func newRecoveryCmd() *cobra.Command {
 
 	cmd.AddCommand(
 		&cobra.Command{
-			Use:   "start",
+			Use:   cmdStart,
 			Short: "Start recovery",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Starting recovery...")
@@ -924,6 +928,137 @@ func newQueryCmd() *cobra.Command {
 			Short: "Show query monitoring status",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				fmt.Fprintln(os.Stdout, "Query monitoring status...")
+				return nil
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newBackupCmd creates the backup command group.
+func newBackupCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backup",
+		Short: "Backup and restore management",
+	}
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdCreate,
+			Short: "Create a new backup",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Creating backup...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdList,
+			Short: "List available backups",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing backups...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdDelete,
+			Short: "Delete a backup",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Deleting backup...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "restore",
+			Short: "Restore from a backup",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Restoring from backup...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdStatus,
+			Short: "Show backup status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Backup status...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "schedule",
+			Short: "Manage backup schedule",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Backup schedule...")
+				return nil
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newDataLoadingCmd creates the data loading command group.
+func newDataLoadingCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "data-loading",
+		Short: "Data loading management",
+	}
+
+	jobsCmd := &cobra.Command{
+		Use:   "jobs",
+		Short: "Manage data loading jobs",
+	}
+
+	jobsCmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdList,
+			Short: "List data loading jobs",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Listing data loading jobs...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdCreate,
+			Short: "Create a data loading job",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Creating data loading job...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdStart,
+			Short: "Start a data loading job",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Starting data loading job...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdStop,
+			Short: "Stop a data loading job",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Stopping data loading job...")
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   cmdDelete,
+			Short: "Delete a data loading job",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Deleting data loading job...")
+				return nil
+			},
+		},
+	)
+
+	cmd.AddCommand(
+		jobsCmd,
+		&cobra.Command{
+			Use:   cmdStatus,
+			Short: "Show data loading status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				fmt.Fprintln(os.Stdout, "Data loading status...")
 				return nil
 			},
 		},

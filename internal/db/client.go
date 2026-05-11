@@ -65,6 +65,22 @@ type Client interface {
 	DropResourceGroup(ctx context.Context, name string) error
 	// ListResourceGroups returns all resource groups.
 	ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo, error)
+	// CreateBackup creates a new backup.
+	CreateBackup(ctx context.Context, opts BackupOptions) (*BackupInfo, error)
+	// RestoreBackup restores from a backup.
+	RestoreBackup(ctx context.Context, opts RestoreOptions) error
+	// ListBackups returns all available backups.
+	ListBackups(ctx context.Context) ([]BackupInfo, error)
+	// DeleteBackup deletes a backup by ID.
+	DeleteBackup(ctx context.Context, id string) error
+	// CreateDataLoadingJob creates a new data loading job.
+	CreateDataLoadingJob(ctx context.Context, job DataLoadingJobConfig) error
+	// StartDataLoadingJob starts a data loading job.
+	StartDataLoadingJob(ctx context.Context, name string) error
+	// StopDataLoadingJob stops a data loading job.
+	StopDataLoadingJob(ctx context.Context, name string) error
+	// ListDataLoadingJobs returns all data loading jobs.
+	ListDataLoadingJobs(ctx context.Context) ([]DataLoadingJobStatus, error)
 }
 
 // ParameterScope defines the scope for parameter changes.
@@ -164,6 +180,51 @@ type ResourceGroupInfo struct {
 	MemoryLimit   int32   `json:"memoryLimit"`
 	CPUUsage      float64 `json:"cpuUsage"`
 	MemoryUsage   float64 `json:"memoryUsage"`
+}
+
+// BackupOptions defines options for creating a backup.
+type BackupOptions struct {
+	Type        string // full, incremental
+	Compression int32
+	Parallelism int32
+	Destination string
+}
+
+// BackupInfo represents a backup record.
+type BackupInfo struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Status    string    `json:"status"`
+	StartTime time.Time `json:"startTime"`
+	EndTime   time.Time `json:"endTime"`
+	SizeBytes int64     `json:"sizeBytes"`
+	Path      string    `json:"path"`
+}
+
+// RestoreOptions defines options for restoring from a backup.
+type RestoreOptions struct {
+	BackupID       string
+	TargetDatabase string
+	Schemas        []string
+	Tables         []string
+}
+
+// DataLoadingJobConfig defines a data loading job configuration.
+type DataLoadingJobConfig struct {
+	Name        string
+	Type        string // s3, kafka, rabbitmq
+	TargetTable string
+	Schedule    string
+	Config      map[string]string
+}
+
+// DataLoadingJobStatus represents the status of a data loading job.
+type DataLoadingJobStatus struct {
+	Name       string    `json:"name"`
+	Type       string    `json:"type"`
+	Status     string    `json:"status"`
+	LastRun    time.Time `json:"lastRun"`
+	RowsLoaded int64     `json:"rowsLoaded"`
 }
 
 // Config holds database client configuration.
@@ -701,6 +762,75 @@ func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo
 	}
 
 	return groups, nil
+}
+
+// CreateBackup creates a new backup.
+func (c *pgxClient) CreateBackup(ctx context.Context, opts BackupOptions) (*BackupInfo, error) {
+	c.logger.Info("creating backup", "type", opts.Type, "destination", opts.Destination)
+
+	info := &BackupInfo{
+		ID:        fmt.Sprintf("backup-%d", time.Now().UnixNano()),
+		Type:      opts.Type,
+		Status:    "InProgress",
+		StartTime: time.Now(),
+	}
+
+	// Backup is initiated via external tooling; record the intent.
+	c.logger.Info("backup initiated", "id", info.ID, "type", info.Type)
+	return info, nil
+}
+
+// RestoreBackup restores from a backup.
+func (c *pgxClient) RestoreBackup(ctx context.Context, opts RestoreOptions) error {
+	c.logger.Info("restoring backup",
+		"backupID", opts.BackupID,
+		"targetDatabase", opts.TargetDatabase,
+		"schemas", opts.Schemas,
+		"tables", opts.Tables,
+	)
+
+	// Restore is initiated via external tooling; record the intent.
+	return nil
+}
+
+// ListBackups returns all available backups.
+func (c *pgxClient) ListBackups(_ context.Context) ([]BackupInfo, error) {
+	// Backup catalog is managed externally; return empty list as placeholder.
+	return []BackupInfo{}, nil
+}
+
+// DeleteBackup deletes a backup by ID.
+func (c *pgxClient) DeleteBackup(_ context.Context, id string) error {
+	c.logger.Info("deleting backup", "id", id)
+	// Backup deletion is managed externally; record the intent.
+	return nil
+}
+
+// CreateDataLoadingJob creates a new data loading job.
+func (c *pgxClient) CreateDataLoadingJob(_ context.Context, job DataLoadingJobConfig) error {
+	c.logger.Info("creating data loading job", "name", job.Name, "type", job.Type, "target", job.TargetTable)
+	// Data loading job creation is managed externally; record the intent.
+	return nil
+}
+
+// StartDataLoadingJob starts a data loading job.
+func (c *pgxClient) StartDataLoadingJob(_ context.Context, name string) error {
+	c.logger.Info("starting data loading job", "name", name)
+	// Data loading job start is managed externally; record the intent.
+	return nil
+}
+
+// StopDataLoadingJob stops a data loading job.
+func (c *pgxClient) StopDataLoadingJob(_ context.Context, name string) error {
+	c.logger.Info("stopping data loading job", "name", name)
+	// Data loading job stop is managed externally; record the intent.
+	return nil
+}
+
+// ListDataLoadingJobs returns all data loading jobs.
+func (c *pgxClient) ListDataLoadingJobs(_ context.Context) ([]DataLoadingJobStatus, error) {
+	// Data loading job listing is managed externally; return empty list as placeholder.
+	return []DataLoadingJobStatus{}, nil
 }
 
 // buildRoleOptions constructs the SQL options clause for role operations.

@@ -25,6 +25,7 @@ const (
 
 	responseKeyStatus = "status"
 	responseKeyTotal  = "total"
+	responseKeyJob    = "job"
 )
 
 // Server is the REST API server for the cloudberry operator.
@@ -146,6 +147,34 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetQueryMonitoring)))
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/active",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetActiveQueries)))
+
+	// Backup and restore.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListBackups)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateBackup)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/{id}",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetBackup)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/backups/{id}",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteBackup)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups/{id}/restore",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleRestoreBackup)))
+
+	// Data loading.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/jobs",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListDataLoadingJobs)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/jobs",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateDataLoadingJob)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetDataLoadingJob)))
+	s.mux.Handle("PUT "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleUpdateDataLoadingJob)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteDataLoadingJob)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}/start",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStartDataLoadingJob)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}/stop",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStopDataLoadingJob)))
 }
 
 // withAuth wraps a handler with authentication middleware.
@@ -570,6 +599,225 @@ func (s *Server) handleGetActiveQueries(w http.ResponseWriter, r *http.Request) 
 		"activeQueries":  cluster.Status.ActiveQueries,
 		"queuedQueries":  cluster.Status.QueuedQueries,
 		"blockedQueries": cluster.Status.BlockedQueries,
+	})
+}
+
+// handleListBackups lists backups for a cluster.
+func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"cluster":          cluster.Name,
+		"backups":          []interface{}{},
+		responseKeyTotal:   0,
+		"lastBackupTime":   cluster.Status.LastBackupTime,
+		"lastBackupStatus": cluster.Status.LastBackupStatus,
+	})
+}
+
+// handleCreateBackup creates a new backup for a cluster.
+func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
+			"backup is not enabled for this cluster")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus: "backup initiated",
+		"cluster":         cluster.Name,
+	})
+}
+
+// handleGetBackup gets a specific backup.
+func (s *Server) handleGetBackup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	backupID := r.PathValue("id")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeErrorJSON(w, http.StatusNotFound, "BACKUP_NOT_FOUND",
+		fmt.Sprintf("backup %q not found", backupID))
+}
+
+// handleDeleteBackup deletes a backup.
+func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	backupID := r.PathValue("id")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		responseKeyStatus: "deleted",
+		"backupID":        backupID,
+	})
+}
+
+// handleRestoreBackup restores from a backup.
+func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	backupID := r.PathValue("id")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus: "restore initiated",
+		"backupID":        backupID,
+	})
+}
+
+// handleListDataLoadingJobs lists data loading jobs for a cluster.
+func (s *Server) handleListDataLoadingJobs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var jobs []interface{}
+	if cluster.Spec.DataLoading != nil {
+		for i := range cluster.Spec.DataLoading.Jobs {
+			jobs = append(jobs, cluster.Spec.DataLoading.Jobs[i])
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"jobs":           jobs,
+		responseKeyTotal: len(jobs),
+	})
+}
+
+// handleCreateDataLoadingJob creates a new data loading job.
+func (s *Server) handleCreateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
+		writeErrorJSON(w, http.StatusBadRequest, "DATA_LOADING_NOT_ENABLED",
+			"data loading is not enabled for this cluster")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus: "job created",
+	})
+}
+
+// handleGetDataLoadingJob gets a specific data loading job.
+func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	jobName := r.PathValue("job")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if cluster.Spec.DataLoading != nil {
+		for i := range cluster.Spec.DataLoading.Jobs {
+			if cluster.Spec.DataLoading.Jobs[i].Name == jobName {
+				writeJSON(w, http.StatusOK, cluster.Spec.DataLoading.Jobs[i])
+				return
+			}
+		}
+	}
+
+	writeErrorJSON(w, http.StatusNotFound, "JOB_NOT_FOUND",
+		fmt.Sprintf("data loading job %q not found", jobName))
+}
+
+// handleUpdateDataLoadingJob updates a data loading job.
+func (s *Server) handleUpdateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	jobName := r.PathValue("job")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		responseKeyStatus: "updated",
+		responseKeyJob:    jobName,
+	})
+}
+
+// handleDeleteDataLoadingJob deletes a data loading job.
+func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	jobName := r.PathValue("job")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		responseKeyStatus: "deleted",
+		responseKeyJob:    jobName,
+	})
+}
+
+// handleStartDataLoadingJob starts a data loading job.
+func (s *Server) handleStartDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	jobName := r.PathValue("job")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus: "started",
+		responseKeyJob:    jobName,
+	})
+}
+
+// handleStopDataLoadingJob stops a data loading job.
+func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	jobName := r.PathValue("job")
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		responseKeyStatus: "stopped",
+		responseKeyJob:    jobName,
 	})
 }
 

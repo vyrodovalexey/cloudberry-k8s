@@ -390,6 +390,16 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		{"WorkloadRule", func() interface{} { var s *WorkloadRule; return s.DeepCopy() }},
 		{"IdleSessionRule", func() interface{} { var s *IdleSessionRule; return s.DeepCopy() }},
 		{"QueryMonitoringSpec", func() interface{} { var s *QueryMonitoringSpec; return s.DeepCopy() }},
+		{"BackupSpec", func() interface{} { var s *BackupSpec; return s.DeepCopy() }},
+		{"BackupRetention", func() interface{} { var s *BackupRetention; return s.DeepCopy() }},
+		{"BackupDestination", func() interface{} { var s *BackupDestination; return s.DeepCopy() }},
+		{"SecretReference", func() interface{} { var s *SecretReference; return s.DeepCopy() }},
+		{"DataLoadingSpec", func() interface{} { var s *DataLoadingSpec; return s.DeepCopy() }},
+		{"StreamingServerSpec", func() interface{} { var s *StreamingServerSpec; return s.DeepCopy() }},
+		{"DataLoadingJob", func() interface{} { var s *DataLoadingJob; return s.DeepCopy() }},
+		{"S3SourceSpec", func() interface{} { var s *S3SourceSpec; return s.DeepCopy() }},
+		{"KafkaSourceSpec", func() interface{} { var s *KafkaSourceSpec; return s.DeepCopy() }},
+		{"RabbitMQSourceSpec", func() interface{} { var s *RabbitMQSourceSpec; return s.DeepCopy() }},
 	}
 
 	for _, tt := range nilTests {

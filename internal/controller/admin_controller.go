@@ -112,6 +112,16 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		logger.Error("failed to reconcile query monitoring", "error", err)
 	}
 
+	// Reconcile backup configuration.
+	if err := r.reconcileBackup(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile backup", "error", err)
+	}
+
+	// Reconcile data loading configuration.
+	if err := r.reconcileDataLoading(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile data loading", "error", err)
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }
 
@@ -181,6 +191,87 @@ func (r *AdminReconciler) reconcileQueryMonitoring(
 
 	r.recorder.Event(cluster, "Normal", "QueryMonitoringReconciled",
 		"Query monitoring configuration reconciled")
+
+	return nil
+}
+
+// reconcileBackup reconciles backup configuration and status.
+func (r *AdminReconciler) reconcileBackup(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("reconciling backup configuration",
+		"schedule", cluster.Spec.Backup.Schedule,
+		"incremental", cluster.Spec.Backup.Incremental,
+		"destination", cluster.Spec.Backup.Destination.Type,
+	)
+
+	// Update backup-related status conditions.
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		"BackupConfigured",
+		metav1.ConditionTrue,
+		"BackupReconciled",
+		"Backup configuration is applied",
+	)
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating backup status: %w", err)
+	}
+
+	r.recorder.Event(cluster, "Normal", "BackupReconciled",
+		fmt.Sprintf("Backup configuration reconciled: schedule=%s, destination=%s",
+			cluster.Spec.Backup.Schedule, cluster.Spec.Backup.Destination.Type))
+
+	return nil
+}
+
+// reconcileDataLoading reconciles data loading configuration and status.
+func (r *AdminReconciler) reconcileDataLoading(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	activeJobs := int32(0)
+	for _, job := range cluster.Spec.DataLoading.Jobs {
+		if job.Enabled {
+			activeJobs++
+		}
+	}
+
+	logger.Info("reconciling data loading configuration",
+		"totalJobs", len(cluster.Spec.DataLoading.Jobs),
+		"activeJobs", activeJobs,
+	)
+
+	// Update data loading status.
+	cluster.Status.DataLoadingJobs = activeJobs
+	r.metrics.SetDataLoadingJobsActive(
+		cluster.Name, cluster.Namespace, float64(activeJobs),
+	)
+
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		"DataLoadingConfigured",
+		metav1.ConditionTrue,
+		"DataLoadingReconciled",
+		"Data loading configuration is applied",
+	)
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating data loading status: %w", err)
+	}
+
+	r.recorder.Event(cluster, "Normal", "DataLoadingReconciled",
+		fmt.Sprintf("Data loading reconciled: %d jobs configured, %d active",
+			len(cluster.Spec.DataLoading.Jobs), activeJobs))
 
 	return nil
 }

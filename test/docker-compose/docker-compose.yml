@@ -1,7 +1,5 @@
-version: '3.6'
-
 # =============================================================================
-# avapigw Test Environment
+# Cloudberry Operator Test Environment
 # =============================================================================
 # Port allocation:
 #   8200       - Vault (dev mode, root token: myroot)
@@ -10,12 +8,18 @@ version: '3.6'
 #   4317/4318  - OTLP receivers
 #   8428       - VictoriaMetrics
 #   3000       - Grafana
+#   9000/9001  - MinIO (S3-compatible storage, minioadmin/minioadmin)
+#   9094       - Kafka (KRaft mode, external listener)
+#   5672/15672 - RabbitMQ (guest/guest)
 #
 # Setup order:
 #   1. docker compose up -d
 #   2. Wait for Vault and Keycloak to be ready
 #   3. Run scripts/setup-vault.sh   (configures PKI, issues certs)
 #   4. Run scripts/setup-keycloak.sh (creates realm, clients for service-to-service)
+#   5. Run scripts/setup-minio.sh    (creates test buckets)
+#   6. Run scripts/setup-kafka.sh    (creates test topics)
+#   7. Run scripts/setup-rabbitmq.sh (creates test queues)
 # =============================================================================
 
 services:
@@ -146,6 +150,76 @@ services:
       - victoriametrics
       - tempo
 
+  # ===========================================================================
+  # MinIO - S3-compatible object storage for backup testing
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ===========================================================================
+  # Kafka (KRaft mode - no ZooKeeper)
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "cloudberry-test-kafka-cluster"
+    ports:
+      - 9094:9094
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ===========================================================================
+  # RabbitMQ
+  # ===========================================================================
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - 5672:5672
+      - 15672:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
 volumes:
   postgres_data:
   vault_data:
@@ -153,3 +227,6 @@ volumes:
   grafana_data:
   tempo_data:
   mtls_certs:
+  minio_data:
+  kafka_data:
+  rabbitmq_data:

@@ -10,14 +10,17 @@ import (
 const (
 	metricsNamespace = "cloudberry"
 
-	labelCluster   = "cluster"
-	labelNamespace = "namespace"
-	labelPhase     = "phase"
-	labelVersion   = "version"
-	labelSegment   = "segment"
-	labelComponent = "component"
-	labelOperation = "operation"
-	labelResult    = "result"
+	labelCluster    = "cluster"
+	labelNamespace  = "namespace"
+	labelPhase      = "phase"
+	labelVersion    = "version"
+	labelSegment    = "segment"
+	labelComponent  = "component"
+	labelOperation  = "operation"
+	labelResult     = "result"
+	labelType       = "type"
+	labelJob        = "job"
+	labelSourceType = "source_type"
 )
 
 // Recorder defines the interface for recording metrics.
@@ -72,6 +75,18 @@ type Recorder interface {
 	RecordIdleSessionTermination(cluster, namespace, rule string)
 	// RecordSlowQuery records a slow query event.
 	RecordSlowQuery(cluster, namespace string)
+	// RecordBackup records a backup event by type and status.
+	RecordBackup(cluster, namespace, backupType, status string)
+	// ObserveBackupDuration records the duration of a backup operation.
+	ObserveBackupDuration(cluster, namespace string, duration time.Duration)
+	// SetBackupSizeBytes sets the size of the last backup.
+	SetBackupSizeBytes(cluster, namespace string, bytes float64)
+	// RecordRestore records a restore event.
+	RecordRestore(cluster, namespace, status string)
+	// SetDataLoadingJobsActive sets the number of active data loading jobs.
+	SetDataLoadingJobsActive(cluster, namespace string, count float64)
+	// RecordDataLoadingRows records the number of rows loaded by a job.
+	RecordDataLoadingRows(cluster, namespace, job, sourceType string, count float64)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -111,6 +126,13 @@ type PrometheusRecorder struct {
 	resourceGroupMemory    *prometheus.GaugeVec
 	idleSessionTermination *prometheus.CounterVec
 	slowQueries            *prometheus.CounterVec
+
+	backupTotal          *prometheus.CounterVec
+	backupDuration       *prometheus.HistogramVec
+	backupSizeBytes      *prometheus.GaugeVec
+	restoreTotal         *prometheus.CounterVec
+	dataLoadingJobsGauge *prometheus.GaugeVec
+	dataLoadingRows      *prometheus.CounterVec
 }
 
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
@@ -273,6 +295,38 @@ func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 			Name:      "slow_queries_total",
 			Help:      "Total number of slow queries detected.",
 		}, []string{labelCluster, labelNamespace}),
+
+		backupTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "backup_total",
+			Help:      "Total number of backup operations.",
+		}, []string{labelCluster, labelNamespace, labelType, labelResult}),
+		backupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "backup_duration_seconds",
+			Help:      "Duration of backup operations in seconds.",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+		}, []string{labelCluster, labelNamespace}),
+		backupSizeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "backup_size_bytes",
+			Help:      "Size of the last backup in bytes.",
+		}, []string{labelCluster, labelNamespace}),
+		restoreTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "restore_total",
+			Help:      "Total number of restore operations.",
+		}, []string{labelCluster, labelNamespace, labelResult}),
+		dataLoadingJobsGauge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "data_loading_jobs_active",
+			Help:      "Number of active data loading jobs.",
+		}, []string{labelCluster, labelNamespace}),
+		dataLoadingRows: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "data_loading_rows_total",
+			Help:      "Total number of rows loaded by data loading jobs.",
+		}, []string{labelCluster, labelNamespace, labelJob, labelSourceType}),
 	}
 
 	r.register(reg)
@@ -292,6 +346,8 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.activeQueries, r.queuedQueries, r.blockedQueries,
 		r.workloadRuleActions, r.resourceGroupCPU, r.resourceGroupMemory,
 		r.idleSessionTermination, r.slowQueries,
+		r.backupTotal, r.backupDuration, r.backupSizeBytes,
+		r.restoreTotal, r.dataLoadingJobsGauge, r.dataLoadingRows,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -432,6 +488,39 @@ func (r *PrometheusRecorder) RecordSlowQuery(cluster, namespace string) {
 	r.slowQueries.WithLabelValues(cluster, namespace).Inc()
 }
 
+// RecordBackup records a backup event by type and status.
+func (r *PrometheusRecorder) RecordBackup(cluster, namespace, backupType, status string) {
+	r.backupTotal.WithLabelValues(cluster, namespace, backupType, status).Inc()
+}
+
+// ObserveBackupDuration records the duration of a backup operation.
+func (r *PrometheusRecorder) ObserveBackupDuration(cluster, namespace string, duration time.Duration) {
+	r.backupDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// SetBackupSizeBytes sets the size of the last backup.
+func (r *PrometheusRecorder) SetBackupSizeBytes(cluster, namespace string, bytes float64) {
+	r.backupSizeBytes.WithLabelValues(cluster, namespace).Set(bytes)
+}
+
+// RecordRestore records a restore event.
+func (r *PrometheusRecorder) RecordRestore(cluster, namespace, status string) {
+	r.restoreTotal.WithLabelValues(cluster, namespace, status).Inc()
+}
+
+// SetDataLoadingJobsActive sets the number of active data loading jobs.
+func (r *PrometheusRecorder) SetDataLoadingJobsActive(cluster, namespace string, count float64) {
+	r.dataLoadingJobsGauge.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// RecordDataLoadingRows records the number of rows loaded by a job.
+func (r *PrometheusRecorder) RecordDataLoadingRows(
+	cluster, namespace, job, sourceType string,
+	count float64,
+) {
+	r.dataLoadingRows.WithLabelValues(cluster, namespace, job, sourceType).Add(count)
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -468,3 +557,9 @@ func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string)         {}
 func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64) {}
 func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string)        {}
 func (n *NoopRecorder) RecordSlowQuery(_, _ string)                        {}
+func (n *NoopRecorder) RecordBackup(_, _, _, _ string)                     {}
+func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration) {}
+func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64)          {}
+func (n *NoopRecorder) RecordRestore(_, _, _ string)                       {}
+func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)    {}
+func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64) {}

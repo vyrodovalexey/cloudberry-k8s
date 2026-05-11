@@ -78,6 +78,12 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateQueryMonitoring(cluster); err != nil {
 		return warnings, err
 	}
+	if err := validateBackup(cluster); err != nil {
+		return warnings, err
+	}
+	if err := validateDataLoading(cluster); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
 }
@@ -188,6 +194,49 @@ func validateQueryMonitoring(cluster *cbv1alpha1.CloudberryCluster) error {
 
 	if cluster.Spec.QueryMonitoring.SamplingInterval < 0 {
 		return fmt.Errorf("queryMonitoring.samplingInterval must be non-negative")
+	}
+
+	return nil
+}
+
+// validateBackup validates backup configuration.
+func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		return nil
+	}
+
+	if cluster.Spec.Backup.Destination.Type == "" {
+		return fmt.Errorf("backup.destination.type is required when backup is enabled")
+	}
+
+	if cluster.Spec.Backup.Destination.Type == "s3" && cluster.Spec.Backup.Destination.Bucket == "" {
+		return fmt.Errorf("backup.destination.bucket is required for S3 destinations")
+	}
+
+	if cluster.Spec.Backup.Compression < 0 || cluster.Spec.Backup.Compression > 9 {
+		return fmt.Errorf("backup.compression must be between 0 and 9, got %d",
+			cluster.Spec.Backup.Compression)
+	}
+
+	return nil
+}
+
+// validateDataLoading validates data loading configuration.
+func validateDataLoading(cluster *cbv1alpha1.CloudberryCluster) error {
+	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
+		return nil
+	}
+
+	for i, job := range cluster.Spec.DataLoading.Jobs {
+		if job.Name == "" {
+			return fmt.Errorf("dataLoading.jobs[%d].name is required", i)
+		}
+		if job.Type == "" {
+			return fmt.Errorf("dataLoading.jobs[%d].type is required", i)
+		}
+		if job.TargetTable == "" {
+			return fmt.Errorf("dataLoading.jobs[%d].targetTable is required", i)
+		}
 	}
 
 	return nil

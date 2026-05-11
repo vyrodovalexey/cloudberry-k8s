@@ -239,6 +239,49 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetConnectionsMax("c", "n", 0)
 	recorder.SetDiskUsageBytes("c", "n", "db", 0)
 	recorder.RecordAuthAttempt("basic", "success")
+	recorder.RecordBackup("c", "n", "full", "success")
+	recorder.ObserveBackupDuration("c", "n", time.Second)
+	recorder.SetBackupSizeBytes("c", "n", 1024)
+	recorder.RecordRestore("c", "n", "success")
+	recorder.SetDataLoadingJobsActive("c", "n", 1)
+	recorder.RecordDataLoadingRows("c", "n", "job1", "s3", 100)
+}
+
+func TestRecordBackup(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordBackup("test", "default", "full", "success")
+	recorder.RecordBackup("test", "default", "incremental", "failed")
+}
+
+func TestObserveBackupDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveBackupDuration("test", "default", 30*time.Second)
+}
+
+func TestSetBackupSizeBytes(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetBackupSizeBytes("test", "default", 1073741824)
+}
+
+func TestRecordRestore(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordRestore("test", "default", "success")
+}
+
+func TestSetDataLoadingJobsActive(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetDataLoadingJobsActive("test", "default", 3)
+}
+
+func TestRecordDataLoadingRows(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordDataLoadingRows("test", "default", "s3-loader", "s3", 1000)
 }
 
 func TestNoopRecorder_ImplementsInterface(t *testing.T) {

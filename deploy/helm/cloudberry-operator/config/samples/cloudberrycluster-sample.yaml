@@ -72,5 +72,25 @@ spec:
   queryMonitoring:
     enabled: false
 
+  backup:
+    enabled: false
+    schedule: "0 2 * * *"
+    retention:
+      fullCount: 3
+      maxAge: "30d"
+    destination:
+      type: s3
+      bucket: cloudberry-backups
+      endpoint: "http://minio:9000"
+      forcePathStyle: true
+      credentialSecret:
+        name: minio-credentials
+    compression: 6
+    parallelism: 1
+    incremental: false
+
+  dataLoading:
+    enabled: false
+
   deletionPolicy: Retain
   backupOnDelete: false

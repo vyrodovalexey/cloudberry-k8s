@@ -39,6 +39,8 @@ func setClusterDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	setMonitoringDefaults(cluster)
 	setWorkloadDefaults(cluster)
 	setQueryMonitoringDefaults(cluster)
+	setBackupDefaults(cluster)
+	setDataLoadingDefaults(cluster)
 
 	if cluster.Spec.DeletionPolicy == "" {
 		cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
@@ -194,5 +196,43 @@ func setQueryMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	}
 	if cluster.Spec.QueryMonitoring.SlowQueryThreshold == "" {
 		cluster.Spec.QueryMonitoring.SlowQueryThreshold = "1000ms"
+	}
+}
+
+// setBackupDefaults sets backup defaults.
+func setBackupDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	if cluster.Spec.Backup == nil {
+		// Backup is optional; no defaults needed when not specified.
+		return
+	}
+
+	if cluster.Spec.Backup.Compression == 0 {
+		cluster.Spec.Backup.Compression = 6
+	}
+	if cluster.Spec.Backup.Parallelism == 0 {
+		cluster.Spec.Backup.Parallelism = 1
+	}
+	if cluster.Spec.Backup.Retention.FullCount == 0 {
+		cluster.Spec.Backup.Retention.FullCount = 3
+	}
+	if cluster.Spec.Backup.Retention.MaxAge == "" {
+		cluster.Spec.Backup.Retention.MaxAge = "30d"
+	}
+}
+
+// setDataLoadingDefaults sets data loading defaults.
+func setDataLoadingDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	if cluster.Spec.DataLoading == nil {
+		// Data loading is optional; no defaults needed when not specified.
+		return
+	}
+
+	if cluster.Spec.DataLoading.StreamingServer != nil {
+		if cluster.Spec.DataLoading.StreamingServer.Port == 0 {
+			cluster.Spec.DataLoading.StreamingServer.Port = 5432
+		}
+		if cluster.Spec.DataLoading.StreamingServer.TLSMode == "" {
+			cluster.Spec.DataLoading.StreamingServer.TLSMode = "none"
+		}
 	}
 }

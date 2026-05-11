@@ -83,6 +83,22 @@ func (m *mockDBClient) DropResourceGroup(_ context.Context, _ string) error { re
 func (m *mockDBClient) ListResourceGroups(_ context.Context) ([]db.ResourceGroupInfo, error) {
 	return nil, nil
 }
+func (m *mockDBClient) CreateBackup(_ context.Context, opts db.BackupOptions) (*db.BackupInfo, error) {
+	return &db.BackupInfo{ID: "test", Type: opts.Type, Status: "InProgress"}, nil
+}
+func (m *mockDBClient) RestoreBackup(_ context.Context, _ db.RestoreOptions) error { return nil }
+func (m *mockDBClient) ListBackups(_ context.Context) ([]db.BackupInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) DeleteBackup(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) CreateDataLoadingJob(_ context.Context, _ db.DataLoadingJobConfig) error {
+	return nil
+}
+func (m *mockDBClient) StartDataLoadingJob(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) StopDataLoadingJob(_ context.Context, _ string) error  { return nil }
+func (m *mockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJobStatus, error) {
+	return nil, nil
+}
 
 func TestNewHAReconciler(t *testing.T) {
 	scheme := newTestScheme()

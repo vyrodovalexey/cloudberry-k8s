@@ -34,6 +34,16 @@ const (
 	EnvSkipDockerCompose = "SKIP_DOCKER_COMPOSE"
 	// EnvTestNamespace is the environment variable for the test Kubernetes namespace.
 	EnvTestNamespace = "TEST_NAMESPACE"
+	// EnvMinIOAddr is the environment variable for the MinIO address.
+	EnvMinIOAddr = "MINIO_ADDR"
+	// EnvMinIOAccessKey is the environment variable for the MinIO access key.
+	EnvMinIOAccessKey = "MINIO_ACCESS_KEY"
+	// EnvMinIOSecretKey is the environment variable for the MinIO secret key.
+	EnvMinIOSecretKey = "MINIO_SECRET_KEY"
+	// EnvKafkaBrokers is the environment variable for the Kafka broker addresses.
+	EnvKafkaBrokers = "KAFKA_BROKERS"
+	// EnvRabbitMQAddr is the environment variable for the RabbitMQ address.
+	EnvRabbitMQAddr = "RABBITMQ_ADDR"
 
 	// DefaultVaultAddr is the default Vault address for testing.
 	DefaultVaultAddr = "http://127.0.0.1:8200"
@@ -51,6 +61,16 @@ const (
 	DefaultVictoriaMetricsAddr = "http://127.0.0.1:8428"
 	// DefaultTestNamespace is the default test namespace.
 	DefaultTestNamespace = "cloudberry-test"
+	// DefaultMinIOAddr is the default MinIO address for testing.
+	DefaultMinIOAddr = "http://127.0.0.1:9000"
+	// DefaultMinIOAccessKey is the default MinIO access key for testing.
+	DefaultMinIOAccessKey = "minioadmin"
+	// DefaultMinIOSecretKey is the default MinIO secret key for testing.
+	DefaultMinIOSecretKey = "minioadmin"
+	// DefaultKafkaBrokers is the default Kafka broker address for testing.
+	DefaultKafkaBrokers = "127.0.0.1:9094"
+	// DefaultRabbitMQAddr is the default RabbitMQ address for testing.
+	DefaultRabbitMQAddr = "amqp://guest:guest@127.0.0.1:5672/"
 )
 
 // TestEnv holds the test environment configuration.
@@ -64,6 +84,11 @@ type TestEnv struct {
 	VictoriaMetricsAddr   string
 	DockerComposeDir      string
 	TestNamespace         string
+	MinIOAddr             string
+	MinIOAccessKey        string
+	MinIOSecretKey        string
+	KafkaBrokers          string
+	RabbitMQAddr          string
 	Logger                *slog.Logger
 }
 
@@ -79,6 +104,11 @@ func NewTestEnv() *TestEnv {
 		VictoriaMetricsAddr:   getEnvOrDefault(EnvVictoriaMetricsAddr, DefaultVictoriaMetricsAddr),
 		DockerComposeDir:      getEnvOrDefault(EnvDockerComposeDir, findDockerComposeDir()),
 		TestNamespace:         getEnvOrDefault(EnvTestNamespace, DefaultTestNamespace),
+		MinIOAddr:             getEnvOrDefault(EnvMinIOAddr, DefaultMinIOAddr),
+		MinIOAccessKey:        getEnvOrDefault(EnvMinIOAccessKey, DefaultMinIOAccessKey),
+		MinIOSecretKey:        getEnvOrDefault(EnvMinIOSecretKey, DefaultMinIOSecretKey),
+		KafkaBrokers:          getEnvOrDefault(EnvKafkaBrokers, DefaultKafkaBrokers),
+		RabbitMQAddr:          getEnvOrDefault(EnvRabbitMQAddr, DefaultRabbitMQAddr),
 		Logger:                slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
 }
