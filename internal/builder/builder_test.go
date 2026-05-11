@@ -528,3 +528,179 @@ func TestBuildPVC_WithoutStorageClass(t *testing.T) {
 	pvc := buildPVC(storage, labels)
 	assert.Nil(t, pvc.Spec.StorageClassName)
 }
+
+func TestBuildCoordinatorStatefulSet_WithBackupConfig(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:     true,
+		Schedule:    "0 2 * * *",
+		Compression: 6,
+		Destination: cbv1alpha1.BackupDestination{
+			Type:   "s3",
+			Bucket: "cloudberry-backups",
+		},
+	}
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	require.NotNil(t, sts)
+
+	// Verify the StatefulSet is created with the correct name and labels.
+	assert.Equal(t, util.CoordinatorName("test-cluster"), sts.Name)
+	assert.Equal(t, util.ComponentCoordinator, sts.Labels[util.LabelComponent])
+
+	// Verify the main container exists.
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "cloudberry", sts.Spec.Template.Spec.Containers[0].Name)
+}
+
+func TestBuildCoordinatorStatefulSet_WithDataLoadingConfig(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		StreamingServer: &cbv1alpha1.StreamingServerSpec{
+			Host:    "streaming.example.com",
+			Port:    5432,
+			TLSMode: "none",
+		},
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{
+				Name:        "s3-loader",
+				Type:        "s3",
+				Enabled:     true,
+				TargetTable: "public.events",
+			},
+		},
+	}
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	require.NotNil(t, sts)
+
+	// Verify the StatefulSet is created with config volume.
+	volumes := sts.Spec.Template.Spec.Volumes
+	require.NotEmpty(t, volumes)
+
+	// Config volume should always be present.
+	configVolumeFound := false
+	for _, v := range volumes {
+		if v.Name == "config" {
+			configVolumeFound = true
+			break
+		}
+	}
+	assert.True(t, configVolumeFound, "config volume should be present")
+
+	// Verify the main container has config volume mount.
+	container := sts.Spec.Template.Spec.Containers[0]
+	configMountFound := false
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "config" {
+			configMountFound = true
+			break
+		}
+	}
+	assert.True(t, configMountFound, "config volume mount should be present")
+}
+
+func TestBuildPostgresqlConfConfigMap_WithQueryMonitoring(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+		Enabled:            true,
+		HistoryRetention:   "30d",
+		SamplingInterval:   5,
+		SlowQueryThreshold: "1000ms",
+	}
+	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
+		Parameters: map[string]string{
+			"log_min_duration_statement": "1000",
+		},
+	}
+
+	cm := b.BuildPostgresqlConfConfigMap(cluster)
+	require.NotNil(t, cm)
+
+	conf := cm.Data["postgresql.conf"]
+	assert.Contains(t, conf, "log_min_duration_statement = '1000'")
+}
+
+func TestBuildPostgresqlConfConfigMap_WithWorkloadParams(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
+		Parameters: map[string]string{
+			"gp_enable_global_deadlock_detector": "on",
+			"gp_autostats_mode":                  "on_change",
+		},
+	}
+
+	cm := b.BuildPostgresqlConfConfigMap(cluster)
+	require.NotNil(t, cm)
+
+	conf := cm.Data["postgresql.conf"]
+	assert.Contains(t, conf, "gp_autostats_mode = 'on_change'")
+	assert.Contains(t, conf, "gp_enable_global_deadlock_detector = 'on'")
+}
+
+func TestBuildSegmentPrimaryStatefulSet_WithRequiredAntiAffinity(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.AntiAffinity = cbv1alpha1.AntiAffinityRequired
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	require.NotNil(t, sts)
+
+	affinity := sts.Spec.Template.Spec.Affinity
+	require.NotNil(t, affinity)
+	require.NotNil(t, affinity.PodAntiAffinity)
+	require.Len(t, affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, 1)
+}
+
+func TestFormatHBARule_AllTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		rule     cbv1alpha1.HBARule
+		contains []string
+	}{
+		{
+			name: "local rule",
+			rule: cbv1alpha1.HBARule{
+				Type: cbv1alpha1.HBATypeLocal, Database: "all",
+				User: "gpadmin", Method: cbv1alpha1.AuthMethodTrust,
+			},
+			contains: []string{"local", "all", "gpadmin", "trust"},
+		},
+		{
+			name: "host rule with address",
+			rule: cbv1alpha1.HBARule{
+				Type: cbv1alpha1.HBATypeHost, Database: "mydb",
+				User: "appuser", Address: "10.0.0.0/8",
+				Method: cbv1alpha1.AuthMethodScramSHA256,
+			},
+			contains: []string{"host", "mydb", "appuser", "10.0.0.0/8", "scram-sha-256"},
+		},
+		{
+			name: "hostssl rule with options",
+			rule: cbv1alpha1.HBARule{
+				Type: cbv1alpha1.HBATypeHostSSL, Database: "all",
+				User: "all", Address: "0.0.0.0/0",
+				Method: cbv1alpha1.AuthMethodCert, Options: "clientcert=1",
+			},
+			contains: []string{"hostssl", "cert", "clientcert=1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := formatHBARule(tt.rule)
+			for _, s := range tt.contains {
+				assert.Contains(t, result, s)
+			}
+		})
+	}
+}

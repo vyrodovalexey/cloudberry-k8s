@@ -129,3 +129,51 @@ cloudberry-ctl workload rules export --cluster my-cluster -o rules.yaml
 | cloudberry_resource_group_cpu_usage | Gauge | CPU usage per resource group |
 | cloudberry_resource_group_memory_usage | Gauge | Memory usage per resource group |
 | cloudberry_idle_session_terminations_total | Counter | Idle session terminations |
+
+## 7. Per-Tablespace I/O Limits
+
+Resource groups support per-tablespace disk I/O limits:
+
+```yaml
+resourceGroups:
+  - name: analytics
+    ioLimits:
+      - tablespace: "*"
+        readBytesPerSec: 104857600
+        writeBytesPerSec: 52428800
+        readIOPS: 1000
+        writeIOPS: 500
+```
+
+Applied via `ALTER RESOURCE GROUP ... SET io_limit ...`.
+
+## 8. Query Tags
+
+Query tags enable workload routing based on user-defined session tags:
+
+```yaml
+rules:
+  - name: route-by-tag
+    queryTag: "etl-batch"
+    action: move
+    moveTarget: etl
+```
+
+Tags are set per-session via `SET gp_query_tag = 'etl-batch'`.
+
+## 9. Rule Import/Export
+
+Workload rules can be imported and exported as YAML:
+
+```bash
+cloudberry-ctl workload rules export --cluster my-cluster -o rules.yaml
+cloudberry-ctl workload rules import --cluster my-cluster -f rules.yaml
+```
+
+The operator reconciles imported rules the same way as CRD-defined rules.
+
+## 10. Rule Ordering
+
+Rules are evaluated in priority order (lowest number first). The `priority` field
+on each rule controls evaluation order. Rules with the same priority are evaluated
+in the order they appear in the CRD spec.

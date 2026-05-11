@@ -109,3 +109,41 @@ cloudberry-ctl backup schedule
 - `parallelism`: 1
 - `retention.fullCount`: 3
 - `retention.maxAge`: "30d"
+
+## Non-Parallel Backup
+
+For small databases or schema-only exports, the operator supports non-parallel
+logical backup via `pg_dump`:
+
+```bash
+cloudberry-ctl backup create --type non-parallel --format custom --compression 6
+cloudberry-ctl backup create --type non-parallel --format plain --schema-only
+```
+
+Supported formats: `plain`, `custom`, `directory`, `tar`.
+
+## Cross-Cluster Migration
+
+The operator supports parallel database migration between clusters:
+
+```bash
+cloudberry-ctl migrate --source-cluster src --target-cluster dst \
+  --database mydb --tables "public.users,public.orders" --truncate
+```
+
+Post-migration validation includes row-count and checksum verification.
+
+## Pre-Backup Health Checks
+
+Before running a backup, the operator verifies:
+- Destination disk space is sufficient
+- Cluster is healthy (all segments up)
+- No long-running transactions that could block backup
+
+## Post-Restore Validation
+
+After restoring, the operator:
+- Verifies row counts against backup metadata
+- Refreshes planner statistics (`ANALYZE`)
+- Scans for invalid objects
+- Confirms application connectivity

@@ -105,3 +105,29 @@ cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt
 | cloudberry_queries_queued | Gauge | Currently queued queries |
 | cloudberry_queries_blocked | Gauge | Currently blocked queries |
 | cloudberry_queries_slow_total | Counter | Slow queries exceeding threshold |
+
+## 7. Session Management
+
+### 7.1 Active Sessions
+
+The operator exposes session listing and management:
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| GET | /clusters/{name}/sessions | Operator Basic | List active sessions |
+| POST | /clusters/{name}/sessions/{pid}/cancel | Operator | Cancel session query |
+| POST | /clusters/{name}/sessions/{pid}/terminate | Operator | Terminate session |
+
+### 7.2 CSV Export
+
+Query monitor and history results can be exported to CSV:
+
+```bash
+cloudberry-ctl queries export --cluster my-cluster --format csv -o queries.csv
+cloudberry-ctl queries history --cluster my-cluster --last 24h --export csv
+```
+
+### 7.3 Pause/Resume Monitor
+
+The query monitor supports pause/resume to snapshot a moment in time.
+While paused, a "stale data" indicator is shown and no new data is fetched.

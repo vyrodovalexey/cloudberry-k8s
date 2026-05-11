@@ -56,3 +56,18 @@ autostop:
 console:
   enabled: true
   short_only: false
+
+# =============================================================================
+# SQL Benchmark Configuration
+# =============================================================================
+# When running with --sql-bench, the following SQL files are executed
+# against the target database in order:
+#
+# sql_benchmark:
+#   setup:
+#     - sql/create-tables.sql
+#     - sql/load-data.sql
+#   queries:
+#     - sql/select-queries.sql
+#     - sql/join-queries.sql
+#     - sql/update-queries.sql

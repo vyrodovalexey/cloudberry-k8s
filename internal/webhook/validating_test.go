@@ -313,6 +313,544 @@ func TestValidateSegments_SpreadWarning(t *testing.T) {
 	assert.Contains(t, warnings[0], "spread mirroring")
 }
 
+func TestValidateBackup(t *testing.T) {
+	tests := []struct {
+		name        string
+		cluster     *cbv1alpha1.CloudberryCluster
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:      "backup disabled",
+			cluster:   newValidCluster(),
+			expectErr: false,
+		},
+		{
+			name: "backup enabled with valid s3 destination",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled:     true,
+					Compression: 6,
+					Destination: cbv1alpha1.BackupDestination{
+						Type:   "s3",
+						Bucket: "my-bucket",
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "backup enabled missing destination type",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled: true,
+					Destination: cbv1alpha1.BackupDestination{
+						Type: "",
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "backup.destination.type",
+		},
+		{
+			name: "backup s3 missing bucket",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled:     true,
+					Compression: 6,
+					Destination: cbv1alpha1.BackupDestination{
+						Type: "s3",
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "backup.destination.bucket",
+		},
+		{
+			name: "backup invalid compression too high",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled:     true,
+					Compression: 10,
+					Destination: cbv1alpha1.BackupDestination{
+						Type:   "s3",
+						Bucket: "my-bucket",
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "backup.compression",
+		},
+		{
+			name: "backup invalid compression negative",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled:     true,
+					Compression: -1,
+					Destination: cbv1alpha1.BackupDestination{
+						Type:   "s3",
+						Bucket: "my-bucket",
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "backup.compression",
+		},
+		{
+			name: "backup local destination valid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Backup = &cbv1alpha1.BackupSpec{
+					Enabled: true,
+					Destination: cbv1alpha1.BackupDestination{
+						Type: "local",
+						Path: "/backups",
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateBackup(tt.cluster)
+			if tt.expectErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateDataLoading(t *testing.T) {
+	tests := []struct {
+		name        string
+		cluster     *cbv1alpha1.CloudberryCluster
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:      "data loading disabled",
+			cluster:   newValidCluster(),
+			expectErr: false,
+		},
+		{
+			name: "data loading enabled with valid s3 job",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name:        "test-job",
+							Type:        "s3",
+							TargetTable: "public.data",
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "data loading job missing name",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Type:        "s3",
+							TargetTable: "public.data",
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "dataLoading.jobs[0].name",
+		},
+		{
+			name: "data loading job missing type",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name:        "test-job",
+							TargetTable: "public.data",
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "dataLoading.jobs[0].type",
+		},
+		{
+			name: "data loading job missing target table",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name: "test-job",
+							Type: "kafka",
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "dataLoading.jobs[0].targetTable",
+		},
+		{
+			name: "data loading kafka job valid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name:        "kafka-job",
+							Type:        "kafka",
+							TargetTable: "public.stream",
+							KafkaSource: &cbv1alpha1.KafkaSourceSpec{
+								Brokers: []string{"kafka:9092"},
+								Topic:   "test-topic",
+							},
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "data loading rabbitmq job valid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name:        "rmq-job",
+							Type:        "rabbitmq",
+							TargetTable: "public.queue_data",
+							RabbitMQSource: &cbv1alpha1.RabbitMQSourceSpec{
+								Host:  "rabbitmq",
+								Queue: "data-queue",
+							},
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "data loading multiple jobs with one invalid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+					Enabled: true,
+					Jobs: []cbv1alpha1.DataLoadingJob{
+						{
+							Name:        "valid-job",
+							Type:        "s3",
+							TargetTable: "public.data",
+						},
+						{
+							Name: "invalid-job",
+							Type: "kafka",
+							// missing TargetTable
+						},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "dataLoading.jobs[1].targetTable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDataLoading(tt.cluster)
+			if tt.expectErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateWorkload(t *testing.T) {
+	tests := []struct {
+		name        string
+		cluster     *cbv1alpha1.CloudberryCluster
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:      "workload disabled",
+			cluster:   newValidCluster(),
+			expectErr: false,
+		},
+		{
+			name: "workload enabled with valid config",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+						{Name: "analytics", Concurrency: 10},
+					},
+					Rules: []cbv1alpha1.WorkloadRule{
+						{Name: "cancel-long", Action: "cancel"},
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "workload resource group missing name",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+						{Concurrency: 10},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.resourceGroups[0].name",
+		},
+		{
+			name: "workload rule missing name",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					Rules: []cbv1alpha1.WorkloadRule{
+						{Action: "cancel"},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.rules[0].name",
+		},
+		{
+			name: "workload rule missing action",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					Rules: []cbv1alpha1.WorkloadRule{
+						{Name: "my-rule"},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.rules[0].action",
+		},
+		{
+			name: "workload idle rule missing resource group",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					IdleRules: []cbv1alpha1.IdleSessionRule{
+						{Name: "idle-rule", IdleTimeout: "30m"},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.idleRules[0].resourceGroup",
+		},
+		{
+			name: "workload idle rule missing timeout",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					IdleRules: []cbv1alpha1.IdleSessionRule{
+						{Name: "idle-rule", ResourceGroup: "analytics"},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.idleRules[0].idleTimeout",
+		},
+		{
+			name: "workload idle rule missing name",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					IdleRules: []cbv1alpha1.IdleSessionRule{
+						{ResourceGroup: "analytics", IdleTimeout: "30m"},
+					},
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "workload.idleRules[0].name",
+		},
+		{
+			name: "workload all rule actions valid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+					Enabled: true,
+					Rules: []cbv1alpha1.WorkloadRule{
+						{Name: "cancel-rule", Action: "cancel"},
+						{Name: "move-rule", Action: "move", MoveTarget: "etl"},
+						{Name: "log-rule", Action: "log"},
+					},
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWorkload(tt.cluster)
+			if tt.expectErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateQueryMonitoring(t *testing.T) {
+	tests := []struct {
+		name        string
+		cluster     *cbv1alpha1.CloudberryCluster
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:      "query monitoring disabled",
+			cluster:   newValidCluster(),
+			expectErr: false,
+		},
+		{
+			name: "query monitoring enabled with valid config",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+					Enabled:            true,
+					HistoryRetention:   "30d",
+					SamplingInterval:   5,
+					SlowQueryThreshold: "1000ms",
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "query monitoring negative sampling interval",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+					Enabled:          true,
+					SamplingInterval: -1,
+				}
+				return c
+			}(),
+			expectErr:   true,
+			errContains: "samplingInterval",
+		},
+		{
+			name: "query monitoring with guest access enabled",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+					Enabled:     true,
+					GuestAccess: true,
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "query monitoring with plan collection enabled",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+					Enabled:        true,
+					PlanCollection: true,
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "query monitoring zero sampling interval is valid",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+					Enabled:          true,
+					SamplingInterval: 0,
+				}
+				return c
+			}(),
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateQueryMonitoring(tt.cluster)
+			if tt.expectErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValidateStorage(t *testing.T) {
 	tests := []struct {
 		name        string

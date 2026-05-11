@@ -125,3 +125,44 @@ cloudberry-ctl data-loading status
 
 - `streamingServer.port`: 5432
 - `streamingServer.tlsMode`: "none"
+
+## YAML Upload
+
+Jobs can be created by uploading a streaming-server YAML configuration file:
+
+```bash
+cloudberry-ctl data-loading jobs create --from-yaml job-config.yaml
+```
+
+The YAML is validated and converted to the CRD job format.
+
+## Parallel File Server Loading
+
+External tables backed by a parallel file-distribution server load data into all
+segments simultaneously. Each segment reads its share of the data over the network,
+scaling load throughput linearly with segment count.
+
+Capabilities:
+- Readable and writable external tables targeting the parallel file server
+- Per-row error tolerance with configurable reject threshold
+- Multiple file-server instances per host for bandwidth saturation
+
+## Change Data Capture (CDC) Streaming
+
+Kafka and RabbitMQ sources support continuous CDC streaming with:
+- At-least-once delivery semantics
+- Configurable batch size and flush interval
+- Per-job alerting on lag or errors
+
+## Job Scheduling and Chaining
+
+Jobs support cron-style scheduling and follow-up actions:
+
+```yaml
+jobs:
+  - name: hourly-load
+    schedule: "0 * * * *"
+    postActions:
+      - analyze
+      - notify
+```

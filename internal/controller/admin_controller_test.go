@@ -204,6 +204,275 @@ func TestAdminReconciler_ReconcileConfig_NilConfig(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestAdminReconciler_ReconcileBackup_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileBackup(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ReconcileBackup_Enabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:  true,
+		Schedule: "0 2 * * *",
+		Destination: cbv1alpha1.BackupDestination{
+			Type:   "s3",
+			Bucket: "my-bucket",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileBackup(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Verify condition was set.
+	found := false
+	for _, c := range cluster.Status.Conditions {
+		if c.Type == "BackupConfigured" {
+			found = true
+			assert.Equal(t, "True", string(c.Status))
+			break
+		}
+	}
+	assert.True(t, found, "BackupConfigured condition should be set")
+}
+
+func TestAdminReconciler_ReconcileDataLoading_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ReconcileDataLoading_Enabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{Name: "job1", Type: "s3", Enabled: true, TargetTable: "public.data"},
+			{Name: "job2", Type: "kafka", Enabled: false, TargetTable: "public.stream"},
+			{Name: "job3", Type: "rabbitmq", Enabled: true, TargetTable: "public.queue"},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(2), cluster.Status.DataLoadingJobs)
+}
+
+func TestAdminReconciler_ReconcileWorkload_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileWorkload(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ReconcileWorkload_Enabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+			{Name: "analytics", Concurrency: 10, CPUMaxPercent: 50},
+			{Name: "etl", Concurrency: 5, CPUMaxPercent: 30},
+		},
+		Rules: []cbv1alpha1.WorkloadRule{
+			{Name: "cancel-long", Action: "cancel", ThresholdType: "running_time", Threshold: "3600"},
+		},
+		IdleRules: []cbv1alpha1.IdleSessionRule{
+			{Name: "idle-analytics", ResourceGroup: "analytics", IdleTimeout: "30m"},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileWorkload(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Verify condition was set.
+	found := false
+	for _, c := range cluster.Status.Conditions {
+		if c.Type == "WorkloadConfigured" {
+			found = true
+			assert.Equal(t, "True", string(c.Status))
+			break
+		}
+	}
+	assert.True(t, found, "WorkloadConfigured condition should be set")
+}
+
+func TestAdminReconciler_ReconcileQueryMonitoring_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileQueryMonitoring(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ReconcileQueryMonitoring_Enabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ActiveQueries = 5
+	cluster.Status.QueuedQueries = 2
+	cluster.Status.BlockedQueries = 1
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+		Enabled:            true,
+		HistoryRetention:   "30d",
+		SamplingInterval:   5,
+		SlowQueryThreshold: "1000ms",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileQueryMonitoring(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_Reconcile_WithAllFeatures(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+			{Name: "default", Concurrency: 20},
+		},
+	}
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+		Enabled:          true,
+		HistoryRetention: "30d",
+	}
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled: true,
+		Destination: cbv1alpha1.BackupDestination{
+			Type:   "s3",
+			Bucket: "backups",
+		},
+	}
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{Name: "loader", Type: "s3", Enabled: true, TargetTable: "public.data"},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
 func TestAdminReconciler_HandleMaintenance(t *testing.T) {
 	tests := []struct {
 		name        string

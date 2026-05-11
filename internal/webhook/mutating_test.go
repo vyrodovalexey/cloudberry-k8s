@@ -296,3 +296,194 @@ func TestSetClusterDefaults_ExistingDeletionPolicy(t *testing.T) {
 	setClusterDefaults(cluster)
 	assert.Equal(t, cbv1alpha1.DeletionPolicyDelete, cluster.Spec.DeletionPolicy)
 }
+
+func TestSetBackupDefaults(t *testing.T) {
+	t.Run("nil backup does nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		setBackupDefaults(cluster)
+		assert.Nil(t, cluster.Spec.Backup)
+	})
+
+	t.Run("backup gets defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+			Enabled: true,
+			Destination: cbv1alpha1.BackupDestination{
+				Type:   "s3",
+				Bucket: "my-bucket",
+			},
+		}
+		setBackupDefaults(cluster)
+
+		assert.Equal(t, int32(6), cluster.Spec.Backup.Compression)
+		assert.Equal(t, int32(1), cluster.Spec.Backup.Parallelism)
+		assert.Equal(t, int32(3), cluster.Spec.Backup.Retention.FullCount)
+		assert.Equal(t, "30d", cluster.Spec.Backup.Retention.MaxAge)
+	})
+
+	t.Run("existing backup values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+			Enabled:     true,
+			Compression: 9,
+			Parallelism: 4,
+			Retention: cbv1alpha1.BackupRetention{
+				FullCount: 5,
+				MaxAge:    "90d",
+			},
+			Destination: cbv1alpha1.BackupDestination{
+				Type:   "s3",
+				Bucket: "my-bucket",
+			},
+		}
+		setBackupDefaults(cluster)
+
+		assert.Equal(t, int32(9), cluster.Spec.Backup.Compression)
+		assert.Equal(t, int32(4), cluster.Spec.Backup.Parallelism)
+		assert.Equal(t, int32(5), cluster.Spec.Backup.Retention.FullCount)
+		assert.Equal(t, "90d", cluster.Spec.Backup.Retention.MaxAge)
+	})
+}
+
+func TestSetDataLoadingDefaults(t *testing.T) {
+	t.Run("nil data loading does nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		setDataLoadingDefaults(cluster)
+		assert.Nil(t, cluster.Spec.DataLoading)
+	})
+
+	t.Run("streaming server gets defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			StreamingServer: &cbv1alpha1.StreamingServerSpec{
+				Host: "streaming.example.com",
+			},
+		}
+		setDataLoadingDefaults(cluster)
+
+		assert.Equal(t, int32(5432), cluster.Spec.DataLoading.StreamingServer.Port)
+		assert.Equal(t, "none", cluster.Spec.DataLoading.StreamingServer.TLSMode)
+	})
+
+	t.Run("existing streaming server values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			StreamingServer: &cbv1alpha1.StreamingServerSpec{
+				Host:    "streaming.example.com",
+				Port:    5433,
+				TLSMode: "tls",
+			},
+		}
+		setDataLoadingDefaults(cluster)
+
+		assert.Equal(t, int32(5433), cluster.Spec.DataLoading.StreamingServer.Port)
+		assert.Equal(t, "tls", cluster.Spec.DataLoading.StreamingServer.TLSMode)
+	})
+
+	t.Run("data loading without streaming server", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+		}
+		setDataLoadingDefaults(cluster)
+		assert.Nil(t, cluster.Spec.DataLoading.StreamingServer)
+	})
+}
+
+func TestSetWorkloadDefaults(t *testing.T) {
+	t.Run("nil workload does nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		setWorkloadDefaults(cluster)
+		assert.Nil(t, cluster.Spec.Workload)
+	})
+
+	t.Run("resource groups get defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Enabled: true,
+			ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+				{Name: "analytics"},
+			},
+		}
+		setWorkloadDefaults(cluster)
+
+		rg := cluster.Spec.Workload.ResourceGroups[0]
+		assert.Equal(t, int32(20), rg.Concurrency)
+		assert.Equal(t, int32(100), rg.CPUMaxPercent)
+		assert.Equal(t, int32(100), rg.CPUWeight)
+	})
+
+	t.Run("existing resource group values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Enabled: true,
+			ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+				{
+					Name:          "analytics",
+					Concurrency:   10,
+					CPUMaxPercent: 50,
+					CPUWeight:     75,
+				},
+			},
+		}
+		setWorkloadDefaults(cluster)
+
+		rg := cluster.Spec.Workload.ResourceGroups[0]
+		assert.Equal(t, int32(10), rg.Concurrency)
+		assert.Equal(t, int32(50), rg.CPUMaxPercent)
+		assert.Equal(t, int32(75), rg.CPUWeight)
+	})
+
+	t.Run("multiple resource groups get defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Enabled: true,
+			ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+				{Name: "analytics"},
+				{Name: "etl", Concurrency: 5},
+			},
+		}
+		setWorkloadDefaults(cluster)
+
+		assert.Equal(t, int32(20), cluster.Spec.Workload.ResourceGroups[0].Concurrency)
+		assert.Equal(t, int32(5), cluster.Spec.Workload.ResourceGroups[1].Concurrency)
+		assert.Equal(t, int32(100), cluster.Spec.Workload.ResourceGroups[1].CPUMaxPercent)
+	})
+}
+
+func TestSetQueryMonitoringDefaults(t *testing.T) {
+	t.Run("nil query monitoring does nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		setQueryMonitoringDefaults(cluster)
+		assert.Nil(t, cluster.Spec.QueryMonitoring)
+	})
+
+	t.Run("query monitoring gets defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled: true,
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		assert.Equal(t, "30d", cluster.Spec.QueryMonitoring.HistoryRetention)
+		assert.Equal(t, int32(15), cluster.Spec.QueryMonitoring.SamplingInterval)
+		assert.Equal(t, "1000ms", cluster.Spec.QueryMonitoring.SlowQueryThreshold)
+	})
+
+	t.Run("existing query monitoring values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled:            true,
+			HistoryRetention:   "90d",
+			SamplingInterval:   5,
+			SlowQueryThreshold: "500ms",
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		assert.Equal(t, "90d", cluster.Spec.QueryMonitoring.HistoryRetention)
+		assert.Equal(t, int32(5), cluster.Spec.QueryMonitoring.SamplingInterval)
+		assert.Equal(t, "500ms", cluster.Spec.QueryMonitoring.SlowQueryThreshold)
+	})
+}

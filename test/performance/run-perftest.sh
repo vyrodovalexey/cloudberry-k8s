@@ -17,6 +17,12 @@
 #   --ammo <file>        Override ammo file path
 #   --docker             Run via Docker (default)
 #   --native             Run via native yandex-tank installation
+#   --generate-data      Generate the 100MB test dataset before running
+#   --sql-bench          Run SQL benchmark queries against a target database
+#   --db-host <host>     Database host for SQL benchmark (default: localhost)
+#   --db-port <port>     Database port for SQL benchmark (default: 5432)
+#   --db-name <name>     Database name for SQL benchmark (default: postgres)
+#   --db-user <user>     Database user for SQL benchmark (default: gpadmin)
 #   --analyze-only       Only analyze existing results (skip test execution)
 #   --dry-run            Validate configuration without running the test
 #   --help               Show this help message
@@ -42,6 +48,12 @@ RPS_OVERRIDE=""
 DURATION_OVERRIDE=""
 AMMO_OVERRIDE=""
 USE_DOCKER=true
+GENERATE_DATA=false
+SQL_BENCH=false
+DB_HOST="localhost"
+DB_PORT="5432"
+DB_NAME="postgres"
+DB_USER="gpadmin"
 ANALYZE_ONLY=false
 DRY_RUN=false
 RESULTS_DIR="${SCRIPT_DIR}/.yandextank"
@@ -115,6 +127,30 @@ parse_args() {
                 ;;
             --ammo)
                 AMMO_OVERRIDE="$2"
+                shift 2
+                ;;
+            --generate-data)
+                GENERATE_DATA=true
+                shift
+                ;;
+            --sql-bench)
+                SQL_BENCH=true
+                shift
+                ;;
+            --db-host)
+                DB_HOST="$2"
+                shift 2
+                ;;
+            --db-port)
+                DB_PORT="$2"
+                shift 2
+                ;;
+            --db-name)
+                DB_NAME="$2"
+                shift 2
+                ;;
+            --db-user)
+                DB_USER="$2"
                 shift 2
                 ;;
             --docker)
@@ -850,6 +886,59 @@ generate_status_chart() {
     echo ""
 }
 
+# Generate test dataset
+generate_data() {
+    log_header "Generating Test Dataset"
+
+    local gen_script="${SCRIPT_DIR}/generate-dataset.sh"
+    if [[ ! -x "$gen_script" ]]; then
+        log_error "generate-dataset.sh not found or not executable"
+        exit 1
+    fi
+
+    "$gen_script" --output-dir "${SCRIPT_DIR}/data"
+    log_success "Dataset generation complete"
+}
+
+# Run SQL benchmark queries
+run_sql_bench() {
+    log_header "Running SQL Benchmark"
+
+    if ! command -v psql &>/dev/null; then
+        log_error "psql is not installed. Install PostgreSQL client tools."
+        exit 1
+    fi
+
+    local psql_cmd="psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME}"
+    local sql_dir="${SCRIPT_DIR}/sql"
+
+    log_info "Target: ${DB_HOST}:${DB_PORT}/${DB_NAME} (user: ${DB_USER})"
+
+    # Setup: create tables and load data
+    log_info "Creating tables..."
+    ${psql_cmd} -f "${sql_dir}/create-tables.sql" 2>&1 || {
+        log_error "Failed to create tables"
+        return 1
+    }
+
+    log_info "Loading data..."
+    ${psql_cmd} -f "${sql_dir}/load-data.sql" 2>&1 || {
+        log_error "Failed to load data"
+        return 1
+    }
+
+    # Run benchmark queries
+    local sql_files=("select-queries.sql" "join-queries.sql" "update-queries.sql")
+    for sql_file in "${sql_files[@]}"; do
+        log_info "Running ${sql_file}..."
+        ${psql_cmd} -f "${sql_dir}/${sql_file}" 2>&1 || {
+            log_warn "Some queries in ${sql_file} may have failed"
+        }
+    done
+
+    log_success "SQL benchmark complete"
+}
+
 # Cleanup function
 cleanup() {
     log_info "Cleaning up..."
@@ -871,6 +960,24 @@ main() {
 
     # Create results directory
     mkdir -p "${TEST_RUN_DIR}"
+
+    # Handle --generate-data flag
+    if [[ "$GENERATE_DATA" == "true" ]]; then
+        generate_data
+        if [[ "$SQL_BENCH" != "true" && "$ANALYZE_ONLY" != "true" ]]; then
+            # If only generating data, exit after generation
+            if [[ "$SCENARIO" == "smoke" && "$RPS_OVERRIDE" == "" ]]; then
+                log_success "Dataset generated. Use --sql-bench to run SQL benchmarks."
+                exit 0
+            fi
+        fi
+    fi
+
+    # Handle --sql-bench flag
+    if [[ "$SQL_BENCH" == "true" ]]; then
+        run_sql_bench
+        exit 0
+    fi
 
     if [[ "$ANALYZE_ONLY" == "true" ]]; then
         analyze_results
