@@ -374,11 +374,21 @@ verify_setup() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    if [ "${1:-}" = "--verify" ]; then
-        wait_for_vault
-        verify_setup
-        exit $?
-    fi
+    local ci_mode=false
+
+    # Parse arguments
+    for arg in "$@"; do
+        case "$arg" in
+            --verify)
+                wait_for_vault
+                verify_setup
+                exit $?
+                ;;
+            --ci)
+                ci_mode=true
+                ;;
+        esac
+    done
 
     wait_for_vault
 
@@ -391,8 +401,12 @@ main() {
     cert_dir=$(mktemp -d)
     issue_certificates "${cert_dir}"
 
-    # Copy to Docker volume
-    copy_certs_to_volume "${cert_dir}"
+    if [ "$ci_mode" = false ]; then
+        # Copy to Docker volume (only in docker-compose mode, not CI)
+        copy_certs_to_volume "${cert_dir}"
+    else
+        log_info "CI mode: skipping Docker volume copy"
+    fi
 
     # Also keep a local copy for host-side tests
     local local_cert_dir
@@ -412,14 +426,16 @@ main() {
 
     log_info ""
     log_info "=== Vault setup complete ==="
-    log_info "Next steps:"
-    log_info "  1. Restart mTLS backends to pick up certificates:"
-    log_info "     docker compose restart rest_api_4 grpc_3"
-    log_info "  2. Test mTLS connection:"
-    log_info "     curl --cacert ${local_cert_dir}/ca.crt \\"
-    log_info "          --cert ${local_cert_dir}/client.crt \\"
-    log_info "          --key ${local_cert_dir}/client.key \\"
-    log_info "          https://127.0.0.1:8804/health"
+    if [ "$ci_mode" = false ]; then
+        log_info "Next steps:"
+        log_info "  1. Restart mTLS backends to pick up certificates:"
+        log_info "     docker compose restart rest_api_4 grpc_3"
+        log_info "  2. Test mTLS connection:"
+        log_info "     curl --cacert ${local_cert_dir}/ca.crt \\"
+        log_info "          --cert ${local_cert_dir}/client.crt \\"
+        log_info "          --key ${local_cert_dir}/client.key \\"
+        log_info "          https://127.0.0.1:8804/health"
+    fi
 }
 
 main "$@"

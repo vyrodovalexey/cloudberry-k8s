@@ -25,7 +25,7 @@ env:
 
 jobs:
   # ===========================================================================
-  # Parallel Jobs: Lint, Vulnerability Check, Unit Tests, Functional Tests
+  # Parallel Jobs: Lint, Vulnerability Check, Unit Tests
   # ===========================================================================
 
   lint:
@@ -91,17 +91,8 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           mkdir -p coverage
-          go test -race -coverprofile=coverage/unit.out -covermode=atomic ./internal/... ./cmd/... ./api/...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/unit.out
-          flags: unit
-          name: unit-tests
-          fail_ci_if_error: false
-          verbose: true
+          go test -race -coverprofile=coverage/unit.out -covermode=atomic \
+            ./internal/... ./cmd/... ./api/...
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -110,6 +101,10 @@ jobs:
           path: coverage/unit.out
           retention-days: 7
 
+  # ===========================================================================
+  # Functional Tests (with Vault + Keycloak services)
+  # ===========================================================================
+
   functional-tests:
     name: Functional Tests
     runs-on: ubuntu-latest
@@ -117,7 +112,6 @@ jobs:
     permissions:
       contents: read
     services:
-      # Vault for secrets management
       vault:
         image: hashicorp/vault:1.17
         ports:
@@ -125,28 +119,40 @@ jobs:
         env:
           VAULT_DEV_ROOT_TOKEN_ID: myroot
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        options: >-
+          --health-cmd "vault status"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
 
-      # Keycloak DB
       keycloakdb:
         image: postgres:16
-        ports:
-          - 5432:5432
         env:
           POSTGRES_DB: keycloak
           POSTGRES_USER: keycloak
           POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U keycloak"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
 
       keycloak:
-        image: vyrodovalexey/keycloak-test:26.5
+        image: quay.io/keycloak/keycloak:26.5
         env:
           KC_DB: postgres
           KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
           KC_DB_USERNAME: keycloak
           KC_DB_PASSWORD: password
-          KC_HOSTNAME: 127.0.0.1
           KC_HTTP_PORT: 8090
           KC_HOSTNAME_STRICT: "false"
           KC_HOSTNAME_STRICT_HTTPS: "false"
+          KC_HTTP_ENABLED: "true"
+          KC_PROXY_HEADERS: xforwarded
+          KC_FEATURES: token-exchange,admin-fine-grained-authz
+          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
           KC_LOG_LEVEL: info
           KC_METRICS_ENABLED: "true"
           KC_HEALTH_ENABLED: "true"
@@ -170,7 +176,7 @@ jobs:
         run: |
           echo "Waiting for Vault..."
           for i in {1..30}; do
-            if curl -s http://127.0.0.1:8200/v1/sys/health | grep -q '"initialized":true'; then
+            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
               echo "Vault is ready!"
               break
             fi
@@ -180,8 +186,13 @@ jobs:
 
           echo "Waiting for Keycloak..."
           for i in {1..60}; do
-            if curl -sf http://127.0.0.1:8091/health/ready; then
+            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
               echo "Keycloak is ready!"
+              break
+            fi
+            # Fallback: try realm endpoint
+            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
+              echo "Keycloak is ready (via realm endpoint)!"
               break
             fi
             echo "Attempt $i: Waiting for Keycloak..."
@@ -192,7 +203,7 @@ jobs:
         env:
           VAULT_ADDR: http://127.0.0.1:8200
           VAULT_TOKEN: myroot
-        run: bash test/docker-compose/scripts/setup-vault.sh
+        run: bash test/docker-compose/scripts/setup-vault.sh --ci
 
       - name: Setup Keycloak for Testing
         env:
@@ -201,32 +212,277 @@ jobs:
 
       - name: Run functional tests with coverage
         env:
-          TEST_VAULT_ADDR: http://127.0.0.1:8200
-          TEST_VAULT_TOKEN: myroot
-          TEST_KEYCLOAK_ADDR: http://127.0.0.1:8090
-          TEST_KEYCLOAK_REALM: gateway-test
-          TEST_KEYCLOAK_CLIENT_ID: gateway
-          TEST_KEYCLOAK_CLIENT_SECRET: gateway-secret
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: myroot
+          KEYCLOAK_ADDR: http://127.0.0.1:8090
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
         run: |
           mkdir -p coverage
           go test -race -coverprofile=coverage/functional.out -covermode=atomic \
-            -tags=functional ./test/functional/...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/functional.out
-          flags: functional
-          name: functional-tests
-          fail_ci_if_error: false
-          verbose: true
+            -tags=functional -timeout 5m ./test/functional/...
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-functional
           path: coverage/functional.out
+          retention-days: 7
+
+  # ===========================================================================
+  # Integration Tests (with Vault + Keycloak services)
+  # ===========================================================================
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      vault:
+        image: hashicorp/vault:1.17
+        ports:
+          - 8200:8200
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: myroot
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        options: >-
+          --health-cmd "vault status"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
+
+      keycloakdb:
+        image: postgres:16
+        env:
+          POSTGRES_DB: keycloak
+          POSTGRES_USER: keycloak
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U keycloak"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+
+      keycloak:
+        image: quay.io/keycloak/keycloak:26.5
+        env:
+          KC_DB: postgres
+          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
+          KC_DB_USERNAME: keycloak
+          KC_DB_PASSWORD: password
+          KC_HTTP_PORT: 8090
+          KC_HOSTNAME_STRICT: "false"
+          KC_HOSTNAME_STRICT_HTTPS: "false"
+          KC_HTTP_ENABLED: "true"
+          KC_PROXY_HEADERS: xforwarded
+          KC_FEATURES: token-exchange,admin-fine-grained-authz
+          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
+          KC_LOG_LEVEL: info
+          KC_METRICS_ENABLED: "true"
+          KC_HEALTH_ENABLED: "true"
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+        ports:
+          - 8090:8090
+          - 8091:9000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Vault..."
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
+              echo "Vault is ready!"
+              break
+            fi
+            echo "Attempt $i: Waiting for Vault..."
+            sleep 2
+          done
+
+          echo "Waiting for Keycloak..."
+          for i in {1..60}; do
+            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
+              echo "Keycloak is ready!"
+              break
+            fi
+            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
+              echo "Keycloak is ready (via realm endpoint)!"
+              break
+            fi
+            echo "Attempt $i: Waiting for Keycloak..."
+            sleep 5
+          done
+
+      - name: Setup Vault for Testing
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: myroot
+        run: bash test/docker-compose/scripts/setup-vault.sh --ci
+
+      - name: Setup Keycloak for Testing
+        env:
+          KEYCLOAK_ADDR: http://127.0.0.1:8090
+        run: bash test/docker-compose/scripts/setup-keycloak.sh
+
+      - name: Run integration tests with coverage
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: myroot
+          KEYCLOAK_ADDR: http://127.0.0.1:8090
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+          SKIP_DOCKER_COMPOSE: "true"
+        run: |
+          mkdir -p coverage
+          go test -race -coverprofile=coverage/integration.out -covermode=atomic \
+            -tags=integration -v -timeout 10m ./test/integration/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-integration
+          path: coverage/integration.out
+          retention-days: 7
+
+  # ===========================================================================
+  # E2E Tests
+  # ===========================================================================
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      vault:
+        image: hashicorp/vault:1.17
+        ports:
+          - 8200:8200
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: myroot
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        options: >-
+          --health-cmd "vault status"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
+
+      keycloakdb:
+        image: postgres:16
+        env:
+          POSTGRES_DB: keycloak
+          POSTGRES_USER: keycloak
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U keycloak"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+
+      keycloak:
+        image: quay.io/keycloak/keycloak:26.5
+        env:
+          KC_DB: postgres
+          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
+          KC_DB_USERNAME: keycloak
+          KC_DB_PASSWORD: password
+          KC_HTTP_PORT: 8090
+          KC_HOSTNAME_STRICT: "false"
+          KC_HOSTNAME_STRICT_HTTPS: "false"
+          KC_HTTP_ENABLED: "true"
+          KC_PROXY_HEADERS: xforwarded
+          KC_FEATURES: token-exchange,admin-fine-grained-authz
+          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
+          KC_LOG_LEVEL: info
+          KC_METRICS_ENABLED: "true"
+          KC_HEALTH_ENABLED: "true"
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+        ports:
+          - 8090:8090
+          - 8091:9000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Vault..."
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
+              echo "Vault is ready!"
+              break
+            fi
+            echo "Attempt $i: Waiting for Vault..."
+            sleep 2
+          done
+
+          echo "Waiting for Keycloak..."
+          for i in {1..60}; do
+            if curl -sf http://127.0.0.1:8091/health/ready > /dev/null 2>&1; then
+              echo "Keycloak is ready!"
+              break
+            fi
+            if curl -sf http://127.0.0.1:8090/realms/master > /dev/null 2>&1; then
+              echo "Keycloak is ready (via realm endpoint)!"
+              break
+            fi
+            echo "Attempt $i: Waiting for Keycloak..."
+            sleep 5
+          done
+
+      - name: Setup Vault for Testing
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: myroot
+        run: bash test/docker-compose/scripts/setup-vault.sh --ci
+
+      - name: Setup Keycloak for Testing
+        env:
+          KEYCLOAK_ADDR: http://127.0.0.1:8090
+        run: bash test/docker-compose/scripts/setup-keycloak.sh
+
+      - name: Run e2e tests with coverage
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: myroot
+          KEYCLOAK_ADDR: http://127.0.0.1:8090
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+          SKIP_DOCKER_COMPOSE: "true"
+        run: |
+          mkdir -p coverage
+          go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
+            -tags=e2e -v -timeout 15m ./test/e2e/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-e2e
+          path: coverage/e2e.out
           retention-days: 7
 
   # ===========================================================================
@@ -355,11 +611,6 @@ jobs:
             --set installCRDs=true > /dev/null
           echo "Template validation successful!"
 
-      - name: Helm dry-run install
-        run: |
-          # Create a kind cluster for dry-run validation
-          echo "Skipping dry-run (no cluster available). Lint and template passed."
-
   # ===========================================================================
   # Tag-only Jobs: Build & Release
   # ===========================================================================
@@ -368,7 +619,7 @@ jobs:
     name: Build & Release
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, govulncheck, unit-tests, functional-tests]
+    needs: [lint, govulncheck, unit-tests, functional-tests, integration-tests, e2e-tests]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -464,7 +715,7 @@ jobs:
     name: Docker Build & Push
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, govulncheck, unit-tests, functional-tests]
+    needs: [lint, govulncheck, unit-tests, functional-tests, integration-tests, e2e-tests]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -627,7 +878,7 @@ jobs:
     name: Helm Package
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [lint, govulncheck, unit-tests, functional-tests]
+    needs: [lint, govulncheck, unit-tests, functional-tests, integration-tests, e2e-tests]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
