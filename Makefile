@@ -152,7 +152,7 @@ docker-build-operator: ## Build operator Docker image
 	$(DOCKER) build \
 		$(DOCKER_BUILD_ARGS) \
 		-t $(IMG_OPERATOR) \
-		-f Dockerfile .
+		-f Dockerfile.operator .
 
 .PHONY: docker-build-ctl
 docker-build-ctl: ## Build cloudberry-ctl Docker image

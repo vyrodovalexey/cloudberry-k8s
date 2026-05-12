@@ -49,6 +49,7 @@ func (s *WorkloadManagementSuite) TestFunctional_ResourceGroupCreation_Reconcile
 	cluster := testutil.NewClusterBuilder("test-wl-rg", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
 		Enabled: true,
@@ -212,6 +213,7 @@ func (s *WorkloadManagementSuite) TestFunctional_IdleSessionRules_Applied() {
 	cluster := testutil.NewClusterBuilder("test-wl-idle", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
 		Enabled: true,

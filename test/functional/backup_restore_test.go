@@ -49,6 +49,7 @@ func (s *BackupRestoreSuite) TestFunctional_BackupS3Destination_ReconcilesSucess
 	cluster := testutil.NewClusterBuilder("test-backup-s3", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:     true,

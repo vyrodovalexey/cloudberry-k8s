@@ -18,12 +18,14 @@ const (
 
 	// Default values for operator configuration.
 	defaultListenAddress      = ":8443"
+	defaultAPIAddress         = ":8090"
 	defaultMetricsAddress     = ":8080"
 	defaultHealthProbeAddress = ":8081"
 	defaultWebhookPort        = 9443
 	defaultLogLevel           = "info"
 	defaultLogFormat          = "json"
 	defaultLeaderElection     = true
+	defaultWebhookEnabled     = false
 	defaultReconcileInterval  = 30 * time.Second
 	defaultOperationTimeout   = 5 * time.Minute
 )
@@ -32,12 +34,17 @@ const (
 type OperatorConfig struct {
 	// ListenAddress is the address the API server listens on.
 	ListenAddress string `mapstructure:"listen-address"`
+	// APIAddress is the address the REST API server listens on.
+	APIAddress string `mapstructure:"api-address"`
 	// MetricsAddress is the address the metrics server listens on.
 	MetricsAddress string `mapstructure:"metrics-address"`
 	// HealthProbeAddress is the address the health probe server listens on.
 	HealthProbeAddress string `mapstructure:"health-probe-address"`
 	// WebhookPort is the port the webhook server listens on.
 	WebhookPort int `mapstructure:"webhook-port"`
+	// WebhookEnabled controls whether admission webhooks are registered.
+	// Disable in development environments where webhook certificates are not available.
+	WebhookEnabled bool `mapstructure:"webhook-enabled"`
 	// LogLevel is the logging level (debug, info, warn, error).
 	LogLevel string `mapstructure:"log-level"`
 	// LogFormat is the logging format (json, text).
@@ -59,6 +66,20 @@ type OperatorConfig struct {
 	Telemetry TelemetryConfig `mapstructure:"telemetry"`
 }
 
+// RedactedString is a string type that redacts its value in fmt.Stringer output
+// to prevent accidental logging of sensitive data.
+type RedactedString string
+
+// String returns a redacted placeholder instead of the actual value.
+func (r RedactedString) String() string {
+	return "[REDACTED]"
+}
+
+// Value returns the underlying string value for use in code that needs the actual value.
+func (r RedactedString) Value() string {
+	return string(r)
+}
+
 // VaultConfig holds Vault client configuration.
 type VaultConfig struct {
 	// Enabled controls whether Vault integration is active.
@@ -72,7 +93,8 @@ type VaultConfig struct {
 	// Role is the Vault role name.
 	Role string `mapstructure:"role"`
 	// Token is the Vault token (for token auth method).
-	Token string `mapstructure:"token"`
+	// Uses RedactedString to prevent accidental logging of the token value.
+	Token RedactedString `mapstructure:"token"`
 	// SecretPath is the base secret path.
 	SecretPath string `mapstructure:"secret-path"`
 }
@@ -97,6 +119,9 @@ type TelemetryConfig struct {
 	OTLPEndpoint string `mapstructure:"otlp-endpoint"`
 	// OTLPProtocol is the OTLP exporter protocol (grpc, http).
 	OTLPProtocol string `mapstructure:"otlp-protocol"`
+	// OTLPInsecure controls whether OTLP exporters use insecure (plaintext) connections.
+	// When true, TLS is disabled for the OTLP exporter. Defaults to false (TLS enabled).
+	OTLPInsecure bool `mapstructure:"otlp-insecure"`
 	// SamplingRate is the trace sampling rate (0.0 to 1.0).
 	SamplingRate float64 `mapstructure:"sampling-rate"`
 	// ServiceName is the service name for traces.
@@ -154,9 +179,11 @@ func (l *viperLoader) Load() (*OperatorConfig, error) {
 // setDefaults sets default values for all configuration options.
 func (l *viperLoader) setDefaults() {
 	l.v.SetDefault("listen-address", defaultListenAddress)
+	l.v.SetDefault("api-address", defaultAPIAddress)
 	l.v.SetDefault("metrics-address", defaultMetricsAddress)
 	l.v.SetDefault("health-probe-address", defaultHealthProbeAddress)
 	l.v.SetDefault("webhook-port", defaultWebhookPort)
+	l.v.SetDefault("webhook-enabled", defaultWebhookEnabled)
 	l.v.SetDefault("log-level", defaultLogLevel)
 	l.v.SetDefault("log-format", defaultLogFormat)
 	l.v.SetDefault("leader-election", defaultLeaderElection)
@@ -172,6 +199,7 @@ func (l *viperLoader) setDefaults() {
 
 	l.v.SetDefault("telemetry.enabled", false)
 	l.v.SetDefault("telemetry.otlp-protocol", "grpc")
+	l.v.SetDefault("telemetry.otlp-insecure", false)
 	l.v.SetDefault("telemetry.sampling-rate", 1.0)
 	l.v.SetDefault("telemetry.service-name", "cloudberry-operator")
 }

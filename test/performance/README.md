@@ -19,8 +19,9 @@ Performance and load testing suite for the Cloudberry K8s Operator REST API usin
 ### Required
 
 - **Docker** (recommended) or native Yandex Tank installation
-- **Running Cloudberry Operator** with REST API accessible
+- **Running Cloudberry Operator** with REST API accessible on port `:8090` (default)
 - **bash** 4.0+ (for the runner script)
+- **Go** 1.26.3+ (for building the operator from source)
 
 ### Docker (Recommended)
 
@@ -37,17 +38,30 @@ pip install yandextank
 
 ### Operator Setup
 
-The operator must be running and accessible. For local testing:
+The operator must be running and accessible. The REST API server listens on `:8090` by default (configurable via `CLOUDBERRY_API_ADDRESS` or `--api-address` flag).
+
+For local testing:
 
 ```bash
-# Start the operator (from project root)
-make run
+# Build and run the operator (from project root)
+make build-operator
+./bin/cloudberry-operator
 
 # Or via port-forward if running in Kubernetes
-kubectl port-forward svc/cloudberry-operator 8443:8443 -n cloudberry-system
+kubectl port-forward svc/cloudberry-operator 8090:8090 -n cloudberry-system
 ```
 
-Default authentication: `admin:admin` (Basic Auth, base64: `YWRtaW46YWRtaW4=`).
+Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API server uses bcrypt for password verification.
+
+### Test Infrastructure Status
+
+- All unit, functional, integration, and e2e tests pass
+- Docker images build successfully (`make docker-build`)
+- Helm chart deploys to local Kubernetes clusters
+- Monitoring stack (vmagent, otel-collector) can be deployed alongside the operator
+- Performance tests target the REST API server on port `:8090`
+
+> **Note**: The API enforces per-IP rate limiting (10 requests/minute by default). For performance testing, you may need to increase the rate limit or disable it by configuring a higher limit.
 
 ## Quick Start
 
@@ -138,7 +152,7 @@ Detects memory leaks, connection exhaustion, and time-dependent degradation.
 
 Options:
   --scenario <name>    Test scenario: smoke, baseline, stress, endurance
-  --target <host:port> Target address (default: localhost:8443)
+  --target <host:port> Target address (default: localhost:8090)
   --ssl                Enable SSL/TLS
   --rps <number>       Override max RPS
   --duration <seconds> Override test duration
@@ -154,7 +168,7 @@ Options:
 
 ```bash
 # Test against a remote operator
-./run-perftest.sh --scenario baseline --target operator.example.com:8443 --ssl
+./run-perftest.sh --scenario baseline --target operator.example.com:8090 --ssl
 
 # Test with custom RPS
 ./run-perftest.sh --scenario baseline --rps 200 --duration 600
@@ -188,7 +202,7 @@ yandex-tank -c scenarios/baseline.yaml
 
 ```yaml
 phantom:
-  address: localhost:8443    # Target host:port
+  address: localhost:8090    # Target host:port
   ssl: false                 # Enable HTTPS
   ammo_type: uri             # uri (simple) or request (full HTTP)
   ammofile: ammo/api-read.txt
@@ -220,7 +234,7 @@ autostop:
 Simple format for GET requests. Headers are defined once at the top:
 
 ```
-[Host: localhost:8443]
+[Host: localhost:8090]
 [Authorization: Basic YWRtaW46YWRtaW4=]
 /healthz
 /readyz
@@ -235,7 +249,7 @@ Each request is prefixed with its byte count:
 ```
 160 /api/v1alpha1/clusters
 GET /api/v1alpha1/clusters HTTP/1.1
-Host: localhost:8443
+Host: localhost:8090
 Authorization: Basic YWRtaW46YWRtaW4=
 ...
 ```
@@ -255,7 +269,7 @@ To create custom ammo for specific endpoints:
 ```bash
 # URI-style (GET only)
 cat > ammo/custom.txt << 'EOF'
-[Host: localhost:8443]
+[Host: localhost:8090]
 [Authorization: Basic YWRtaW46YWRtaW4=]
 [Accept: application/json]
 /api/v1alpha1/clusters/my-cluster/status
@@ -321,7 +335,7 @@ awk -F'\t' '{sec=int($1); rps[sec]++} END {for(s in rps) print s, rps[s]}' .yand
 {
   "scenario": "baseline",
   "timestamp": "20260511_143022",
-  "target": "localhost:8443",
+  "target": "localhost:8090",
   "total_requests": 35000,
   "status_codes": {
     "2xx": 34990,
@@ -394,10 +408,10 @@ No fixed SLOs. The goal is to identify:
 
 ```bash
 # Verify the operator is running
-curl -u admin:admin http://localhost:8443/healthz
+curl -u admin:admin http://localhost:8090/healthz
 
 # Check if port is open
-nc -z localhost 8443
+nc -z localhost 8090
 ```
 
 ### Docker networking issues

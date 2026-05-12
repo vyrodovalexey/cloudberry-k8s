@@ -2,11 +2,13 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractBearerToken(t *testing.T) {
@@ -305,6 +307,120 @@ func TestOIDCProvider_Authenticate_MissingToken(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, identity)
 	assert.Contains(t, err.Error(), "missing or malformed Bearer token")
+}
+
+func TestOIDCProvider_Authenticate_InvalidToken(t *testing.T) {
+	// Create a mock OIDC server that returns discovery document
+	mux := http.NewServeMux()
+	var serverURL string
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"issuer": "%s",
+			"authorization_endpoint": "%s/auth",
+			"token_endpoint": "%s/token",
+			"jwks_uri": "%s/keys"
+		}`, serverURL, serverURL, serverURL, serverURL)))
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	})
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	defer server.Close()
+
+	cfg := OIDCConfig{
+		IssuerURL: server.URL,
+		ClientID:  "test-client",
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+
+	// Test with an invalid token
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer invalid-token")
+
+	identity, err := provider.Authenticate(context.Background(), req)
+	assert.Error(t, err)
+	assert.Nil(t, identity)
+	assert.Contains(t, err.Error(), "token verification failed")
+}
+
+func TestOIDCProvider_GetOAuth2Config(t *testing.T) {
+	mux := http.NewServeMux()
+	var serverURL string
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"issuer": "%s",
+			"authorization_endpoint": "%s/auth",
+			"token_endpoint": "%s/token",
+			"jwks_uri": "%s/keys"
+		}`, serverURL, serverURL, serverURL, serverURL)))
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	})
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	defer server.Close()
+
+	cfg := OIDCConfig{
+		IssuerURL:    server.URL,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Scopes:       []string{"openid", "profile"},
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	oauth2Cfg := provider.GetOAuth2Config()
+	require.NotNil(t, oauth2Cfg)
+	assert.Equal(t, "test-client", oauth2Cfg.ClientID)
+	assert.Equal(t, "test-secret", oauth2Cfg.ClientSecret)
+	assert.Contains(t, oauth2Cfg.Scopes, "openid")
+}
+
+func TestNewOIDCProvider_DefaultValues(t *testing.T) {
+	mux := http.NewServeMux()
+	var serverURL string
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"issuer": "%s",
+			"authorization_endpoint": "%s/auth",
+			"token_endpoint": "%s/token",
+			"jwks_uri": "%s/keys"
+		}`, serverURL, serverURL, serverURL, serverURL)))
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	})
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	defer server.Close()
+
+	cfg := OIDCConfig{
+		IssuerURL: server.URL,
+		ClientID:  "test-client",
+		// Leave all optional fields empty to test defaults
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+
+	// Verify defaults were applied
+	assert.Equal(t, "realm_access.roles", provider.config.RoleClaimPath)
+	assert.Equal(t, "id_token", provider.config.RoleClaimSource)
+	assert.Equal(t, "exact", provider.config.RoleMatchMode)
+	assert.Len(t, provider.config.Scopes, 3) // openid, profile, email
 }
 
 func TestOIDCProvider_ResolvePermission(t *testing.T) {

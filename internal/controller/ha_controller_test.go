@@ -11,7 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
@@ -537,6 +539,407 @@ func TestHAReconciler_RunFTSProbe_SegmentConfigError(t *testing.T) {
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "getting segment configuration")
+}
+
+func TestHAReconciler_RunFTSProbe_NilDBFactory(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	// Create reconciler with nil dbFactory.
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	err := r.runFTSProbe(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database client factory is not configured")
+}
+
+func TestHAReconciler_MonitorStandby_NilDBFactory(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	err := r.monitorStandby(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database client factory is not configured")
+}
+
+func TestHAReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
+	// When ObservedGeneration matches and no annotations, should skip.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Generation = 2
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 2
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestHAReconciler_Reconcile_ObservedGenerationNotSkippedWithRecoveryAnnotation(t *testing.T) {
+	// When ObservedGeneration matches but recovery annotation is present, should NOT skip.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Generation = 2
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 2
+	cluster.Annotations = map[string]string{
+		util.AnnotationRecovery: util.RecoveryIncremental,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify annotation was removed.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	_, exists := updated.Annotations[util.AnnotationRecovery]
+	assert.False(t, exists)
+}
+
+func TestHAReconciler_Reconcile_ObservedGenerationNotSkippedWithActionAnnotation(t *testing.T) {
+	// When ObservedGeneration matches but action annotation is present, should NOT skip.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Generation = 2
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 2
+	cluster.Annotations = map[string]string{
+		util.AnnotationAction: util.ActionRebalance,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestHAReconciler_RunHealthChecks_MirroringEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{
+		segments: []db.SegmentInfo{
+			{ContentID: 0, Status: "u", Role: "p", Hostname: "host1"},
+		},
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	// Should not panic.
+	r.runHealthChecks(context.Background(), cluster, r.logger)
+}
+
+func TestHAReconciler_RunHealthChecks_StandbyEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{
+		replicationLag: 100,
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	// Should not panic.
+	r.runHealthChecks(context.Background(), cluster, r.logger)
+}
+
+func TestHAReconciler_RunHealthChecks_BothDisabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	// Neither mirroring nor standby enabled.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	// Should not panic and should be a no-op.
+	r.runHealthChecks(context.Background(), cluster, r.logger)
+}
+
+func TestHAReconciler_RunHealthChecks_FTSProbeError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	// nil dbFactory will cause FTS probe to fail.
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	// Should not panic even when FTS probe fails.
+	r.runHealthChecks(context.Background(), cluster, r.logger)
+}
+
+func TestHAReconciler_RunHealthChecks_StandbyMonitorError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	// nil dbFactory will cause standby monitoring to fail.
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	// Should not panic even when standby monitoring fails.
+	r.runHealthChecks(context.Background(), cluster, r.logger)
+}
+
+func TestHAReconciler_HandleAnnotations_NoAnnotations(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, handled, err := r.handleAnnotations(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.False(t, handled)
+}
+
+func TestHAReconciler_HandleAnnotations_UnknownAction(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationAction: "unknown-action",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, handled, err := r.handleAnnotations(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.False(t, handled)
+}
+
+func TestHAReconciler_Reconcile_GetError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return fmt.Errorf("connection refused")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetching cluster")
+}
+
+func TestHAReconciler_HandleRecovery_UpdateError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationRecovery: util.RecoveryIncremental,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return fmt.Errorf("update failed")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, err := r.handleRecovery(context.Background(), cluster, util.RecoveryIncremental)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removing recovery annotation")
+}
+
+func TestHAReconciler_HandleRebalance_UpdateError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationAction: util.ActionRebalance,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return fmt.Errorf("update failed")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, err := r.handleRebalance(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removing rebalance annotation")
+}
+
+func TestHAReconciler_HandleStandbyActivation_UpdateError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationAction: util.ActionActivateStandby,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return fmt.Errorf("update failed")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+
+	_, err := r.handleStandbyActivation(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removing standby activation annotation")
 }
 
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {

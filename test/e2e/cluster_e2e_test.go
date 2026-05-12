@@ -170,6 +170,7 @@ func (s *ClusterE2ESuite) TestE2E_ClusterActions_StartStopRestart() {
 	cluster := testutil.NewClusterBuilder("e2e-actions", s.namespace).
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 
 	err := s.client.Create(s.ctx, cluster)
@@ -191,7 +192,7 @@ func (s *ClusterE2ESuite) TestE2E_ClusterActions_StartStopRestart() {
 
 	for _, action := range actions {
 		s.Run("action_"+action, func() {
-			// Set action annotation
+			// Set action annotation and bump generation to trigger reconciliation
 			updated := &cbv1alpha1.CloudberryCluster{}
 			err := s.client.Get(s.ctx, req.NamespacedName, updated)
 			require.NoError(s.T(), err)
@@ -200,6 +201,8 @@ func (s *ClusterE2ESuite) TestE2E_ClusterActions_StartStopRestart() {
 				updated.Annotations = make(map[string]string)
 			}
 			updated.Annotations[util.AnnotationAction] = action
+			// Bump generation to ensure the reconciler doesn't skip
+			updated.Generation = updated.Status.ObservedGeneration + 1
 			err = s.client.Update(s.ctx, updated)
 			require.NoError(s.T(), err)
 

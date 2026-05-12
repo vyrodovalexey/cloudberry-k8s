@@ -70,6 +70,7 @@ func (k *KeycloakTestHelper) GetClientCredentialsToken(ctx context.Context, real
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
 
 	resp, err := k.HTTPClient.Do(req)
 	if err != nil {
@@ -107,6 +108,7 @@ func (k *KeycloakTestHelper) GetPasswordToken(ctx context.Context, realm, client
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
 
 	resp, err := k.HTTPClient.Do(req)
 	if err != nil {
@@ -193,6 +195,7 @@ func (k *KeycloakTestHelper) GetAdminToken(ctx context.Context) (string, error) 
 		return "", fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
 
 	resp, err := k.HTTPClient.Do(req)
 	if err != nil {
@@ -228,6 +231,7 @@ func (k *KeycloakTestHelper) IntrospectToken(ctx context.Context, realm, clientI
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
 
 	resp, err := k.HTTPClient.Do(req)
 	if err != nil {

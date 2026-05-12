@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestNewBasicAuthProvider(t *testing.T) {
@@ -136,9 +137,11 @@ func TestInMemoryCredentialStore(t *testing.T) {
 	t.Run("set and get credentials", func(t *testing.T) {
 		store.SetCredentials("user1", "pass1", PermissionAdmin)
 
-		password, err := store.GetPassword(context.Background(), "user1")
+		storedHash, err := store.GetPassword(context.Background(), "user1")
 		require.NoError(t, err)
-		assert.Equal(t, "pass1", password)
+		// The stored value should be a bcrypt hash, not the raw password.
+		assert.NotEqual(t, "pass1", storedHash)
+		assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(storedHash), []byte("pass1")))
 
 		level, err := store.GetPermissionLevel(context.Background(), "user1")
 		require.NoError(t, err)
@@ -161,9 +164,11 @@ func TestInMemoryCredentialStore(t *testing.T) {
 		store.SetCredentials("user2", "pass2", PermissionBasic)
 		store.SetCredentials("user2", "newpass", PermissionOperator)
 
-		password, err := store.GetPassword(context.Background(), "user2")
+		storedHash, err := store.GetPassword(context.Background(), "user2")
 		require.NoError(t, err)
-		assert.Equal(t, "newpass", password)
+		// The stored value should be a bcrypt hash of the new password.
+		assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(storedHash), []byte("newpass")))
+		assert.Error(t, bcrypt.CompareHashAndPassword([]byte(storedHash), []byte("pass2")))
 
 		level, err := store.GetPermissionLevel(context.Background(), "user2")
 		require.NoError(t, err)

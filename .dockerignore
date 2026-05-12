@@ -31,7 +31,7 @@ bin/
 
 # Docker
 .dockerignore
-Dockerfile
+Dockerfile.operator
 Dockerfile.ctl
 
 # CI/CD

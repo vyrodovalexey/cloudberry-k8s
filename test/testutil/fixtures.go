@@ -245,6 +245,14 @@ func (b *ClusterBuilder) WithGeneration(gen int64) *ClusterBuilder {
 	return b
 }
 
+// WithPendingGeneration sets the generation higher than observed generation
+// to simulate a spec change that needs reconciliation.
+func (b *ClusterBuilder) WithPendingGeneration() *ClusterBuilder {
+	b.cluster.Generation = 1
+	b.cluster.Status.ObservedGeneration = 0
+	return b
+}
+
 // Build returns the constructed CloudberryCluster.
 func (b *ClusterBuilder) Build() *cbv1alpha1.CloudberryCluster {
 	return b.cluster.DeepCopy()

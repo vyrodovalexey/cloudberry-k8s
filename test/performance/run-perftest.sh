@@ -248,7 +248,8 @@ check_prerequisites() {
     if [[ -n "$AMMO_OVERRIDE" ]]; then
         ammo_file="$AMMO_OVERRIDE"
     else
-        ammo_file=$(grep -oP 'ammofile:\s*\K.*' "${SCRIPT_DIR}/${config_file}" 2>/dev/null || echo "ammo/api-read.txt")
+        ammo_file=$(sed -n 's/^[[:space:]]*ammofile:[[:space:]]*//p' "${SCRIPT_DIR}/${config_file}" 2>/dev/null | head -1)
+        ammo_file="${ammo_file:-ammo/api-read.txt}"
         ammo_file=$(echo "$ammo_file" | tr -d ' ')
     fi
 

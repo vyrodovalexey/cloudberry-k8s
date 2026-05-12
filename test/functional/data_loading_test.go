@@ -49,6 +49,7 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingS3Job_ReconcilesSucessfully
 	cluster := testutil.NewClusterBuilder("test-dl-s3", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
@@ -92,6 +93,7 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingKafkaJob_ReconcilesSucessfu
 	cluster := testutil.NewClusterBuilder("test-dl-kafka", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
@@ -135,6 +137,7 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingRabbitMQJob_ReconcilesSuces
 	cluster := testutil.NewClusterBuilder("test-dl-rmq", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
@@ -177,6 +180,7 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingMixedJobs_CountsActiveCorre
 	cluster := testutil.NewClusterBuilder("test-dl-mixed", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,

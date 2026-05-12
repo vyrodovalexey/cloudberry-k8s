@@ -1,6 +1,8 @@
 package util
 
 import (
+	"crypto/rand"
+	"math/big"
 	"regexp"
 	"strings"
 )
@@ -50,4 +52,25 @@ func RemoveString(slice []string, s string) []string {
 		}
 	}
 	return result
+}
+
+const (
+	// defaultPasswordLength is the length of generated admin passwords.
+	defaultPasswordLength = 32
+	// passwordChars is the set of characters used for password generation.
+	passwordChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+
+// GenerateRandomPassword generates a cryptographically secure random password.
+func GenerateRandomPassword() (string, error) {
+	password := make([]byte, defaultPasswordLength)
+	charsetLen := big.NewInt(int64(len(passwordChars)))
+	for i := range password {
+		idx, err := rand.Int(rand.Reader, charsetLen)
+		if err != nil {
+			return "", err
+		}
+		password[i] = passwordChars[idx.Int64()]
+	}
+	return string(password), nil
 }

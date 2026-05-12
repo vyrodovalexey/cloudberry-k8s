@@ -1013,6 +1013,264 @@ func TestDeepCopyInto_AllSubTypes(t *testing.T) {
 	})
 }
 
+func TestDeepCopy_SpecAndStatus_NonNil(t *testing.T) {
+	t.Run("CloudberryClusterSpec non-nil", func(t *testing.T) {
+		src := &CloudberryClusterSpec{
+			Version: "7.7",
+			Image:   "cloudberrydb/cloudberry:7.7",
+			Config:  &ConfigSpec{Parameters: map[string]string{"key": "val"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "7.7", copied.Version)
+		copied.Config.Parameters["new"] = "val"
+		_, exists := src.Config.Parameters["new"]
+		assert.False(t, exists)
+	})
+
+	t.Run("CloudberryClusterStatus non-nil", func(t *testing.T) {
+		now := metav1.Now()
+		src := &CloudberryClusterStatus{
+			Phase:             ClusterPhaseRunning,
+			CoordinatorReady:  true,
+			LastReconcileTime: &now,
+			Conditions: []metav1.Condition{
+				{Type: "Ready", Status: metav1.ConditionTrue},
+			},
+			FailedSegments: []FailedSegment{{ContentID: 1}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, ClusterPhaseRunning, copied.Phase)
+	})
+
+	t.Run("CoordinatorSpec non-nil", func(t *testing.T) {
+		replicas := int32(1)
+		src := &CoordinatorSpec{
+			Replicas:     &replicas,
+			NodeSelector: map[string]string{"role": "coord"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(1), *copied.Replicas)
+	})
+
+	t.Run("StandbySpec non-nil", func(t *testing.T) {
+		src := &StandbySpec{
+			Enabled:      true,
+			NodeSelector: map[string]string{"role": "standby"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("SegmentsSpec non-nil", func(t *testing.T) {
+		src := &SegmentsSpec{
+			Count:        4,
+			NodeSelector: map[string]string{"role": "seg"},
+			Tolerations:  []Toleration{{Key: "k"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(4), copied.Count)
+	})
+
+	t.Run("AuthSpec non-nil", func(t *testing.T) {
+		src := &AuthSpec{
+			Basic:    &BasicAuthSpec{Enabled: true},
+			HBARules: []HBARule{{Type: HBATypeHost}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Basic.Enabled)
+	})
+
+	t.Run("BasicAuthSpec non-nil", func(t *testing.T) {
+		src := &BasicAuthSpec{
+			Enabled:             true,
+			AdminPasswordSecret: &SecretKeyRef{Name: "s"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("OIDCSpec non-nil", func(t *testing.T) {
+		src := &OIDCSpec{
+			Enabled:     true,
+			Scopes:      []string{"openid"},
+			RoleMapping: map[string]string{"admin": "Admin"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("OIDCSecretRef non-nil", func(t *testing.T) {
+		src := &OIDCSecretRef{SecretRef: &SecretKeyRef{Name: "s"}}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "s", copied.SecretRef.Name)
+	})
+
+	t.Run("SSLSpec non-nil", func(t *testing.T) {
+		src := &SSLSpec{Enabled: true, CertSecret: &CertSecretRef{Name: "c"}}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("ConfigSpec non-nil", func(t *testing.T) {
+		src := &ConfigSpec{
+			Parameters:            map[string]string{"k": "v"},
+			CoordinatorParameters: map[string]string{"ck": "cv"},
+			DatabaseParameters:    map[string]map[string]string{"db": {"k": "v"}},
+			RoleParameters:        map[string]map[string]string{"role": {"k": "v"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "v", copied.Parameters["k"])
+	})
+
+	t.Run("VaultSpec non-nil", func(t *testing.T) {
+		src := &VaultSpec{
+			Enabled:   true,
+			TLSSecret: &VaultTLSSecret{Name: "tls"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("ResourceRequirements non-nil", func(t *testing.T) {
+		src := &ResourceRequirements{
+			Requests: &ResourceList{CPU: "1"},
+			Limits:   &ResourceList{CPU: "2"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "1", copied.Requests.CPU)
+	})
+
+	t.Run("Toleration with TolerationSeconds non-nil", func(t *testing.T) {
+		secs := int64(300)
+		src := &Toleration{Key: "k", TolerationSeconds: &secs}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int64(300), *copied.TolerationSeconds)
+	})
+
+	t.Run("WorkloadSpec non-nil", func(t *testing.T) {
+		src := &WorkloadSpec{
+			Enabled:        true,
+			ResourceGroups: []ResourceGroupSpec{{Name: "rg"}},
+			Rules:          []WorkloadRule{{Name: "r"}},
+			IdleRules:      []IdleSessionRule{{Name: "ir"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("BackupSpec non-nil", func(t *testing.T) {
+		src := &BackupSpec{
+			Enabled: true,
+			Destination: BackupDestination{
+				CredentialSecret: &SecretReference{Name: "cred"},
+			},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("BackupDestination non-nil", func(t *testing.T) {
+		src := &BackupDestination{
+			Type:             "s3",
+			CredentialSecret: &SecretReference{Name: "cred"},
+			ForcePathStyle:   true,
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "s3", copied.Type)
+	})
+
+	t.Run("DataLoadingSpec non-nil", func(t *testing.T) {
+		src := &DataLoadingSpec{
+			Enabled:         true,
+			StreamingServer: &StreamingServerSpec{Host: "h"},
+			Jobs:            []DataLoadingJob{{Name: "j"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Enabled)
+	})
+
+	t.Run("StreamingServerSpec non-nil with credential", func(t *testing.T) {
+		src := &StreamingServerSpec{
+			Host:             "h",
+			CredentialSecret: &SecretReference{Name: "c"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "h", copied.Host)
+	})
+
+	t.Run("DataLoadingJob with all sources", func(t *testing.T) {
+		src := &DataLoadingJob{
+			Name:           "j",
+			S3Source:       &S3SourceSpec{Bucket: "b", CredentialSecret: &SecretReference{Name: "s"}},
+			KafkaSource:    &KafkaSourceSpec{Brokers: []string{"b1"}},
+			RabbitMQSource: &RabbitMQSourceSpec{Host: "h", CredentialSecret: &SecretReference{Name: "r"}},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "j", copied.Name)
+	})
+
+	t.Run("StorageManagementSpec non-nil", func(t *testing.T) {
+		src := &StorageManagementSpec{
+			DiskMonitoring:     true,
+			RecommendationScan: &RecommendationScanSpec{Enabled: true},
+			UsageReport:        &UsageReportSpec{Enabled: true},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.DiskMonitoring)
+	})
+
+	t.Run("S3SourceSpec non-nil", func(t *testing.T) {
+		src := &S3SourceSpec{
+			Bucket:           "b",
+			CredentialSecret: &SecretReference{Name: "c"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "b", copied.Bucket)
+	})
+
+	t.Run("KafkaSourceSpec non-nil", func(t *testing.T) {
+		src := &KafkaSourceSpec{
+			Brokers: []string{"b1", "b2"},
+			Topic:   "t",
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Len(t, copied.Brokers, 2)
+	})
+
+	t.Run("RabbitMQSourceSpec non-nil", func(t *testing.T) {
+		src := &RabbitMQSourceSpec{
+			Host:             "h",
+			CredentialSecret: &SecretReference{Name: "c"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "h", copied.Host)
+	})
+}
+
 func TestDeepCopy_PopulatedSubTypes(t *testing.T) {
 	t.Run("MirroringSpec non-nil", func(t *testing.T) {
 		src := &MirroringSpec{Enabled: true, Layout: MirroringLayoutGroup}

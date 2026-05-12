@@ -2,12 +2,12 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
@@ -19,12 +19,19 @@ const (
 	AuthMethodOIDCName = "oidc"
 )
 
-// dummyHash is generated at init time to prevent timing attacks when the user is not found.
+// dummyHash is a valid bcrypt hash generated at init time to prevent timing attacks
+// when the user is not found. Using a bcrypt comparison against this hash ensures
+// constant-time behavior regardless of whether the user exists.
 var dummyHash []byte
 
 func init() {
-	h := sha256.Sum256([]byte("cloudberry-dummy-hash-init-value"))
-	dummyHash = h[:]
+	// Generate a bcrypt hash at init time instead of using a constant value.
+	h, err := bcrypt.GenerateFromPassword([]byte("cloudberry-dummy-hash-init-value"), bcrypt.DefaultCost)
+	if err != nil {
+		// This should never fail with a valid input; panic during init is acceptable.
+		panic(fmt.Sprintf("failed to generate dummy bcrypt hash: %v", err))
+	}
+	dummyHash = h
 }
 
 // CredentialStore defines the interface for retrieving user credentials.
@@ -60,21 +67,19 @@ func (p *BasicAuthProvider) Authenticate(ctx context.Context, r *http.Request) (
 		return nil, util.NewAuthenticationError(AuthMethodBasicName, "missing or malformed Authorization header")
 	}
 
-	storedPassword, err := p.store.GetPassword(ctx, username)
+	storedHash, err := p.store.GetPassword(ctx, username)
 	if err != nil {
 		return nil, fmt.Errorf("retrieving credentials: %w", err)
 	}
 
-	if storedPassword == "" {
-		// User not found; perform dummy comparison to prevent timing attacks.
-		_ = subtle.ConstantTimeCompare(dummyHash, dummyHash)
+	if storedHash == "" {
+		// User not found; compare against dummy hash to prevent timing attacks.
+		// bcrypt.CompareHashAndPassword provides constant-time comparison internally.
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 		return nil, util.NewAuthenticationError(AuthMethodBasicName, "invalid credentials")
 	}
 
-	expectedHash := sha256.Sum256([]byte(storedPassword))
-	actualHash := sha256.Sum256([]byte(password))
-
-	if subtle.ConstantTimeCompare(expectedHash[:], actualHash[:]) != 1 {
+	if bcryptErr := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)); bcryptErr != nil {
 		p.logger.Warn("basic auth failed", "username", username)
 		return nil, util.NewAuthenticationError(AuthMethodBasicName, "invalid credentials")
 	}
@@ -113,11 +118,18 @@ func NewInMemoryCredentialStore() *InMemoryCredentialStore {
 	}
 }
 
-// SetCredentials sets the password and permission level for a user.
+// SetCredentials hashes the password with bcrypt and stores the hash and permission level for a user.
 func (s *InMemoryCredentialStore) SetCredentials(username, password string, permission PermissionLevel) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		// bcrypt only fails if password exceeds 72 bytes or cost is invalid;
+		// log and store empty to prevent silent authentication bypass.
+		slog.Error("failed to hash password for user", "username", username, "error", err)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.credentials[username] = password
+	s.credentials[username] = string(hash)
 	s.permissions[username] = permission
 }
 

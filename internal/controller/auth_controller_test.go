@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,7 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
@@ -430,4 +433,287 @@ func TestAuthReconciler_ValidateOIDCConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthReconciler_Reconcile_OIDCDisabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		OIDC: &cbv1alpha1.OIDCSpec{
+			Enabled: false,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_OIDCMissingClientID(t *testing.T) {
+	// OIDC validation failure is a warning, not a hard error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		OIDC: &cbv1alpha1.OIDCSpec{
+			Enabled:   true,
+			IssuerURL: "https://issuer.example.com",
+			// ClientID intentionally missing.
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_DeletingPhase(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseDeleting
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+}
+
+func TestAuthReconciler_ReconcileHBA_CreateThenUpdate(t *testing.T) {
+	// Test reconcileHBA create path then update path.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// First call creates the configmap.
+	err := r.reconcileHBA(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Second call should find existing and check hash.
+	err = r.reconcileHBA(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAuthReconciler_Reconcile_AuthNilSpec(t *testing.T) {
+	// When Auth spec is nil, OIDC validation should be skipped.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = nil
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_GetError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return fmt.Errorf("connection refused")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetching cluster")
+}
+
+func TestAuthReconciler_ReconcileHBA_CreateError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return fmt.Errorf("create failed")
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.reconcileHBA(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating pg_hba.conf configmap")
+}
+
+func TestAuthReconciler_ReconcileHBA_GetError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return fmt.Errorf("get failed")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.reconcileHBA(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting pg_hba.conf configmap")
+}
+
+func TestAuthReconciler_ReconcileHBA_UpdateError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	// Pre-create with different hash to trigger update.
+	existingCM := b.BuildPgHBAConfConfigMap(cluster)
+	existingCM.Annotations[util.AnnotationConfigHash] = "old-hash"
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, existingCM).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return fmt.Errorf("update failed")
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.reconcileHBA(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "updating pg_hba.conf configmap")
+}
+
+func TestAuthReconciler_Reconcile_HBAError_SetsCondition(t *testing.T) {
+	// When HBA reconciliation fails, the auth condition should be set to False.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return fmt.Errorf("create failed")
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, requeueAfterError, result.RequeueAfter)
 }

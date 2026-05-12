@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "otel-collector.fullname" . }}
+  labels:
+    {{- include "otel-collector.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: {{ .Values.receivers.otlp.protocols.grpc.endpoint | quote }}
+          http:
+            endpoint: {{ .Values.receivers.otlp.protocols.http.endpoint | quote }}
+
+    processors:
+      batch:
+        timeout: {{ .Values.processors.batch.timeout }}
+        send_batch_size: {{ .Values.processors.batch.send_batch_size }}
+
+    exporters:
+      prometheusremotewrite:
+        endpoint: {{ .Values.exporters.prometheusremotewrite.endpoint | quote }}
+        tls:
+          insecure: true
+      {{- if index .Values.exporters "otlp/tempo" }}
+      otlp/tempo:
+        endpoint: {{ index .Values.exporters "otlp/tempo" "endpoint" | quote }}
+        tls:
+          insecure: {{ index .Values.exporters "otlp/tempo" "tls" "insecure" }}
+      {{- end }}
+      debug:
+        verbosity: {{ .Values.exporters.debug.verbosity }}
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: {{ toJson .Values.pipelines.traces.receivers }}
+          processors: {{ toJson .Values.pipelines.traces.processors }}
+          exporters: {{ toJson .Values.pipelines.traces.exporters }}
+        metrics:
+          receivers: {{ toJson .Values.pipelines.metrics.receivers }}
+          processors: {{ toJson .Values.pipelines.metrics.processors }}
+          exporters: {{ toJson .Values.pipelines.metrics.exporters }}
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          address: 0.0.0.0:8888

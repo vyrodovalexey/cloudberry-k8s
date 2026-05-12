@@ -3,6 +3,7 @@ package builder
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -103,21 +104,31 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(cluster *cbv1alpha1.Cloudbe
 				},
 				Spec: corev1.PodSpec{
 					InitContainers: []corev1.Container{
-						buildInitContainer(cluster),
+						buildInitContainer(),
 					},
-					Containers: []corev1.Container{
-						buildMainContainer(cluster, port, cluster.Spec.Coordinator.Resources),
-					},
+					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Coordinator.NodeSelector,
 					Tolerations:  convertTolerations(cluster.Spec.Coordinator.Tolerations),
 				},
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				buildPVC(cluster.Spec.Coordinator.Storage, labels),
-			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
 		},
 	}
+
+	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Coordinator.Resources)
+	if err != nil {
+		slog.Error("failed to build coordinator main container", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	pvc, err := buildPVC(cluster.Spec.Coordinator.Storage, labels)
+	if err != nil {
+		slog.Error("failed to build coordinator PVC", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts
@@ -162,18 +173,28 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						buildMainContainer(cluster, port, cluster.Spec.Standby.Resources),
-					},
+					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Standby.NodeSelector,
 				},
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				buildPVC(storage, labels),
-			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
 		},
 	}
+
+	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Standby.Resources)
+	if err != nil {
+		slog.Error("failed to build standby main container", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	pvc, err := buildPVC(storage, labels)
+	if err != nil {
+		slog.Error("failed to build standby PVC", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts
@@ -211,20 +232,30 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						buildMainContainer(cluster, port, cluster.Spec.Segments.Resources),
-					},
+					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Segments.NodeSelector,
 					Tolerations:  convertTolerations(cluster.Spec.Segments.Tolerations),
 					Affinity:     buildSegmentAffinity(cluster, util.ComponentSegmentMirror),
 				},
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				buildPVC(cluster.Spec.Segments.Storage, labels),
-			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
 		},
 	}
+
+	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
+	if err != nil {
+		slog.Error("failed to build segment primary main container", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
+	if err != nil {
+		slog.Error("failed to build segment primary PVC", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts
@@ -266,20 +297,30 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						buildMainContainer(cluster, port, cluster.Spec.Segments.Resources),
-					},
+					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Segments.NodeSelector,
 					Tolerations:  convertTolerations(cluster.Spec.Segments.Tolerations),
 					Affinity:     buildSegmentAffinity(cluster, util.ComponentSegmentPrimary),
 				},
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				buildPVC(cluster.Spec.Segments.Storage, labels),
-			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
 		},
 	}
+
+	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
+	if err != nil {
+		slog.Error("failed to build segment mirror main container", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
+	if err != nil {
+		slog.Error("failed to build segment mirror PVC", "error", err, "cluster", cluster.Name)
+		return nil
+	}
+	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts
@@ -506,7 +547,7 @@ func ownerRef(cluster *cbv1alpha1.CloudberryCluster) metav1.OwnerReference {
 
 // buildInitContainer creates the init container that prepares the data directory.
 // Uses a lightweight busybox image to avoid entrypoint interference from database images.
-func buildInitContainer(_ *cbv1alpha1.CloudberryCluster) corev1.Container {
+func buildInitContainer() corev1.Container {
 	return corev1.Container{
 		Name:  initContainerN,
 		Image: initImage,
@@ -525,11 +566,12 @@ func buildInitContainer(_ *cbv1alpha1.CloudberryCluster) corev1.Container {
 }
 
 // buildMainContainer creates the main database container.
+// Returns an error if resource quantities are invalid.
 func buildMainContainer(
 	cluster *cbv1alpha1.CloudberryCluster,
 	port int32,
 	resources *cbv1alpha1.ResourceRequirements,
-) corev1.Container {
+) (corev1.Container, error) {
 	container := corev1.Container{
 		Name:  containerName,
 		Image: cluster.Spec.Image,
@@ -542,7 +584,17 @@ func buildMainContainer(
 		},
 		Env: []corev1.EnvVar{
 			{Name: "PGDATA", Value: pgDataSubDir},
-			{Name: "POSTGRES_PASSWORD", Value: "changeme"},
+			{
+				Name: "POSTGRES_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: util.AdminPasswordSecretName(cluster.Name),
+						},
+						Key: "password",
+					},
+				},
+			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: dataVolumeName, MountPath: dataVolumePath},
@@ -572,7 +624,11 @@ func buildMainContainer(
 	}
 
 	if resources != nil {
-		container.Resources = convertResources(resources)
+		k8sRes, err := convertResources(resources)
+		if err != nil {
+			return corev1.Container{}, fmt.Errorf("converting resources: %w", err)
+		}
+		container.Resources = k8sRes
 	}
 
 	// Add TLS volume mount if SSL is enabled.
@@ -584,7 +640,7 @@ func buildMainContainer(
 		})
 	}
 
-	return container
+	return container, nil
 }
 
 // buildVolumes creates the volumes for a pod.
@@ -619,7 +675,13 @@ func buildVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume {
 }
 
 // buildPVC creates a PersistentVolumeClaim template.
-func buildPVC(storage cbv1alpha1.StorageSpec, labels map[string]string) corev1.PersistentVolumeClaim {
+// Returns an error if the storage size string is invalid.
+func buildPVC(storage cbv1alpha1.StorageSpec, labels map[string]string) (corev1.PersistentVolumeClaim, error) {
+	storageQty, err := resource.ParseQuantity(storage.Size)
+	if err != nil {
+		return corev1.PersistentVolumeClaim{}, fmt.Errorf("parsing storage size %q: %w", storage.Size, err)
+	}
+
 	pvc := corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dataVolumeName,
@@ -631,7 +693,7 @@ func buildPVC(storage cbv1alpha1.StorageSpec, labels map[string]string) corev1.P
 			},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(storage.Size),
+					corev1.ResourceStorage: storageQty,
 				},
 			},
 		},
@@ -641,7 +703,7 @@ func buildPVC(storage cbv1alpha1.StorageSpec, labels map[string]string) corev1.P
 		pvc.Spec.StorageClassName = &storage.StorageClass
 	}
 
-	return pvc
+	return pvc, nil
 }
 
 // buildSegmentAffinity creates anti-affinity rules for segments.
@@ -686,31 +748,45 @@ func buildSegmentAffinity(
 	}
 }
 
+// parseResourceList converts a CRD ResourceList to a K8s ResourceList.
+func parseResourceList(
+	rv *cbv1alpha1.ResourceList, label string,
+) (corev1.ResourceList, error) {
+	if rv == nil {
+		return nil, nil
+	}
+	rl := corev1.ResourceList{}
+	if rv.CPU != "" {
+		qty, err := resource.ParseQuantity(rv.CPU)
+		if err != nil {
+			return nil, fmt.Errorf("parsing CPU %s %q: %w", label, rv.CPU, err)
+		}
+		rl[corev1.ResourceCPU] = qty
+	}
+	if rv.Memory != "" {
+		qty, err := resource.ParseQuantity(rv.Memory)
+		if err != nil {
+			return nil, fmt.Errorf("parsing memory %s %q: %w", label, rv.Memory, err)
+		}
+		rl[corev1.ResourceMemory] = qty
+	}
+	return rl, nil
+}
+
 // convertResources converts CRD resource requirements to K8s resource requirements.
-func convertResources(res *cbv1alpha1.ResourceRequirements) corev1.ResourceRequirements {
+// Returns an error if any resource quantity string is invalid.
+func convertResources(res *cbv1alpha1.ResourceRequirements) (corev1.ResourceRequirements, error) {
 	k8sRes := corev1.ResourceRequirements{}
 
-	if res.Requests != nil {
-		k8sRes.Requests = corev1.ResourceList{}
-		if res.Requests.CPU != "" {
-			k8sRes.Requests[corev1.ResourceCPU] = resource.MustParse(res.Requests.CPU)
-		}
-		if res.Requests.Memory != "" {
-			k8sRes.Requests[corev1.ResourceMemory] = resource.MustParse(res.Requests.Memory)
-		}
+	var err error
+	if k8sRes.Requests, err = parseResourceList(res.Requests, "request"); err != nil {
+		return k8sRes, err
+	}
+	if k8sRes.Limits, err = parseResourceList(res.Limits, "limit"); err != nil {
+		return k8sRes, err
 	}
 
-	if res.Limits != nil {
-		k8sRes.Limits = corev1.ResourceList{}
-		if res.Limits.CPU != "" {
-			k8sRes.Limits[corev1.ResourceCPU] = resource.MustParse(res.Limits.CPU)
-		}
-		if res.Limits.Memory != "" {
-			k8sRes.Limits[corev1.ResourceMemory] = resource.MustParse(res.Limits.Memory)
-		}
-	}
-
-	return k8sRes
+	return k8sRes, nil
 }
 
 // convertTolerations converts CRD tolerations to K8s tolerations.

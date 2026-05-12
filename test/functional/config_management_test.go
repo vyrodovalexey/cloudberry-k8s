@@ -48,6 +48,7 @@ func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_AppliesParameters
 	cluster := testutil.NewClusterBuilder("test-config", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithConfig(map[string]string{
 			"shared_buffers":  "256MB",
 			"work_mem":        "64MB",
@@ -84,6 +85,7 @@ func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_DetectsChanges() 
 	cluster := testutil.NewClusterBuilder("test-config-change", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithConfig(map[string]string{
 			"shared_buffers": "128MB",
 		}).

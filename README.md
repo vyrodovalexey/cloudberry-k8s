@@ -38,9 +38,14 @@ A Kubernetes operator for managing the full lifecycle of [Cloudberry Database](h
 │  │  │         (controller-runtime / kubebuilder)           │  │  │
 │  │  └─────────────────────────────────────────────────────┘  │  │
 │  │                                                           │  │
+│  │  ┌──────────────────────────────────────────────────────┐ │  │
+│  │  │  REST API Server (:8090)                             │ │  │
+│  │  │  Rate Limiter → Auth Middleware → Handlers           │ │  │
+│  │  └──────────────────────────────────────────────────────┘ │  │
+│  │                                                           │  │
 │  │  ┌──────────┐  ┌───────────┐  ┌────────────────────────┐ │  │
 │  │  │ Metrics  │  │ Telemetry │  │   Auth Middleware      │ │  │
-│  │  │ (Prom)   │  │  (OTLP)   │  │  (Basic + OIDC/JWT)   │ │  │
+│  │  │ (Prom)   │  │  (OTLP)   │  │ (bcrypt + OIDC/JWT)   │ │  │
 │  │  └──────────┘  └───────────┘  └────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
@@ -162,7 +167,7 @@ cloudberry-ctl cluster status --cluster my-cluster --namespace cloudberry-test
 |-------------|---------|
 | Kubernetes | >= 1.26 |
 | Helm | >= 3.x |
-| Go (for building) | >= 1.23 |
+| Go (for building) | >= 1.26.3 |
 | kubectl | >= 1.26 |
 
 Optional:
@@ -320,9 +325,12 @@ Key configuration options in `values.yaml`:
 | `image.repository` | Operator image | `cloudberry-operator` |
 | `operator.logLevel` | Log level | `info` |
 | `operator.leaderElection` | Enable leader election | `true` |
+| `operator.apiAddress` | REST API bind address | `:8090` |
+| `operator.webhookEnabled` | Enable admission webhooks | `false` |
 | `vault.enabled` | Enable Vault integration | `false` |
 | `oidc.enabled` | Enable OIDC authentication | `false` |
 | `telemetry.enabled` | Enable OTLP tracing | `false` |
+| `telemetry.otlpInsecure` | Disable TLS for OTLP exporter | `false` |
 | `metrics.enabled` | Enable Prometheus metrics | `true` |
 | `webhook.enabled` | Enable admission webhooks | `true` |
 
@@ -373,12 +381,13 @@ cloudberry-k8s/
 │   ├── operator/          # Operator entry point
 │   └── cloudberry-ctl/    # CLI entry point
 ├── internal/
-│   ├── api/               # REST API server
-│   ├── auth/              # Authentication providers and middleware
+│   ├── api/               # REST API server with rate limiting
+│   ├── auth/              # Authentication providers (bcrypt, OIDC/JWT)
 │   ├── builder/           # Kubernetes resource builders
 │   ├── config/            # Operator configuration
 │   ├── controller/        # Reconciliation controllers
-│   ├── db/                # Database client (pgx)
+│   ├── ctl/               # Operator API client for cloudberry-ctl
+│   ├── db/                # Database client (pgx) and client factory
 │   ├── metrics/           # Prometheus metrics
 │   ├── telemetry/         # OpenTelemetry tracing
 │   ├── util/              # Shared utilities

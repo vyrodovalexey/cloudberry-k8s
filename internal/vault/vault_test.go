@@ -2,8 +2,11 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -434,4 +437,650 @@ func TestConfig_Fields(t *testing.T) {
 	assert.Equal(t, "kubernetes", cfg.AuthMethod)
 	assert.Equal(t, "cloudberry", cfg.Role)
 	assert.Equal(t, 5, cfg.RetryOpts.MaxRetries)
+}
+
+func TestNewClient_TokenAuth_WithMockServer(t *testing.T) {
+	// Create a mock Vault server that accepts token auth
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.True(t, client.IsEnabled())
+}
+
+func TestVaultClient_ReadSecret_WithMockServer(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"data": {
+					"username": "admin",
+					"password": "secret123"
+				},
+				"metadata": {
+					"version": 1
+				}
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/test")
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	assert.Equal(t, "admin", data["username"])
+	assert.Equal(t, "secret123", data["password"])
+}
+
+func TestVaultClient_ReadSecret_NotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/missing", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/missing")
+	assert.Error(t, err)
+	assert.Nil(t, data)
+}
+
+func TestVaultClient_WriteSecret_WithMockServer(t *testing.T) {
+	var receivedData map[string]interface{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			receivedData = body
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"version":1}}`))
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	err = client.WriteSecret(context.Background(), "secret/data/test", map[string]interface{}{
+		"username": "admin",
+		"password": "new-secret",
+	})
+	require.NoError(t, err)
+
+	// Verify KV v2 data wrapping
+	require.NotNil(t, receivedData)
+	dataField, ok := receivedData["data"]
+	assert.True(t, ok, "data should be wrapped in 'data' key for KV v2")
+	dataMap, ok := dataField.(map[string]interface{})
+	assert.True(t, ok)
+	assert.Equal(t, "admin", dataMap["username"])
+}
+
+func TestVaultClient_ReadSecret_NonKVv2(t *testing.T) {
+	// Test reading a secret that is NOT KV v2 (no nested "data" key)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/test", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"username": "admin",
+				"password": "secret123"
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/test")
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	// When data doesn't have a nested "data" key, it returns the raw data
+	assert.Equal(t, "admin", data["username"])
+}
+
+func TestVaultClient_AppRoleAuth_WithMockServer(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/approle/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"auth": {
+				"client_token": "s.approle-token",
+				"policies": ["default"]
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "approle",
+		Role:       "my-role-id",
+		Token:      "my-secret-id",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.True(t, client.IsEnabled())
+}
+
+func TestVaultClient_AppRoleAuth_CustomPath(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/custom-approle/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"auth": {
+				"client_token": "s.custom-token",
+				"policies": ["default"]
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "approle",
+		AuthPath:   "auth/custom-approle",
+		Role:       "my-role-id",
+		Token:      "my-secret-id",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestVaultClient_AppRoleAuth_NoAuthData(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/approle/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "approle",
+		Role:       "my-role-id",
+		Token:      "my-secret-id",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "no auth data")
+}
+
+func TestNewClient_InvalidTLSCACert(t *testing.T) {
+	cfg := Config{
+		Enabled:    true,
+		Address:    "https://127.0.0.1:8200",
+		AuthMethod: "token",
+		Token:      "s.test",
+		TLSCACert:  "/nonexistent/ca.pem",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "configuring vault TLS")
+}
+
+func TestVaultClient_WriteSecret_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	err = client.WriteSecret(context.Background(), "secret/data/test", map[string]interface{}{
+		"key": "value",
+	})
+	assert.Error(t, err)
+}
+
+func TestVaultClient_IsEnabled(t *testing.T) {
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	assert.True(t, client.IsEnabled())
+}
+
+func TestVaultClient_ReadSecret_ContextCancelled(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(5 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = client.ReadSecret(ctx, "secret/data/test")
+	assert.Error(t, err)
+}
+
+func TestNewClient_KubernetesAuth_CustomPath(t *testing.T) {
+	// This tests the kubernetes auth path resolution with custom auth path
+	// It will fail because the service account token file doesn't exist
+	cfg := Config{
+		Enabled:    true,
+		Address:    "http://127.0.0.1:8200",
+		AuthMethod: "kubernetes",
+		AuthPath:   "auth/custom-k8s",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, client)
+}
+
+func TestNewClient_DefaultRetryOpts(t *testing.T) {
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test",
+		RetryOpts:  util.RetryOptions{MaxRetries: 0}, // Should use defaults
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestSecretWatcher_Watch_WithChanges(t *testing.T) {
+	callCount := 0
+	readCount := 0
+	client := &changingMockClient{
+		readFunc: func() (map[string]interface{}, error) {
+			readCount++
+			return map[string]interface{}{"key": fmt.Sprintf("value-%d", readCount)}, nil
+		},
+	}
+
+	onChange := func(_ map[string]interface{}) {
+		callCount++
+	}
+
+	watcher := NewSecretWatcher(client, "secret/path", 30*time.Millisecond, onChange, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	watcher.Watch(ctx)
+
+	// Should have detected at least one change (first read sets hash, subsequent reads detect changes)
+	assert.Greater(t, readCount, 1)
+}
+
+// changingMockClient returns different data on each read.
+type changingMockClient struct {
+	readFunc func() (map[string]interface{}, error)
+}
+
+func (c *changingMockClient) ReadSecret(_ context.Context, _ string) (map[string]interface{}, error) {
+	return c.readFunc()
+}
+
+func (c *changingMockClient) WriteSecret(_ context.Context, _ string, _ map[string]interface{}) error {
+	return nil
+}
+
+func (c *changingMockClient) IsEnabled() bool {
+	return true
+}
+
+func TestSecretWatcher_Watch_ContextAlreadyCancelled(t *testing.T) {
+	client := &noopClient{}
+	onChange := func(_ map[string]interface{}) {}
+
+	watcher := NewSecretWatcher(client, "secret/path", time.Minute, onChange, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately.
+
+	done := make(chan struct{})
+	go func() {
+		watcher.Watch(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - Watch returned immediately.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Watch did not return after context was already cancelled")
+	}
+}
+
+func TestVaultClient_ReadSecret_ServerError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/error", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"errors":["internal server error"]}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/error")
+	assert.Error(t, err)
+	assert.Nil(t, data)
+}
+
+func TestVaultClient_WriteSecret_ContextCancelled(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/slow", func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(5 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err = client.WriteSecret(ctx, "secret/data/slow", map[string]interface{}{"key": "value"})
+	assert.Error(t, err)
+}
+
+func TestNewClient_WithLogger(t *testing.T) {
+	cfg := Config{Enabled: false}
+	logger := slog.Default()
+	client, err := NewClient(context.Background(), cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestVaultClient_ReadSecret_KVv2DataWrapping(t *testing.T) {
+	// Test that KV v2 data is properly unwrapped from the "data" key.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/kvv2", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := map[string]interface{}{
+			"data": map[string]interface{}{
+				"data": map[string]interface{}{
+					"db_user":     "admin",
+					"db_password": "secret",
+				},
+				"metadata": map[string]interface{}{
+					"version": 3,
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/kvv2")
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	assert.Equal(t, "admin", data["db_user"])
+	assert.Equal(t, "secret", data["db_password"])
+}
+
+func TestVaultClient_WriteSecret_KVv2DataWrapping(t *testing.T) {
+	// Verify that WriteSecret wraps data in "data" key for KV v2.
+	var receivedBody map[string]interface{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/kvv2-write", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"version":1}}`))
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	require.NoError(t, err)
+
+	err = client.WriteSecret(context.Background(), "secret/data/kvv2-write", map[string]interface{}{
+		"key1": "val1",
+		"key2": "val2",
+	})
+	require.NoError(t, err)
+
+	// Verify the data was wrapped.
+	require.NotNil(t, receivedBody)
+	dataField, ok := receivedBody["data"].(map[string]interface{})
+	require.True(t, ok, "data should be wrapped in 'data' key")
+	assert.Equal(t, "val1", dataField["key1"])
+	assert.Equal(t, "val2", dataField["key2"])
+}
+
+func TestNewClient_NilLogger(t *testing.T) {
+	// Test that NewClient works with nil logger.
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestVaultClient_ReadSecret_EmptyData(t *testing.T) {
+	// Test reading a secret that returns empty data.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/empty", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Return a response with nil data (simulates deleted secret).
+		_, _ = w.Write([]byte(`{}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/empty")
+	assert.Error(t, err)
+	assert.Nil(t, data)
+	assert.Contains(t, err.Error(), "secret not found")
+}
+
+func TestSecretWatcher_CheckForChanges_MultipleChanges(t *testing.T) {
+	callCount := 0
+	var lastData map[string]interface{}
+	onChange := func(data map[string]interface{}) {
+		callCount++
+		lastData = data
+	}
+
+	readCount := 0
+	client := &changingMockClient{
+		readFunc: func() (map[string]interface{}, error) {
+			readCount++
+			return map[string]interface{}{"version": fmt.Sprintf("%d", readCount)}, nil
+		},
+	}
+
+	watcher := NewSecretWatcher(client, "secret/path", time.Minute, onChange, slog.Default())
+
+	// First check sets hash.
+	watcher.checkForChanges(context.Background())
+	assert.Equal(t, 0, callCount)
+
+	// Second check detects change.
+	watcher.checkForChanges(context.Background())
+	assert.Equal(t, 1, callCount)
+	assert.NotNil(t, lastData)
+
+	// Third check detects another change.
+	watcher.checkForChanges(context.Background())
+	assert.Equal(t, 2, callCount)
 }

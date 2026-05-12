@@ -68,9 +68,9 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_BackendRealmExists()
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	err := s.keycloak.CheckRealmExists(ctx, "backend-test")
+	err := s.keycloak.CheckRealmExists(ctx, "test")
 	if err != nil {
-		s.T().Skipf("backend-test realm not found (run setup-keycloak.sh first): %v", err)
+		s.T().Skipf("test realm not found (run setup-keycloak.sh first): %v", err)
 	}
 }
 
@@ -78,9 +78,10 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_GatewayRealmExists()
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	err := s.keycloak.CheckRealmExists(ctx, "gateway-test")
+	// The test realm serves both backend and gateway purposes.
+	err := s.keycloak.CheckRealmExists(ctx, "test")
 	if err != nil {
-		s.T().Skipf("gateway-test realm not found (run setup-keycloak.sh first): %v", err)
+		s.T().Skipf("test realm not found (run setup-keycloak.sh first): %v", err)
 	}
 }
 
@@ -89,12 +90,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_ClientCredentialsGra
 	defer cancel()
 
 	// Check realm exists first
-	if err := s.keycloak.CheckRealmExists(ctx, "backend-test"); err != nil {
-		s.T().Skipf("backend-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	tokenResp, err := s.keycloak.GetClientCredentialsToken(
-		ctx, "backend-test", "gateway-backend", "gateway-backend-secret",
+		ctx, "test", "cloudberry-operator", "some-secret",
 	)
 	require.NoError(s.T(), err, "should obtain client credentials token")
 	require.NotNil(s.T(), tokenResp)
@@ -108,12 +109,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_PasswordGrant() {
 	defer cancel()
 
 	// Check realm exists first
-	if err := s.keycloak.CheckRealmExists(ctx, "gateway-test"); err != nil {
-		s.T().Skipf("gateway-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	tokenResp, err := s.keycloak.GetPasswordToken(
-		ctx, "gateway-test", "gateway", "gateway-secret", "testuser", "testpass",
+		ctx, "test", "cloudberry-operator", "some-secret", "testuser", "testpass",
 	)
 	require.NoError(s.T(), err, "should obtain password grant token")
 	require.NotNil(s.T(), tokenResp)
@@ -124,12 +125,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_PasswordGrant_Invali
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "gateway-test"); err != nil {
-		s.T().Skipf("gateway-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	_, err := s.keycloak.GetPasswordToken(
-		ctx, "gateway-test", "gateway", "gateway-secret", "testuser", "wrongpassword",
+		ctx, "test", "cloudberry-operator", "some-secret", "testuser", "wrongpassword",
 	)
 	assert.Error(s.T(), err, "should fail with invalid credentials")
 }
@@ -138,12 +139,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_PasswordGrant_AdminU
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "gateway-test"); err != nil {
-		s.T().Skipf("gateway-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	tokenResp, err := s.keycloak.GetPasswordToken(
-		ctx, "gateway-test", "gateway", "gateway-secret", "adminuser", "adminpass",
+		ctx, "test", "cloudberry-operator", "some-secret", "adminuser", "adminpass",
 	)
 	require.NoError(s.T(), err, "should obtain token for admin user")
 	assert.NotEmpty(s.T(), tokenResp.AccessToken)
@@ -153,12 +154,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_PasswordGrant_Reader
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "gateway-test"); err != nil {
-		s.T().Skipf("gateway-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	tokenResp, err := s.keycloak.GetPasswordToken(
-		ctx, "gateway-test", "gateway", "gateway-secret", "reader", "readerpass",
+		ctx, "test", "cloudberry-operator", "some-secret", "reader", "readerpass",
 	)
 	require.NoError(s.T(), err, "should obtain token for reader user")
 	assert.NotEmpty(s.T(), tokenResp.AccessToken)
@@ -168,11 +169,11 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_OIDCDiscovery_Backen
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "backend-test"); err != nil {
-		s.T().Skipf("backend-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
-	discovery, err := s.keycloak.GetOIDCDiscovery(ctx, "backend-test")
+	discovery, err := s.keycloak.GetOIDCDiscovery(ctx, "test")
 	require.NoError(s.T(), err, "should get OIDC discovery document")
 	require.NotNil(s.T(), discovery)
 
@@ -187,11 +188,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_OIDCDiscovery_Gatewa
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "gateway-test"); err != nil {
-		s.T().Skipf("gateway-test realm not found: %v", err)
+	// The test realm serves both backend and gateway purposes.
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
-	discovery, err := s.keycloak.GetOIDCDiscovery(ctx, "gateway-test")
+	discovery, err := s.keycloak.GetOIDCDiscovery(ctx, "test")
 	require.NoError(s.T(), err, "should get OIDC discovery document")
 	require.NotNil(s.T(), discovery)
 
@@ -203,19 +205,19 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_TokenIntrospection()
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "backend-test"); err != nil {
-		s.T().Skipf("backend-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	// Get a token first
 	tokenResp, err := s.keycloak.GetClientCredentialsToken(
-		ctx, "backend-test", "gateway-backend", "gateway-backend-secret",
+		ctx, "test", "cloudberry-operator", "some-secret",
 	)
 	require.NoError(s.T(), err)
 
 	// Introspect the token
 	introspection, err := s.keycloak.IntrospectToken(
-		ctx, "backend-test", "gateway-backend", "gateway-backend-secret", tokenResp.AccessToken,
+		ctx, "test", "cloudberry-operator", "some-secret", tokenResp.AccessToken,
 	)
 	require.NoError(s.T(), err, "should introspect token")
 	require.NotNil(s.T(), introspection)
@@ -229,12 +231,12 @@ func (s *KeycloakIntegrationSuite) TestIntegration_Keycloak_InvalidClientCredent
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 
-	if err := s.keycloak.CheckRealmExists(ctx, "backend-test"); err != nil {
-		s.T().Skipf("backend-test realm not found: %v", err)
+	if err := s.keycloak.CheckRealmExists(ctx, "test"); err != nil {
+		s.T().Skipf("test realm not found: %v", err)
 	}
 
 	_, err := s.keycloak.GetClientCredentialsToken(
-		ctx, "backend-test", "gateway-backend", "wrong-secret",
+		ctx, "test", "cloudberry-operator", "wrong-secret",
 	)
 	assert.Error(s.T(), err, "should fail with invalid client secret")
 }

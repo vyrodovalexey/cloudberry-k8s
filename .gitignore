@@ -27,7 +27,6 @@ test/docker-compose/certs/
 !vendor/**/zz_generated.*
 orig_docs
 gp_docs
-docs
 functions
 md_docs
 # editor, robots, and IDE paraphernalia

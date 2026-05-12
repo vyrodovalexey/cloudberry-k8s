@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTruncateName(t *testing.T) {
@@ -236,4 +237,20 @@ func TestRemoveString(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestGenerateRandomPassword(t *testing.T) {
+	password, err := GenerateRandomPassword()
+	require.NoError(t, err)
+	assert.Len(t, password, defaultPasswordLength)
+
+	// Verify all characters are from the allowed set.
+	for _, c := range password {
+		assert.Contains(t, passwordChars, string(c))
+	}
+
+	// Verify two generated passwords are different (probabilistic but extremely unlikely to fail).
+	password2, err := GenerateRandomPassword()
+	require.NoError(t, err)
+	assert.NotEqual(t, password, password2)
 }

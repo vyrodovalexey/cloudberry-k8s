@@ -31,6 +31,9 @@ type Config struct {
 	OTLPEndpoint string
 	// OTLPProtocol is the OTLP exporter protocol (grpc, http).
 	OTLPProtocol string
+	// OTLPInsecure controls whether OTLP exporters use insecure (plaintext) connections.
+	// When true, TLS is disabled for the OTLP exporter.
+	OTLPInsecure bool
 	// SamplingRate is the trace sampling rate (0.0 to 1.0).
 	SamplingRate float64
 	// ServiceName is the service name for traces.
@@ -87,18 +90,25 @@ func InitTracer(ctx context.Context, cfg Config) (ShutdownFunc, error) {
 }
 
 // createExporter creates the appropriate OTLP exporter based on protocol.
+// TLS is used by default; insecure (plaintext) connections are only used when OTLPInsecure is true.
 func createExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error) {
 	switch cfg.OTLPProtocol {
 	case protocolHTTP:
-		return otlptracehttp.New(ctx,
+		opts := []otlptracehttp.Option{
 			otlptracehttp.WithEndpoint(cfg.OTLPEndpoint),
-			otlptracehttp.WithInsecure(),
-		)
+		}
+		if cfg.OTLPInsecure {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
+		return otlptracehttp.New(ctx, opts...)
 	default:
-		return otlptracegrpc.New(ctx,
+		opts := []otlptracegrpc.Option{
 			otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
-			otlptracegrpc.WithInsecure(),
-		)
+		}
+		if cfg.OTLPInsecure {
+			opts = append(opts, otlptracegrpc.WithInsecure())
+		}
+		return otlptracegrpc.New(ctx, opts...)
 	}
 }
 

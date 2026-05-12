@@ -75,6 +75,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RunsFTSProbe_AllHealthy()
 	cluster := testutil.NewClusterBuilder("test-ha-fts-healthy", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithMirroring(true, cbv1alpha1.MirroringLayoutGroup).
 		WithHA(60, 20, 5).
 		Build()
@@ -111,6 +112,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RunsFTSProbe_DegradedSegm
 	cluster := testutil.NewClusterBuilder("test-ha-fts-degraded", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithMirroring(true, cbv1alpha1.MirroringLayoutGroup).
 		WithHA(60, 20, 5).
 		Build()

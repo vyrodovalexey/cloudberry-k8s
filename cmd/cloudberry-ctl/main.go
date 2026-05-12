@@ -2,17 +2,23 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/ctl"
 )
 
-const (
-	appName    = "cloudberry-ctl"
-	appVersion = "1.0.0"
-)
+const appName = "cloudberry-ctl"
+
+// version is set via ldflags at build time (e.g. -X main.version=...).
+var version = "dev" //nolint:gochecknoglobals // set by ldflags
 
 // Exit codes.
 const (
@@ -56,8 +62,115 @@ var globals globalFlags
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
+		var apiErr *ctl.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.StatusCode {
+			case http.StatusUnauthorized:
+				os.Exit(exitAuthFailure)
+			case http.StatusForbidden:
+				os.Exit(exitPermissionDenied)
+			case http.StatusNotFound:
+				os.Exit(exitClusterNotFound)
+			case http.StatusRequestTimeout:
+				os.Exit(exitTimeout)
+			case http.StatusTooManyRequests:
+				os.Exit(exitTimeout)
+			default:
+				os.Exit(exitGeneralError)
+			}
+		}
 		os.Exit(exitGeneralError)
 	}
+}
+
+// newClient creates an OperatorClient from the global flags.
+func newClient() (*ctl.OperatorClient, error) {
+	if globals.operatorURL == "" {
+		return nil, fmt.Errorf("operator URL is required (set --operator-url or CLOUDBERRY_OPERATOR_URL)")
+	}
+
+	timeout, err := time.ParseDuration(globals.timeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timeout %q: %w", globals.timeout, err)
+	}
+
+	return ctl.NewOperatorClient(ctl.ClientConfig{
+		BaseURL:    globals.operatorURL,
+		Username:   globals.username,
+		Password:   globals.password,
+		AuthMethod: globals.authMethod,
+		Timeout:    timeout,
+	}), nil
+}
+
+// newFormatter creates a Formatter from the global flags.
+func newFormatter() *ctl.Formatter {
+	return ctl.NewFormatter(globals.output, os.Stdout)
+}
+
+// requireCluster returns an error if the cluster flag is not set.
+func requireCluster() error {
+	if globals.cluster == "" {
+		return fmt.Errorf("cluster name is required (set --cluster or CLOUDBERRY_CLUSTER)")
+	}
+	return nil
+}
+
+// cmdContext creates a context with the configured timeout.
+func cmdContext() (context.Context, context.CancelFunc) {
+	timeout, err := time.ParseDuration(globals.timeout)
+	if err != nil {
+		timeout = 5 * time.Minute
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+// runAPIGet is a helper that creates a client, performs a GET request, and formats the output.
+func runAPIGet(path string) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	resp, apiErr := client.Get(ctx, path)
+	if apiErr != nil {
+		return apiErr
+	}
+	return newFormatter().Format(resp.Body)
+}
+
+// runAPIPost is a helper that creates a client, performs a POST request, and formats the output.
+func runAPIPost(path string, body interface{}) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	resp, apiErr := client.Post(ctx, path, body)
+	if apiErr != nil {
+		return apiErr
+	}
+	return newFormatter().Format(resp.Body)
+}
+
+// runAPIDelete is a helper that creates a client, performs a DELETE request, and formats the output.
+func runAPIDelete(path string) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	resp, apiErr := client.Delete(ctx, path)
+	if apiErr != nil {
+		return apiErr
+	}
+	return newFormatter().Format(resp.Body)
 }
 
 // newRootCmd creates the root command.
@@ -138,7 +251,15 @@ func bindEnvVars() {
 	}
 }
 
-// initConfig reads the config file.
+// setIfEmpty sets dst to the viper value for key when dst still holds its
+// default value.
+func setIfEmpty(dst *string, key, defaultVal string) {
+	if v := viper.GetString(key); v != "" && *dst == defaultVal {
+		*dst = v
+	}
+}
+
+// initConfig reads the config file and applies viper values to global flags.
 func initConfig() {
 	viper.SetConfigName(".cloudberry-ctl")
 	viper.SetConfigType("yaml")
@@ -148,13 +269,17 @@ func initConfig() {
 	// Config file is optional.
 	_ = viper.ReadInConfig()
 
-	// Apply env overrides.
-	if v := viper.GetString("cluster"); v != "" && globals.cluster == "" {
-		globals.cluster = v
-	}
-	if v := viper.GetString("namespace"); v != "" && globals.namespace == "cloudberry-test" {
-		globals.namespace = v
-	}
+	// Apply all viper values to globals struct.
+	// Environment variables (set in bindEnvVars) take priority over config
+	// file values.
+	setIfEmpty(&globals.cluster, "cluster", "")
+	setIfEmpty(&globals.namespace, "namespace", "cloudberry-test")
+	setIfEmpty(&globals.operatorURL, "operator-url", "")
+	setIfEmpty(&globals.authMethod, "auth-method", "basic")
+	setIfEmpty(&globals.username, "username", "")
+	setIfEmpty(&globals.password, "password", "")
+	setIfEmpty(&globals.timeout, "timeout", "5m")
+	setIfEmpty(&globals.output, "output", "table")
 }
 
 // newVersionCmd creates the version command.
@@ -163,7 +288,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Show version information",
 		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Fprintf(os.Stdout, "%s version %s\n", appName, appVersion)
+			fmt.Fprintf(os.Stdout, "%s version %s\n", appName, version)
 		},
 	}
 }
@@ -202,54 +327,66 @@ func newClusterCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show cluster status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Cluster status: (requires operator connection)")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterStatusPath(globals.cluster, globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStart,
 			Short: "Start cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Starting cluster...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "start", globals.namespace), nil)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStop,
 			Short: "Stop cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Stopping cluster...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "stop", globals.namespace), nil)
 			},
 		},
 		&cobra.Command{
 			Use:   "restart",
 			Short: "Restart cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Restarting cluster...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "restart", globals.namespace), nil)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdCreate,
 			Short: "Create cluster from spec",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Creating cluster...")
-				return nil
+				return runAPIPost(ctl.ClustersPath(), nil)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdDelete,
 			Short: "Delete cluster",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Deleting cluster...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIDelete(ctl.ClusterPath(globals.cluster, globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "upgrade",
 			Short: "Upgrade cluster version",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Upgrading cluster...")
 				return nil
 			},
@@ -271,22 +408,48 @@ func newConfigCmd() *cobra.Command {
 			Use:   "get",
 			Short: "Get parameter value(s)",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Getting configuration...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "config", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "set",
 			Short: "Set parameter value",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Setting parameter...")
-				return nil
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				if len(args) < 2 {
+					return fmt.Errorf("usage: config set <key> <value>")
+				}
+				body := map[string]interface{}{
+					"parameters": map[string]string{args[0]: args[1]},
+				}
+				client, err := newClient()
+				if err != nil {
+					return err
+				}
+				ctx, cancel := cmdContext()
+				defer cancel()
+				configPath := ctl.ClusterSubresourcePath(
+					globals.cluster, "config", globals.namespace,
+				)
+				resp, apiErr := client.Put(ctx, configPath, body)
+				if apiErr != nil {
+					return apiErr
+				}
+				return newFormatter().Format(resp.Body)
 			},
 		},
 		&cobra.Command{
 			Use:   "reset",
 			Short: "Reset parameter to default",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Resetting parameter...")
 				return nil
 			},
@@ -295,8 +458,10 @@ func newConfigCmd() *cobra.Command {
 			Use:   "reload",
 			Short: "Reload configuration",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Reloading configuration...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "reload", globals.namespace), nil)
 			},
 		},
 		newHBACmd(),
@@ -354,24 +519,30 @@ func newSegmentsCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List all segments",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing segments...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "segments", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show segment status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Segment status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "segments", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "inspect",
 			Short: "Detailed segment info",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Inspecting segment...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "segments", globals.namespace))
 			},
 		},
 	)
@@ -395,8 +566,10 @@ func newHACmd() *cobra.Command {
 			Use:   "rebalance",
 			Short: "Rebalance segments",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Rebalancing segments...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "rebalance", globals.namespace), nil)
 			},
 		},
 	)
@@ -416,14 +589,19 @@ func newMirroringCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show mirroring status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Mirroring status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "mirroring", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "enable",
 			Short: "Enable mirroring",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Enabling mirroring...")
 				return nil
 			},
@@ -432,6 +610,9 @@ func newMirroringCmd() *cobra.Command {
 			Use:   "disable",
 			Short: "Disable mirroring",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Disabling mirroring...")
 				return nil
 			},
@@ -453,22 +634,30 @@ func newRecoveryCmd() *cobra.Command {
 			Use:   cmdStart,
 			Short: "Start recovery",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Starting recovery...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				body := map[string]string{"type": "incremental"}
+				return runAPIPost(ctl.ClusterSubresourcePath(globals.cluster, "recovery", globals.namespace), body)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show recovery status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Recovery status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterStatusPath(globals.cluster, globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "cancel",
 			Short: "Cancel recovery",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Canceling recovery...")
 				return nil
 			},
@@ -490,22 +679,32 @@ func newStandbyCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show standby status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Standby status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "standby", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "activate",
 			Short: "Activate standby",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Activating standby...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "standby/activate", globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 		&cobra.Command{
 			Use:   "reinitialize",
 			Short: "Reinitialize standby",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Reinitializing standby...")
 				return nil
 			},
@@ -514,6 +713,9 @@ func newStandbyCmd() *cobra.Command {
 			Use:   "restore-roles",
 			Short: "Restore original roles",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Restoring roles...")
 				return nil
 			},
@@ -564,24 +766,40 @@ func newSessionsCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List active sessions",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing sessions...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "sessions", globals.namespace))
 			},
 		},
 		&cobra.Command{
-			Use:   "cancel-query",
+			Use:   "cancel-query [pid]",
 			Short: "Cancel running query",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Canceling query...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/sessions/%s/cancel", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIPost(path, nil)
 			},
 		},
 		&cobra.Command{
-			Use:   "terminate",
+			Use:   "terminate [pid]",
 			Short: "Terminate session",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Terminating session...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/sessions/%s", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIDelete(path)
 			},
 		},
 	)
@@ -601,30 +819,48 @@ func newMaintenanceCmd() *cobra.Command {
 			Use:   "vacuum",
 			Short: "Run vacuum",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Running vacuum...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "maintenance/vacuum", globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 		&cobra.Command{
 			Use:   "analyze",
 			Short: "Run analyze",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Running analyze...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "maintenance/analyze", globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 		&cobra.Command{
 			Use:   "reindex",
 			Short: "Run reindex",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Running reindex...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "maintenance/reindex", globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 		&cobra.Command{
 			Use:   "check-catalog",
 			Short: "Run catalog check",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Running catalog check...")
 				return nil
 			},
@@ -633,6 +869,9 @@ func newMaintenanceCmd() *cobra.Command {
 			Use:   "jobs",
 			Short: "List maintenance jobs",
 			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stdout, "Listing maintenance jobs...")
 				return nil
 			},
@@ -745,55 +984,76 @@ func newInspectCmd() *cobra.Command {
 			Use:   "disk-usage",
 			Short: "Show disk usage",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Disk usage...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/disk-usage", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "skew",
 			Short: "Show data distribution skew",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Data skew...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "storage/recommendations", globals.namespace,
+				)
+				return runAPIGet(p)
 			},
 		},
 		&cobra.Command{
 			Use:   "bloat",
 			Short: "Show table bloat",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Table bloat...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "storage/recommendations", globals.namespace,
+				)
+				return runAPIGet(p)
 			},
 		},
 		&cobra.Command{
 			Use:   "missing-stats",
 			Short: "Show tables missing stats",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Missing stats...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/tables", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "connections",
 			Short: "Show connection info",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Connection info...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "sessions", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "locks",
 			Short: "Show lock info",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Lock info...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "sessions", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "logs",
 			Short: "View server logs",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Server logs...")
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				fmt.Fprintln(os.Stdout, "Server logs require direct pod access")
 				return nil
 			},
 		},
@@ -867,24 +1127,30 @@ func newWorkloadCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show workload management status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Workload management status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "workload", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "rules",
 			Short: "List workload rules",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing workload rules...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "workload/rules", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "idle-rules",
 			Short: "List idle session rules",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing idle session rules...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "workload", globals.namespace))
 			},
 		},
 	)
@@ -904,32 +1170,40 @@ func newQueryCmd() *cobra.Command {
 			Use:   "active",
 			Short: "Show active queries",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Active queries...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries/active", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "slow",
 			Short: "Show slow queries",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Slow queries...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "history",
 			Short: "Show query history",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Query history...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show query monitoring status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Query monitoring status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries", globals.namespace))
 			},
 		},
 	)
@@ -949,47 +1223,70 @@ func newBackupCmd() *cobra.Command {
 			Use:   cmdCreate,
 			Short: "Create a new backup",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Creating backup...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace), nil)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdList,
 			Short: "List available backups",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing backups...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
 			},
 		},
 		&cobra.Command{
-			Use:   cmdDelete,
+			Use:   cmdDelete + " [backup-id]",
 			Short: "Delete a backup",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Deleting backup...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/backups/%s", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIDelete(path)
 			},
 		},
 		&cobra.Command{
-			Use:   "restore",
+			Use:   "restore [backup-id]",
 			Short: "Restore from a backup",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Restoring from backup...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/backups/%s/restore", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIPost(path, nil)
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show backup status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Backup status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   "schedule",
 			Short: "Manage backup schedule",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Backup schedule...")
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				fmt.Fprintln(os.Stdout, "Backup schedule management requires cluster spec update")
 				return nil
 			},
 		},
@@ -1015,16 +1312,25 @@ func newStorageCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List tables with storage info",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing tables...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/tables", globals.namespace))
 			},
 		},
 		&cobra.Command{
-			Use:   "detail",
+			Use:   "detail [schema] [table]",
 			Short: "Show table detail",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Table detail...")
-				return nil
+			Args:  cobra.ExactArgs(2),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/storage/tables/%s/%s", globals.cluster, args[0], args[1])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIGet(path)
 			},
 		},
 	)
@@ -1039,16 +1345,28 @@ func newStorageCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List recommendations",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing recommendations...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "storage/recommendations",
+					globals.namespace,
+				)
+				return runAPIGet(p)
 			},
 		},
 		&cobra.Command{
 			Use:   "scan",
 			Short: "Trigger recommendation scan",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Triggering recommendation scan...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "storage/recommendations/scan",
+					globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 	)
@@ -1058,8 +1376,10 @@ func newStorageCmd() *cobra.Command {
 			Use:   "disk-usage",
 			Short: "Show disk usage",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Disk usage...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/disk-usage", globals.namespace))
 			},
 		},
 		tablesCmd,
@@ -1068,8 +1388,10 @@ func newStorageCmd() *cobra.Command {
 			Use:   "usage-report",
 			Short: "Show usage report",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Usage report...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/usage-report", globals.namespace))
 			},
 		},
 	)
@@ -1094,40 +1416,69 @@ func newDataLoadingCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List data loading jobs",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing data loading jobs...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "data-loading/jobs", globals.namespace))
 			},
 		},
 		&cobra.Command{
 			Use:   cmdCreate,
 			Short: "Create a data loading job",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Creating data loading job...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				p := ctl.ClusterSubresourcePath(
+					globals.cluster, "data-loading/jobs",
+					globals.namespace,
+				)
+				return runAPIPost(p, nil)
 			},
 		},
 		&cobra.Command{
-			Use:   cmdStart,
+			Use:   cmdStart + " [job-name]",
 			Short: "Start a data loading job",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Starting data loading job...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/start", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIPost(path, nil)
 			},
 		},
 		&cobra.Command{
-			Use:   cmdStop,
+			Use:   cmdStop + " [job-name]",
 			Short: "Stop a data loading job",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Stopping data loading job...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/stop", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIPost(path, nil)
 			},
 		},
 		&cobra.Command{
-			Use:   cmdDelete,
+			Use:   cmdDelete + " [job-name]",
 			Short: "Delete a data loading job",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Deleting data loading job...")
-				return nil
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s", globals.cluster, args[0])
+				if globals.namespace != "" {
+					path += "?namespace=" + globals.namespace
+				}
+				return runAPIDelete(path)
 			},
 		},
 	)
@@ -1138,8 +1489,10 @@ func newDataLoadingCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show data loading status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Data loading status...")
-				return nil
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "data-loading/jobs", globals.namespace))
 			},
 		},
 	)

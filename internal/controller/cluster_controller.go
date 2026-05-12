@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"encoding/json"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -85,6 +86,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
 	}
 
+	// Skip full reconciliation if only status changed (ObservedGeneration matches).
+	if cluster.Status.ObservedGeneration == cluster.Generation &&
+		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
+		logger.Info("skipping reconciliation, generation unchanged and cluster running")
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	}
+
 	// Handle deletion.
 	if !cluster.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, cluster)
@@ -134,6 +142,11 @@ func (r *ClusterReconciler) reconcileCluster(
 		return r.updatePhase(ctx, cluster, cbv1alpha1.ClusterPhasePending)
 	}
 
+	// Reconcile admin password Secret (must exist before StatefulSets reference it).
+	if err := r.reconcileAdminSecret(ctx, cluster); err != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling admin secret: %w", err)
+	}
+
 	// Reconcile ConfigMaps.
 	if err := r.reconcileConfigMaps(ctx, cluster); err != nil {
 		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling configmaps: %w", err)
@@ -164,6 +177,7 @@ func (r *ClusterReconciler) reconcileCluster(
 	// Update status.
 	if err := r.updateStatus(ctx, cluster); err != nil {
 		logger.Error("failed to update status", "error", err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating status: %w", err)
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
@@ -189,6 +203,46 @@ func (r *ClusterReconciler) reconcileConfigMaps(
 	return nil
 }
 
+// reconcileAdminSecret ensures the admin password Secret exists.
+// If the Secret doesn't exist, it generates a random password and creates it.
+// If the Secret already exists (e.g. user-provided), it is left unchanged.
+func (r *ClusterReconciler) reconcileAdminSecret(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	secretName := util.AdminPasswordSecretName(cluster.Name)
+	existing := &corev1.Secret{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: cluster.Namespace,
+	}, existing)
+
+	if err == nil {
+		// Secret already exists, nothing to do.
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting admin password secret %s: %w", secretName, err)
+	}
+
+	// Generate a random password.
+	password, err := util.GenerateRandomPassword()
+	if err != nil {
+		return fmt.Errorf("generating admin password: %w", err)
+	}
+
+	desired := r.builder.BuildAdminPasswordSecret(cluster, password)
+	if createErr := r.client.Create(ctx, desired); createErr != nil {
+		return fmt.Errorf("creating admin password secret %s: %w", secretName, createErr)
+	}
+
+	util.LoggerFromContext(ctx).Info("created admin password secret", "name", secretName)
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "SecretCreated",
+		fmt.Sprintf("Admin password secret %s created", secretName))
+
+	return nil
+}
+
 // reconcileServices ensures Services are in the desired state.
 func (r *ClusterReconciler) reconcileServices(
 	ctx context.Context,
@@ -196,9 +250,13 @@ func (r *ClusterReconciler) reconcileServices(
 ) error {
 	services := []*corev1.Service{
 		r.builder.BuildCoordinatorService(cluster),
-		r.builder.BuildStandbyService(cluster),
 		r.builder.BuildSegmentService(cluster),
 		r.builder.BuildClientService(cluster),
+	}
+
+	// Only create standby service when standby is enabled.
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
+		services = append(services, r.builder.BuildStandbyService(cluster))
 	}
 
 	for _, svc := range services {
@@ -216,6 +274,9 @@ func (r *ClusterReconciler) reconcileCoordinator(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
 	desired := r.builder.BuildCoordinatorStatefulSet(cluster)
+	if desired == nil {
+		return fmt.Errorf("failed to build coordinator StatefulSet for cluster %s", cluster.Name)
+	}
 	return r.createOrUpdateStatefulSet(ctx, desired)
 }
 
@@ -238,6 +299,9 @@ func (r *ClusterReconciler) reconcileSegments(
 ) error {
 	// Primary segments.
 	primarySts := r.builder.BuildSegmentPrimaryStatefulSet(cluster)
+	if primarySts == nil {
+		return fmt.Errorf("failed to build primary segment StatefulSet for cluster %s", cluster.Name)
+	}
 	if err := r.createOrUpdateStatefulSet(ctx, primarySts); err != nil {
 		return fmt.Errorf("primary segments: %w", err)
 	}
@@ -413,13 +477,31 @@ func (r *ClusterReconciler) handleAction(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling action", "action", action)
 
-	// Remove the action annotation after processing.
-	defer func() {
-		delete(cluster.Annotations, util.AnnotationAction)
-		if err := r.client.Update(ctx, cluster); err != nil {
-			logger.Error("failed to remove action annotation", "error", err)
-		}
-	}()
+	// Remove the action annotation using a MergePatch to avoid conflicts with stale objects.
+	annotationKey := util.AnnotationAction
+	patchData, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				annotationKey: nil,
+			},
+		},
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("marshaling annotation removal patch: %w", err)
+	}
+
+	if patchErr := r.client.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patchData)); patchErr != nil {
+		logger.Error("failed to remove action annotation", "error", patchErr)
+		return ctrl.Result{}, fmt.Errorf("removing action annotation: %w", patchErr)
+	}
+
+	// Re-fetch the cluster to get the latest state after the patch.
+	if fetchErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      cluster.Name,
+		Namespace: cluster.Namespace,
+	}, cluster); fetchErr != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching cluster after annotation removal: %w", fetchErr)
+	}
 
 	switch action {
 	case util.ActionStart, util.ActionStartRestricted, util.ActionStartMaintenance:
@@ -497,7 +579,8 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *cbv1alpha
 			Name:      util.SegmentMirrorName(cluster.Name),
 			Namespace: cluster.Namespace,
 		}, mirrorSts)
-		if mirrorErr == nil && mirrorSts.Status.ReadyReplicas == *mirrorSts.Spec.Replicas {
+		if mirrorErr == nil && mirrorSts.Spec.Replicas != nil &&
+			mirrorSts.Status.ReadyReplicas == *mirrorSts.Spec.Replicas {
 			cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
 		} else {
 			cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
@@ -559,6 +642,7 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Secret{}).
 		Named(clusterControllerName).
 		Complete(r)
 }

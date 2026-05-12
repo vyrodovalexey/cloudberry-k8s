@@ -44,6 +44,7 @@ func (s *HAE2ESuite) TestE2E_HA_MirroringLifecycle() {
 	cluster := testutil.NewClusterBuilder("e2e-ha-mirror", s.namespace).
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithSegments(4).
 		WithMirroring(true, cbv1alpha1.MirroringLayoutGroup).
 		WithHA(60, 20, 5).
@@ -147,6 +148,7 @@ func (s *HAE2ESuite) TestE2E_HA_StandbyMonitoring() {
 	cluster := testutil.NewClusterBuilder("e2e-ha-standby", s.namespace).
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithStandby(true).
 		WithHA(60, 20, 5).
 		Build()

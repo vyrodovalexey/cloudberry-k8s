@@ -180,6 +180,14 @@ const (
 	ConditionConfigApplied ConditionType = "ConfigApplied"
 	// ConditionVaultConnected indicates Vault connection is established.
 	ConditionVaultConnected ConditionType = "VaultConnected"
+	// ConditionWorkloadConfigured indicates workload management is configured.
+	ConditionWorkloadConfigured ConditionType = "WorkloadConfigured"
+	// ConditionBackupConfigured indicates backup configuration is applied.
+	ConditionBackupConfigured ConditionType = "BackupConfigured"
+	// ConditionDataLoadingConfigured indicates data loading configuration is applied.
+	ConditionDataLoadingConfigured ConditionType = "DataLoadingConfigured"
+	// ConditionStorageConfigured indicates storage management is configured.
+	ConditionStorageConfigured ConditionType = "StorageConfigured"
 )
 
 // +kubebuilder:object:root=true

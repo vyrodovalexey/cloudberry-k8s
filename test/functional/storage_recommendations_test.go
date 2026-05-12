@@ -49,6 +49,7 @@ func (s *StorageRecommendationsSuite) TestFunctional_StorageMonitoringEnabled_Re
 	cluster := testutil.NewClusterBuilder("test-storage-mon", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		Build()
 	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
 		DiskMonitoring: true,

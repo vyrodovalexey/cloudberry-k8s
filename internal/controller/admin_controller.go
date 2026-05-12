@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +32,8 @@ type AdminReconciler struct {
 	metrics   metrics.Recorder
 	logger    *slog.Logger
 	// configHashes tracks the last known config hash per cluster for change detection.
-	configHashes map[string]string
+	// Uses sync.Map for thread-safe concurrent access from multiple reconcile goroutines.
+	configHashes sync.Map
 }
 
 // NewAdminReconciler creates a new AdminReconciler.
@@ -48,14 +50,13 @@ func NewAdminReconciler(
 		logger = slog.Default()
 	}
 	return &AdminReconciler{
-		client:       c,
-		scheme:       scheme,
-		recorder:     recorder,
-		builder:      b,
-		dbFactory:    dbFactory,
-		metrics:      m,
-		logger:       logger.With("controller", adminControllerName),
-		configHashes: make(map[string]string),
+		client:    c,
+		scheme:    scheme,
+		recorder:  recorder,
+		builder:   b,
+		dbFactory: dbFactory,
+		metrics:   m,
+		logger:    logger.With("controller", adminControllerName),
 	}
 }
 
@@ -78,6 +79,14 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	// Skip if cluster is not running.
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	}
+
+	// Skip full reconciliation if only status changed (ObservedGeneration matches)
+	// and there are no maintenance annotations pending.
+	if cluster.Status.ObservedGeneration == cluster.Generation &&
+		cluster.Annotations[util.AnnotationMaintenance] == "" {
+		logger.Info("skipping admin reconciliation, generation unchanged")
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
@@ -158,7 +167,7 @@ func (r *AdminReconciler) reconcileWorkload(
 	// Persist workload reconciliation status.
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
-		"WorkloadConfigured",
+		string(cbv1alpha1.ConditionWorkloadConfigured),
 		metav1.ConditionTrue,
 		"WorkloadReconciled",
 		"Workload management is configured",
@@ -219,7 +228,7 @@ func (r *AdminReconciler) reconcileBackup(
 	// Update backup-related status conditions.
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
-		"BackupConfigured",
+		string(cbv1alpha1.ConditionBackupConfigured),
 		metav1.ConditionTrue,
 		"BackupReconciled",
 		"Backup configuration is applied",
@@ -265,7 +274,7 @@ func (r *AdminReconciler) reconcileDataLoading(
 
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
-		"DataLoadingConfigured",
+		string(cbv1alpha1.ConditionDataLoadingConfigured),
 		metav1.ConditionTrue,
 		"DataLoadingReconciled",
 		"Data loading configuration is applied",
@@ -321,7 +330,7 @@ func (r *AdminReconciler) reconcileStorage(
 
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
-		"StorageConfigured",
+		string(cbv1alpha1.ConditionStorageConfigured),
 		metav1.ConditionTrue,
 		"StorageReconciled",
 		"Storage management is configured",
@@ -348,7 +357,8 @@ func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alph
 	// Compute current config hash.
 	currentHash := util.ComputeHash(cluster.Spec.Config.Parameters)
 	clusterKey := fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name)
-	lastHash := r.configHashes[clusterKey]
+	lastHashVal, _ := r.configHashes.Load(clusterKey)
+	lastHash, _ := lastHashVal.(string)
 
 	if currentHash == lastHash {
 		return nil
@@ -378,7 +388,7 @@ func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alph
 	}
 
 	// Update config hash.
-	r.configHashes[clusterKey] = currentHash
+	r.configHashes.Store(clusterKey, currentHash)
 
 	// Update status.
 	now := metav1.Now()

@@ -83,6 +83,15 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
+	// Skip full reconciliation if only status changed (ObservedGeneration matches)
+	// and there are no annotation-based actions pending.
+	if cluster.Status.ObservedGeneration == cluster.Generation &&
+		cluster.Annotations[util.AnnotationRecovery] == "" &&
+		cluster.Annotations[util.AnnotationAction] == "" {
+		logger.Info("skipping HA reconciliation, generation unchanged")
+		return ctrl.Result{RequeueAfter: r.probeInterval(cluster)}, nil
+	}
+
 	// Handle annotation-based actions first.
 	if result, handled, err := r.handleAnnotations(ctx, cluster); handled {
 		return result, err
@@ -150,6 +159,11 @@ func (r *HAReconciler) probeInterval(cluster *cbv1alpha1.CloudberryCluster) time
 func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	logger := util.LoggerFromContext(ctx)
 	startTime := time.Now()
+
+	if r.dbFactory == nil {
+		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
+		return fmt.Errorf("database client factory is not configured")
+	}
 
 	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
 	if err != nil {
@@ -220,6 +234,10 @@ func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.Clou
 
 // monitorStandby checks the standby coordinator health and replication lag.
 func (r *HAReconciler) monitorStandby(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+	if r.dbFactory == nil {
+		return fmt.Errorf("database client factory is not configured")
+	}
+
 	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
 	if err != nil {
 		return fmt.Errorf("creating db client for standby monitoring: %w", err)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -23,19 +24,41 @@ const (
 	defaultPageSize = 50
 	maxPageSize     = 100
 
+	// maxBodySize is the maximum allowed request body size (1 MiB).
+	maxBodySize = 1 << 20
+
 	responseKeyStatus  = "status"
 	responseKeyTotal   = "total"
 	responseKeyJob     = "job"
 	responseKeyCluster = "cluster"
 )
 
+// dns1123SubdomainRegex validates DNS-1123 subdomain names used for cluster and namespace names.
+// Must consist of lower case alphanumeric characters, '-' or '.', and must start and end with
+// an alphanumeric character.
+var dns1123SubdomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$`)
+
+// isValidDNS1123Name validates that a name conforms to DNS-1123 subdomain format.
+func isValidDNS1123Name(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	return dns1123SubdomainRegex.MatchString(name)
+}
+
+// limitBody wraps the request body with a size-limited reader to prevent oversized payloads.
+func limitBody(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+}
+
 // Server is the REST API server for the cloudberry operator.
 type Server struct {
-	k8sClient client.Client
-	authMW    *auth.AuthMiddleware
-	metrics   metrics.Recorder
-	logger    *slog.Logger
-	mux       *http.ServeMux
+	k8sClient   client.Client
+	authMW      *auth.AuthMiddleware
+	rateLimiter *RateLimiter
+	metrics     metrics.Recorder
+	logger      *slog.Logger
+	mux         *http.ServeMux
 }
 
 // NewServer creates a new API server.
@@ -50,11 +73,12 @@ func NewServer(
 	}
 
 	s := &Server{
-		k8sClient: k8sClient,
-		authMW:    authMW,
-		metrics:   metricsRecorder,
-		logger:    logger.With("component", "api-server"),
-		mux:       http.NewServeMux(),
+		k8sClient:   k8sClient,
+		authMW:      authMW,
+		rateLimiter: NewRateLimiter(defaultRateLimit, defaultRateInterval, logger),
+		metrics:     metricsRecorder,
+		logger:      logger.With("component", "api-server"),
+		mux:         http.NewServeMux(),
 	}
 
 	s.registerRoutes()
@@ -192,12 +216,14 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStopDataLoadingJob)))
 }
 
-// withAuth wraps a handler with authentication middleware.
+// withAuth wraps a handler with rate limiting and authentication middleware.
+// Rate limiting is applied before authentication to protect against brute-force attacks.
 func (s *Server) withAuth(handler http.Handler) http.Handler {
 	if s.authMW == nil {
 		return handler
 	}
-	return s.authMW.Handler()(handler)
+	// Apply rate limiting before auth to prevent brute-force credential attacks.
+	return s.rateLimiter.Middleware(s.authMW.Handler()(handler))
 }
 
 // withPermission wraps a handler function with permission checking.
@@ -278,15 +304,24 @@ func (s *Server) handleGetClusterStatus(w http.ResponseWriter, r *http.Request) 
 
 // handleCreateCluster creates a new CloudberryCluster.
 func (s *Server) handleCreateCluster(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
 	cluster := &cbv1alpha1.CloudberryCluster{}
 	if err := json.NewDecoder(r.Body).Decode(cluster); err != nil {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
+	if !isValidDNS1123Name(cluster.Name) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"cluster name must be a valid DNS-1123 subdomain")
+		return
+	}
+
 	if err := s.k8sClient.Create(r.Context(), cluster); err != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to create cluster: %v", err))
+		s.logger.Error("failed to create cluster", "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create cluster")
 		return
 	}
 
@@ -304,8 +339,8 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.k8sClient.Delete(r.Context(), cluster); err != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to delete cluster: %v", err))
+		s.logger.Error("failed to delete cluster", "cluster", name, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete cluster")
 		return
 	}
 
@@ -346,6 +381,9 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 
 // handleUpdateConfig updates the cluster configuration.
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
@@ -362,8 +400,8 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	cluster.Spec.Config = &configUpdate
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to update config: %v", updateErr))
+		s.logger.Error("failed to update config", "cluster", name, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update config")
 		return
 	}
 
@@ -477,6 +515,9 @@ func (s *Server) handleActivateStandby(w http.ResponseWriter, r *http.Request) {
 
 // handleStartRecovery starts a recovery operation.
 func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
 	var req struct {
 		Type string `json:"type"`
 	}
@@ -498,8 +539,8 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 	}
 	cluster.Annotations[util.AnnotationRecovery] = req.Type
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to start recovery: %v", updateErr))
+		s.logger.Error("failed to start recovery", "cluster", name, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to start recovery")
 		return
 	}
 
@@ -958,8 +999,8 @@ func (s *Server) setClusterAnnotation(w http.ResponseWriter, r *http.Request, ac
 	}
 	cluster.Annotations[util.AnnotationAction] = action
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to set action: %v", updateErr))
+		s.logger.Error("failed to set action annotation", "cluster", name, "action", action, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to set action")
 		return
 	}
 
@@ -981,8 +1022,10 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 	}
 	cluster.Annotations[util.AnnotationMaintenance] = operation
 	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			fmt.Sprintf("failed to set maintenance: %v", updateErr))
+		s.logger.Error("failed to set maintenance annotation",
+			"cluster", name, "operation", operation, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError,
+			"INTERNAL_ERROR", "failed to set maintenance")
 		return
 	}
 
@@ -990,10 +1033,18 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 }
 
 // getCluster retrieves a CloudberryCluster by name.
+// It validates the name and namespace parameters for DNS-1123 compliance.
 func (s *Server) getCluster(
 	ctx context.Context,
 	name, namespace string,
 ) (*cbv1alpha1.CloudberryCluster, error) {
+	if !isValidDNS1123Name(name) {
+		return nil, fmt.Errorf("invalid cluster name %q", name)
+	}
+	if namespace != "" && !isValidDNS1123Name(namespace) {
+		return nil, fmt.Errorf("invalid namespace %q", namespace)
+	}
+
 	if namespace == "" {
 		// List all namespaces and find the cluster.
 		clusterList := &cbv1alpha1.CloudberryClusterList{}
@@ -1043,9 +1094,12 @@ func StartServer(ctx context.Context, addr string, handler http.Handler, logger 
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	//nolint:contextcheck,gosec // fresh ctx needed for graceful shutdown
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second) //nolint:contextcheck // parent ctx is done
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("API server shutdown error", "error", err)

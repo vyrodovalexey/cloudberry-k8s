@@ -448,8 +448,9 @@ func TestConvertResources(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertResources(tt.res)
-			_ = result // Just verify no panic
+			result, err := convertResources(tt.res)
+			require.NoError(t, err)
+			_ = result // Just verify no error
 		})
 	}
 }
@@ -516,7 +517,8 @@ func TestBuildPVC_WithStorageClass(t *testing.T) {
 	storage := cbv1alpha1.StorageSpec{Size: "10Gi", StorageClass: "fast"}
 	labels := map[string]string{"app": "test"}
 
-	pvc := buildPVC(storage, labels)
+	pvc, err := buildPVC(storage, labels)
+	require.NoError(t, err)
 	require.NotNil(t, pvc.Spec.StorageClassName)
 	assert.Equal(t, "fast", *pvc.Spec.StorageClassName)
 }
@@ -525,7 +527,8 @@ func TestBuildPVC_WithoutStorageClass(t *testing.T) {
 	storage := cbv1alpha1.StorageSpec{Size: "10Gi"}
 	labels := map[string]string{"app": "test"}
 
-	pvc := buildPVC(storage, labels)
+	pvc, err := buildPVC(storage, labels)
+	require.NoError(t, err)
 	assert.Nil(t, pvc.Spec.StorageClassName)
 }
 
@@ -659,6 +662,529 @@ func TestBuildSegmentPrimaryStatefulSet_WithRequiredAntiAffinity(t *testing.T) {
 	require.NotNil(t, affinity)
 	require.NotNil(t, affinity.PodAntiAffinity)
 	require.Len(t, affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, 1)
+}
+
+func TestBuildCoordinatorStatefulSet_WithSSL(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:    true,
+			CertSecret: &cbv1alpha1.CertSecretRef{Name: "tls-secret"},
+		},
+	}
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	require.NotNil(t, sts)
+
+	// Verify TLS volume mount is present.
+	container := sts.Spec.Template.Spec.Containers[0]
+	tlsMountFound := false
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "tls" {
+			tlsMountFound = true
+			break
+		}
+	}
+	assert.True(t, tlsMountFound, "TLS volume mount should be present")
+
+	// Verify TLS volume is present.
+	tlsVolumeFound := false
+	for _, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name == "tls" {
+			tlsVolumeFound = true
+			break
+		}
+	}
+	assert.True(t, tlsVolumeFound, "TLS volume should be present")
+}
+
+func TestBuildCoordinatorStatefulSet_InvalidResources(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Resources = &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{CPU: "invalid-cpu"},
+	}
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when resources are invalid")
+}
+
+func TestBuildCoordinatorStatefulSet_InvalidStorageSize(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Storage.Size = "not-a-valid-size"
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when storage size is invalid")
+}
+
+func TestBuildStandbyStatefulSet_InvalidResources(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
+		Enabled: true,
+		Resources: &cbv1alpha1.ResourceRequirements{
+			Limits: &cbv1alpha1.ResourceList{Memory: "invalid-mem"},
+		},
+	}
+
+	sts := b.BuildStandbyStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when standby resources are invalid")
+}
+
+func TestBuildStandbyStatefulSet_InvalidStorageSize(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
+		Enabled: true,
+		Storage: &cbv1alpha1.StorageSpec{Size: "bad-size"},
+	}
+
+	sts := b.BuildStandbyStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when standby storage size is invalid")
+}
+
+func TestBuildStandbyStatefulSet_WithNodeSelector(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
+		Enabled:      true,
+		NodeSelector: map[string]string{"zone": "us-east-1a"},
+	}
+
+	sts := b.BuildStandbyStatefulSet(cluster)
+	require.NotNil(t, sts)
+	assert.Equal(t, "us-east-1a", sts.Spec.Template.Spec.NodeSelector["zone"])
+}
+
+func TestBuildSegmentPrimaryStatefulSet_InvalidResources(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Resources = &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{CPU: "bad-cpu"},
+	}
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when segment resources are invalid")
+}
+
+func TestBuildSegmentPrimaryStatefulSet_InvalidStorageSize(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Storage.Size = "bad-size"
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when segment storage size is invalid")
+}
+
+func TestBuildSegmentPrimaryStatefulSet_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	require.NotNil(t, sts)
+	container := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
+}
+
+func TestBuildSegmentPrimaryStatefulSet_WithNodeSelectorAndTolerations(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.NodeSelector = map[string]string{"role": "segment"}
+	cluster.Spec.Segments.Tolerations = []cbv1alpha1.Toleration{
+		{Key: "dedicated", Operator: "Equal", Value: "segment", Effect: "NoSchedule"},
+	}
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	require.NotNil(t, sts)
+	assert.Equal(t, "segment", sts.Spec.Template.Spec.NodeSelector["role"])
+	require.Len(t, sts.Spec.Template.Spec.Tolerations, 1)
+	assert.Equal(t, "dedicated", sts.Spec.Template.Spec.Tolerations[0].Key)
+}
+
+func TestBuildSegmentMirrorStatefulSet_InvalidResources(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Segments.Resources = &cbv1alpha1.ResourceRequirements{
+		Limits: &cbv1alpha1.ResourceList{CPU: "bad-cpu"},
+	}
+
+	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when mirror resources are invalid")
+}
+
+func TestBuildSegmentMirrorStatefulSet_InvalidStorageSize(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Segments.Storage.Size = "bad-size"
+
+	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	assert.Nil(t, sts, "should return nil when mirror storage size is invalid")
+}
+
+func TestBuildSegmentMirrorStatefulSet_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Coordinator.Port = 0
+
+	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	require.NotNil(t, sts)
+	container := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
+}
+
+func TestBuildSegmentMirrorStatefulSet_WithNodeSelectorAndTolerations(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Segments.NodeSelector = map[string]string{"role": "segment"}
+	cluster.Spec.Segments.Tolerations = []cbv1alpha1.Toleration{
+		{Key: "dedicated", Operator: "Equal", Value: "segment", Effect: "NoSchedule"},
+	}
+
+	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	require.NotNil(t, sts)
+	assert.Equal(t, "segment", sts.Spec.Template.Spec.NodeSelector["role"])
+	require.Len(t, sts.Spec.Template.Spec.Tolerations, 1)
+}
+
+func TestBuildCoordinatorService_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	svc := b.BuildCoordinatorService(cluster)
+	require.NotNil(t, svc)
+	assert.Equal(t, int32(5432), svc.Spec.Ports[0].Port)
+}
+
+func TestBuildStandbyService_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	svc := b.BuildStandbyService(cluster)
+	require.NotNil(t, svc)
+	assert.Equal(t, int32(5432), svc.Spec.Ports[0].Port)
+}
+
+func TestBuildSegmentService_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	svc := b.BuildSegmentService(cluster)
+	require.NotNil(t, svc)
+	assert.Equal(t, int32(5432), svc.Spec.Ports[0].Port)
+}
+
+func TestBuildClientService_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	svc := b.BuildClientService(cluster)
+	require.NotNil(t, svc)
+	assert.Equal(t, int32(5432), svc.Spec.Ports[0].Port)
+}
+
+func TestBuildPVC_InvalidStorageSize(t *testing.T) {
+	storage := cbv1alpha1.StorageSpec{Size: "not-a-valid-size"}
+	labels := map[string]string{"app": "test"}
+
+	_, err := buildPVC(storage, labels)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing storage size")
+}
+
+func TestConvertResources_InvalidCPURequest(t *testing.T) {
+	res := &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{CPU: "invalid-cpu"},
+	}
+	_, err := convertResources(res)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing CPU request")
+}
+
+func TestConvertResources_InvalidMemoryRequest(t *testing.T) {
+	res := &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{Memory: "invalid-mem"},
+	}
+	_, err := convertResources(res)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing memory request")
+}
+
+func TestConvertResources_InvalidCPULimit(t *testing.T) {
+	res := &cbv1alpha1.ResourceRequirements{
+		Limits: &cbv1alpha1.ResourceList{CPU: "invalid-cpu"},
+	}
+	_, err := convertResources(res)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing CPU limit")
+}
+
+func TestConvertResources_InvalidMemoryLimit(t *testing.T) {
+	res := &cbv1alpha1.ResourceRequirements{
+		Limits: &cbv1alpha1.ResourceList{Memory: "invalid-mem"},
+	}
+	_, err := convertResources(res)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing memory limit")
+}
+
+func TestBuildPostgresqlConfConfigMap_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+
+	cm := b.BuildPostgresqlConfConfigMap(cluster)
+	require.NotNil(t, cm)
+	assert.Contains(t, cm.Data["postgresql.conf"], "port = 5432")
+}
+
+func TestBuildPostgresqlConfConfigMap_SSLDefaultMinTLS(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:    true,
+			CertSecret: &cbv1alpha1.CertSecretRef{Name: "tls-secret"},
+			// MinTLSVersion not set, should default to TLSv1.2.
+		},
+	}
+
+	cm := b.BuildPostgresqlConfConfigMap(cluster)
+	require.NotNil(t, cm)
+	assert.Contains(t, cm.Data["postgresql.conf"], "TLSv1.2")
+}
+
+func TestBuildMainContainer_WithSSL(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:    true,
+			CertSecret: &cbv1alpha1.CertSecretRef{Name: "tls-secret"},
+		},
+	}
+
+	container, err := buildMainContainer(cluster, 5432, nil)
+	require.NoError(t, err)
+
+	// Verify TLS volume mount is present.
+	tlsMountFound := false
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "tls" {
+			tlsMountFound = true
+			assert.True(t, vm.ReadOnly)
+			break
+		}
+	}
+	assert.True(t, tlsMountFound, "TLS volume mount should be present")
+}
+
+func TestBuildMainContainer_WithoutSSL(t *testing.T) {
+	cluster := newTestCluster()
+
+	container, err := buildMainContainer(cluster, 5432, nil)
+	require.NoError(t, err)
+
+	// Verify TLS volume mount is NOT present.
+	for _, vm := range container.VolumeMounts {
+		assert.NotEqual(t, "tls", vm.Name, "TLS volume mount should not be present")
+	}
+}
+
+func TestBuildMainContainer_WithResources(t *testing.T) {
+	cluster := newTestCluster()
+	resources := &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{CPU: "1", Memory: "2Gi"},
+		Limits:   &cbv1alpha1.ResourceList{CPU: "2", Memory: "4Gi"},
+	}
+
+	container, err := buildMainContainer(cluster, 5432, resources)
+	require.NoError(t, err)
+	assert.NotEmpty(t, container.Resources.Requests)
+	assert.NotEmpty(t, container.Resources.Limits)
+}
+
+func TestBuildMainContainer_InvalidResources(t *testing.T) {
+	cluster := newTestCluster()
+	resources := &cbv1alpha1.ResourceRequirements{
+		Requests: &cbv1alpha1.ResourceList{CPU: "invalid"},
+	}
+
+	_, err := buildMainContainer(cluster, 5432, resources)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "converting resources")
+}
+
+func TestBuildInitContainer(t *testing.T) {
+	container := buildInitContainer()
+	assert.Equal(t, "init-cloudberry", container.Name)
+	assert.Equal(t, "busybox:1.36", container.Image)
+	require.Len(t, container.VolumeMounts, 1)
+	assert.Equal(t, "data", container.VolumeMounts[0].Name)
+}
+
+func TestOwnerRef(t *testing.T) {
+	cluster := newTestCluster()
+	ref := ownerRef(cluster)
+	assert.Equal(t, "test-cluster", ref.Name)
+	assert.Equal(t, "CloudberryCluster", ref.Kind)
+	assert.True(t, *ref.Controller)
+	assert.True(t, *ref.BlockOwnerDeletion)
+}
+
+func TestAddImagePullSecrets_Empty(t *testing.T) {
+	spec := &corev1.PodSpec{}
+	addImagePullSecrets(spec, nil)
+	assert.Empty(t, spec.ImagePullSecrets)
+}
+
+func TestAddImagePullSecrets_Multiple(t *testing.T) {
+	spec := &corev1.PodSpec{}
+	secrets := []cbv1alpha1.ImagePullSecret{
+		{Name: "secret1"},
+		{Name: "secret2"},
+	}
+	addImagePullSecrets(spec, secrets)
+	require.Len(t, spec.ImagePullSecrets, 2)
+	assert.Equal(t, "secret1", spec.ImagePullSecrets[0].Name)
+	assert.Equal(t, "secret2", spec.ImagePullSecrets[1].Name)
+}
+
+func TestBuildSegmentService_SelectorLabels(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+
+	svc := b.BuildSegmentService(cluster)
+	require.NotNil(t, svc)
+
+	// Segment service should NOT have component label in selector (matches both primary and mirror).
+	_, hasComponent := svc.Spec.Selector[util.LabelComponent]
+	assert.False(t, hasComponent, "segment service selector should not have component label")
+	assert.Equal(t, cluster.Name, svc.Spec.Selector[util.LabelCluster])
+}
+
+func TestBuildCoordinatorStatefulSet_CustomPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 6432
+
+	sts := b.BuildCoordinatorStatefulSet(cluster)
+	require.NotNil(t, sts)
+
+	container := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, int32(6432), container.Ports[0].ContainerPort)
+}
+
+func TestBuildStandbyStatefulSet_DefaultPort(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Coordinator.Port = 0
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	sts := b.BuildStandbyStatefulSet(cluster)
+	require.NotNil(t, sts)
+	container := sts.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
+}
+
+func TestBuildSegmentMirrorStatefulSet_WithImagePullSecrets(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.ImagePullSecrets = []cbv1alpha1.ImagePullSecret{
+		{Name: "my-secret"},
+	}
+
+	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	require.NotNil(t, sts)
+	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
+	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
+}
+
+func TestBuildStandbyStatefulSet_WithImagePullSecrets(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+	cluster.Spec.ImagePullSecrets = []cbv1alpha1.ImagePullSecret{
+		{Name: "my-secret"},
+	}
+
+	sts := b.BuildStandbyStatefulSet(cluster)
+	require.NotNil(t, sts)
+	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
+	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
+}
+
+func TestBuildSegmentPrimaryStatefulSet_WithImagePullSecrets(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+	cluster.Spec.ImagePullSecrets = []cbv1alpha1.ImagePullSecret{
+		{Name: "my-secret"},
+	}
+
+	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	require.NotNil(t, sts)
+	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
+	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
+}
+
+func TestRenderPgHBAConf_DefaultRules(t *testing.T) {
+	cluster := newTestCluster()
+	content := renderPgHBAConf(cluster)
+
+	assert.Contains(t, content, "Generated by cloudberry-operator")
+	assert.Contains(t, content, "local")
+	assert.Contains(t, content, "gpadmin")
+	assert.Contains(t, content, "trust")
+	assert.Contains(t, content, "scram-sha-256")
+	assert.Contains(t, content, "replication")
+}
+
+func TestRenderPgHBAConf_CustomRules(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		HBARules: []cbv1alpha1.HBARule{
+			{Type: cbv1alpha1.HBATypeHostSSL, Database: "mydb", User: "myuser",
+				Address: "10.0.0.0/8", Method: cbv1alpha1.AuthMethodCert},
+		},
+	}
+	content := renderPgHBAConf(cluster)
+
+	assert.Contains(t, content, "hostssl")
+	assert.Contains(t, content, "mydb")
+	// Should NOT contain default rules.
+	assert.NotContains(t, content, "trust")
+}
+
+func TestDefaultHBARules(t *testing.T) {
+	rules := defaultHBARules()
+	require.Len(t, rules, 5)
+	assert.Equal(t, cbv1alpha1.HBATypeLocal, rules[0].Type)
+	assert.Equal(t, "gpadmin", rules[0].User)
+}
+
+func TestBuildVolumes_SSLEnabledNoCertSecret(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:    true,
+			CertSecret: nil, // No cert secret.
+		},
+	}
+
+	volumes := buildVolumes(cluster)
+	// Should only have config volume, no TLS volume.
+	require.Len(t, volumes, 1)
+	assert.Equal(t, "config", volumes[0].Name)
 }
 
 func TestFormatHBARule_AllTypes(t *testing.T) {

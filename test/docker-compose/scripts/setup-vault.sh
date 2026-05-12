@@ -5,11 +5,10 @@
 # This script:
 #   1. Enables PKI secrets engine
 #   2. Generates a Root CA
-#   3. Creates PKI roles for REST and gRPC servers + gateway client
-#   4. Issues server certificates for rest_api_4 and grpc_3
-#   5. Issues a client certificate for the gateway (avapigw)
-#   6. Writes all certs to the shared Docker volume (mtls_certs)
-#   7. Sets up KV v2 secrets engine for credential storage
+#   3. Creates PKI roles for clients
+#   4. Issues a client certificate for the gateway (avapigw)
+#   5. Writes all certs to the shared Docker volume (mtls_certs)
+#   6. Sets up KV v2 secrets engine for credential storage
 #
 # Usage:
 #   ./scripts/setup-vault.sh [--verify]
@@ -173,49 +172,6 @@ data = json.load(sys.stdin)
 cert = data.get('data', {}).get('certificate', '')
 print(cert)
 " > "${output_dir}/ca.crt"
-
-    # Issue REST server certificate
-    log_info "Issuing REST server certificate..."
-    local rest_resp
-    rest_resp=$(vault_api POST "${PKI_MOUNT}/issue/${PKI_ROLE_SERVER}" \
-        -d "{
-            \"common_name\": \"rest_api_4\",
-            \"alt_names\": \"localhost,rest_api_4\",
-            \"ip_sans\": \"127.0.0.1\",
-            \"ttl\": \"${CERT_TTL}\"
-        }")
-    echo "$rest_resp" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)['data']
-print(data['certificate'])
-" > "${output_dir}/rest-server.crt"
-    echo "$rest_resp" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)['data']
-print(data['private_key'])
-" > "${output_dir}/rest-server.key"
-
-    # Issue gRPC server certificate
-    log_info "Issuing gRPC server certificate..."
-    local grpc_resp
-    grpc_resp=$(vault_api POST "${PKI_MOUNT}/issue/${PKI_ROLE_SERVER}" \
-        -d "{
-            \"common_name\": \"grpc_3\",
-            \"alt_names\": \"localhost,grpc_3\",
-            \"ip_sans\": \"127.0.0.1\",
-            \"ttl\": \"${CERT_TTL}\"
-        }")
-    echo "$grpc_resp" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)['data']
-print(data['certificate'])
-" > "${output_dir}/grpc-server.crt"
-    echo "$grpc_resp" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)['data']
-print(data['private_key'])
-" > "${output_dir}/grpc-server.key"
-
     # Issue gateway client certificate (for avapigw to connect to mTLS backends)
     log_info "Issuing gateway client certificate..."
     local client_resp
@@ -243,10 +199,6 @@ print(data['private_key'])
 
     log_info "All certificates issued successfully"
     log_info "  CA cert:          ${output_dir}/ca.crt"
-    log_info "  REST server cert: ${output_dir}/rest-server.crt"
-    log_info "  REST server key:  ${output_dir}/rest-server.key"
-    log_info "  gRPC server cert: ${output_dir}/grpc-server.crt"
-    log_info "  gRPC server key:  ${output_dir}/grpc-server.key"
     log_info "  Client cert:      ${output_dir}/client.crt"
     log_info "  Client key:       ${output_dir}/client.key"
 }
@@ -426,16 +378,6 @@ main() {
 
     log_info ""
     log_info "=== Vault setup complete ==="
-    if [ "$ci_mode" = false ]; then
-        log_info "Next steps:"
-        log_info "  1. Restart mTLS backends to pick up certificates:"
-        log_info "     docker compose restart rest_api_4 grpc_3"
-        log_info "  2. Test mTLS connection:"
-        log_info "     curl --cacert ${local_cert_dir}/ca.crt \\"
-        log_info "          --cert ${local_cert_dir}/client.crt \\"
-        log_info "          --key ${local_cert_dir}/client.key \\"
-        log_info "          https://127.0.0.1:8804/health"
-    fi
 }
 
 main "$@"
