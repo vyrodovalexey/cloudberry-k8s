@@ -170,3 +170,90 @@ func TestInMemoryCredentialStore(t *testing.T) {
 		assert.Equal(t, PermissionOperator, level)
 	})
 }
+
+func TestBasicAuthProvider_Authenticate_EmptyCredentials(t *testing.T) {
+	tests := []struct {
+		name     string
+		username string
+		password string
+	}{
+		{"empty username and password", "", ""},
+		{"empty username", "", "somepass"},
+		{"empty password", "someuser", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewInMemoryCredentialStore()
+			provider := NewBasicAuthProvider(store, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.SetBasicAuth(tt.username, tt.password)
+
+			identity, err := provider.Authenticate(context.Background(), req)
+			require.Error(t, err)
+			assert.Nil(t, identity)
+			assert.Contains(t, err.Error(), "invalid credentials")
+		})
+	}
+}
+
+func TestBasicAuthProvider_Authenticate_SpecialCharacters(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+	}{
+		{"password with special chars", "p@$$w0rd!#%^&*()"},
+		{"password with unicode", "\u00e9\u00e8\u00ea\u00eb"},
+		{"password with spaces", "my secret password"},
+		{"password with quotes", `pass"word'test`},
+		{"password with newlines", "pass\nword"},
+		{"very long password", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewInMemoryCredentialStore()
+			store.SetCredentials("user", tt.password, PermissionAdmin)
+			provider := NewBasicAuthProvider(store, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.SetBasicAuth("user", tt.password)
+
+			identity, err := provider.Authenticate(context.Background(), req)
+			require.NoError(t, err)
+			require.NotNil(t, identity)
+			assert.Equal(t, "user", identity.Username)
+			assert.Equal(t, PermissionAdmin, identity.Permission)
+		})
+	}
+}
+
+func TestBasicAuthProvider_Authenticate_AllPermissionLevels(t *testing.T) {
+	levels := []struct {
+		name  string
+		level PermissionLevel
+	}{
+		{"SelfOnly", PermissionSelfOnly},
+		{"Basic", PermissionBasic},
+		{"OperatorBasic", PermissionOperatorBasic},
+		{"Operator", PermissionOperator},
+		{"Admin", PermissionAdmin},
+	}
+
+	for _, tt := range levels {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewInMemoryCredentialStore()
+			store.SetCredentials("user", "pass", tt.level)
+			provider := NewBasicAuthProvider(store, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.SetBasicAuth("user", "pass")
+
+			identity, err := provider.Authenticate(context.Background(), req)
+			require.NoError(t, err)
+			require.NotNil(t, identity)
+			assert.Equal(t, tt.level, identity.Permission)
+		})
+	}
+}

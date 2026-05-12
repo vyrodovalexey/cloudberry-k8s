@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -386,6 +387,156 @@ func TestHAReconciler_MonitorStandby(t *testing.T) {
 	cond := findCondition(cluster.Status.Conditions, string(cbv1alpha1.ConditionStandbyReady))
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+}
+
+func TestHAReconciler_RunFTSProbe_DBClientError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbFactory := &mockDBClientFactory{
+		err: fmt.Errorf("connection refused"),
+	}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	err := r.runFTSProbe(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating db client")
+}
+
+func TestHAReconciler_MonitorStandby_DBClientError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbFactory := &mockDBClientFactory{
+		err: fmt.Errorf("connection refused"),
+	}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	err := r.monitorStandby(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating db client")
+}
+
+func TestHAReconciler_MonitorStandby_ReplicationLagError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{
+		repLagErr: fmt.Errorf("standby not available"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	err := r.monitorStandby(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting replication lag")
+
+	cond := findCondition(cluster.Status.Conditions, string(cbv1alpha1.ConditionStandbyReady))
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+}
+
+func TestHAReconciler_Reconcile_RunningWithMirroringAndStandby(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{
+		segments: []db.SegmentInfo{
+			{ContentID: 0, Status: "u", Role: "p", Hostname: "host1"},
+			{ContentID: 0, Status: "u", Role: "m", Hostname: "host2"},
+		},
+		replicationLag: 512,
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestHAReconciler_ProbeInterval_CustomHA(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := NewHAReconciler(k8sClient, scheme, record.NewFakeRecorder(10), nil, &metrics.NoopRecorder{}, nil)
+
+	cluster := newTestCluster()
+	cluster.Spec.HA = &cbv1alpha1.HASpec{FTSProbeInterval: 120}
+	interval := r.probeInterval(cluster)
+	assert.Equal(t, 120, int(interval.Seconds()))
+}
+
+func TestHAReconciler_RunFTSProbe_SegmentConfigError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{
+		segErr: fmt.Errorf("query failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+
+	err := r.runFTSProbe(context.Background(), cluster)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting segment configuration")
 }
 
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {

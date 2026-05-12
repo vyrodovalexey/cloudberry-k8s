@@ -412,3 +412,745 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		})
 	}
 }
+
+// newFullyPopulatedCluster creates a CloudberryCluster with ALL fields set for deep copy testing.
+func newFullyPopulatedCluster() *CloudberryCluster {
+	replicas := int32(1)
+	tolSeconds := int64(300)
+	now := metav1.Now()
+
+	return &CloudberryCluster{
+		TypeMeta: metav1.TypeMeta{Kind: "CloudberryCluster", APIVersion: "avsoft.io/v1alpha1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "full-cluster", Namespace: "production",
+			Labels: map[string]string{"env": "prod"},
+		},
+		Spec: CloudberryClusterSpec{
+			Version: "7.7", Image: "cloudberrydb/cloudberry:7.7",
+			ImagePullPolicy:  ImagePullAlways,
+			ImagePullSecrets: []ImagePullSecret{{Name: "registry-secret"}},
+			Coordinator: CoordinatorSpec{
+				Replicas: &replicas,
+				Resources: &ResourceRequirements{
+					Requests: &ResourceList{CPU: "2", Memory: "4Gi"},
+					Limits:   &ResourceList{CPU: "4", Memory: "8Gi"},
+				},
+				Storage:      StorageSpec{StorageClass: "fast-ssd", Size: "50Gi"},
+				NodeSelector: map[string]string{"role": "coordinator"},
+				Tolerations: []Toleration{
+					{Key: "dedicated", Operator: "Equal", Value: "db",
+						Effect: "NoSchedule", TolerationSeconds: &tolSeconds},
+				},
+				Port: 5432,
+			},
+			Standby: &StandbySpec{
+				Enabled: true,
+				Resources: &ResourceRequirements{
+					Requests: &ResourceList{CPU: "2", Memory: "4Gi"},
+				},
+				Storage:      &StorageSpec{StorageClass: "fast-ssd", Size: "50Gi"},
+				NodeSelector: map[string]string{"role": "standby"},
+			},
+			Segments: SegmentsSpec{
+				Count: 8, PrimariesPerHost: 4,
+				Mirroring: &MirroringSpec{Enabled: true, Layout: MirroringLayoutSpread},
+				Resources: &ResourceRequirements{
+					Requests: &ResourceList{CPU: "4", Memory: "16Gi"},
+					Limits:   &ResourceList{CPU: "8", Memory: "32Gi"},
+				},
+				Storage:      StorageSpec{StorageClass: "fast-ssd", Size: "100Gi"},
+				NodeSelector: map[string]string{"role": "segment"},
+				Tolerations:  []Toleration{{Key: "segment", Effect: "NoSchedule"}},
+				AntiAffinity: AntiAffinityRequired,
+			},
+			Auth: &AuthSpec{
+				Basic: &BasicAuthSpec{
+					Enabled: true, AdminUser: "gpadmin",
+					AdminPasswordSecret: &SecretKeyRef{Name: "admin-secret", Key: "password"},
+				},
+				OIDC: &OIDCSpec{
+					Enabled: true, IssuerURL: "https://keycloak.example.com/realms/db",
+					ClientID:      "cloudberry",
+					ClientSecret:  &OIDCSecretRef{SecretRef: &SecretKeyRef{Name: "oidc", Key: "secret"}},
+					Scopes:        []string{"openid", "profile", "email", "roles"},
+					RoleClaimPath: "realm_access.roles", RoleClaimSource: RoleClaimSourceIDToken,
+					RoleMatchMode: RoleMatchPrefix,
+					RoleMapping:   map[string]string{"db-admin": "Admin", "db-viewer": "Basic"},
+					PKCE:          true, AllowLocalSignIn: true,
+				},
+				HBARules: []HBARule{
+					{Type: HBATypeHostSSL, Database: "all", User: "all",
+						Address: "10.0.0.0/8", Method: AuthMethodScramSHA256},
+					{Type: HBATypeLocal, Database: "all", User: "gpadmin", Method: AuthMethodPeer},
+				},
+				SSL: &SSLSpec{
+					Enabled: true, CertSecret: &CertSecretRef{Name: "tls-cert"},
+					MinTLSVersion: "1.3",
+				},
+			},
+			Config: &ConfigSpec{
+				Parameters:            map[string]string{"max_connections": "500", "work_mem": "128MB"},
+				CoordinatorParameters: map[string]string{"log_statement": "all"},
+				DatabaseParameters: map[string]map[string]string{
+					"analytics": {"search_path": "analytics,public"},
+				},
+				RoleParameters: map[string]map[string]string{
+					"etl_user": {"statement_timeout": "3600s"},
+				},
+			},
+			HA: &HASpec{
+				FTSProbeInterval: 30, FTSProbeTimeout: 10,
+				FTSProbeRetries: 3, Checksums: true,
+			},
+			Vault: &VaultSpec{
+				Enabled: true, Address: "https://vault.example.com:8200",
+				AuthMethod: VaultAuthAppRole, AuthPath: "auth/approle",
+				Role: "cloudberry", SecretPath: "secret/data/cloudberry",
+				TLSSecret: &VaultTLSSecret{Name: "vault-ca"},
+			},
+			Monitoring: &MonitoringSpec{
+				Enabled: true, MetricsPort: 9187, ServiceMonitor: true,
+			},
+			Telemetry: &TelemetrySpec{
+				Enabled: true, OTLPEndpoint: "otel-collector:4317",
+				OTLPProtocol: OTLPProtocolGRPC, SamplingRate: 0.5,
+			},
+			Workload: &WorkloadSpec{
+				Enabled: true,
+				ResourceGroups: []ResourceGroupSpec{
+					{Name: "analytics", Concurrency: 20, CPUMaxPercent: 60,
+						CPUWeight: 100, MemoryLimit: 4096, MinCost: 500},
+				},
+				Rules: []WorkloadRule{
+					{Name: "cancel-long", Enabled: true, ResourceGroup: "analytics",
+						Action: "cancel", Threshold: "3600", ThresholdType: "running_time", Priority: 1},
+				},
+				IdleRules: []IdleSessionRule{
+					{Name: "idle-30m", Enabled: true, ResourceGroup: "analytics",
+						IdleTimeout: "30m", ExcludeInTransaction: true, TerminateMessage: "idle timeout"},
+				},
+			},
+			QueryMonitoring: &QueryMonitoringSpec{
+				Enabled: true, HistoryRetention: "90d", SamplingInterval: 5,
+				GuestAccess: false, PlanCollection: true, SlowQueryThreshold: "500ms",
+			},
+			Backup: &BackupSpec{
+				Enabled: true, Schedule: "0 2 * * *",
+				Retention: BackupRetention{FullCount: 7, IncrementalCount: 30, MaxAge: "90d"},
+				Destination: BackupDestination{
+					Type: "s3", Bucket: "db-backups", Endpoint: "s3.amazonaws.com",
+					Region: "us-east-1", Path: "/cloudberry",
+					CredentialSecret: &SecretReference{Name: "s3-creds", Key: "credentials"},
+					ForcePathStyle:   true,
+				},
+				Compression: 6, Parallelism: 4, Incremental: true,
+			},
+			DataLoading: &DataLoadingSpec{
+				Enabled: true,
+				StreamingServer: &StreamingServerSpec{
+					Host: "gpfdist.example.com", Port: 8081, TLSMode: "tls",
+					CredentialSecret: &SecretReference{Name: "gpfdist-creds"},
+				},
+				Jobs: []DataLoadingJob{
+					{
+						Name: "s3-loader", Type: "s3", Enabled: true,
+						Schedule: "*/15 * * * *", TargetTable: "public.events",
+						S3Source: &S3SourceSpec{
+							Bucket: "data-lake", Path: "/events/", Endpoint: "s3.amazonaws.com",
+							Region: "us-east-1", Format: "json",
+							CredentialSecret: &SecretReference{Name: "s3-data-creds"},
+							ForcePathStyle:   true,
+						},
+					},
+					{
+						Name: "kafka-stream", Type: "kafka", Enabled: true,
+						TargetTable: "public.stream",
+						KafkaSource: &KafkaSourceSpec{
+							Brokers: []string{"kafka-1:9092", "kafka-2:9092"},
+							Topic:   "events", GroupID: "cloudberry-consumer",
+							Format: "avro", StartOffset: "latest",
+						},
+					},
+					{
+						Name: "rabbitmq-queue", Type: "rabbitmq", Enabled: false,
+						TargetTable: "public.messages",
+						RabbitMQSource: &RabbitMQSourceSpec{
+							Host: "rabbitmq.example.com", Port: 5672, VHost: "/production",
+							Queue: "db-messages", Format: "json",
+							CredentialSecret: &SecretReference{Name: "rmq-creds"},
+						},
+					},
+				},
+			},
+			Storage: &StorageManagementSpec{
+				DiskMonitoring: true,
+				RecommendationScan: &RecommendationScanSpec{
+					Enabled: true, Schedule: "0 3 * * 0", BloatThreshold: 20,
+					SkewThreshold: 50, AgeThreshold: 200000000,
+					IndexBloatThreshold: 30, ScanDuration: "2h",
+				},
+				UsageReport: &UsageReportSpec{Enabled: true, Monthly: true},
+			},
+			DeletionPolicy: DeletionPolicyDelete,
+			BackupOnDelete: true,
+		},
+		Status: CloudberryClusterStatus{
+			Phase: ClusterPhaseRunning, CoordinatorReady: true, StandbyReady: true,
+			SegmentsReady: 8, SegmentsTotal: 8,
+			MirroringStatus: MirroringInSync, ClusterVersion: "7.7",
+			LastReconcileTime: &now, LastConfigChangeTime: &now,
+			ActiveQueries: 15, QueuedQueries: 3, BlockedQueries: 1,
+			LastBackupTime: &now, LastBackupStatus: "Success",
+			DataLoadingJobs: 2, DiskUsagePercent: 45, RecommendationCount: 3,
+			ObservedGeneration: 5,
+			Conditions: []metav1.Condition{
+				{Type: "ClusterReady", Status: metav1.ConditionTrue,
+					Reason: "AllReady", Message: "All components ready",
+					LastTransitionTime: now},
+				{Type: "BackupConfigured", Status: metav1.ConditionTrue,
+					Reason: "Configured", Message: "Backup configured",
+					LastTransitionTime: now},
+			},
+			FailedSegments: []FailedSegment{
+				{ContentID: 3, Hostname: "seg-host-2", Role: "mirror", Status: "d"},
+			},
+		},
+	}
+}
+
+func TestDeepCopyInto_FullyPopulatedCluster(t *testing.T) {
+	original := newFullyPopulatedCluster()
+	copied := &CloudberryCluster{}
+	original.DeepCopyInto(copied)
+
+	// Verify all top-level fields match.
+	assert.Equal(t, original.Name, copied.Name)
+	assert.Equal(t, original.Spec.Version, copied.Spec.Version)
+	assert.Equal(t, original.Status.Phase, copied.Status.Phase)
+
+	// Verify pointer fields are independent copies.
+	copied.Spec.Coordinator.NodeSelector["new-key"] = "new-val"
+	_, exists := original.Spec.Coordinator.NodeSelector["new-key"]
+	assert.False(t, exists, "modifying copy's NodeSelector should not affect original")
+
+	copied.Spec.Auth.OIDC.Scopes = append(copied.Spec.Auth.OIDC.Scopes, "extra")
+	assert.NotEqual(t, len(original.Spec.Auth.OIDC.Scopes), len(copied.Spec.Auth.OIDC.Scopes))
+}
+
+func TestDeepCopy_IndependentCopies_Spec(t *testing.T) {
+	original := newFullyPopulatedCluster()
+	copied := original.DeepCopy()
+	require.NotNil(t, copied)
+
+	t.Run("modify coordinator resources", func(t *testing.T) {
+		copied.Spec.Coordinator.Resources.Requests.CPU = "99"
+		assert.Equal(t, "2", original.Spec.Coordinator.Resources.Requests.CPU)
+	})
+
+	t.Run("modify standby node selector", func(t *testing.T) {
+		copied.Spec.Standby.NodeSelector["extra"] = "label"
+		_, exists := original.Spec.Standby.NodeSelector["extra"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify segment tolerations", func(t *testing.T) {
+		copied.Spec.Segments.Tolerations[0].Key = "changed"
+		assert.Equal(t, "segment", original.Spec.Segments.Tolerations[0].Key)
+	})
+
+	t.Run("modify config parameters", func(t *testing.T) {
+		copied.Spec.Config.Parameters["new_param"] = "new_value"
+		_, exists := original.Spec.Config.Parameters["new_param"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify coordinator parameters", func(t *testing.T) {
+		copied.Spec.Config.CoordinatorParameters["new_coord_param"] = "val"
+		_, exists := original.Spec.Config.CoordinatorParameters["new_coord_param"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify database parameters", func(t *testing.T) {
+		copied.Spec.Config.DatabaseParameters["analytics"]["new_key"] = "val"
+		_, exists := original.Spec.Config.DatabaseParameters["analytics"]["new_key"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify role parameters", func(t *testing.T) {
+		copied.Spec.Config.RoleParameters["etl_user"]["new_key"] = "val"
+		_, exists := original.Spec.Config.RoleParameters["etl_user"]["new_key"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify OIDC role mapping", func(t *testing.T) {
+		copied.Spec.Auth.OIDC.RoleMapping["new-role"] = "Operator"
+		_, exists := original.Spec.Auth.OIDC.RoleMapping["new-role"]
+		assert.False(t, exists)
+	})
+
+	t.Run("modify workload resource groups", func(t *testing.T) {
+		copied.Spec.Workload.ResourceGroups[0].Name = "changed"
+		assert.Equal(t, "analytics", original.Spec.Workload.ResourceGroups[0].Name)
+	})
+
+	t.Run("modify data loading kafka brokers", func(t *testing.T) {
+		copied.Spec.DataLoading.Jobs[1].KafkaSource.Brokers[0] = "changed:9092"
+		assert.Equal(t, "kafka-1:9092", original.Spec.DataLoading.Jobs[1].KafkaSource.Brokers[0])
+	})
+}
+
+func TestDeepCopy_IndependentCopies_Status(t *testing.T) {
+	original := newFullyPopulatedCluster()
+	copied := original.DeepCopy()
+	require.NotNil(t, copied)
+
+	t.Run("modify conditions", func(t *testing.T) {
+		copied.Status.Conditions[0].Reason = "Modified"
+		assert.Equal(t, "AllReady", original.Status.Conditions[0].Reason)
+	})
+
+	t.Run("modify failed segments", func(t *testing.T) {
+		copied.Status.FailedSegments[0].Hostname = "changed-host"
+		assert.Equal(t, "seg-host-2", original.Status.FailedSegments[0].Hostname)
+	})
+
+	t.Run("modify last reconcile time", func(t *testing.T) {
+		newTime := metav1.Now()
+		copied.Status.LastReconcileTime = &newTime
+		assert.NotEqual(t, copied.Status.LastReconcileTime, original.Status.LastReconcileTime)
+	})
+}
+
+func TestDeepCopy_SubTypes_Populated(t *testing.T) {
+	t.Run("BackupSpec with all fields", func(t *testing.T) {
+		original := &BackupSpec{
+			Enabled: true, Schedule: "0 2 * * *",
+			Retention: BackupRetention{FullCount: 7, IncrementalCount: 30, MaxAge: "90d"},
+			Destination: BackupDestination{
+				Type: "s3", Bucket: "backups",
+				CredentialSecret: &SecretReference{Name: "creds", Key: "key"},
+			},
+			Compression: 6, Parallelism: 4, Incremental: true,
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, original.Schedule, copied.Schedule)
+		assert.Equal(t, original.Destination.CredentialSecret.Name, copied.Destination.CredentialSecret.Name)
+
+		copied.Destination.CredentialSecret.Name = "changed"
+		assert.Equal(t, "creds", original.Destination.CredentialSecret.Name)
+	})
+
+	t.Run("DataLoadingJob with S3Source", func(t *testing.T) {
+		original := &DataLoadingJob{
+			Name: "loader", Type: "s3", TargetTable: "public.data",
+			S3Source: &S3SourceSpec{
+				Bucket: "data", Format: "csv",
+				CredentialSecret: &SecretReference{Name: "s3-creds"},
+			},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		copied.S3Source.Bucket = "changed"
+		assert.Equal(t, "data", original.S3Source.Bucket)
+	})
+
+	t.Run("DataLoadingJob with KafkaSource", func(t *testing.T) {
+		original := &DataLoadingJob{
+			Name: "kafka-job", Type: "kafka", TargetTable: "public.stream",
+			KafkaSource: &KafkaSourceSpec{
+				Brokers: []string{"b1:9092", "b2:9092"}, Topic: "events",
+			},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		copied.KafkaSource.Brokers[0] = "changed:9092"
+		assert.Equal(t, "b1:9092", original.KafkaSource.Brokers[0])
+	})
+
+	t.Run("DataLoadingJob with RabbitMQSource", func(t *testing.T) {
+		original := &DataLoadingJob{
+			Name: "rmq-job", Type: "rabbitmq", TargetTable: "public.msgs",
+			RabbitMQSource: &RabbitMQSourceSpec{
+				Host: "rmq.example.com", Queue: "messages",
+				CredentialSecret: &SecretReference{Name: "rmq-creds"},
+			},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		copied.RabbitMQSource.CredentialSecret.Name = "changed"
+		assert.Equal(t, "rmq-creds", original.RabbitMQSource.CredentialSecret.Name)
+	})
+
+	t.Run("StorageManagementSpec with all sub-specs", func(t *testing.T) {
+		original := &StorageManagementSpec{
+			DiskMonitoring: true,
+			RecommendationScan: &RecommendationScanSpec{
+				Enabled: true, Schedule: "0 3 * * 0", BloatThreshold: 20,
+			},
+			UsageReport: &UsageReportSpec{Enabled: true, Monthly: true},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		copied.RecommendationScan.BloatThreshold = 99
+		assert.Equal(t, int32(20), original.RecommendationScan.BloatThreshold)
+	})
+
+	t.Run("StreamingServerSpec with credential", func(t *testing.T) {
+		original := &StreamingServerSpec{
+			Host: "gpfdist.example.com", Port: 8081,
+			CredentialSecret: &SecretReference{Name: "creds"},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		copied.CredentialSecret.Name = "changed"
+		assert.Equal(t, "creds", original.CredentialSecret.Name)
+	})
+
+	t.Run("Toleration with TolerationSeconds", func(t *testing.T) {
+		seconds := int64(600)
+		original := &Toleration{
+			Key: "dedicated", Operator: "Equal", Value: "db",
+			Effect: "NoSchedule", TolerationSeconds: &seconds,
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		newSeconds := int64(999)
+		copied.TolerationSeconds = &newSeconds
+		assert.Equal(t, int64(600), *original.TolerationSeconds)
+	})
+}
+
+func TestCloudberryClusterList_DeepCopyObject_WithItems(t *testing.T) {
+	list := &CloudberryClusterList{
+		TypeMeta: metav1.TypeMeta{Kind: "CloudberryClusterList"},
+		Items: []CloudberryCluster{
+			*newFullyPopulatedCluster(),
+		},
+	}
+
+	obj := list.DeepCopyObject()
+	require.NotNil(t, obj)
+
+	copiedList, ok := obj.(*CloudberryClusterList)
+	require.True(t, ok)
+	require.Len(t, copiedList.Items, 1)
+	assert.Equal(t, "full-cluster", copiedList.Items[0].Name)
+
+	// Verify independence.
+	copiedList.Items[0].Name = "modified"
+	assert.Equal(t, "full-cluster", list.Items[0].Name)
+}
+
+func TestCloudberryCluster_DeepCopyObject_FullyPopulated(t *testing.T) {
+	original := newFullyPopulatedCluster()
+	obj := original.DeepCopyObject()
+	require.NotNil(t, obj)
+
+	copied, ok := obj.(*CloudberryCluster)
+	require.True(t, ok)
+	assert.Equal(t, original.Name, copied.Name)
+	assert.Equal(t, original.Spec.Version, copied.Spec.Version)
+
+	// Verify it's a true deep copy.
+	copied.Spec.Config.Parameters["extra"] = "value"
+	_, exists := original.Spec.Config.Parameters["extra"]
+	assert.False(t, exists)
+}
+
+func TestCloudberryClusterList_DeepCopy_EmptyItems(t *testing.T) {
+	list := &CloudberryClusterList{Items: []CloudberryCluster{}}
+	copied := list.DeepCopy()
+	require.NotNil(t, copied)
+	assert.Empty(t, copied.Items)
+}
+
+func TestDeepCopyInto_AllSubTypes(t *testing.T) {
+	t.Run("MirroringSpec", func(t *testing.T) {
+		src := MirroringSpec{Enabled: true, Layout: MirroringLayoutSpread}
+		dst := MirroringSpec{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, src.Enabled, dst.Enabled)
+		assert.Equal(t, src.Layout, dst.Layout)
+	})
+
+	t.Run("SecretKeyRef", func(t *testing.T) {
+		src := SecretKeyRef{Name: "secret", Key: "password"}
+		dst := SecretKeyRef{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "secret", dst.Name)
+	})
+
+	t.Run("HBARule", func(t *testing.T) {
+		src := HBARule{Type: HBATypeHost, Database: "all", User: "all",
+			Address: "0.0.0.0/0", Method: AuthMethodMD5, Options: "opt"}
+		dst := HBARule{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, HBATypeHost, dst.Type)
+	})
+
+	t.Run("CertSecretRef", func(t *testing.T) {
+		src := CertSecretRef{Name: "tls-cert"}
+		dst := CertSecretRef{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "tls-cert", dst.Name)
+	})
+
+	t.Run("HASpec", func(t *testing.T) {
+		src := HASpec{FTSProbeInterval: 30, FTSProbeTimeout: 10, FTSProbeRetries: 3, Checksums: true}
+		dst := HASpec{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, int32(30), dst.FTSProbeInterval)
+	})
+
+	t.Run("VaultTLSSecret", func(t *testing.T) {
+		src := VaultTLSSecret{Name: "vault-tls"}
+		dst := VaultTLSSecret{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "vault-tls", dst.Name)
+	})
+
+	t.Run("MonitoringSpec", func(t *testing.T) {
+		src := MonitoringSpec{Enabled: true, MetricsPort: 9187, ServiceMonitor: true}
+		dst := MonitoringSpec{}
+		src.DeepCopyInto(&dst)
+		assert.True(t, dst.Enabled)
+	})
+
+	t.Run("TelemetrySpec", func(t *testing.T) {
+		src := TelemetrySpec{Enabled: true, OTLPEndpoint: "localhost:4317",
+			OTLPProtocol: OTLPProtocolGRPC, SamplingRate: 0.5}
+		dst := TelemetrySpec{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, 0.5, dst.SamplingRate)
+	})
+
+	t.Run("ResourceList", func(t *testing.T) {
+		src := ResourceList{CPU: "4", Memory: "8Gi"}
+		dst := ResourceList{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "4", dst.CPU)
+	})
+
+	t.Run("StorageSpec", func(t *testing.T) {
+		src := StorageSpec{StorageClass: "fast", Size: "100Gi"}
+		dst := StorageSpec{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "fast", dst.StorageClass)
+	})
+
+	t.Run("FailedSegment", func(t *testing.T) {
+		src := FailedSegment{ContentID: 3, Hostname: "host1", Role: "mirror", Status: "d"}
+		dst := FailedSegment{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, int32(3), dst.ContentID)
+	})
+
+	t.Run("ImagePullSecret", func(t *testing.T) {
+		src := ImagePullSecret{Name: "registry-secret"}
+		dst := ImagePullSecret{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "registry-secret", dst.Name)
+	})
+
+	t.Run("ResourceGroupSpec", func(t *testing.T) {
+		src := ResourceGroupSpec{Name: "analytics", Concurrency: 20, CPUMaxPercent: 60}
+		dst := ResourceGroupSpec{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "analytics", dst.Name)
+	})
+
+	t.Run("WorkloadRule", func(t *testing.T) {
+		src := WorkloadRule{Name: "rule1", Enabled: true, Action: "cancel", Priority: 1}
+		dst := WorkloadRule{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "rule1", dst.Name)
+	})
+
+	t.Run("IdleSessionRule", func(t *testing.T) {
+		src := IdleSessionRule{Name: "idle", Enabled: true, ResourceGroup: "default",
+			IdleTimeout: "30m", ExcludeInTransaction: true, TerminateMessage: "timeout"}
+		dst := IdleSessionRule{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "idle", dst.Name)
+	})
+
+	t.Run("QueryMonitoringSpec", func(t *testing.T) {
+		src := QueryMonitoringSpec{Enabled: true, HistoryRetention: "30d",
+			SamplingInterval: 5, SlowQueryThreshold: "1000ms"}
+		dst := QueryMonitoringSpec{}
+		src.DeepCopyInto(&dst)
+		assert.True(t, dst.Enabled)
+	})
+
+	t.Run("BackupRetention", func(t *testing.T) {
+		src := BackupRetention{FullCount: 7, IncrementalCount: 30, MaxAge: "90d"}
+		dst := BackupRetention{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, int32(7), dst.FullCount)
+	})
+
+	t.Run("SecretReference", func(t *testing.T) {
+		src := SecretReference{Name: "creds", Key: "key"}
+		dst := SecretReference{}
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "creds", dst.Name)
+	})
+
+	t.Run("RecommendationScanSpec", func(t *testing.T) {
+		src := RecommendationScanSpec{Enabled: true, Schedule: "0 3 * * 0",
+			BloatThreshold: 20, SkewThreshold: 50, AgeThreshold: 200000000}
+		dst := RecommendationScanSpec{}
+		src.DeepCopyInto(&dst)
+		assert.True(t, dst.Enabled)
+	})
+
+	t.Run("UsageReportSpec", func(t *testing.T) {
+		src := UsageReportSpec{Enabled: true, Monthly: true}
+		dst := UsageReportSpec{}
+		src.DeepCopyInto(&dst)
+		assert.True(t, dst.Monthly)
+	})
+}
+
+func TestDeepCopy_PopulatedSubTypes(t *testing.T) {
+	t.Run("MirroringSpec non-nil", func(t *testing.T) {
+		src := &MirroringSpec{Enabled: true, Layout: MirroringLayoutGroup}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, src.Enabled, copied.Enabled)
+	})
+
+	t.Run("HASpec non-nil", func(t *testing.T) {
+		src := &HASpec{FTSProbeInterval: 60, Checksums: true}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(60), copied.FTSProbeInterval)
+	})
+
+	t.Run("MonitoringSpec non-nil", func(t *testing.T) {
+		src := &MonitoringSpec{Enabled: true, MetricsPort: 9187}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(9187), copied.MetricsPort)
+	})
+
+	t.Run("TelemetrySpec non-nil", func(t *testing.T) {
+		src := &TelemetrySpec{Enabled: true, SamplingRate: 0.5}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, 0.5, copied.SamplingRate)
+	})
+
+	t.Run("QueryMonitoringSpec non-nil", func(t *testing.T) {
+		src := &QueryMonitoringSpec{Enabled: true, HistoryRetention: "30d"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "30d", copied.HistoryRetention)
+	})
+
+	t.Run("ResourceGroupSpec non-nil", func(t *testing.T) {
+		src := &ResourceGroupSpec{Name: "test", Concurrency: 10}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "test", copied.Name)
+	})
+
+	t.Run("WorkloadRule non-nil", func(t *testing.T) {
+		src := &WorkloadRule{Name: "rule", Action: "cancel"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "cancel", copied.Action)
+	})
+
+	t.Run("IdleSessionRule non-nil", func(t *testing.T) {
+		src := &IdleSessionRule{Name: "idle", IdleTimeout: "30m", ResourceGroup: "default"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "30m", copied.IdleTimeout)
+	})
+
+	t.Run("BackupRetention non-nil", func(t *testing.T) {
+		src := &BackupRetention{FullCount: 7}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(7), copied.FullCount)
+	})
+
+	t.Run("SecretReference non-nil", func(t *testing.T) {
+		src := &SecretReference{Name: "creds"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "creds", copied.Name)
+	})
+
+	t.Run("RecommendationScanSpec non-nil", func(t *testing.T) {
+		src := &RecommendationScanSpec{Enabled: true, BloatThreshold: 20}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(20), copied.BloatThreshold)
+	})
+
+	t.Run("UsageReportSpec non-nil", func(t *testing.T) {
+		src := &UsageReportSpec{Enabled: true, Monthly: true}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Monthly)
+	})
+
+	t.Run("FailedSegment non-nil", func(t *testing.T) {
+		src := &FailedSegment{ContentID: 1, Hostname: "host1"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, int32(1), copied.ContentID)
+	})
+
+	t.Run("ImagePullSecret non-nil", func(t *testing.T) {
+		src := &ImagePullSecret{Name: "secret"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "secret", copied.Name)
+	})
+
+	t.Run("CertSecretRef non-nil", func(t *testing.T) {
+		src := &CertSecretRef{Name: "cert"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "cert", copied.Name)
+	})
+
+	t.Run("VaultTLSSecret non-nil", func(t *testing.T) {
+		src := &VaultTLSSecret{Name: "tls"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "tls", copied.Name)
+	})
+
+	t.Run("ResourceList non-nil", func(t *testing.T) {
+		src := &ResourceList{CPU: "4", Memory: "8Gi"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "4", copied.CPU)
+	})
+
+	t.Run("StorageSpec non-nil", func(t *testing.T) {
+		src := &StorageSpec{StorageClass: "fast", Size: "100Gi"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "fast", copied.StorageClass)
+	})
+
+	t.Run("HBARule non-nil", func(t *testing.T) {
+		src := &HBARule{Type: HBATypeHost, Database: "all"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, HBATypeHost, copied.Type)
+	})
+
+	t.Run("SecretKeyRef non-nil", func(t *testing.T) {
+		src := &SecretKeyRef{Name: "secret", Key: "key"}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "secret", copied.Name)
+	})
+}

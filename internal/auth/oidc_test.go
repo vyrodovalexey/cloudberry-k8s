@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -255,6 +256,55 @@ func TestOIDCProvider_MatchRole(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestNewOIDCProvider_MissingIssuerURL(t *testing.T) {
+	cfg := OIDCConfig{
+		IssuerURL: "",
+		ClientID:  "client-id",
+	}
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, provider)
+	assert.Contains(t, err.Error(), "OIDC issuer URL is required")
+}
+
+func TestNewOIDCProvider_MissingClientID(t *testing.T) {
+	cfg := OIDCConfig{
+		IssuerURL: "https://issuer.example.com",
+		ClientID:  "",
+	}
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, provider)
+	assert.Contains(t, err.Error(), "OIDC client ID is required")
+}
+
+func TestNewOIDCProvider_InvalidIssuer(t *testing.T) {
+	cfg := OIDCConfig{
+		IssuerURL: "https://invalid-issuer.example.com/nonexistent",
+		ClientID:  "client-id",
+	}
+	// This should fail because the issuer URL is not reachable.
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, provider)
+}
+
+func TestOIDCProvider_Type(t *testing.T) {
+	provider := &OIDCProvider{}
+	assert.Equal(t, "oidc", provider.Type())
+}
+
+func TestOIDCProvider_Authenticate_MissingToken(t *testing.T) {
+	provider := &OIDCProvider{
+		config: OIDCConfig{},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	identity, err := provider.Authenticate(context.Background(), req)
+	assert.Error(t, err)
+	assert.Nil(t, identity)
+	assert.Contains(t, err.Error(), "missing or malformed Bearer token")
 }
 
 func TestOIDCProvider_ResolvePermission(t *testing.T) {

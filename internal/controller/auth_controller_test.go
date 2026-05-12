@@ -157,6 +157,214 @@ func TestAuthReconciler_Reconcile_WithOIDC(t *testing.T) {
 	assert.NotZero(t, result.RequeueAfter)
 }
 
+func TestAuthReconciler_Reconcile_WithOIDC_MissingIssuer(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		OIDC: &cbv1alpha1.OIDCSpec{
+			Enabled:  true,
+			ClientID: "client-id",
+			// IssuerURL intentionally missing.
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Should still succeed (OIDC validation is a warning, not a failure).
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_WithSSL(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:       true,
+			CertSecret:    &cbv1alpha1.CertSecretRef{Name: "tls-cert"},
+			MinTLSVersion: "1.3",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_HBAUpdate(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+
+	// Pre-create the HBA configmap so the reconciler hits the update path.
+	existingCM := b.BuildPgHBAConfConfigMap(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, existingCM).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_WithOIDCAndSSL(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		Basic: &cbv1alpha1.BasicAuthSpec{
+			Enabled:   true,
+			AdminUser: "gpadmin",
+		},
+		OIDC: &cbv1alpha1.OIDCSpec{
+			Enabled:   true,
+			IssuerURL: "https://keycloak.example.com",
+			ClientID:  "cloudberry",
+		},
+		SSL: &cbv1alpha1.SSLSpec{
+			Enabled:       true,
+			CertSecret:    &cbv1alpha1.CertSecretRef{Name: "tls-cert"},
+			MinTLSVersion: "1.3",
+		},
+		HBARules: []cbv1alpha1.HBARule{
+			{Type: cbv1alpha1.HBATypeHostSSL, Database: "all", User: "all",
+				Address: "0.0.0.0/0", Method: cbv1alpha1.AuthMethodScramSHA256},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_HBAUpdateWithChangedRules(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+
+	// Pre-create the HBA configmap with old data.
+	existingCM := b.BuildPgHBAConfConfigMap(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, existingCM).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	// Now add HBA rules to the cluster (changes the desired configmap).
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		HBARules: []cbv1alpha1.HBARule{
+			{Type: cbv1alpha1.HBATypeHostSSL, Database: "all", User: "all",
+				Address: "10.0.0.0/8", Method: cbv1alpha1.AuthMethodScramSHA256},
+		},
+	}
+	// Update the cluster object in the fake client.
+	err := k8sClient.Update(context.Background(), cluster)
+	require.NoError(t, err)
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_WithHBARules(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Auth = &cbv1alpha1.AuthSpec{
+		HBARules: []cbv1alpha1.HBARule{
+			{Type: cbv1alpha1.HBATypeHostSSL, Database: "all", User: "all",
+				Address: "10.0.0.0/8", Method: cbv1alpha1.AuthMethodScramSHA256},
+			{Type: cbv1alpha1.HBATypeLocal, Database: "all", User: "gpadmin",
+				Method: cbv1alpha1.AuthMethodPeer},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify HBA configmap was created.
+	cm := &corev1.ConfigMap{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.PgHBAConfConfigMapName("test-cluster"),
+		Namespace: "default",
+	}, cm)
+	require.NoError(t, err)
+}
+
 func TestAuthReconciler_ValidateOIDCConfig(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()

@@ -711,6 +711,628 @@ func TestHandleStartRecovery_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// Backup endpoint tests.
+
+func TestHandleListBackups(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListBackups(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(0), resp["total"])
+	assert.Equal(t, "test-cluster", resp["cluster"])
+}
+
+func TestHandleListBackups_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/nonexistent/backups?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListBackups(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleCreateBackup(t *testing.T) {
+	t.Run("backup not enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("backup enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+			Enabled:     true,
+			Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "backups"},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/nonexistent/backups?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestHandleGetBackup(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleGetBackup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetBackup_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/nonexistent/backups/bk-1?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleGetBackup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleDeleteBackup(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleDeleteBackup(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "deleted", resp["status"])
+	assert.Equal(t, "bk-1", resp["backupID"])
+}
+
+func TestHandleRestoreBackup(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/backups/bk-1/restore?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleRestoreBackup(rec, req)
+	assert.Equal(t, http.StatusAccepted, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "restore initiated", resp["status"])
+}
+
+func TestHandleRestoreBackup_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/nonexistent/backups/bk-1/restore?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleRestoreBackup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// Data loading endpoint tests.
+
+func TestHandleListDataLoadingJobs(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{Name: "job1", Type: "s3", TargetTable: "public.data"},
+		},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListDataLoadingJobs(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(1), resp["total"])
+}
+
+func TestHandleListDataLoadingJobs_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/data-loading/jobs?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListDataLoadingJobs(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleCreateDataLoadingJob(t *testing.T) {
+	t.Run("data loading not enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("data loading enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+}
+
+func TestHandleGetDataLoadingJob(t *testing.T) {
+	t.Run("job found", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Jobs:    []cbv1alpha1.DataLoadingJob{{Name: "job1", Type: "s3", TargetTable: "t"}},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/job1?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "job1")
+		rec := httptest.NewRecorder()
+		s.handleGetDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("job not found", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/missing?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "missing")
+		rec := httptest.NewRecorder()
+		s.handleGetDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestHandleStartStopDataLoadingJob(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	t.Run("start job", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/start?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "j1")
+		rec := httptest.NewRecorder()
+		s.handleStartDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+
+	t.Run("stop job", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/stop?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "j1")
+		rec := httptest.NewRecorder()
+		s.handleStopDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+}
+
+func TestHandleUpdateDeleteDataLoadingJob(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	t.Run("update job", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "j1")
+		rec := httptest.NewRecorder()
+		s.handleUpdateDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("delete job", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("job", "j1")
+		rec := httptest.NewRecorder()
+		s.handleDeleteDataLoadingJob(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+// Workload endpoint tests.
+
+func TestHandleGetWorkload(t *testing.T) {
+	t.Run("workload nil", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/workload?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetWorkload(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["enabled"])
+	})
+
+	t.Run("workload enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{Enabled: true}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/workload?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetWorkload(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/nonexistent/workload?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		rec := httptest.NewRecorder()
+		s.handleGetWorkload(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestHandleListResourceGroups(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+			{Name: "analytics", Concurrency: 10},
+		},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListResourceGroups(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(1), resp["total"])
+}
+
+func TestHandleListResourceGroups_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/workload/resource-groups?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListResourceGroups(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleListWorkloadRules(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		Rules: []cbv1alpha1.WorkloadRule{
+			{Name: "rule1", Action: "cancel"},
+		},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListWorkloadRules(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(1), resp["total"])
+}
+
+func TestHandleListWorkloadRules_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/workload/rules?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListWorkloadRules(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// Query monitoring endpoint tests.
+
+func TestHandleGetQueryMonitoring(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 5
+	cluster.Status.QueuedQueries = 2
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetQueryMonitoring(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(5), resp["activeQueries"])
+	assert.NotNil(t, resp["config"])
+}
+
+func TestHandleGetQueryMonitoring_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/queries?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetQueryMonitoring(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetActiveQueries(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 10
+	cluster.Status.BlockedQueries = 1
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries/active?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetActiveQueries(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(10), resp["activeQueries"])
+	assert.Equal(t, float64(1), resp["blockedQueries"])
+}
+
+func TestHandleGetActiveQueries_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/queries/active?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetActiveQueries(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// Storage endpoint tests.
+
+func TestHandleGetDiskUsage(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.DiskUsagePercent = 45
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/disk-usage?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetDiskUsage(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(45), resp["diskUsagePercent"])
+}
+
+func TestHandleGetDiskUsage_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/storage/disk-usage?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetDiskUsage(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleListTables(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/tables?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListTables(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(0), resp["total"])
+}
+
+func TestHandleListTables_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/storage/tables?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListTables(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetTableDetail(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/tables/public/users?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("schema", "public")
+	req.SetPathValue("table", "users")
+	rec := httptest.NewRecorder()
+	s.handleGetTableDetail(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "public", resp["schema"])
+	assert.Equal(t, "users", resp["table"])
+}
+
+func TestHandleListRecommendations(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.RecommendationCount = 3
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/recommendations?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListRecommendations(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(3), resp["recommendationCount"])
+}
+
+func TestHandleListRecommendations_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/storage/recommendations?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListRecommendations(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleTriggerRecommendationScan(t *testing.T) {
+	t.Run("scan not enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/storage/recommendations/scan?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleTriggerRecommendationScan(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("scan enabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+			DiskMonitoring: true,
+			RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+				Enabled: true, Schedule: "0 3 * * 0",
+			},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/storage/recommendations/scan?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleTriggerRecommendationScan(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/nonexistent/storage/recommendations/scan?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		rec := httptest.NewRecorder()
+		s.handleTriggerRecommendationScan(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestHandleGetUsageReport(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/usage-report?namespace=default&month=2025-01", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetUsageReport(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "2025-01", resp["month"])
+}
+
+func TestHandleGetUsageReport_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/storage/usage-report?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetUsageReport(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleDeleteBackup_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/nonexistent/backups/bk-1?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("id", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleDeleteBackup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetStandby_NoStandby(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/standby?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetStandby(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, false, resp["enabled"])
+}
+
+func TestGetCluster_AllNamespaces_NotFound(t *testing.T) {
+	s := newTestServer()
+	result, err := s.getCluster(context.Background(), "nonexistent", "")
+	assert.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "not found")
+}
+
 func TestWithAuth_WithMiddleware(t *testing.T) {
 	basicProvider := &mockAuthProvider{
 		identity: &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin},

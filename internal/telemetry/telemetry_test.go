@@ -116,3 +116,153 @@ func TestProtocolConstants(t *testing.T) {
 	assert.Equal(t, "grpc", protocolGRPC)
 	assert.Equal(t, "http", protocolHTTP)
 }
+
+func TestInitTracer_EnabledWithEmptyEndpoint(t *testing.T) {
+	cfg := Config{
+		Enabled:        true,
+		OTLPEndpoint:   "",
+		OTLPProtocol:   "grpc",
+		SamplingRate:   1.0,
+		ServiceName:    "test-service",
+		ServiceVersion: "1.0.0",
+		Namespace:      "default",
+	}
+
+	shutdown, err := InitTracer(context.Background(), cfg)
+	// Should succeed even with empty endpoint (exporter will fail on flush, not on init).
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+
+	// Shutdown should not panic.
+	_ = shutdown(context.Background())
+}
+
+func TestInitTracer_HTTPProtocol(t *testing.T) {
+	cfg := Config{
+		Enabled:        true,
+		OTLPEndpoint:   "localhost:4318",
+		OTLPProtocol:   "http",
+		SamplingRate:   1.0,
+		ServiceName:    "test-service",
+		ServiceVersion: "1.0.0",
+		Namespace:      "default",
+	}
+
+	shutdown, err := InitTracer(context.Background(), cfg)
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+
+	_ = shutdown(context.Background())
+}
+
+func TestInitTracer_GRPCProtocol(t *testing.T) {
+	cfg := Config{
+		Enabled:        true,
+		OTLPEndpoint:   "localhost:4317",
+		OTLPProtocol:   "grpc",
+		SamplingRate:   0.5,
+		ServiceName:    "test-service",
+		ServiceVersion: "1.0.0",
+		Namespace:      "test-ns",
+	}
+
+	shutdown, err := InitTracer(context.Background(), cfg)
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+
+	_ = shutdown(context.Background())
+}
+
+func TestInitTracer_SamplingRates(t *testing.T) {
+	rates := []struct {
+		name string
+		rate float64
+	}{
+		{"zero rate", 0.0},
+		{"half rate", 0.5},
+		{"full rate", 1.0},
+	}
+
+	for _, tt := range rates {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:        true,
+				OTLPEndpoint:   "localhost:4317",
+				OTLPProtocol:   "grpc",
+				SamplingRate:   tt.rate,
+				ServiceName:    "test",
+				ServiceVersion: "1.0",
+			}
+
+			shutdown, err := InitTracer(context.Background(), cfg)
+			require.NoError(t, err)
+			require.NotNil(t, shutdown)
+
+			_ = shutdown(context.Background())
+		})
+	}
+}
+
+func TestInitTracer_Disabled_ShutdownIdempotent(t *testing.T) {
+	cfg := Config{Enabled: false}
+
+	shutdown, err := InitTracer(context.Background(), cfg)
+	require.NoError(t, err)
+
+	// Calling shutdown multiple times should be safe.
+	assert.NoError(t, shutdown(context.Background()))
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestStartSpan_ReturnsValidContext(t *testing.T) {
+	otel.SetTracerProvider(noop.NewTracerProvider())
+
+	ctx := context.Background()
+	newCtx, span := StartSpan(ctx, "tracer", "operation")
+	defer span.End()
+
+	// The returned context should be different from the original.
+	assert.NotNil(t, newCtx)
+	assert.NotNil(t, span)
+}
+
+func TestSetSpanError_WithVariousErrors(t *testing.T) {
+	otel.SetTracerProvider(noop.NewTracerProvider())
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"nil error", nil},
+		{"simple error", fmt.Errorf("simple error")},
+		{"wrapped error", fmt.Errorf("outer: %w", fmt.Errorf("inner"))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, span := StartSpan(context.Background(), "test", "span")
+			defer span.End()
+			// Should not panic for any error type.
+			SetSpanError(span, tt.err)
+		})
+	}
+}
+
+func TestConfig_Fields(t *testing.T) {
+	cfg := Config{
+		Enabled:        true,
+		OTLPEndpoint:   "collector:4317",
+		OTLPProtocol:   "grpc",
+		SamplingRate:   0.75,
+		ServiceName:    "cloudberry-operator",
+		ServiceVersion: "1.0.0",
+		Namespace:      "production",
+	}
+
+	assert.True(t, cfg.Enabled)
+	assert.Equal(t, "collector:4317", cfg.OTLPEndpoint)
+	assert.Equal(t, "grpc", cfg.OTLPProtocol)
+	assert.Equal(t, 0.75, cfg.SamplingRate)
+	assert.Equal(t, "cloudberry-operator", cfg.ServiceName)
+	assert.Equal(t, "production", cfg.Namespace)
+}

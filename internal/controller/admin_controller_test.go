@@ -559,6 +559,219 @@ func TestAdminReconciler_ReconcileStorage_WithRecommendationScan(t *testing.T) {
 	assert.Equal(t, int32(5), cluster.Status.RecommendationCount)
 }
 
+func TestAdminReconciler_Reconcile_WithAllFeaturesAndStorage(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+			{Name: "default", Concurrency: 20},
+			{Name: "analytics", Concurrency: 10, CPUMaxPercent: 50},
+		},
+		Rules: []cbv1alpha1.WorkloadRule{
+			{Name: "cancel-long", Action: "cancel", ThresholdType: "running_time", Threshold: "3600"},
+		},
+		IdleRules: []cbv1alpha1.IdleSessionRule{
+			{Name: "idle-30m", ResourceGroup: "analytics", IdleTimeout: "30m"},
+		},
+	}
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+		Enabled:            true,
+		HistoryRetention:   "90d",
+		SamplingInterval:   5,
+		PlanCollection:     true,
+		SlowQueryThreshold: "500ms",
+	}
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:  true,
+		Schedule: "0 2 * * *",
+		Destination: cbv1alpha1.BackupDestination{
+			Type: "s3", Bucket: "backups",
+		},
+		Incremental: true,
+	}
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{Name: "loader1", Type: "s3", Enabled: true, TargetTable: "public.data"},
+			{Name: "loader2", Type: "kafka", Enabled: true, TargetTable: "public.stream"},
+			{Name: "loader3", Type: "rabbitmq", Enabled: false, TargetTable: "public.queue"},
+		},
+	}
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		DiskMonitoring: true,
+		RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+			Enabled:        true,
+			Schedule:       "0 3 * * 0",
+			BloatThreshold: 20,
+			SkewThreshold:  50,
+		},
+		UsageReport: &cbv1alpha1.UsageReportSpec{Enabled: true, Monthly: true},
+	}
+	cluster.Status.ActiveQueries = 10
+	cluster.Status.QueuedQueries = 3
+	cluster.Status.BlockedQueries = 1
+	cluster.Status.DiskUsagePercent = 55
+	cluster.Status.RecommendationCount = 7
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(30)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify data loading jobs count.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), updated.Status.DataLoadingJobs)
+}
+
+func TestAdminReconciler_ReconcileStorage_WithUsageReport(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		DiskMonitoring: true,
+		UsageReport:    &cbv1alpha1.UsageReportSpec{Enabled: true, Monthly: true},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileStorage(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_Reconcile_WithAllFeaturesEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
+		Parameters: map[string]string{"max_connections": "200"},
+	}
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled:        true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{{Name: "default", Concurrency: 20}},
+	}
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+		Enabled: true, HistoryRetention: "30d",
+	}
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:     true,
+		Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "b"},
+	}
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs:    []cbv1alpha1.DataLoadingJob{{Name: "j", Type: "s3", Enabled: true, TargetTable: "t"}},
+	}
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		DiskMonitoring: true,
+		RecommendationScan: &cbv1alpha1.RecommendationScanSpec{
+			Enabled: true, Schedule: "0 3 * * 0",
+		},
+		UsageReport: &cbv1alpha1.UsageReportSpec{Enabled: true},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(30)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAdminReconciler_Reconcile_WithConfigAndExistingConfigMap(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
+		Parameters: map[string]string{"max_connections": "100"},
+	}
+
+	b := builder.NewBuilder()
+	// Pre-create the postgresql.conf configmap.
+	existingCM := b.BuildPostgresqlConfConfigMap(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, existingCM).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAdminReconciler_ReconcileConfig_ConfigChange(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
+		Parameters: map[string]string{"max_connections": "100"},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	// First reconcile sets the hash.
+	err := r.reconcileConfig(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Change config.
+	cluster.Spec.Config.Parameters["max_connections"] = "200"
+	err = r.reconcileConfig(context.Background(), cluster)
+	require.NoError(t, err)
+
+	assert.NotNil(t, cluster.Status.LastConfigChangeTime)
+}
+
 func TestAdminReconciler_HandleMaintenance(t *testing.T) {
 	tests := []struct {
 		name        string
