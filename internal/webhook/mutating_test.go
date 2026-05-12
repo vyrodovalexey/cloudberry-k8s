@@ -44,14 +44,6 @@ func TestDefault(t *testing.T) {
 	assert.Equal(t, cbv1alpha1.ImagePullIfNotPresent, cluster.Spec.ImagePullPolicy)
 }
 
-func TestDefault_WrongType(t *testing.T) {
-	d := NewCloudberryClusterDefaulter()
-	wrongObj := &cbv1alpha1.CloudberryClusterList{}
-	err := d.Default(context.Background(), wrongObj)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "expected CloudberryCluster")
-}
-
 func TestSetSpecDefaults(t *testing.T) {
 	tests := []struct {
 		name     string

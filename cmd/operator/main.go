@@ -271,7 +271,7 @@ func startAPIServer(
 func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger) error {
 	// Register the validating webhook.
 	if err := ctrl.NewWebhookManagedBy(mgr, &cbv1alpha1.CloudberryCluster{}).
-		WithCustomValidator(webhook.NewCloudberryClusterValidator()).
+		WithValidator(webhook.NewCloudberryClusterValidator()).
 		Complete(); err != nil {
 		return fmt.Errorf("creating validating webhook: %w", err)
 	}
@@ -279,7 +279,7 @@ func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger) error {
 
 	// Register the mutating webhook.
 	if err := ctrl.NewWebhookManagedBy(mgr, &cbv1alpha1.CloudberryCluster{}).
-		WithCustomDefaulter(webhook.NewCloudberryClusterDefaulter()).
+		WithDefaulter(webhook.NewCloudberryClusterDefaulter()).
 		Complete(); err != nil {
 		return fmt.Errorf("creating mutating webhook: %w", err)
 	}

@@ -101,15 +101,6 @@ func TestValidateCreate(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_WrongType(t *testing.T) {
-	v := NewCloudberryClusterValidator()
-	// Use a different runtime.Object that is not CloudberryCluster
-	wrongObj := &cbv1alpha1.CloudberryClusterList{}
-	_, err := v.ValidateCreate(context.Background(), wrongObj)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "expected CloudberryCluster")
-}
-
 func TestValidateUpdate(t *testing.T) {
 	v := NewCloudberryClusterValidator()
 	oldCluster := newValidCluster()
@@ -118,13 +109,6 @@ func TestValidateUpdate(t *testing.T) {
 	warnings, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
 	require.NoError(t, err)
 	_ = warnings
-}
-
-func TestValidateUpdate_WrongType(t *testing.T) {
-	v := NewCloudberryClusterValidator()
-	wrongObj := &cbv1alpha1.CloudberryClusterList{}
-	_, err := v.ValidateUpdate(context.Background(), newValidCluster(), wrongObj)
-	require.Error(t, err)
 }
 
 func TestValidateDelete(t *testing.T) {

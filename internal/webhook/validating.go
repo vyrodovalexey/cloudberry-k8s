@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -22,32 +21,24 @@ func NewCloudberryClusterValidator() *CloudberryClusterValidator {
 // ValidateCreate validates a CloudberryCluster on creation.
 func (v *CloudberryClusterValidator) ValidateCreate(
 	_ context.Context,
-	obj runtime.Object,
+	cluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
-	cluster, ok := obj.(*cbv1alpha1.CloudberryCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected CloudberryCluster, got %T", obj)
-	}
 	return validateCluster(cluster)
 }
 
 // ValidateUpdate validates a CloudberryCluster on update.
 func (v *CloudberryClusterValidator) ValidateUpdate(
 	_ context.Context,
-	_ runtime.Object,
-	newObj runtime.Object,
+	_ *cbv1alpha1.CloudberryCluster,
+	newCluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
-	cluster, ok := newObj.(*cbv1alpha1.CloudberryCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected CloudberryCluster, got %T", newObj)
-	}
-	return validateCluster(cluster)
+	return validateCluster(newCluster)
 }
 
 // ValidateDelete validates a CloudberryCluster on deletion.
 func (v *CloudberryClusterValidator) ValidateDelete(
 	_ context.Context,
-	_ runtime.Object,
+	_ *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
 	// No validation needed on delete.
 	return nil, nil

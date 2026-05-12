@@ -2,9 +2,6 @@ package webhook
 
 import (
 	"context"
-	"fmt"
-
-	"k8s.io/apimachinery/pkg/runtime"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -19,12 +16,7 @@ func NewCloudberryClusterDefaulter() *CloudberryClusterDefaulter {
 }
 
 // Default sets defaults on a CloudberryCluster.
-func (d *CloudberryClusterDefaulter) Default(_ context.Context, obj runtime.Object) error {
-	cluster, ok := obj.(*cbv1alpha1.CloudberryCluster)
-	if !ok {
-		return fmt.Errorf("expected CloudberryCluster, got %T", obj)
-	}
-
+func (d *CloudberryClusterDefaulter) Default(_ context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	setClusterDefaults(cluster)
 	return nil
 }
