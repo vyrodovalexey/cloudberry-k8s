@@ -391,15 +391,15 @@ main() {
     done
 
     wait_for_keycloak
-    if [ "$CI_MODE" = false ]; then
-      disable_ssl_requirements
-    fi
     get_admin_token
 
     setup_realm
+    if [ "$CI_MODE" = false ]; then
+      disable_ssl_requirements
+      # After realm is created, also disable SSL on the test realm
+      disable_ssl_on_test_realm
+    fi
 
-    # After realm is created, also disable SSL on the test realm
-    disable_ssl_on_test_realm
 
     verify_setup
 
