@@ -31,6 +31,7 @@ const (
 	clusterControllerName = "cluster-controller"
 	requeueAfterDefault   = 30 * time.Second
 	requeueAfterError     = 10 * time.Second
+	requeueAfterStopping  = 5 * time.Second
 )
 
 // ClusterReconciler reconciles a CloudberryCluster object.
@@ -86,12 +87,26 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
 	}
 
+	// Handle annotation-based actions FIRST — annotations don't change the
+	// generation, so they must be checked before the generation skip.
+	if action, ok := cluster.Annotations[util.AnnotationAction]; ok {
+		result, err := r.handleAction(ctx, cluster, action)
+		if err != nil {
+			r.recordReconcileResult(cluster, startTime, "error")
+			return result, err
+		}
+		return result, nil
+	}
+
+	// Check if the cluster is in a lifecycle phase that should short-circuit reconciliation.
+	if result, handled := r.handleLifecyclePhase(ctx, cluster); handled {
+		return result, nil
+	}
+
 	// Skip full reconciliation if only status changed (ObservedGeneration matches).
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
 		logger.Info("skipping reconciliation, generation unchanged and cluster running")
-		// Always refresh metrics so they reflect the current cluster state,
-		// even when we skip the full reconciliation loop.
 		r.recordMetricsSnapshot(cluster)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
@@ -110,16 +125,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Handle annotation-based actions.
-	if action, ok := cluster.Annotations[util.AnnotationAction]; ok {
-		result, err := r.handleAction(ctx, cluster, action)
-		if err != nil {
-			r.recordReconcileResult(cluster, startTime, "error")
-			return result, err
-		}
-		return result, nil
-	}
-
 	// Main reconciliation flow.
 	result, err := r.reconcileCluster(ctx, cluster)
 	if err != nil {
@@ -131,6 +136,43 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.recordReconcileResult(cluster, startTime, "success")
 	logger.Info("reconciliation completed", "duration", time.Since(startTime))
 	return result, nil
+}
+
+// handleLifecyclePhase checks whether the cluster is in a lifecycle phase
+// (Stopped, Stopping, Restricted, Maintenance) that should short-circuit
+// normal reconciliation when no action annotation is pending.
+// Returns (result, true) if the phase was handled, or (_, false) to continue.
+func (r *ClusterReconciler) handleLifecyclePhase(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, bool) {
+	_, hasAction := cluster.Annotations[util.AnnotationAction]
+	if hasAction {
+		// An action is pending — let the main reconciliation handle it.
+		return ctrl.Result{}, false
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	switch cluster.Status.Phase {
+	case cbv1alpha1.ClusterPhaseStopped:
+		logger.Info("cluster is stopped, skipping reconciliation")
+		r.recordMetricsSnapshot(cluster)
+		return ctrl.Result{}, true
+
+	case cbv1alpha1.ClusterPhaseStopping:
+		result, _ := r.checkStopProgress(ctx, cluster)
+		return result, true
+
+	case cbv1alpha1.ClusterPhaseRestricted, cbv1alpha1.ClusterPhaseMaintenance:
+		logger.Info("cluster in limited mode, skipping full reconciliation",
+			"phase", cluster.Status.Phase)
+		r.recordMetricsSnapshot(cluster)
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true
+
+	default:
+		return ctrl.Result{}, false
+	}
 }
 
 // reconcileCluster performs the main reconciliation logic.
@@ -508,18 +550,337 @@ func (r *ClusterReconciler) handleAction(
 
 	switch action {
 	case util.ActionStart, util.ActionStartRestricted, util.ActionStartMaintenance:
-		r.recorder.Event(cluster, corev1.EventTypeNormal, "Starting", "Cluster start initiated")
-		return r.reconcileCluster(ctx, cluster)
-	case util.ActionStop:
-		r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopping", "Cluster stop initiated")
-		return r.reconcileCluster(ctx, cluster)
+		return r.handleStart(ctx, cluster, action)
+	case util.ActionStop, util.ActionStopFast, util.ActionStopImmediate:
+		return r.handleStop(ctx, cluster, action)
 	case util.ActionRestart:
-		r.recorder.Event(cluster, corev1.EventTypeNormal, "Restarting", "Cluster restart initiated")
-		return r.reconcileCluster(ctx, cluster)
+		return r.handleRestart(ctx, cluster)
 	default:
 		logger.Warn("unknown action", "action", action)
 		return ctrl.Result{}, nil
 	}
+}
+
+// handleStop processes stop actions (stop, stop-fast, stop-immediate).
+// It sets the phase to Stopping, scales all StatefulSets to 0, and transitions
+// to Stopped once all pods are terminated.
+func (r *ClusterReconciler) handleStop(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	mode string,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("stopping cluster", "mode", mode)
+
+	// Set phase to Stopping.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting stopping phase: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopping",
+		fmt.Sprintf("Cluster stop initiated (mode: %s)", mode))
+
+	// Scale StatefulSets to 0 in order: mirrors, primaries, standby, coordinator.
+	for _, name := range r.getScaleDownOrder(cluster) {
+		if err := r.scaleStatefulSet(ctx, cluster.Namespace, name, 0); err != nil {
+			logger.Error("failed to scale down", "statefulset", name, "error", err)
+		}
+	}
+
+	// Check if all pods are terminated.
+	if !r.allStatefulSetsAtScale(ctx, cluster, 0) {
+		// Requeue to check again.
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+
+	// All stopped — update status.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Status.CoordinatorReady = false
+	cluster.Status.StandbyReady = false
+	cluster.Status.SegmentsReady = 0
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopped",
+		fmt.Sprintf("Cluster stopped (mode: %s)", mode))
+	return ctrl.Result{}, nil
+}
+
+// handleStart processes start actions (start, start-restricted, start-maintenance).
+func (r *ClusterReconciler) handleStart(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	mode string,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("starting cluster", "mode", mode)
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Starting",
+		fmt.Sprintf("Cluster start initiated (mode: %s)", mode))
+
+	switch mode {
+	case util.ActionStartRestricted:
+		// Only coordinator, restricted connections.
+		coordName := util.CoordinatorName(cluster.Name)
+		if err := r.scaleStatefulSet(ctx, cluster.Namespace, coordName, 1); err != nil {
+			return ctrl.Result{}, fmt.Errorf("scaling coordinator for restricted start: %w", err)
+		}
+		// Re-fetch to get the latest resourceVersion before status update.
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Name: cluster.Name, Namespace: cluster.Namespace,
+		}, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for restricted start: %w", err)
+		}
+		cluster.Status.Phase = cbv1alpha1.ClusterPhaseRestricted
+		if err := r.client.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("setting restricted phase: %w", err)
+		}
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "Started",
+			"Cluster started in restricted mode")
+		return ctrl.Result{}, nil
+
+	case util.ActionStartMaintenance:
+		// Only coordinator in utility mode.
+		coordName := util.CoordinatorName(cluster.Name)
+		if err := r.scaleStatefulSet(ctx, cluster.Namespace, coordName, 1); err != nil {
+			return ctrl.Result{}, fmt.Errorf("scaling coordinator for maintenance start: %w", err)
+		}
+		// Re-fetch to get the latest resourceVersion before status update.
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Name: cluster.Name, Namespace: cluster.Namespace,
+		}, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for maintenance start: %w", err)
+		}
+		cluster.Status.Phase = cbv1alpha1.ClusterPhaseMaintenance
+		if err := r.client.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("setting maintenance phase: %w", err)
+		}
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "Started",
+			"Cluster started in maintenance mode")
+		return ctrl.Result{}, nil
+
+	default:
+		// Normal start — reset phase so updateStatus can transition to Running,
+		// then scale everything back via full reconciliation.
+		// Re-fetch to get the latest resourceVersion before status update.
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Name: cluster.Name, Namespace: cluster.Namespace,
+		}, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for start: %w", err)
+		}
+		cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+		if err := r.client.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("resetting phase for normal start: %w", err)
+		}
+		return r.reconcileCluster(ctx, cluster)
+	}
+}
+
+// handleRestart processes the restart action.
+// It marks the cluster with a restart-pending annotation, then initiates a stop.
+// When the stop completes, the lifecycle handler detects the pending restart
+// and triggers a full start.
+func (r *ClusterReconciler) handleRestart(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("restarting cluster")
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Restarting", "Cluster restart initiated")
+
+	// Mark restart as pending so the lifecycle handler knows to start after stop.
+	if err := setAnnotationPatch(ctx, r.client, cluster, util.AnnotationRestartPending, "true"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting restart-pending annotation: %w", err)
+	}
+
+	// Set phase to Stopping.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting stopping phase for restart: %w", err)
+	}
+
+	// Scale all StatefulSets to 0.
+	stsNames := r.getScaleDownOrder(cluster)
+	for _, name := range stsNames {
+		if err := r.scaleStatefulSet(ctx, cluster.Namespace, name, 0); err != nil {
+			logger.Error("failed to scale down for restart", "statefulset", name, "error", err)
+		}
+	}
+
+	// Check if all pods are terminated.
+	if r.allStatefulSetsAtScale(ctx, cluster, 0) {
+		return r.completeRestart(ctx, cluster)
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+}
+
+// completeRestart finishes a restart by removing the restart-pending annotation,
+// transitioning through Stopped, and starting the cluster back up.
+func (r *ClusterReconciler) completeRestart(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	// Remove the restart-pending annotation.
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationRestartPending); err != nil {
+		return ctrl.Result{}, fmt.Errorf("removing restart-pending annotation: %w", err)
+	}
+
+	// Re-fetch to get the latest resourceVersion before status update.
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name: cluster.Name, Namespace: cluster.Namespace,
+	}, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching cluster for restart: %w", err)
+	}
+
+	// Reset phase to Initializing so updateStatus can transition to Running.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+	cluster.Status.CoordinatorReady = false
+	cluster.Status.StandbyReady = false
+	cluster.Status.SegmentsReady = 0
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("resetting phase for restart: %w", err)
+	}
+
+	// Start everything back up via full reconciliation.
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Restarted",
+		"Cluster restart: scaling back up")
+	return r.reconcileCluster(ctx, cluster)
+}
+
+// checkStopProgress checks whether a cluster in Stopping phase has completed scale-down.
+// If a restart is pending, it completes the restart instead of just stopping.
+func (r *ClusterReconciler) checkStopProgress(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("checking stop progress")
+
+	if !r.allStatefulSetsAtScale(ctx, cluster, 0) {
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+
+	// If a restart is pending, complete the restart instead of just stopping.
+	if _, pending := cluster.Annotations[util.AnnotationRestartPending]; pending {
+		return r.completeRestart(ctx, cluster)
+	}
+
+	// All stopped.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Status.CoordinatorReady = false
+	cluster.Status.StandbyReady = false
+	cluster.Status.SegmentsReady = 0
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopped", "Cluster stopped")
+	return ctrl.Result{}, nil
+}
+
+// allStatefulSetsAtScale checks whether all cluster StatefulSets have reached
+// the desired replica count.
+func (r *ClusterReconciler) allStatefulSetsAtScale(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	replicas int32,
+) bool {
+	stsNames := r.getScaleDownOrder(cluster)
+	for _, name := range stsNames {
+		ready, _ := r.isStatefulSetAtScale(ctx, cluster.Namespace, name, replicas)
+		if !ready {
+			return false
+		}
+	}
+	return true
+}
+
+// scaleStatefulSet scales a StatefulSet to the desired number of replicas.
+func (r *ClusterReconciler) scaleStatefulSet(
+	ctx context.Context,
+	namespace, name string,
+	replicas int32,
+) error {
+	sts := &appsv1.StatefulSet{}
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			// StatefulSet doesn't exist; nothing to scale.
+			return nil
+		}
+		return fmt.Errorf("getting statefulset %s for scaling: %w", name, err)
+	}
+
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == replicas {
+		// Already at the desired scale.
+		return nil
+	}
+
+	sts.Spec.Replicas = &replicas
+	if err := r.client.Update(ctx, sts); err != nil {
+		return fmt.Errorf("scaling statefulset %s to %d: %w", name, replicas, err)
+	}
+
+	util.LoggerFromContext(ctx).Info("scaled statefulset",
+		"name", name, "replicas", replicas)
+	return nil
+}
+
+// isStatefulSetAtScale checks whether a StatefulSet has reached the desired replica count.
+// Returns true if the StatefulSet does not exist (nothing to wait for).
+func (r *ClusterReconciler) isStatefulSetAtScale(
+	ctx context.Context,
+	namespace, name string,
+	replicas int32,
+) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			// StatefulSet doesn't exist — treat as "at scale" (nothing to wait for).
+			return true, nil
+		}
+		return false, fmt.Errorf("getting statefulset %s for scale check: %w", name, err)
+	}
+
+	if replicas == 0 {
+		return sts.Status.Replicas == 0, nil
+	}
+	return sts.Status.ReadyReplicas >= replicas, nil
+}
+
+// getScaleDownOrder returns the StatefulSet names in the order they should be
+// scaled down: mirrors first, then primaries, then standby, then coordinator.
+func (r *ClusterReconciler) getScaleDownOrder(
+	cluster *cbv1alpha1.CloudberryCluster,
+) []string {
+	var names []string
+
+	// Mirrors first.
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		names = append(names, util.SegmentMirrorName(cluster.Name))
+	}
+
+	// Primary segments.
+	names = append(names, util.SegmentPrimaryName(cluster.Name))
+
+	// Standby coordinator.
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
+		names = append(names, util.StandbyName(cluster.Name))
+	}
+
+	// Coordinator last.
+	names = append(names, util.CoordinatorName(cluster.Name))
+
+	return names
 }
 
 // updatePhase updates the cluster phase in the status.
@@ -593,26 +954,36 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *cbv1alpha
 	}
 
 	// Determine overall phase.
-	if cluster.Status.CoordinatorReady && cluster.Status.SegmentsReady == cluster.Status.SegmentsTotal {
-		cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
-		cluster.Status.Conditions = util.SetCondition(
-			cluster.Status.Conditions,
-			string(cbv1alpha1.ConditionClusterReady),
-			metav1.ConditionTrue,
-			"AllComponentsReady",
-			"All cluster components are running and healthy",
-		)
-	} else if cluster.Status.Phase != cbv1alpha1.ClusterPhaseDeleting {
-		if cluster.Status.Phase == cbv1alpha1.ClusterPhasePending {
-			cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+	// Preserve intentional lifecycle phases that should not be overridden.
+	switch cluster.Status.Phase {
+	case cbv1alpha1.ClusterPhaseDeleting,
+		cbv1alpha1.ClusterPhaseStopped,
+		cbv1alpha1.ClusterPhaseStopping,
+		cbv1alpha1.ClusterPhaseRestricted,
+		cbv1alpha1.ClusterPhaseMaintenance:
+		// Do not override these phases — they are managed by action handlers.
+	default:
+		if cluster.Status.CoordinatorReady && cluster.Status.SegmentsReady == cluster.Status.SegmentsTotal {
+			cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+			cluster.Status.Conditions = util.SetCondition(
+				cluster.Status.Conditions,
+				string(cbv1alpha1.ConditionClusterReady),
+				metav1.ConditionTrue,
+				"AllComponentsReady",
+				"All cluster components are running and healthy",
+			)
+		} else {
+			if cluster.Status.Phase == cbv1alpha1.ClusterPhasePending {
+				cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+			}
+			cluster.Status.Conditions = util.SetCondition(
+				cluster.Status.Conditions,
+				string(cbv1alpha1.ConditionClusterReady),
+				metav1.ConditionFalse,
+				"ComponentsNotReady",
+				"Some cluster components are not yet ready",
+			)
 		}
-		cluster.Status.Conditions = util.SetCondition(
-			cluster.Status.Conditions,
-			string(cbv1alpha1.ConditionClusterReady),
-			metav1.ConditionFalse,
-			"ComponentsNotReady",
-			"Some cluster components are not yet ready",
-		)
 	}
 
 	// Update metrics.

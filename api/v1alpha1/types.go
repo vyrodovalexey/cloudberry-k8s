@@ -22,6 +22,14 @@ const (
 	ClusterPhaseFailed ClusterPhase = "Failed"
 	// ClusterPhaseDeleting indicates the cluster is being deleted.
 	ClusterPhaseDeleting ClusterPhase = "Deleting"
+	// ClusterPhaseStopped indicates the cluster is stopped.
+	ClusterPhaseStopped ClusterPhase = "Stopped"
+	// ClusterPhaseStopping indicates the cluster is being stopped.
+	ClusterPhaseStopping ClusterPhase = "Stopping"
+	// ClusterPhaseRestricted indicates the cluster is running in restricted mode.
+	ClusterPhaseRestricted ClusterPhase = "Restricted"
+	// ClusterPhaseMaintenance indicates the cluster is running in maintenance mode.
+	ClusterPhaseMaintenance ClusterPhase = "Maintenance"
 )
 
 // MirroringStatus represents the current mirroring state.

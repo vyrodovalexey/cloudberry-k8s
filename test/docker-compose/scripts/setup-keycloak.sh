@@ -8,7 +8,7 @@
 #   3. Test users for user auth testing
 #
 # Usage:
-#   ./scripts/setup-keycloak.sh [--verify]
+#   ./scripts/setup-keycloak.sh [--verify] [--ci]
 # =============================================================================
 
 set -euo pipefail
@@ -21,7 +21,7 @@ KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-admin}"
 REALM="test"
 CLOUDBERRY_OPERATOR_CLIENT_ID="cloudberry-operator"
 CLOUDBERRY_OPERATOR_CLIENT_SECRET="some-secret"
-
+CI_MODE=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -384,8 +384,16 @@ main() {
         exit $?
     fi
 
+    for arg in "$@"; do
+      case "$arg" in
+        --ci)     CI_MODE=true ;;
+      esac
+    done
+
     wait_for_keycloak
-    disable_ssl_requirements
+    if [ "$CI_MODE" = false ]; then
+      disable_ssl_requirements
+    fi
     get_admin_token
 
     setup_realm

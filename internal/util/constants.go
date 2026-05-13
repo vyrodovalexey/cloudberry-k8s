@@ -42,6 +42,8 @@ const (
 	AnnotationRollingRestart = "avsoft.io/rolling-restart"
 	// AnnotationRestartTrigger triggers a pod restart when changed.
 	AnnotationRestartTrigger = "avsoft.io/restart-trigger"
+	// AnnotationRestartPending indicates a full cluster restart is in progress.
+	AnnotationRestartPending = "avsoft.io/restart-pending"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"
@@ -51,6 +53,10 @@ const (
 	ActionStartMaintenance = "start-maintenance"
 	// ActionStop triggers a cluster stop.
 	ActionStop = "stop"
+	// ActionStopFast triggers a fast cluster stop (rolls back transactions).
+	ActionStopFast = "stop-fast"
+	// ActionStopImmediate triggers an immediate cluster stop (aborts connections).
+	ActionStopImmediate = "stop-immediate"
 	// ActionRestart triggers a cluster restart.
 	ActionRestart = "restart"
 	// ActionRebalance triggers segment rebalancing.
