@@ -90,6 +90,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
 		logger.Info("skipping reconciliation, generation unchanged and cluster running")
+		// Always refresh metrics so they reflect the current cluster state,
+		// even when we skip the full reconciliation loop.
+		r.recordMetricsSnapshot(cluster)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
@@ -635,6 +638,27 @@ func (r *ClusterReconciler) recordReconcileResult(
 	r.metrics.RecordReconcile(cluster.Name, cluster.Namespace, result, time.Since(startTime))
 }
 
+// recordMetricsSnapshot publishes the current cluster state to Prometheus
+// metrics without performing a full reconciliation. This ensures metrics
+// are always up-to-date even when the generation-skip optimisation fires.
+func (r *ClusterReconciler) recordMetricsSnapshot(cluster *cbv1alpha1.CloudberryCluster) {
+	r.metrics.UpdateClusterInfo(
+		cluster.Name, cluster.Namespace,
+		cluster.Spec.Version, string(cluster.Status.Phase),
+		float64(cluster.Status.SegmentsReady),
+	)
+	r.metrics.SetCoordinatorUp(cluster.Name, cluster.Namespace, cluster.Status.CoordinatorReady)
+	r.metrics.SetStandbyUp(cluster.Name, cluster.Namespace, cluster.Status.StandbyReady)
+	r.metrics.SetSegmentsReady(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsReady))
+	r.metrics.SetSegmentsTotal(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsTotal))
+
+	r.metrics.SetMirroringInSync(
+		cluster.Name, cluster.Namespace,
+		cluster.Status.MirroringStatus == cbv1alpha1.MirroringInSync,
+	)
+	r.metrics.SetConnectionsMax(cluster.Name, cluster.Namespace, 0)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -645,4 +669,109 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Named(clusterControllerName).
 		Complete(r)
+}
+
+// buildAnnotationPatch builds a MergePatch payload for setting or removing an annotation.
+// A nil value removes the annotation; a non-nil value sets it.
+func buildAnnotationPatch(key string, value interface{}) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		patchKeyMetadata: map[string]interface{}{
+			patchKeyAnnotations: map[string]interface{}{
+				key: value,
+			},
+		},
+	})
+}
+
+// removeAnnotationPatch removes an annotation from a cluster using a MergePatch
+// to avoid conflicts with stale objects. After patching, it re-fetches the
+// cluster to ensure the caller has the latest state.
+func removeAnnotationPatch(
+	ctx context.Context,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+	annotationKey string,
+) error {
+	patchData, err := buildAnnotationPatch(annotationKey, nil)
+	if err != nil {
+		return fmt.Errorf("marshaling annotation removal patch: %w", err)
+	}
+
+	if patchErr := c.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patchData)); patchErr != nil {
+		return fmt.Errorf("patching annotation removal: %w", patchErr)
+	}
+
+	// Re-fetch the cluster to get the latest state after the patch.
+	if fetchErr := c.Get(ctx, types.NamespacedName{
+		Name:      cluster.Name,
+		Namespace: cluster.Namespace,
+	}, cluster); fetchErr != nil {
+		return fmt.Errorf("re-fetching cluster after annotation removal: %w", fetchErr)
+	}
+
+	return nil
+}
+
+// setAnnotationPatch sets an annotation on a cluster using a MergePatch.
+func setAnnotationPatch(
+	ctx context.Context,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+	annotationKey, value string,
+) error {
+	patchData, err := buildAnnotationPatch(annotationKey, value)
+	if err != nil {
+		return fmt.Errorf("marshaling annotation set patch: %w", err)
+	}
+
+	return c.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patchData))
+}
+
+// patchStatus patches the status subresource of a CloudberryCluster using MergePatch.
+// This prevents clobbering status changes from other controllers.
+func patchStatus(
+	ctx context.Context,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	statusPatch, err := json.Marshal(map[string]interface{}{
+		"status": cluster.Status,
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling status patch: %w", err)
+	}
+
+	return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
+}
+
+// patchFTSStatus patches the FTS-related status fields using a manually constructed
+// MergePatch. This is necessary because the FailedSegments field uses omitempty,
+// which causes json.Marshal to omit it when empty. With MergePatch, omitted fields
+// are left unchanged, so we must explicitly include failedSegments as an empty array
+// to clear previously failed segments.
+func patchFTSStatus(
+	ctx context.Context,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+	failedSegments []cbv1alpha1.FailedSegment,
+) error {
+	// Build the patch manually to ensure failedSegments is always included,
+	// even when empty (to clear previous failures via MergePatch).
+	statusMap := map[string]interface{}{
+		"mirroringStatus": cluster.Status.MirroringStatus,
+	}
+	if len(failedSegments) == 0 {
+		statusMap["failedSegments"] = []interface{}{}
+	} else {
+		statusMap["failedSegments"] = failedSegments
+	}
+
+	statusPatch, err := json.Marshal(map[string]interface{}{
+		"status": statusMap,
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling FTS status patch: %w", err)
+	}
+
+	return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
 }

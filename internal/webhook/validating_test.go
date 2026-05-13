@@ -7,10 +7,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 )
+
+func newTestScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = cbv1alpha1.AddToScheme(scheme)
+	return scheme
+}
 
 func newValidCluster() *cbv1alpha1.CloudberryCluster {
 	return &cbv1alpha1.CloudberryCluster{
@@ -35,7 +43,7 @@ func newValidCluster() *cbv1alpha1.CloudberryCluster {
 }
 
 func TestNewCloudberryClusterValidator(t *testing.T) {
-	v := NewCloudberryClusterValidator()
+	v := NewCloudberryClusterValidator(nil)
 	require.NotNil(t, v)
 }
 
@@ -85,7 +93,7 @@ func TestValidateCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := NewCloudberryClusterValidator()
+			v := NewCloudberryClusterValidator(nil)
 			warnings, err := v.ValidateCreate(context.Background(), tt.cluster)
 
 			if tt.expectErr {
@@ -102,7 +110,7 @@ func TestValidateCreate(t *testing.T) {
 }
 
 func TestValidateUpdate(t *testing.T) {
-	v := NewCloudberryClusterValidator()
+	v := NewCloudberryClusterValidator(nil)
 	oldCluster := newValidCluster()
 	newCluster := newValidCluster()
 
@@ -112,7 +120,7 @@ func TestValidateUpdate(t *testing.T) {
 }
 
 func TestValidateDelete(t *testing.T) {
-	v := NewCloudberryClusterValidator()
+	v := NewCloudberryClusterValidator(nil)
 	warnings, err := v.ValidateDelete(context.Background(), newValidCluster())
 	require.NoError(t, err)
 	assert.Nil(t, warnings)
@@ -994,4 +1002,76 @@ func TestValidateStorage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateCreate_DuplicateNameDetection(t *testing.T) {
+	scheme := newTestScheme()
+
+	t.Run("no duplicate", func(t *testing.T) {
+		existing := newValidCluster()
+		existing.Name = "existing-cluster"
+		existing.Namespace = "ns-a"
+
+		k8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existing).
+			Build()
+
+		v := NewCloudberryClusterValidator(k8sClient)
+		newCluster := newValidCluster()
+		newCluster.Name = "new-cluster"
+		newCluster.Namespace = "ns-b"
+
+		_, err := v.ValidateCreate(context.Background(), newCluster)
+		require.NoError(t, err)
+	})
+
+	t.Run("duplicate name in different namespace", func(t *testing.T) {
+		existing := newValidCluster()
+		existing.Name = "test-cluster"
+		existing.Namespace = "ns-a"
+
+		k8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existing).
+			Build()
+
+		v := NewCloudberryClusterValidator(k8sClient)
+		newCluster := newValidCluster()
+		newCluster.Name = "test-cluster"
+		newCluster.Namespace = "ns-b"
+
+		_, err := v.ValidateCreate(context.Background(), newCluster)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "already exists in namespace")
+		assert.Contains(t, err.Error(), "ns-a")
+	})
+
+	t.Run("same name same namespace is allowed", func(t *testing.T) {
+		// Same namespace means it's the same resource (update, not create of duplicate).
+		existing := newValidCluster()
+		existing.Name = "test-cluster"
+		existing.Namespace = "default"
+
+		k8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existing).
+			Build()
+
+		v := NewCloudberryClusterValidator(k8sClient)
+		newCluster := newValidCluster()
+		newCluster.Name = "test-cluster"
+		newCluster.Namespace = "default"
+
+		_, err := v.ValidateCreate(context.Background(), newCluster)
+		require.NoError(t, err)
+	})
+
+	t.Run("nil reader skips duplicate check", func(t *testing.T) {
+		v := NewCloudberryClusterValidator(nil)
+		newCluster := newValidCluster()
+
+		_, err := v.ValidateCreate(context.Background(), newCluster)
+		require.NoError(t, err)
+	})
 }

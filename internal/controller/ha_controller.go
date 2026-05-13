@@ -219,7 +219,7 @@ func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.Clou
 			fmt.Sprintf("%d segments are down", len(failedSegments)))
 	}
 
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchFTSStatus(ctx, r.client, cluster, failedSegments); err != nil {
 		return fmt.Errorf("updating cluster status after FTS probe: %w", err)
 	}
 
@@ -268,7 +268,7 @@ func (r *HAReconciler) monitorStandby(ctx context.Context, cluster *cbv1alpha1.C
 		fmt.Sprintf("Standby replication lag: %d bytes", lag),
 	)
 
-	return r.client.Status().Update(ctx, cluster)
+	return patchStatus(ctx, r.client, cluster)
 }
 
 // handleRecovery processes recovery annotations.
@@ -280,9 +280,8 @@ func (r *HAReconciler) handleRecovery(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling recovery", "type", recoveryType)
 
-	// Remove the recovery annotation.
-	delete(cluster.Annotations, util.AnnotationRecovery)
-	if err := r.client.Update(ctx, cluster); err != nil {
+	// Remove the recovery annotation using MergePatch to avoid conflicts with stale objects.
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationRecovery); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing recovery annotation: %w", err)
 	}
 
@@ -300,9 +299,8 @@ func (r *HAReconciler) handleRebalance(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling rebalance")
 
-	// Remove the action annotation.
-	delete(cluster.Annotations, util.AnnotationAction)
-	if err := r.client.Update(ctx, cluster); err != nil {
+	// Remove the action annotation using MergePatch to avoid conflicts with stale objects.
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationAction); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing rebalance annotation: %w", err)
 	}
 
@@ -319,9 +317,8 @@ func (r *HAReconciler) handleStandbyActivation(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling standby activation")
 
-	// Remove the action annotation.
-	delete(cluster.Annotations, util.AnnotationAction)
-	if err := r.client.Update(ctx, cluster); err != nil {
+	// Remove the action annotation using MergePatch to avoid conflicts with stale objects.
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationAction); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing standby activation annotation: %w", err)
 	}
 

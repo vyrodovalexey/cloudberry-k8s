@@ -23,7 +23,7 @@
 # =============================================================================
 
 phantom:
-  address: localhost:8443
+  address: localhost:8090
   ssl: false
   ammo_type: uri
   ammofile: ammo/api-read.txt

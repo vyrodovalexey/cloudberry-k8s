@@ -457,6 +457,10 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
 		return
 	}
+	if pid <= 0 {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"pid":      pid,
 		"canceled": true,
@@ -469,6 +473,10 @@ func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) 
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
 	if err != nil {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		return
+	}
+	if pid <= 0 {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{

@@ -333,7 +333,10 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 		retryOpts = util.DefaultRetryOptions()
 	}
 
-	connStr := buildConnectionString(cfg)
+	connStr, err := buildConnectionString(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building connection string: %w", err)
+	}
 
 	poolCfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -374,7 +377,8 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 
 // buildConnectionString constructs a PostgreSQL connection string with properly
 // escaped parameters to prevent injection vulnerabilities.
-func buildConnectionString(cfg Config) string {
+// Returns an error if the connection string cannot be parsed.
+func buildConnectionString(cfg Config) (string, error) {
 	sslMode := cfg.SSLMode
 	if sslMode == "" {
 		sslMode = "disable"
@@ -382,25 +386,19 @@ func buildConnectionString(cfg Config) string {
 
 	// Use pgx's ParseConfig to safely build and validate the connection string.
 	// This avoids injection via specially crafted host/user/password values.
-	connCfg, err := pgx.ParseConfig(
-		"host=" + escapeConnParam(cfg.Host) +
-			" port=" + fmt.Sprintf("%d", cfg.Port) +
-			" dbname=" + escapeConnParam(cfg.Database) +
-			" user=" + escapeConnParam(cfg.Username) +
-			" password=" + escapeConnParam(cfg.Password) +
-			" sslmode=" + escapeConnParam(sslMode),
-	)
+	rawConn := "host=" + escapeConnParam(cfg.Host) +
+		" port=" + fmt.Sprintf("%d", cfg.Port) +
+		" dbname=" + escapeConnParam(cfg.Database) +
+		" user=" + escapeConnParam(cfg.Username) +
+		" password=" + escapeConnParam(cfg.Password) +
+		" sslmode=" + escapeConnParam(sslMode)
+
+	connCfg, err := pgx.ParseConfig(rawConn)
 	if err != nil {
-		// Fallback with escaped parameters if ParseConfig fails.
-		return "host=" + escapeConnParam(cfg.Host) +
-			" port=" + fmt.Sprintf("%d", cfg.Port) +
-			" dbname=" + escapeConnParam(cfg.Database) +
-			" user=" + escapeConnParam(cfg.Username) +
-			" password=" + escapeConnParam(cfg.Password) +
-			" sslmode=" + escapeConnParam(sslMode)
+		return "", fmt.Errorf("invalid connection parameters: %w", err)
 	}
 
-	return connCfg.ConnString()
+	return connCfg.ConnString(), nil
 }
 
 // escapeConnParam escapes a connection string parameter value by replacing

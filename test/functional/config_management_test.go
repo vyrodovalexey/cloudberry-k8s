@@ -81,13 +81,13 @@ func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_AppliesParameters
 }
 
 func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_DetectsChanges() {
-	// Arrange
+	// Arrange: use a reload-safe parameter so the change doesn't trigger a rolling restart.
 	cluster := testutil.NewClusterBuilder("test-config-change", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
 		WithPendingGeneration().
 		WithConfig(map[string]string{
-			"shared_buffers": "128MB",
+			"work_mem": "64MB",
 		}).
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -104,10 +104,11 @@ func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_DetectsChanges() 
 	_, err := reconciler.Reconcile(s.ctx, s.reqFor(cluster))
 	require.NoError(s.T(), err)
 
-	// Update config
+	// Update config with a reload-safe parameter change.
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
-	updated.Spec.Config.Parameters["shared_buffers"] = "256MB"
+	updated.Spec.Config.Parameters["work_mem"] = "128MB"
+	updated.Generation = updated.Generation + 1
 	err = s.env.Client.Update(s.ctx, updated)
 	require.NoError(s.T(), err)
 
@@ -118,7 +119,7 @@ func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_DetectsChanges() 
 	// Verify the ConfigMap was updated
 	cm, err := s.env.GetConfigMap(s.ctx, util.PostgresqlConfConfigMapName(cluster.Name), cluster.Namespace)
 	require.NoError(s.T(), err)
-	assert.Contains(s.T(), cm.Data["postgresql.conf"], "256MB")
+	assert.Contains(s.T(), cm.Data["postgresql.conf"], "128MB")
 }
 
 func (s *ConfigManagementSuite) TestFunctional_ConfigReconcile_SkipsNonRunningCluster() {

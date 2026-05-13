@@ -465,9 +465,126 @@ The operator watches Vault secrets for changes:
    b. Reload affected components
    c. Emit event
 
-## 9. Auditing
+## 9. Webhook Certificate Management
 
-### 9.1 Connection Auditing
+### 9.1 Overview
+
+The operator manages TLS certificates for Kubernetes admission webhooks (validating and mutating). Two certificate sources are supported:
+
+| Source | Description | Use Case |
+|--------|-------------|----------|
+| **Vault PKI** | Certificates issued by HashiCorp Vault PKI engine | Production (preferred) |
+| **Self-signed** | Operator generates its own CA and certificates | Development, environments without Vault |
+
+### 9.2 Certificate Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                Certificate Lifecycle                         │
+│                                                              │
+│  1. Issuance                                                 │
+│     ├── Vault PKI: Request cert from Vault PKI engine        │
+│     └── Self-signed: Generate CA + server cert               │
+│                                                              │
+│  2. Storage                                                  │
+│     └── Store in Kubernetes Secret:                          │
+│         {release}-webhook-certs                              │
+│         ├── tls.crt  (server certificate)                    │
+│         ├── tls.key  (server private key)                    │
+│         └── ca.crt   (CA certificate)                        │
+│                                                              │
+│  3. Injection                                                │
+│     └── Patch ValidatingWebhookConfiguration and             │
+│         MutatingWebhookConfiguration with caBundle           │
+│                                                              │
+│  4. Rotation                                                 │
+│     ├── Check every 12 hours                                 │
+│     ├── Rotate at 2/3 of certificate lifetime                │
+│     └── Re-inject caBundle after rotation                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.3 Vault PKI Integration
+
+When `webhook.certSource` is `vault-pki`:
+
+1. **Authentication**: Use the operator's Vault token (from `vault.authMethod`)
+2. **Certificate Request**: Issue certificate from `{vaultPKI.mountPath}/issue/{vaultPKI.role}`
+3. **Common Name**: `{webhookServiceName}.{namespace}.svc`
+4. **SANs**: `{webhookServiceName}.{namespace}.svc`, `{webhookServiceName}.{namespace}.svc.cluster.local`
+5. **TTL**: Requested from Vault role configuration (typically 720h)
+
+```go
+// Vault PKI certificate request
+type VaultPKICertRequest struct {
+    CommonName string   `json:"common_name"`
+    AltNames   string   `json:"alt_names"`
+    TTL        string   `json:"ttl"`
+    Format     string   `json:"format"` // "pem"
+}
+```
+
+### 9.4 Self-Signed CA Generation
+
+When `webhook.certSource` is `self-signed`:
+
+1. **CA Generation**: Generate RSA 4096-bit CA key pair
+2. **CA Certificate**: Self-signed, 10-year validity, CA:TRUE basic constraint
+3. **Server Certificate**: Signed by the generated CA
+   - RSA 2048-bit key
+   - 1-year validity
+   - SANs: `{webhookServiceName}.{namespace}.svc`, `{webhookServiceName}.{namespace}.svc.cluster.local`
+4. **Storage**: CA cert, server cert, and server key stored in the webhook cert Secret
+
+### 9.5 Certificate Rotation Strategy
+
+The operator runs a background goroutine for certificate rotation:
+
+- **Check interval**: Every 12 hours
+- **Rotation threshold**: Rotate when 2/3 of the certificate lifetime has elapsed
+- **Rotation steps**:
+  1. Issue or generate new certificate (depending on `certSource`)
+  2. Update the Kubernetes Secret with new cert/key
+  3. Patch webhook configurations with new `caBundle`
+  4. The webhook server picks up the new certificate from the mounted Secret volume
+  5. Emit `CertificateRotated` Kubernetes event
+
+```go
+// Certificate rotation check
+func shouldRotate(cert *x509.Certificate) bool {
+    lifetime := cert.NotAfter.Sub(cert.NotBefore)
+    threshold := cert.NotBefore.Add(lifetime * 2 / 3)
+    return time.Now().After(threshold)
+}
+```
+
+### 9.6 Helm Chart Configuration
+
+```yaml
+webhook:
+  enabled: true
+  certSource: "self-signed"  # "self-signed" or "vault-pki"
+  certSecretName: ""          # auto-generated: {release}-webhook-certs
+  serviceName: ""             # auto-generated: {release}-webhook
+  caBundle: ""                # static CA bundle (leave empty for runtime injection)
+  vaultPKI:
+    mountPath: "pki"
+    role: "cloudberry-operator"
+```
+
+Environment variables injected into the operator pod:
+
+| Variable | Description |
+|----------|-------------|
+| `CLOUDBERRY_WEBHOOK_CERT_SOURCE` | Certificate source (`self-signed` or `vault-pki`) |
+| `CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME` | Secret name for storing certificates |
+| `CLOUDBERRY_WEBHOOK_SERVICE_NAME` | Webhook service name for SAN generation |
+| `CLOUDBERRY_WEBHOOK_VAULT_PKI_MOUNT` | Vault PKI mount path (vault-pki only) |
+| `CLOUDBERRY_WEBHOOK_VAULT_PKI_ROLE` | Vault PKI role name (vault-pki only) |
+
+## 10. Auditing
+
+### 10.1 Connection Auditing
 
 Enabled via configuration parameters:
 ```yaml
@@ -477,7 +594,7 @@ config:
     log_disconnections: "on"
 ```
 
-### 9.2 Statement Auditing
+### 10.2 Statement Auditing
 
 ```yaml
 config:
@@ -487,7 +604,7 @@ config:
     log_duration: "on"
 ```
 
-### 9.3 Operator Audit Log
+### 10.3 Operator Audit Log
 
 The operator logs all authentication and authorization events:
 - Successful/failed login attempts
@@ -508,7 +625,7 @@ Format:
 }
 ```
 
-## 10. Security Headers (Operator API)
+## 11. Security Headers (Operator API)
 
 When the operator exposes an HTTP API:
 
@@ -523,9 +640,9 @@ X-Frame-Options: DENY
 X-XSS-Protection: 1; mode=block
 ```
 
-## 11. cloudberry-ctl Authentication
+## 12. cloudberry-ctl Authentication
 
-### 11.1 Configuration File
+### 12.1 Configuration File
 
 ```yaml
 # ~/.cloudberry-ctl.yaml
@@ -543,7 +660,7 @@ clusters:
       # Token cached in ~/.cloudberry-ctl/tokens/
 ```
 
-### 11.2 Authentication Commands
+### 12.2 Authentication Commands
 
 ```bash
 # Login with OIDC (opens browser for auth code flow)

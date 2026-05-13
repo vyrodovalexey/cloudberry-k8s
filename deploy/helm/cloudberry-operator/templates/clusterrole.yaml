@@ -121,6 +121,29 @@ rules:
       - patch
       - update
       - watch
+  # Batch resources
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  # Networking resources
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - update
+      - watch
   # Admission webhooks
   - apiGroups:
       - admissionregistration.k8s.io

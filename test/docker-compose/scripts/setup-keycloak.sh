@@ -56,6 +56,42 @@ wait_for_keycloak() {
 }
 
 # ---------------------------------------------------------------------------
+# Disable SSL requirements on Keycloak realms
+# ---------------------------------------------------------------------------
+disable_ssl_requirements() {
+    log_info "Disabling SSL requirements on Keycloak realms..."
+
+    # Authenticate kcadm.sh with the Keycloak admin
+    docker exec keycloak_web /opt/keycloak/bin/kcadm.sh config credentials \
+        --server http://127.0.0.1:8090 \
+        --realm master \
+        --user "${KEYCLOAK_ADMIN}" \
+        --password "${KEYCLOAK_ADMIN_PASSWORD}"
+
+    # Disable SSL on master realm
+    docker exec keycloak_web /opt/keycloak/bin/kcadm.sh update realms/master \
+        -s sslRequired=NONE
+
+    log_info "  SSL requirement disabled on 'master' realm"
+
+    # Disable SSL on test realm (will be created later, but set it if it already exists)
+    docker exec keycloak_web /opt/keycloak/bin/kcadm.sh update "realms/${REALM}" \
+        -s sslRequired=NONE 2>/dev/null || true
+
+    log_info "  SSL requirements configured"
+}
+
+# ---------------------------------------------------------------------------
+# Disable SSL on test realm (after it has been created)
+# ---------------------------------------------------------------------------
+disable_ssl_on_test_realm() {
+    log_info "Disabling SSL requirement on '${REALM}' realm..."
+    docker exec keycloak_web /opt/keycloak/bin/kcadm.sh update "realms/${REALM}" \
+        -s sslRequired=NONE
+    log_info "  SSL requirement disabled on '${REALM}' realm"
+}
+
+# ---------------------------------------------------------------------------
 # Get admin token
 # ---------------------------------------------------------------------------
 ADMIN_TOKEN=""
@@ -105,7 +141,7 @@ create_realm() {
     log_info "Creating realm '${realm_name}'..."
 
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${ADMIN_TOKEN}" \
         -H "Content-Type: application/json" \
@@ -146,7 +182,7 @@ create_client() {
     log_info "Creating client '${client_id}' in realm '${realm}'..."
 
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${ADMIN_TOKEN}" \
         -H "Content-Type: application/json" \
@@ -181,7 +217,7 @@ create_realm_role() {
     local role_name="$2"
 
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${ADMIN_TOKEN}" \
         -H "Content-Type: application/json" \
@@ -207,7 +243,7 @@ create_user() {
     log_info "Creating user '${username}' in realm '${realm}'..."
 
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${ADMIN_TOKEN}" \
         -H "Content-Type: application/json" \
@@ -349,9 +385,13 @@ main() {
     fi
 
     wait_for_keycloak
+    disable_ssl_requirements
     get_admin_token
 
     setup_realm
+
+    # After realm is created, also disable SSL on the test realm
+    disable_ssl_on_test_realm
 
     verify_setup
 

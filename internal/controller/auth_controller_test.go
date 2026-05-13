@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -684,6 +685,68 @@ func TestAuthReconciler_ReconcileHBA_UpdateError(t *testing.T) {
 	err := r.reconcileHBA(context.Background(), cluster)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updating pg_hba.conf configmap")
+}
+
+func TestAuthReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
+	// When ObservedGeneration matches Generation, should skip reconciliation.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Generation = 3
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 3
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Minute, result.RequeueAfter)
+}
+
+func TestAuthReconciler_Reconcile_ObservedGenerationMismatch(t *testing.T) {
+	// When ObservedGeneration does NOT match Generation, should proceed with reconciliation.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Generation = 3
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 2
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify HBA configmap was created (reconciliation proceeded).
+	cm := &corev1.ConfigMap{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.PgHBAConfConfigMapName("test-cluster"),
+		Namespace: "default",
+	}, cm)
+	require.NoError(t, err)
 }
 
 func TestAuthReconciler_Reconcile_HBAError_SetsCondition(t *testing.T) {

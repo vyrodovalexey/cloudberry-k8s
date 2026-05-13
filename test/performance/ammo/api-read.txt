@@ -1,4 +1,4 @@
-[Host: localhost:8443]
+[Host: localhost:8090]
 [Authorization: Basic YWRtaW46YWRtaW4=]
 [Connection: keep-alive]
 [User-Agent: yandex-tank/perftest]

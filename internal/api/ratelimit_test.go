@@ -219,7 +219,11 @@ func TestRateLimiter_Middleware_RateLimited(t *testing.T) {
 	assert.NotEmpty(t, rec2.Header().Get(retryAfterHeader))
 }
 
-func TestExtractClientIP(t *testing.T) {
+func TestExtractClientIP_NoTrustedProxies(t *testing.T) {
+	// Without trusted proxies, forwarded headers are ignored.
+	rl := NewRateLimiter(10, time.Minute, slog.Default())
+	defer rl.Stop()
+
 	tests := []struct {
 		name       string
 		headers    map[string]string
@@ -227,28 +231,16 @@ func TestExtractClientIP(t *testing.T) {
 		expected   string
 	}{
 		{
-			name:       "X-Forwarded-For single IP",
+			name:       "X-Forwarded-For ignored without trusted proxies",
 			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1"},
 			remoteAddr: "192.168.1.1:12345",
-			expected:   "10.0.0.1",
+			expected:   "192.168.1.1",
 		},
 		{
-			name:       "X-Forwarded-For multiple IPs",
-			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1, 10.0.0.2, 10.0.0.3"},
-			remoteAddr: "192.168.1.1:12345",
-			expected:   "10.0.0.1",
-		},
-		{
-			name:       "X-Real-IP",
+			name:       "X-Real-IP ignored without trusted proxies",
 			headers:    map[string]string{"X-Real-IP": "10.0.0.5"},
 			remoteAddr: "192.168.1.1:12345",
-			expected:   "10.0.0.5",
-		},
-		{
-			name:       "X-Forwarded-For takes precedence over X-Real-IP",
-			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1", "X-Real-IP": "10.0.0.5"},
-			remoteAddr: "192.168.1.1:12345",
-			expected:   "10.0.0.1",
+			expected:   "192.168.1.1",
 		},
 		{
 			name:       "RemoteAddr with port",
@@ -283,7 +275,64 @@ func TestExtractClientIP(t *testing.T) {
 			for k, v := range tt.headers {
 				req.Header.Set(k, v)
 			}
-			result := extractClientIP(req)
+			result := rl.extractClientIP(req)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestExtractClientIP_WithTrustedProxies(t *testing.T) {
+	// With trusted proxies, forwarded headers are trusted from proxy IPs.
+	rl := NewRateLimiter(10, time.Minute, slog.Default(),
+		WithTrustedProxies([]string{"192.168.1.0/24"}))
+	defer rl.Stop()
+
+	tests := []struct {
+		name       string
+		headers    map[string]string
+		remoteAddr string
+		expected   string
+	}{
+		{
+			name:       "X-Forwarded-For trusted from proxy",
+			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1"},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "10.0.0.1",
+		},
+		{
+			name:       "X-Forwarded-For multiple IPs from proxy",
+			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1, 10.0.0.2, 10.0.0.3"},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "10.0.0.1",
+		},
+		{
+			name:       "X-Real-IP trusted from proxy",
+			headers:    map[string]string{"X-Real-IP": "10.0.0.5"},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "10.0.0.5",
+		},
+		{
+			name:       "X-Forwarded-For takes precedence over X-Real-IP from proxy",
+			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1", "X-Real-IP": "10.0.0.5"},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "10.0.0.1",
+		},
+		{
+			name:       "X-Forwarded-For ignored from non-proxy",
+			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1"},
+			remoteAddr: "10.10.10.10:12345",
+			expected:   "10.10.10.10",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			result := rl.extractClientIP(req)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -541,6 +590,42 @@ func TestHandleGetDataLoadingJob_ClusterNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.handleGetDataLoadingJob(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestRateLimiter_Stop(t *testing.T) {
+	rl := NewRateLimiter(10, time.Minute, slog.Default())
+
+	// Stop should not panic and should stop the cleanup goroutine.
+	rl.Stop()
+
+	// Calling Stop again should panic (closing closed channel), so we don't do that.
+}
+
+func TestWithTrustedProxies_InvalidCIDR(t *testing.T) {
+	// Invalid CIDRs should be ignored with a warning.
+	rl := NewRateLimiter(10, time.Minute, slog.Default(),
+		WithTrustedProxies([]string{"invalid-cidr", "192.168.1.0/24", "also-invalid"}))
+	defer rl.Stop()
+
+	// Only the valid CIDR should be added.
+	assert.Len(t, rl.trustedProxies, 1)
+}
+
+func TestWithTrustedProxies_Empty(t *testing.T) {
+	rl := NewRateLimiter(10, time.Minute, slog.Default(),
+		WithTrustedProxies([]string{}))
+	defer rl.Stop()
+
+	assert.Empty(t, rl.trustedProxies)
+}
+
+func TestIsTrustedProxy_InvalidIP(t *testing.T) {
+	rl := NewRateLimiter(10, time.Minute, slog.Default(),
+		WithTrustedProxies([]string{"192.168.1.0/24"}))
+	defer rl.Stop()
+
+	// Invalid IP should not be trusted.
+	assert.False(t, rl.isTrustedProxy("not-an-ip"))
 }
 
 func TestIsValidDNS1123Name(t *testing.T) {

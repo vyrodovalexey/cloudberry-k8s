@@ -157,8 +157,21 @@ webhook:
   targetPort: 9443
   # -- Failure policy for validating webhook (Fail or Ignore)
   failurePolicy: Fail
+  # -- Certificate source: "self-signed" or "vault-pki"
+  certSource: "self-signed"
   # -- TLS certificate secret name (auto-generated if empty)
   certSecretName: ""
+  # -- Webhook service name (defaults to release-name-webhook)
+  serviceName: ""
+  # -- Static CA bundle to inject into webhook configurations (base64-encoded)
+  # -- Leave empty for operator to inject at runtime
+  caBundle: ""
+  # -- Vault PKI configuration (when certSource is "vault-pki")
+  vaultPKI:
+    # -- Vault PKI mount path
+    mountPath: "pki"
+    # -- Vault PKI role name
+    role: "cloudberry-operator"
 
 # =============================================================================
 # Network Policy

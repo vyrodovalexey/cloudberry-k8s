@@ -77,6 +77,12 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
+	// Skip full reconciliation if only status changed (ObservedGeneration matches).
+	if cluster.Status.ObservedGeneration == cluster.Generation {
+		logger.Info("skipping auth reconciliation, generation unchanged")
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
 	// Reconcile pg_hba.conf.
 	if err := r.reconcileHBA(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile HBA", "error", err)
@@ -87,16 +93,24 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			"HBAReconcileFailed",
 			fmt.Sprintf("Failed to reconcile pg_hba.conf: %v", err),
 		)
-		if statusErr := r.client.Status().Update(ctx, cluster); statusErr != nil {
+		if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
 			logger.Error("failed to update status", "error", statusErr)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
+	// Record event for auth configuration changes.
+	r.recorder.Event(cluster, "Normal", "AuthReconciled", "Authentication configuration reconciled")
+
 	// Validate OIDC configuration if enabled.
 	if cluster.Spec.Auth != nil && cluster.Spec.Auth.OIDC != nil && cluster.Spec.Auth.OIDC.Enabled {
 		if err := r.validateOIDCConfig(ctx, cluster); err != nil {
 			logger.Warn("OIDC validation failed", "error", err)
+			r.recorder.Event(cluster, "Warning", "OIDCValidationFailed",
+				fmt.Sprintf("OIDC validation failed: %v", err))
+		} else {
+			r.recorder.Event(cluster, "Normal", "OIDCConfigured",
+				"OIDC authentication is properly configured")
 		}
 	}
 
@@ -109,7 +123,9 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		"Authentication is properly configured",
 	)
 
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	// Use Status().Patch() with MergePatch to prevent clobbering status changes
+	// from other controllers.
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating auth status: %w", err)
 	}
 

@@ -49,6 +49,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_CreatesHBAConfigMap() {
 	cluster := testutil.NewClusterBuilder("test-auth-hba", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithHBARules(testutil.DefaultHBARules()).
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -76,6 +77,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_CustomHBARules() {
 	cluster := testutil.NewClusterBuilder("test-auth-custom-hba", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithHBARules(testutil.CustomHBARules()).
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -124,6 +126,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_InitializingCluster() {
 	cluster := testutil.NewClusterBuilder("test-auth-init", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseInitializing).
+		WithPendingGeneration().
 		WithHBARules(testutil.DefaultHBARules()).
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -146,6 +149,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCValidation_Valid() {
 	cluster := testutil.NewClusterBuilder("test-auth-oidc-valid", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithOIDC(true, "http://keycloak:8090/realms/test", "cloudberry-client").
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -237,10 +241,11 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCDisabled() {
 }
 
 func (s *AuthConfigSuite) TestFunctional_AuthReconcile_UpdatesHBAConfigMap() {
-	// Arrange - create initial HBA config
+	// Arrange - create initial HBA config with pending generation to trigger reconciliation
 	cluster := testutil.NewClusterBuilder("test-auth-update-hba", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
+		WithPendingGeneration().
 		WithHBARules(testutil.DefaultHBARules()).
 		Build()
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -250,14 +255,15 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_UpdatesHBAConfigMap() {
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
-	// First reconcile
+	// First reconcile - creates the HBA ConfigMap
 	_, err := reconciler.Reconcile(s.ctx, s.reqFor(cluster))
 	require.NoError(s.T(), err)
 
-	// Update HBA rules
+	// Update HBA rules and bump generation to trigger re-reconciliation
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	updated.Spec.Auth.HBARules = testutil.CustomHBARules()
+	updated.Generation = updated.Status.ObservedGeneration + 1
 	err = s.env.Client.Update(s.ctx, updated)
 	require.NoError(s.T(), err)
 

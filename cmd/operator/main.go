@@ -15,12 +15,14 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/api"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/certmanager"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/config"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/controller"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
@@ -28,7 +30,6 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/webhook"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // version is set via ldflags at build time (e.g. -X main.version=...).
@@ -97,8 +98,9 @@ func run(ctx context.Context) error {
 		}()
 	}
 
-	// Initialize metrics.
-	metricsRecorder := metrics.NewPrometheusRecorder(prometheus.DefaultRegisterer)
+	// Initialize metrics using controller-runtime's registry so they are
+	// exposed on the same /metrics endpoint as the controller-runtime metrics.
+	metricsRecorder := metrics.NewPrometheusRecorder(ctrlmetrics.Registry)
 
 	// Create controller manager.
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -121,6 +123,9 @@ func run(ctx context.Context) error {
 
 	// Register admission webhooks when enabled.
 	if cfg.WebhookEnabled {
+		if err := setupWebhookCerts(ctx, mgr, cfg, logger); err != nil {
+			return fmt.Errorf("setting up webhook certificates: %w", err)
+		}
 		if err := registerWebhooks(mgr, logger); err != nil {
 			return fmt.Errorf("registering webhooks: %w", err)
 		}
@@ -251,9 +256,19 @@ func startAPIServer(
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 ) error {
-	// Create an in-memory credential store with a default admin user.
+	// Create an in-memory credential store with an admin user.
 	credStore := auth.NewInMemoryCredentialStore()
-	credStore.SetCredentials("admin", "admin", auth.PermissionAdmin)
+	adminPassword := os.Getenv("CLOUDBERRY_API_ADMIN_PASSWORD")
+	if adminPassword == "" {
+		generated, genErr := util.GenerateRandomPassword()
+		if genErr != nil {
+			return fmt.Errorf("generating admin password: %w", genErr)
+		}
+		adminPassword = generated
+		logger.Warn("CLOUDBERRY_API_ADMIN_PASSWORD not set, using generated password",
+			"hint", "set CLOUDBERRY_API_ADMIN_PASSWORD environment variable for production use")
+	}
+	credStore.SetCredentials("admin", adminPassword, auth.PermissionAdmin)
 
 	// Create the basic auth provider and middleware.
 	basicProvider := auth.NewBasicAuthProvider(credStore, logger)
@@ -266,12 +281,79 @@ func startAPIServer(
 	return api.StartServer(ctx, cfg.APIAddress, apiServer.Handler(), logger)
 }
 
+// setupWebhookCerts creates and manages webhook TLS certificates.
+func setupWebhookCerts(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	cfg *config.OperatorConfig,
+	logger *slog.Logger,
+) error {
+	operatorNS := cfg.Namespace
+	if operatorNS == "" {
+		operatorNS = util.OperatorNamespace
+	}
+
+	certCfg := certmanager.Config{
+		ServiceName:       cfg.WebhookServiceName,
+		ServiceNamespace:  operatorNS,
+		SecretName:        cfg.WebhookCertSecretName,
+		SecretNamespace:   operatorNS,
+		CertSource:        cfg.WebhookCertSource,
+		VaultPKIMountPath: cfg.VaultPKIMountPath,
+		VaultPKIRole:      cfg.VaultPKIRole,
+	}
+
+	cm := certmanager.New(mgr.GetClient(), nil, certCfg, logger)
+
+	caBundle, err := cm.EnsureCertificates(ctx)
+	if err != nil {
+		return fmt.Errorf("ensuring webhook certificates: %w", err)
+	}
+
+	logger.Info("webhook certificates ready",
+		"caBundle_len", len(caBundle),
+		"certSource", cfg.WebhookCertSource,
+	)
+
+	// Start background goroutine for certificate rotation.
+	go runCertRotation(ctx, cm, logger)
+
+	return nil
+}
+
+// runCertRotation periodically checks and rotates webhook certificates.
+func runCertRotation(ctx context.Context, cm certmanager.CertManager, logger *slog.Logger) {
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			needs, err := cm.NeedsRotation(ctx)
+			if err != nil {
+				logger.Error("failed to check certificate rotation", "error", err)
+				continue
+			}
+			if needs {
+				logger.Info("rotating webhook certificates")
+				if _, rotErr := cm.EnsureCertificates(ctx); rotErr != nil {
+					logger.Error("failed to rotate certificates", "error", rotErr)
+				} else {
+					logger.Info("webhook certificates rotated successfully")
+				}
+			}
+		}
+	}
+}
+
 // registerWebhooks registers the validating and mutating admission webhooks
 // for CloudberryCluster resources with the controller manager.
 func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger) error {
 	// Register the validating webhook.
 	if err := ctrl.NewWebhookManagedBy(mgr, &cbv1alpha1.CloudberryCluster{}).
-		WithValidator(webhook.NewCloudberryClusterValidator()).
+		WithValidator(webhook.NewCloudberryClusterValidator(mgr.GetClient())).
 		Complete(); err != nil {
 		return fmt.Errorf("creating validating webhook: %w", err)
 	}

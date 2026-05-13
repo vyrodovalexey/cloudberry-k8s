@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -1053,6 +1055,99 @@ func TestVaultClient_ReadSecret_EmptyData(t *testing.T) {
 	assert.Contains(t, err.Error(), "secret not found")
 }
 
+func TestNewClient_KubernetesAuth_WithMockServer(t *testing.T) {
+	// Test kubernetes auth with a mock server that provides a valid response.
+	// The test will fail at reading the service account token file, which is expected.
+	cfg := Config{
+		Enabled:    true,
+		Address:    "http://127.0.0.1:8200",
+		AuthMethod: "kubernetes",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	// Should fail because the service account token file doesn't exist.
+	assert.Contains(t, err.Error(), "authenticating with vault")
+}
+
+func TestNewClient_TokenAuth_EmptyToken(t *testing.T) {
+	cfg := Config{
+		Enabled:    true,
+		Address:    "http://127.0.0.1:8200",
+		AuthMethod: "token",
+		Token:      "",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "vault token is required")
+}
+
+func TestVaultClient_ReadSecret_RetryOnError(t *testing.T) {
+	// Test that ReadSecret retries on transient errors.
+	callCount := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/retry-test", func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"data":{"key":"value"}}}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 3, InitialBackoff: time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 1.5},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.ReadSecret(context.Background(), "secret/data/retry-test")
+	require.NoError(t, err)
+	assert.Equal(t, "value", data["key"])
+}
+
+func TestSecretWatcher_Watch_DetectsChanges(t *testing.T) {
+	// Test that Watch detects changes and calls onChange.
+	readCount := 0
+	changeCount := 0
+	client := &changingMockClient{
+		readFunc: func() (map[string]interface{}, error) {
+			readCount++
+			return map[string]interface{}{"version": fmt.Sprintf("%d", readCount)}, nil
+		},
+	}
+
+	onChange := func(_ map[string]interface{}) {
+		changeCount++
+	}
+
+	watcher := NewSecretWatcher(client, "secret/path", 20*time.Millisecond, onChange, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	watcher.Watch(ctx)
+
+	// Should have detected at least one change.
+	assert.Greater(t, readCount, 1)
+	assert.Greater(t, changeCount, 0)
+}
+
 func TestSecretWatcher_CheckForChanges_MultipleChanges(t *testing.T) {
 	callCount := 0
 	var lastData map[string]interface{}
@@ -1083,4 +1178,160 @@ func TestSecretWatcher_CheckForChanges_MultipleChanges(t *testing.T) {
 	// Third check detects another change.
 	watcher.checkForChanges(context.Background())
 	assert.Equal(t, 2, callCount)
+}
+
+func TestNewClient_KubernetesAuth_SuccessfulLogin(t *testing.T) {
+	// Create a temporary file to simulate the Kubernetes service account token.
+	tmpDir := t.TempDir()
+	tokenFile := filepath.Join(tmpDir, "token")
+	err := os.WriteFile(tokenFile, []byte("fake-jwt-token"), 0o600)
+	require.NoError(t, err)
+
+	// Override the kubeTokenPath for this test.
+	origPath := kubeTokenPath
+	kubeTokenPath = tokenFile
+	t.Cleanup(func() { kubeTokenPath = origPath })
+
+	// Create a mock Vault server that handles Kubernetes auth login.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		// Verify the request contains the expected fields.
+		assert.Equal(t, "test-role", body["role"])
+		assert.Equal(t, "fake-jwt-token", body["jwt"])
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"auth": {
+				"client_token": "s.k8s-token",
+				"policies": ["default"]
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "kubernetes",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.True(t, client.IsEnabled())
+}
+
+func TestNewClient_KubernetesAuth_CustomAuthPath(t *testing.T) {
+	// Create a temporary file to simulate the Kubernetes service account token.
+	tmpDir := t.TempDir()
+	tokenFile := filepath.Join(tmpDir, "token")
+	err := os.WriteFile(tokenFile, []byte("fake-jwt-token"), 0o600)
+	require.NoError(t, err)
+
+	origPath := kubeTokenPath
+	kubeTokenPath = tokenFile
+	t.Cleanup(func() { kubeTokenPath = origPath })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/custom-k8s/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"auth": {
+				"client_token": "s.custom-k8s-token",
+				"policies": ["default"]
+			}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "kubernetes",
+		AuthPath:   "auth/custom-k8s",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.True(t, client.IsEnabled())
+}
+
+func TestNewClient_KubernetesAuth_NoAuthData(t *testing.T) {
+	// Create a temporary file to simulate the Kubernetes service account token.
+	tmpDir := t.TempDir()
+	tokenFile := filepath.Join(tmpDir, "token")
+	err := os.WriteFile(tokenFile, []byte("fake-jwt-token"), 0o600)
+	require.NoError(t, err)
+
+	origPath := kubeTokenPath
+	kubeTokenPath = tokenFile
+	t.Cleanup(func() { kubeTokenPath = origPath })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Return response with no auth data.
+		_, _ = w.Write([]byte(`{}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "kubernetes",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "no auth data")
+}
+
+func TestNewClient_KubernetesAuth_ServerError(t *testing.T) {
+	// Create a temporary file to simulate the Kubernetes service account token.
+	tmpDir := t.TempDir()
+	tokenFile := filepath.Join(tmpDir, "token")
+	err := os.WriteFile(tokenFile, []byte("fake-jwt-token"), 0o600)
+	require.NoError(t, err)
+
+	origPath := kubeTokenPath
+	kubeTokenPath = tokenFile
+	t.Cleanup(func() { kubeTokenPath = origPath })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "kubernetes",
+		Role:       "test-role",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, slog.Default())
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "authenticating with vault")
 }

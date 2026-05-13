@@ -470,6 +470,32 @@ spec:
 4. If `vault.enabled` is true, `address` is required
 5. `config.parameters` keys must be valid Cloudberry configuration parameter names
 6. `deletionPolicy` defaults to `Retain` for safety
+7. **Cross-namespace name uniqueness**: CloudberryCluster names must be unique across all namespaces. This is enforced via a validating admission webhook that checks for duplicate `metadata.name` values across namespaces on CREATE operations. The webhook prevents naming collisions that could cause resource conflicts in shared infrastructure (e.g., shared storage, DNS, monitoring labels).
+
+### 1.4 Webhook Validation Rules for Duplicate Detection
+
+The validating webhook enforces cross-namespace uniqueness:
+
+- **On CREATE**: List all CloudberryCluster resources across all namespaces. If any existing cluster has the same `metadata.name`, reject the request with an error message indicating the conflicting namespace.
+- **On UPDATE**: No cross-namespace check needed (name is immutable on update).
+- **Failure policy**: Configurable via `webhook.failurePolicy` (default: `Fail`). In environments where the webhook may be unavailable, set to `Ignore` to avoid blocking cluster creation.
+
+```go
+// Webhook duplicate detection logic
+func (v *CloudberryClusterValidator) validateNameUniqueness(ctx context.Context, cluster *v1alpha1.CloudberryCluster) error {
+    var clusterList v1alpha1.CloudberryClusterList
+    if err := v.client.List(ctx, &clusterList); err != nil {
+        return fmt.Errorf("failed to list clusters: %w", err)
+    }
+    for _, existing := range clusterList.Items {
+        if existing.Name == cluster.Name && existing.Namespace != cluster.Namespace {
+            return fmt.Errorf("CloudberryCluster %q already exists in namespace %q; names must be unique across namespaces",
+                cluster.Name, existing.Namespace)
+        }
+    }
+    return nil
+}
+```
 
 ## 2. Sample Manifests
 

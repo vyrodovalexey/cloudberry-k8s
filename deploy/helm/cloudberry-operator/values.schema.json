@@ -141,7 +141,36 @@
           "type": "string",
           "enum": ["Fail", "Ignore"]
         },
-        "certSecretName": { "type": "string" }
+        "certSource": {
+          "type": "string",
+          "enum": ["self-signed", "vault-pki"],
+          "description": "Certificate source for webhook TLS"
+        },
+        "certSecretName": {
+          "type": "string",
+          "description": "TLS certificate secret name (auto-generated if empty)"
+        },
+        "serviceName": {
+          "type": "string",
+          "description": "Webhook service name (defaults to release-name-webhook)"
+        },
+        "caBundle": {
+          "type": "string",
+          "description": "Static CA bundle for webhook configurations (leave empty for operator runtime injection)"
+        },
+        "vaultPKI": {
+          "type": "object",
+          "properties": {
+            "mountPath": {
+              "type": "string",
+              "description": "Vault PKI mount path"
+            },
+            "role": {
+              "type": "string",
+              "description": "Vault PKI role name"
+            }
+          }
+        }
       }
     },
     "networkPolicy": {

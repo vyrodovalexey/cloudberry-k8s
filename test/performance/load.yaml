@@ -13,7 +13,7 @@
 
 phantom:
   # Target address (operator API server)
-  address: localhost:8443
+  address: localhost:8090
   # Use HTTP (set to true for HTTPS)
   ssl: false
   # Ammo type: uri-style for simple GET requests, request-style for full HTTP

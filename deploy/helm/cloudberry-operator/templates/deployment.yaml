@@ -59,6 +59,20 @@ spec:
                   name: {{ include "cloudberry-operator.oidcSecretName" . }}
                   key: {{ .Values.oidc.existingSecretKey | default "client-secret" }}
             {{- end }}
+            {{- if .Values.webhook.enabled }}
+            - name: CLOUDBERRY_WEBHOOK_CERT_SOURCE
+              value: {{ .Values.webhook.certSource | quote }}
+            - name: CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME
+              value: {{ include "cloudberry-operator.webhookCertSecretName" . }}
+            - name: CLOUDBERRY_WEBHOOK_SERVICE_NAME
+              value: {{ include "cloudberry-operator.webhookServiceName" . }}
+            {{- if eq .Values.webhook.certSource "vault-pki" }}
+            - name: CLOUDBERRY_WEBHOOK_VAULT_PKI_MOUNT
+              value: {{ .Values.webhook.vaultPKI.mountPath | quote }}
+            - name: CLOUDBERRY_WEBHOOK_VAULT_PKI_ROLE
+              value: {{ .Values.webhook.vaultPKI.role | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -84,6 +98,11 @@ spec:
             - name: config
               mountPath: /etc/cloudberry
               readOnly: true
+            {{- if .Values.webhook.enabled }}
+            - name: webhook-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -91,6 +110,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "cloudberry-operator.configMapName" . }}
+        {{- if .Values.webhook.enabled }}
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "cloudberry-operator.webhookCertSecretName" . }}
+            optional: true
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

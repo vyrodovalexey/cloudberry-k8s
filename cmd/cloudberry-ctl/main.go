@@ -17,6 +17,11 @@ import (
 
 const appName = "cloudberry-ctl"
 
+// notImplemented returns a standardized error for commands that are not yet implemented.
+func notImplemented(name string) error {
+	return fmt.Errorf("command %q is not yet implemented", name)
+}
+
 // version is set via ldflags at build time (e.g. -X main.version=...).
 var version = "dev" //nolint:gochecknoglobals // set by ldflags
 
@@ -387,8 +392,7 @@ func newClusterCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Upgrading cluster...")
-				return nil
+				return notImplemented("cluster upgrade")
 			},
 		},
 	)
@@ -450,8 +454,7 @@ func newConfigCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Resetting parameter...")
-				return nil
+				return notImplemented("config reset")
 			},
 		},
 		&cobra.Command{
@@ -482,24 +485,21 @@ func newHBACmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List HBA rules",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing HBA rules...")
-				return nil
+				return notImplemented("hba list")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdUpdate,
 			Short: "Update HBA rules",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Updating HBA rules...")
-				return nil
+				return notImplemented("hba update")
 			},
 		},
 		&cobra.Command{
 			Use:   "history",
 			Short: "View HBA change history",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "HBA change history...")
-				return nil
+				return notImplemented("hba history")
 			},
 		},
 	)
@@ -602,8 +602,7 @@ func newMirroringCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Enabling mirroring...")
-				return nil
+				return notImplemented("mirroring enable")
 			},
 		},
 		&cobra.Command{
@@ -613,8 +612,7 @@ func newMirroringCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Disabling mirroring...")
-				return nil
+				return notImplemented("mirroring disable")
 			},
 		},
 	)
@@ -658,8 +656,7 @@ func newRecoveryCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Canceling recovery...")
-				return nil
+				return notImplemented("recovery cancel")
 			},
 		},
 	)
@@ -705,8 +702,7 @@ func newStandbyCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Reinitializing standby...")
-				return nil
+				return notImplemented("standby reinitialize")
 			},
 		},
 		&cobra.Command{
@@ -716,8 +712,7 @@ func newStandbyCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Restoring roles...")
-				return nil
+				return notImplemented("standby restore-roles")
 			},
 		},
 	)
@@ -737,16 +732,14 @@ func newFTSCmd() *cobra.Command {
 			Use:   cmdStatus,
 			Short: "Show FTS status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "FTS status...")
-				return nil
+				return notImplemented("fts status")
 			},
 		},
 		&cobra.Command{
 			Use:   "configure",
 			Short: "Configure FTS parameters",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Configuring FTS...")
-				return nil
+				return notImplemented("fts configure")
 			},
 		},
 	)
@@ -861,8 +854,7 @@ func newMaintenanceCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Running catalog check...")
-				return nil
+				return notImplemented("maintenance check-catalog")
 			},
 		},
 		&cobra.Command{
@@ -872,8 +864,7 @@ func newMaintenanceCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Listing maintenance jobs...")
-				return nil
+				return notImplemented("maintenance jobs")
 			},
 		},
 	)
@@ -893,32 +884,28 @@ func newAuthCmd() *cobra.Command {
 			Use:   "login",
 			Short: "Authenticate with operator",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Logging in...")
-				return nil
+				return notImplemented("auth login")
 			},
 		},
 		&cobra.Command{
 			Use:   "logout",
 			Short: "Clear cached credentials",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Logged out")
-				return nil
+				return notImplemented("auth logout")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show auth status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Auth status...")
-				return nil
+				return notImplemented("auth status")
 			},
 		},
 		&cobra.Command{
 			Use:   "rotate-password",
 			Short: "Rotate admin password",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Rotating password...")
-				return nil
+				return notImplemented("auth rotate-password")
 			},
 		},
 		newRolesCmd(),
@@ -939,32 +926,28 @@ func newRolesCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List roles",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing roles...")
-				return nil
+				return notImplemented("roles list")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdCreate,
 			Short: "Create role",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Creating role...")
-				return nil
+				return notImplemented("roles create")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdUpdate,
 			Short: "Update role",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Updating role...")
-				return nil
+				return notImplemented("roles update")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdDelete,
 			Short: "Delete role",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Deleting role...")
-				return nil
+				return notImplemented("roles delete")
 			},
 		},
 	)
@@ -1053,8 +1036,7 @@ func newInspectCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Server logs require direct pod access")
-				return nil
+				return notImplemented("inspect logs")
 			},
 		},
 	)
@@ -1074,40 +1056,35 @@ func newResourceGroupCmd() *cobra.Command {
 			Use:   cmdList,
 			Short: "List resource groups",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Listing resource groups...")
-				return nil
+				return notImplemented("resource-group list")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdCreate,
 			Short: "Create resource group",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Creating resource group...")
-				return nil
+				return notImplemented("resource-group create")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdUpdate,
 			Short: "Update resource group",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Updating resource group...")
-				return nil
+				return notImplemented("resource-group update")
 			},
 		},
 		&cobra.Command{
 			Use:   cmdDelete,
 			Short: "Delete resource group",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Deleting resource group...")
-				return nil
+				return notImplemented("resource-group delete")
 			},
 		},
 		&cobra.Command{
 			Use:   "assign",
 			Short: "Assign role to group",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				fmt.Fprintln(os.Stdout, "Assigning role to group...")
-				return nil
+				return notImplemented("resource-group assign")
 			},
 		},
 	)
@@ -1286,8 +1263,7 @@ func newBackupCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				fmt.Fprintln(os.Stdout, "Backup schedule management requires cluster spec update")
-				return nil
+				return notImplemented("backup schedule")
 			},
 		},
 	)

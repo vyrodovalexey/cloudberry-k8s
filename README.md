@@ -47,6 +47,10 @@ A Kubernetes operator for managing the full lifecycle of [Cloudberry Database](h
 │  │  │ Metrics  │  │ Telemetry │  │   Auth Middleware      │ │  │
 │  │  │ (Prom)   │  │  (OTLP)   │  │ (bcrypt + OIDC/JWT)   │ │  │
 │  │  └──────────┘  └───────────┘  └────────────────────────┘ │  │
+│  │                                                           │  │
+│  │  ┌──────────────────────────────────────────────────────┐ │  │
+│  │  │  Cert Manager (Vault PKI / Self-Signed)             │ │  │
+│  │  └──────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
@@ -77,6 +81,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 
 **Cluster Lifecycle Management**
 - Declarative cluster creation, updates, and deletion via `CloudberryCluster` CRD
+- Cross-namespace cluster name uniqueness enforced by validating webhook
 - Start, stop, and restart with multiple modes (normal, restricted, maintenance)
 - Rolling upgrades with automatic rollback on failure
 - Configurable PVC retention policy on deletion
@@ -95,6 +100,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Five-tier permission model: Self Only, Basic, Operator Basic, Operator, Admin
 - `pg_hba.conf` management via CRD
 - SSL/TLS support with configurable minimum TLS version
+- Webhook TLS certificate management (Vault PKI or self-signed with automatic rotation)
 - HashiCorp Vault integration for secrets management
 
 **Observability**
@@ -106,14 +112,16 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Configuration management with reload-safe and restart-required parameter detection
 - Cluster-wide, coordinator-only, per-database, and per-role parameters
 - Maintenance operations: vacuum, analyze, reindex
-- Session management: list, cancel queries, terminate sessions
+- Session management: list, cancel queries, terminate sessions (with PID validation)
 - Resource group management
+- API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated
 
 **CLI Companion**
 - `cloudberry-ctl` for imperative operations through the operator API
-- Table, JSON, and YAML output formats
+- Table, JSON, and YAML output formats with deterministic column ordering
 - Shell completion for bash, zsh, and fish
 - Environment variable and config file support
+- Stub commands return clear "not yet implemented" errors
 
 ## Quick Start
 
@@ -327,12 +335,14 @@ Key configuration options in `values.yaml`:
 | `operator.leaderElection` | Enable leader election | `true` |
 | `operator.apiAddress` | REST API bind address | `:8090` |
 | `operator.webhookEnabled` | Enable admission webhooks | `false` |
+| `env.CLOUDBERRY_API_ADMIN_PASSWORD` | Admin password for the REST API (auto-generated if not set) | (generated) |
 | `vault.enabled` | Enable Vault integration | `false` |
 | `oidc.enabled` | Enable OIDC authentication | `false` |
 | `telemetry.enabled` | Enable OTLP tracing | `false` |
 | `telemetry.otlpInsecure` | Disable TLS for OTLP exporter | `false` |
 | `metrics.enabled` | Enable Prometheus metrics | `true` |
 | `webhook.enabled` | Enable admission webhooks | `true` |
+| `webhook.certSource` | Certificate source (`self-signed` or `vault-pki`) | `self-signed` |
 
 See [docs/installation.md](docs/installation.md) for the full values reference.
 
@@ -384,6 +394,7 @@ cloudberry-k8s/
 │   ├── api/               # REST API server with rate limiting
 │   ├── auth/              # Authentication providers (bcrypt, OIDC/JWT)
 │   ├── builder/           # Kubernetes resource builders
+│   ├── certmanager/       # Webhook TLS cert lifecycle (Vault PKI / self-signed)
 │   ├── config/            # Operator configuration
 │   ├── controller/        # Reconciliation controllers
 │   ├── ctl/               # Operator API client for cloudberry-ctl
@@ -467,7 +478,7 @@ make test-e2e
 make test-all
 ```
 
-The project targets **90%+ unit test statement coverage**. See [docs/development.md](docs/development.md) for the full development and testing guide.
+The project targets **90%+ unit test statement coverage**. Key packages: `internal/db` at 92.9%, `internal/vault` at 99.1%. See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Documentation
 

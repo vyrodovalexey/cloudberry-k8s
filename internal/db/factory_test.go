@@ -357,7 +357,8 @@ func TestBuildConnectionString_SpecialCharacters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildConnectionString(tt.cfg)
+			result, err := buildConnectionString(tt.cfg)
+			assert.NoError(t, err)
 			assert.NotEmpty(t, result)
 		})
 	}

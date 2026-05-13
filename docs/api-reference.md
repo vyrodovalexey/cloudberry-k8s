@@ -455,6 +455,19 @@ curl -u admin:password -X POST \
 }
 ```
 
+**Error (400 Bad Request — invalid PID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "PID must be a positive integer"
+  }
+}
+```
+
+> **Note**: The PID must be a positive integer. Zero, negative, and non-numeric values are rejected with a `400 Bad Request` response.
+
 #### Terminate Session
 
 ```bash
@@ -470,6 +483,19 @@ curl -u admin:password -X DELETE \
   "terminated": true
 }
 ```
+
+**Error (400 Bad Request — invalid PID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "PID must be a positive integer"
+  }
+}
+```
+
+> **Note**: The PID must be a positive integer. Zero, negative, and non-numeric values are rejected with a `400 Bad Request` response.
 
 ### Maintenance
 
@@ -622,8 +648,10 @@ The API enforces per-IP token bucket rate limiting on all authenticated endpoint
 
 - **Default limit**: 10 requests per minute per client IP
 - **Algorithm**: Token bucket with automatic refill based on elapsed time
-- **IP extraction**: `X-Forwarded-For` → `X-Real-IP` → `RemoteAddr`
+- **IP extraction**: Uses `RemoteAddr` by default. `X-Forwarded-For` and `X-Real-IP` headers are only trusted when the direct connection comes from a configured trusted proxy CIDR range. This prevents header spoofing attacks
+- **Trusted proxies**: Configure trusted proxy CIDR ranges (e.g., `10.0.0.0/8`) to enable proxy header trust. When no trusted proxies are configured (the default), only `RemoteAddr` is used
 - **Cleanup**: Inactive entries are removed every 5 minutes
+- **Graceful shutdown**: The rate limiter's `Stop()` method terminates the background cleanup goroutine to prevent goroutine leaks
 
 When the rate limit is exceeded, the API returns:
 
@@ -655,7 +683,7 @@ The API validates all input parameters:
 |-----------|------|------------|
 | Cluster name | Must be a valid DNS-1123 subdomain (lowercase alphanumeric, `-`, max 253 chars) | `INVALID_REQUEST` |
 | Namespace | Must be a valid DNS-1123 subdomain (if provided) | `INVALID_REQUEST` |
-| PID (sessions) | Must be a valid integer | `INVALID_REQUEST` |
+| PID (sessions) | Must be a valid positive integer (> 0). Zero, negative, and non-numeric values are rejected | `INVALID_REQUEST` |
 | Request body | Must be valid JSON | `INVALID_REQUEST` |
 | Body size | Must not exceed 1 MiB | `INVALID_REQUEST` |
 
@@ -671,12 +699,24 @@ POST /validate-cloudberry-example-com-v1alpha1-cloudberrycluster
 
 Validates `CloudberryCluster` resources before admission. Enforces:
 
+- **Cross-namespace name uniqueness**: Rejects creation if a `CloudberryCluster` with the same name already exists in any namespace. This prevents naming collisions across the entire Kubernetes cluster
 - `segments.count >= 1`
 - Spread mirroring requires hosts > `primariesPerHost`
 - OIDC enabled requires `issuerURL` and `clientID`
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
 - `deletionPolicy` is `Retain` or `Delete`
+
+**Duplicate name rejection example:**
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "CloudberryCluster with name \"my-cluster\" already exists in namespace \"other-ns\""
+  }
+}
+```
 
 ### Mutating Webhook
 

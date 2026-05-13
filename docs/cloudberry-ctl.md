@@ -125,6 +125,23 @@ All flags can be set via environment variables with the `CLOUDBERRY_` prefix:
 | `CLOUDBERRY_TIMEOUT` | `--timeout` |
 | `CLOUDBERRY_OUTPUT` | `--output` |
 
+## Implementation Status
+
+The following commands are fully implemented and communicate with the operator REST API:
+
+- `version`
+- `cluster status`, `cluster start`, `cluster stop`, `cluster restart`, `cluster create`, `cluster delete`
+- `config get`, `config set`
+- `segments list`, `segments status`, `segments inspect`
+- `ha mirroring status`, `ha recovery start`, `ha recovery status`, `ha rebalance`, `ha standby status`, `ha standby activate`
+- `sessions list`, `sessions cancel-query`, `sessions terminate`
+- `maintenance vacuum`, `maintenance analyze`, `maintenance reindex`
+- `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
+
+All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth *`, `resource-group *`, `inspect logs`, and `maintenance check-catalog/jobs`.
+
+> **Note**: Stub commands use the `notImplemented()` helper to return a consistent error message. They exit with code `1` (general error). This behavior is intentional — it prevents silent no-ops in automation scripts.
+
 ## Command Reference
 
 ### version
@@ -498,6 +515,8 @@ Cancel a running query by PID.
 cloudberry-ctl sessions cancel-query --cluster my-cluster --pid 12345
 ```
 
+> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
+
 #### sessions terminate
 
 Terminate a session by PID.
@@ -505,6 +524,8 @@ Terminate a session by PID.
 ```bash
 cloudberry-ctl sessions terminate --cluster my-cluster --pid 12345
 ```
+
+> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
 
 ---
 
@@ -759,6 +780,8 @@ cloudberry-ctl resource-group assign --cluster my-cluster \
 ```
 
 ## Output Formats
+
+All table output uses **deterministic column ordering** — columns are sorted alphabetically by header name. This ensures consistent output across runs, making it safe to use in scripts and automated pipelines that parse table output.
 
 ### Table (default)
 

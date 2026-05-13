@@ -37,8 +37,8 @@
 | CLI | cloudberry-ctl (cobra / viper) |
 | CRD | CloudberryCluster (v1alpha1, group: avsoft.io) |
 | Test Coverage Target | 90%+ unit test statement coverage |
-| Total Tasks | 59 |
-| Estimated Effort | 91-127 developer-days |
+| Total Tasks | 60 |
+| Estimated Effort | 93-130 developer-days |
 
 ---
 
@@ -77,7 +77,8 @@ A.3 ──> C.2, E.2, E.3
 C.1, C.2, B.3, B.4 ──> D.1
 D.1 ──> D.2, D.3, D.4
 B.6, D.1, C.1 ──> E.1
-D.1..D.4, E.1..E.3 ──> E.4
+E.2, E.3 ──> E.3b
+D.1..D.4, E.1..E.3b ──> E.4
 B.1 ──> F.1 ──> F.2 ──> F.3..F.10
 H.1 ──> H.2 ──> H.3 ──> H.4, H.5
 D.1..D.4 ──> I.1 ──> I.2..I.5
@@ -925,6 +926,63 @@ I.7 ──> J.1..J.3
 - Unit: Minimal spec gets all defaults applied
 - Unit: Explicitly set values are not overwritten
 - Unit: Partial spec gets missing defaults filled
+
+---
+
+### E.3b - Webhook Certificate Management
+
+| Attribute | Value |
+|-----------|-------|
+| **Dependencies** | A.3, B.1, B.5, E.2, E.3 |
+| **Priority** | P1 |
+| **Complexity** | L |
+
+**Description**: Implement webhook TLS certificate lifecycle management supporting two certificate sources: Vault PKI (preferred for production) and self-signed (fallback for development). Includes certificate issuance, storage in Kubernetes Secrets, caBundle injection into webhook configurations, and automatic rotation.
+
+**Acceptance Criteria**:
+- Interface: `CertManager` with `EnsureCertificates(ctx) error` and `NeedsRotation() bool`
+- **Self-signed certificate source**:
+  - Generate RSA 4096-bit CA key pair with 10-year validity
+  - Generate RSA 2048-bit server certificate signed by CA with 1-year validity
+  - SANs: `{serviceName}.{namespace}.svc`, `{serviceName}.{namespace}.svc.cluster.local`
+  - Store CA cert, server cert, and server key in Kubernetes Secret
+- **Vault PKI certificate source**:
+  - Request certificate from `{mountPath}/issue/{role}` endpoint
+  - Common name: `{serviceName}.{namespace}.svc`
+  - Parse PEM response and store in Kubernetes Secret
+- **Certificate rotation**:
+  - Background goroutine checking every 12 hours
+  - Rotate when 2/3 of certificate lifetime has elapsed
+  - Re-issue certificate from the configured source
+  - Update Kubernetes Secret with new cert/key
+  - Patch webhook configurations with new `caBundle`
+  - Emit `CertificateRotated` Kubernetes event
+- **caBundle injection**:
+  - Patch `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration`
+  - Set `webhooks[].clientConfig.caBundle` to base64-encoded CA certificate
+- Configuration via environment variables:
+  - `CLOUDBERRY_WEBHOOK_CERT_SOURCE` (`self-signed` or `vault-pki`)
+  - `CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME`
+  - `CLOUDBERRY_WEBHOOK_SERVICE_NAME`
+  - `CLOUDBERRY_WEBHOOK_VAULT_PKI_MOUNT` (vault-pki only)
+  - `CLOUDBERRY_WEBHOOK_VAULT_PKI_ROLE` (vault-pki only)
+
+**Test Cases**:
+- Unit: Self-signed CA generation produces valid CA certificate
+- Unit: Self-signed server cert is signed by generated CA
+- Unit: Server cert SANs match expected service DNS names
+- Unit: Certificate stored in correct Kubernetes Secret
+- Unit: caBundle injected into ValidatingWebhookConfiguration
+- Unit: caBundle injected into MutatingWebhookConfiguration
+- Unit: Rotation triggered when 2/3 lifetime elapsed
+- Unit: Rotation not triggered when certificate is fresh
+- Unit: Vault PKI request uses correct mount path and role
+- Unit: Vault PKI response parsed correctly
+- Unit: CertificateRotated event emitted after rotation
+- Edge: Secret does not exist yet (create vs update)
+- Edge: Vault unavailable falls back gracefully
+- Edge: Certificate already expired triggers immediate rotation
+- Negative: Invalid Vault PKI role returns error
 
 ---
 
@@ -1830,6 +1888,7 @@ I.7 ──> J.1..J.3
 | 19 | D.4 | Admin Controller |
 | 20 | E.2 | Validating Webhook |
 | 21 | E.3 | Mutating Webhook |
+| 21b | E.3b | Webhook Certificate Management |
 
 ### Sprint 6: API + Operator Main (P0/P1)
 | # | Task | Description |
@@ -1932,13 +1991,13 @@ I.7 ──> J.1..J.3
 | B - Internal Packages | 6 | XL | 10-14 |
 | C - DB Client + Builders | 2 | XXL | 8-12 |
 | D - Controllers | 4 | XXL | 12-16 |
-| E - API + Webhooks | 4 | XL | 8-10 |
+| E - API + Webhooks | 5 | XL | 10-13 |
 | F - CLI | 10 | XL | 10-14 |
 | G - Unit Tests | 7 | XXL | 10-14 |
 | H - DevOps | 5 | L | 6-8 |
 | I - Integration + E2E | 9 | XXL | 14-20 |
 | J - Performance | 3 | M | 3-5 |
 | K - Documentation | 3 | L | 5-7 |
-| **TOTAL** | **59** | | **91-127 days** |
+| **TOTAL** | **60** | | **93-130 days** |
 
 > **Note**: Unit tests (Phase G) are listed as a separate phase for the final coverage sweep, but tests should be written alongside implementation in each phase. The G phase represents the gap analysis and additional tests needed to reach 90%+ coverage.

@@ -858,7 +858,7 @@ func TestHAReconciler_Reconcile_GetError(t *testing.T) {
 	assert.Contains(t, err.Error(), "fetching cluster")
 }
 
-func TestHAReconciler_HandleRecovery_UpdateError(t *testing.T) {
+func TestHAReconciler_HandleRecovery_PatchError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
@@ -871,8 +871,8 @@ func TestHAReconciler_HandleRecovery_UpdateError(t *testing.T) {
 		WithObjects(cluster).
 		WithStatusSubresource(cluster).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				return fmt.Errorf("update failed")
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return fmt.Errorf("patch failed")
 			},
 		}).
 		Build()
@@ -886,7 +886,7 @@ func TestHAReconciler_HandleRecovery_UpdateError(t *testing.T) {
 	assert.Contains(t, err.Error(), "removing recovery annotation")
 }
 
-func TestHAReconciler_HandleRebalance_UpdateError(t *testing.T) {
+func TestHAReconciler_HandleRebalance_PatchError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
@@ -899,8 +899,8 @@ func TestHAReconciler_HandleRebalance_UpdateError(t *testing.T) {
 		WithObjects(cluster).
 		WithStatusSubresource(cluster).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				return fmt.Errorf("update failed")
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return fmt.Errorf("patch failed")
 			},
 		}).
 		Build()
@@ -914,7 +914,7 @@ func TestHAReconciler_HandleRebalance_UpdateError(t *testing.T) {
 	assert.Contains(t, err.Error(), "removing rebalance annotation")
 }
 
-func TestHAReconciler_HandleStandbyActivation_UpdateError(t *testing.T) {
+func TestHAReconciler_HandleStandbyActivation_PatchError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
@@ -927,8 +927,8 @@ func TestHAReconciler_HandleStandbyActivation_UpdateError(t *testing.T) {
 		WithObjects(cluster).
 		WithStatusSubresource(cluster).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				return fmt.Errorf("update failed")
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return fmt.Errorf("patch failed")
 			},
 		}).
 		Build()

@@ -10,6 +10,11 @@ webhooks:
     admissionReviewVersions:
       - v1
     clientConfig:
+      {{- if .Values.webhook.caBundle }}
+      caBundle: {{ .Values.webhook.caBundle | b64enc }}
+      {{- else }}
+      caBundle: ""
+      {{- end }}
       service:
         name: {{ include "cloudberry-operator.webhookServiceName" . }}
         namespace: {{ .Release.Namespace }}
@@ -38,6 +43,11 @@ webhooks:
     admissionReviewVersions:
       - v1
     clientConfig:
+      {{- if .Values.webhook.caBundle }}
+      caBundle: {{ .Values.webhook.caBundle | b64enc }}
+      {{- else }}
+      caBundle: ""
+      {{- end }}
       service:
         name: {{ include "cloudberry-operator.webhookServiceName" . }}
         namespace: {{ .Release.Namespace }}

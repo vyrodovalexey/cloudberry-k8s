@@ -30,7 +30,7 @@ func TestFunctional_Webhook(t *testing.T) {
 
 func (s *WebhookSuite) SetupTest() {
 	s.ctx = context.Background()
-	s.validator = webhook.NewCloudberryClusterValidator()
+	s.validator = webhook.NewCloudberryClusterValidator(nil)
 	s.defaulter = webhook.NewCloudberryClusterDefaulter()
 }
 

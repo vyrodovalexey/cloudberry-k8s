@@ -254,3 +254,35 @@ func TestGenerateRandomPassword(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, password, password2)
 }
+
+func TestPasswordChars_IncludesSpecialCharacters(t *testing.T) {
+	// Verify that passwordChars includes special characters.
+	specialChars := "!@#$%^&*()-_=+"
+	for _, c := range specialChars {
+		assert.Contains(t, passwordChars, string(c),
+			"passwordChars should contain special character %q", string(c))
+	}
+
+	// Verify it includes lowercase, uppercase, and digits.
+	assert.Contains(t, passwordChars, "a")
+	assert.Contains(t, passwordChars, "z")
+	assert.Contains(t, passwordChars, "A")
+	assert.Contains(t, passwordChars, "Z")
+	assert.Contains(t, passwordChars, "0")
+	assert.Contains(t, passwordChars, "9")
+}
+
+func TestGenerateRandomPassword_Length(t *testing.T) {
+	assert.Equal(t, 32, defaultPasswordLength)
+}
+
+func TestGenerateRandomPassword_Uniqueness(t *testing.T) {
+	// Generate multiple passwords and verify they are all unique.
+	passwords := make(map[string]bool)
+	for range 10 {
+		pw, err := GenerateRandomPassword()
+		require.NoError(t, err)
+		assert.False(t, passwords[pw], "generated duplicate password")
+		passwords[pw] = true
+	}
+}

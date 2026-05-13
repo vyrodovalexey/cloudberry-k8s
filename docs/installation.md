@@ -7,6 +7,9 @@ This guide covers installing the Cloudberry Operator on a Kubernetes cluster, co
 - [Prerequisites](#prerequisites)
 - [Helm Installation](#helm-installation)
 - [Configuration Options](#configuration-options)
+  - [Webhook Certificate Configuration](#webhook-certificate-configuration)
+  - [API Admin Password](#api-admin-password)
+  - [Environment Variable Configuration](#environment-variable-configuration)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
@@ -219,7 +222,12 @@ kubectl logs -n cloudberry-system deployment/cloudberry-operator
 | `webhook.port` | Webhook service port | `443` |
 | `webhook.targetPort` | Target port on the operator | `9443` |
 | `webhook.failurePolicy` | Failure policy (Fail or Ignore) | `Fail` |
-| `webhook.certSecretName` | TLS certificate secret name | `""` |
+| `webhook.certSource` | Certificate source: `self-signed` or `vault-pki` | `self-signed` |
+| `webhook.certSecretName` | TLS certificate secret name (auto-generated if empty) | `""` |
+| `webhook.serviceName` | Webhook service name (defaults to `{release}-webhook`) | `""` |
+| `webhook.caBundle` | Static CA bundle (base64-encoded); leave empty for runtime injection | `""` |
+| `webhook.vaultPKI.mountPath` | Vault PKI engine mount path (when `certSource` is `vault-pki`) | `pki` |
+| `webhook.vaultPKI.role` | Vault PKI role name (when `certSource` is `vault-pki`) | `cloudberry-operator` |
 
 #### Pod Configuration
 
@@ -247,6 +255,75 @@ kubectl logs -n cloudberry-system deployment/cloudberry-operator
 | `securityContext.readOnlyRootFilesystem` | Read-only root filesystem | `true` |
 | `networkPolicy.enabled` | Enable network policies | `false` |
 
+### Webhook Certificate Configuration
+
+The operator manages TLS certificates for its admission webhooks automatically. Two certificate sources are supported:
+
+#### Self-Signed Certificates (Default)
+
+The operator generates a self-signed CA and server certificate on startup. No external dependencies are required.
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set webhook.enabled=true \
+  --set webhook.certSource=self-signed
+```
+
+The operator:
+1. Generates an ECDSA P-256 CA key pair and a server certificate
+2. Stores both in a Kubernetes Secret (`{release}-webhook-certs`)
+3. Injects the CA bundle into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration`
+4. Checks for rotation every 12 hours and rotates when 2/3 of the certificate lifetime has elapsed
+
+#### Vault PKI Certificates (Recommended for Production)
+
+Use Vault's PKI secrets engine to issue trusted certificates:
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set webhook.enabled=true \
+  --set webhook.certSource=vault-pki \
+  --set webhook.vaultPKI.mountPath=pki \
+  --set webhook.vaultPKI.role=cloudberry-operator \
+  --set vault.enabled=true \
+  --set vault.address=http://vault:8200
+```
+
+**Vault PKI prerequisites:**
+1. Enable the PKI secrets engine at the configured mount path
+2. Configure a root or intermediate CA
+3. Create a role that allows issuing certificates for the webhook service DNS names:
+   - `{serviceName}.{namespace}.svc`
+   - `{serviceName}.{namespace}.svc.cluster.local`
+
+```bash
+# Example Vault PKI setup
+vault secrets enable -path=pki pki
+vault write pki/root/generate/internal \
+  common_name="cloudberry-operator-ca" ttl=87600h
+vault write pki/roles/cloudberry-operator \
+  allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local" \
+  allow_subdomains=true max_ttl=8760h
+```
+
+#### Custom Certificate Secret
+
+To use externally managed certificates, create a TLS Secret and reference it:
+
+```bash
+kubectl create secret tls my-webhook-certs \
+  -n cloudberry-system \
+  --cert=server.crt --key=server.key
+
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set webhook.enabled=true \
+  --set webhook.certSecretName=my-webhook-certs \
+  --set webhook.caBundle="$(base64 < ca.crt)"
+```
+
 ### Admin Password Secret
 
 The operator automatically creates an admin password Secret (`{cluster}-admin-password`) for each `CloudberryCluster` if one does not already exist. The Secret contains a bcrypt-hashed password used for basic authentication and database admin access.
@@ -262,12 +339,42 @@ kubectl create secret generic my-cluster-admin-password \
 
 - **POSTGRES_PASSWORD**: The operator injects the admin password into the coordinator pod via a `SecretKeyRef` environment variable (not a hardcoded value), ensuring the password is never stored in plain text in pod specs
 
+### API Admin Password
+
+The operator REST API requires authentication. The admin password for the API server is configured via the `CLOUDBERRY_API_ADMIN_PASSWORD` environment variable:
+
+```bash
+# Set the admin password for the operator REST API
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set-string env.CLOUDBERRY_API_ADMIN_PASSWORD="your-secure-api-password"
+```
+
+Or set it directly in the deployment:
+
+```yaml
+env:
+  - name: CLOUDBERRY_API_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: operator-api-credentials
+        key: admin-password
+```
+
+**Behavior:**
+- If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it as the admin password for the REST API
+- If **not** set, the operator auto-generates a cryptographically secure random password (including special characters) and logs a warning with a hint to set the variable for production use
+- The generated password is logged only as a warning hint — it is not persisted. Restarting the operator without `CLOUDBERRY_API_ADMIN_PASSWORD` generates a new password each time
+
+> **Production recommendation**: Always set `CLOUDBERRY_API_ADMIN_PASSWORD` via a Kubernetes Secret reference to ensure a stable, known password for API access.
+
 ### Environment Variable Configuration
 
 All operator settings can be configured via environment variables with the `CLOUDBERRY_` prefix. Nested keys use underscores as separators:
 
 | Environment Variable | Config Key | Description |
 |---------------------|------------|-------------|
+| `CLOUDBERRY_API_ADMIN_PASSWORD` | — | Admin password for the operator REST API (auto-generated if not set) |
 | `CLOUDBERRY_API_ADDRESS` | `api-address` | REST API bind address |
 | `CLOUDBERRY_WEBHOOK_ENABLED` | `webhook-enabled` | Enable admission webhooks |
 | `CLOUDBERRY_TELEMETRY_OTLP_INSECURE` | `telemetry.otlp-insecure` | Disable TLS for OTLP |

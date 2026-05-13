@@ -5,9 +5,11 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
 ## Table of Contents
 
 - [Creating a CloudberryCluster](#creating-a-cloudberrycluster)
+- [Cluster Name Uniqueness](#cluster-name-uniqueness)
 - [Managing Cluster Lifecycle](#managing-cluster-lifecycle)
 - [Configuration Management](#configuration-management)
 - [Authentication Setup](#authentication-setup)
+- [Webhook Certificate Setup](#webhook-certificate-setup)
 - [High Availability](#high-availability)
 - [Maintenance Operations](#maintenance-operations)
 - [Monitoring and Observability](#monitoring-and-observability)
@@ -185,6 +187,49 @@ spec:
   deletionPolicy: Retain
   backupOnDelete: true
 ```
+
+## Cluster Name Uniqueness
+
+CloudberryCluster names must be **unique across all namespaces**. The validating webhook rejects creation of a cluster if another cluster with the same name already exists in any namespace.
+
+```bash
+# This succeeds:
+kubectl apply -f - <<EOF
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: my-cluster
+  namespace: team-a
+spec:
+  image: "postgres:16"
+  coordinator:
+    storage: { size: 5Gi }
+  segments:
+    count: 2
+    storage: { size: 5Gi }
+EOF
+
+# This is rejected — "my-cluster" already exists in namespace "team-a":
+kubectl apply -f - <<EOF
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: my-cluster
+  namespace: team-b
+spec:
+  image: "postgres:16"
+  coordinator:
+    storage: { size: 5Gi }
+  segments:
+    count: 2
+    storage: { size: 5Gi }
+EOF
+# Error: CloudberryCluster with name "my-cluster" already exists in namespace "team-a"
+```
+
+This constraint prevents naming collisions in cross-namespace service discovery and ensures cluster names can serve as unique identifiers across the entire Kubernetes cluster.
+
+> **Note**: This validation requires the admission webhook to be enabled (`webhook.enabled=true`). If webhooks are disabled, duplicate names are not prevented.
 
 ### Checking Cluster Status
 
@@ -524,6 +569,62 @@ cloudberry-ctl auth roles update --cluster my-cluster \
 cloudberry-ctl auth roles delete --cluster my-cluster --name analyst
 ```
 
+## Webhook Certificate Setup
+
+The operator's admission webhooks require TLS certificates. The operator manages these certificates automatically using one of two strategies.
+
+### Self-Signed Certificates (Default)
+
+No configuration is needed. The operator generates a self-signed CA and server certificate on startup, stores them in a Kubernetes Secret, and injects the CA bundle into the webhook configurations.
+
+Certificates are checked for rotation every 12 hours and automatically rotated when 2/3 of their lifetime has elapsed.
+
+### Vault PKI Certificates
+
+For production environments, use Vault's PKI secrets engine for trusted certificate issuance:
+
+```yaml
+# In your Helm values
+webhook:
+  enabled: true
+  certSource: vault-pki
+  vaultPKI:
+    mountPath: pki
+    role: cloudberry-operator
+
+vault:
+  enabled: true
+  address: http://vault:8200
+```
+
+Ensure the Vault PKI role allows issuing certificates for the webhook service DNS names.
+
+### Verifying Webhook Certificates
+
+```bash
+# Check the certificate Secret
+kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
+
+# Verify the webhook configuration has a CA bundle
+kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
+```
+
+### Troubleshooting Webhook Certificates
+
+If webhook calls fail with TLS errors:
+
+1. Check that the certificate Secret exists and contains valid data:
+   ```bash
+   kubectl get secret <release>-webhook-certs -n cloudberry-system -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+   ```
+
+2. Verify the CA bundle in the webhook configuration matches the CA in the Secret:
+   ```bash
+   kubectl get validatingwebhookconfiguration <release>-validating -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -text -noout
+   ```
+
+3. If using Vault PKI, ensure the Vault server is reachable and the PKI role is properly configured.
+
 ## High Availability
 
 ### Segment Mirroring
@@ -750,6 +851,8 @@ cloudberry-ctl sessions cancel-query --cluster my-cluster --pid 12345
 cloudberry-ctl sessions terminate --cluster my-cluster --pid 12345
 ```
 
+> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error (`INVALID_REQUEST: PID must be a positive integer`).
+
 ### Inspection Commands
 
 ```bash
@@ -844,7 +947,22 @@ The operator REST API enforces per-IP rate limiting to protect against abuse and
 - **Default limit**: 10 requests per minute per client IP
 - **Algorithm**: Token bucket with automatic refill
 - **Scope**: Applied to all authenticated endpoints (health checks are exempt)
+- **IP identification**: Uses `RemoteAddr` by default. Proxy headers (`X-Forwarded-For`, `X-Real-IP`) are only trusted when the request comes from a configured trusted proxy CIDR range. This prevents clients from spoofing forwarded headers to bypass rate limiting
 - **Response**: When the limit is exceeded, the API returns `429 Too Many Requests` with a `Retry-After` header
+
+#### Trusted Proxies
+
+By default, the rate limiter does **not** trust any proxy headers — it uses only the direct connection's `RemoteAddr` for client IP identification. If the operator runs behind a load balancer or reverse proxy, configure trusted proxy CIDR ranges so the rate limiter correctly identifies client IPs:
+
+```yaml
+# Example: trust the cluster's internal pod network
+# Configure via operator startup options
+trustedProxies:
+  - "10.0.0.0/8"
+  - "172.16.0.0/12"
+```
+
+When a request arrives from an IP within a trusted proxy range, the rate limiter reads the client IP from the `X-Forwarded-For` header (first IP in the chain) or `X-Real-IP` header. Invalid CIDR strings are logged as warnings and ignored.
 
 If you encounter rate limiting with `cloudberry-ctl`, wait for the `Retry-After` period before retrying. For automation scripts, implement exponential backoff when receiving 429 responses.
 
@@ -877,6 +995,9 @@ Key event types:
 | `RecoveryStarted` | Normal | Recovery operation initiated |
 | `RecoveryCompleted` | Normal | Recovery operation completed |
 | `RecoveryFailed` | Warning | Recovery operation failed |
+| `AuthReconciled` | Normal | Authentication configuration reconciled |
+| `OIDCValidationFailed` | Warning | OIDC validation failed (with details) |
+| `OIDCConfigured` | Normal | OIDC authentication properly configured |
 
 ### Vault Integration
 

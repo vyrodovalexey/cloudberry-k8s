@@ -28,6 +28,9 @@ const (
 	defaultWebhookEnabled     = false
 	defaultReconcileInterval  = 30 * time.Second
 	defaultOperationTimeout   = 5 * time.Minute
+	defaultWebhookCertSource  = "self-signed"
+	defaultWebhookCertSecret  = "cloudberry-operator-webhook-certs"
+	defaultWebhookServiceName = "cloudberry-operator-webhook"
 )
 
 // OperatorConfig holds all operator configuration settings.
@@ -57,6 +60,17 @@ type OperatorConfig struct {
 	OperationTimeout time.Duration `mapstructure:"operation-timeout"`
 	// Namespace is the namespace the operator watches (empty for all namespaces).
 	Namespace string `mapstructure:"namespace"`
+
+	// WebhookCertSource is the certificate source for webhook TLS ("self-signed" or "vault-pki").
+	WebhookCertSource string `mapstructure:"webhook-cert-source"`
+	// WebhookCertSecretName is the name of the Secret to store webhook certs in.
+	WebhookCertSecretName string `mapstructure:"webhook-cert-secret-name"`
+	// WebhookServiceName is the webhook service name.
+	WebhookServiceName string `mapstructure:"webhook-service-name"`
+	// VaultPKIMountPath is the Vault PKI mount path (for vault-pki cert source).
+	VaultPKIMountPath string `mapstructure:"vault-pki-mount-path"`
+	// VaultPKIRole is the Vault PKI role name (for vault-pki cert source).
+	VaultPKIRole string `mapstructure:"vault-pki-role"`
 
 	// Vault holds Vault client configuration.
 	Vault VaultConfig `mapstructure:"vault"`
@@ -108,7 +122,8 @@ type OIDCConfig struct {
 	// ClientID is the OIDC client identifier.
 	ClientID string `mapstructure:"client-id"`
 	// ClientSecret is the OIDC client secret.
-	ClientSecret string `mapstructure:"client-secret"`
+	// Uses RedactedString to prevent accidental logging of the secret value.
+	ClientSecret RedactedString `mapstructure:"client-secret"`
 }
 
 // TelemetryConfig holds telemetry configuration.
@@ -191,6 +206,12 @@ func (l *viperLoader) setDefaults() {
 	l.v.SetDefault("operation-timeout", defaultOperationTimeout)
 	l.v.SetDefault("namespace", "")
 
+	l.v.SetDefault("webhook-cert-source", defaultWebhookCertSource)
+	l.v.SetDefault("webhook-cert-secret-name", defaultWebhookCertSecret)
+	l.v.SetDefault("webhook-service-name", defaultWebhookServiceName)
+	l.v.SetDefault("vault-pki-mount-path", "")
+	l.v.SetDefault("vault-pki-role", "")
+
 	l.v.SetDefault("vault.enabled", false)
 	l.v.SetDefault("vault.auth-method", "kubernetes")
 	l.v.SetDefault("vault.secret-path", "secret/data/cloudberry")
@@ -250,6 +271,14 @@ func validate(cfg *OperatorConfig) error {
 
 	if cfg.Telemetry.Enabled && cfg.Telemetry.OTLPEndpoint == "" {
 		return fmt.Errorf("telemetry.otlp-endpoint is required when telemetry is enabled")
+	}
+
+	validCertSources := map[string]bool{"self-signed": true, "vault-pki": true}
+	if cfg.WebhookCertSource != "" && !validCertSources[cfg.WebhookCertSource] {
+		return fmt.Errorf(
+			"webhook-cert-source must be one of self-signed, vault-pki; got %q",
+			cfg.WebhookCertSource,
+		)
 	}
 
 	return nil

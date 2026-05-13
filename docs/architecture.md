@@ -12,7 +12,11 @@ This document describes the system architecture of the Cloudberry Kubernetes Ope
 - [High Availability Design](#high-availability-design)
 - [Observability Architecture](#observability-architecture)
 - [REST API Server Architecture](#rest-api-server-architecture)
+  - [Rate Limiter](#rate-limiter)
+  - [Trusted Proxies](#trusted-proxies)
 - [DBClientFactory Pattern](#dbclientfactory-pattern)
+- [Status Update Pattern](#status-update-pattern)
+- [Webhook Certificate Manager](#webhook-certificate-manager)
 - [Design Principles](#design-principles)
 
 ## System Overview
@@ -56,6 +60,10 @@ The operator runs two server components:
 │  │                                                           │  │
 │  │  ┌──────────────────────────────────────────────────────┐ │  │
 │  │  │  DB Client Factory  │  Webhooks (conditional)       │ │  │
+│  │  └──────────────────────────────────────────────────────┘ │  │
+│  │                                                           │  │
+│  │  ┌──────────────────────────────────────────────────────┐ │  │
+│  │  │  Cert Manager (Vault PKI / Self-Signed)             │ │  │
 │  │  └──────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
@@ -101,7 +109,8 @@ The operator runs two server components:
 | **Vault Client** | `internal/vault` | HashiCorp Vault integration for secrets management |
 | **Metrics** | `internal/metrics` | Prometheus metrics registration and recording |
 | **Telemetry** | `internal/telemetry` | OpenTelemetry tracing setup and span helpers |
-| **Webhooks** | `internal/webhook` | Validating and mutating admission webhooks |
+| **Webhooks** | `internal/webhook` | Validating and mutating admission webhooks (including cross-namespace duplicate detection) |
+| **Cert Manager** | `internal/certmanager` | Webhook TLS certificate lifecycle: issuance, storage, and rotation via Vault PKI or self-signed CA |
 
 ### Managed Kubernetes Resources
 
@@ -263,6 +272,7 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - **Requeues** every 30 seconds for periodic health checks (10 seconds on error)
 - Emits **Kubernetes events** for state transitions
 - Records **Prometheus metrics** for reconciliation duration and results
+- Uses **`Status().Patch()` with MergePatch** for all status updates (see [Status Update Pattern](#status-update-pattern) below)
 
 ### HA Controller
 
@@ -299,6 +309,7 @@ The HA Controller manages fault tolerance and recovery:
 │  │  - full: pg_basebackup from mirror          │ │
 │  │  - differential: rsync-based recovery       │ │
 │  │  Creates Kubernetes Jobs for execution      │ │
+│  │  Uses MergePatch for annotation removal     │ │
 │  └─────────────────────────────────────────────┘ │
 │                                                   │
 │  ┌─────────────────────────────────────────────┐ │
@@ -321,6 +332,11 @@ Manages authentication configuration:
 3. Validates OIDC settings (issuer URL reachable, client ID valid)
 4. Manages TLS certificate mounting and PostgreSQL SSL parameters
 5. Syncs admin password from Kubernetes Secret or Vault to the database
+6. Checks `ObservedGeneration` to skip reconciliation when only status has changed, reducing unnecessary work
+7. Emits Kubernetes events for auth configuration changes:
+   - `AuthReconciled` (Normal) — authentication configuration reconciled successfully
+   - `OIDCValidationFailed` (Warning) — OIDC validation failed with details
+   - `OIDCConfigured` (Normal) — OIDC authentication is properly configured
 
 ### Admin Controller
 
@@ -331,6 +347,8 @@ Manages configuration and maintenance:
 3. Applies parameters at cluster, coordinator, database, and role levels
 4. Creates Kubernetes Jobs for maintenance operations (vacuum, analyze, reindex)
 5. Monitors Job completion and cleans up finished Jobs
+6. Performs a single consolidated status update per reconciliation cycle to reduce API server load
+7. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
 
 ## Authentication Architecture
 
@@ -543,11 +561,24 @@ The API uses a per-IP token bucket rate limiter (`internal/api/ratelimit.go`):
 
 - **Algorithm**: Token bucket with automatic refill based on elapsed time
 - **Default limit**: 10 requests per minute per IP
-- **IP extraction**: Checks `X-Forwarded-For`, then `X-Real-IP`, then `RemoteAddr`
+- **IP extraction**: Uses `RemoteAddr` by default. `X-Forwarded-For` and `X-Real-IP` headers are only trusted when the direct connection comes from a configured trusted proxy (see [Trusted Proxies](#trusted-proxies) below). This prevents header spoofing attacks where untrusted clients forge forwarded headers to bypass rate limiting
 - **Cleanup**: Background goroutine removes inactive entries every 5 minutes to prevent memory leaks
+- **Graceful shutdown**: The `Stop()` method terminates the background cleanup goroutine, preventing goroutine leaks when the rate limiter is no longer needed. The API server calls `Stop()` during shutdown
 - **Response**: Returns `429 Too Many Requests` with a `Retry-After` header when the limit is exceeded
 
 Rate limiting is applied **before** authentication to protect against brute-force credential attacks.
+
+#### Trusted Proxies
+
+By default, the rate limiter uses only `RemoteAddr` for client IP identification. To trust proxy headers (`X-Forwarded-For`, `X-Real-IP`), configure trusted proxy CIDR ranges via the `WithTrustedProxies` option:
+
+```go
+rateLimiter := api.NewRateLimiter(10, time.Minute, logger,
+    api.WithTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12"}),
+)
+```
+
+When a request arrives from an IP within a trusted proxy range, the rate limiter reads the client IP from `X-Forwarded-For` (first IP in the chain) or `X-Real-IP`. Invalid CIDR strings are logged as warnings and skipped.
 
 ### Input Validation
 
@@ -557,7 +588,7 @@ Rate limiting is applied **before** authentication to protect against brute-forc
 
 ### API Server Lifecycle
 
-The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled.
+The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled. During shutdown, the rate limiter's `Stop()` method is called to terminate the background cleanup goroutine and prevent goroutine leaks.
 
 ## DBClientFactory Pattern
 
@@ -586,6 +617,104 @@ The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating 
 - Resolves the coordinator service endpoint as `{cluster}-coordinator.{namespace}.svc`
 - Configures retry options with exponential backoff
 - Returns a `Client` interface for testability
+
+## Status Update Pattern
+
+All controllers use `Status().Patch()` with `MergePatchType` instead of `Status().Update()` to prevent status clobbering between concurrent controllers. When multiple controllers (Cluster, HA, Auth, Admin) reconcile the same `CloudberryCluster` simultaneously, a full status update from one controller can overwrite fields set by another.
+
+### `patchStatus()`
+
+The standard status patch function serializes the entire `cluster.Status` struct and applies it as a MergePatch:
+
+```go
+func patchStatus(ctx context.Context, c client.Client, cluster *CloudberryCluster) error {
+    statusPatch, _ := json.Marshal(map[string]interface{}{
+        "status": cluster.Status,
+    })
+    return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
+}
+```
+
+### `patchFTSStatus()`
+
+The FTS probe results require special handling because the `FailedSegments` field uses `omitempty` in its JSON tag. With `json.Marshal`, an empty slice is omitted entirely, and MergePatch treats omitted fields as "no change" — meaning previously failed segments would never be cleared.
+
+`patchFTSStatus()` manually constructs the patch JSON to always include `failedSegments`, even when empty:
+
+```go
+statusMap := map[string]interface{}{
+    "mirroringStatus": cluster.Status.MirroringStatus,
+}
+if len(failedSegments) == 0 {
+    statusMap["failedSegments"] = []interface{}{} // explicit empty array
+} else {
+    statusMap["failedSegments"] = failedSegments
+}
+```
+
+This ensures that when all segments recover, the `failedSegments` list is properly cleared in the status.
+
+## Webhook Certificate Manager
+
+The `internal/certmanager` package manages TLS certificates for the admission webhook server. It supports two certificate sources with automatic rotation.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Cert Manager                                │
+│                                                              │
+│  ┌────────────────────┐    ┌─────────────────────────────┐  │
+│  │  Vault PKI         │    │  Self-Signed (fallback)     │  │
+│  │  (preferred)       │    │                             │  │
+│  │                    │    │  - Generates ECDSA P-256    │  │
+│  │  - Issues certs    │    │    CA + server key pairs    │  │
+│  │    via PKI engine  │    │  - CA valid for 10 years    │  │
+│  │  - Configurable    │    │  - Server cert validity     │  │
+│  │    mount path and  │    │    configurable (default    │  │
+│  │    role            │    │    1 year)                   │  │
+│  └────────┬───────────┘    └──────────────┬──────────────┘  │
+│           └──────────┬───────────────────┘                   │
+│                      ▼                                       │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │  Kubernetes Secret (TLS type)                         │   │
+│  │  - ca.crt   (CA certificate PEM)                      │   │
+│  │  - tls.crt  (server certificate PEM)                  │   │
+│  │  - tls.key  (server private key PEM)                  │   │
+│  └───────────────────────────────────────────────────────┘   │
+│                      │                                       │
+│                      ▼                                       │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │  CA Bundle Injection                                  │   │
+│  │  → ValidatingWebhookConfiguration.caBundle            │   │
+│  │  → MutatingWebhookConfiguration.caBundle              │   │
+│  └───────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Certificate Lifecycle
+
+1. **Startup**: `EnsureCertificates()` checks if a valid certificate Secret exists
+2. **Issuance**: If no Secret exists or the certificate is invalid, new certificates are generated using the configured source
+3. **Storage**: Certificates are stored in a Kubernetes Secret of type `kubernetes.io/tls`
+4. **Rotation check**: `NeedsRotation()` is called periodically (every 12 hours). Rotation triggers when **2/3 of the certificate lifetime** has elapsed
+5. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources
+
+### DNS SANs
+
+Server certificates include the following Subject Alternative Names:
+
+- `{serviceName}.{namespace}.svc`
+- `{serviceName}.{namespace}.svc.cluster.local`
+
+### Configuration
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `CertSource` | Certificate source (`vault-pki` or `self-signed`) | `self-signed` |
+| `ServiceName` | Webhook service name for DNS SANs | — |
+| `SecretName` | Kubernetes Secret name for certificate storage | — |
+| `VaultPKIMountPath` | Vault PKI engine mount path | `pki` |
+| `VaultPKIRole` | Vault PKI role name | `cloudberry-operator` |
+| `CertValidityDuration` | Certificate validity period | `365d` |
 
 ## Design Principles
 

@@ -251,3 +251,53 @@ func TestFormatter_DefaultFormat(t *testing.T) {
 	assert.Contains(t, output, "key:")
 	assert.Contains(t, output, "value")
 }
+
+func TestFormatter_FormatMapTable_SortedKeys(t *testing.T) {
+	var buf bytes.Buffer
+	f := NewFormatter(OutputTable, &buf)
+
+	// Keys should be sorted alphabetically in the output.
+	data := map[string]interface{}{
+		"zebra":  "z",
+		"apple":  "a",
+		"mango":  "m",
+		"banana": "b",
+	}
+	err := f.Format(data)
+	require.NoError(t, err)
+
+	output := buf.String()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	require.Len(t, lines, 4)
+
+	// Verify sorted order: apple, banana, mango, zebra.
+	assert.True(t, strings.HasPrefix(lines[0], "apple:"))
+	assert.True(t, strings.HasPrefix(lines[1], "banana:"))
+	assert.True(t, strings.HasPrefix(lines[2], "mango:"))
+	assert.True(t, strings.HasPrefix(lines[3], "zebra:"))
+}
+
+func TestFormatter_FormatSliceTable_SortedHeaders(t *testing.T) {
+	var buf bytes.Buffer
+	f := NewFormatter(OutputTable, &buf)
+
+	// Headers should be sorted alphabetically.
+	data := []interface{}{
+		map[string]interface{}{"zebra": "z1", "apple": "a1", "mango": "m1"},
+		map[string]interface{}{"zebra": "z2", "apple": "a2", "mango": "m2"},
+	}
+	err := f.Format(data)
+	require.NoError(t, err)
+
+	output := buf.String()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	require.GreaterOrEqual(t, len(lines), 3) // header + separator + at least 1 data row
+
+	// First line should have headers in sorted order.
+	headerLine := lines[0]
+	appleIdx := strings.Index(headerLine, "APPLE")
+	mangoIdx := strings.Index(headerLine, "MANGO")
+	zebraIdx := strings.Index(headerLine, "ZEBRA")
+	assert.Less(t, appleIdx, mangoIdx)
+	assert.Less(t, mangoIdx, zebraIdx)
+}

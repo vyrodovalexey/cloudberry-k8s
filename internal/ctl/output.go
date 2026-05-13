@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -74,19 +75,26 @@ func (f *Formatter) formatTable(data interface{}) error {
 	}
 }
 
-// formatMapTable formats a map as a key-value table.
+// formatMapTable formats a map as a key-value table with deterministic output.
 func (f *Formatter) formatMapTable(data map[string]interface{}) error {
+	// Sort keys for deterministic output.
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	// Find the longest key for alignment.
 	maxKeyLen := 0
-	for k := range data {
+	for _, k := range keys {
 		if len(k) > maxKeyLen {
 			maxKeyLen = len(k)
 		}
 	}
 
-	for k, v := range data {
+	for _, k := range keys {
 		padding := strings.Repeat(" ", maxKeyLen-len(k))
-		fmt.Fprintf(f.writer, "%s:%s  %v\n", k, padding, v)
+		fmt.Fprintf(f.writer, "%s:%s  %v\n", k, padding, data[k])
 	}
 	return nil
 }
@@ -130,6 +138,7 @@ func (f *Formatter) formatSliceTable(data []interface{}) error {
 	for k := range firstItem {
 		headers = append(headers, k)
 	}
+	sort.Strings(headers)
 
 	widths := calcColumnWidths(headers, data)
 

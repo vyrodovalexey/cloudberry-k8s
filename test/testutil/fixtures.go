@@ -253,6 +253,39 @@ func (b *ClusterBuilder) WithPendingGeneration() *ClusterBuilder {
 	return b
 }
 
+// WithCoordinatorParameters sets coordinator-only parameters.
+func (b *ClusterBuilder) WithCoordinatorParameters(params map[string]string) *ClusterBuilder {
+	if b.cluster.Spec.Config == nil {
+		b.cluster.Spec.Config = &cbv1alpha1.ConfigSpec{}
+	}
+	b.cluster.Spec.Config.CoordinatorParameters = params
+	return b
+}
+
+// WithDatabaseParameters sets per-database parameters.
+func (b *ClusterBuilder) WithDatabaseParameters(params map[string]map[string]string) *ClusterBuilder {
+	if b.cluster.Spec.Config == nil {
+		b.cluster.Spec.Config = &cbv1alpha1.ConfigSpec{}
+	}
+	b.cluster.Spec.Config.DatabaseParameters = params
+	return b
+}
+
+// WithRoleParameters sets per-role parameters.
+func (b *ClusterBuilder) WithRoleParameters(params map[string]map[string]string) *ClusterBuilder {
+	if b.cluster.Spec.Config == nil {
+		b.cluster.Spec.Config = &cbv1alpha1.ConfigSpec{}
+	}
+	b.cluster.Spec.Config.RoleParameters = params
+	return b
+}
+
+// WithBackupOnDelete enables backup on delete.
+func (b *ClusterBuilder) WithBackupOnDelete(enabled bool) *ClusterBuilder {
+	b.cluster.Spec.BackupOnDelete = enabled
+	return b
+}
+
 // Build returns the constructed CloudberryCluster.
 func (b *ClusterBuilder) Build() *cbv1alpha1.CloudberryCluster {
 	return b.cluster.DeepCopy()

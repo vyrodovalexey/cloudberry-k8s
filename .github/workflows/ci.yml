@@ -315,16 +315,11 @@ jobs:
           name: coverage-unit
           path: coverage
 
-      - name: Download functional coverage
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
-        with:
-          name: coverage-functional
-          path: coverage
 
-      - name: Download integration/e2e coverage
+      - name: Download functional/integration/e2e coverage
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.0
         with:
-          name: coverage-integration-e2e
+          name: coverage-service-tests
           path: coverage
 
       - name: SonarCloud Scan
@@ -417,28 +412,80 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
   # ===========================================================================
-  # Helm Lint (PR)
+  # Helm Chart Testing (PR - Dry Run)
   # ===========================================================================
 
-  helm-lint:
-    name: Helm Lint
+  helm-test-pr:
+    name: Helm Chart Test (PR)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: [lint, govulncheck, unit-tests]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: 'v3.14.0'
-      - run: helm lint ${{ env.HELM_CHART_PATH }}
-      - run: |
-          helm template cloudberry-operator ${{ env.HELM_CHART_PATH }} \
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.13.0
+        with:
+          cluster_name: helm-test
+          wait: 120s
+
+      - name: Helm lint
+        run: helm lint ${{ env.HELM_CHART_PATH }}
+
+      - name: Helm template validation
+        run: |
+          helm template ${{ env.HELM_CHART_PATH }} \
             --set installCRDs=true > /dev/null
           echo "Template validation successful!"
+
+      - name: Helm dry-run install
+        run: |
+          echo "==> Running Helm dry-run install..."
+          helm install --dry-run --debug ${{ env.HELM_CHART_PATH }} \
+            --set installCRDs=true
+
+      - name: Install Prometheus Operator CRDs
+        run: |
+          echo "==> Installing Prometheus Operator CRDs for ServiceMonitor support..."
+          kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.71.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+
+      - name: Lint monitoring charts
+        run: |
+          echo "==> Linting test monitoring charts..."
+          helm lint test/monitoring/otel-collector
+          helm lint test/monitoring/vmagent
+
+      - name: Validate monitoring chart templates
+        run: |
+          echo "==> Validating monitoring chart templates..."
+          helm template otel-collector test/monitoring/otel-collector > /dev/null
+          helm template vmagent test/monitoring/vmagent > /dev/null
+          echo "Monitoring chart template validation successful!"
+
+      - name: Dry-run install monitoring charts
+        run: |
+          echo "==> Running Helm dry-run for monitoring charts..."
+          helm install --dry-run --debug otel-collector test/monitoring/otel-collector
+          helm install --dry-run --debug vmagent test/monitoring/vmagent
+
+      - name: Validate monitoring chart Kubernetes manifests
+        run: |
+          echo "==> Validating monitoring chart Kubernetes manifests..."
+          helm template otel-collector test/monitoring/otel-collector | kubectl apply --dry-run=client -f -
+          helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
+          echo "Monitoring chart Kubernetes manifest validation successful!"
+
 
   # ===========================================================================
   # Tag-only: Build & Release

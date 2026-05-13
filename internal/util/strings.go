@@ -58,7 +58,7 @@ const (
 	// defaultPasswordLength is the length of generated admin passwords.
 	defaultPasswordLength = 32
 	// passwordChars is the set of characters used for password generation.
-	passwordChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	passwordChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+"
 )
 
 // GenerateRandomPassword generates a cryptographically secure random password.

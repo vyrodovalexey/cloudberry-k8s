@@ -5,25 +5,58 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 )
 
 // CloudberryClusterValidator validates CloudberryCluster resources.
-type CloudberryClusterValidator struct{}
+type CloudberryClusterValidator struct {
+	reader client.Reader
+}
 
 // NewCloudberryClusterValidator creates a new CloudberryClusterValidator.
-func NewCloudberryClusterValidator() *CloudberryClusterValidator {
-	return &CloudberryClusterValidator{}
+func NewCloudberryClusterValidator(reader client.Reader) *CloudberryClusterValidator {
+	return &CloudberryClusterValidator{reader: reader}
 }
 
 // ValidateCreate validates a CloudberryCluster on creation.
 func (v *CloudberryClusterValidator) ValidateCreate(
-	_ context.Context,
+	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	// Check for duplicate cluster names across all namespaces.
+	if v.reader != nil {
+		if err := v.checkDuplicateName(ctx, cluster); err != nil {
+			return nil, err
+		}
+	}
 	return validateCluster(cluster)
+}
+
+// checkDuplicateName checks if a CloudberryCluster with the same name already exists
+// in any namespace.
+func (v *CloudberryClusterValidator) checkDuplicateName(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	clusterList := &cbv1alpha1.CloudberryClusterList{}
+	if err := v.reader.List(ctx, clusterList); err != nil {
+		return fmt.Errorf("listing clusters for duplicate check: %w", err)
+	}
+
+	for i := range clusterList.Items {
+		existing := &clusterList.Items[i]
+		if existing.Name == cluster.Name && existing.Namespace != cluster.Namespace {
+			return fmt.Errorf(
+				"CloudberryCluster with name %q already exists in namespace %q",
+				existing.Name, existing.Namespace,
+			)
+		}
+	}
+
+	return nil
 }
 
 // ValidateUpdate validates a CloudberryCluster on update.

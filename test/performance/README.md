@@ -48,10 +48,16 @@ make build-operator
 ./bin/cloudberry-operator
 
 # Or via port-forward if running in Kubernetes
-kubectl port-forward svc/cloudberry-operator 8090:8090 -n cloudberry-system
+# Note: The operator Service only exposes metrics (8080) and health (8081) ports.
+# The REST API (port 8090) must be port-forwarded directly from the pod:
+kubectl port-forward -n cloudberry-system \
+  $(kubectl get pod -n cloudberry-system -l app.kubernetes.io/name=cloudberry-operator -o jsonpath='{.items[0].metadata.name}') \
+  8090:8090
 ```
 
 Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API server uses bcrypt for password verification.
+
+> **Important**: When running in Kubernetes, the `CLOUDBERRY_API_ADMIN_PASSWORD` environment variable must be set on the operator pod for the `admin:admin` credentials to work. If not set, the operator generates a random password logged at startup.
 
 ### Test Infrastructure Status
 
@@ -60,6 +66,10 @@ Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API serve
 - Helm chart deploys to local Kubernetes clusters
 - Monitoring stack (vmagent, otel-collector) can be deployed alongside the operator
 - Performance tests target the REST API server on port `:8090`
+- Yandex Tank Docker images available: `direvius/yandex-tank`, `yandex/yandex-tank`
+- Test dataset (~87MB) pre-generated in `data/` directory (customers + orders CSVs)
+- 4 test scenarios configured: smoke, baseline, stress, endurance
+- 3 ammo files ready: health, api-read, api-mixed
 
 > **Note**: The API enforces per-IP rate limiting (10 requests/minute by default). For performance testing, you may need to increase the rate limit or disable it by configuring a higher limit.
 
@@ -417,11 +427,13 @@ nc -z localhost 8090
 ### Docker networking issues
 
 ```bash
-# Use --net host for Docker
+# Use --net host for Docker (Linux only)
 docker run --rm --net host -v $(pwd):/var/loadtest direvius/yandex-tank -c scenarios/smoke.yaml
 
-# On macOS, use host.docker.internal instead of localhost
-# Edit the ammo file and config to use host.docker.internal
+# On macOS, --net host does NOT work. Instead:
+# 1. Use host.docker.internal instead of localhost in configs and ammo files
+# 2. Or run yandex-tank natively (pip install yandextank) instead of Docker
+# 3. Or use the --native flag: ./run-perftest.sh --scenario smoke --native
 ```
 
 ### High error rate

@@ -10,7 +10,7 @@
 #
 # Options:
 #   --scenario <name>    Test scenario: smoke, baseline, stress, endurance (default: smoke)
-#   --target <host:port> Target address (default: localhost:8443)
+#   --target <host:port> Target address (default: localhost:8090)
 #   --ssl                Enable SSL/TLS for target connection
 #   --rps <number>       Override max RPS (only for custom runs)
 #   --duration <seconds> Override test duration (only for custom runs)
@@ -29,7 +29,7 @@
 #
 # Examples:
 #   ./run-perftest.sh --scenario smoke
-#   ./run-perftest.sh --scenario baseline --target operator.example.com:8443 --ssl
+#   ./run-perftest.sh --scenario baseline --target operator.example.com:8090 --ssl
 #   ./run-perftest.sh --scenario stress --rps 500
 #   ./run-perftest.sh --analyze-only
 #
@@ -42,7 +42,7 @@ set -euo pipefail
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCENARIO="smoke"
-TARGET="localhost:8443"
+TARGET="localhost:8090"
 SSL="false"
 RPS_OVERRIDE=""
 DURATION_OVERRIDE=""
@@ -335,7 +335,7 @@ create_runtime_config() {
     cp "${SCRIPT_DIR}/${config_file}" "${runtime_config}"
 
     # Apply target override
-    if [[ "$TARGET" != "localhost:8443" ]]; then
+    if [[ "$TARGET" != "localhost:8090" ]]; then
         sed -i.bak "s|address:.*|address: ${TARGET}|" "${runtime_config}"
         rm -f "${runtime_config}.bak"
     fi

@@ -38,6 +38,10 @@ const (
 	AnnotationRecovery = "avsoft.io/recovery"
 	// AnnotationConfigHash is the annotation key for configuration hash.
 	AnnotationConfigHash = "avsoft.io/config-hash"
+	// AnnotationRollingRestart tracks rolling restart progress.
+	AnnotationRollingRestart = "avsoft.io/rolling-restart"
+	// AnnotationRestartTrigger triggers a pod restart when changed.
+	AnnotationRestartTrigger = "avsoft.io/restart-trigger"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"

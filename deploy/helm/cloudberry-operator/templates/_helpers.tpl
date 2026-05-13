@@ -71,7 +71,22 @@ Operator image with tag
 Webhook service name
 */}}
 {{- define "cloudberry-operator.webhookServiceName" -}}
-{{- printf "%s-webhook" (include "cloudberry-operator.fullname" .) }}
+{{- if .Values.webhook.serviceName -}}
+{{- .Values.webhook.serviceName -}}
+{{- else -}}
+{{- printf "%s-webhook" (include "cloudberry-operator.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Webhook certificate secret name
+*/}}
+{{- define "cloudberry-operator.webhookCertSecretName" -}}
+{{- if .Values.webhook.certSecretName -}}
+{{- .Values.webhook.certSecretName -}}
+{{- else -}}
+{{- printf "%s-webhook-certs" (include "cloudberry-operator.fullname" .) -}}
+{{- end -}}
 {{- end }}
 
 {{/*

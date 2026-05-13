@@ -17,9 +17,11 @@ const (
 	authMethodToken      = "token"
 	authMethodKubernetes = "kubernetes"
 	authMethodAppRole    = "approle"
-
-	defaultKubeTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // not a credential
 )
+
+// kubeTokenPath is the path to the Kubernetes service account token file.
+// It is a variable so that tests can override it.
+var kubeTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // not a credential
 
 // Client defines the interface for Vault operations.
 type Client interface {
@@ -138,7 +140,7 @@ func (v *vaultClient) authenticateToken() error {
 
 // authenticateKubernetes authenticates using the Kubernetes service account token.
 func (v *vaultClient) authenticateKubernetes(ctx context.Context) error {
-	jwt, err := os.ReadFile(defaultKubeTokenPath)
+	jwt, err := os.ReadFile(kubeTokenPath)
 	if err != nil {
 		return fmt.Errorf("reading kubernetes service account token: %w", err)
 	}

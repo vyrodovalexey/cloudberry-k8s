@@ -1102,7 +1102,7 @@ func TestAdminReconciler_Reconcile_ConfigReconcileError(t *testing.T) {
 	assert.Equal(t, requeueAfterError, result.RequeueAfter)
 }
 
-func TestAdminReconciler_HandleMaintenance_UpdateError(t *testing.T) {
+func TestAdminReconciler_HandleMaintenance_PatchError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
@@ -1115,8 +1115,8 @@ func TestAdminReconciler_HandleMaintenance_UpdateError(t *testing.T) {
 		WithObjects(cluster).
 		WithStatusSubresource(cluster).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				return fmt.Errorf("update failed")
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return fmt.Errorf("patch failed")
 			},
 		}).
 		Build()

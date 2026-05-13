@@ -29,16 +29,19 @@ type rateLimitEntry struct {
 
 // RateLimiter implements a per-IP token bucket rate limiter.
 type RateLimiter struct {
-	mu       sync.Mutex
-	entries  map[string]*rateLimitEntry
-	limit    int
-	interval time.Duration
-	logger   *slog.Logger
+	mu             sync.Mutex
+	entries        map[string]*rateLimitEntry
+	limit          int
+	interval       time.Duration
+	logger         *slog.Logger
+	stopCh         chan struct{}
+	trustedProxies []net.IPNet
 }
 
 // NewRateLimiter creates a new per-IP rate limiter.
 // limit is the maximum number of requests allowed per interval.
-func NewRateLimiter(limit int, interval time.Duration, logger *slog.Logger) *RateLimiter {
+// opts can be used to configure trusted proxies via WithTrustedProxies.
+func NewRateLimiter(limit int, interval time.Duration, logger *slog.Logger, opts ...RateLimiterOption) *RateLimiter {
 	if limit <= 0 {
 		limit = defaultRateLimit
 	}
@@ -54,12 +57,42 @@ func NewRateLimiter(limit int, interval time.Duration, logger *slog.Logger) *Rat
 		limit:    limit,
 		interval: interval,
 		logger:   logger.With("component", "rate-limiter"),
+		stopCh:   make(chan struct{}),
+	}
+
+	for _, opt := range opts {
+		opt(rl)
 	}
 
 	// Start background cleanup goroutine to prevent unbounded memory growth.
 	go rl.cleanupLoop()
 
 	return rl
+}
+
+// RateLimiterOption configures a RateLimiter.
+type RateLimiterOption func(*RateLimiter)
+
+// WithTrustedProxies configures the CIDR ranges whose X-Forwarded-For and
+// X-Real-IP headers are trusted. When the list is empty (the default),
+// only RemoteAddr is used for client identification.
+func WithTrustedProxies(cidrs []string) RateLimiterOption {
+	return func(rl *RateLimiter) {
+		for _, cidr := range cidrs {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				rl.logger.Warn("ignoring invalid trusted proxy CIDR", "cidr", cidr, "error", err)
+				continue
+			}
+			rl.trustedProxies = append(rl.trustedProxies, *ipNet)
+		}
+	}
+}
+
+// Stop stops the background cleanup goroutine. It should be called when the
+// RateLimiter is no longer needed to prevent goroutine leaks.
+func (rl *RateLimiter) Stop() {
+	close(rl.stopCh)
 }
 
 // Allow checks whether a request from the given IP is allowed.
@@ -111,12 +144,18 @@ func (rl *RateLimiter) RetryAfterSeconds() int {
 }
 
 // cleanupLoop periodically removes expired entries to prevent memory leaks.
+// It exits when the stopCh channel is closed.
 func (rl *RateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(defaultCleanupInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		rl.cleanup()
+	for {
+		select {
+		case <-ticker.C:
+			rl.cleanup()
+		case <-rl.stopCh:
+			return
+		}
 	}
 }
 
@@ -139,7 +178,7 @@ func (rl *RateLimiter) cleanup() {
 // with a Retry-After header.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := extractClientIP(r)
+		ip := rl.extractClientIP(r)
 		if !rl.Allow(ip) {
 			retryAfter := rl.RetryAfterSeconds()
 			w.Header().Set(retryAfterHeader, fmt.Sprintf("%d", retryAfter))
@@ -153,28 +192,57 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 }
 
 // extractClientIP extracts the client IP from the request.
-// It prefers X-Forwarded-For, then X-Real-IP, then falls back to RemoteAddr.
-func extractClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (first IP in the chain).
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For can contain multiple IPs; use the first one.
-		for i := range len(xff) {
-			if xff[i] == ',' {
-				return xff[:i]
+// It only trusts X-Forwarded-For and X-Real-IP headers when the direct
+// connection comes from a trusted proxy. Otherwise, RemoteAddr is used
+// to prevent header spoofing attacks.
+func (rl *RateLimiter) extractClientIP(r *http.Request) string {
+	remoteHost := extractRemoteHost(r.RemoteAddr)
+
+	// Only trust forwarded headers when the remote address is a trusted proxy.
+	if rl.isTrustedProxy(remoteHost) {
+		// Check X-Forwarded-For header (first IP in the chain).
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// X-Forwarded-For can contain multiple IPs; use the first one.
+			for i := range len(xff) {
+				if xff[i] == ',' {
+					return xff[:i]
+				}
 			}
+			return xff
 		}
-		return xff
+
+		// Check X-Real-IP header.
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return xri
+		}
 	}
 
-	// Check X-Real-IP header.
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
+	return remoteHost
+}
 
-	// Fall back to RemoteAddr, stripping the port.
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+// extractRemoteHost extracts the host part from a RemoteAddr, stripping the port.
+func extractRemoteHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return remoteAddr
 	}
 	return host
+}
+
+// isTrustedProxy checks whether the given IP is within any of the configured
+// trusted proxy CIDR ranges.
+func (rl *RateLimiter) isTrustedProxy(ip string) bool {
+	if len(rl.trustedProxies) == 0 {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for i := range rl.trustedProxies {
+		if rl.trustedProxies[i].Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }

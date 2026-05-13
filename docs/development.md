@@ -226,8 +226,15 @@ cloudberry-k8s/
 │   │   ├── vault.go                  # Vault client
 │   │   └── vault_test.go             # Vault tests
 │   │
+│   ├── certmanager/
+│   │   ├── certmanager.go            # Certificate manager interface and lifecycle
+│   │   ├── certmanager_test.go       # Certificate manager tests
+│   │   ├── selfsigned.go             # Self-signed CA and server cert generation
+│   │   ├── selfsigned_test.go        # Self-signed cert tests
+│   │   └── vaultpki.go              # Vault PKI certificate issuance
+│   │
 │   └── webhook/
-│       ├── validating.go             # Validating admission webhook
+│       ├── validating.go             # Validating admission webhook (with cross-namespace duplicate detection)
 │       ├── validating_test.go
 │       ├── mutating.go               # Mutating admission webhook
 │       └── mutating_test.go
@@ -296,7 +303,23 @@ cloudberry-k8s/
 | `internal/builder` | K8s resource construction | api/v1alpha1, internal/util |
 | `internal/controller` | Reconciliation controllers | All internal packages |
 | `internal/api` | REST API server | internal/auth, internal/metrics |
-| `internal/webhook` | Admission webhooks | api/v1alpha1 |
+| `internal/certmanager` | Webhook TLS cert lifecycle (Vault PKI / self-signed) | internal/vault, k8s client |
+| `internal/webhook` | Admission webhooks (with cross-namespace duplicate detection) | api/v1alpha1 |
+
+### Key Internal Helpers
+
+The codebase uses several internal helper functions that are important to understand when contributing:
+
+| Helper | Package | Purpose |
+|--------|---------|---------|
+| `resolvePort()` | `internal/builder` | Returns the coordinator port from the cluster spec, falling back to the default (5432). Used by all resource builder functions to avoid duplicating port resolution logic |
+| `notImplemented()` | `cmd/cloudberry-ctl` | Returns a standardized `"command %q is not yet implemented"` error for stub CLI commands. All unimplemented commands use this helper to provide consistent error messages |
+| `removeAnnotationPatch()` | `internal/controller` | Removes an annotation from a cluster using a `MergePatch` instead of a full update. This avoids race conditions when multiple controllers modify the same resource concurrently |
+| `patchStatus()` | `internal/controller` | Patches the status subresource using `Status().Patch()` with `MergePatchType`. Prevents status clobbering between concurrent controllers |
+| `patchFTSStatus()` | `internal/controller` | Patches FTS-related status fields with a manually constructed MergePatch. Handles `omitempty` on `FailedSegments` by always including the field explicitly, even when empty |
+| `checkDuplicateName()` | `internal/webhook` | Lists all `CloudberryCluster` resources across namespaces and rejects creation if the same name exists in a different namespace |
+| `buildConnectionString()` | `internal/db` | Constructs a PostgreSQL connection string with properly escaped parameters. Returns an error (instead of falling back to a default) if the connection string cannot be parsed |
+| `GenerateRandomPassword()` | `internal/util` | Generates a cryptographically secure random password including special characters (`!@#$%^&*()-_=+`). Used for auto-generated admin passwords |
 
 ## Building
 
@@ -406,7 +429,12 @@ make test-all
 
 ### Coverage
 
-The project targets **90%+ unit test statement coverage**.
+The project targets **90%+ unit test statement coverage**. Current coverage for key packages:
+
+| Package | Coverage |
+|---------|----------|
+| `internal/db` | 92.9% |
+| `internal/vault` | 99.1% |
 
 ```bash
 # Generate coverage report
@@ -656,6 +684,51 @@ The `internal/ctl` package provides:
 - **`OperatorClient`**: HTTP client with basic/OIDC auth, timeout, and redirect protection
 - **`FormatOutput`**: Renders API responses in table, JSON, or YAML format
 - **Path helpers**: `ClusterPath()`, `ClusterStatusPath()`, `ClusterActionPath()`, etc.
+
+### Status Update Pattern
+
+All controllers use `Status().Patch()` with `MergePatchType` instead of `Status().Update()`. This prevents status clobbering when multiple controllers reconcile the same `CloudberryCluster` concurrently.
+
+**Standard status patch:**
+
+```go
+func patchStatus(ctx context.Context, c client.Client, cluster *CloudberryCluster) error {
+    statusPatch, _ := json.Marshal(map[string]interface{}{
+        "status": cluster.Status,
+    })
+    return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
+}
+```
+
+**FTS status patch** (handles `omitempty` on `FailedSegments`):
+
+```go
+// Always include failedSegments explicitly to clear previous failures
+statusMap["failedSegments"] = []interface{}{} // empty array, not omitted
+```
+
+When adding new status fields or updating status in a controller, always use `patchStatus()` or construct a MergePatch manually. Never use `Status().Update()`.
+
+### Webhook Certificate Manager (`internal/certmanager`)
+
+The `certmanager` package manages TLS certificates for the admission webhook server. It provides:
+
+- **`CertManager` interface**: `EnsureCertificates()` and `NeedsRotation()`
+- **Two strategies**: `vault-pki` (issues certs via Vault PKI engine) and `self-signed` (generates ECDSA P-256 CA + server certs)
+- **Automatic rotation**: Certificates rotate when 2/3 of their lifetime has elapsed
+- **Kubernetes Secret storage**: Certs stored as `kubernetes.io/tls` Secrets with `ca.crt`, `tls.crt`, `tls.key`
+
+To extend the certmanager (e.g., adding cert-manager.io support), implement the certificate generation logic and add a new `CertSource` constant.
+
+### Cross-Namespace Duplicate Detection
+
+The validating webhook checks for duplicate `CloudberryCluster` names across all namespaces on CREATE operations. If a cluster with the same `.metadata.name` exists in any other namespace, the webhook rejects the request with an error:
+
+```
+CloudberryCluster with name "my-cluster" already exists in namespace "other-ns"
+```
+
+This is implemented in `internal/webhook/validating.go` via `checkDuplicateName()`, which lists all clusters and compares names. Updates to existing clusters in the same namespace are allowed.
 
 ### Adding a New Prometheus Metric
 

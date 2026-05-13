@@ -117,6 +117,16 @@ func (e *TestK8sEnv) GetConfigMap(ctx context.Context, name, namespace string) (
 	return cm, nil
 }
 
+// GetSecret retrieves a Secret from the fake client.
+func (e *TestK8sEnv) GetSecret(ctx context.Context, name, namespace string) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	err := e.Client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, secret)
+	if err != nil {
+		return nil, fmt.Errorf("getting secret %s/%s: %w", namespace, name, err)
+	}
+	return secret, nil
+}
+
 // MockDBClient implements db.Client for testing.
 type MockDBClient struct {
 	PingFunc                    func(ctx context.Context) error
