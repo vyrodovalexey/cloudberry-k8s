@@ -114,7 +114,7 @@ jobs:
           --health-retries 10
           --health-start-period 10s
 
-      keycloak:
+      keycloak_web:
         image: quay.io/keycloak/keycloak:26.5
         command: start-dev
         env:
