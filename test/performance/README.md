@@ -36,6 +36,29 @@ docker pull direvius/yandex-tank
 pip install yandextank
 ```
 
+### Test Data (Scenario 7)
+
+Performance tests that exercise data-dependent endpoints (skew analysis, rebalance, query monitoring under load) require the Scenario 7 test dataset. Load it before running these tests:
+
+```bash
+# From the project root
+bash test/scenarios/scenario7_load_data.sh
+```
+
+This populates the `mydb` database with ~1,450,000 rows (~218 MB) across 5 tables:
+
+| Table | Rows | Distribution |
+|-------|------|-------------|
+| `orders` | 1,000,000 | hash (`customer_id`), Pareto-skewed |
+| `logs` | 200,000 | random |
+| `customers` | 100,000 | hash (`id`) |
+| `audit_log` | 100,000 | hash (`id`), excluded from rebalance |
+| `temp_staging` | 50,000 | hash (`id`), `temp_*` exclusion pattern |
+
+The Pareto skew (80% of orders to 20% of customers) provides a realistic workload for testing rebalance detection and query performance under uneven data distribution. See [docs/user-guide.md](../docs/user-guide.md#test-data-setup) for full details.
+
+> **Note**: Scenario 7 depends on Scenarios 1–6 having been run first (it expects the `mydb` database, `customers` and `orders` tables, and the `analyst` role to exist).
+
 ### Operator Setup
 
 The operator must be running and accessible. The REST API server listens on `:8090` by default (configurable via `CLOUDBERRY_API_ADDRESS` or `--api-address` flag).

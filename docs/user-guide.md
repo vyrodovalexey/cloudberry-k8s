@@ -34,6 +34,11 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Listing Resource Groups](#listing-resource-groups)
   - [Assigning a Role to a Resource Group](#assigning-a-role-to-a-resource-group)
   - [Deleting a Resource Group](#deleting-a-resource-group)
+- [Test Data Setup](#test-data-setup)
+  - [Test Data Schema](#test-data-schema)
+  - [Pareto Skew Pattern](#pareto-skew-pattern)
+  - [Rebalance Exclusion Patterns](#rebalance-exclusion-patterns)
+  - [Loading Test Data](#loading-test-data)
 - [Inspection Commands](#inspection-commands)
 - [Monitoring and Observability](#monitoring-and-observability)
 
@@ -1333,6 +1338,110 @@ DROP RESOURCE GROUP analytics;
 ```
 
 > **Note**: You cannot delete a resource group that has roles assigned to it. Reassign or drop the roles first.
+
+## Test Data Setup
+
+The project includes a data loading scenario (Scenario 7) that populates a realistic test dataset for validating scale, rebalance, and performance operations. The dataset uses the `mydb` database and creates five tables with different distribution strategies, intentional data skew, and exclusion patterns.
+
+### Test Data Schema
+
+| Table | Rows | Approx. Size | Distribution | Description |
+|-------|------|-------------|-------------|-------------|
+| `orders` | 1,000,000 | 101 MB | hash (`customer_id`) | 500K from Scenario 6 + 500K Pareto-skewed |
+| `logs` | 200,000 | 56 MB | random | Application log entries with JSONB metadata |
+| `customers` | 100,000 | 17 MB | hash (`id`) | Pre-existing from Scenario 6 |
+| `audit_log` | 100,000 | 25 MB | hash (`id`) | Excluded from rebalance (`exclude_from_rebalance=true`) |
+| `temp_staging` | 50,000 | 12 MB | hash (`id`) | Matches `temp_*` exclusion pattern |
+
+**Total**: ~1,450,000 rows, ~218 MB, 16 indexes across all tables.
+
+Distribution metadata is stored via `COMMENT ON TABLE`, which encodes the distribution type, key, and exclusion flags. For example:
+
+```sql
+COMMENT ON TABLE orders IS 'distribution=hash, key=customer_id';
+COMMENT ON TABLE logs IS 'distribution=random';
+COMMENT ON TABLE audit_log IS 'distribution=hash, key=id, exclude_from_rebalance=true';
+COMMENT ON TABLE temp_staging IS 'distribution=hash, key=id, temporary_staging=true';
+```
+
+The `analyst` role receives `SELECT` on all tables and `USAGE` on all sequences.
+
+### Pareto Skew Pattern
+
+The `orders` table uses a Pareto (80/20) distribution to create measurable data skew for rebalance testing:
+
+- **80%** of the 500K new orders target the first 20,000 customers (IDs 1–20,000)
+- **20%** of the 500K new orders target the remaining 80,000 customers (IDs 20,001–100,000)
+
+This produces a realistic skew where a small fraction of distribution keys hold a disproportionate share of the data. Use this pattern to verify that:
+
+1. The `inspect skew` command correctly detects uneven data distribution
+2. Rebalance operations redistribute data across segments
+3. Query performance degrades predictably on skewed tables
+
+```sql
+-- Pareto distribution logic (from scenario7_load_data.sql)
+INSERT INTO orders (customer_id, amount, status)
+SELECT
+    CASE WHEN random() < 0.8
+        THEN (random() * 19999 + 1)::int          -- 80% to first 20K customers
+        ELSE (random() * 79999 + 20001)::int       -- 20% to remaining 80K
+    END,
+    (random() * 5000 + 1)::numeric(10,2),
+    CASE (random() * 4)::int
+        WHEN 0 THEN 'pending'
+        WHEN 1 THEN 'completed'
+        WHEN 2 THEN 'shipped'
+        WHEN 3 THEN 'cancelled'
+        ELSE 'returned'
+    END
+FROM generate_series(1, 500000);
+```
+
+### Rebalance Exclusion Patterns
+
+Two tables are configured to be excluded from rebalance operations:
+
+**1. `audit_log` — Explicit exclusion flag**
+
+The `audit_log` table has `exclude_from_rebalance=true` in its distribution comment. Rebalance operations should skip this table entirely, preserving its current data placement. This is useful for compliance or audit tables where data locality must remain stable.
+
+```sql
+COMMENT ON TABLE audit_log IS 'distribution=hash, key=id, exclude_from_rebalance=true';
+```
+
+**2. `temp_staging` — Name pattern exclusion**
+
+The `temp_staging` table matches the `temp_*` wildcard exclusion pattern. Any table whose name starts with `temp_` is automatically excluded from rebalance. This prevents unnecessary data movement for transient staging tables.
+
+```sql
+COMMENT ON TABLE temp_staging IS 'distribution=hash, key=id, temporary_staging=true';
+```
+
+When implementing or testing rebalance logic, verify that:
+- Tables with `exclude_from_rebalance=true` are not moved
+- Tables matching the `temp_*` pattern are not moved
+- Only `orders`, `logs`, and `customers` participate in rebalance
+
+### Loading Test Data
+
+Run the data loading script against a running Cloudberry cluster:
+
+```bash
+# Load test data (uses default namespace and cluster name)
+bash test/scenarios/scenario7_load_data.sh
+
+# Override namespace and cluster name
+NAMESPACE=my-ns CLUSTER=my-cluster bash test/scenarios/scenario7_load_data.sh
+```
+
+The script performs the following steps:
+
+1. Copies `test/scenarios/scenario7_load_data.sql` to the coordinator pod via `kubectl cp`
+2. Executes the SQL via `psql -U gpadmin -d mydb`
+3. Verifies the results by printing table sizes, row counts, index counts, and total database size
+
+> **Prerequisite**: Scenarios 1–6 must have been run first. The script expects the `mydb` database, `customers` table (100K rows), `orders` table (500K rows), and `analyst` role to already exist.
 
 ## Inspection Commands
 

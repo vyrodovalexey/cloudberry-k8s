@@ -264,7 +264,11 @@ cloudberry-k8s/
 │   │   ├── maintenance_test.go
 │   │   ├── scenario5_session_management_test.go
 │   │   ├── scenario6_resource_management_test.go
+│   │   ├── scenario7_load_data_test.go
 │   │   └── webhook_test.go
+│   ├── scenarios/                    # SQL/shell scripts for test scenarios
+│   │   ├── scenario7_load_data.sql   # Test data loading (5 tables, ~1.45M rows)
+│   │   └── scenario7_load_data.sh    # Runner script (kubectl cp + psql)
 │   ├── integration/                  # Integration tests
 │   │   ├── api_integration_test.go
 │   │   ├── auth_flow_test.go
@@ -512,6 +516,51 @@ Tests the resource group management API endpoints (create, list, assign, delete)
 - **Client lifecycle**: Verifies that the database client is closed after each request via `defer dbClient.Close()`
 - **11 test cases** covering all success paths, error paths, and edge cases
 
+#### Scenario 7 — Load Data for Subsequent Scenarios
+
+Prepares a realistic test dataset in the `mydb` database for use by subsequent scenarios (scale, rebalance, performance). The scenario creates tables with different distribution strategies, loads data with intentional skew, and sets up exclusion patterns.
+
+- **SQL script**: `test/scenarios/scenario7_load_data.sql`
+- **Shell runner**: `test/scenarios/scenario7_load_data.sh`
+- **Functional tests**: `test/functional/scenario7_load_data_test.go`
+
+**Data loaded:**
+
+| Table | Rows | Distribution | Notes |
+|-------|------|-------------|-------|
+| `orders` | 1,000,000 | hash (`customer_id`) | 500K existing + 500K Pareto-skewed (80% to 20% of customers) |
+| `logs` | 200,000 | random | Log entries with JSONB metadata |
+| `customers` | 100,000 | hash (`id`) | Pre-existing from Scenario 6 |
+| `audit_log` | 100,000 | hash (`id`) | Marked `exclude_from_rebalance=true` |
+| `temp_staging` | 50,000 | hash (`id`) | Matches `temp_*` exclusion pattern |
+
+**Total**: ~1,450,000 rows, ~218 MB, 16 indexes
+
+**How to run:**
+
+```bash
+# Run the data loading script against a running cluster
+bash test/scenarios/scenario7_load_data.sh
+
+# Override namespace and cluster name
+NAMESPACE=my-ns CLUSTER=my-cluster bash test/scenarios/scenario7_load_data.sh
+```
+
+The shell script copies the SQL file to the coordinator pod via `kubectl cp`, executes it with `psql -U gpadmin -d mydb`, and verifies table sizes, row counts, index counts, and total database size.
+
+**Functional tests (8 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario7_DataSchemaDefinition` | Table references, required columns, and indexes in the SQL script |
+| `TestScenario7_TableDistributionComments` | `COMMENT ON TABLE` metadata for distribution type, key, and exclusion flags |
+| `TestScenario7_ExpectedTableCount` | Exactly 5 tables defined; `ANALYZE` called for each |
+| `TestScenario7_SkewedDataDistribution` | Pareto distribution logic: `random() < 0.8` split, 20K/80K customer targeting |
+| `TestScenario7_SQLScriptStructure` | Database connection (`\c mydb`), `GRANT` statements, `CREATE TABLE IF NOT EXISTS`, index count |
+| `TestScenario7_InsertRowCounts` | `generate_series` counts: 500K orders, 200K logs, 100K audit, 50K staging |
+| `TestScenario7_TempStagingExclusion` | `temporary_staging=true` flag and `temp_` prefix pattern |
+| `TestScenario7_ShellScriptExists` | Shell script structure: shebang, strict mode, `kubectl cp`/`exec`, verification queries |
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -527,6 +576,9 @@ go test ./test/functional/... -v -tags functional -run TestScenario5
 
 # Run resource management functional tests
 go test ./test/functional/... -v -tags functional -run TestScenario6
+
+# Run data loading functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario7
 ```
 
 ### Coverage

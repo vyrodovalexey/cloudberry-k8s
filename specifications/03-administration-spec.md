@@ -74,7 +74,217 @@ The Administration specification covers the operator's capabilities for managing
 2. Start cluster (normal mode)
 3. Update status
 
-### 2.5 Upgrade Cluster
+### 2.5 Scale-Out (Add Segments)
+
+**Trigger**: Increase `spec.segments.count` in the CloudberryCluster CR
+
+**Example**: Scale from 4 to 8 primary segments
+
+```yaml
+spec:
+  segments:
+    count: 8          # was 4
+    mirroring:
+      enabled: true
+      layout: group
+```
+
+**Process**:
+1. Operator detects `spec.segments.count` increased
+2. Set status phase to `Scaling`
+3. Pre-flight checks:
+   - Cluster must be in `Running` phase
+   - Sufficient node capacity for new pods
+   - If mirroring enabled, mirror count must match primary count
+4. Update primary segment StatefulSet replicas from old count to new count
+5. Wait for new primary segment pods to be ready (OrderedReady policy ensures sequential startup)
+6. If mirroring enabled, update mirror segment StatefulSet replicas
+7. Wait for new mirror segment pods to be ready
+8. Run segment expansion (gpexpand equivalent):
+   - Register new segments in `gp_segment_configuration`
+   - Initialize new segment data directories
+   - Redistribute data across all segments (rebalance)
+9. Verify all segments are healthy and data is distributed
+10. Update status: `segmentsReady`, `segmentsTotal`, phase back to `Running`
+11. Record event `ScaleOutCompleted`
+12. Update Prometheus metrics: `cloudberry_segments_total`, `cloudberry_segments_ready`
+
+**Rebalancing After Scale-Out**:
+- Data redistribution runs as a background Job
+- Progress tracked via `status.conditions` with type `DataRedistribution`
+- Condition values: `InProgress`, `Completed`, `Failed`
+- Redistribution can be monitored via:
+  ```bash
+  cloudberry-ctl cluster scale-status --cluster my-cluster
+  ```
+- Tables are redistributed one at a time to minimize impact
+- Redistribution respects resource limits (configurable parallelism)
+
+**Rollback**: If new segments fail health checks, the operator:
+1. Marks failed segments in `status.failedSegments`
+2. Sets condition `ScaleOutFailed` with reason
+3. Does NOT automatically scale back (manual intervention required)
+4. Emits warning event `ScaleOutFailed`
+
+### 2.6 Scale-In (Remove Segments)
+
+**Trigger**: Decrease `spec.segments.count` in the CloudberryCluster CR
+
+**Example**: Scale from 8 to 4 primary segments
+
+```yaml
+spec:
+  segments:
+    count: 4          # was 8
+```
+
+**Process**:
+1. Operator detects `spec.segments.count` decreased
+2. Set status phase to `Scaling`
+3. Pre-flight checks:
+   - Cluster must be in `Running` phase
+   - New segment count must be >= 1
+   - Sufficient capacity on remaining segments for redistributed data
+4. Run data redistribution to move data OFF segments being removed:
+   - Redistribute all tables to use only the first N segments
+   - This is a potentially long-running operation tracked via Job
+5. Wait for redistribution to complete
+6. Verify no data remains on segments being removed
+7. Deregister removed segments from `gp_segment_configuration`
+8. If mirroring enabled, scale down mirror StatefulSet first
+9. Scale down primary segment StatefulSet
+10. Handle PVCs based on `deletionPolicy`:
+    - `Retain`: PVCs for removed segments are kept (can be manually cleaned)
+    - `Delete`: PVCs for removed segments are deleted
+11. Update status: `segmentsReady`, `segmentsTotal`, phase back to `Running`
+12. Record event `ScaleInCompleted`
+
+**Safety Constraints**:
+- Scale-in is blocked if redistribution would exceed available disk space
+- Scale-in is blocked during active backup or recovery operations
+- Minimum segment count is 1
+- Scale-in by more than 50% of current count requires explicit confirmation annotation:
+  ```yaml
+  annotations:
+    avsoft.io/confirm-scale-in: "true"
+  ```
+
+**Rebalancing During Scale-In**:
+- Data must be fully redistributed BEFORE segments are removed
+- Redistribution progress tracked via `status.conditions` type `DataRedistribution`
+- If redistribution fails, scale-in is aborted and cluster remains at current size
+- Failed redistribution emits event `ScaleInRedistributionFailed`
+
+### 2.7 Segment Rebalancing
+
+**Trigger**: CR annotation `avsoft.io/action: rebalance` or automatic after scale operations
+
+**Purpose**: Redistribute data evenly across all segments to eliminate skew
+
+**Process**:
+1. Analyze current data distribution using `gp_toolkit.gp_skew_coefficients`
+2. Identify tables with significant skew (above configurable threshold)
+3. Create a redistribution plan
+4. Execute redistribution as a background Job:
+   - `ALTER TABLE ... SET DISTRIBUTED BY (...)` for hash-distributed tables
+   - `ALTER TABLE ... SET DISTRIBUTED RANDOMLY` for randomly distributed tables
+5. Track progress via status condition `DataRedistribution`
+6. Verify distribution after completion
+7. Update metrics: `cloudberry_data_skew_coefficient`
+
+**Configuration**:
+```yaml
+spec:
+  segments:
+    rebalance:
+      skewThreshold: 10        # percentage skew to trigger rebalance
+      parallelism: 2           # number of tables to redistribute concurrently
+      excludeTables:            # tables to skip during rebalance
+        - "audit_log"
+        - "temp_*"
+```
+
+**CLI**:
+```bash
+# Trigger manual rebalance
+cloudberry-ctl ha rebalance --cluster my-cluster
+
+# Check rebalance status
+cloudberry-ctl ha rebalance --cluster my-cluster --status
+
+# Rebalance specific tables
+cloudberry-ctl ha rebalance --cluster my-cluster --tables public.orders,public.customers
+```
+
+### 2.8 Extend Persistent Volumes
+
+**Trigger**: Increase `spec.coordinator.storage.size`, `spec.standby.storage.size`, or `spec.segments.storage.size` in the CloudberryCluster CR
+
+**Example**: Extend coordinator storage from 5Gi to 20Gi
+
+```yaml
+spec:
+  coordinator:
+    storage:
+      size: "20Gi"    # was "5Gi"
+```
+
+**Process**:
+1. Operator detects storage size increase in the CR spec
+2. Pre-flight checks:
+   - StorageClass must support volume expansion (`allowVolumeExpansion: true`)
+   - New size must be greater than current size (shrinking is not supported)
+   - Cluster should be in `Running` or `Stopped` phase
+3. For each affected PVC:
+   a. Patch the PVC `spec.resources.requests.storage` to the new size
+   b. Wait for the PVC to report the new capacity in `status.capacity.storage`
+   c. Some StorageClasses require a pod restart for the filesystem to be resized
+4. If pod restart is required:
+   - Perform rolling restart of affected StatefulSet (same order as config rolling restart)
+   - Mirrors first, then primaries, then standby, then coordinator
+5. Verify filesystem size inside pods matches the new PVC size
+6. Update status condition `StorageExpanded` with details
+7. Record event `StorageExpanded`
+
+**Scope of Expansion**:
+
+| Field | Affects |
+|-------|---------|
+| `spec.coordinator.storage.size` | Coordinator PVC |
+| `spec.standby.storage.size` | Standby coordinator PVC |
+| `spec.segments.storage.size` | ALL primary segment PVCs AND all mirror segment PVCs |
+
+**Constraints**:
+- Volume shrinking is NOT supported (Kubernetes limitation)
+- The StorageClass must have `allowVolumeExpansion: true`
+- Some cloud providers require the pod to be restarted for online expansion
+- Expansion of segment storage applies to ALL segments uniformly (individual segment expansion is not supported)
+
+**Monitoring**:
+- `cloudberry_disk_usage_bytes` metric tracks actual usage
+- `cloudberry_disk_usage_percent` metric tracks usage percentage
+- Alerts can be configured on usage percentage to trigger proactive expansion
+
+**CLI**:
+```bash
+# Check current storage usage
+cloudberry-ctl inspect disk-usage --cluster my-cluster
+
+# View PVC sizes
+cloudberry-ctl storage disk-usage --cluster my-cluster
+```
+
+**Example: Extend all segment storage**:
+```yaml
+spec:
+  segments:
+    storage:
+      size: "50Gi"    # was "20Gi"
+```
+
+This patches all segment PVCs (both primary and mirror) to 50Gi.
+
+### 2.9 Upgrade Cluster
 
 **Trigger**: Change to `spec.version` or `spec.image`
 
@@ -90,7 +300,7 @@ The Administration specification covers the operator's capabilities for managing
 
 **Rollback**: If any step fails health check, revert to previous image
 
-### 2.6 Remove Cluster
+### 2.10 Remove Cluster
 
 **Trigger**: CloudberryCluster CR deletion
 
@@ -184,6 +394,8 @@ The operator continuously monitors and reports:
 | Segment readiness | Pod health + segment status | `status.segmentsReady` |
 | Mirroring status | gp_segment_configuration | `status.mirroringStatus` |
 | Failed segments | gp_segment_configuration | `status.failedSegments` |
+| Data redistribution | gpexpand / redistribution Job | `status.conditions[DataRedistribution]` |
+| Storage expansion | PVC status | `status.conditions[StorageExpanded]` |
 
 ### 4.2 Prometheus Metrics
 
@@ -203,6 +415,11 @@ The operator continuously monitors and reports:
 | `cloudberry_connections_active` | Gauge | Active database connections |
 | `cloudberry_connections_max` | Gauge | Maximum allowed connections |
 | `cloudberry_disk_usage_bytes` | Gauge | Disk usage per database |
+| `cloudberry_disk_usage_percent` | Gauge | Disk usage percentage |
+| `cloudberry_data_skew_coefficient` | Gauge | Data distribution skew coefficient |
+| `cloudberry_scale_operations_total` | Counter | Total scale-out/scale-in operations |
+| `cloudberry_redistribution_progress` | Gauge | Data redistribution progress (0-100%) |
+| `cloudberry_pvc_size_bytes` | Gauge | PVC requested size per component |
 
 ### 4.3 Structured Logging
 

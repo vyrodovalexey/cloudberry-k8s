@@ -491,6 +491,15 @@ make test-e2e
 make test-all
 ```
 
+**Test Data Loading** (prerequisite for scale/rebalance/performance tests):
+
+```bash
+# Load Scenario 7 test data (~1.45M rows, ~218 MB across 5 tables)
+bash test/scenarios/scenario7_load_data.sh
+```
+
+Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
+
 The project targets **90%+ unit test statement coverage**. Key packages: `internal/db` at 92.9%, `internal/vault` at 99.1%. See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Documentation
