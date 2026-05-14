@@ -73,6 +73,8 @@ type Client interface {
 	DropResourceGroup(ctx context.Context, name string) error
 	// ListResourceGroups returns all resource groups.
 	ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo, error)
+	// AssignRoleResourceGroup assigns a role to a resource group.
+	AssignRoleResourceGroup(ctx context.Context, role, group string) error
 	// CreateBackup creates a new backup.
 	CreateBackup(ctx context.Context, opts BackupOptions) (*BackupInfo, error)
 	// RestoreBackup restores from a backup.
@@ -553,11 +555,13 @@ func (c *pgxClient) ReloadConfig(ctx context.Context) error {
 
 // ListSessions returns active database sessions.
 func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
-	query := `SELECT pid, usename, application_name, client_addr, state, 
+	query := `SELECT pid, COALESCE(usename, ''), COALESCE(application_name, ''), 
+		COALESCE(client_addr::text, ''), COALESCE(state, ''), 
 		COALESCE(query, ''), COALESCE(query_start, now()),
 		COALESCE(now() - query_start, interval '0')::text
 		FROM pg_stat_activity 
 		WHERE pid != pg_backend_pid()
+		AND usename IS NOT NULL
 		ORDER BY query_start DESC NULLS LAST`
 
 	rows, err := c.pool.Query(ctx, query)
@@ -569,15 +573,11 @@ func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var s Session
-		var clientAddr *string
 		if err := rows.Scan(
-			&s.PID, &s.Username, &s.Application, &clientAddr,
+			&s.PID, &s.Username, &s.Application, &s.ClientAddress,
 			&s.State, &s.Query, &s.QueryStart, &s.Duration,
 		); err != nil {
 			return nil, fmt.Errorf("scanning session row: %w", err)
-		}
-		if clientAddr != nil {
-			s.ClientAddress = *clientAddr
 		}
 		sessions = append(sessions, s)
 	}
@@ -858,6 +858,17 @@ func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo
 	}
 
 	return groups, nil
+}
+
+// AssignRoleResourceGroup assigns a role to a resource group.
+func (c *pgxClient) AssignRoleResourceGroup(ctx context.Context, role, group string) error {
+	sql := fmt.Sprintf("ALTER ROLE %s RESOURCE GROUP %s",
+		pgx.Identifier{role}.Sanitize(), pgx.Identifier{group}.Sanitize())
+	if _, err := c.pool.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("assigning role %s to resource group %s: %w", role, group, err)
+	}
+	c.logger.Info("role assigned to resource group", "role", role, "group", group)
+	return nil
 }
 
 // CreateBackup creates a new backup.

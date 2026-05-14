@@ -32,7 +32,7 @@ func newTestServer(clusters ...*cbv1alpha1.CloudberryCluster) *Server {
 		objs = append(objs, c)
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, &metrics.NoopRecorder{}, nil)
+	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil)
 }
 
 func newTestCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
@@ -249,26 +249,50 @@ func TestHandleGetMirroring(t *testing.T) {
 }
 
 func TestHandleListSessions(t *testing.T) {
-	s := newTestServer()
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
 
-	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test/sessions", nil)
-	req.SetPathValue("name", "test")
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/sessions?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
 	rec := httptest.NewRecorder()
 	s.handleListSessions(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	// Without dbFactory, should return empty sessions with message.
+	assert.Equal(t, float64(0), resp["total"])
+	assert.Equal(t, "database connection not available", resp["message"])
+}
+
+func TestHandleListSessions_NotFound(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/nonexistent/sessions?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListSessions(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestHandleCancelQuery(t *testing.T) {
-	t.Run("valid pid", func(t *testing.T) {
-		s := newTestServer()
-		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test/sessions/123/cancel", nil)
-		req.SetPathValue("name", "test")
+	t.Run("valid pid no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("pid", "123")
 		rec := httptest.NewRecorder()
 		s.handleCancelQuery(rec, req)
 
 		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["canceled"])
+		assert.Equal(t, "database connection not available", resp["message"])
 	})
 
 	t.Run("invalid pid", func(t *testing.T) {
@@ -281,18 +305,45 @@ func TestHandleCancelQuery(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
+
+	t.Run("zero pid", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test/sessions/0/cancel", nil)
+		req.SetPathValue("name", "test")
+		req.SetPathValue("pid", "0")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/nonexistent/sessions/123/cancel?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("pid", "123")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
 }
 
 func TestHandleTerminateSession(t *testing.T) {
-	t.Run("valid pid", func(t *testing.T) {
-		s := newTestServer()
-		req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/test/sessions/456", nil)
-		req.SetPathValue("name", "test")
+	t.Run("valid pid no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/test-cluster/sessions/456?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("pid", "456")
 		rec := httptest.NewRecorder()
 		s.handleTerminateSession(rec, req)
 
 		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["terminated"])
+		assert.Equal(t, "database connection not available", resp["message"])
 	})
 
 	t.Run("invalid pid", func(t *testing.T) {
@@ -304,6 +355,28 @@ func TestHandleTerminateSession(t *testing.T) {
 		s.handleTerminateSession(rec, req)
 
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("negative pid", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/test/sessions/-1", nil)
+		req.SetPathValue("name", "test")
+		req.SetPathValue("pid", "-1")
+		rec := httptest.NewRecorder()
+		s.handleTerminateSession(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/nonexistent/sessions/456?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("pid", "456")
+		rec := httptest.NewRecorder()
+		s.handleTerminateSession(rec, req)
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 }
 
@@ -1013,6 +1086,149 @@ func TestHandleGetWorkload(t *testing.T) {
 		rec := httptest.NewRecorder()
 		s.handleGetWorkload(rec, req)
 		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestHandleCreateResourceGroup(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"name": "test"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/nonexistent/workload/resource-groups?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "nonexistent")
+		rec := httptest.NewRecorder()
+		s.handleCreateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+			bytes.NewReader([]byte("invalid")))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("empty name", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"name": ""})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"name": "analytics", "concurrency": 10})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusCreated, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "analytics", resp["name"])
+		assert.Contains(t, resp["message"], "pending")
+	})
+}
+
+func TestHandleDeleteResourceGroup(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/nonexistent/workload/resource-groups/analytics?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleDeleteResourceGroup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleDeleteResourceGroup(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "pending", resp["status"])
+	})
+}
+
+func TestHandleAssignResourceGroup(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"role": "analyst"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/nonexistent/workload/resource-groups/analytics/assign?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleAssignResourceGroup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics/assign?namespace=default",
+			bytes.NewReader([]byte("invalid")))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleAssignResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("empty role", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"role": ""})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics/assign?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleAssignResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"role": "analyst"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics/assign?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleAssignResourceGroup(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "pending", resp["status"])
 	})
 }
 

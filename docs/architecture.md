@@ -189,7 +189,7 @@ CloudberryCluster
 │   ├── telemetry            # OTLP tracing config
 │   └── deletionPolicy       # Retain or Delete PVCs
 └── status
-    ├── phase                # Pending/Initializing/Running/Failed/Deleting
+    ├── phase                # Pending/Initializing/Running/Stopping/Stopped/Restricted/Maintenance/Failed/Deleting
     ├── coordinatorReady     # Coordinator health
     ├── standbyReady         # Standby health
     ├── segmentsReady        # Ready segment count
@@ -198,6 +198,22 @@ CloudberryCluster
     ├── conditions           # Standard Kubernetes conditions
     └── failedSegments       # List of failed segments
 ```
+
+### Status Phases
+
+| Phase | Description |
+|-------|-------------|
+| `Pending` | Cluster resource created, waiting for initialization |
+| `Initializing` | StatefulSets and Services are being created |
+| `Running` | All components are running and healthy |
+| `Updating` | Cluster spec changed, resources are being updated |
+| `Scaling` | Segment count is being changed |
+| `Stopping` | Cluster is shutting down (scale-down in progress) |
+| `Stopped` | All pods are scaled to zero |
+| `Restricted` | Coordinator only, superuser connections only |
+| `Maintenance` | Coordinator only, utility mode |
+| `Failed` | An error occurred during reconciliation |
+| `Deleting` | Cluster is being deleted |
 
 ### Status Conditions
 
@@ -209,7 +225,7 @@ CloudberryCluster
 | `SegmentsReady` | All segment pods are running |
 | `MirroringHealthy` | All mirrors are in sync |
 | `AuthConfigured` | Authentication is properly configured |
-| `ConfigApplied` | All configuration parameters are applied |
+| `ConfigApplied` | All configuration parameters are applied. Reason values: `ConfigReloaded`, `RestartRequired`, `ConfigAppliedAfterRestart` |
 | `VaultConnected` | Vault connection is established (if enabled) |
 
 ### Printer Columns
@@ -268,11 +284,20 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 **Key behaviors:**
 - Uses a **finalizer** (`avsoft.io/finalizer`) to ensure cleanup before deletion
 - Supports **annotation-based actions** for start, stop, restart operations
+- Checks **action annotations before generation skip** — annotations don't change the CRD generation, so they must be processed before the `ObservedGeneration` check
+- Handles **lifecycle phases** (`Stopped`, `Stopping`, `Restricted`, `Maintenance`) that short-circuit normal reconciliation when no action annotation is pending
 - Implements **create-or-update** pattern for idempotent resource management
-- **Requeues** every 30 seconds for periodic health checks (10 seconds on error)
-- Emits **Kubernetes events** for state transitions
-- Records **Prometheus metrics** for reconciliation duration and results
+- **Requeues** every 30 seconds for periodic health checks (10 seconds on error, 5 seconds during stopping)
+- Emits **Kubernetes events** for state transitions (Stopping, Stopped, Starting, Started, Restarting, Restarted)
+- Records **Prometheus metrics** for reconciliation duration and results via `recordMetricsSnapshot()`
 - Uses **`Status().Patch()` with MergePatch** for all status updates (see [Status Update Pattern](#status-update-pattern) below)
+
+**Stop/Start/Restart lifecycle:**
+- **Stop** (`stop`, `stop-fast`, `stop-immediate`): Scales down StatefulSets in order: mirrors → primaries → standby → coordinator. Uses `scaleStatefulSet()` to set replicas to 0. Phase: `Running` → `Stopping` → `Stopped`.
+- **Start** (`start`, `start-restricted`, `start-maintenance`): For normal start, triggers full reconciliation to restore all StatefulSets. For restricted/maintenance, scales up only the coordinator. Phase: `Stopped` → `Initializing`/`Restricted`/`Maintenance` → `Running`.
+- **Restart** (`restart`): Performs a stop followed by a start. Phase: `Running` → `Stopping` → `Initializing` → `Running`.
+
+All metrics are registered with `ctrlmetrics.Registry` (controller-runtime's metrics registry) to ensure they are exposed on the `/metrics` endpoint.
 
 ### HA Controller
 
@@ -340,15 +365,22 @@ Manages authentication configuration:
 
 ### Admin Controller
 
-Manages configuration and maintenance:
+Manages configuration, rolling restarts, and maintenance:
 
 1. Detects parameter changes via hash comparison
-2. Determines if parameters require restart or can be reloaded
-3. Applies parameters at cluster, coordinator, database, and role levels
-4. Creates Kubernetes Jobs for maintenance operations (vacuum, analyze, reindex)
-5. Monitors Job completion and cleans up finished Jobs
-6. Performs a single consolidated status update per reconciliation cycle to reduce API server load
-7. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
+2. Classifies changed parameters using `restartRequiredParams` map (shared_buffers, max_connections, wal_level, etc.)
+3. **Reload-safe changes**: Updates ConfigMap, sets `ConfigApplied=True/ConfigReloaded`, emits `ConfigReloaded` event, increments `cloudberry_config_reload_total`
+4. **Restart-required changes**: Updates ConfigMap, triggers rolling restart via `triggerRollingRestart()`, sets `ConfigApplied=False/RestartRequired`
+5. **Rolling restart state machine**: Tracked via `avsoft.io/rolling-restart` annotation with JSON state (`phase`, `startedAt`, `restartParams`). Phases: mirrors → primaries → standby → coordinator → completed. Uses `continueRollingRestart()` and `restartStatefulSet()` to progress through phases.
+6. Creates Kubernetes `batchv1.Job` resources for maintenance operations via `BuildMaintenanceJob()`:
+   - Supported operations: `vacuum`, `vacuum-analyze`, `vacuum-full`, `analyze`, `reindex`
+   - Job properties: `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`, `RestartPolicy=Never`
+   - `PGPASSWORD` sourced from admin password Secret
+   - Unknown operations emit `MaintenanceUnknown` warning event
+   - Emits `MaintenanceStarted` event with job name
+7. Monitors Job completion and cleans up finished Jobs
+8. Performs a single consolidated status update per reconciliation cycle to reduce API server load
+9. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
 
 ## Authentication Architecture
 
@@ -493,12 +525,13 @@ Recovery operations run as Kubernetes Jobs with configurable backoff and timeout
 
 ### Metrics (Prometheus)
 
-The operator exposes metrics at the `/metrics` endpoint:
+The operator exposes metrics at the `/metrics` endpoint. All custom metrics are registered with `ctrlmetrics.Registry` (controller-runtime's built-in Prometheus registry), which ensures they are served alongside standard controller-runtime metrics on the same `/metrics` endpoint.
 
 - **Cluster metrics**: `cloudberry_cluster_info`, `cloudberry_coordinator_up`, `cloudberry_standby_up`
 - **Segment metrics**: `cloudberry_segments_ready`, `cloudberry_segments_total`, `cloudberry_segments_failed`
 - **Mirroring metrics**: `cloudberry_mirroring_in_sync`
 - **Reconciliation metrics**: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds`
+- **Configuration metrics**: `cloudberry_config_reload_total`
 - **FTS metrics**: `cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`, `cloudberry_replication_lag_bytes`
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
 
@@ -592,7 +625,7 @@ The API server starts in a background goroutine from the operator `main()` funct
 
 ## DBClientFactory Pattern
 
-The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating database connections for each managed cluster. Controllers do not create database clients directly; instead, they use the factory.
+The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating database connections for each managed cluster. Both controllers and the API server use the factory instead of creating database clients directly.
 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
@@ -600,7 +633,10 @@ The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating 
 │  (HA, Admin)     │     │                   │     │   (pgx)          │
 └──────────────────┘     └────────┬──────────┘     └──────────────────┘
                                   │
-                         ┌────────▼──────────┐
+┌──────────────────┐              │
+│   API Server     │──────────────┘
+│  (Sessions)      │
+└──────────────────┘     ┌───────────────────┐
                          │  Resolves:         │
                          │  - Coordinator     │
                          │    service host    │
@@ -617,6 +653,48 @@ The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating 
 - Resolves the coordinator service endpoint as `{cluster}-coordinator.{namespace}.svc`
 - Configures retry options with exponential backoff
 - Returns a `Client` interface for testability
+
+### API Server Integration
+
+The API server receives a `DBClientFactory` at startup (injected from `cmd/operator/main.go`). The factory is used by session management handlers to create short-lived database connections:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
+│  HTTP Client │────▶│  API Server  │────▶│  DBClientFactory  │────▶│  PostgreSQL  │
+│  (ctl/curl)  │     │  (handler)   │     │                   │     │  Coordinator │
+└──────────────┘     └──────┬───────┘     └───────────────────┘     └──────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │  Session Flow:   │
+                   │  1. Resolve      │
+                   │     cluster CR   │
+                   │  2. Create DB    │
+                   │     client       │
+                   │  3. Execute SQL  │
+                   │     (pg_stat_    │
+                   │      activity,   │
+                   │      pg_cancel/  │
+                   │      terminate_  │
+                   │      backend)    │
+                   │  4. Close client │
+                   └─────────────────┘
+```
+
+**Session operation flow:**
+
+1. The API handler receives a request (e.g., `GET /clusters/{name}/sessions`)
+2. The handler resolves the `CloudberryCluster` CR from the Kubernetes API
+3. If no `DBClientFactory` is configured, the handler returns a graceful degradation response (empty sessions with a `"database connection not available"` message)
+4. The handler calls `dbFactory.NewClient()` to create a short-lived database connection to the cluster's coordinator
+5. If the connection fails, the handler returns `503 DB_UNAVAILABLE`
+6. The handler executes the database operation:
+   - **List sessions**: Queries `pg_stat_activity` for active sessions
+   - **Cancel query**: Calls `pg_cancel_backend(pid)` to cancel a running query
+   - **Terminate session**: Calls `pg_terminate_backend(pid)` to terminate a session
+7. The database client is closed via `defer dbClient.Close()`
+8. The handler returns the result as JSON
+
+The `DBClientFactory` interface is defined in both `internal/controller/ha_controller.go` (for controllers) and `internal/api/server.go` (for the API server). Both interfaces have the same signature, and the concrete implementation in `internal/db/factory.go` satisfies both.
 
 ## Status Update Pattern
 

@@ -293,6 +293,7 @@ func (m *mockDBClient) DropResourceGroup(_ context.Context, _ string) error { re
 func (m *mockDBClient) ListResourceGroups(_ context.Context) ([]ResourceGroupInfo, error) {
 	return []ResourceGroupInfo{}, nil
 }
+func (m *mockDBClient) AssignRoleResourceGroup(_ context.Context, _, _ string) error { return nil }
 func (m *mockDBClient) CreateBackup(_ context.Context, opts BackupOptions) (*BackupInfo, error) {
 	return &BackupInfo{ID: "test-backup", Type: opts.Type, Status: "InProgress"}, nil
 }
@@ -483,6 +484,11 @@ func TestMockDBClient_AllMethods(t *testing.T) {
 		groups, err := client.ListResourceGroups(ctx)
 		assert.NoError(t, err)
 		assert.NotNil(t, groups)
+	})
+
+	t.Run("AssignRoleResourceGroup", func(t *testing.T) {
+		err := client.AssignRoleResourceGroup(ctx, "analyst", "analytics")
+		assert.NoError(t, err)
 	})
 
 	t.Run("CreateBackup", func(t *testing.T) {

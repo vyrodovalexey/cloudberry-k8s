@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,7 +35,28 @@ const (
 	portName = "postgresql"
 
 	hbaTargetAll = "all"
+
+	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
+	secretKeyPassword = "password"
+
+	// maintenanceContainerName is the container name for maintenance jobs.
+	maintenanceContainerName = "maintenance"
+
+	// maintenanceJobTTL is the TTL in seconds after a maintenance job finishes.
+	maintenanceJobTTL int32 = 3600
+
+	// maintenanceJobBackoffLimit is the number of retries for a maintenance job.
+	maintenanceJobBackoffLimit int32 = 1
 )
+
+// maintenanceSQL maps maintenance operation types to their SQL commands.
+var maintenanceSQL = map[string]string{
+	util.MaintenanceVacuum:        "VACUUM",
+	util.MaintenanceVacuumAnalyze: "VACUUM ANALYZE",
+	util.MaintenanceVacuumFull:    "VACUUM FULL",
+	util.MaintenanceAnalyze:       "ANALYZE",
+	util.MaintenanceReindex:       "REINDEX DATABASE postgres",
+}
 
 // resolvePort returns the coordinator port from the cluster spec,
 // falling back to the default port if not specified.
@@ -69,6 +91,8 @@ type ResourceBuilder interface {
 	BuildPgHBAConfConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
 	// BuildAdminPasswordSecret builds the admin password Secret.
 	BuildAdminPasswordSecret(cluster *cbv1alpha1.CloudberryCluster, password string) *corev1.Secret
+	// BuildMaintenanceJob builds a Kubernetes Job for a maintenance operation.
+	BuildMaintenanceJob(cluster *cbv1alpha1.CloudberryCluster, operation, timestamp string) *batchv1.Job
 }
 
 // DefaultBuilder implements ResourceBuilder.
@@ -513,7 +537,76 @@ func (b *DefaultBuilder) BuildAdminPasswordSecret(
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			"password": []byte(password),
+			secretKeyPassword: []byte(password),
+		},
+	}
+}
+
+// BuildMaintenanceJob builds a Kubernetes Job for a maintenance operation.
+// The operation parameter must be one of the maintenance constants defined in util.
+func (b *DefaultBuilder) BuildMaintenanceJob(
+	cluster *cbv1alpha1.CloudberryCluster,
+	operation, timestamp string,
+) *batchv1.Job {
+	labels := util.CommonLabels(cluster.Name, util.ComponentCoordinator)
+	labels[util.LabelOperation] = operation
+
+	sql, ok := maintenanceSQL[operation]
+	if !ok {
+		slog.Error("unknown maintenance operation", "operation", operation, "cluster", cluster.Name)
+		return nil
+	}
+
+	coordinatorSvc := util.CoordinatorServiceName(cluster.Name)
+	backoffLimit := maintenanceJobBackoffLimit
+	ttl := maintenanceJobTTL
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.MaintenanceJobName(cluster.Name, operation, timestamp),
+			Namespace: cluster.Namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				ownerRef(cluster),
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttl,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:  maintenanceContainerName,
+							Image: cluster.Spec.Image,
+							Command: []string{
+								"psql",
+								"-h", coordinatorSvc,
+								"-U", util.DefaultAdminUser,
+								"-d", "postgres",
+								"-c", sql,
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name: "PGPASSWORD",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: util.AdminPasswordSecretName(cluster.Name),
+											},
+											Key: secretKeyPassword,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -576,7 +669,7 @@ func buildMainContainer(
 						LocalObjectReference: corev1.LocalObjectReference{
 							Name: util.AdminPasswordSecretName(cluster.Name),
 						},
-						Key: "password",
+						Key: secretKeyPassword,
 					},
 				},
 			},

@@ -15,6 +15,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
@@ -31,6 +32,16 @@ const (
 	responseKeyTotal   = "total"
 	responseKeyJob     = "job"
 	responseKeyCluster = "cluster"
+	responseKeyPID     = "pid"
+	responseKeyMessage = "message"
+
+	// msgDBNotAvailable is the message returned when the database factory is not configured.
+	msgDBNotAvailable = "database connection not available"
+
+	responseKeyGroup = "group"
+	responseKeyName  = "name"
+
+	statusDeleted = "deleted"
 )
 
 // dns1123SubdomainRegex validates DNS-1123 subdomain names used for cluster and namespace names.
@@ -51,11 +62,18 @@ func limitBody(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 }
 
+// DBClientFactory creates database clients for cluster operations.
+type DBClientFactory interface {
+	// NewClient creates a new database client for the given cluster.
+	NewClient(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) (db.Client, error)
+}
+
 // Server is the REST API server for the cloudberry operator.
 type Server struct {
 	k8sClient   client.Client
 	authMW      *auth.AuthMiddleware
 	rateLimiter *RateLimiter
+	dbFactory   DBClientFactory
 	metrics     metrics.Recorder
 	logger      *slog.Logger
 	mux         *http.ServeMux
@@ -65,6 +83,7 @@ type Server struct {
 func NewServer(
 	k8sClient client.Client,
 	authMW *auth.AuthMiddleware,
+	dbFactory DBClientFactory,
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 ) *Server {
@@ -76,6 +95,7 @@ func NewServer(
 		k8sClient:   k8sClient,
 		authMW:      authMW,
 		rateLimiter: NewRateLimiter(defaultRateLimit, defaultRateInterval, logger),
+		dbFactory:   dbFactory,
 		metrics:     metricsRecorder,
 		logger:      logger.With("component", "api-server"),
 		mux:         http.NewServeMux(),
@@ -166,6 +186,14 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceGroups)))
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/rules",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListWorkloadRules)))
+
+	// Resource group management.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceGroup)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceGroup)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}/assign",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleAssignResourceGroup)))
 
 	// Query monitoring.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
@@ -296,9 +324,9 @@ func (s *Server) handleGetClusterStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"name":      cluster.Name,
-		"namespace": cluster.Namespace,
-		"status":    cluster.Status,
+		responseKeyName: cluster.Name,
+		"namespace":     cluster.Namespace,
+		"status":        cluster.Status,
 	})
 }
 
@@ -440,16 +468,55 @@ func (s *Server) handleGetMirroring(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleListSessions lists active sessions.
-func (s *Server) handleListSessions(w http.ResponseWriter, _ *http.Request) {
-	// Sessions require a DB connection; return placeholder.
+// handleListSessions lists active sessions by querying pg_stat_activity
+// through a short-lived database connection created via the DBClientFactory.
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("session list requested but database factory not available",
+			"cluster", cluster.Name)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"sessions":         []interface{}{},
+			responseKeyTotal:   0,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
+	if err != nil {
+		s.logger.Error("failed to create database client for session listing",
+			"cluster", cluster.Name, "error", err)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	sessions, err := dbClient.ListSessions(r.Context())
+	if err != nil {
+		s.logger.Error("failed to list sessions",
+			"cluster", cluster.Name, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to list sessions")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"sessions":       []interface{}{},
-		responseKeyTotal: 0,
+		"sessions":       sessions,
+		responseKeyTotal: len(sessions),
 	})
 }
 
-// handleCancelQuery cancels a running query.
+// handleCancelQuery cancels a running query by calling pg_cancel_backend
+// through a short-lived database connection created via the DBClientFactory.
 func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	pidStr := r.PathValue("pid")
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
@@ -461,13 +528,55 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
 		return
 	}
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("cancel query requested but database factory not available",
+			"cluster", cluster.Name, responseKeyPID, pid)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyPID:     pid,
+			"canceled":         false,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
+	if err != nil {
+		s.logger.Error("failed to create database client for cancel query",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	result, err := dbClient.CancelQuery(r.Context(), int32(pid))
+	if err != nil {
+		s.logger.Error("failed to cancel query",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to cancel query")
+		return
+	}
+
+	s.logger.Info("query cancel requested",
+		"cluster", cluster.Name, responseKeyPID, pid, "canceled", result)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pid":      pid,
-		"canceled": true,
+		responseKeyPID: pid,
+		"canceled":     result,
 	})
 }
 
-// handleTerminateSession terminates a session.
+// handleTerminateSession terminates a session by calling pg_terminate_backend
+// through a short-lived database connection created via the DBClientFactory.
 func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) {
 	pidStr := r.PathValue("pid")
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
@@ -479,9 +588,50 @@ func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) 
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
 		return
 	}
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("terminate session requested but database factory not available",
+			"cluster", cluster.Name, responseKeyPID, pid)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyPID:     pid,
+			"terminated":       false,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
+	if err != nil {
+		s.logger.Error("failed to create database client for terminate session",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	result, err := dbClient.TerminateSession(r.Context(), int32(pid))
+	if err != nil {
+		s.logger.Error("failed to terminate session",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to terminate session")
+		return
+	}
+
+	s.logger.Info("session terminate requested",
+		"cluster", cluster.Name, responseKeyPID, pid, "terminated", result)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pid":        pid,
-		"terminated": true,
+		responseKeyPID: pid,
+		"terminated":   result,
 	})
 }
 
@@ -580,7 +730,9 @@ func (s *Server) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cluster.Spec.Workload)
 }
 
-// handleListResourceGroups lists resource groups.
+// handleListResourceGroups lists resource groups. When a database connection is
+// available via dbFactory, groups are queried from gp_toolkit.gp_resgroup_status.
+// Otherwise, the CRD spec is used as a fallback.
 func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -590,6 +742,28 @@ func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Try to list from the database when dbFactory is available.
+	if s.dbFactory != nil {
+		dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+		if dbErr == nil {
+			defer dbClient.Close()
+			dbGroups, listErr := dbClient.ListResourceGroups(r.Context())
+			if listErr == nil {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"resourceGroups": dbGroups,
+					responseKeyTotal: len(dbGroups),
+				})
+				return
+			}
+			s.logger.Warn("failed to list resource groups from database, falling back to CRD spec",
+				"cluster", cluster.Name, "error", listErr)
+		} else {
+			s.logger.Warn("failed to create database client for resource group listing, falling back to CRD spec",
+				"cluster", cluster.Name, "error", dbErr)
+		}
+	}
+
+	// Fallback: read from CRD spec.
 	var groups []interface{}
 	if cluster.Spec.Workload != nil {
 		for i := range cluster.Spec.Workload.ResourceGroups {
@@ -600,6 +774,199 @@ func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"resourceGroups": groups,
 		responseKeyTotal: len(groups),
+	})
+}
+
+// handleCreateResourceGroup creates a new resource group in the database.
+func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var req struct {
+		Name          string `json:"name"`
+		Concurrency   int32  `json:"concurrency"`
+		CPUMaxPercent int32  `json:"cpuMaxPercent"`
+		MemoryLimit   int32  `json:"memoryLimit"`
+	}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if req.Name == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource group name is required")
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("create resource group requested but database factory not available",
+			"cluster", cluster.Name, "group", req.Name)
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			responseKeyName:    req.Name,
+			"concurrency":      req.Concurrency,
+			"cpuMaxPercent":    req.CPUMaxPercent,
+			"memoryLimit":      req.MemoryLimit,
+			responseKeyMessage: "resource group creation pending; database connection not available",
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource group creation",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	opts := db.ResourceGroupOptions{
+		Name:          req.Name,
+		Concurrency:   req.Concurrency,
+		CPUMaxPercent: req.CPUMaxPercent,
+		MemoryLimit:   req.MemoryLimit,
+	}
+	if createErr := dbClient.CreateResourceGroup(r.Context(), opts); createErr != nil {
+		s.logger.Error("failed to create resource group",
+			"cluster", cluster.Name, "group", req.Name, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to create resource group")
+		return
+	}
+
+	s.logger.Info("resource group created",
+		"cluster", cluster.Name, "group", req.Name)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		responseKeyName:   req.Name,
+		"concurrency":     req.Concurrency,
+		"cpuMaxPercent":   req.CPUMaxPercent,
+		"memoryLimit":     req.MemoryLimit,
+		responseKeyStatus: "created",
+	})
+}
+
+// handleDeleteResourceGroup deletes a resource group from the database.
+func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	groupName := r.PathValue("groupName")
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("delete resource group requested but database factory not available",
+			"cluster", cluster.Name, "group", groupName)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyGroup:   groupName,
+			responseKeyStatus:  "pending",
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource group deletion",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	if dropErr := dbClient.DropResourceGroup(r.Context(), groupName); dropErr != nil {
+		s.logger.Error("failed to drop resource group",
+			"cluster", cluster.Name, responseKeyGroup, groupName, "error", dropErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to drop resource group")
+		return
+	}
+
+	s.logger.Info("resource group dropped",
+		"cluster", cluster.Name, responseKeyGroup, groupName)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyGroup:  groupName,
+		responseKeyStatus: statusDeleted,
+	})
+}
+
+// handleAssignResourceGroup assigns a role to a resource group.
+func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	groupName := r.PathValue("groupName")
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var req struct {
+		Role string `json:"role"`
+	}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if req.Role == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "role is required")
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("assign resource group requested but database factory not available",
+			"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyGroup:   groupName,
+			"role":             req.Role,
+			responseKeyStatus:  "pending",
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource group assignment",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	if assignErr := dbClient.AssignRoleResourceGroup(r.Context(), req.Role, groupName); assignErr != nil {
+		s.logger.Error("failed to assign role to resource group",
+			"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role, "error", assignErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to assign role to resource group")
+		return
+	}
+
+	s.logger.Info("role assigned to resource group",
+		"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyGroup:  groupName,
+		"role":            req.Role,
+		responseKeyStatus: "assigned",
 	})
 }
 
@@ -732,7 +1099,7 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: "deleted",
+		responseKeyStatus: statusDeleted,
 		"backupID":        backupID,
 	})
 }
@@ -848,7 +1215,7 @@ func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: "deleted",
+		responseKeyStatus: statusDeleted,
 		responseKeyJob:    jobName,
 	})
 }
@@ -1088,8 +1455,8 @@ func writeErrorJSON(w http.ResponseWriter, status int, code, message string) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
-			"code":    code,
-			"message": message,
+			"code":             code,
+			responseKeyMessage: message,
 		},
 	})
 }

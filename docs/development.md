@@ -262,6 +262,8 @@ cloudberry-k8s/
 │   │   ├── ha_operations_test.go
 │   │   ├── auth_config_test.go
 │   │   ├── maintenance_test.go
+│   │   ├── scenario5_session_management_test.go
+│   │   ├── scenario6_resource_management_test.go
 │   │   └── webhook_test.go
 │   ├── integration/                  # Integration tests
 │   │   ├── api_integration_test.go
@@ -425,6 +427,106 @@ make test-e2e
 
 # All tests
 make test-all
+```
+
+### Controller Test Scenarios
+
+The controller tests cover four comprehensive scenarios that validate the operator's core functionality:
+
+#### Scenario 1 — Full Cluster Bootstrap
+
+Tests the complete cluster creation flow with all features enabled:
+
+- **Setup**: Coordinator + standby + 4 primary segments + 4 mirrors, OIDC (Keycloak), Vault integration, all 4 config layers (cluster, coordinator, database, role)
+- **Webhook validation**: Negative test verifying `segments.count=0` is rejected
+- **Resources verified**: ConfigMaps (`postgresql.conf`, `pg_hba.conf`), Secrets, headless Services, StatefulSets with init containers, OrderedReady pod management
+- **Status assertions**: `phase=Running`, `coordinatorReady=true`, `standbyReady=true`, `segmentsReady=4`, `mirroringStatus=InSync`
+- **Metrics verified**: `cloudberry_cluster_info`, `cloudberry_coordinator_up`, `cloudberry_standby_up`, `cloudberry_segments_ready/total`, `cloudberry_mirroring_in_sync`, `cloudberry_connections_max`
+- **Logging verified**: Structured JSON logging with `cluster`, `namespace`, `controller` fields
+
+#### Scenario 2 — Configuration Hot-Reload and Rolling Restart
+
+Tests the configuration change classification and rolling restart state machine:
+
+- **Phase A (Reload-safe)**: Change `log_min_messages` → ConfigMap updated, no pod restarts, `ConfigApplied=True/ConfigReloaded`
+- **Phase B (Restart-required)**: Change `shared_buffers` and `max_connections` → ConfigMap updated, rolling restart triggered
+- **Rolling restart order**: mirrors → primaries → standby → coordinator
+- **Parameter classification**: Validates the `restartRequiredParams` map
+- **Status conditions**: `ConfigApplied=False/RestartRequired` during restart, `ConfigApplied=True/ConfigAppliedAfterRestart` after
+- **Events verified**: `ConfigReloaded`, `RollingRestartStarted`, `RollingRestartCompleted`
+- **Annotation tracking**: `avsoft.io/rolling-restart` with JSON state
+- **Metrics verified**: `cloudberry_config_reload_total` incremented
+
+#### Scenario 3 — Stop / Start Modes
+
+Tests all cluster lifecycle transitions:
+
+- **3a**: Smart stop (`stop`) → `Stopped` (0 pods) → Normal start (`start`) → `Running` (10 pods)
+- **3b**: Fast stop (`stop-fast`) → `Stopped` → Restricted start (`start-restricted`) → `Restricted` (coordinator only)
+- **3c**: Immediate stop (`stop-immediate`) → `Stopped` → Maintenance start (`start-maintenance`) → `Maintenance` (coordinator only)
+- **3d**: Restart (`restart`) → `Stopping` → `Initializing` → `Running`
+- **Scale-down order**: mirrors → primaries → standby → coordinator
+- **Scale-up**: Full reconciliation restores all StatefulSets
+- **Events verified**: `Stopping`, `Stopped`, `Starting`, `Started`, `Restarting`, `Restarted`
+- **Annotation handling**: Action annotations checked BEFORE generation skip
+
+#### Scenario 4 — Maintenance Operations
+
+Tests the maintenance Job creation pipeline:
+
+- **Builder method**: `BuildMaintenanceJob` added to `ResourceBuilder` interface
+- **Job creation**: Creates `batchv1.Job` with `psql` command connecting to coordinator
+- **Operations tested**: `vacuum`, `vacuum-analyze`, `vacuum-full`, `analyze`, `reindex`
+- **Job properties**: `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`, `RestartPolicy=Never`
+- **Authentication**: `PGPASSWORD` from admin password Secret
+- **Error handling**: Unknown operations emit `MaintenanceUnknown` warning event
+- **Events verified**: `MaintenanceStarted` with job name
+
+#### Scenario 5 — Session Management
+
+Tests the session management API endpoints (list sessions, cancel query, terminate session) via the API server handlers with a mock `DBClientFactory`:
+
+- **List sessions**: Verifies that `handleListSessions` queries `pg_stat_activity` via `dbClient.ListSessions()` and returns session data (PID, username, application, clientAddress, state, query, queryStart, duration)
+- **Cancel query**: Verifies that `handleCancelQuery` calls `pg_cancel_backend()` via `dbClient.CancelQuery()` and returns the result
+- **Terminate session**: Verifies that `handleTerminateSession` calls `pg_terminate_backend()` via `dbClient.TerminateSession()` and returns the result
+- **PID validation**: Invalid PIDs (zero, negative, non-numeric) return `400 Bad Request` with `INVALID_REQUEST` error code
+- **Graceful degradation**: When no `DBClientFactory` is configured, list returns empty sessions with `"database connection not available"` message
+- **DB connection errors**: When `dbFactory.NewClient()` fails, returns `503 DB_UNAVAILABLE`
+- **Query errors**: When the database operation fails, returns `500 INTERNAL_ERROR`
+- **Cluster not found**: When the cluster does not exist, returns `404 CLUSTER_NOT_FOUND`
+- **Client lifecycle**: Verifies that the database client is closed after each request via `defer dbClient.Close()`
+- **12 test cases** covering all success paths, error paths, and edge cases
+
+#### Scenario 6 — Resource Management
+
+Tests the resource group management API endpoints (create, list, assign, delete) via the API server handlers with a mock `DBClientFactory`:
+
+- **Create resource group**: Verifies that `handleCreateResourceGroup` calls `dbClient.CreateResourceGroup()` with the correct `ResourceGroupOptions` (name, concurrency, cpuMaxPercent, memoryLimit) and returns `201 Created` with the group details
+- **Assign role to resource group**: Verifies that `handleAssignResourceGroup` calls `dbClient.AssignRoleResourceGroup()` with the correct role and group name, and returns `200 OK` with assignment confirmation
+- **List resource groups**: Verifies that `handleListResourceGroups` queries `dbClient.ListResourceGroups()` and returns the full list with `total` count. Falls back to CRD spec when the database is unavailable
+- **Delete resource group**: Verifies that `handleDeleteResourceGroup` calls `dbClient.DropResourceGroup()` with the correct group name and returns `200 OK` with deletion confirmation
+- **Graceful degradation**: When no `DBClientFactory` is configured, create returns `201` with a `"pending"` message
+- **Validation errors**: Empty resource group name returns `400 INVALID_REQUEST`; empty role on assign returns `400 INVALID_REQUEST`
+- **Database errors**: When `CreateResourceGroup`, `DropResourceGroup`, or `AssignRoleResourceGroup` fails, returns `500 INTERNAL_ERROR`
+- **Cluster not found**: When the cluster does not exist, returns `404 CLUSTER_NOT_FOUND`
+- **Client lifecycle**: Verifies that the database client is closed after each request via `defer dbClient.Close()`
+- **11 test cases** covering all success paths, error paths, and edge cases
+
+```bash
+# Run all controller tests
+go test ./internal/controller/... -v
+
+# Run a specific scenario
+go test ./internal/controller/... -v -run TestScenario1
+go test ./internal/controller/... -v -run TestScenario2
+go test ./internal/controller/... -v -run TestScenario3
+go test ./internal/controller/... -v -run TestScenario4
+
+# Run session management functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario5
+
+# Run resource management functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario6
 ```
 
 ### Coverage
@@ -650,6 +752,53 @@ Run `make generate && make manifests` after:
 - Adding new RBAC markers to controllers
 
 ## Adding New Features
+
+### Key Implementation Details
+
+#### `BuildMaintenanceJob` (ResourceBuilder Interface)
+
+The `BuildMaintenanceJob` method on the `ResourceBuilder` interface creates a Kubernetes `batchv1.Job` for maintenance operations:
+
+```go
+BuildMaintenanceJob(cluster *CloudberryCluster, operation, timestamp string) *batchv1.Job
+```
+
+- **Parameters**: `operation` is one of `vacuum`, `vacuum-analyze`, `vacuum-full`, `analyze`, `reindex`. `timestamp` is used for unique Job naming.
+- **Job name**: `{cluster}-maintenance-{timestamp}`
+- **Container**: Uses the cluster's image with a `psql` command connecting to the coordinator service
+- **Environment**: `PGPASSWORD` sourced from `{cluster}-admin-password` Secret via `SecretKeyRef`
+- **Properties**: `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`, `RestartPolicy=Never`
+- **Labels**: `avsoft.io/cluster={cluster}`, `avsoft.io/operation=maintenance`
+
+#### `restartRequiredParams` Classification
+
+The `restartRequiredParams` map in `internal/controller/admin_controller.go` classifies PostgreSQL parameters that require a server restart (context = `postmaster`). All parameters not in this map are treated as reload-safe (context = `sighup`).
+
+When the Admin Controller detects a config change, it diffs the old and new parameter maps and checks each changed parameter against `restartRequiredParams`. If any changed parameter is in the map, a rolling restart is triggered; otherwise, a simple reload is performed.
+
+```go
+var restartRequiredParams = map[string]bool{
+    "shared_buffers":                 true,
+    "max_connections":                true,
+    "max_prepared_transactions":      true,
+    "max_worker_processes":           true,
+    "max_wal_senders":                true,
+    "wal_level":                      true,
+    "wal_buffers":                    true,
+    "huge_pages":                     true,
+    "shared_preload_libraries":       true,
+    "max_locks_per_transaction":      true,
+    "max_files_per_process":          true,
+    "port":                           true,
+    "superuser_reserved_connections": true,
+    "unix_socket_directories":        true,
+    "listen_addresses":               true,
+    "bonjour":                        true,
+    "ssl":                            true,
+}
+```
+
+To add a new restart-required parameter, add it to this map and update the documentation in `docs/user-guide.md`.
 
 ### Adding a New CRD Field
 

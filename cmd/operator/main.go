@@ -274,8 +274,11 @@ func startAPIServer(
 	basicProvider := auth.NewBasicAuthProvider(credStore, logger)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, logger, metricsRecorder)
 
+	// Create database client factory for session operations.
+	dbFactory := db.NewClientFactory(mgr.GetClient(), logger)
+
 	// Create and start the API server.
-	apiServer := api.NewServer(mgr.GetClient(), authMW, metricsRecorder, logger)
+	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger)
 
 	logger.Info("starting REST API server", "address", cfg.APIAddress)
 	return api.StartServer(ctx, cfg.APIAddress, apiServer.Handler(), logger)

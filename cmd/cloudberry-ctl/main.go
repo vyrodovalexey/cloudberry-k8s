@@ -1051,21 +1051,92 @@ func newResourceGroupCmd() *cobra.Command {
 		Short: "Resource group management",
 	}
 
+	// list subcommand.
+	listCmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List resource groups",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-groups", globals.namespace))
+		},
+	}
+
+	// create subcommand with flags.
+	var createName string
+	var createConcurrency int32
+	var createCPUMaxPercent int32
+	var createMemoryLimit int32
+	createCmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create resource group",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			body := map[string]interface{}{
+				"name":          createName,
+				"concurrency":   createConcurrency,
+				"cpuMaxPercent": createCPUMaxPercent,
+				"memoryLimit":   createMemoryLimit,
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-groups", globals.namespace), body)
+		},
+	}
+	createCmd.Flags().StringVar(&createName, "name", "", "Resource group name")
+	createCmd.Flags().Int32Var(&createConcurrency, "concurrency", 0, "Concurrency limit")
+	createCmd.Flags().Int32Var(&createCPUMaxPercent, "cpu-max-percent", 0, "CPU max percent")
+	createCmd.Flags().Int32Var(&createMemoryLimit, "memory-limit", 0, "Memory limit")
+
+	// delete subcommand with flag.
+	var deleteName string
+	deleteCmd := &cobra.Command{
+		Use:   cmdDelete,
+		Short: "Delete resource group",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/clusters/%s/workload/resource-groups/%s",
+				globals.cluster, deleteName)
+			if globals.namespace != "" {
+				path += "?namespace=" + globals.namespace
+			}
+			return runAPIDelete(path)
+		},
+	}
+	deleteCmd.Flags().StringVar(&deleteName, "name", "", "Resource group name to delete")
+
+	// assign subcommand with flags.
+	var assignGroup string
+	var assignRole string
+	assignCmd := &cobra.Command{
+		Use:   "assign",
+		Short: "Assign role to group",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/clusters/%s/workload/resource-groups/%s/assign",
+				globals.cluster, assignGroup)
+			if globals.namespace != "" {
+				path += "?namespace=" + globals.namespace
+			}
+			body := map[string]interface{}{
+				"role": assignRole,
+			}
+			return runAPIPost(path, body)
+		},
+	}
+	assignCmd.Flags().StringVar(&assignGroup, "group", "", "Resource group name")
+	assignCmd.Flags().StringVar(&assignRole, "role", "", "Role to assign")
+
 	cmd.AddCommand(
-		&cobra.Command{
-			Use:   cmdList,
-			Short: "List resource groups",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("resource-group list")
-			},
-		},
-		&cobra.Command{
-			Use:   cmdCreate,
-			Short: "Create resource group",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("resource-group create")
-			},
-		},
+		listCmd,
+		createCmd,
 		&cobra.Command{
 			Use:   cmdUpdate,
 			Short: "Update resource group",
@@ -1073,20 +1144,8 @@ func newResourceGroupCmd() *cobra.Command {
 				return notImplemented("resource-group update")
 			},
 		},
-		&cobra.Command{
-			Use:   cmdDelete,
-			Short: "Delete resource group",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("resource-group delete")
-			},
-		},
-		&cobra.Command{
-			Use:   "assign",
-			Short: "Assign role to group",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("resource-group assign")
-			},
-		},
+		deleteCmd,
+		assignCmd,
 	)
 
 	return cmd

@@ -137,8 +137,9 @@ The following commands are fully implemented and communicate with the operator R
 - `sessions list`, `sessions cancel-query`, `sessions terminate`
 - `maintenance vacuum`, `maintenance analyze`, `maintenance reindex`
 - `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
+- `resource-group list`, `resource-group create`, `resource-group delete`, `resource-group assign`
 
-All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth *`, `resource-group *`, `inspect logs`, and `maintenance check-catalog/jobs`.
+All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth *`, `resource-group update`, `inspect logs`, and `maintenance check-catalog/jobs`.
 
 > **Note**: Stub commands use the `notImplemented()` helper to return a consistent error message. They exit with code `1` (general error). This behavior is intentional — it prevents silent no-ops in automation scripts.
 
@@ -183,41 +184,64 @@ my-cluster   Running  7.7      Ready        Ready    4/4       InSync
 
 #### cluster start
 
-Start a cluster.
+Start a cluster. The start mode determines which components are brought up and the resulting cluster phase.
 
 ```bash
-# Normal start
+# Normal start — all components (coordinator, standby, primaries, mirrors)
+# Resulting phase: Running
 cloudberry-ctl cluster start --cluster my-cluster
 
-# Restricted mode (superuser connections only)
+# Restricted mode — coordinator only, superuser connections only
+# Resulting phase: Restricted
 cloudberry-ctl cluster start --cluster my-cluster --mode restricted
 
-# Maintenance mode (coordinator only)
+# Maintenance mode — coordinator only, utility mode
+# Resulting phase: Maintenance
 cloudberry-ctl cluster start --cluster my-cluster --mode maintenance
 ```
 
+| Mode | Annotation Value | Components Started | Resulting Phase |
+|------|-----------------|-------------------|-----------------|
+| normal (default) | `start` | All | `Running` |
+| restricted | `start-restricted` | Coordinator only | `Restricted` |
+| maintenance | `start-maintenance` | Coordinator only | `Maintenance` |
+
 #### cluster stop
 
-Stop a cluster.
+Stop a cluster. The stop mode determines how active connections are handled.
 
 ```bash
-# Smart stop (wait for clients)
+# Smart stop — wait for clients to disconnect (default)
+# Annotation: avsoft.io/action=stop
 cloudberry-ctl cluster stop --cluster my-cluster
 
-# Fast stop (rollback transactions)
+# Fast stop — rollback active transactions, disconnect clients
+# Annotation: avsoft.io/action=stop-fast
 cloudberry-ctl cluster stop --cluster my-cluster --mode fast
 
-# Immediate stop (abort all)
+# Immediate stop — abort all connections immediately
+# Annotation: avsoft.io/action=stop-immediate
 cloudberry-ctl cluster stop --cluster my-cluster --mode immediate
 ```
 
+| Mode | Annotation Value | Behavior |
+|------|-----------------|----------|
+| smart (default) | `stop` | Wait for clients to disconnect |
+| fast | `stop-fast` | Rollback active transactions, disconnect clients |
+| immediate | `stop-immediate` | Abort all connections immediately |
+
+Scale-down order: mirrors → primaries → standby → coordinator. The cluster transitions through `Stopping` → `Stopped` (0 pods).
+
 #### cluster restart
 
-Restart a cluster.
+Restart a cluster. Performs a stop followed by a full start.
 
 ```bash
+# Annotation: avsoft.io/action=restart
 cloudberry-ctl cluster restart --cluster my-cluster
 ```
+
+Phase transitions: `Running` → `Stopping` → `Initializing` → `Running`.
 
 #### cluster create
 
@@ -490,11 +514,11 @@ cloudberry-ctl ha fts configure --cluster my-cluster \
 
 ### sessions
 
-Session management commands.
+Session management commands. These commands query `pg_stat_activity` on the cluster's coordinator database via the `DBClientFactory` to provide real-time session information.
 
 #### sessions list
 
-List active sessions.
+List active sessions from the cluster's coordinator.
 
 ```bash
 # All sessions
@@ -507,35 +531,105 @@ cloudberry-ctl sessions list --cluster my-cluster --state active
 cloudberry-ctl sessions list --cluster my-cluster --user analyst
 ```
 
-#### sessions cancel-query
+**Output (table):**
 
-Cancel a running query by PID.
-
-```bash
-cloudberry-ctl sessions cancel-query --cluster my-cluster --pid 12345
+```
+PID    USERNAME  APPLICATION  CLIENT_ADDRESS  STATE   QUERY                          DURATION
+1234   gpadmin   psql         10.0.0.1        active  SELECT * FROM orders           00:05:30
+5678   appuser   pgbench      10.0.0.2        idle    INSERT INTO logs VALUES ($1)   00:15:30
 ```
 
-> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
+**Output (JSON):**
+
+```json
+{
+  "sessions": [
+    {
+      "pid": 1234,
+      "username": "gpadmin",
+      "application": "psql",
+      "clientAddress": "10.0.0.1",
+      "state": "active",
+      "query": "SELECT * FROM orders",
+      "queryStart": "2026-05-14T10:00:00Z",
+      "duration": "00:05:30"
+    },
+    {
+      "pid": 5678,
+      "username": "appuser",
+      "application": "pgbench",
+      "clientAddress": "10.0.0.2",
+      "state": "idle",
+      "query": "INSERT INTO logs VALUES ($1)",
+      "queryStart": "2026-05-14T09:50:00Z",
+      "duration": "00:15:30"
+    }
+  ],
+  "total": 2
+}
+```
+
+When the database connection is not available, the command returns an empty list with a message:
+
+```json
+{
+  "sessions": [],
+  "total": 0,
+  "message": "database connection not available"
+}
+```
+
+#### sessions cancel-query
+
+Cancel a running query by PID. The PID is passed as a positional argument. This calls `pg_cancel_backend()` on the coordinator — the session remains connected but the current query is interrupted.
+
+```bash
+cloudberry-ctl sessions cancel-query --cluster my-cluster 12345
+```
+
+**Output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "canceled": true
+}
+```
+
+A `canceled: false` result means the PID was not found or the query had already completed.
+
+> **PID validation**: The PID must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
 
 #### sessions terminate
 
-Terminate a session by PID.
+Terminate a session by PID. The PID is passed as a positional argument. This calls `pg_terminate_backend()` on the coordinator — the client is disconnected.
 
 ```bash
-cloudberry-ctl sessions terminate --cluster my-cluster --pid 12345
+cloudberry-ctl sessions terminate --cluster my-cluster 5678
 ```
 
-> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
+**Output (JSON):**
+
+```json
+{
+  "pid": 5678,
+  "terminated": true
+}
+```
+
+A `terminated: false` result means the PID was not found or the session had already ended.
+
+> **PID validation**: The PID must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error.
 
 ---
 
 ### maintenance
 
-Maintenance operation commands.
+Maintenance operation commands. Each maintenance command triggers the creation of a Kubernetes `batchv1.Job` that runs the requested operation against the coordinator. Jobs are automatically cleaned up after 1 hour (`TTLSecondsAfterFinished=3600`).
 
 #### maintenance vacuum
 
-Run vacuum.
+Run vacuum. Creates a Job with annotation `avsoft.io/maintenance=vacuum`.
 
 ```bash
 # Regular vacuum
@@ -544,16 +638,22 @@ cloudberry-ctl maintenance vacuum --cluster my-cluster
 # Vacuum specific table
 cloudberry-ctl maintenance vacuum --cluster my-cluster --table public.large_table
 
-# Vacuum with analyze
+# Vacuum with analyze (annotation: vacuum-analyze)
 cloudberry-ctl maintenance vacuum --cluster my-cluster --analyze
 
-# Full vacuum (exclusive lock)
+# Full vacuum (exclusive lock, annotation: vacuum-full)
 cloudberry-ctl maintenance vacuum --cluster my-cluster --full
 ```
 
+| Flag | Annotation Value | SQL Command |
+|------|-----------------|-------------|
+| (none) | `vacuum` | `VACUUM` |
+| `--analyze` | `vacuum-analyze` | `VACUUM ANALYZE` |
+| `--full` | `vacuum-full` | `VACUUM FULL` |
+
 #### maintenance analyze
 
-Run analyze to refresh planner statistics.
+Run analyze to refresh planner statistics. Creates a Job with annotation `avsoft.io/maintenance=analyze`.
 
 ```bash
 # All tables
@@ -565,7 +665,7 @@ cloudberry-ctl maintenance analyze --cluster my-cluster --table public.large_tab
 
 #### maintenance reindex
 
-Rebuild indexes.
+Rebuild indexes. Creates a Job with annotation `avsoft.io/maintenance=reindex`.
 
 ```bash
 # All indexes in a database
@@ -585,10 +685,17 @@ cloudberry-ctl maintenance check-catalog --cluster my-cluster --database mydb
 
 #### maintenance jobs
 
-List maintenance jobs.
+List maintenance jobs. Shows all Jobs created by the operator for the specified cluster.
 
 ```bash
 cloudberry-ctl maintenance jobs --cluster my-cluster
+```
+
+You can also view maintenance Jobs directly with kubectl:
+
+```bash
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
 ```
 
 ---
@@ -734,23 +841,121 @@ cloudberry-ctl inspect logs --cluster my-cluster --severity ERROR --last 1h
 
 ### resource-group
 
-Resource group management commands.
+Resource group management commands. These commands manage Cloudberry resource groups for workload isolation by executing SQL commands on the cluster's coordinator database via the `DBClientFactory`.
 
 #### resource-group list
 
-List resource groups.
+List all resource groups in the cluster. When a database connection is available, groups are queried from `gp_toolkit.gp_resgroup_status`. Otherwise, the CRD spec is used as a fallback.
 
 ```bash
 cloudberry-ctl resource-group list --cluster my-cluster
 ```
 
+**Output (JSON):**
+
+```json
+{
+  "resourceGroups": [
+    {
+      "name": "analytics",
+      "concurrency": 10,
+      "cpuMaxPercent": 50,
+      "memoryLimit": 30
+    }
+  ],
+  "total": 1
+}
+```
+
 #### resource-group create
 
-Create a resource group.
+Create a resource group with concurrency, CPU, and memory limits.
 
 ```bash
 cloudberry-ctl resource-group create --cluster my-cluster \
   --name analytics --concurrency 10 --cpu-max-percent 50 --memory-limit 30
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--name` | string | Yes | Resource group name |
+| `--concurrency` | int | No | Maximum number of concurrent transactions (default: 0) |
+| `--cpu-max-percent` | int | No | Maximum CPU usage percentage, 0–100 (default: 0) |
+| `--memory-limit` | int | No | Memory limit percentage, 0–100 (default: 0) |
+
+**Output (JSON):**
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30,
+  "status": "created"
+}
+```
+
+When the database connection is not available, the response includes a pending message:
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30,
+  "message": "resource group creation pending; database connection not available"
+}
+```
+
+#### resource-group delete
+
+Delete a resource group from the cluster.
+
+```bash
+cloudberry-ctl resource-group delete --cluster my-cluster --name analytics
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--name` | string | Yes | Resource group name to delete |
+
+**Output (JSON):**
+
+```json
+{
+  "group": "analytics",
+  "status": "deleted"
+}
+```
+
+#### resource-group assign
+
+Assign a database role to a resource group. This executes `ALTER ROLE <role> RESOURCE GROUP <group>` on the coordinator.
+
+```bash
+cloudberry-ctl resource-group assign --cluster my-cluster \
+  --group analytics --role analyst
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--group` | string | Yes | Resource group name |
+| `--role` | string | Yes | Database role to assign |
+
+**Output (JSON):**
+
+```json
+{
+  "group": "analytics",
+  "role": "analyst",
+  "status": "assigned"
+}
 ```
 
 #### resource-group update
@@ -762,22 +967,7 @@ cloudberry-ctl resource-group update --cluster my-cluster \
   --name analytics --concurrency 20
 ```
 
-#### resource-group delete
-
-Delete a resource group.
-
-```bash
-cloudberry-ctl resource-group delete --cluster my-cluster --name analytics
-```
-
-#### resource-group assign
-
-Assign a role to a resource group.
-
-```bash
-cloudberry-ctl resource-group assign --cluster my-cluster \
-  --group analytics --role analyst
-```
+> **Note**: This command is a stub and returns a `"command \"resource-group update\" is not yet implemented"` error.
 
 ## Output Formats
 

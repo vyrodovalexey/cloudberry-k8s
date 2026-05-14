@@ -13,6 +13,7 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
   - [Configuration](#configuration)
   - [High Availability](#high-availability)
   - [Sessions](#sessions)
+  - [Resource Groups](#resource-groups)
   - [Maintenance](#maintenance)
   - [Authentication Management](#authentication-management)
 - [Request/Response Schemas](#requestresponse-schemas)
@@ -21,6 +22,11 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
 - [Rate Limiting](#rate-limiting)
 - [Request Body Limits](#request-body-limits)
 - [Input Validation](#input-validation)
+- [Annotations Reference](#annotations-reference)
+  - [Action Annotations](#action-annotations-avsoftioaction)
+  - [Maintenance Annotations](#maintenance-annotations-avsofiomaintenance)
+  - [Rolling Restart Annotation](#rolling-restart-annotation-avsoftiorolling-restart)
+  - [Status Phases](#status-phases)
 - [Webhook Endpoints](#webhook-endpoints)
 
 ## Base URL
@@ -406,17 +412,19 @@ curl -u admin:password \
 
 ### Sessions
 
+Session endpoints query `pg_stat_activity` on the cluster's coordinator database via the `DBClientFactory`. Each request creates a short-lived database connection, executes the operation, and closes the connection.
+
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
-| `GET` | `/clusters/{name}/sessions` | Operator Basic | List sessions |
-| `POST` | `/clusters/{name}/sessions/{pid}/cancel` | Operator | Cancel query |
-| `DELETE` | `/clusters/{name}/sessions/{pid}` | Operator | Terminate session |
+| `GET` | `/clusters/{name}/sessions` | Operator Basic | List active sessions from `pg_stat_activity` |
+| `POST` | `/clusters/{name}/sessions/{pid}/cancel` | Operator | Cancel a running query via `pg_cancel_backend()` |
+| `DELETE` | `/clusters/{name}/sessions/{pid}` | Operator | Terminate a session via `pg_terminate_backend()` |
 
 #### List Sessions
 
 ```bash
 curl -u admin:password \
-  "http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions?limit=50&offset=0"
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions"
 ```
 
 **Response (200 OK):**
@@ -425,33 +433,115 @@ curl -u admin:password \
 {
   "sessions": [
     {
-      "pid": 12345,
-      "username": "analyst",
+      "pid": 1234,
+      "username": "gpadmin",
       "application": "psql",
-      "clientAddress": "10.0.0.5",
+      "clientAddress": "10.0.0.1",
       "state": "active",
-      "query": "SELECT * FROM large_table",
-      "queryStart": "2026-05-11T17:58:00Z",
-      "duration": "2m30s"
+      "query": "SELECT * FROM orders",
+      "queryStart": "2026-05-14T10:00:00Z",
+      "duration": "00:05:30"
+    },
+    {
+      "pid": 5678,
+      "username": "appuser",
+      "application": "pgbench",
+      "clientAddress": "10.0.0.2",
+      "state": "idle",
+      "query": "INSERT INTO logs VALUES ($1)",
+      "queryStart": "2026-05-14T09:50:00Z",
+      "duration": "00:15:30"
     }
   ],
-  "total": 1
+  "total": 2
+}
+```
+
+**Session fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pid` | int | PostgreSQL backend process ID |
+| `username` | string | Database user running the session |
+| `application` | string | Application name (e.g., `psql`, `pgbench`) |
+| `clientAddress` | string | Client IP address |
+| `state` | string | Session state (`active`, `idle`, `idle in transaction`, etc.) |
+| `query` | string | Current or last executed query |
+| `queryStart` | string | ISO 8601 timestamp when the current query started |
+| `duration` | string | Elapsed time of the current query (e.g., `00:05:30`) |
+
+**Graceful degradation (200 OK — no DB factory):**
+
+When the `DBClientFactory` is not configured, the endpoint returns an empty result with an informational message instead of an error:
+
+```json
+{
+  "sessions": [],
+  "total": 0,
+  "message": "database connection not available"
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+**Error (500 Internal Server Error — query failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to list sessions"
+  }
 }
 ```
 
 #### Cancel Query
 
+Cancels a running query by calling `pg_cancel_backend()` on the coordinator. The session remains connected.
+
 ```bash
 curl -u admin:password -X POST \
-  http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions/12345/cancel
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions/1234/cancel
 ```
 
 **Response (200 OK):**
 
 ```json
 {
-  "pid": 12345,
+  "pid": 1234,
   "canceled": true
+}
+```
+
+The `canceled` field reflects the return value of `pg_cancel_backend()`. A value of `false` means the PID was not found or the query had already completed.
+
+**Graceful degradation (200 OK — no DB factory):**
+
+```json
+{
+  "pid": 1234,
+  "canceled": false,
+  "message": "database connection not available"
 }
 ```
 
@@ -462,6 +552,39 @@ curl -u admin:password -X POST \
   "error": {
     "code": "INVALID_REQUEST",
     "message": "PID must be a positive integer"
+  }
+}
+```
+
+**Error (400 Bad Request — non-numeric PID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "invalid PID"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+**Error (500 Internal Server Error — cancel failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to cancel query"
   }
 }
 ```
@@ -470,17 +593,31 @@ curl -u admin:password -X POST \
 
 #### Terminate Session
 
+Terminates a session by calling `pg_terminate_backend()` on the coordinator. The client is disconnected.
+
 ```bash
 curl -u admin:password -X DELETE \
-  http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions/12345
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/sessions/5678
 ```
 
 **Response (200 OK):**
 
 ```json
 {
-  "pid": 12345,
+  "pid": 5678,
   "terminated": true
+}
+```
+
+The `terminated` field reflects the return value of `pg_terminate_backend()`. A value of `false` means the PID was not found or the session had already ended.
+
+**Graceful degradation (200 OK — no DB factory):**
+
+```json
+{
+  "pid": 5678,
+  "terminated": false,
+  "message": "database connection not available"
 }
 ```
 
@@ -495,7 +632,303 @@ curl -u admin:password -X DELETE \
 }
 ```
 
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+**Error (500 Internal Server Error — terminate failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to terminate session"
+  }
+}
+```
+
 > **Note**: The PID must be a positive integer. Zero, negative, and non-numeric values are rejected with a `400 Bad Request` response.
+
+### Resource Groups
+
+Resource group endpoints manage Cloudberry resource groups for workload isolation. Operations execute SQL commands on the coordinator via the `DBClientFactory`.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/workload/resource-groups` | Basic | List resource groups |
+| `POST` | `/clusters/{name}/workload/resource-groups` | Operator | Create a resource group |
+| `DELETE` | `/clusters/{name}/workload/resource-groups/{groupName}` | Operator | Delete a resource group |
+| `POST` | `/clusters/{name}/workload/resource-groups/{groupName}/assign` | Operator | Assign a role to a resource group |
+
+#### List Resource Groups
+
+Lists resource groups. When a database connection is available, groups are queried from `gp_toolkit.gp_resgroup_status`. Otherwise, the CRD spec is used as a fallback.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/workload/resource-groups"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "resourceGroups": [
+    {
+      "name": "analytics",
+      "concurrency": 10,
+      "cpuMaxPercent": 50,
+      "memoryLimit": 30
+    }
+  ],
+  "total": 1
+}
+```
+
+#### Create Resource Group
+
+Creates a new resource group in the database by executing `CREATE RESOURCE GROUP`.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/workload/resource-groups \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "analytics",
+    "concurrency": 10,
+    "cpuMaxPercent": 50,
+    "memoryLimit": 30
+  }'
+```
+
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Resource group name |
+| `concurrency` | int | No | Maximum concurrent transactions |
+| `cpuMaxPercent` | int | No | Maximum CPU usage percentage (0–100) |
+| `memoryLimit` | int | No | Memory limit percentage (0–100) |
+
+**Response (201 Created):**
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30,
+  "status": "created"
+}
+```
+
+**Graceful degradation (201 Created — no DB factory):**
+
+When the `DBClientFactory` is not configured, the endpoint returns a success response with a pending message:
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30,
+  "message": "resource group creation pending; database connection not available"
+}
+```
+
+**Error (400 Bad Request — missing name):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "resource group name is required"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (500 Internal Server Error — database operation failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to create resource group"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+#### Delete Resource Group
+
+Deletes a resource group from the database by executing `DROP RESOURCE GROUP`.
+
+```bash
+curl -u admin:password -X DELETE \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/workload/resource-groups/analytics
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "group": "analytics",
+  "status": "deleted"
+}
+```
+
+**Graceful degradation (200 OK — no DB factory):**
+
+```json
+{
+  "group": "analytics",
+  "status": "pending",
+  "message": "database connection not available"
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (500 Internal Server Error — database operation failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to drop resource group"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+#### Assign Role to Resource Group
+
+Assigns a database role to a resource group by executing `ALTER ROLE <role> RESOURCE GROUP <group>`.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/workload/resource-groups/analytics/assign \
+  -H "Content-Type: application/json" \
+  -d '{"role": "analyst"}'
+```
+
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `role` | string | Yes | Database role to assign to the resource group |
+
+**Response (200 OK):**
+
+```json
+{
+  "group": "analytics",
+  "role": "analyst",
+  "status": "assigned"
+}
+```
+
+**Graceful degradation (200 OK — no DB factory):**
+
+```json
+{
+  "group": "analytics",
+  "role": "analyst",
+  "status": "pending",
+  "message": "database connection not available"
+}
+```
+
+**Error (400 Bad Request — missing role):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "role is required"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (500 Internal Server Error — database operation failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to assign role to resource group"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
 
 ### Maintenance
 
@@ -582,6 +1015,7 @@ All errors follow a consistent JSON format:
 | 429 | `RATE_LIMITED` | Rate limit exceeded |
 | 500 | `INTERNAL_ERROR` | Unexpected server error |
 | 503 | `SERVICE_UNAVAILABLE` | Operator not ready |
+| 503 | `DB_UNAVAILABLE` | Cannot connect to the cluster's database (session operations) |
 
 ### Error Examples
 
@@ -686,6 +1120,83 @@ The API validates all input parameters:
 | PID (sessions) | Must be a valid positive integer (> 0). Zero, negative, and non-numeric values are rejected | `INVALID_REQUEST` |
 | Request body | Must be valid JSON | `INVALID_REQUEST` |
 | Body size | Must not exceed 1 MiB | `INVALID_REQUEST` |
+
+## Annotations Reference
+
+The operator uses annotations on `CloudberryCluster` resources to trigger actions and track state.
+
+### Action Annotations (`avsoft.io/action`)
+
+Set this annotation to trigger lifecycle operations. The operator processes and removes the annotation after handling.
+
+| Value | Description | Resulting Phase |
+|-------|-------------|-----------------|
+| `start` | Normal start — all components | `Running` |
+| `start-restricted` | Coordinator only, superuser connections | `Restricted` |
+| `start-maintenance` | Coordinator only, utility mode | `Maintenance` |
+| `stop` | Smart stop — wait for clients to disconnect | `Stopped` |
+| `stop-fast` | Fast stop — rollback active transactions | `Stopped` |
+| `stop-immediate` | Immediate stop — abort all connections | `Stopped` |
+| `restart` | Stop then start all components | `Running` |
+| `rebalance` | Rebalance segment roles after recovery | `Running` |
+| `activate-standby` | Promote standby to coordinator | `Running` |
+
+### Maintenance Annotations (`avsoft.io/maintenance`)
+
+Set this annotation to trigger maintenance operations. The operator creates a Kubernetes Job and removes the annotation.
+
+| Value | Description | SQL Command |
+|-------|-------------|-------------|
+| `vacuum` | Regular vacuum | `VACUUM` |
+| `vacuum-analyze` | Vacuum with statistics refresh | `VACUUM ANALYZE` |
+| `vacuum-full` | Full vacuum (exclusive lock) | `VACUUM FULL` |
+| `analyze` | Refresh planner statistics | `ANALYZE` |
+| `reindex` | Rebuild indexes | `REINDEX DATABASE` |
+
+### Rolling Restart Annotation (`avsoft.io/rolling-restart`)
+
+This annotation is managed by the operator to track rolling restart progress. It contains a JSON payload:
+
+```json
+{
+  "phase": "primaries",
+  "startedAt": "2026-05-14T10:00:00Z",
+  "restartParams": ["shared_buffers", "max_connections"]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `phase` | string | Current restart phase: `mirrors`, `primaries`, `standby`, `coordinator`, `completed` |
+| `startedAt` | string | ISO 8601 timestamp when the rolling restart started |
+| `restartParams` | string[] | List of parameter names that triggered the restart |
+
+### Other Annotations
+
+| Annotation | Description |
+|------------|-------------|
+| `avsoft.io/config-hash` | Hash of the current configuration for change detection |
+| `avsoft.io/restart-trigger` | Triggers a pod restart when changed |
+| `avsoft.io/restart-pending` | Indicates a full cluster restart is in progress |
+| `avsoft.io/recovery` | Triggers recovery operations (`incremental`, `full`, `differential`) |
+
+### Status Phases
+
+The `status.phase` field reflects the current cluster lifecycle state:
+
+| Phase | Description |
+|-------|-------------|
+| `Pending` | Cluster resource created, waiting for initialization |
+| `Initializing` | StatefulSets and Services are being created |
+| `Running` | All components are running and healthy |
+| `Updating` | Cluster spec changed, resources are being updated |
+| `Scaling` | Segment count is being changed |
+| `Stopping` | Cluster is shutting down (scale-down in progress) |
+| `Stopped` | All pods are scaled to zero |
+| `Restricted` | Coordinator only, superuser connections only |
+| `Maintenance` | Coordinator only, utility mode |
+| `Failed` | An error occurred during reconciliation |
+| `Deleting` | Cluster is being deleted |
 
 ## Webhook Endpoints
 

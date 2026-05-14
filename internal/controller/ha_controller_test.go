@@ -86,6 +86,7 @@ func (m *mockDBClient) DropResourceGroup(_ context.Context, _ string) error { re
 func (m *mockDBClient) ListResourceGroups(_ context.Context) ([]db.ResourceGroupInfo, error) {
 	return nil, nil
 }
+func (m *mockDBClient) AssignRoleResourceGroup(_ context.Context, _, _ string) error { return nil }
 func (m *mockDBClient) CreateBackup(_ context.Context, opts db.BackupOptions) (*db.BackupInfo, error) {
 	return &db.BackupInfo{ID: "test", Type: opts.Type, Status: "InProgress"}, nil
 }

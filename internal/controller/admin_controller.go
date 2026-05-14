@@ -880,7 +880,8 @@ func (r *AdminReconciler) nextRestartPhase(
 	return restartPhaseCompleted
 }
 
-// handleMaintenance processes maintenance annotations.
+// handleMaintenance processes maintenance annotations by creating a Kubernetes Job
+// for the requested database maintenance operation (vacuum, analyze, reindex, etc.).
 func (r *AdminReconciler) handleMaintenance(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -894,8 +895,33 @@ func (r *AdminReconciler) handleMaintenance(
 		return ctrl.Result{}, fmt.Errorf("removing maintenance annotation: %w", err)
 	}
 
+	// Validate the maintenance operation type.
+	validOps := map[string]bool{
+		util.MaintenanceVacuum:        true,
+		util.MaintenanceVacuumAnalyze: true,
+		util.MaintenanceVacuumFull:    true,
+		util.MaintenanceAnalyze:       true,
+		util.MaintenanceReindex:       true,
+	}
+	if !validOps[maintenance] {
+		logger.Warn("unknown maintenance operation", "type", maintenance)
+		r.recorder.Event(cluster, "Warning", "MaintenanceUnknown",
+			fmt.Sprintf("Unknown maintenance operation: %s", maintenance))
+		return ctrl.Result{}, nil
+	}
+
+	// Create the maintenance Job.
+	timestamp := time.Now().Format("20060102-150405")
+	job := r.builder.BuildMaintenanceJob(cluster, maintenance, timestamp)
+	if err := r.client.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, fmt.Errorf("creating maintenance job: %w", err)
+		}
+		logger.Info("maintenance job already exists", "job", job.Name)
+	}
+
 	r.recorder.Event(cluster, "Normal", "MaintenanceStarted",
-		fmt.Sprintf("Maintenance operation %s initiated", maintenance))
+		fmt.Sprintf("Maintenance operation %s initiated, job: %s", maintenance, job.Name))
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }

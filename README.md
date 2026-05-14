@@ -82,7 +82,11 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 **Cluster Lifecycle Management**
 - Declarative cluster creation, updates, and deletion via `CloudberryCluster` CRD
 - Cross-namespace cluster name uniqueness enforced by validating webhook
-- Start, stop, and restart with multiple modes (normal, restricted, maintenance)
+- Start, stop, and restart with multiple modes:
+  - **Stop modes**: smart (wait for clients), fast (rollback transactions), immediate (abort connections)
+  - **Start modes**: normal (all components), restricted (coordinator only), maintenance (utility mode)
+  - **Restart**: stop + start with phase transitions (Running → Stopping → Initializing → Running)
+- New cluster phases: `Stopped`, `Stopping`, `Restricted`, `Maintenance`
 - Rolling upgrades with automatic rollback on failure
 - Configurable PVC retention policy on deletion
 
@@ -109,11 +113,20 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Structured logging (slog) with JSON output
 
 **Administration**
-- Configuration management with reload-safe and restart-required parameter detection
+- Configuration management with automatic hot-reload vs rolling restart detection
+  - Reload-safe parameters applied without pod restarts
+  - Restart-required parameters (shared_buffers, max_connections, wal_level, etc.) trigger rolling restart
+  - Rolling restart order: mirrors → primaries → standby → coordinator
+  - Rolling restart state tracked via `avsoft.io/rolling-restart` annotation
 - Cluster-wide, coordinator-only, per-database, and per-role parameters
-- Maintenance operations: vacuum, analyze, reindex
-- Session management: list, cancel queries, terminate sessions (with PID validation)
-- Resource group management
+- Maintenance operations via Kubernetes Jobs: vacuum, vacuum-analyze, vacuum-full, analyze, reindex
+  - Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
+  - `PGPASSWORD` sourced from admin password Secret
+- Session management: list active sessions from `pg_stat_activity`, cancel queries via `pg_cancel_backend()`, terminate sessions via `pg_terminate_backend()` (with PID validation and graceful degradation when DB is unavailable)
+- Resource group management: create, list, assign, and delete resource groups for workload isolation
+  - Create groups with concurrency, CPU, and memory limits
+  - Assign database roles to resource groups (`ALTER ROLE ... RESOURCE GROUP`)
+  - Query live resource groups from the database with CRD spec fallback
 - API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated
 
 **CLI Companion**

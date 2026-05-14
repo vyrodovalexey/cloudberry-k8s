@@ -199,6 +199,87 @@ The operator automatically creates an admin password Secret (`{cluster}-admin-pa
 helm uninstall cloudberry-operator --namespace cloudberry-system
 ```
 
+## Cluster Phases
+
+The `CloudberryCluster` resource reports its current lifecycle state via `status.phase`:
+
+| Phase | Description |
+|-------|-------------|
+| `Pending` | Cluster resource created, waiting for initialization |
+| `Initializing` | StatefulSets and Services are being created |
+| `Running` | All components are running and healthy |
+| `Updating` | Cluster spec changed, resources are being updated |
+| `Scaling` | Segment count is being changed |
+| `Stopping` | Cluster is shutting down (scale-down in progress) |
+| `Stopped` | All pods are scaled to zero |
+| `Restricted` | Coordinator only, superuser connections only |
+| `Maintenance` | Coordinator only, utility mode |
+| `Failed` | An error occurred during reconciliation |
+| `Deleting` | Cluster is being deleted |
+
+### Lifecycle Actions
+
+Trigger lifecycle actions via annotations on the `CloudberryCluster` resource:
+
+```bash
+# Stop the cluster (fast mode)
+kubectl annotate cloudberrycluster my-cluster avsoft.io/action=stop-fast
+
+# Start the cluster
+kubectl annotate cloudberrycluster my-cluster avsoft.io/action=start
+
+# Start in restricted mode (coordinator only)
+kubectl annotate cloudberrycluster my-cluster avsoft.io/action=start-restricted
+
+# Start in maintenance mode
+kubectl annotate cloudberrycluster my-cluster avsoft.io/action=start-maintenance
+
+# Restart the cluster
+kubectl annotate cloudberrycluster my-cluster avsoft.io/action=restart
+```
+
+## Maintenance Operations
+
+The operator creates Kubernetes Jobs for database maintenance operations. Trigger them via annotations:
+
+```bash
+# Vacuum
+kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum
+
+# Vacuum with analyze
+kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum-analyze
+
+# Full vacuum (exclusive lock)
+kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum-full
+
+# Analyze (refresh planner statistics)
+kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=analyze
+
+# Reindex
+kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=reindex
+```
+
+**Job properties:**
+- `BackoffLimit`: 1
+- `TTLSecondsAfterFinished`: 3600 (auto-cleanup after 1 hour)
+- `RestartPolicy`: Never
+- `PGPASSWORD`: Sourced from `{cluster}-admin-password` Secret
+
+Monitor maintenance Jobs:
+
+```bash
+kubectl get jobs -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
+```
+
+## Configuration Hot-Reload
+
+The operator automatically detects whether a parameter change requires a restart or can be applied via reload:
+
+- **Reload-safe parameters** (e.g., `log_min_messages`, `work_mem`): ConfigMap updated, no pod restarts
+- **Restart-required parameters** (e.g., `shared_buffers`, `max_connections`, `wal_level`): ConfigMap updated, rolling restart triggered
+
+Rolling restart order: mirrors → primaries → standby → coordinator.
+
 ## CRDs
 
 The chart includes the CloudberryCluster CRD. Set `installCRDs: false` to skip CRD installation if they are managed separately.

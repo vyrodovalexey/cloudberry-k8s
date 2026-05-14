@@ -71,6 +71,23 @@ Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API serve
 - 4 test scenarios configured: smoke, baseline, stress, endurance
 - 3 ammo files ready: health, api-read, api-mixed
 
+### Controller Test Coverage (Scenarios 1–4)
+
+The operator's controller tests include four comprehensive scenarios that validate core functionality. These are separate from the performance tests but provide the functional foundation:
+
+| Scenario | Name | Coverage |
+|----------|------|----------|
+| 1 | Full Cluster Bootstrap | Coordinator + standby + segments + mirrors, OIDC, Vault, webhook validation, ConfigMaps, Secrets, Services, StatefulSets, status fields, Prometheus metrics, structured logging |
+| 2 | Configuration Hot-Reload and Rolling Restart | Reload-safe vs restart-required parameter classification, ConfigMap updates, rolling restart state machine (mirrors → primaries → standby → coordinator), status conditions, events, metrics |
+| 3 | Stop / Start Modes | Smart/fast/immediate stop, normal/restricted/maintenance start, restart, scale-down/up ordering, phase transitions (Running ↔ Stopping ↔ Stopped ↔ Restricted/Maintenance), events |
+| 4 | Maintenance Operations | `BuildMaintenanceJob` builder method, Job creation for vacuum/analyze/reindex, Job properties (BackoffLimit, TTL, RestartPolicy), PGPASSWORD from Secret, unknown operation handling, events |
+
+Run the controller tests:
+
+```bash
+go test ./internal/controller/... -v
+```
+
 > **Note**: The API enforces per-IP rate limiting (10 requests/minute by default). For performance testing, you may need to increase the rate limit or disable it by configuring a higher limit.
 
 ## Quick Start

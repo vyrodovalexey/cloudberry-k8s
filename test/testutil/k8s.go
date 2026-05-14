@@ -7,6 +7,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +38,7 @@ func NewTestK8sEnv(initObjects ...client.Object) *TestK8sEnv {
 	_ = cbv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
 
 	// Build the fake client with status subresource for CloudberryCluster.
 	fakeClientBuilder := fake.NewClientBuilder().
@@ -107,6 +109,16 @@ func (e *TestK8sEnv) GetService(ctx context.Context, name, namespace string) (*c
 	return svc, nil
 }
 
+// GetJob retrieves a Job from the fake client.
+func (e *TestK8sEnv) GetJob(ctx context.Context, name, namespace string) (*batchv1.Job, error) {
+	job := &batchv1.Job{}
+	err := e.Client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, job)
+	if err != nil {
+		return nil, fmt.Errorf("getting job %s/%s: %w", namespace, name, err)
+	}
+	return job, nil
+}
+
 // GetConfigMap retrieves a ConfigMap from the fake client.
 func (e *TestK8sEnv) GetConfigMap(ctx context.Context, name, namespace string) (*corev1.ConfigMap, error) {
 	cm := &corev1.ConfigMap{}
@@ -153,6 +165,7 @@ type MockDBClient struct {
 	AlterResourceGroupFunc      func(ctx context.Context, opts db.ResourceGroupOptions) error
 	DropResourceGroupFunc       func(ctx context.Context, name string) error
 	ListResourceGroupsFunc      func(ctx context.Context) ([]db.ResourceGroupInfo, error)
+	AssignRoleResourceGroupFunc func(ctx context.Context, role, group string) error
 	Closed                      bool
 }
 
@@ -372,6 +385,14 @@ func (m *MockDBClient) ListResourceGroups(ctx context.Context) ([]db.ResourceGro
 	return []db.ResourceGroupInfo{
 		{Name: "default_group", Concurrency: 20, CPUUsage: 10.0, MemoryUsage: 30.0},
 	}, nil
+}
+
+// AssignRoleResourceGroup implements db.Client.
+func (m *MockDBClient) AssignRoleResourceGroup(ctx context.Context, role, group string) error {
+	if m.AssignRoleResourceGroupFunc != nil {
+		return m.AssignRoleResourceGroupFunc(ctx, role, group)
+	}
+	return nil
 }
 
 // CreateBackup implements db.Client.

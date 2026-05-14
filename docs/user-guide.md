@@ -7,11 +7,34 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
 - [Creating a CloudberryCluster](#creating-a-cloudberrycluster)
 - [Cluster Name Uniqueness](#cluster-name-uniqueness)
 - [Managing Cluster Lifecycle](#managing-cluster-lifecycle)
+  - [Cluster Phases](#cluster-phases)
+  - [Starting a Cluster](#starting-a-cluster)
+  - [Stopping a Cluster](#stopping-a-cluster)
+  - [Restarting a Cluster](#restarting-a-cluster)
+  - [Phase Transitions](#phase-transitions)
+  - [Action Annotations Reference](#action-annotations-reference)
 - [Configuration Management](#configuration-management)
+  - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
+  - [Restart-Required Parameters](#restart-required-parameters)
+  - [Rolling Restart Behavior](#rolling-restart-behavior)
 - [Authentication Setup](#authentication-setup)
 - [Webhook Certificate Setup](#webhook-certificate-setup)
 - [High Availability](#high-availability)
 - [Maintenance Operations](#maintenance-operations)
+  - [Maintenance Jobs](#maintenance-jobs)
+  - [Maintenance Annotations](#maintenance-annotations)
+- [Session Management](#session-management)
+  - [Listing Sessions](#listing-sessions)
+  - [Canceling a Query](#canceling-a-query)
+  - [Terminating a Session](#terminating-a-session)
+  - [Graceful Degradation](#graceful-degradation)
+  - [Error Handling](#error-handling)
+- [Resource Group Management](#resource-group-management)
+  - [Creating a Resource Group](#creating-a-resource-group)
+  - [Listing Resource Groups](#listing-resource-groups)
+  - [Assigning a Role to a Resource Group](#assigning-a-role-to-a-resource-group)
+  - [Deleting a Resource Group](#deleting-a-resource-group)
+- [Inspection Commands](#inspection-commands)
 - [Monitoring and Observability](#monitoring-and-observability)
 
 ## Creating a CloudberryCluster
@@ -255,13 +278,31 @@ cloudberry-ctl cluster status --cluster production-cluster --output json
 
 ## Managing Cluster Lifecycle
 
+### Cluster Phases
+
+The cluster progresses through several phases during its lifecycle:
+
+| Phase | Description |
+|-------|-------------|
+| `Pending` | Cluster resource created, waiting for initialization |
+| `Initializing` | StatefulSets and Services are being created |
+| `Running` | All components are running and healthy |
+| `Updating` | Cluster spec changed, resources are being updated |
+| `Scaling` | Segment count is being changed |
+| `Stopping` | Cluster is shutting down (scale-down in progress) |
+| `Stopped` | All pods are scaled to zero |
+| `Restricted` | Coordinator only, superuser connections only |
+| `Maintenance` | Coordinator only, utility mode |
+| `Failed` | An error occurred during reconciliation |
+| `Deleting` | Cluster is being deleted |
+
 ### Starting a Cluster
 
 ```bash
-# Normal start — all components
+# Normal start — all components (coordinator, standby, primaries, mirrors)
 cloudberry-ctl cluster start --cluster my-cluster
 
-# Restricted start — superuser connections only
+# Restricted start — coordinator only, superuser connections only
 cloudberry-ctl cluster start --cluster my-cluster --mode restricted
 
 # Maintenance start — coordinator only in utility mode
@@ -271,9 +312,23 @@ cloudberry-ctl cluster start --cluster my-cluster --mode maintenance
 Or via annotation:
 
 ```bash
+# Normal start
 kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
   avsoft.io/action=start
+
+# Restricted start
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=start-restricted
+
+# Maintenance start
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=start-maintenance
 ```
+
+When starting from `Stopped`:
+- **Normal start** (`start`): Full reconciliation restores all StatefulSets. Phase transitions: `Stopped` → `Initializing` → `Running` (all 10 pods for a typical cluster with coordinator + standby + 4 primaries + 4 mirrors).
+- **Restricted start** (`start-restricted`): Only the coordinator StatefulSet is scaled up. Phase transitions: `Stopped` → `Restricted` (coordinator only).
+- **Maintenance start** (`start-maintenance`): Only the coordinator StatefulSet is scaled up in utility mode. Phase transitions: `Stopped` → `Maintenance` (coordinator only).
 
 ### Stopping a Cluster
 
@@ -288,13 +343,87 @@ cloudberry-ctl cluster stop --cluster my-cluster --mode fast
 cloudberry-ctl cluster stop --cluster my-cluster --mode immediate
 ```
 
+Or via annotation:
+
+```bash
+# Smart stop (default)
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=stop
+
+# Fast stop
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=stop-fast
+
+# Immediate stop
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=stop-immediate
+```
+
+The operator scales down StatefulSets in a safe order: **mirrors → primaries → standby → coordinator**. The phase transitions through `Stopping` → `Stopped` (0 pods).
+
+The operator emits the following events during stop:
+- `Stopping` — scale-down initiated
+- `Stopped` — all pods are down
+
 ### Restarting a Cluster
 
 ```bash
 cloudberry-ctl cluster restart --cluster my-cluster
 ```
 
-This performs a fast stop followed by a normal start.
+Or via annotation:
+
+```bash
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=restart
+```
+
+A restart performs a stop followed by a full start. Phase transitions: `Running` → `Stopping` → `Initializing` → `Running`. The operator emits `Restarting` and `Restarted` events.
+
+### Phase Transitions
+
+```
+                    ┌──────────┐
+                    │ Pending  │
+                    └────┬─────┘
+                         │
+                    ┌────▼──────────┐
+                    │ Initializing  │◄──────────────────────┐
+                    └────┬──────────┘                       │
+                         │                                  │
+                    ┌────▼─────┐    stop/stop-fast/     ┌───┴────┐
+                    │ Running  │───stop-immediate──────▶│Stopping│
+                    └────┬─────┘                        └───┬────┘
+                         │                                  │
+                         │ restart                     ┌────▼────┐
+                         └────────────────────────────▶│ Stopped │
+                                                       └────┬────┘
+                                                            │
+                                    ┌───────────────────────┼───────────────┐
+                                    │ start                 │               │
+                               ┌────▼──────────┐    ┌──────▼─────┐  ┌──────▼──────────┐
+                               │ Initializing  │    │ Restricted │  │  Maintenance    │
+                               │  → Running    │    │            │  │                 │
+                               └───────────────┘    └────────────┘  └─────────────────┘
+```
+
+### Action Annotations Reference
+
+All lifecycle actions are triggered by setting the `avsoft.io/action` annotation on the `CloudberryCluster` resource. The operator processes the annotation and removes it after handling.
+
+| Annotation Value | Description | Resulting Phase |
+|-----------------|-------------|-----------------|
+| `start` | Normal start — all components | `Running` |
+| `start-restricted` | Coordinator only, superuser connections | `Restricted` |
+| `start-maintenance` | Coordinator only, utility mode | `Maintenance` |
+| `stop` | Smart stop — wait for clients | `Stopped` |
+| `stop-fast` | Fast stop — rollback transactions | `Stopped` |
+| `stop-immediate` | Immediate stop — abort connections | `Stopped` |
+| `restart` | Stop then start | `Running` |
+| `rebalance` | Rebalance segment roles | `Running` |
+| `activate-standby` | Promote standby to coordinator | `Running` |
+
+> **Note**: Action annotations are checked **before** the generation-based skip logic. This ensures that lifecycle actions (which do not change the CRD generation) are always processed.
 
 ### Upgrading a Cluster
 
@@ -381,6 +510,76 @@ spec:
       analyst:
         statement_mem: "1GB"
 ```
+
+### Hot-Reload vs Rolling Restart
+
+The operator automatically classifies parameter changes into two categories:
+
+**Reload-safe parameters** (PostgreSQL context = `sighup`): These parameters take effect after a configuration reload without restarting pods. Examples include `log_min_messages`, `work_mem`, `statement_timeout`, and `log_statement`.
+
+When you change a reload-safe parameter:
+1. The operator updates the `{cluster}-postgresql-conf` ConfigMap
+2. No pods are restarted
+3. The `ConfigApplied` condition is set to `True` with reason `ConfigReloaded`
+4. A `ConfigReloaded` event is emitted
+5. The `cloudberry_config_reload_total` metric is incremented
+
+**Restart-required parameters** (PostgreSQL context = `postmaster`): These parameters require a server restart to take effect. Changing them triggers an automatic rolling restart.
+
+When you change a restart-required parameter:
+1. The operator updates the `{cluster}-postgresql-conf` ConfigMap
+2. A rolling restart is triggered automatically
+3. The `ConfigApplied` condition is set to `False` with reason `RestartRequired`
+4. A `RollingRestartStarted` event is emitted
+5. After the rolling restart completes, `ConfigApplied` is set to `True` with reason `ConfigAppliedAfterRestart`
+6. A `RollingRestartCompleted` event is emitted
+
+### Restart-Required Parameters
+
+The following parameters require a server restart:
+
+| Parameter | Description |
+|-----------|-------------|
+| `shared_buffers` | Shared memory for caching |
+| `max_connections` | Maximum concurrent connections |
+| `max_prepared_transactions` | Maximum prepared transactions |
+| `max_worker_processes` | Maximum background workers |
+| `max_wal_senders` | Maximum WAL sender processes |
+| `wal_level` | WAL logging level |
+| `wal_buffers` | WAL buffer size |
+| `huge_pages` | Huge pages usage |
+| `shared_preload_libraries` | Preloaded shared libraries |
+| `max_locks_per_transaction` | Maximum locks per transaction |
+| `max_files_per_process` | Maximum open files per process |
+| `port` | Listening port |
+| `superuser_reserved_connections` | Reserved superuser connections |
+| `unix_socket_directories` | Unix socket directories |
+| `listen_addresses` | Listen addresses |
+| `bonjour` | Bonjour service discovery |
+| `ssl` | SSL/TLS mode |
+
+All other parameters are reload-safe and do not require a restart.
+
+### Rolling Restart Behavior
+
+When a rolling restart is triggered (by changing restart-required parameters), the operator restarts pods in a safe order to minimize downtime:
+
+1. **Mirrors** — Mirror segments are restarted first (lowest impact)
+2. **Primaries** — Primary segments are restarted next
+3. **Standby** — The standby coordinator is restarted
+4. **Coordinator** — The coordinator is restarted last
+
+The rolling restart state is tracked via the `avsoft.io/rolling-restart` annotation, which contains a JSON payload:
+
+```json
+{
+  "phase": "primaries",
+  "startedAt": "2026-05-14T10:00:00Z",
+  "restartParams": ["shared_buffers", "max_connections"]
+}
+```
+
+The `phase` field progresses through: `mirrors` → `primaries` → `standby` → `coordinator` → `completed`.
 
 ### Reloading Configuration
 
@@ -832,10 +1031,71 @@ cloudberry-ctl maintenance reindex --cluster my-cluster --table public.large_tab
 cloudberry-ctl maintenance check-catalog --cluster my-cluster --database mydb
 ```
 
-### Session Management
+### Maintenance Jobs
+
+The operator creates Kubernetes `batchv1.Job` resources for maintenance operations. Each Job runs a `psql` command that connects to the coordinator service and executes the requested operation.
+
+**Job properties:**
+- **BackoffLimit**: `1` (retry once on failure)
+- **TTLSecondsAfterFinished**: `3600` (auto-cleanup after 1 hour)
+- **RestartPolicy**: `Never`
+- **Authentication**: `PGPASSWORD` sourced from the cluster's admin password Secret
+
+**Supported operations:**
+
+| Operation | Annotation Value | SQL Command |
+|-----------|-----------------|-------------|
+| Vacuum | `vacuum` | `VACUUM` |
+| Vacuum + Analyze | `vacuum-analyze` | `VACUUM ANALYZE` |
+| Full Vacuum | `vacuum-full` | `VACUUM FULL` |
+| Analyze | `analyze` | `ANALYZE` |
+| Reindex | `reindex` | `REINDEX DATABASE` |
+
+Unknown operations emit a `MaintenanceUnknown` warning event and are not executed.
+
+**Events:**
+- `MaintenanceStarted` (Normal) — Job created with the job name in the message
+
+### Maintenance Annotations
+
+You can trigger maintenance operations directly via annotations:
 
 ```bash
-# List active sessions
+# Trigger a vacuum
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/maintenance=vacuum
+
+# Trigger vacuum with analyze
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/maintenance=vacuum-analyze
+
+# Trigger a full vacuum
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/maintenance=vacuum-full
+
+# Trigger analyze
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/maintenance=analyze
+
+# Trigger reindex
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/maintenance=reindex
+```
+
+The operator removes the annotation after creating the Job. You can monitor Job status with:
+
+```bash
+kubectl get jobs -n cloudberry-test -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
+```
+
+## Session Management
+
+The operator provides real-time session management by querying `pg_stat_activity` on the cluster's coordinator database. Session operations use the `DBClientFactory` to create short-lived database connections, execute the requested operation, and close the connection.
+
+### Listing Sessions
+
+```bash
+# List all active sessions
 cloudberry-ctl sessions list --cluster my-cluster
 
 # Filter by state
@@ -843,17 +1103,238 @@ cloudberry-ctl sessions list --cluster my-cluster --state active
 
 # Filter by user
 cloudberry-ctl sessions list --cluster my-cluster --user analyst
-
-# Cancel a running query
-cloudberry-ctl sessions cancel-query --cluster my-cluster --pid 12345
-
-# Terminate a session
-cloudberry-ctl sessions terminate --cluster my-cluster --pid 12345
 ```
 
-> **PID validation**: The `--pid` value must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error (`INVALID_REQUEST: PID must be a positive integer`).
+**Example output (JSON):**
 
-### Inspection Commands
+```json
+{
+  "sessions": [
+    {
+      "pid": 1234,
+      "username": "gpadmin",
+      "application": "psql",
+      "clientAddress": "10.0.0.1",
+      "state": "active",
+      "query": "SELECT * FROM orders",
+      "queryStart": "2026-05-14T10:00:00Z",
+      "duration": "00:05:30"
+    },
+    {
+      "pid": 5678,
+      "username": "appuser",
+      "application": "pgbench",
+      "clientAddress": "10.0.0.2",
+      "state": "idle",
+      "query": "INSERT INTO logs VALUES ($1)",
+      "queryStart": "2026-05-14T09:50:00Z",
+      "duration": "00:15:30"
+    }
+  ],
+  "total": 2
+}
+```
+
+**Session fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pid` | int | PostgreSQL backend process ID |
+| `username` | string | Database user running the session |
+| `application` | string | Application name (e.g., `psql`, `pgbench`) |
+| `clientAddress` | string | Client IP address |
+| `state` | string | Session state (`active`, `idle`, `idle in transaction`, etc.) |
+| `query` | string | Current or last executed query |
+| `queryStart` | string | ISO 8601 timestamp when the current query started |
+| `duration` | string | Elapsed time of the current query (e.g., `00:05:30`) |
+
+### Canceling a Query
+
+Cancel a running query without terminating the session. This calls `pg_cancel_backend()` on the coordinator:
+
+```bash
+cloudberry-ctl sessions cancel-query --cluster my-cluster 12345
+```
+
+**Example output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "canceled": true
+}
+```
+
+The `canceled` field indicates whether `pg_cancel_backend()` returned `true`. A value of `false` means the PID was not found or the query had already completed.
+
+### Terminating a Session
+
+Terminate a session entirely, disconnecting the client. This calls `pg_terminate_backend()` on the coordinator:
+
+```bash
+cloudberry-ctl sessions terminate --cluster my-cluster 12345
+```
+
+**Example output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "terminated": true
+}
+```
+
+The `terminated` field indicates whether `pg_terminate_backend()` returned `true`. A value of `false` means the PID was not found or the session had already ended.
+
+### Graceful Degradation
+
+When the database connection is not available (e.g., the `DBClientFactory` is not configured), the list sessions endpoint returns an empty result with an informational message instead of an error:
+
+```json
+{
+  "sessions": [],
+  "total": 0,
+  "message": "database connection not available"
+}
+```
+
+### Error Handling
+
+| Scenario | HTTP Status | Error Code | Description |
+|----------|-------------|------------|-------------|
+| Invalid PID (zero, negative, non-numeric) | 400 | `INVALID_REQUEST` | PID must be a positive integer |
+| Cluster not found | 404 | `CLUSTER_NOT_FOUND` | The specified cluster does not exist |
+| Database connection failed | 503 | `DB_UNAVAILABLE` | Cannot connect to the cluster's database |
+| Query execution failed | 500 | `INTERNAL_ERROR` | The database query or operation failed |
+
+> **PID validation**: The PID argument must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error (`INVALID_REQUEST: PID must be a positive integer`).
+
+## Resource Group Management
+
+Resource groups allow you to control how database resources (CPU, memory, concurrency) are allocated across different workloads and roles. You can create resource groups with specific limits, assign database roles to them, and manage their lifecycle through the CLI or REST API.
+
+Resource group operations execute SQL commands directly on the Cloudberry coordinator via the `DBClientFactory`. When the database connection is not available, create operations return a `201` response with a `"pending"` message, and list operations fall back to the CRD spec.
+
+### Creating a Resource Group
+
+Create a resource group with concurrency, CPU, and memory limits:
+
+```bash
+cloudberry-ctl resource-group create --cluster my-cluster \
+  --name analytics --concurrency 10 --cpu-max-percent 50 --memory-limit 30
+```
+
+**Flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--name` | string | Resource group name (required) |
+| `--concurrency` | int | Maximum number of concurrent transactions |
+| `--cpu-max-percent` | int | Maximum CPU usage percentage (0–100) |
+| `--memory-limit` | int | Memory limit percentage (0–100) |
+
+**Response (JSON):**
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30,
+  "status": "created"
+}
+```
+
+The underlying SQL executed on the coordinator is:
+
+```sql
+CREATE RESOURCE GROUP analytics WITH (concurrency=10, cpu_max_percent=50, memory_limit=30);
+```
+
+### Listing Resource Groups
+
+List all resource groups in the cluster:
+
+```bash
+cloudberry-ctl resource-group list --cluster my-cluster
+```
+
+**Response (JSON):**
+
+```json
+{
+  "resourceGroups": [
+    {
+      "name": "analytics",
+      "concurrency": 10,
+      "cpuMaxPercent": 50,
+      "memoryLimit": 30
+    }
+  ],
+  "total": 1
+}
+```
+
+When a database connection is available, resource groups are queried from `gp_toolkit.gp_resgroup_status`. When the database is unavailable, the endpoint falls back to the resource groups defined in the CRD spec.
+
+### Assigning a Role to a Resource Group
+
+Assign a database role to a resource group to enforce its resource limits on that role's queries:
+
+```bash
+cloudberry-ctl resource-group assign --cluster my-cluster \
+  --group analytics --role analyst
+```
+
+**Flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--group` | string | Resource group name (required) |
+| `--role` | string | Database role to assign (required) |
+
+**Response (JSON):**
+
+```json
+{
+  "group": "analytics",
+  "role": "analyst",
+  "status": "assigned"
+}
+```
+
+The underlying SQL executed on the coordinator is:
+
+```sql
+ALTER ROLE analyst RESOURCE GROUP analytics;
+```
+
+### Deleting a Resource Group
+
+Delete a resource group from the cluster:
+
+```bash
+cloudberry-ctl resource-group delete --cluster my-cluster --name analytics
+```
+
+**Response (JSON):**
+
+```json
+{
+  "group": "analytics",
+  "status": "deleted"
+}
+```
+
+The underlying SQL executed on the coordinator is:
+
+```sql
+DROP RESOURCE GROUP analytics;
+```
+
+> **Note**: You cannot delete a resource group that has roles assigned to it. Reassign or drop the roles first.
+
+## Inspection Commands
 
 ```bash
 # Disk usage
@@ -891,6 +1372,8 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_reconcile_total` | Counter | Total reconciliation count |
 | `cloudberry_reconcile_errors_total` | Counter | Reconciliation error count |
 | `cloudberry_reconcile_duration_seconds` | Histogram | Reconciliation duration |
+| `cloudberry_config_reload_total` | Counter | Configuration reload count |
+| `cloudberry_connections_max` | Gauge | Maximum configured connections |
 | `cloudberry_fts_probe_total` | Counter | Total FTS probes |
 | `cloudberry_fts_failover_total` | Counter | Total failovers |
 | `cloudberry_replication_lag_bytes` | Gauge | Replication lag per segment |
@@ -985,6 +1468,17 @@ Key event types:
 
 | Event | Type | Description |
 |-------|------|-------------|
+| `Stopping` | Normal | Cluster stop initiated |
+| `Stopped` | Normal | Cluster fully stopped (0 pods) |
+| `Starting` | Normal | Cluster start initiated |
+| `Started` | Normal | Cluster fully started |
+| `Restarting` | Normal | Cluster restart initiated |
+| `Restarted` | Normal | Cluster restart completed |
+| `ConfigReloaded` | Normal | Configuration reloaded without restart |
+| `RollingRestartStarted` | Normal | Rolling restart initiated for restart-required params |
+| `RollingRestartCompleted` | Normal | Rolling restart completed |
+| `MaintenanceStarted` | Normal | Maintenance Job created |
+| `MaintenanceUnknown` | Warning | Unknown maintenance operation requested |
 | `SegmentFailover` | Warning | Primary segment failed, mirror promoted |
 | `SegmentRecovered` | Normal | Failed segment recovered |
 | `SegmentsRebalanced` | Normal | Segment roles restored |

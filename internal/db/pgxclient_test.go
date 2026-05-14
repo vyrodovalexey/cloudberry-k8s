@@ -1160,6 +1160,27 @@ func TestPgxClient_AlterResourceGroup_Error(t *testing.T) {
 	assert.Contains(t, err.Error(), "altering resource group")
 }
 
+func TestPgxClient_AssignRoleResourceGroup_Mock(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return execResponse("ALTER ROLE")
+	})
+	defer cleanup()
+
+	err := client.AssignRoleResourceGroup(context.Background(), "analyst", "analytics")
+	assert.NoError(t, err)
+}
+
+func TestPgxClient_AssignRoleResourceGroup_Error(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return errorResponseMsg("role not found")
+	})
+	defer cleanup()
+
+	err := client.AssignRoleResourceGroup(context.Background(), "nonexistent", "analytics")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "assigning role")
+}
+
 func TestPgxClient_DropResourceGroup_Error(t *testing.T) {
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return errorResponseMsg("drop failed")
