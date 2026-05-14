@@ -61,7 +61,7 @@ func (s *APIIntegrationSuite) SetupTest() {
 	basicProvider := auth.NewBasicAuthProvider(store, nil)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
 
-	s.server = api.NewServer(s.env.Client, authMW, &metrics.NoopRecorder{}, nil)
+	s.server = api.NewServer(s.env.Client, authMW, nil, &metrics.NoopRecorder{}, nil)
 }
 
 func (s *APIIntegrationSuite) doRequest(method, path string, body string, username, password string) *httptest.ResponseRecorder {

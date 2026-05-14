@@ -14,10 +14,12 @@ The Cloudberry Operator is a Kubernetes operator that manages the full lifecycle
 
 1. **Declarative Cluster Management** - Define Cloudberry clusters as Kubernetes custom resources
 2. **Automated Lifecycle** - Install, upgrade, scale, configure, and remove clusters automatically
-3. **High Availability** - Segment mirroring, coordinator standby, automatic failover
-4. **Security** - Basic and OIDC authentication, RBAC, TLS, Vault integration
-5. **Observability** - Prometheus metrics, OTLP tracing, structured logging
-6. **CLI Companion** - `cloudberry-ctl` utility for imperative operations through the operator
+3. **Elastic Scaling** - Scale-out (add segments) and scale-in (remove segments) with automatic data redistribution and rebalancing
+4. **Storage Elasticity** - Online PV expansion for coordinator, standby, and segment storage
+5. **High Availability** - Segment mirroring, coordinator standby, automatic failover
+6. **Security** - Basic and OIDC authentication, RBAC, TLS, Vault integration
+7. **Observability** - Prometheus metrics, OTLP tracing, structured logging
+8. **CLI Companion** - `cloudberry-ctl` utility for imperative operations through the operator
 
 ## 3. Architecture
 
@@ -81,10 +83,10 @@ The operator follows the standard Kubernetes reconciliation pattern:
 
 | Controller | Watches | Manages |
 |-----------|---------|---------|
-| ClusterController | CloudberryCluster | StatefulSets, Services, ConfigMaps, Secrets, PVCs |
-| HAController | CloudberryCluster (HA section) | Mirroring config, FTS settings, standby lifecycle |
+| ClusterController | CloudberryCluster | StatefulSets, Services, ConfigMaps, Secrets, PVCs, scaling operations, PV expansion |
+| HAController | CloudberryCluster (HA section) | Mirroring config, FTS settings, standby lifecycle, segment rebalancing |
 | AuthController | CloudberryCluster (Auth section) | pg_hba.conf ConfigMap, OIDC config, TLS secrets |
-| AdminController | CloudberryCluster (Config section) | Parameter ConfigMaps, maintenance jobs |
+| AdminController | CloudberryCluster (Config section) | Parameter ConfigMaps, maintenance jobs, rolling restarts, data redistribution |
 
 ### 3.4 Operator Lifecycle
 
@@ -127,8 +129,8 @@ kubectl delete crd cloudberryclusters.avsoft.io
 
 | Component | Technology | Version |
 |-----------|-----------|---------|
-| Language | Go | 1.23+ |
-| Operator Framework | controller-runtime | v0.19+ |
+| Language | Go | 1.26+ |
+| Operator Framework | controller-runtime | v0.24+ |
 | CLI Framework | cobra + viper | latest |
 | OIDC | go-oidc/v3 + oauth2 | latest |
 | Database Driver | pgx/v5 | latest |

@@ -14,7 +14,7 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
 https://{operator-service}:{port}/api/v1alpha1
 ```
 
-Default port: 8443 (HTTPS)
+Default port: 8090 (HTTP) or 8443 (HTTPS with TLS)
 
 ## 3. Authentication
 
@@ -64,10 +64,27 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
-| POST | /clusters/{name}/start | Operator | Start cluster |
-| POST | /clusters/{name}/stop | Operator | Stop cluster |
+| POST | /clusters/{name}/start | Operator | Start cluster (modes: normal, restricted, maintenance) |
+| POST | /clusters/{name}/stop | Operator | Stop cluster (modes: smart, fast, immediate) |
 | POST | /clusters/{name}/restart | Operator | Restart cluster |
 | POST | /clusters/{name}/reload | Operator | Reload configuration |
+
+### 4.2.1 Scaling Operations
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| POST | /clusters/{name}/scale | Admin | Scale cluster segments |
+| GET | /clusters/{name}/scale/status | Operator Basic | Get scale operation status |
+| POST | /clusters/{name}/rebalance | Operator | Trigger data rebalancing |
+| GET | /clusters/{name}/rebalance/status | Operator Basic | Get rebalance status |
+
+### 4.2.2 Storage Operations
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| POST | /clusters/{name}/storage/expand | Admin | Expand PV storage |
+| GET | /clusters/{name}/storage/disk-usage | Basic | Get disk usage |
+| GET | /clusters/{name}/storage/pvcs | Basic | List PVC sizes and status |
 
 ### 4.3 Configuration
 
@@ -120,7 +137,16 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 | DELETE | /clusters/{name}/auth/roles/{role} | Admin | Delete role |
 | POST | /clusters/{name}/auth/rotate-password | Admin | Rotate admin password |
 
-### 4.8 Health and Metrics
+### 4.8 Resource Group Management
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| GET | /clusters/{name}/workload/resource-groups | Basic | List resource groups |
+| POST | /clusters/{name}/workload/resource-groups | Operator | Create resource group |
+| DELETE | /clusters/{name}/workload/resource-groups/{group} | Operator | Delete resource group |
+| POST | /clusters/{name}/workload/resource-groups/{group}/assign | Operator | Assign role to group |
+
+### 4.9 Health and Metrics
 
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
@@ -216,7 +242,89 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 }
 ```
 
-### 5.7 Session List Response
+### 5.7 Scale Request
+
+```json
+{
+  "segmentCount": 8,
+  "confirmScaleIn": false
+}
+```
+
+**Notes**:
+- If `segmentCount` > current count: scale-out (add segments)
+- If `segmentCount` < current count: scale-in (remove segments)
+- `confirmScaleIn` must be `true` when reducing by more than 50%
+
+### 5.8 Scale Status Response
+
+```json
+{
+  "operation": "scale-out",
+  "previousCount": 4,
+  "targetCount": 8,
+  "currentCount": 6,
+  "phase": "redistributing",
+  "redistributionProgress": 65,
+  "startedAt": "2026-05-14T10:00:00Z",
+  "estimatedCompletion": "2026-05-14T10:30:00Z"
+}
+```
+
+### 5.9 Storage Expand Request
+
+```json
+{
+  "component": "segments",
+  "newSize": "500Gi"
+}
+```
+
+**Valid `component` values**: `coordinator`, `standby`, `segments` (applies to all primary + mirror PVCs)
+
+### 5.10 Storage Expand Response
+
+```json
+{
+  "component": "segments",
+  "previousSize": "200Gi",
+  "newSize": "500Gi",
+  "affectedPVCs": 8,
+  "status": "expanding",
+  "requiresRestart": false
+}
+```
+
+### 5.11 Resource Group Create Request
+
+```json
+{
+  "name": "analytics",
+  "concurrency": 10,
+  "cpuMaxPercent": 50,
+  "memoryLimit": 30
+}
+```
+
+### 5.12 Resource Group Assign Request
+
+```json
+{
+  "role": "analyst"
+}
+```
+
+### 5.13 Rebalance Request
+
+```json
+{
+  "tables": ["public.orders", "public.customers"],
+  "parallelism": 4,
+  "excludeTables": ["audit_log", "temp_*"]
+}
+```
+
+### 5.14 Session List Response
 
 ```json
 {
@@ -264,13 +372,17 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 | 409 | CONFLICT | Operation conflicts with current state |
 | 422 | VALIDATION_ERROR | Request validation failed |
 | 500 | INTERNAL_ERROR | Unexpected server error |
+| 429 | RATE_LIMITED | Too many requests, retry after delay |
 | 503 | SERVICE_UNAVAILABLE | Operator not ready |
+| 503 | DB_UNAVAILABLE | Database connection unavailable |
 
 ### 6.3 Rate Limiting
 
-- Default: 100 requests/minute per authenticated user
-- Configurable via operator flags
+- Default: 10 requests/minute per client IP (token bucket algorithm)
+- Only trusts `X-Forwarded-For`/`X-Real-IP` from configured trusted proxies
+- Configurable via operator configuration
 - Returns `429 Too Many Requests` with `Retry-After` header
+- Applied before authentication to prevent brute-force attacks
 
 ## 7. Pagination
 

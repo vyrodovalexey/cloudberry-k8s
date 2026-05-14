@@ -186,6 +186,23 @@ spec:
                       type: string
                       enum: [preferred, required]
                       default: preferred
+                    rebalance:
+                      type: object
+                      description: "Segment rebalancing configuration"
+                      properties:
+                        skewThreshold:
+                          type: integer
+                          default: 10
+                          description: "Percentage skew threshold to trigger rebalance"
+                        parallelism:
+                          type: integer
+                          default: 2
+                          description: "Number of tables to redistribute concurrently"
+                        excludeTables:
+                          type: array
+                          items:
+                            type: string
+                          description: "Tables to skip during rebalance (supports glob patterns)"
 
                 # --- Authentication & Authorization ---
                 auth:
@@ -406,7 +423,7 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Initializing, Running, Updating, Scaling, Failed, Deleting]
+                  enum: [Pending, Initializing, Running, Updating, Scaling, Failed, Deleting, Stopped, Stopping, Restricted, Maintenance]
                 coordinatorReady:
                   type: boolean
                 standbyReady:
@@ -438,6 +455,12 @@ spec:
                       lastTransitionTime: { type: string, format: date-time }
                       reason: { type: string }
                       message: { type: string }
+                previousSegmentCount:
+                  type: integer
+                  description: "Previous segment count before scale operation (for tracking)"
+                redistributionProgress:
+                  type: integer
+                  description: "Data redistribution progress percentage (0-100)"
                 failedSegments:
                   type: array
                   items:
@@ -461,6 +484,10 @@ spec:
 | `AuthConfigured` | Authentication is properly configured |
 | `ConfigApplied` | All configuration parameters are applied |
 | `VaultConnected` | Vault connection is established (if enabled) |
+| `DataRedistribution` | Data redistribution status (InProgress, Completed, Failed) |
+| `StorageExpanded` | PV expansion status |
+| `ScaleOutCompleted` | Scale-out operation completed successfully |
+| `ScaleInCompleted` | Scale-in operation completed successfully |
 
 ### 1.3 Validation Rules
 
@@ -470,7 +497,10 @@ spec:
 4. If `vault.enabled` is true, `address` is required
 5. `config.parameters` keys must be valid Cloudberry configuration parameter names
 6. `deletionPolicy` defaults to `Retain` for safety
-7. **Cross-namespace name uniqueness**: CloudberryCluster names must be unique across all namespaces. This is enforced via a validating admission webhook that checks for duplicate `metadata.name` values across namespaces on CREATE operations. The webhook prevents naming collisions that could cause resource conflicts in shared infrastructure (e.g., shared storage, DNS, monitoring labels).
+7. Scale-in by more than 50% of current segment count requires confirmation annotation `avsoft.io/confirm-scale-in: "true"`
+8. Storage size can only be increased, never decreased (Kubernetes PVC limitation)
+9. Storage expansion requires the StorageClass to have `allowVolumeExpansion: true`
+10. **Cross-namespace name uniqueness**: CloudberryCluster names must be unique across all namespaces. This is enforced via a validating admission webhook that checks for duplicate `metadata.name` values across namespaces on CREATE operations. The webhook prevents naming collisions that could cause resource conflicts in shared infrastructure (e.g., shared storage, DNS, monitoring labels).
 
 ### 1.4 Webhook Validation Rules for Duplicate Detection
 
@@ -634,6 +664,59 @@ spec:
     otlpProtocol: grpc
   deletionPolicy: Retain
   backupOnDelete: true
+```
+
+### 2.3 Scale-Out Example
+
+```yaml
+# Scale from 4 to 8 segments with rebalance configuration
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: production-cluster
+  namespace: cloudberry-test
+spec:
+  segments:
+    count: 8          # increased from 4
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      storageClass: fast-ssd
+      size: 200Gi
+    rebalance:
+      skewThreshold: 10
+      parallelism: 4
+      excludeTables:
+        - "audit_log"
+        - "temp_*"
+```
+
+### 2.4 Storage Expansion Example
+
+```yaml
+# Expand coordinator storage from 50Gi to 100Gi
+# and segment storage from 200Gi to 500Gi
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: production-cluster
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      storageClass: fast-ssd
+      size: 100Gi       # increased from 50Gi
+  standby:
+    enabled: true
+    storage:
+      storageClass: fast-ssd
+      size: 100Gi       # increased from 50Gi
+  segments:
+    count: 8
+    storage:
+      storageClass: fast-ssd
+      size: 500Gi       # increased from 200Gi — applies to ALL primary and mirror PVCs
 ```
 
 ## 3. Printer Columns

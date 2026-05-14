@@ -56,7 +56,7 @@ func (s *AuthE2ESuite) TestE2E_AuthFlow_BasicAuth_FullJourney() {
 
 	basicProvider := auth.NewBasicAuthProvider(store, nil)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	server := api.NewServer(k8sEnv.Client, authMW, &metrics.NoopRecorder{}, nil)
+	server := api.NewServer(k8sEnv.Client, authMW, nil, &metrics.NoopRecorder{}, nil)
 
 	// Test matrix: endpoint -> required permission -> user -> expected result
 	tests := []struct {
@@ -119,7 +119,7 @@ func (s *AuthE2ESuite) TestE2E_AuthFlow_PermissionEscalation_Prevention() {
 
 	basicProvider := auth.NewBasicAuthProvider(store, nil)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	server := api.NewServer(k8sEnv.Client, authMW, &metrics.NoopRecorder{}, nil)
+	server := api.NewServer(k8sEnv.Client, authMW, nil, &metrics.NoopRecorder{}, nil)
 
 	// A viewer should NOT be able to perform any write operations
 	writeEndpoints := []struct {
@@ -163,7 +163,7 @@ func (s *AuthE2ESuite) TestE2E_AuthFlow_SecurityHeaders_AllEndpoints() {
 
 	basicProvider := auth.NewBasicAuthProvider(store, nil)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	server := api.NewServer(k8sEnv.Client, authMW, &metrics.NoopRecorder{}, nil)
+	server := api.NewServer(k8sEnv.Client, authMW, nil, &metrics.NoopRecorder{}, nil)
 
 	endpoints := []string{
 		"/healthz",
@@ -203,7 +203,7 @@ func (s *AuthE2ESuite) TestE2E_AuthFlow_APIResponseFormat() {
 
 	basicProvider := auth.NewBasicAuthProvider(store, nil)
 	authMW := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	server := api.NewServer(k8sEnv.Client, authMW, &metrics.NoopRecorder{}, nil)
+	server := api.NewServer(k8sEnv.Client, authMW, nil, &metrics.NoopRecorder{}, nil)
 
 	// Test that error responses have proper JSON format
 	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/clusters", nil)

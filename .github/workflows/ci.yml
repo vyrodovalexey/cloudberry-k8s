@@ -452,8 +452,9 @@ jobs:
       - name: Helm dry-run install
         run: |
           echo "==> Running Helm dry-run install..."
-          helm install --dry-run --debug ${{ env.HELM_CHART_PATH }} \
+          helm install --dry-run --debug cloudberry-operator ${{ env.HELM_CHART_PATH }} \
             --set installCRDs=true
+
 
       - name: Install Prometheus Operator CRDs
         run: |
