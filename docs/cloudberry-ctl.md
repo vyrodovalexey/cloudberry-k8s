@@ -10,9 +10,10 @@ All commands communicate with the operator via HTTP calls to the REST API server
 - [Configuration](#configuration)
 - [Global Flags](#global-flags)
 - [Environment Variables](#environment-variables)
+- [Verbose Mode](#verbose-mode)
 - [Command Reference](#command-reference)
   - [version](#version)
-  - [cluster](#cluster)
+  - [cluster](#cluster) (including [scale-status](#cluster-scale-status))
   - [config](#config)
   - [segments](#segments)
   - [ha](#ha)
@@ -94,6 +95,8 @@ Configuration values are resolved in this order (highest priority first):
 3. **Configuration file** (`~/.cloudberry-ctl.yaml`)
 4. **Default values**
 
+This priority order is enforced consistently across all settings. For example, if `CLOUDBERRY_NAMESPACE=production` is set as an environment variable but you pass `--namespace staging` on the command line, the CLI uses `staging`.
+
 ## Global Flags
 
 | Flag | Short | Description | Default |
@@ -107,7 +110,7 @@ Configuration values are resolved in this order (highest priority first):
 | `--username` | | Basic auth username | |
 | `--password` | | Basic auth password | (prompted if not set) |
 | `--output` | `-o` | Output format (`table`, `json`, `yaml`) | `table` |
-| `--verbose` | `-v` | Enable verbose output | `false` |
+| `--verbose` | `-v` | Enable verbose output (logs HTTP requests and responses) | `false` |
 | `--timeout` | | Operation timeout | `5m` |
 
 ## Environment Variables
@@ -125,15 +128,37 @@ All flags can be set via environment variables with the `CLOUDBERRY_` prefix:
 | `CLOUDBERRY_TIMEOUT` | `--timeout` |
 | `CLOUDBERRY_OUTPUT` | `--output` |
 
+## Verbose Mode
+
+The `--verbose` (`-v`) flag enables debug logging of HTTP requests and responses. When enabled, the CLI logs the HTTP method, URL, status code, and response body for each API call. This is useful for debugging connectivity issues, authentication failures, and unexpected API responses.
+
+```bash
+# Enable verbose output for a single command
+cloudberry-ctl cluster status --cluster my-cluster --verbose
+
+# Short form
+cloudberry-ctl cluster status --cluster my-cluster -v
+```
+
+**Example verbose output:**
+
+```
+GET http://localhost:8090/api/v1alpha1/clusters/my-cluster/status
+HTTP 200 OK
+{"name":"my-cluster","namespace":"cloudberry-test","status":{"phase":"Running",...}}
+```
+
+The verbose flag is wired through to the `OperatorClient`, which performs the actual HTTP calls. All request/response details are logged via `slog` at debug level.
+
 ## Implementation Status
 
 The following commands are fully implemented and communicate with the operator REST API:
 
 - `version`
-- `cluster status`, `cluster start`, `cluster stop`, `cluster restart`, `cluster create`, `cluster delete`
+- `cluster status`, `cluster start`, `cluster stop`, `cluster restart`, `cluster create`, `cluster delete`, `cluster scale-status`
 - `config get`, `config set`
 - `segments list`, `segments status`, `segments inspect`
-- `ha mirroring status`, `ha recovery start`, `ha recovery status`, `ha rebalance`, `ha standby status`, `ha standby activate`
+- `ha mirroring status`, `ha recovery start`, `ha recovery status`, `ha rebalance` (with `--status` and `--tables` flags), `ha standby status`, `ha standby activate`
 - `sessions list`, `sessions cancel-query`, `sessions terminate`
 - `maintenance vacuum`, `maintenance analyze`, `maintenance reindex`
 - `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
@@ -262,6 +287,59 @@ cloudberry-ctl cluster delete --cluster my-cluster --confirm
 # Retain data (PVCs)
 cloudberry-ctl cluster delete --cluster my-cluster --retain-data --confirm
 ```
+
+#### cluster scale-status
+
+Show the current scale operation status for a cluster. Reports whether a scale-out is in progress, segment readiness, and data redistribution state.
+
+```bash
+cloudberry-ctl cluster scale-status --cluster my-cluster
+```
+
+**Output (JSON — scaling in progress):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": true,
+  "phase": "Scaling",
+  "segmentsReady": 4,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "InProgress",
+    "message": "Data redistribution in progress"
+  }
+}
+```
+
+**Output (JSON — scaling completed):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": false,
+  "phase": "Running",
+  "segmentsReady": 6,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "Completed",
+    "message": "Data redistribution completed"
+  }
+}
+```
+
+**Output (table):**
+
+```
+CLUSTER      PHASE    SCALING  SEGMENTS  REDISTRIBUTION
+my-cluster   Running  false    6/6       Completed
+```
+
+This command calls `GET /clusters/{name}/scale/status` on the operator REST API.
 
 #### cluster upgrade
 
@@ -449,15 +527,51 @@ cloudberry-ctl ha recovery cancel --cluster my-cluster
 
 #### ha rebalance
 
-Rebalance segment roles after recovery.
+Rebalance segment data distribution. Redistributes data across segments based on the configured skew threshold, parallelism, and table exclusion patterns.
 
 ```bash
-# Rebalance all segments
+# Rebalance all segments (uses configured or default settings)
 cloudberry-ctl ha rebalance --cluster my-cluster
 
-# Rebalance specific segments
+# Rebalance specific tables only
+cloudberry-ctl ha rebalance --cluster my-cluster --tables orders,customers,logs
+
+# Check rebalance status (config + DataRedistribution condition)
+cloudberry-ctl ha rebalance --cluster my-cluster --status
+
+# Rebalance specific segments (legacy)
 cloudberry-ctl ha rebalance --cluster my-cluster --content-ids 0,1,2
 ```
+
+**Flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--status` | bool | Show rebalance status instead of triggering a rebalance. Returns the rebalance configuration and `DataRedistribution` condition |
+| `--tables` | string | Comma-separated list of tables to rebalance. When specified, only the listed tables are redistributed |
+| `--content-ids` | string | Comma-separated list of segment content IDs to rebalance |
+
+**Output (JSON — `--status`):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "config": {
+    "skewThreshold": 10,
+    "parallelism": 2,
+    "excludeTables": ["audit_log", "temp_*"]
+  },
+  "redistribution": {
+    "status": "True",
+    "reason": "RebalanceCompleted",
+    "message": "Rebalance completed successfully",
+    "lastTransition": "2026-05-14T10:05:00Z"
+  }
+}
+```
+
+This command calls `GET /clusters/{name}/rebalance/status` (with `--status`) or `POST /clusters/{name}/rebalance` (without `--status`) on the operator REST API.
 
 #### ha standby status
 

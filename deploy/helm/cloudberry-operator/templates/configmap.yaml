@@ -11,6 +11,7 @@ data:
     metrics-address: {{ .Values.operator.metricsAddress | quote }}
     health-probe-address: {{ .Values.operator.healthProbeAddress | quote }}
     webhook-port: {{ .Values.operator.webhookPort }}
+    webhook-enabled: {{ .Values.webhook.enabled }}
     log-level: {{ .Values.operator.logLevel | quote }}
     log-format: {{ .Values.operator.logFormat | quote }}
     leader-election: {{ .Values.operator.leaderElection }}

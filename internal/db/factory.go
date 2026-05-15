@@ -19,6 +19,13 @@ const (
 	passwordSecretKey = "password"
 )
 
+// DBClientFactory defines the interface for creating database clients for clusters.
+// This interface is shared across the api and controller packages to avoid duplication.
+type DBClientFactory interface {
+	// NewClient creates a new database client for the given cluster.
+	NewClient(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) (Client, error)
+}
+
 // ClientFactory creates database clients from cluster connection information.
 // It reads the coordinator service name, port, and admin credentials from the
 // cluster spec and the associated Kubernetes Secret.

@@ -13,6 +13,20 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Restarting a Cluster](#restarting-a-cluster)
   - [Phase Transitions](#phase-transitions)
   - [Action Annotations Reference](#action-annotations-reference)
+  - [Upgrading a Cluster](#upgrading-a-cluster)
+    - [Upgrade Process](#upgrade-process)
+    - [Monitoring Upgrade Progress](#monitoring-upgrade-progress)
+    - [Checking Upgrade Status](#checking-upgrade-status)
+    - [Automatic Rollback](#automatic-rollback)
+    - [Upgrade Events](#upgrade-events)
+    - [Troubleshooting Upgrades](#troubleshooting-upgrades)
+  - [Deleting a Cluster](#deleting-a-cluster)
+    - [Deletion Policy](#deletion-policy)
+    - [Backup on Delete](#backup-on-delete)
+    - [Deletion Flow](#deletion-flow)
+    - [Deletion Events](#deletion-events)
+    - [Monitoring Deletion](#monitoring-deletion)
+    - [No Finalizer Behavior](#no-finalizer-behavior)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -34,11 +48,40 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Listing Resource Groups](#listing-resource-groups)
   - [Assigning a Role to a Resource Group](#assigning-a-role-to-a-resource-group)
   - [Deleting a Resource Group](#deleting-a-resource-group)
+- [Storage Expansion](#storage-expansion)
+  - [StorageClass Requirements](#storageclass-requirements)
+  - [Expansion Scopes](#expansion-scopes)
+  - [Safety Constraints](#safety-constraints)
+  - [Monitoring Storage Expansion](#monitoring-storage-expansion)
+  - [Storage Expansion Events and Conditions](#storage-expansion-events-and-conditions)
+  - [Storage Expansion Metrics](#storage-expansion-metrics)
+- [Scaling Operations](#scaling-operations)
+  - [Scaling Out (Adding Segments)](#scaling-out-adding-segments)
+  - [Scaling In (Removing Segments)](#scaling-in-removing-segments)
+  - [Scale-Out Failure Handling](#scale-out-failure-handling)
+  - [Phase Transitions During Scaling](#phase-transitions-during-scaling)
+  - [Monitoring Scale Progress](#monitoring-scale-progress)
+  - [Data Redistribution](#data-redistribution)
+  - [Scale Metrics](#scale-metrics)
+- [Segment Rebalancing](#segment-rebalancing)
+  - [Rebalance Configuration](#rebalance-configuration)
+  - [Triggering a Rebalance](#triggering-a-rebalance)
+  - [Monitoring Rebalance Status](#monitoring-rebalance-status)
+  - [Rebalance Events and Conditions](#rebalance-events-and-conditions)
+  - [Rebalance Metrics](#rebalance-metrics)
 - [Test Data Setup](#test-data-setup)
   - [Test Data Schema](#test-data-schema)
   - [Pareto Skew Pattern](#pareto-skew-pattern)
   - [Rebalance Exclusion Patterns](#rebalance-exclusion-patterns)
   - [Loading Test Data](#loading-test-data)
+- [Error Handling and Observability](#error-handling-and-observability)
+  - [Structured Error Types](#structured-error-types)
+  - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
+  - [Reconciliation Metrics](#reconciliation-metrics)
+  - [Telemetry Spans](#telemetry-spans)
+  - [Structured Logging](#structured-logging)
+  - [Webhook Validation Errors](#webhook-validation-errors)
+  - [Pod Deletion Recovery](#pod-deletion-recovery)
 - [Inspection Commands](#inspection-commands)
 - [Monitoring and Observability](#monitoring-and-observability)
 
@@ -281,6 +324,8 @@ cloudberry-ctl cluster status --cluster production-cluster --output json
 
 > **Note**: All `cloudberry-ctl` commands communicate with the operator REST API server (default port `:8090`). The CLI uses the `internal/ctl.OperatorClient` to make authenticated HTTP calls. Ensure the operator is running and accessible before using CLI commands.
 
+> **Tip**: Use the `--verbose` (`-v`) flag to debug connectivity or authentication issues. Verbose mode logs HTTP request/response details. Configuration priority is: CLI flag > environment variable > config file > default. See [cloudberry-ctl reference](cloudberry-ctl.md) for details.
+
 ## Managing Cluster Lifecycle
 
 ### Cluster Phases
@@ -432,22 +477,140 @@ All lifecycle actions are triggered by setting the `avsoft.io/action` annotation
 
 ### Upgrading a Cluster
 
-To upgrade the database version, update the `spec.image` field:
+To upgrade the database version, update `spec.version` and `spec.image`:
 
 ```bash
 kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge -p '
-  {"spec": {"image": "postgres:17"}}'
+  {"spec": {"version": "7.2.0", "image": "postgres:17"}}'
 ```
 
-The operator performs a rolling upgrade:
-1. Pre-flight checks (cluster healthy, disk space)
-2. Update mirror StatefulSets (rolling)
-3. Update primary segment StatefulSets (rolling)
-4. Update standby coordinator
-5. Update coordinator
-6. Verify cluster health
+Or update the CRD manifest directly:
 
-If any step fails the health check, the operator reverts to the previous image.
+```yaml
+spec:
+  version: "7.2.0"    # was "7.1.0"
+  image: "postgres:17"  # was "postgres:16"
+```
+
+The operator detects the upgrade when `spec.version` differs from `status.clusterVersion` and performs a phase-by-phase rolling upgrade.
+
+#### Upgrade Process
+
+1. **Pre-flight check**: The cluster must be in `Running` phase. If not, the operator emits an `UpgradeBlocked` warning event and retries on the next reconciliation
+2. **State capture**: The operator saves the current image and version in the `avsoft.io/upgrade` annotation for rollback
+3. **Phase transition**: The cluster phase changes to `Updating`
+4. **Rolling upgrade** (least critical components first):
+   - **Mirrors** — Mirror segment StatefulSet image is updated; waits for all mirror pods to be ready
+   - **Primaries** — Primary segment StatefulSet image is updated; waits for all primary pods to be ready
+   - **Standby** — Standby coordinator StatefulSet image is updated; waits for the standby pod to be ready (skipped if standby is not enabled)
+   - **Coordinator** — Coordinator StatefulSet image is updated; waits for the coordinator pod to be ready
+5. **Verification**: Post-upgrade health check confirms the coordinator and primary segments are ready
+6. **Completion**: Phase returns to `Running`, `status.clusterVersion` is updated, and the `UpgradeCompleted` event is emitted
+
+#### Monitoring Upgrade Progress
+
+```bash
+# Watch the cluster phase
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+
+# Check the upgrade annotation for current phase
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.metadata.annotations.avsoft\.io/upgrade}' | jq .
+
+# Watch upgrade events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -i upgrade
+```
+
+**Example upgrade annotation** (during the primaries phase):
+
+```json
+{
+  "previousImage": "postgres:16",
+  "previousVersion": "7.1.0",
+  "phase": "primaries",
+  "startedAt": "2026-05-15T10:00:00Z",
+  "phaseStartedAt": "2026-05-15T10:01:00Z"
+}
+```
+
+#### Checking Upgrade Status
+
+```bash
+# Check if upgrade completed
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="UpgradeCompleted")]}' | jq .
+
+# Check if upgrade failed
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="UpgradeFailed")]}' | jq .
+
+# Verify the new cluster version
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.clusterVersion}'
+```
+
+#### Automatic Rollback
+
+Each upgrade phase has a **10-minute timeout**. If a phase does not complete within this window (e.g., new pods fail to become ready), the operator automatically rolls back:
+
+1. **ALL** StatefulSets (mirrors, primaries, standby, coordinator) are reverted to the previous image
+2. The cluster phase returns to `Running` with the old version
+3. The `UpgradeFailed` condition is set with reason `RolledBack`
+4. An `UpgradeRollback` warning event is emitted
+
+```bash
+# After a rollback, check the UpgradeFailed condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="UpgradeFailed")]}' | jq .
+```
+
+**Example output:**
+
+```json
+{
+  "type": "UpgradeFailed",
+  "status": "True",
+  "reason": "RolledBack",
+  "message": "phase \"coordinator\" timed out after 10m0s",
+  "lastTransitionTime": "2026-05-15T10:12:00Z"
+}
+```
+
+#### Upgrade Events
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `UpgradeStarted` | Normal | Upgrade initiated (includes previous and new version) |
+| `UpgradeCompleted` | Normal | Upgrade completed successfully |
+| `UpgradeBlocked` | Warning | Upgrade blocked — cluster not in `Running` phase |
+| `UpgradeRollback` | Warning | Upgrade rolled back due to phase timeout |
+
+```bash
+# View all upgrade-related events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'Upgrade'
+```
+
+#### Troubleshooting Upgrades
+
+If an upgrade fails and rolls back:
+
+1. **Check why pods failed to become ready**:
+
+   ```bash
+   kubectl get pods -n cloudberry-test -l avsoft.io/cluster=my-cluster | grep -v Running
+   kubectl describe pod <failing-pod> -n cloudberry-test
+   kubectl logs <failing-pod> -n cloudberry-test
+   ```
+
+2. **Common causes**:
+
+   | Cause | Symptoms | Resolution |
+   |-------|----------|------------|
+   | Invalid image | Pods in `ImagePullBackOff` | Fix the image name/tag and retry |
+   | Incompatible version | Pods crash-looping | Check database compatibility and use a supported version |
+   | Insufficient resources | Pods stuck in `Pending` | Increase resource limits or add nodes |
+
+3. **Retry the upgrade** after fixing the issue by patching `spec.version` and `spec.image` again
 
 ### Deleting a Cluster
 
@@ -459,11 +622,87 @@ cloudberry-ctl cluster delete --cluster my-cluster --confirm
 kubectl delete cloudberrycluster my-cluster -n cloudberry-test
 ```
 
-The deletion behavior depends on the `deletionPolicy`:
-- **Retain** (default): PVCs are preserved after deletion
-- **Delete**: PVCs are removed along with the cluster
+When you delete a `CloudberryCluster`, the operator's finalizer intercepts the deletion and performs cleanup before the resource is removed. The cluster phase transitions from its current state to `Deleting` during this process.
 
-If `backupOnDelete: true`, the operator triggers a backup before deletion.
+#### Deletion Policy
+
+The `deletionPolicy` field controls what happens to PVCs when the cluster is deleted:
+
+| Policy | Behavior | Use Case |
+|--------|----------|----------|
+| `Retain` (default) | PVCs are preserved after deletion | Data recovery, audit compliance, debugging |
+| `Delete` | All cluster PVCs are automatically deleted | Cost savings, ephemeral environments |
+
+Configure the deletion policy in the CRD:
+
+```yaml
+spec:
+  deletionPolicy: Retain    # or "Delete"
+  backupOnDelete: true       # optional: trigger backup before deletion
+```
+
+#### Backup on Delete
+
+When `backupOnDelete: true`, the operator creates a maintenance Job to perform a backup before proceeding with deletion. This ensures you have a recovery point even when deleting a cluster.
+
+```yaml
+spec:
+  deletionPolicy: Retain
+  backupOnDelete: true
+```
+
+The backup Job:
+- **Name**: `{cluster}-maintenance-{timestamp}` with `backup-on-delete` in the name
+- **Operation**: `backup-on-delete` (maps to `gpbackup` in production Cloudberry)
+- **Labels**: `avsoft.io/cluster={cluster}`, `avsoft.io/operation=backup-on-delete`
+- **Properties**: Same as other maintenance Jobs (`BackoffLimit=1`, `TTLSecondsAfterFinished=3600`)
+
+#### Deletion Flow
+
+The operator processes deletion in the following order:
+
+1. **Phase transition**: Sets the cluster phase to `Deleting` and emits a `Deleting` event
+2. **Backup** (if `backupOnDelete: true`): Creates a backup maintenance Job and emits a `BackupOnDelete` event
+3. **PVC cleanup**: Based on the `deletionPolicy`:
+   - **Retain**: PVCs are preserved; emits a `PVCsRetained` event
+   - **Delete**: All cluster PVCs are deleted; emits a `PVCsDeleted` event
+4. **Finalizer removal**: Removes the `avsoft.io/finalizer` finalizer, allowing Kubernetes to complete the deletion
+5. **Completion**: Emits a `Deleted` event
+
+#### Deletion Events
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `Deleting` | Normal | Cluster deletion initiated, phase set to `Deleting` |
+| `BackupOnDelete` | Normal | Backup triggered before deletion (when `backupOnDelete: true`) |
+| `PVCsRetained` | Normal | PVCs preserved (when `deletionPolicy: Retain`) |
+| `PVCsDeleted` | Normal | All PVCs deleted (when `deletionPolicy: Delete`) |
+| `Deleted` | Normal | Cluster deletion completed, finalizer removed |
+
+```bash
+# Watch deletion events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'Deleting|BackupOnDelete|PVCs|Deleted'
+```
+
+#### Monitoring Deletion
+
+```bash
+# Watch the cluster phase during deletion
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+
+# Check if backup Job was created
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=my-cluster,avsoft.io/operation=backup-on-delete
+
+# Verify PVC state after deletion
+kubectl get pvc -n cloudberry-test -l avsoft.io/cluster=my-cluster
+```
+
+#### No Finalizer Behavior
+
+If the cluster does not have a finalizer (e.g., it was removed manually), Kubernetes deletes the resource immediately without invoking the operator's deletion logic. No backup is performed, no PVC cleanup occurs, and no deletion events are emitted.
+
+> **Note**: The operator automatically adds a finalizer when creating a cluster. Removing the finalizer manually bypasses all deletion safeguards.
 
 ## Configuration Management
 
@@ -1055,8 +1294,11 @@ The operator creates Kubernetes `batchv1.Job` resources for maintenance operatio
 | Full Vacuum | `vacuum-full` | `VACUUM FULL` |
 | Analyze | `analyze` | `ANALYZE` |
 | Reindex | `reindex` | `REINDEX DATABASE` |
+| Redistribute | `redistribute` | `ANALYZE` (maps to `gpexpand` in production Cloudberry) |
+| Rebalance | `rebalance` | `ANALYZE` (maps to `gpexpand` redistribution in production Cloudberry) |
+| Backup on Delete | `backup-on-delete` | `SELECT 1` (maps to `gpbackup` in production Cloudberry) |
 
-Unknown operations emit a `MaintenanceUnknown` warning event and are not executed.
+The `redistribute` operation is created automatically during scale-out operations. The `rebalance` operation is created when a manual rebalance is triggered via annotation or API. The `backup-on-delete` operation is created automatically during cluster deletion when `backupOnDelete: true`. Unknown operations emit a `MaintenanceUnknown` warning event and are not executed.
 
 **Events:**
 - `MaintenanceStarted` (Normal) — Job created with the job name in the message
@@ -1339,6 +1581,820 @@ DROP RESOURCE GROUP analytics;
 
 > **Note**: You cannot delete a resource group that has roles assigned to it. Reassign or drop the roles first.
 
+## Storage Expansion
+
+The operator supports online expansion of persistent volume claims (PVCs) for all cluster components. When you increase a storage size in the `CloudberryCluster` spec, the operator detects the change during reconciliation and patches the corresponding PVCs to the new size.
+
+> **Prerequisite**: Your `StorageClass` must support volume expansion (`allowVolumeExpansion: true`). Without this, the operator blocks the PVC patch entirely and logs a warning. See [StorageClass Requirements](#storageclass-requirements) below.
+
+### StorageClass Requirements
+
+The operator performs a **pre-flight StorageClass check** before expanding any PVC. The StorageClass referenced by the PVC must have `allowVolumeExpansion: true` for the expansion to proceed.
+
+#### How the Check Works
+
+When `expandPVCIfNeeded()` detects that a PVC needs resizing, it calls `storageClassSupportsExpansion()` which:
+
+1. Reads the StorageClass name from the PVC's `spec.storageClassName` field
+2. Falls back to the legacy `volume.beta.kubernetes.io/storage-class` annotation if the field is not set
+3. Looks up the StorageClass in the Kubernetes API
+4. Checks the `allowVolumeExpansion` field:
+   - **`true`** — expansion proceeds normally
+   - **`false` or `nil`** — expansion is **blocked**; a warning is logged and the PVC remains unchanged
+   - **StorageClass not found** — expansion is **blocked** with a descriptive reason
+5. If **no StorageClass is specified** (the PVC uses the cluster default), the expansion is **allowed** (the operator cannot determine the default StorageClass's capabilities)
+6. On **transient API errors**, the expansion is **allowed** rather than blocked (fail-open to avoid permanently blocking legitimate expansions)
+
+#### Checking Your StorageClass
+
+Verify that your StorageClass supports volume expansion:
+
+```bash
+# Check a specific StorageClass
+kubectl get storageclass <name> -o jsonpath='{.allowVolumeExpansion}'
+
+# List all StorageClasses with their expansion support
+kubectl get storageclass -o custom-columns=NAME:.metadata.name,EXPANSION:.allowVolumeExpansion
+```
+
+#### Enabling Volume Expansion
+
+If your StorageClass does not support expansion, you can enable it:
+
+```bash
+kubectl patch storageclass <name> -p '{"allowVolumeExpansion": true}'
+```
+
+> **Note**: Not all storage provisioners support volume expansion even when `allowVolumeExpansion` is set to `true`. Check your storage provider's documentation to confirm support.
+
+#### What Happens When Expansion Is Blocked
+
+When the StorageClass does not support expansion, the operator:
+
+1. Logs a **WARN**-level message with the PVC name, StorageClass name, reason, and the current and desired sizes
+2. **Skips** the PVC patch — the PVC remains at its current size
+3. **Does not return an error** — reconciliation continues normally for other components
+4. **Does not emit** a `StorageExpanded` event or set the `StorageExpanded` condition
+
+**Example log output:**
+
+```json
+{
+  "level": "WARN",
+  "msg": "PVC expansion blocked by StorageClass",
+  "pvc": "data-my-cluster-coordinator-0",
+  "storageClass": "standard",
+  "reason": "StorageClass \"standard\" does not allow volume expansion",
+  "currentSize": "5Gi",
+  "desiredSize": "10Gi"
+}
+```
+
+This is a non-fatal condition. To resolve it, either enable `allowVolumeExpansion` on the StorageClass or migrate to a StorageClass that supports expansion.
+
+#### Docker Desktop / hostpath Limitation
+
+The Docker Desktop `hostpath` provisioner does **not** actually implement volume expansion at the storage layer, even when `allowVolumeExpansion: true` is set on the StorageClass. The operator patches the PVC's `spec.resources.requests.storage` to the new size, but the underlying volume on disk does not resize.
+
+This means:
+- The PVC metadata shows the new size
+- The actual available disk space inside the container remains unchanged
+- This limitation applies only to local development with Docker Desktop
+
+For production environments, use a storage provisioner that fully supports volume expansion (e.g., AWS EBS, GCE PD, Azure Disk, Ceph RBD).
+
+### Expansion Scopes
+
+Storage expansion operates independently on three scopes. You can expand one scope without affecting the others.
+
+#### Coordinator Storage
+
+Expand the coordinator's PVC by increasing `spec.coordinator.storage.size`:
+
+```yaml
+spec:
+  coordinator:
+    storage:
+      size: 10Gi    # was 5Gi
+```
+
+Or via `kubectl patch`:
+
+```bash
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"coordinator": {"storage": {"size": "10Gi"}}}}'
+```
+
+The operator patches the single coordinator PVC (`data-{cluster}-coordinator-0`). Standby and segment PVCs remain unchanged.
+
+#### Standby Storage
+
+Expand the standby coordinator's PVC by increasing `spec.standby.storage.size`:
+
+```yaml
+spec:
+  standby:
+    enabled: true
+    storage:
+      size: 10Gi    # was 5Gi
+```
+
+Or via `kubectl patch`:
+
+```bash
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"standby": {"storage": {"size": "10Gi"}}}}'
+```
+
+The operator patches the single standby PVC (`data-{cluster}-standby-0`). Coordinator and segment PVCs remain unchanged.
+
+> **Note**: Standby expansion is skipped if `spec.standby.enabled` is `false` or `spec.standby.storage` is not set.
+
+#### Segment Storage
+
+Expand all segment PVCs by increasing `spec.segments.storage.size`:
+
+```yaml
+spec:
+  segments:
+    count: 4
+    mirroring:
+      enabled: true
+    storage:
+      size: 10Gi    # was 5Gi
+```
+
+Or via `kubectl patch`:
+
+```bash
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"storage": {"size": "10Gi"}}}}'
+```
+
+The operator patches **all** primary segment PVCs (`data-{cluster}-segment-primary-0` through `data-{cluster}-segment-primary-N`) and, if mirroring is enabled, all mirror segment PVCs (`data-{cluster}-segment-mirror-0` through `data-{cluster}-segment-mirror-N`).
+
+**Example**: A cluster with 3 segments and mirroring enabled has 6 segment PVCs. Increasing `segments.storage.size` from `5Gi` to `10Gi` expands all 6 PVCs. The coordinator PVC remains unchanged.
+
+### Safety Constraints
+
+**No shrink allowed**: The operator only expands PVCs — it never shrinks them. If the desired size is less than or equal to the current PVC size, the expansion is silently skipped. This prevents accidental data loss from reducing volume sizes.
+
+**PVC not found is skipped**: If a PVC does not yet exist (e.g., during initial cluster creation before StatefulSets have created their PVCs), the expansion is skipped without error. The PVC is created at the correct size by the StatefulSet's `volumeClaimTemplate`.
+
+**StorageClass requirement**: The underlying `StorageClass` must have `allowVolumeExpansion: true`. Verify your StorageClass supports expansion:
+
+```bash
+kubectl get storageclass -o custom-columns=NAME:.metadata.name,EXPANSION:.allowVolumeExpansion
+```
+
+**No downtime**: PVC expansion is an online operation — pods do not need to restart. However, some storage providers may require the pod to be restarted for the filesystem to recognize the new size. Check your storage provider's documentation.
+
+### Monitoring Storage Expansion
+
+#### Via CLI
+
+```bash
+# List all PVCs for a cluster with their current sizes
+cloudberry-ctl cluster pvcs --cluster my-cluster
+```
+
+#### Via API
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/pvcs?namespace=cloudberry-test"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "pvcs": [
+    {
+      "name": "data-my-cluster-coordinator-0",
+      "component": "coordinator",
+      "size": "10Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-standby-0",
+      "component": "standby",
+      "size": "10Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-segment-primary-0",
+      "component": "segment-primary",
+      "size": "10Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-segment-mirror-0",
+      "component": "segment-mirror",
+      "size": "10Gi",
+      "phase": "Bound"
+    }
+  ],
+  "total": 4
+}
+```
+
+#### Via kubectl
+
+```bash
+# Check PVC sizes directly
+kubectl get pvc -n cloudberry-test -l avsoft.io/cluster=my-cluster \
+  -o custom-columns=NAME:.metadata.name,SIZE:.spec.resources.requests.storage,STATUS:.status.phase
+
+# Check the StorageExpanded condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="StorageExpanded")]}'
+
+# Watch storage expansion events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep StorageExpanded
+```
+
+### Storage Expansion Events and Conditions
+
+The operator emits the following event when PVCs are expanded:
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `StorageExpanded` | Normal | PVC storage expanded successfully |
+
+The `StorageExpanded` status condition tracks whether PVCs have been expanded:
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `StorageExpanded` | `True` | `PVCsExpanded` | Persistent volume claims expanded to new sizes |
+
+**Example condition:**
+
+```json
+{
+  "type": "StorageExpanded",
+  "status": "True",
+  "reason": "PVCsExpanded",
+  "message": "Persistent volume claims expanded to new sizes",
+  "lastTransitionTime": "2026-05-15T10:00:00Z"
+}
+```
+
+### Storage Expansion Metrics
+
+The operator exposes a Prometheus metric for PVC sizes:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_pvc_size_bytes` | Gauge | `cluster`, `namespace`, `component` | PVC size in bytes for each component |
+
+```promql
+# Coordinator PVC size
+cloudberry_pvc_size_bytes{cluster="my-cluster", component="coordinator"}
+
+# All segment PVC sizes
+cloudberry_pvc_size_bytes{cluster="my-cluster", component=~"segment-.*"}
+
+# Total storage across all components
+sum(cloudberry_pvc_size_bytes{cluster="my-cluster"})
+```
+
+## Scaling Operations
+
+The operator supports scaling a Cloudberry cluster by changing the segment count. When you modify `spec.segments.count`, the operator detects the difference between the desired and actual StatefulSet replicas, transitions the cluster to the `Scaling` phase, updates both primary and mirror StatefulSets, creates a data redistribution Job, and transitions back to `Running` once all pods reach the desired replica count. Both scale-out (adding segments) and scale-in (removing segments) are supported.
+
+### Scaling Out (Adding Segments)
+
+To scale out a cluster, patch the `segments.count` field in the CRD:
+
+```bash
+# Scale from 4 to 6 segments
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"count": 6}}}'
+```
+
+Or update the CRD manifest directly:
+
+```yaml
+spec:
+  segments:
+    count: 6    # was 4
+```
+
+The operator automatically:
+1. Detects the scale-out in `reconcileSegments()` by comparing `spec.segments.count` against the current StatefulSet replicas
+2. Sets the cluster phase to `Scaling`
+3. Updates the primary segment StatefulSet replicas to the new count
+4. Updates the mirror segment StatefulSet replicas (if mirroring is enabled)
+5. Creates a redistribution Job to rebalance data across the new segments
+6. Monitors pod readiness and transitions back to `Running` when all pods are ready
+
+**Example**: Scaling a mirrored cluster from 4 to 6 segments:
+- Before: 10 pods (1 coordinator + 1 standby + 4 primaries + 4 mirrors)
+- After: 14 pods (1 coordinator + 1 standby + 6 primaries + 6 mirrors)
+
+### Scaling In (Removing Segments)
+
+To scale in a cluster, decrease the `segments.count` field in the CRD:
+
+```bash
+# Scale from 6 to 4 segments
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"count": 4}}}'
+```
+
+Or update the CRD manifest directly:
+
+```yaml
+spec:
+  segments:
+    count: 4    # was 6
+```
+
+The operator automatically:
+1. Detects the scale-in in `reconcileSegments()` by comparing `spec.segments.count` against the current StatefulSet replicas
+2. Sets the cluster phase to `Scaling`
+3. Creates a redistribution Job to move data off the segments being removed
+4. Scales down the mirror segment StatefulSet first (if mirroring is enabled)
+5. Scales down the primary segment StatefulSet
+6. Handles PVC cleanup based on the `deletionPolicy`
+7. Transitions back to `Running` when all StatefulSets reach the desired replica count
+
+**Example**: Scaling a mirrored cluster from 6 to 4 segments:
+- Before: 14 pods (1 coordinator + 1 standby + 6 primaries + 6 mirrors)
+- After: 10 pods (1 coordinator + 1 standby + 4 primaries + 4 mirrors)
+
+#### PVC Behavior During Scale-In
+
+The `deletionPolicy` controls what happens to PVCs for removed segments:
+
+| Policy | Behavior | Use Case |
+|--------|----------|----------|
+| `Retain` (default) | PVCs for removed segments are preserved | Data recovery, audit compliance |
+| `Delete` | PVCs for removed segments are automatically deleted | Cost savings, ephemeral environments |
+
+**Retain policy example** (scaling from 6 → 4 segments):
+- Mirror and primary StatefulSets scale from 6 to 4 replicas
+- PVCs for segments 4 and 5 remain in the namespace
+- Total PVCs remain at 16 (12 active + 4 orphaned)
+- Orphaned PVCs can be manually cleaned up later
+
+**Delete policy example** (scaling from 6 → 4 segments):
+- Mirror and primary StatefulSets scale from 6 to 4 replicas
+- PVCs for segments 4 and 5 are automatically deleted by `cleanupOrphanedPVCs()`
+- Total PVCs decrease from 16 to 12
+
+#### 50% Confirmation Requirement
+
+Scale-in operations that reduce the segment count by more than 50% require an explicit confirmation annotation. This safety mechanism prevents accidental large-scale reductions that could cause significant data movement and potential service disruption.
+
+**How it works**: The operator calculates `newCount / currentCount`. If the ratio is less than 0.5 (i.e., more than 50% of segments are being removed), the operation is blocked unless the `avsoft.io/confirm-scale-in=true` annotation is present on the cluster resource.
+
+**Example: Scaling from 8 to 3 segments (62.5% reduction)**
+
+```bash
+# Step 1: This is BLOCKED — scaling from 8 to 3 is a 62.5% reduction (>50%)
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"count": 3}}}'
+
+# The operator emits a ScaleInBlocked warning event:
+#   ScaleInBlocked — "Scale-in from 8 to 3 requires annotation avsoft.io/confirm-scale-in=true"
+# The cluster phase stays Running, and no StatefulSets are modified.
+
+# Step 2: Add the confirmation annotation
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/confirm-scale-in=true
+
+# Step 3: Now the scale-in proceeds on the next reconciliation
+# The operator detects the annotation and allows the scale-in:
+#   - Phase transitions: Running → Scaling → Running
+#   - Events: ScaleInStarted, ScaleInCompleted
+#   - Primary and mirror StatefulSets scale from 8 to 3 replicas
+```
+
+After the scale-in completes successfully, the operator **automatically removes** the `avsoft.io/confirm-scale-in` annotation along with the `avsoft.io/scale-started` annotation. You do not need to clean up the annotation manually.
+
+**Boundary behavior**:
+
+| From | To | Reduction | Blocked? | Reason |
+|------|----|-----------|----------|--------|
+| 8 | 3 | 62.5% | **Yes** | Exceeds 50% threshold |
+| 10 | 4 | 60% | **Yes** | Exceeds 50% threshold |
+| 8 | 4 | 50% (exactly) | **No** | Check uses strict less-than (`< 0.5`) |
+| 6 | 4 | 33% | **No** | Within 50% threshold |
+
+> **Note**: The confirmation annotation is checked only when the new count is less than 50% of the current count. Scale-in operations at or within the 50% threshold proceed without confirmation. The annotation has no effect on scale-out operations.
+
+### Scale-Out Failure Handling
+
+The operator includes pre-flight checks, timeout detection, and failure reporting for scale operations. These mechanisms prevent scaling in unsafe states and surface failures for manual resolution.
+
+#### Pre-Flight Blocking
+
+Scale-out and scale-in operations require the cluster to be in the `Running` phase. If the cluster is in any other phase (e.g., `Initializing`, `Stopped`, `Scaling`), the operator blocks the operation and emits a warning event:
+
+```bash
+# Check events for blocked scale operations
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'ScaleOutBlocked|ScaleInBlocked'
+```
+
+| Event | Type | Trigger |
+|-------|------|---------|
+| `ScaleOutBlocked` | Warning | Scale-out attempted when cluster is not in `Running` phase |
+| `ScaleInBlocked` | Warning | Scale-in attempted when cluster is not in `Running` phase, or >50% reduction without confirmation |
+
+The operator does not return an error for blocked operations — it skips the scale and retries on the next reconciliation cycle. Once the cluster reaches the `Running` phase, the pending scale operation proceeds automatically.
+
+#### Timeout and Failure Detection
+
+When a scale operation starts, the operator sets the `avsoft.io/scale-started` annotation with the current timestamp. On each reconciliation, `checkScaleProgress()` checks whether the operation has exceeded the **10-minute timeout**.
+
+If the timeout elapses and not all segment pods are ready, the operator invokes `handleScaleFailure()`:
+
+1. Identifies which primary and mirror segments are not ready
+2. Populates `status.failedSegments` with details for each unready segment
+3. Sets the `ScaleOutFailed` condition to `True` with reason `SegmentsNotReady`
+4. Emits a `ScaleOutFailed` warning event
+5. Removes the `avsoft.io/scale-started` annotation
+6. The cluster **stays in the `Scaling` phase** — no automatic rollback
+
+#### Checking Failed Segments
+
+After a scale failure, inspect the cluster status to see which segments failed:
+
+```bash
+# View failed segments in the cluster status
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.failedSegments}' | jq .
+```
+
+**Example output:**
+
+```json
+[
+  {
+    "contentID": 4,
+    "hostname": "my-cluster-segment-primary-4",
+    "role": "primary",
+    "status": "NotReady"
+  },
+  {
+    "contentID": 5,
+    "hostname": "my-cluster-segment-primary-5",
+    "role": "primary",
+    "status": "NotReady"
+  }
+]
+```
+
+Check the `ScaleOutFailed` condition for summary information:
+
+```bash
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="ScaleOutFailed")]}' | jq .
+```
+
+**Example output:**
+
+```json
+{
+  "type": "ScaleOutFailed",
+  "status": "True",
+  "reason": "SegmentsNotReady",
+  "message": "Scale-out failed: 2 segments not ready after 10m0s",
+  "lastTransitionTime": "2026-05-15T10:15:00Z"
+}
+```
+
+#### Manual Recovery Steps
+
+Since the operator does not automatically roll back a failed scale operation, you must resolve the issue manually:
+
+1. **Diagnose the failure** — Check why the new segment pods are not ready:
+
+   ```bash
+   # Check pod status
+   kubectl get pods -n cloudberry-test -l avsoft.io/cluster=my-cluster | grep -v Running
+
+   # Describe a failing pod for events and conditions
+   kubectl describe pod my-cluster-segment-primary-4 -n cloudberry-test
+
+   # Check pod logs
+   kubectl logs my-cluster-segment-primary-4 -n cloudberry-test
+   ```
+
+2. **Common causes and fixes**:
+
+   | Cause | Symptoms | Resolution |
+   |-------|----------|------------|
+   | Insufficient node resources | Pod stuck in `Pending` | Add nodes or increase resource quotas |
+   | PVC provisioning failure | Pod stuck in `Pending` with PVC events | Check StorageClass and available storage |
+   | Image pull failure | Pod in `ImagePullBackOff` | Verify image name and registry access |
+   | Readiness probe failure | Pod in `Running` but not `Ready` | Check database initialization logs |
+   | Node affinity/anti-affinity | Pod stuck in `Pending` | Adjust anti-affinity rules or add nodes |
+
+3. **After fixing the underlying issue**, the operator automatically detects that the pods become ready on the next reconciliation cycle and transitions the cluster back to `Running`.
+
+4. **If you need to revert** the scale operation (scale back to the original count), update `spec.segments.count` back to the previous value:
+
+   ```bash
+   # Revert from 6 back to 4 segments
+   kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+     -p '{"spec": {"segments": {"count": 4}}}'
+   ```
+
+   > **Note**: Reverting a failed scale-out triggers a scale-in operation, which requires the cluster to be in `Running` phase. If the cluster is stuck in `Scaling` phase due to the failure, you may need to manually resolve the pod issues first.
+
+### Phase Transitions During Scaling
+
+```
+┌─────────┐    segments.count    ┌─────────┐    all pods ready    ┌─────────┐
+│ Running │───── changed ───────▶│ Scaling │────── complete ─────▶│ Running │
+└─────────┘                      └─────────┘                      └─────────┘
+```
+
+During scaling (both scale-out and scale-in):
+- The cluster phase changes from `Running` to `Scaling`
+- A `DataRedistribution` condition is set with reason `ScaleOutStarted` or `ScaleInStarted`
+- A `ScaleOutStarted` or `ScaleInStarted` event is emitted
+- When all segment StatefulSets reach the desired replica count, the phase returns to `Running`
+- A `ScaleOutCompleted` or `ScaleInCompleted` event is emitted
+- The `DataRedistribution` condition is updated with reason `Completed`
+- For scale-in with `deletionPolicy=Delete`, orphaned PVCs are cleaned up at completion
+
+### Monitoring Scale Progress
+
+#### Via CLI
+
+```bash
+# Check scale operation status
+cloudberry-ctl cluster scale-status --cluster my-cluster
+```
+
+**Output (JSON):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": true,
+  "phase": "Scaling",
+  "segmentsReady": 4,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "InProgress",
+    "message": "Data redistribution in progress"
+  }
+}
+```
+
+After scaling completes:
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": false,
+  "phase": "Running",
+  "segmentsReady": 6,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "Completed",
+    "message": "Data redistribution completed"
+  }
+}
+```
+
+#### Via API
+
+```bash
+curl -u admin:password \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/scale/status
+```
+
+See [API Reference — Scale Status](api-reference.md#scale-status) for the full response schema.
+
+#### Via kubectl
+
+```bash
+# Watch cluster phase
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+
+# Check events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep Scale
+
+# Check StatefulSet readiness
+kubectl get statefulsets -n cloudberry-test -l avsoft.io/cluster=my-cluster
+```
+
+### Data Redistribution
+
+When a scale operation is initiated, the operator creates a redistribution Job. For scale-out, the Job rebalances data across the new segments. For scale-in, the Job moves data off the segments being removed. The Job uses the `redistribute` maintenance operation, which runs an `ANALYZE` command on the coordinator (in a production Cloudberry deployment, this maps to `gpexpand` redistribution).
+
+**Job properties:**
+- **Name**: `{cluster}-maintenance-{timestamp}`
+- **Operation**: `redistribute`
+- **BackoffLimit**: `1`
+- **TTLSecondsAfterFinished**: `3600`
+- **Authentication**: `PGPASSWORD` from the cluster's admin password Secret
+
+Monitor the redistribution Job:
+
+```bash
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
+```
+
+### Scale Metrics
+
+The operator exposes Prometheus metrics for scale operations:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_scale_operations_total` | Counter | Total number of scale operations (labels: `cluster`, `namespace`, `operation`) |
+| `cloudberry_redistribution_progress` | Gauge | Data redistribution progress from 0.0 to 1.0 (labels: `cluster`, `namespace`) |
+
+The `operation` label distinguishes between `scale-out` and `scale-in` operations:
+
+```promql
+# Total scale-out operations
+cloudberry_scale_operations_total{operation="scale-out"}
+
+# Total scale-in operations
+cloudberry_scale_operations_total{operation="scale-in"}
+```
+
+These metrics complement the existing segment metrics (`cloudberry_segments_total`, `cloudberry_segments_ready`) to provide full visibility into scaling operations.
+
+## Segment Rebalancing
+
+After recovery or failover events, segments may not be in their preferred roles — a mirror may be acting as primary. The rebalance operation redistributes data across segments to restore optimal data placement. The operator supports configurable rebalance with skew thresholds, parallelism control, and table exclusion patterns.
+
+### Rebalance Configuration
+
+Configure rebalance behavior in the `spec.segments.rebalance` section of the `CloudberryCluster` CRD:
+
+```yaml
+spec:
+  segments:
+    count: 4
+    rebalance:
+      skewThreshold: 10       # Percentage skew threshold (default: 10)
+      parallelism: 2           # Concurrent table redistributions (default: 2)
+      excludeTables:           # Tables to skip during rebalance
+        - audit_log
+        - "temp_*"
+```
+
+**Configuration fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `skewThreshold` | int | `10` | Percentage of data skew that triggers rebalance. A value of `10` means rebalance activates when any segment holds 10% more data than the average |
+| `parallelism` | int | `2` | Number of tables to redistribute concurrently. Higher values speed up rebalance but increase cluster load |
+| `excludeTables` | string[] | `[]` | Tables to skip during rebalance. Supports exact names (`audit_log`) and glob patterns (`temp_*`) |
+
+> **Note**: If `spec.segments.rebalance` is not set, the operator uses default values (`skewThreshold=10`, `parallelism=2`, no excluded tables).
+
+### Triggering a Rebalance
+
+You can trigger a rebalance operation in three ways:
+
+#### Via CLI
+
+```bash
+# Rebalance all segments (uses configured or default settings)
+cloudberry-ctl ha rebalance --cluster my-cluster
+
+# Rebalance specific tables only
+cloudberry-ctl ha rebalance --cluster my-cluster --tables orders,customers,logs
+
+# Check rebalance status
+cloudberry-ctl ha rebalance --cluster my-cluster --status
+```
+
+#### Via Annotation
+
+```bash
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/action=rebalance
+```
+
+The operator processes the annotation, creates a rebalance Job, and removes the annotation after handling.
+
+#### Via API
+
+```bash
+# Trigger rebalance
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/rebalance
+
+# Trigger rebalance for specific tables
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/rebalance \
+  -H "Content-Type: application/json" \
+  -d '{"tables": ["orders", "customers", "logs"]}'
+```
+
+### Monitoring Rebalance Status
+
+#### Via CLI
+
+```bash
+cloudberry-ctl ha rebalance --cluster my-cluster --status
+```
+
+**Output (JSON):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "config": {
+    "skewThreshold": 10,
+    "parallelism": 2,
+    "excludeTables": ["audit_log", "temp_*"]
+  },
+  "redistribution": {
+    "status": "True",
+    "reason": "RebalanceCompleted",
+    "message": "Rebalance completed successfully",
+    "lastTransition": "2026-05-14T10:05:00Z"
+  }
+}
+```
+
+#### Via API
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/rebalance/status"
+```
+
+See [API Reference — Rebalance Status](api-reference.md#rebalance-status) for the full response schema.
+
+#### Via kubectl
+
+```bash
+# Check the DataRedistribution condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="DataRedistribution")]}'
+
+# Watch events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -i rebalance
+
+# Check the rebalance Job
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
+```
+
+### Rebalance Events and Conditions
+
+The operator emits the following events during rebalance:
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `RebalanceStarted` | Normal | Rebalance operation initiated with configuration details |
+| `RebalanceCompleted` | Normal | Rebalance operation completed successfully |
+
+The `DataRedistribution` status condition tracks rebalance progress:
+
+| Reason | Status | Description |
+|--------|--------|-------------|
+| `RebalanceStarted` | `True` | Rebalance is in progress |
+| `RebalanceCompleted` | `True` | Rebalance finished successfully |
+
+**Example condition:**
+
+```json
+{
+  "type": "DataRedistribution",
+  "status": "True",
+  "reason": "RebalanceCompleted",
+  "message": "Rebalance completed successfully",
+  "lastTransitionTime": "2026-05-14T10:05:00Z"
+}
+```
+
+### Rebalance Metrics
+
+The operator exposes the following metrics related to rebalance operations:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_scale_operations_total{operation="rebalance"}` | Counter | Total number of rebalance operations completed |
+| `cloudberry_data_skew_coefficient` | Gauge | Current data skew coefficient across segments (labels: `cluster`, `namespace`) |
+
+```promql
+# Total rebalance operations for a cluster
+cloudberry_scale_operations_total{operation="rebalance", cluster="my-cluster"}
+
+# Current data skew coefficient
+cloudberry_data_skew_coefficient{cluster="my-cluster"}
+```
+
 ## Test Data Setup
 
 The project includes a data loading scenario (Scenario 7) that populates a realistic test dataset for validating scale, rebalance, and performance operations. The dataset uses the `mydb` database and creates five tables with different distribution strategies, intentional data skew, and exclusion patterns.
@@ -1443,6 +2499,186 @@ The script performs the following steps:
 
 > **Prerequisite**: Scenarios 1–6 must have been run first. The script expects the `mydb` database, `customers` table (100K rows), `orders` table (500K rows), and `analyst` role to already exist.
 
+## Error Handling and Observability
+
+The operator provides comprehensive error handling, retry mechanisms, and observability features to ensure reliable cluster management and easy troubleshooting.
+
+### Structured Error Types
+
+The operator uses a hierarchy of typed errors that support `errors.Is()` and `errors.As()` for programmatic error handling. Each error type wraps a sentinel error for easy classification:
+
+| Error Type | Sentinel | Description |
+|------------|----------|-------------|
+| `ReconcileError` | (wraps inner error) | Error during reconciliation — includes the operation name and underlying cause |
+| `ClusterNotFoundError` | `ErrNotFound` | Cluster resource not found in the specified namespace |
+| `ValidationError` | `ErrInvalidInput` | Input validation failure — includes the field name and constraint message |
+| `AuthenticationError` | `ErrUnauthorized` | Authentication failure — includes the auth method and reason |
+| `PermissionDeniedError` | `ErrForbidden` | Authorization failure — includes the user, operation, and required permission |
+| `SegmentNotFoundError` | `ErrNotFound` | Segment with the specified content ID not found |
+
+**Example: Checking error types in Go**
+
+```go
+import "github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
+
+err := reconcileCluster(ctx, cluster)
+if errors.Is(err, util.ErrNotFound) {
+    // Handle missing resource
+} else if errors.Is(err, util.ErrInvalidInput) {
+    // Handle validation failure
+} else if errors.Is(err, util.ErrRetryExhausted) {
+    // All retry attempts failed
+}
+```
+
+### Retry with Exponential Backoff
+
+The operator uses `RetryWithBackoff()` for transient failure recovery. All retryable operations (database connections, Vault calls, API requests) use this mechanism.
+
+**Retry behavior:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MaxRetries` | `5` | Maximum number of retry attempts after the initial call |
+| `InitialBackoff` | `1s` | Wait time before the first retry |
+| `MaxBackoff` | `30s` | Maximum wait time between retries |
+| `Multiplier` | `2.0` | Backoff multiplier (exponential growth) |
+| `JitterFraction` | `0.1` | Random jitter added to prevent thundering herd (0.0–1.0) |
+
+**Key behaviors:**
+
+- **Exponential growth**: Each retry waits `previous × multiplier`, capped at `MaxBackoff`
+- **Context-aware**: Respects `context.Context` cancellation and deadlines — stops retrying immediately when the context expires
+- **Sentinel error**: Returns `ErrRetryExhausted` (wrapped with the last error) when all attempts fail
+- **Jitter**: Adds randomized jitter to prevent synchronized retries across multiple operator instances
+
+**Example retry timeline** (with defaults):
+
+```
+Attempt 1: immediate
+Attempt 2: ~1s wait
+Attempt 3: ~2s wait
+Attempt 4: ~4s wait
+Attempt 5: ~8s wait
+Attempt 6: ~16s wait
+→ ErrRetryExhausted if all fail
+```
+
+### Reconciliation Metrics
+
+The operator records metrics for every reconciliation cycle, providing visibility into operator health and performance.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_reconcile_total` | Counter | `cluster`, `namespace`, `result` | Total reconciliation count. `result` is `success` or `error` |
+| `cloudberry_reconcile_errors_total` | Counter | `cluster`, `namespace` | Total reconciliation errors (incremented when `result=error`) |
+| `cloudberry_reconcile_duration_seconds` | Histogram | `cluster`, `namespace` | Time spent in each reconciliation cycle |
+
+**Useful PromQL queries:**
+
+```promql
+# Reconciliation error rate (last 5 minutes)
+rate(cloudberry_reconcile_errors_total[5m])
+
+# Average reconciliation duration
+rate(cloudberry_reconcile_duration_seconds_sum[5m])
+  / rate(cloudberry_reconcile_duration_seconds_count[5m])
+
+# Success ratio
+sum(rate(cloudberry_reconcile_total{result="success"}[5m]))
+  / sum(rate(cloudberry_reconcile_total[5m]))
+```
+
+### Telemetry Spans
+
+When OpenTelemetry tracing is enabled, the operator creates spans for reconciliation loops and records errors on those spans. This provides distributed tracing visibility into operator behavior.
+
+**Error recording on spans:**
+
+- `SetSpanError(span, err)` sets the span status to `codes.Error` and records an `exception` event with the error message
+- Safe to call with `nil` error — no status change occurs
+- Error spans appear in your tracing backend (Jaeger, Tempo, etc.) with error indicators
+
+**Span attributes include:**
+
+- Cluster name and namespace
+- Reconciliation result (success/error)
+- Duration
+- Error details (when applicable)
+
+### Structured Logging
+
+The operator uses Go's `slog` package for structured JSON logging. Every log entry includes contextual fields for filtering and correlation:
+
+```json
+{
+  "level": "ERROR",
+  "msg": "reconciliation failed",
+  "cluster": "my-cluster",
+  "namespace": "cloudberry-test",
+  "controller": "cluster-controller",
+  "reconcileID": "abc-123",
+  "error": "reconcile error during \"reconciling coordinator\": connection refused",
+  "duration": "1.234s"
+}
+```
+
+**Filtering logs by error type:**
+
+```bash
+# All reconciliation errors
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.level == "ERROR")'
+
+# Errors for a specific cluster
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.level == "ERROR" and .cluster == "my-cluster")'
+
+# All warnings (including blocked operations, degraded state)
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.level == "WARN")'
+```
+
+### Webhook Validation Errors
+
+The validating admission webhook rejects invalid `CloudberryCluster` resources at creation time, preventing misconfigured clusters from entering the system:
+
+| Validation | Error Message |
+|------------|---------------|
+| `segments.count < 1` | `segments.count must be >= 1, got 0` |
+| OIDC enabled without `issuerURL` | `auth.oidc.issuerURL is required when OIDC is enabled` |
+| OIDC enabled without `clientID` | `auth.oidc.clientID is required when OIDC is enabled` |
+| Missing coordinator storage | `coordinator.storage.size is required` |
+| Missing segment storage | `segments.storage.size is required` |
+| Duplicate cluster name | `CloudberryCluster with name "X" already exists in namespace "Y"` |
+
+**Example: Webhook rejection**
+
+```bash
+$ kubectl apply -f invalid-cluster.yaml
+Error from server: error when creating "invalid-cluster.yaml":
+  admission webhook "validate.cloudberrycluster.avsoft.io" denied the request:
+  segments.count must be >= 1, got 0
+```
+
+### Pod Deletion Recovery
+
+The operator automatically detects and recovers from pod deletions during normal operation:
+
+1. **Detection**: During reconciliation, the operator compares `StatefulSet.Status.ReadyReplicas` against the expected count. When `segmentsReady < segmentsTotal`, the cluster is in a degraded state
+2. **Status update**: The operator updates `status.segmentsReady` to reflect the actual ready count
+3. **Recovery**: Kubernetes automatically recreates deleted StatefulSet pods. On the next reconciliation cycle, the operator detects the recovered pods and updates the status back to healthy
+4. **No manual intervention**: The entire detection-recovery cycle is automatic
+
+```bash
+# Check for degraded segments
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.segmentsReady}/{.status.segmentsTotal}'
+
+# Watch recovery in real time
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+```
+
 ## Inspection Commands
 
 ```bash
@@ -1487,6 +2723,10 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_fts_failover_total` | Counter | Total failovers |
 | `cloudberry_replication_lag_bytes` | Gauge | Replication lag per segment |
 | `cloudberry_connections_active` | Gauge | Active database connections |
+| `cloudberry_scale_operations_total` | Counter | Total scale operations (labels: `operation` = `scale-out`, `scale-in`, `rebalance`) |
+| `cloudberry_redistribution_progress` | Gauge | Data redistribution progress (0.0–1.0) |
+| `cloudberry_data_skew_coefficient` | Gauge | Data skew coefficient across segments |
+| `cloudberry_pvc_size_bytes` | Gauge | PVC size in bytes (labels: `cluster`, `namespace`, `component`) |
 
 ### ServiceMonitor
 
@@ -1588,6 +2828,25 @@ Key event types:
 | `RollingRestartCompleted` | Normal | Rolling restart completed |
 | `MaintenanceStarted` | Normal | Maintenance Job created |
 | `MaintenanceUnknown` | Warning | Unknown maintenance operation requested |
+| `ScaleOutStarted` | Normal | Scale-out operation initiated |
+| `ScaleOutCompleted` | Normal | Scale-out operation completed |
+| `ScaleInStarted` | Normal | Scale-in operation initiated |
+| `ScaleInCompleted` | Normal | Scale-in operation completed |
+| `ScaleOutBlocked` | Warning | Scale-out blocked (cluster not in Running phase) |
+| `ScaleOutFailed` | Warning | Scale-out failed (segments not ready after timeout) |
+| `ScaleInBlocked` | Warning | Scale-in blocked (cluster not in Running phase, or >50% reduction without confirmation) |
+| `RebalanceStarted` | Normal | Segment rebalance initiated with configuration details |
+| `RebalanceCompleted` | Normal | Segment rebalance completed successfully |
+| `StorageExpanded` | Normal | PVC storage expanded successfully |
+| `UpgradeStarted` | Normal | Cluster upgrade initiated (includes previous and new version) |
+| `UpgradeCompleted` | Normal | Cluster upgrade completed successfully |
+| `UpgradeBlocked` | Warning | Upgrade blocked — cluster not in `Running` phase |
+| `UpgradeRollback` | Warning | Upgrade rolled back due to phase timeout |
+| `Deleting` | Normal | Cluster deletion initiated, phase set to `Deleting` |
+| `BackupOnDelete` | Normal | Backup triggered before deletion (when `backupOnDelete: true`) |
+| `PVCsRetained` | Normal | PVCs preserved after deletion (when `deletionPolicy: Retain`) |
+| `PVCsDeleted` | Normal | All PVCs deleted after deletion (when `deletionPolicy: Delete`) |
+| `Deleted` | Normal | Cluster deletion completed, finalizer removed |
 | `SegmentFailover` | Warning | Primary segment failed, mirror promoted |
 | `SegmentRecovered` | Normal | Failed segment recovered |
 | `SegmentsRebalanced` | Normal | Segment roles restored |

@@ -8,6 +8,9 @@ This guide covers setting up a development environment, building the project, ru
 - [Project Structure](#project-structure)
 - [Building](#building)
 - [Testing](#testing)
+- [Code Review Findings and Fixes](#code-review-findings-and-fixes)
+  - [Test Coverage Requirements](#test-coverage-requirements)
+  - [Performance Testing](#performance-testing)
 - [Code Style and Linting](#code-style-and-linting)
 - [Code Generation](#code-generation)
 - [Adding New Features](#adding-new-features)
@@ -94,19 +97,28 @@ kubectl get cloudberryclusters -n cloudberry-test
 
 The sample CR (`cloudberrycluster-sample.yaml`) uses `postgres:16` with reduced resources suitable for local development: 100m CPU / 256Mi memory requests, 5Gi storage, and 2 segments with no standby or mirroring.
 
-### Test Environment (Docker Compose)
-
-See [Docker Compose Test Environment](#docker-compose-test-environment) above for detailed setup instructions.
-
 ### Docker Compose Test Environment
 
-The project includes a Docker Compose setup for integration testing with Vault and Keycloak:
+The project includes a Docker Compose setup with 9 services for integration testing:
+
+| Service | Port(s) | Purpose |
+|---------|---------|---------|
+| Vault | 8200 | PKI for mTLS certificates, secrets management |
+| Keycloak | 8090/8091 | OIDC provider for authentication testing |
+| MinIO | 9000/9001 | S3-compatible storage |
+| Kafka | 9094 | Event streaming (KRaft mode) |
+| RabbitMQ | 5672/15672 | Message queue |
+| VictoriaMetrics | 8428 | Metrics storage |
+| Grafana | 3000 | Dashboards |
+| Tempo | 3200/4317/4318 | Distributed tracing (OTLP receivers) |
+| Keycloak DB | (internal) | PostgreSQL backend for Keycloak |
 
 ```bash
-# Start test services (Vault, Keycloak)
+# Start all test services
 make test-env-up
+# or: docker compose -f test/docker-compose/docker-compose.yml up -d
 
-# Run setup scripts (configures Vault policies, Keycloak realm/clients)
+# Run setup scripts (configures Vault PKI, Keycloak realm, MinIO buckets, Kafka topics, RabbitMQ queues)
 make test-env-setup
 
 # Run integration tests
@@ -116,23 +128,54 @@ make test-integration
 make test-env-down
 ```
 
+**Setup order:**
+
+1. `docker compose up -d` — start all services
+2. Wait for Vault and Keycloak to be ready (health checks)
+3. `scripts/setup-vault.sh` — configures PKI engine, issues certificates
+4. `scripts/setup-keycloak.sh` — creates realm, clients for service-to-service auth
+5. `scripts/setup-minio.sh` — creates test buckets
+6. `scripts/setup-kafka.sh` — creates test topics
+7. `scripts/setup-rabbitmq.sh` — creates test queues
+
 The setup scripts (`test/docker-compose/scripts/`) configure:
-- **Vault**: Enables the KV secrets engine, creates policies and Kubernetes auth roles
+- **Vault**: Enables the PKI secrets engine, creates policies and Kubernetes auth roles
 - **Keycloak**: Creates the `cloudberry` realm, `cloudberry-operator` client, and test users with roles
+- **MinIO**: Creates S3-compatible test buckets for backup testing
+- **Kafka**: Creates test topics for event streaming
+- **RabbitMQ**: Creates test queues for message processing
 
 ### Monitoring Stack Deployment
 
-The project includes monitoring configurations in the `monitoring/` directory:
+The project includes monitoring configurations in the `monitoring/` directory and the Docker Compose test environment:
 
 - **Grafana dashboards**: Pre-built dashboards for operator metrics in `monitoring/grafana/`
-- **vmagent / otel-collector**: Deploy alongside the operator for metrics collection and distributed tracing
+- **vmagent**: VictoriaMetrics agent for Prometheus-compatible metrics collection
+- **otel-collector**: OpenTelemetry Collector for distributed tracing
 
-To deploy the monitoring stack to a local Kubernetes cluster:
+**Local development (Docker Compose):**
+
+The Docker Compose test environment includes VictoriaMetrics (port 8428), Grafana (port 3000), and Tempo (ports 3200/4317/4318) pre-configured:
 
 ```bash
-# Deploy the operator with telemetry enabled
+# Start the full test environment including monitoring services
+make test-env-up
+
+# Access Grafana at http://localhost:3000
+# Access VictoriaMetrics at http://localhost:8428
+# OTLP receivers at localhost:4317 (gRPC) and localhost:4318 (HTTP)
+```
+
+**Kubernetes deployment:**
+
+To deploy the monitoring stack alongside the operator in a local Kubernetes cluster:
+
+```bash
+# Deploy the operator with metrics and telemetry enabled
 helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --namespace cloudberry-system \
+  --set metrics.enabled=true \
+  --set serviceMonitor.enabled=true \
   --set telemetry.enabled=true \
   --set telemetry.otlpEndpoint=otel-collector:4317 \
   --set telemetry.otlpInsecure=true
@@ -265,6 +308,11 @@ cloudberry-k8s/
 │   │   ├── scenario5_session_management_test.go
 │   │   ├── scenario6_resource_management_test.go
 │   │   ├── scenario7_load_data_test.go
+│   │   ├── scenario9_scalein_test.go
+│   │   ├── scenario12_scalein_confirmation_test.go
+│   │   ├── scenario13_pv_expansion_test.go
+│   │   ├── scenario15_error_handling_test.go
+│   │   ├── scenario16_deletion_test.go
 │   │   └── webhook_test.go
 │   ├── scenarios/                    # SQL/shell scripts for test scenarios
 │   │   ├── scenario7_load_data.sql   # Test data loading (5 tables, ~1.45M rows)
@@ -305,7 +353,7 @@ cloudberry-k8s/
 | `internal/vault` | Vault client with retry | vault/api, internal/util |
 | `internal/auth` | Auth providers and middleware | go-oidc, internal/vault |
 | `internal/ctl` | Operator API HTTP client for CLI | net/http |
-| `internal/db` | Database operations and client factory | pgx/v5 |
+| `internal/db` | Database operations, client factory, and shared `DBClientFactory` interface | pgx/v5 |
 | `internal/builder` | K8s resource construction | api/v1alpha1, internal/util |
 | `internal/controller` | Reconciliation controllers | All internal packages |
 | `internal/api` | REST API server | internal/auth, internal/metrics |
@@ -324,7 +372,7 @@ The codebase uses several internal helper functions that are important to unders
 | `patchStatus()` | `internal/controller` | Patches the status subresource using `Status().Patch()` with `MergePatchType`. Prevents status clobbering between concurrent controllers |
 | `patchFTSStatus()` | `internal/controller` | Patches FTS-related status fields with a manually constructed MergePatch. Handles `omitempty` on `FailedSegments` by always including the field explicitly, even when empty |
 | `checkDuplicateName()` | `internal/webhook` | Lists all `CloudberryCluster` resources across namespaces and rejects creation if the same name exists in a different namespace |
-| `buildConnectionString()` | `internal/db` | Constructs a PostgreSQL connection string with properly escaped parameters. Returns an error (instead of falling back to a default) if the connection string cannot be parsed |
+| `buildConnectionString()` | `internal/db` | Constructs a PostgreSQL connection string using the pgx native config builder (not manual string escaping). Returns an error (instead of falling back to a default) if the connection string cannot be parsed |
 | `GenerateRandomPassword()` | `internal/util` | Generates a cryptographically secure random password including special characters (`!@#$%^&*()-_=+`). Used for auto-generated admin passwords |
 
 ## Building
@@ -561,6 +609,333 @@ The shell script copies the SQL file to the coordinator pod via `kubectl cp`, ex
 | `TestScenario7_TempStagingExclusion` | `temporary_staging=true` flag and `temp_` prefix pattern |
 | `TestScenario7_ShellScriptExists` | Shell script structure: shebang, strict mode, `kubectl cp`/`exec`, verification queries |
 
+#### Scenario 8 — Scale-Out with Mirroring
+
+Tests the scale-out flow for a mirrored cluster, including scale detection, StatefulSet updates, redistribution Job creation, and phase transitions.
+
+- **Scale detection**: `reconcileSegments()` compares `spec.segments.count` against the current primary StatefulSet replicas. When the desired count exceeds the current count, `handleScaleOut()` is invoked
+- **Phase transitions**: `Running` → `Scaling` → `Running` (verified via status assertions)
+- **StatefulSet updates**: Primary StatefulSet replicas updated from 4 to 6; mirror StatefulSet replicas updated from 4 to 6
+- **Pod count**: Total pods increase from 10 to 14 (6 primary + 6 mirror + coordinator + standby)
+- **Redistribution Job**: A `{cluster}-maintenance-{timestamp}` Job is created with the `redistribute` operation
+- **Events verified**: `ScaleOutStarted` (emitted when scaling begins), `ScaleOutCompleted` (emitted when all pods are ready)
+- **Conditions verified**: `DataRedistribution` condition transitions through `ScaleOutStarted` → `InProgress` → `Completed`
+- **Metrics verified**: `cloudberry_segments_total=6`, `cloudberry_segments_ready=6`, `cloudberry_scale_operations_total=1`
+- **Scale status API**: `GET /clusters/{name}/scale/status` returns scaling state, segment readiness, and redistribution condition
+- **CLI command**: `cloudberry-ctl cluster scale-status --cluster <name>` calls the scale status API
+- **No-op test**: Verifying that patching `segments.count` to the same value does not trigger a scale-out or emit `ScaleOutStarted`
+- **Functional tests**: `test/functional/scenario8_scaleout_test.go`
+
+**Live verification results** (from a running cluster):
+- Patched `segments.count` from 4 to 6
+- Phase: `Running` → `Scaling` → `Running` (40 seconds)
+- Primary StatefulSet: 4/4 → 6/6
+- Mirror StatefulSet: 4/4 → 6/6
+- Total pods: 10 → 14
+
+#### Scenario 9 — Scale-In with Both PVC Policies
+
+Tests the scale-in flow for a mirrored cluster, including safety checks, StatefulSet scale-down, PVC cleanup, and phase transitions.
+
+- **Scale detection**: `reconcileSegments()` compares `spec.segments.count` against the current primary StatefulSet replicas. When the desired count is less than the current count, `handleScaleIn()` is invoked
+- **Safety check**: Scale-in by more than 50% requires the `avsoft.io/confirm-scale-in=true` annotation. Without it, a `ScaleInBlocked` warning event is emitted and the operation is skipped
+- **Phase transitions**: `Running` → `Scaling` → `Running` (verified via status assertions)
+- **StatefulSet updates**: Mirror StatefulSet scaled down first, then primary StatefulSet (mirrors first for safety)
+- **PVC behavior (Retain)**: PVCs for removed segments are preserved; total PVC count remains unchanged
+- **PVC behavior (Delete)**: `cleanupOrphanedPVCs()` deletes PVCs for removed segments; total PVC count decreases
+- **Redistribution Job**: A `{cluster}-maintenance-{timestamp}` Job is created with the `redistribute` operation to move data off segments being removed
+- **Events verified**: `ScaleInStarted` (when scaling begins), `ScaleInCompleted` (when all pods are ready), `ScaleInBlocked` (when >50% reduction lacks confirmation)
+- **Conditions verified**: `DataRedistribution` condition transitions through `ScaleInStarted` → `InProgress` → `Completed`
+- **Metrics verified**: `cloudberry_scale_operations_total{operation="scale-in"}=1`
+- **Functional tests**: `test/functional/scenario9_scalein_test.go`
+
+**Live verification results** (from a running cluster):
+- Scenario 9a (Retain policy): Scaled from 6 → 4 segments
+  - Phase: `Running` → `Scaling` → `Running` (5 seconds)
+  - Mirror StatefulSet: 6 → 4, Primary StatefulSet: 6 → 4
+  - PVCs for segments 4, 5 preserved — 16 PVCs remain
+  - Events: `ScaleInStarted`, `ScaleInCompleted`
+  - Metrics: `scale_operations_total{scale-in}=1`
+
+**Functional tests (5 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario9a_ScaleInRetain` | Scale-in with Retain policy: PVCs preserved for removed segments |
+| `TestScenario9b_ScaleInDelete` | Scale-in with Delete policy: PVCs deleted for removed segments |
+| `TestScenario9_ScaleInBlockedWithout50PercentConfirmation` | Scale-in >50% blocked without confirmation annotation |
+| `TestScenario9_ScaleInWithConfirmationProceeds` | Scale-in >50% proceeds with `avsoft.io/confirm-scale-in=true` |
+| `TestScenario9_ScaleMetricsRecorded` | `cloudberry_scale_operations_total{operation="scale-in"}` incremented |
+
+#### Scenario 10 — Manual Segment Rebalancing
+
+Tests the manual segment rebalancing flow, including rebalance configuration, Job creation, status API, CLI flags, events, conditions, and metrics.
+
+- **RebalanceSpec**: `spec.segments.rebalance` with `skewThreshold`, `parallelism`, and `excludeTables` fields added to the CRD
+- **handleRebalance()**: Full implementation in the HA controller — reads rebalance config from the cluster spec (with defaults: `skewThreshold=10`, `parallelism=2`), creates a maintenance Job with the `rebalance` operation, sets `DataRedistribution` conditions, and emits events
+- **Annotation trigger**: Setting `avsoft.io/action=rebalance` triggers `handleRebalance()`, which removes the annotation via MergePatch
+- **Rebalance Job**: Created via `BuildMaintenanceJob(cluster, "rebalance", timestamp)` — uses the `rebalance` entry in the maintenance SQL map (maps to `ANALYZE` in test mode, `gpexpand` redistribution in production Cloudberry)
+- **Status API**: `GET /clusters/{name}/rebalance/status` returns the rebalance configuration and `DataRedistribution` condition
+- **CLI flags**: `cloudberry-ctl ha rebalance --status` queries the status API; `--tables` sends a table list in the POST body
+- **Events verified**: `RebalanceStarted` (with threshold and parallelism in message), `RebalanceCompleted`
+- **Conditions verified**: `DataRedistribution` transitions through `RebalanceStarted` → `RebalanceCompleted`
+- **Metrics verified**: `cloudberry_scale_operations_total{operation="rebalance"}` incremented; `cloudberry_data_skew_coefficient` gauge available
+- **Default config test**: When `spec.segments.rebalance` is nil, defaults (`skewThreshold=10`, `parallelism=2`, no excludeTables) are applied
+- **Functional tests**: `test/functional/scenario10_rebalance_test.go`
+
+**Live verification results** (from a running cluster):
+- Rebalance config set: `skewThreshold=10`, `parallelism=2`, `excludeTables=[audit_log, temp_*]`
+- Annotation `avsoft.io/action=rebalance` triggered rebalance
+- Job created and completed
+- Events: `RebalanceStarted`, `RebalanceCompleted`
+- DataRedistribution condition: `RebalanceCompleted`
+- Metric: `cloudberry_scale_operations_total{operation="rebalance"}=1`
+- API status endpoint returns rebalance config and condition
+
+**Functional tests (5 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario10a_RebalanceViaAnnotation` | Annotation triggers rebalance: Job created, events emitted, conditions set, annotation removed |
+| `TestScenario10b_RebalanceStatusAPI` | `GET /rebalance/status` returns config and DataRedistribution condition |
+| `TestScenario10c_RebalanceSpecificTables` | `POST /rebalance` with tables body sets the rebalance annotation |
+| `TestScenario10_RebalanceMetrics` | `RecordScaleOperation("rebalance")` called after rebalance completes |
+| `TestScenario10_DefaultRebalanceConfig` | Nil `RebalanceSpec` uses defaults (threshold=10, parallelism=2) |
+
+#### Scenario 11 — Scale-Out Failure and Rollback
+
+Tests the scale-out failure handling flow, including pre-flight blocking, timeout detection, failure reporting, and the guard against false scale detection during restarts.
+
+- **Pre-flight blocking (scale-out)**: When the cluster is not in `Running` phase, `handleScaleOut()` emits a `ScaleOutBlocked` warning event and skips the operation. The operator retries on the next reconciliation cycle
+- **Pre-flight blocking (scale-in)**: When the cluster is not in `Running` phase, `handleScaleIn()` emits a `ScaleInBlocked` warning event and skips the operation
+- **Scale timeout**: The `avsoft.io/scale-started` annotation tracks the operation start time. `checkScaleProgress()` detects when the elapsed time exceeds the 10-minute timeout
+- **`handleScaleFailure()`**: Identifies unready segments from both primary and mirror StatefulSets, populates `status.failedSegments` with contentID, hostname, role, and status, sets the `ScaleOutFailed` condition to `True` with reason `SegmentsNotReady`, emits a `ScaleOutFailed` warning event, and removes the `avsoft.io/scale-started` annotation
+- **No automatic rollback**: The cluster stays in `Scaling` phase after failure — manual intervention is required
+- **Guard against false scale detection**: The `currentCount > 0` check in `reconcileSegments()` prevents false scale-out/scale-in detection when StatefulSets are being created during initial cluster bootstrap or restart
+- **Annotation cleanup on success**: The `avsoft.io/scale-started` annotation is removed after a successful scale completion
+- **Failed segments with mirroring**: When mirroring is enabled, both primary and mirror unready segments are reported in `status.failedSegments`
+- **Functional tests**: `test/functional/scenario11_scaleout_failure_test.go`
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `ScaleOutBlocked` | Warning | Scale-out blocked because cluster is not in `Running` phase |
+| `ScaleInBlocked` | Warning | Scale-in blocked because cluster is not in `Running` phase |
+| `ScaleOutFailed` | Warning | Scale-out failed — segments not ready after 10-minute timeout |
+
+**Conditions:**
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `ScaleOutFailed` | `True` | `SegmentsNotReady` | Scale-out failed with count and timeout info |
+
+**Functional tests (7 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario11a_ScaleOutBlockedWhenNotRunning` | Scale-out blocked when cluster is in `Initializing` phase; `ScaleOutBlocked` event emitted |
+| `TestScenario11b_ScaleOutTimeoutAndFailure` | Scale timeout triggers `handleScaleFailure()`; `ScaleOutFailed` condition and event; `failedSegments` populated |
+| `TestScenario11c_ScaleInBlockedWhenNotRunning` | Scale-in blocked when cluster is not in `Running` phase; `ScaleInBlocked` event emitted |
+| `TestScenario11d_ScaleStartedAnnotationCleanup` | `avsoft.io/scale-started` annotation removed after successful scale completion |
+| `TestScenario11e_ScaleFailureWithMirroring` | Both primary and mirror unready segments reported in `failedSegments` |
+| `TestScenario11f_FalseScaleDetectionGuard` | `currentCount > 0` guard prevents false scale detection during restarts |
+| `TestScenario11g_NoAutoRollback` | Cluster stays in `Scaling` phase after failure — no automatic rollback |
+
+#### Scenario 12 — Scale-In >50% Confirmation Requirement
+
+Tests the safety mechanism that blocks scale-in operations reducing the segment count by more than 50%, requiring an explicit `avsoft.io/confirm-scale-in=true` annotation to proceed. Also verifies that the confirmation annotation is cleaned up after successful scale-in completion.
+
+- **Confirmation check**: `handleScaleIn()` calculates `newCount / currentCount`. If the ratio is less than 0.5 (i.e., more than 50% reduction), the operation is blocked unless the `avsoft.io/confirm-scale-in=true` annotation is present
+- **Blocked behavior**: When blocked, a `ScaleInBlocked` warning event is emitted with a message referencing the required annotation. The cluster phase stays `Running`, StatefulSet replicas remain unchanged, and no redistribution Job is created
+- **Confirmed behavior**: With the annotation present, scale-in proceeds normally — phase transitions to `Scaling`, StatefulSets are updated, a redistribution Job is created, and `DataRedistribution` condition is set to `InProgress`
+- **Annotation cleanup**: After successful scale-in completion, `completeScaleOperation()` calls `finaliseScaleIn()` → `cleanupScaleAnnotations()`, which removes both `avsoft.io/confirm-scale-in` and `avsoft.io/scale-started` annotations via MergePatch
+- **Boundary test (exactly 50%)**: Scaling from 8→4 (exactly 50%) is NOT blocked — the check uses strict less-than (`< 0.5`), so 50% reductions proceed without confirmation
+- **Boundary test (just over 50%)**: Scaling from 10→4 (60% reduction) IS blocked without the confirmation annotation
+- **Refactored helpers**: `checkScaleProgress()` was refactored to extract `completeScaleOperation()`, `finaliseScaleIn()`, and `cleanupScaleAnnotations()` for reduced cyclomatic complexity
+- **Functional tests**: `test/functional/scenario12_scalein_confirmation_test.go`
+
+**Live verification results** (from a running cluster):
+- 12a: Scale 8→3 without confirmation → `ScaleInBlocked` warning event, phase stays `Running`
+- 12b: Scale 8→3 with `avsoft.io/confirm-scale-in=true` → proceeds, `ScaleInStarted`, `ScaleInCompleted`, segments=3
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `ScaleInBlocked` | Warning | Scale-in >50% blocked — annotation `avsoft.io/confirm-scale-in=true` required |
+| `ScaleInStarted` | Normal | Scale-in proceeds after confirmation |
+| `ScaleInCompleted` | Normal | Scale-in completed, confirmation annotation cleaned up |
+
+**Functional tests (5 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario12a_ScaleInBlockedWithout50PercentConfirmation` | 8→3 (62.5% reduction) blocked without confirmation: `ScaleInBlocked` event, phase stays `Running`, StatefulSets unchanged, no Job created |
+| `TestScenario12b_ScaleInProceedsWithConfirmation` | 8→3 proceeds with `avsoft.io/confirm-scale-in=true`: phase → `Scaling`, StatefulSets updated to 3, redistribution Job created, `DataRedistribution` condition set |
+| `TestScenario12_ScaleInCompletionCleansConfirmation` | After scale-in completes: `confirm-scale-in` and `scale-started` annotations removed, phase → `Running`, `ScaleInCompleted` event emitted |
+| `TestScenario12_ExactlyAt50PercentNotBlocked` | 8→4 (exactly 50%) NOT blocked: phase → `Scaling`, `ScaleInStarted` emitted, no `ScaleInBlocked` event |
+| `TestScenario12_JustOver50PercentBlocked` | 10→4 (60% reduction) blocked without confirmation: `ScaleInBlocked` event, phase stays `Running`, StatefulSets unchanged |
+
+#### Scenario 13 — Extend Persistent Volumes
+
+Tests the online PVC expansion flow for coordinator, standby, and segment storage, including safety constraints (no shrink, PVC not found), StorageClass pre-flight checks, and the PVC listing API.
+
+- **`reconcileStorageExpansion()`**: Detects PVC size increases by comparing `spec.*.storage.size` against actual PVC sizes. Patches PVCs for coordinator, standby, and segments independently
+- **`expandPVCIfNeeded()`**: Compares desired vs current PVC size using `resource.Quantity.Cmp()`. Calls `storageClassSupportsExpansion()` before patching. Patches the PVC if the desired size is larger and the StorageClass allows it. Returns `(false, nil)` if the PVC is not found or the desired size is not larger (no shrink)
+- **`storageClassSupportsExpansion()`**: Pre-flight check that looks up the StorageClass referenced by the PVC (via `spec.storageClassName` or the legacy `volume.beta.kubernetes.io/storage-class` annotation). Blocks expansion if `allowVolumeExpansion` is `false` or `nil`, or if the StorageClass is not found. Allows expansion when no StorageClass is specified (default SC) or on transient errors (fail-open). When blocked, logs a WARN with PVC name, StorageClass name, reason, and current/desired sizes — no error is returned
+- **Three scopes**: Coordinator (single PVC), standby (single PVC), segments (all primary + mirror PVCs)
+- **Safety**: Shrink requests are silently skipped (desired ≤ current). Missing PVCs are skipped without error. StorageClass without `allowVolumeExpansion: true` blocks expansion with a warning
+- **PVC listing API**: `GET /clusters/{name}/storage/pvcs` lists all cluster PVCs with sizes, component labels, and binding status
+- **Metric**: `cloudberry_pvc_size_bytes` gauge with `cluster`, `namespace`, `component` labels via `SetPVCSizeBytes()`
+- **Condition**: `StorageExpanded` set to `True` with reason `PVCsExpanded` when any PVC is expanded
+- **Event**: `StorageExpanded` (Normal) emitted when PVCs are expanded successfully
+- **Functional tests**: `test/functional/scenario13_pv_expansion_test.go`
+
+**Functional tests (8 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario13a_CoordinatorStorageExpansion` | Coordinator PVC expanded from 5Gi→10Gi; segment PVCs unchanged; `StorageExpanded` condition and event emitted |
+| `TestScenario13b_StandbyStorageExpansion` | Standby PVC expanded from 5Gi→10Gi; coordinator and segment PVCs unchanged |
+| `TestScenario13c_SegmentStorageExpansion` | All 6 segment PVCs (3 primary + 3 mirror) expanded from 5Gi→10Gi; coordinator PVC unchanged; `StorageExpanded` event emitted |
+| `TestScenario13_NoExpansionWhenSizeUnchanged` | No PVCs modified when storage sizes match; no `StorageExpanded` event |
+| `TestScenario13_NoShrinkAllowed` | PVCs remain at 10Gi when spec requests 3Gi (shrink); no `StorageExpanded` event |
+| `TestScenario13_PVCNotFoundSkipped` | Reconciliation succeeds when PVCs don't exist; no `StorageExpanded` event |
+| `TestScenario13_BlockedByStorageClass` | PVC with `allowVolumeExpansion=false` StorageClass → expansion blocked, PVC stays at original 5Gi size, no `StorageExpanded` event emitted, reconciliation succeeds without error |
+| `TestScenario13_AllowedByStorageClass` | PVC with `allowVolumeExpansion=true` StorageClass → expansion proceeds, PVC expanded to 10Gi, `StorageExpanded` event emitted |
+
+#### Scenario 14 — Cluster Upgrade with Rollback
+
+Tests the cluster upgrade flow, including phase-by-phase image updates, post-upgrade verification, automatic rollback on timeout, pre-flight blocking, and no-op detection when the version is unchanged.
+
+- **Upgrade detection**: `isUpgradeNeeded()` checks whether `spec.version != status.clusterVersion` or the `avsoft.io/upgrade` annotation is present
+- **Pre-flight blocking**: When the cluster is not in `Running` phase, `handleUpgrade()` emits an `UpgradeBlocked` warning event and skips the operation (retries on next reconcile)
+- **`handleUpgrade()`**: Captures the current image from the coordinator StatefulSet, stores rollback state (previousImage, previousVersion, phase, startedAt, phaseStartedAt) in the `avsoft.io/upgrade` annotation as JSON, sets phase to `Updating`, and emits `UpgradeStarted` event
+- **Upgrade order**: mirrors → primaries → standby → coordinator → verify (least critical first)
+- **`upgradePhase()`**: Generic phase handler that updates the StatefulSet image, checks readiness, and advances to the next phase. Skips phases for disabled components (mirroring, standby)
+- **`verifyUpgrade()`**: Post-upgrade health check confirming coordinator and primary segments are ready
+- **`completeUpgrade()`**: Sets phase to `Running`, updates `status.clusterVersion`, sets `UpgradeCompleted` condition, removes the upgrade annotation, and emits `UpgradeCompleted` event
+- **Rollback**: Each phase has a 10-minute timeout. On timeout, `rollbackUpgrade()` reverts ALL StatefulSets to the previous image, restores the old version, sets `UpgradeFailed` condition with reason `RolledBack`, and emits `UpgradeRollback` warning event
+- **No-op detection**: When `spec.version == status.clusterVersion` and no upgrade annotation exists, no upgrade is triggered
+- **Functional tests**: `test/functional/scenario14_upgrade_test.go`
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `UpgradeStarted` | Normal | Upgrade initiated with previous and new version |
+| `UpgradeCompleted` | Normal | Upgrade completed successfully |
+| `UpgradeBlocked` | Warning | Upgrade blocked — cluster not in `Running` phase |
+| `UpgradeRollback` | Warning | Upgrade rolled back due to phase timeout |
+
+**Conditions:**
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `UpgradeCompleted` | `True` | `UpgradeSucceeded` | Upgrade completed successfully |
+| `UpgradeFailed` | `True` | `RolledBack` | Upgrade failed and was rolled back |
+
+**Functional tests (4 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario14_UpgradeHappyPath` | Full upgrade flow: `Running` → `Updating` → `Running`, all StatefulSets updated to new image, `UpgradeStarted` and `UpgradeCompleted` events, upgrade annotation set and removed, `clusterVersion` updated |
+| `TestScenario14_UpgradeRollback` | Timeout triggers rollback: all StatefulSets reverted to old image, phase returns to `Running`, `clusterVersion` restored, `UpgradeFailed` condition set with reason `RolledBack`, `UpgradeRollback` event emitted, upgrade annotation removed |
+| `TestScenario14_UpgradeBlockedWhenNotRunning` | Upgrade blocked when cluster is in `Stopped` phase: no upgrade annotation set, phase remains `Stopped` |
+| `TestScenario14_NoUpgradeWhenVersionUnchanged` | No upgrade triggered when `spec.version == status.clusterVersion`: phase does not change to `Updating`, no `UpgradeStarted` event |
+
+#### Scenario 15 — Error Handling, Retry, and Observability
+
+Tests the error handling, retry with exponential backoff, metrics recording, telemetry spans, structured logging, and structured error types across the operator.
+
+- **Webhook validation**: Rejects invalid parameters — `segments.count=0`, OIDC without `issuerURL`, OIDC without `clientID`, missing coordinator storage, missing segment storage
+- **Reconcile error metrics**: `TrackingMetricsRecorder` verifies that `RecordReconcile(result="error")` is called on failures with the correct cluster name, namespace, and positive duration
+- **Reconcile success metrics**: `RecordReconcile(result="success")` is called with positive duration after a healthy reconciliation
+- **Retry with exponential backoff**: `RetryWithBackoff()` tested for fail-then-succeed, retry exhaustion (`ErrRetryExhausted`), context cancellation, exponential timing verification, and deadline expiry during backoff
+- **Telemetry spans**: `SetSpanError()` records error status (`codes.Error`) and an `exception` event on OpenTelemetry spans. Nil error is safe (no error status set)
+- **Structured error logging**: slog output captured via `bytes.Buffer` — verifies `cluster`, `namespace`, cluster name, namespace value, and `reconciliation` messages are present
+- **Reconcile total and duration**: Multiple reconciliation cycles tracked correctly — `RecordReconcile` called at least once per cycle with positive duration
+- **Context timeout handling**: `RetryWithBackoff` respects context timeout, handles pre-canceled context immediately, and propagates `context.DeadlineExceeded`
+- **Pod deletion recovery**: Detects degraded state (`segmentsReady < segmentsTotal`) when a segment pod is deleted, then recovers to `Running` with `segmentsReady == segmentsTotal` when the pod returns
+- **Prometheus metrics**: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, and `cloudberry_reconcile_duration_seconds` are all registered and populated via `NewPrometheusRecorder` with a dedicated `prometheus.Registry`
+- **Structured errors**: Error wrapping verified with `errors.Is()` for `ReconcileError` (wraps inner error), `ErrRetryExhausted` (from exhausted retries), `ValidationError` (wraps `ErrInvalidInput`), and `ClusterNotFoundError` (wraps `ErrNotFound`)
+
+**Key test infrastructure:**
+
+| Component | Purpose |
+|-----------|---------|
+| `TrackingMetricsRecorder` | Implements `metrics.Recorder`; captures `RecordReconcile` and `RecordScaleOperation` calls for assertion |
+| `tracetest.InMemoryExporter` | In-memory OTEL span exporter for verifying span status, events, and error recording |
+| `bytes.Buffer` + `util.NewLogger` | Captures structured log output for content verification |
+| `webhookValidatorAdapter` | Replicates webhook validation logic for functional tests without importing internal webhook package |
+
+**Functional tests (22 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario15_WebhookRejectsInvalidParams/segments_count_zero` | `segments.count=0` rejected with "must be >= 1" |
+| `TestScenario15_WebhookRejectsInvalidParams/oidc_without_issuer_url` | OIDC without `issuerURL` rejected |
+| `TestScenario15_WebhookRejectsInvalidParams/oidc_without_client_id` | OIDC without `clientID` rejected |
+| `TestScenario15_ReconcileErrorMetrics` | `RecordReconcile(result="error")` called with correct cluster, namespace, positive duration |
+| `TestScenario15_ReconcileSuccessMetrics` | `RecordReconcile(result="success")` called with correct cluster, namespace, positive duration |
+| `TestScenario15_RetryWithExponentialBackoff/fails_then_succeeds` | 3 failures then success — 4 total attempts |
+| `TestScenario15_RetryWithExponentialBackoff/always_fails_exhausts_retries` | All retries exhausted — `ErrRetryExhausted` returned |
+| `TestScenario15_RetryWithExponentialBackoff/context_cancellation` | Pre-canceled context returns immediately |
+| `TestScenario15_RetryWithExponentialBackoff/exponential_backoff_timing` | Second interval > half of first interval (exponential growth) |
+| `TestScenario15_RetryWithExponentialBackoff/context_deadline_during_backoff` | Deadline exceeded during backoff sleep — fewer than max attempts |
+| `TestScenario15_TelemetrySpanOnError` | Span has `codes.Error` status and `exception` event after `SetSpanError` |
+| `TestScenario15_StructuredErrorLogging` | Log output contains `cluster`, `namespace`, cluster name, namespace value, `reconciliation` |
+| `TestScenario15_ReconcileTotalAndDuration` | 3 reconciliation cycles produce ≥3 `RecordReconcile` calls with positive duration |
+| `TestScenario15_ContextTimeoutHandling/retry_respects_timeout` | 50ms timeout stops retries with 100ms backoff |
+| `TestScenario15_ContextTimeoutHandling/pre_canceled_context` | Pre-canceled context — function never called |
+| `TestScenario15_ContextTimeoutHandling/deadline_exceeded_propagation` | Expired context propagated correctly |
+| `TestScenario15_PodDeletionRecovery` | Degraded → recovered: `segmentsReady < segmentsTotal` then `segmentsReady == segmentsTotal` |
+| `TestScenario15_PrometheusMetricsRecording/record_reconcile_success` | `cloudberry_reconcile_total` and `cloudberry_reconcile_duration_seconds` present in registry |
+| `TestScenario15_PrometheusMetricsRecording/record_reconcile_error` | `cloudberry_reconcile_errors_total` present in registry |
+| `TestScenario15_SetSpanErrorNilSafe` | `SetSpanError(span, nil)` does not set error status |
+| `TestScenario15_WebhookValidatesStorage/missing_coordinator_storage` | Missing `coordinator.storage.size` rejected |
+| `TestScenario15_WebhookValidatesStorage/missing_segment_storage` | Missing `segments.storage.size` rejected |
+| `TestScenario15_StructuredErrors/reconcile_error_wrapping` | `ReconcileError` wraps inner error, `errors.Is` works |
+| `TestScenario15_StructuredErrors/retry_exhausted_wrapping` | Exhausted retries wrap `ErrRetryExhausted` |
+| `TestScenario15_StructuredErrors/validation_error` | `ValidationError` wraps `ErrInvalidInput` |
+| `TestScenario15_StructuredErrors/cluster_not_found_error` | `ClusterNotFoundError` wraps `ErrNotFound` |
+
+#### Scenario 16 — Cluster Deletion with Both Policies
+
+Tests the cluster deletion flow with both `Retain` and `Delete` PVC policies, including backup-on-delete support, PVC event reporting, and phase transitions.
+
+- **Deletion with Retain policy**: When `deletionPolicy=Retain` and `backupOnDelete=true`, the operator sets the phase to `Deleting`, creates a `backup-on-delete` maintenance Job, preserves all PVCs, emits `BackupOnDelete` and `PVCsRetained` events, removes the finalizer, and emits the `Deleted` event
+- **Deletion with Delete policy**: When `deletionPolicy=Delete`, the operator deletes all cluster PVCs via `deletePVCs()`, emits the `PVCsDeleted` event, removes the finalizer, and emits the `Deleted` event. No `BackupOnDelete` or `PVCsRetained` events are emitted
+- **No finalizer skips deletion**: When the cluster has no finalizer, the reconciler returns immediately without emitting any events. The cluster is deleted by Kubernetes garbage collection
+- **Backup Job creation**: When `backupOnDelete=true`, a `batchv1.Job` is created with `backup-on-delete` in the name, the `avsoft.io/cluster` label set to the cluster name, and the `avsoft.io/operation` label set to `backup-on-delete`. The Job uses `BuildMaintenanceJob()` with the `backup-on-delete` operation (maps to `SELECT 1` in test mode, `gpbackup` in production Cloudberry)
+- **Phase transition**: The cluster phase transitions from `Running` → `Deleting` during deletion. The `Deleting` event confirms the transition occurred. After finalizer removal, the cluster is deleted by Kubernetes
+- **Functional tests**: `test/functional/scenario16_deletion_test.go`
+
+**Live verification results** (from a running cluster):
+- 16a (Retain + backupOnDelete): Cluster deleted, backup job created, 18 PVCs retained. Events: `Deleting` → `BackupOnDelete` → `PVCsRetained` → `Deleted`
+- 16b (Delete): Cluster deleted, PVCs deleted (Terminating). Events: `Deleting` → `PVCsDeleted` → `Deleted`
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `Deleting` | Normal | Cluster deletion initiated |
+| `BackupOnDelete` | Normal | Backup triggered before cluster deletion (when `backupOnDelete=true`) |
+| `PVCsRetained` | Normal | PVCs preserved (when `deletionPolicy=Retain`) |
+| `PVCsDeleted` | Normal | All PVCs deleted (when `deletionPolicy=Delete`) |
+| `Deleted` | Normal | Cluster deletion completed, finalizer removed |
+
+**Functional tests (5 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario16a_DeleteWithRetainPolicy` | Retain + backupOnDelete: PVCs preserved (3 remain), backup Job created, events `Deleting` → `BackupOnDelete` → `PVCsRetained` → `Deleted`, no `PVCsDeleted` event |
+| `TestScenario16b_DeleteWithDeletePolicy` | Delete policy: PVCs deleted (0 remain), events `Deleting` → `PVCsDeleted` → `Deleted`, no `BackupOnDelete` or `PVCsRetained` events |
+| `TestScenario16_NoFinalizerSkipsDeletion` | No finalizer: reconciler returns immediately, no requeue, no events emitted |
+| `TestScenario16_BackupJobCreated` | backupOnDelete=true: Job with `backup-on-delete` in name created, correct `avsoft.io/cluster` and `avsoft.io/operation` labels |
+| `TestScenario16_DeletionPhaseTransition` | Phase transition: `Running` → `Deleting` confirmed by `Deleting` event, cluster deleted after finalizer removal, `Deleted` event emitted |
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -579,16 +954,49 @@ go test ./test/functional/... -v -tags functional -run TestScenario6
 
 # Run data loading functional tests
 go test ./test/functional/... -v -tags functional -run TestScenario7
+
+# Run scale-out functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario8
+
+# Run scale-in functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario9
+
+# Run rebalance functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario10
+
+# Run scale-out failure and rollback functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario11
+
+# Run scale-in >50% confirmation functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario12
+
+# Run PV expansion functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario13
+
+# Run cluster upgrade functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario14
+
+# Run error handling, retry, and observability functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario15
+
+# Run cluster deletion functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario16
 ```
 
 ### Coverage
 
-The project targets **90%+ unit test statement coverage**. Current coverage for key packages:
+The project targets **90%+ unit test statement coverage** per package. Approximately 121 new test cases were added during the latest refactoring cycle, improving overall coverage from ~71% to ~85%+. Current coverage for key packages:
 
-| Package | Coverage |
-|---------|----------|
-| `internal/db` | 92.9% |
-| `internal/vault` | 99.1% |
+| Package | Coverage | Notes |
+|---------|----------|-------|
+| `internal/controller` | ~83% | Improved from 57% with comprehensive scenario tests |
+| `internal/certmanager` | ~90% | Improved from 64% with Vault PKI and self-signed tests |
+| `internal/vault` | 99.1% | Near-complete coverage |
+| `internal/metrics` | 100% | Full coverage |
+| `internal/db` | 92.9% | Includes SQL injection fix tests |
+| `internal/api` | ~85% | Rate limiter, server timeout, and handler tests |
+| `internal/ctl` | ~85% | URL encoding and response size limit tests |
+| `internal/auth` | ~90% | Basic and OIDC provider tests |
 
 ```bash
 # Generate coverage report
@@ -734,6 +1142,84 @@ func TestHealthz(t *testing.T) {
 }
 ```
 
+## Code Review Findings and Fixes
+
+The following security and reliability fixes were applied during a comprehensive code review:
+
+### Critical Fixes
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| CRITICAL-01 | SQL injection risk in `AlterResourceGroup` | Parameterized queries with `pgx` | `internal/db` |
+| CRITICAL-02 | Manual connection string escaping | Replaced with pgx native config builder | `internal/db` |
+
+### High-Priority Fixes
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| HIGH-01 | RateLimiter goroutine leak | Added `sync.Once`-guarded `Stop()` method; called during server shutdown | `internal/api` |
+| HIGH-02 | Unencoded URL path parameters in CLI | Added `url.PathEscape()` for namespace/path parameters | `internal/ctl` |
+| HIGH-03 | DB connection pool leak on retry | Proper pool cleanup on connection retry failure | `internal/db` |
+| HIGH-04 | Duplicated `DBClientFactory` interface | Extracted to shared `internal/db/factory.go` package | `internal/db` |
+| HIGH-05 | Missing HTTP server timeouts | Added `ReadTimeout` (30s), `WriteTimeout` (60s), `IdleTimeout` (120s) | `internal/api` |
+| HIGH-06 | Unbounded response body in CLI | Added 10 MiB response body size limit via `io.LimitReader` | `internal/ctl` |
+
+### Medium-Priority Fixes
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| MEDIUM-01/07 | Inline condition type strings | Defined constants (`DataRedistribution`, `ScaleOutFailed`, etc.) | `internal/util` |
+| MEDIUM-02 | Missing Godoc on `AuthMethod` constants | Added documentation comments | `internal/auth` |
+| MEDIUM-04 | Builder methods silently ignore errors | Changed `Build*StatefulSet` methods to return `(*StatefulSet, error)` | `internal/builder` |
+| MEDIUM-05 | Verbose flag not wired to CLI client | Connected `--verbose` flag to `OperatorClient` for debug logging | `internal/ctl`, `cmd/cloudberry-ctl` |
+| MEDIUM-06 | Silent JSON encoding failures | Added error logging for `json.Encode` failures in API handlers | `internal/api` |
+| MEDIUM-08 | Vault PKI using `ReadSecret` for cert issuance | Changed to `WriteSecretWithResponse` (PKI issue is a write operation) | `internal/certmanager` |
+| MEDIUM-09 | ENV var priority incorrect in CLI | Fixed to: CLI flag > env var > config file > default | `cmd/cloudberry-ctl` |
+
+### Low-Priority Fixes
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| LOW-01 | Missing package-level documentation | Added `// Package ...` doc comments to all packages | All |
+| LOW-02 | Inline event type strings | Standardized with named constants | `internal/controller` |
+| LOW-03 | Missing `NoopRecorder` method comments | Added Godoc comments | `internal/metrics` |
+| LOW-04 | Magic numbers in code | Extracted to named constants (timeouts, limits, etc.) | Multiple |
+| LOW-05 | Exported `Version()` in main package | Unexported to `version()` (not part of public API) | `cmd/cloudberry-ctl` |
+
+### Test Coverage Requirements
+
+All new code must meet the following coverage targets:
+
+- **Per-package minimum**: 90% statement coverage
+- **Critical packages** (`internal/db`, `internal/auth`, `internal/controller`): 85%+ minimum
+- **Run coverage check**: `make test-cover` generates an HTML report at `coverage/coverage.html`
+- **CI enforcement**: The CI pipeline fails if overall coverage drops below the threshold
+
+### Performance Testing
+
+Performance tests validate operator behavior under load and with large datasets. Run them after loading test data (Scenario 7):
+
+```bash
+# Load test data (~1.45M rows, ~218 MB)
+bash test/scenarios/scenario7_load_data.sh
+
+# Run scale-out performance test (measures time to scale from 4 to 6 segments)
+go test ./test/functional/... -v -tags functional -run TestScenario8 -timeout 10m
+
+# Run rebalance performance test
+go test ./test/functional/... -v -tags functional -run TestScenario10 -timeout 10m
+
+# Run all functional tests with extended timeout
+make test-functional TIMEOUT=30m
+```
+
+**Key performance metrics to monitor:**
+
+- Scale-out completion time (target: < 60s for 2 additional segments)
+- Rebalance completion time (depends on data volume)
+- Reconciliation duration (`cloudberry_reconcile_duration_seconds`)
+- API response latency under rate limiting
+
 ## Code Style and Linting
 
 ### Linter Configuration
@@ -807,6 +1293,10 @@ Run `make generate && make manifests` after:
 
 ### Key Implementation Details
 
+#### Builder Interface Error Handling
+
+Builder methods that construct StatefulSets (e.g., `BuildStandbyStatefulSet`) return `(*appsv1.StatefulSet, error)` instead of just `*appsv1.StatefulSet`. This change surfaces configuration errors early (e.g., invalid resource quantities, missing required fields) rather than silently producing invalid resources. Callers must check the error return value.
+
 #### `BuildMaintenanceJob` (ResourceBuilder Interface)
 
 The `BuildMaintenanceJob` method on the `ResourceBuilder` interface creates a Kubernetes `batchv1.Job` for maintenance operations:
@@ -815,7 +1305,7 @@ The `BuildMaintenanceJob` method on the `ResourceBuilder` interface creates a Ku
 BuildMaintenanceJob(cluster *CloudberryCluster, operation, timestamp string) *batchv1.Job
 ```
 
-- **Parameters**: `operation` is one of `vacuum`, `vacuum-analyze`, `vacuum-full`, `analyze`, `reindex`. `timestamp` is used for unique Job naming.
+- **Parameters**: `operation` is one of `vacuum`, `vacuum-analyze`, `vacuum-full`, `analyze`, `reindex`, `backup-on-delete`. `timestamp` is used for unique Job naming.
 - **Job name**: `{cluster}-maintenance-{timestamp}`
 - **Container**: Uses the cluster's image with a `psql` command connecting to the coordinator service
 - **Environment**: `PGPASSWORD` sourced from `{cluster}-admin-password` Secret via `SecretKeyRef`

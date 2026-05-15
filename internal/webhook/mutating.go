@@ -7,6 +7,42 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
+// Default values for CloudberryCluster fields.
+const (
+	// defaultPrimariesPerHost is the default number of primary segments per host.
+	defaultPrimariesPerHost = 2
+	// defaultFTSProbeInterval is the default FTS probe interval in seconds.
+	defaultFTSProbeInterval = 60
+	// defaultFTSProbeTimeout is the default FTS probe timeout in seconds.
+	defaultFTSProbeTimeout = 20
+	// defaultFTSProbeRetries is the default number of FTS probe retries.
+	defaultFTSProbeRetries = 5
+	// defaultResourceGroupConcurrency is the default concurrency for resource groups.
+	defaultResourceGroupConcurrency = 20
+	// defaultCPUMaxPercent is the default CPU max percent for resource groups.
+	defaultCPUMaxPercent = 100
+	// defaultCPUWeight is the default CPU weight for resource groups.
+	defaultCPUWeight = 100
+	// defaultSamplingInterval is the default query monitoring sampling interval in seconds.
+	defaultSamplingInterval = 15
+	// defaultBackupCompression is the default backup compression level (0-9).
+	defaultBackupCompression = 6
+	// defaultBackupParallelism is the default backup parallelism.
+	defaultBackupParallelism = 1
+	// defaultBackupRetentionFullCount is the default number of full backups to retain.
+	defaultBackupRetentionFullCount = 3
+	// defaultStreamingServerPort is the default streaming server port.
+	defaultStreamingServerPort = 5432
+	// defaultBloatThreshold is the default table bloat threshold percentage.
+	defaultBloatThreshold = 20
+	// defaultSkewThreshold is the default data skew threshold percentage.
+	defaultSkewThreshold = 50
+	// defaultAgeThreshold is the default transaction age threshold for recommendations.
+	defaultAgeThreshold = 500_000_000
+	// defaultIndexBloatThreshold is the default index bloat threshold percentage.
+	defaultIndexBloatThreshold = 30
+)
+
 // CloudberryClusterDefaulter sets defaults on CloudberryCluster resources.
 type CloudberryClusterDefaulter struct{}
 
@@ -69,7 +105,7 @@ func setCoordinatorDefaults(coord *cbv1alpha1.CoordinatorSpec) {
 // setSegmentDefaults sets segment defaults.
 func setSegmentDefaults(seg *cbv1alpha1.SegmentsSpec) {
 	if seg.PrimariesPerHost == 0 {
-		seg.PrimariesPerHost = 2
+		seg.PrimariesPerHost = defaultPrimariesPerHost
 	}
 	if seg.Storage.Size == "" {
 		seg.Storage.Size = "20Gi"
@@ -130,13 +166,13 @@ func setHADefaults(cluster *cbv1alpha1.CloudberryCluster) {
 		cluster.Spec.HA = &cbv1alpha1.HASpec{}
 	}
 	if cluster.Spec.HA.FTSProbeInterval == 0 {
-		cluster.Spec.HA.FTSProbeInterval = 60
+		cluster.Spec.HA.FTSProbeInterval = defaultFTSProbeInterval
 	}
 	if cluster.Spec.HA.FTSProbeTimeout == 0 {
-		cluster.Spec.HA.FTSProbeTimeout = 20
+		cluster.Spec.HA.FTSProbeTimeout = defaultFTSProbeTimeout
 	}
 	if cluster.Spec.HA.FTSProbeRetries == 0 {
-		cluster.Spec.HA.FTSProbeRetries = 5
+		cluster.Spec.HA.FTSProbeRetries = defaultFTSProbeRetries
 	}
 }
 
@@ -163,13 +199,13 @@ func setWorkloadDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	for i := range cluster.Spec.Workload.ResourceGroups {
 		rg := &cluster.Spec.Workload.ResourceGroups[i]
 		if rg.Concurrency == 0 {
-			rg.Concurrency = 20
+			rg.Concurrency = defaultResourceGroupConcurrency
 		}
 		if rg.CPUMaxPercent == 0 {
-			rg.CPUMaxPercent = 100
+			rg.CPUMaxPercent = defaultCPUMaxPercent
 		}
 		if rg.CPUWeight == 0 {
-			rg.CPUWeight = 100
+			rg.CPUWeight = defaultCPUWeight
 		}
 	}
 }
@@ -185,7 +221,7 @@ func setQueryMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 		cluster.Spec.QueryMonitoring.HistoryRetention = "30d"
 	}
 	if cluster.Spec.QueryMonitoring.SamplingInterval == 0 {
-		cluster.Spec.QueryMonitoring.SamplingInterval = 15
+		cluster.Spec.QueryMonitoring.SamplingInterval = defaultSamplingInterval
 	}
 	if cluster.Spec.QueryMonitoring.SlowQueryThreshold == "" {
 		cluster.Spec.QueryMonitoring.SlowQueryThreshold = "1000ms"
@@ -200,13 +236,13 @@ func setBackupDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	}
 
 	if cluster.Spec.Backup.Compression == 0 {
-		cluster.Spec.Backup.Compression = 6
+		cluster.Spec.Backup.Compression = defaultBackupCompression
 	}
 	if cluster.Spec.Backup.Parallelism == 0 {
-		cluster.Spec.Backup.Parallelism = 1
+		cluster.Spec.Backup.Parallelism = defaultBackupParallelism
 	}
 	if cluster.Spec.Backup.Retention.FullCount == 0 {
-		cluster.Spec.Backup.Retention.FullCount = 3
+		cluster.Spec.Backup.Retention.FullCount = defaultBackupRetentionFullCount
 	}
 	if cluster.Spec.Backup.Retention.MaxAge == "" {
 		cluster.Spec.Backup.Retention.MaxAge = "30d"
@@ -222,7 +258,7 @@ func setDataLoadingDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 
 	if cluster.Spec.DataLoading.StreamingServer != nil {
 		if cluster.Spec.DataLoading.StreamingServer.Port == 0 {
-			cluster.Spec.DataLoading.StreamingServer.Port = 5432
+			cluster.Spec.DataLoading.StreamingServer.Port = defaultStreamingServerPort
 		}
 		if cluster.Spec.DataLoading.StreamingServer.TLSMode == "" {
 			cluster.Spec.DataLoading.StreamingServer.TLSMode = "none"
@@ -243,16 +279,16 @@ func setStorageManagementDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 			scan.Schedule = "0 3 * * 0"
 		}
 		if scan.BloatThreshold == 0 {
-			scan.BloatThreshold = 20
+			scan.BloatThreshold = defaultBloatThreshold
 		}
 		if scan.SkewThreshold == 0 {
-			scan.SkewThreshold = 50
+			scan.SkewThreshold = defaultSkewThreshold
 		}
 		if scan.AgeThreshold == 0 {
-			scan.AgeThreshold = 500000000
+			scan.AgeThreshold = defaultAgeThreshold
 		}
 		if scan.IndexBloatThreshold == 0 {
-			scan.IndexBloatThreshold = 30
+			scan.IndexBloatThreshold = defaultIndexBloatThreshold
 		}
 		if scan.ScanDuration == "" {
 			scan.ScanDuration = "2h"

@@ -95,6 +95,14 @@ type Recorder interface {
 	ObserveRecommendationScanDuration(cluster, namespace string, duration time.Duration)
 	// SetTableBloatRatio sets the bloat ratio for a table.
 	SetTableBloatRatio(cluster, namespace, table string, ratio float64)
+	// RecordScaleOperation records a scale operation event.
+	RecordScaleOperation(cluster, namespace, operation string)
+	// SetRedistributionProgress sets the data redistribution progress.
+	SetRedistributionProgress(cluster, namespace string, progress float64)
+	// SetDataSkewCoefficient sets the data skew coefficient for a cluster.
+	SetDataSkewCoefficient(cluster, namespace string, coefficient float64)
+	// SetPVCSizeBytes sets the PVC size in bytes for a specific component.
+	SetPVCSizeBytes(cluster, namespace, component string, sizeBytes float64)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -146,6 +154,11 @@ type PrometheusRecorder struct {
 	recommendationsTotal  *prometheus.GaugeVec
 	recommendationScanDur *prometheus.HistogramVec
 	tableBloatRatio       *prometheus.GaugeVec
+
+	scaleOperationsTotal      *prometheus.CounterVec
+	redistributionProgressVec *prometheus.GaugeVec
+	dataSkewCoefficient       *prometheus.GaugeVec
+	pvcSizeBytes              *prometheus.GaugeVec
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -374,6 +387,26 @@ func (r *PrometheusRecorder) initStorageMetrics() {
 		Name:      "table_bloat_ratio",
 		Help:      "Bloat ratio for top tables.",
 	}, []string{labelCluster, labelNamespace, "table"})
+	r.scaleOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "scale_operations_total",
+		Help:      "Total number of scale operations.",
+	}, []string{labelCluster, labelNamespace, labelOperation})
+	r.redistributionProgressVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "redistribution_progress",
+		Help:      "Data redistribution progress (0.0 to 1.0).",
+	}, []string{labelCluster, labelNamespace})
+	r.dataSkewCoefficient = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_skew_coefficient",
+		Help:      "Data skew coefficient across segments.",
+	}, []string{labelCluster, labelNamespace})
+	r.pvcSizeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "pvc_size_bytes",
+		Help:      "PVC size in bytes per component.",
+	}, []string{labelCluster, labelNamespace, labelComponent})
 }
 
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
@@ -406,6 +439,8 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.restoreTotal, r.dataLoadingJobsGauge, r.dataLoadingRows,
 		r.diskUsagePercent, r.recommendationsTotal,
 		r.recommendationScanDur, r.tableBloatRatio,
+		r.scaleOperationsTotal, r.redistributionProgressVec,
+		r.dataSkewCoefficient, r.pvcSizeBytes,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -605,6 +640,26 @@ func (r *PrometheusRecorder) SetTableBloatRatio(cluster, namespace, table string
 	r.tableBloatRatio.WithLabelValues(cluster, namespace, table).Set(ratio)
 }
 
+// RecordScaleOperation records a scale operation event.
+func (r *PrometheusRecorder) RecordScaleOperation(cluster, namespace, operation string) {
+	r.scaleOperationsTotal.WithLabelValues(cluster, namespace, operation).Inc()
+}
+
+// SetRedistributionProgress sets the data redistribution progress.
+func (r *PrometheusRecorder) SetRedistributionProgress(cluster, namespace string, progress float64) {
+	r.redistributionProgressVec.WithLabelValues(cluster, namespace).Set(progress)
+}
+
+// SetDataSkewCoefficient sets the data skew coefficient for a cluster.
+func (r *PrometheusRecorder) SetDataSkewCoefficient(cluster, namespace string, coefficient float64) {
+	r.dataSkewCoefficient.WithLabelValues(cluster, namespace).Set(coefficient)
+}
+
+// SetPVCSizeBytes sets the PVC size in bytes for a specific component.
+func (r *PrometheusRecorder) SetPVCSizeBytes(cluster, namespace, component string, sizeBytes float64) {
+	r.pvcSizeBytes.WithLabelValues(cluster, namespace, component).Set(sizeBytes)
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -614,40 +669,123 @@ func boolToFloat64(b bool) float64 {
 }
 
 // NoopRecorder is a no-op implementation of Recorder for testing.
+// All methods intentionally do nothing as this recorder is used in
+// unit tests where metric recording is not needed.
 type NoopRecorder struct{}
 
-func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration)                {}
-func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64)                 {}
-func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool)                           {}
-func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool)                               {}
-func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64)                        {}
-func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64)                        {}
-func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64)                       {}
-func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool)                         {}
-func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration)                 {}
-func (n *NoopRecorder) RecordFTSFailover(_, _ string)                                  {}
-func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool)                        {}
-func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64)                    {}
-func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64)                {}
-func (n *NoopRecorder) RecordConfigReload(_, _ string)                                 {}
-func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64)                    {}
-func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64)                       {}
-func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64)                    {}
-func (n *NoopRecorder) RecordAuthAttempt(_, _ string)                                  {}
-func (n *NoopRecorder) SetActiveQueries(_, _ string, _ float64)                        {}
-func (n *NoopRecorder) SetQueuedQueries(_, _ string, _ float64)                        {}
-func (n *NoopRecorder) SetBlockedQueries(_, _ string, _ float64)                       {}
-func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string)                     {}
-func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64)             {}
-func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string)                    {}
-func (n *NoopRecorder) RecordSlowQuery(_, _ string)                                    {}
-func (n *NoopRecorder) RecordBackup(_, _, _, _ string)                                 {}
-func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration)             {}
-func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64)                      {}
-func (n *NoopRecorder) RecordRestore(_, _, _ string)                                   {}
-func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)                {}
-func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)             {}
-func (n *NoopRecorder) SetDiskUsagePercent(_, _ string, _ float64)                     {}
-func (n *NoopRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)              {}
+// RecordReconcile is a no-op implementation for testing.
+func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration) {}
+
+// UpdateClusterInfo is a no-op implementation for testing.
+func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64) {}
+
+// SetCoordinatorUp is a no-op implementation for testing.
+func (n *NoopRecorder) SetCoordinatorUp(_, _ string, _ bool) {}
+
+// SetStandbyUp is a no-op implementation for testing.
+func (n *NoopRecorder) SetStandbyUp(_, _ string, _ bool) {}
+
+// SetSegmentsReady is a no-op implementation for testing.
+func (n *NoopRecorder) SetSegmentsReady(_, _ string, _ float64) {}
+
+// SetSegmentsTotal is a no-op implementation for testing.
+func (n *NoopRecorder) SetSegmentsTotal(_, _ string, _ float64) {}
+
+// SetSegmentsFailed is a no-op implementation for testing.
+func (n *NoopRecorder) SetSegmentsFailed(_, _ string, _ float64) {}
+
+// SetMirroringInSync is a no-op implementation for testing.
+func (n *NoopRecorder) SetMirroringInSync(_, _ string, _ bool) {}
+
+// RecordFTSProbe is a no-op implementation for testing.
+func (n *NoopRecorder) RecordFTSProbe(_, _, _ string, _ time.Duration) {}
+
+// RecordFTSFailover is a no-op implementation for testing.
+func (n *NoopRecorder) RecordFTSFailover(_, _ string) {}
+
+// SetSegmentStatus is a no-op implementation for testing.
+func (n *NoopRecorder) SetSegmentStatus(_, _, _ string, _ bool) {}
+
+// SetReplicationLag is a no-op implementation for testing.
+func (n *NoopRecorder) SetReplicationLag(_, _, _ string, _ float64) {}
+
+// SetStandbyReplicationLag is a no-op implementation for testing.
+func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64) {}
+
+// RecordConfigReload is a no-op implementation for testing.
+func (n *NoopRecorder) RecordConfigReload(_, _ string) {}
+
+// SetConnectionsActive is a no-op implementation for testing.
+func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64) {}
+
+// SetConnectionsMax is a no-op implementation for testing.
+func (n *NoopRecorder) SetConnectionsMax(_, _ string, _ float64) {}
+
+// SetDiskUsageBytes is a no-op implementation for testing.
+func (n *NoopRecorder) SetDiskUsageBytes(_, _, _ string, _ float64) {}
+
+// RecordAuthAttempt is a no-op implementation for testing.
+func (n *NoopRecorder) RecordAuthAttempt(_, _ string) {}
+
+// SetActiveQueries is a no-op implementation for testing.
+func (n *NoopRecorder) SetActiveQueries(_, _ string, _ float64) {}
+
+// SetQueuedQueries is a no-op implementation for testing.
+func (n *NoopRecorder) SetQueuedQueries(_, _ string, _ float64) {}
+
+// SetBlockedQueries is a no-op implementation for testing.
+func (n *NoopRecorder) SetBlockedQueries(_, _ string, _ float64) {}
+
+// RecordWorkloadRuleAction is a no-op implementation for testing.
+func (n *NoopRecorder) RecordWorkloadRuleAction(_, _, _, _ string) {}
+
+// SetResourceGroupUsage is a no-op implementation for testing.
+func (n *NoopRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64) {}
+
+// RecordIdleSessionTermination is a no-op implementation for testing.
+func (n *NoopRecorder) RecordIdleSessionTermination(_, _, _ string) {}
+
+// RecordSlowQuery is a no-op implementation for testing.
+func (n *NoopRecorder) RecordSlowQuery(_, _ string) {}
+
+// RecordBackup is a no-op implementation for testing.
+func (n *NoopRecorder) RecordBackup(_, _, _, _ string) {}
+
+// ObserveBackupDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration) {}
+
+// SetBackupSizeBytes is a no-op implementation for testing.
+func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64) {}
+
+// RecordRestore is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRestore(_, _, _ string) {}
+
+// SetDataLoadingJobsActive is a no-op implementation for testing.
+func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64) {}
+
+// RecordDataLoadingRows is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64) {}
+
+// SetDiskUsagePercent is a no-op implementation for testing.
+func (n *NoopRecorder) SetDiskUsagePercent(_, _ string, _ float64) {}
+
+// SetRecommendationsTotal is a no-op implementation for testing.
+func (n *NoopRecorder) SetRecommendationsTotal(_, _, _ string, _ float64) {}
+
+// ObserveRecommendationScanDuration is a no-op implementation for testing.
 func (n *NoopRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {}
-func (n *NoopRecorder) SetTableBloatRatio(_, _, _ string, _ float64)                   {}
+
+// SetTableBloatRatio is a no-op implementation for testing.
+func (n *NoopRecorder) SetTableBloatRatio(_, _, _ string, _ float64) {}
+
+// RecordScaleOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordScaleOperation(_, _, _ string) {}
+
+// SetRedistributionProgress is a no-op implementation for testing.
+func (n *NoopRecorder) SetRedistributionProgress(_, _ string, _ float64) {}
+
+// SetDataSkewCoefficient is a no-op implementation for testing.
+func (n *NoopRecorder) SetDataSkewCoefficient(_, _ string, _ float64) {}
+
+// SetPVCSizeBytes is a no-op implementation for testing.
+func (n *NoopRecorder) SetPVCSizeBytes(_, _, _ string, _ float64) {}

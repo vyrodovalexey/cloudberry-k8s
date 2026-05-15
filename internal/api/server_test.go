@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -17,11 +20,13 @@ import (
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 func newTestScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = cbv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 	return scheme
 }
 
@@ -1569,6 +1574,65 @@ func TestWithAuth_WithMiddleware(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
+func TestHandleListPVCs(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	// Create a PVC that belongs to the cluster.
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-test-cluster-coordinator-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelCluster:   "test-cluster",
+				util.LabelComponent: util.ComponentCoordinator,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	err := s.k8sClient.Create(context.Background(), pvc)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/pvcs?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListPVCs(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(1), resp["total"])
+
+	pvcs := resp["pvcs"].([]interface{})
+	require.Len(t, pvcs, 1)
+	pvcInfo := pvcs[0].(map[string]interface{})
+	assert.Equal(t, "data-test-cluster-coordinator-0", pvcInfo["name"])
+	assert.Equal(t, util.ComponentCoordinator, pvcInfo["component"])
+	assert.Equal(t, "10Gi", pvcInfo["size"])
+}
+
+func TestHandleListPVCs_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/storage/pvcs?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListPVCs(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
 // mockAuthProvider implements auth.Provider for testing.
 type mockAuthProvider struct {
 	identity *auth.Identity
@@ -1581,4 +1645,346 @@ func (m *mockAuthProvider) Authenticate(_ context.Context, _ *http.Request) (*au
 
 func (m *mockAuthProvider) Type() string {
 	return "mock"
+}
+
+// ============================================================================
+// DB-dependent handler tests and additional coverage
+// ============================================================================
+
+func TestHandleGetRebalanceStatus_Success(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Segments.Rebalance = &cbv1alpha1.RebalanceSpec{
+		SkewThreshold: 10,
+		Parallelism:   2,
+		ExcludeTables: []string{"public.large_table"},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/rebalance/status?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetRebalanceStatus(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "test-cluster", resp["name"])
+	assert.Equal(t, "default", resp["namespace"])
+	assert.NotNil(t, resp["config"])
+}
+
+func TestHandleGetRebalanceStatus_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/rebalance/status?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetRebalanceStatus(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetRebalanceStatus_WithRedistributionCondition(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.Conditions = []metav1.Condition{
+		{
+			Type:               string(cbv1alpha1.ConditionDataRedistribution),
+			Status:             metav1.ConditionTrue,
+			Reason:             "InProgress",
+			Message:            "Data redistribution in progress",
+			LastTransitionTime: metav1.Now(),
+		},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/rebalance/status?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetRebalanceStatus(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.NotNil(t, resp["redistribution"])
+}
+
+func TestHandleListSessions_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/sessions?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListSessions(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(0), resp["total"])
+	assert.Equal(t, msgDBNotAvailable, resp["message"])
+}
+
+func TestHandleCancelQuery_InvalidPID(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/sessions/abc/cancel?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "abc")
+	rec := httptest.NewRecorder()
+	s.handleCancelQuery(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleCancelQuery_NegativePID(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/sessions/-1/cancel?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "-1")
+	rec := httptest.NewRecorder()
+	s.handleCancelQuery(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleCancelQuery_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "123")
+	rec := httptest.NewRecorder()
+	s.handleCancelQuery(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, false, resp["canceled"])
+	assert.Equal(t, msgDBNotAvailable, resp["message"])
+}
+
+func TestHandleTerminateSession_InvalidPID(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/sessions/abc?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "abc")
+	rec := httptest.NewRecorder()
+	s.handleTerminateSession(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleTerminateSession_NegativePID(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/sessions/-5?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "-5")
+	rec := httptest.NewRecorder()
+	s.handleTerminateSession(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleTerminateSession_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/sessions/123?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "123")
+	rec := httptest.NewRecorder()
+	s.handleTerminateSession(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, false, resp["terminated"])
+}
+
+func TestHandleListResourceGroups_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+		Enabled: true,
+		ResourceGroups: []cbv1alpha1.ResourceGroupSpec{
+			{Name: "analytics", Concurrency: 10},
+		},
+	}
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListResourceGroups(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(1), resp["total"])
+}
+
+func TestHandleCreateResourceGroup_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	body := `{"name":"analytics","concurrency":10,"cpuMaxPercent":50}`
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+		bytes.NewBufferString(body))
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleCreateResourceGroup(rec, req)
+	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
+func TestHandleCreateResourceGroup_InvalidBody(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+		bytes.NewBufferString("invalid-json"))
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleCreateResourceGroup(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleCreateResourceGroup_EmptyName(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	body := `{"name":"","concurrency":10}`
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups?namespace=default",
+		bytes.NewBufferString(body))
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleCreateResourceGroup(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandleDeleteResourceGroup_NoDBFactory(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("groupName", "analytics")
+	rec := httptest.NewRecorder()
+	s.handleDeleteResourceGroup(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "pending", resp["status"])
+}
+
+func TestHandleListSessions_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/sessions?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleListSessions(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleCancelQuery_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/nonexistent/sessions/123/cancel?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("pid", "123")
+	rec := httptest.NewRecorder()
+	s.handleCancelQuery(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleTerminateSession_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/nonexistent/sessions/123?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("pid", "123")
+	rec := httptest.NewRecorder()
+	s.handleTerminateSession(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleCreateResourceGroup_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+
+	body := `{"name":"analytics","concurrency":10}`
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/nonexistent/workload/resource-groups?namespace=default",
+		bytes.NewBufferString(body))
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleCreateResourceGroup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleDeleteResourceGroup_ClusterNotFound(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/nonexistent/workload/resource-groups/analytics?namespace=default",
+		nil)
+	req.SetPathValue("name", "nonexistent")
+	req.SetPathValue("groupName", "analytics")
+	rec := httptest.NewRecorder()
+	s.handleDeleteResourceGroup(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestStartServer_ContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	logger := slog.Default()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- StartServer(ctx, "127.0.0.1:0", mux, logger)
+	}()
+
+	// Cancel immediately to trigger shutdown.
+	cancel()
+
+	// The server should shut down gracefully.
+	// We don't assert on the error because it depends on timing.
 }

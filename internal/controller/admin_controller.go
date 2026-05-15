@@ -11,6 +11,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -21,6 +22,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -81,7 +83,7 @@ type AdminReconciler struct {
 	scheme    *runtime.Scheme
 	recorder  record.EventRecorder
 	builder   builder.ResourceBuilder
-	dbFactory DBClientFactory
+	dbFactory db.DBClientFactory
 	metrics   metrics.Recorder
 	logger    *slog.Logger
 	// configHashes tracks the last known config hash per cluster for change detection.
@@ -98,7 +100,7 @@ func NewAdminReconciler(
 	scheme *runtime.Scheme,
 	recorder record.EventRecorder,
 	b builder.ResourceBuilder,
-	dbFactory DBClientFactory,
+	dbFactory db.DBClientFactory,
 	m metrics.Recorder,
 	logger *slog.Logger,
 ) *AdminReconciler {
@@ -237,7 +239,7 @@ func (r *AdminReconciler) reconcileWorkload(
 		"idleRules", len(cluster.Spec.Workload.IdleRules),
 	)
 
-	r.recorder.Event(cluster, "Normal", "WorkloadReconciled",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonWorkloadReconciled,
 		fmt.Sprintf("Workload management reconciled: %d resource groups, %d rules",
 			len(cluster.Spec.Workload.ResourceGroups), len(cluster.Spec.Workload.Rules)))
 
@@ -280,7 +282,7 @@ func (r *AdminReconciler) reconcileQueryMonitoring(
 	r.metrics.SetQueuedQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.QueuedQueries))
 	r.metrics.SetBlockedQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.BlockedQueries))
 
-	r.recorder.Event(cluster, "Normal", "QueryMonitoringReconciled",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonQueryMonitoringReconciled,
 		"Query monitoring configuration reconciled")
 
 	return nil
@@ -313,7 +315,7 @@ func (r *AdminReconciler) reconcileBackup(
 		"Backup configuration is applied",
 	)
 
-	r.recorder.Event(cluster, "Normal", "BackupReconciled",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonBackupReconciled,
 		fmt.Sprintf("Backup configuration reconciled: schedule=%s, destination=%s",
 			cluster.Spec.Backup.Schedule, cluster.Spec.Backup.Destination.Type))
 
@@ -358,7 +360,7 @@ func (r *AdminReconciler) reconcileDataLoading(
 		"Data loading configuration is applied",
 	)
 
-	r.recorder.Event(cluster, "Normal", "DataLoadingReconciled",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonDataLoadingReconciled,
 		fmt.Sprintf("Data loading reconciled: %d jobs configured, %d active",
 			len(cluster.Spec.DataLoading.Jobs), activeJobs))
 
@@ -413,7 +415,7 @@ func (r *AdminReconciler) reconcileStorage(
 		"Storage management is configured",
 	)
 
-	r.recorder.Event(cluster, "Normal", "StorageReconciled",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonStorageReconciled,
 		fmt.Sprintf("Storage management reconciled: diskMonitoring=%t, recommendations=%d",
 			cluster.Spec.Storage.DiskMonitoring, recommendationCount))
 
@@ -516,7 +518,7 @@ func (r *AdminReconciler) applyRestartRequired(
 		return fmt.Errorf("updating config status: %w", err)
 	}
 
-	r.recorder.Event(cluster, "Normal", "RollingRestartStarted",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRollingRestartStarted,
 		fmt.Sprintf("Rolling restart initiated for parameters: %s", strings.Join(params, ", ")))
 
 	if err := r.triggerRollingRestart(ctx, cluster, params); err != nil {
@@ -542,7 +544,7 @@ func (r *AdminReconciler) applyReloadSafe(
 		return fmt.Errorf("updating config status: %w", err)
 	}
 
-	r.recorder.Event(cluster, "Normal", "ConfigReloaded",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonConfigReloaded,
 		"Configuration parameters reloaded without restart")
 	return nil
 }
@@ -765,7 +767,7 @@ func (r *AdminReconciler) completeRollingRestart(
 		return ctrl.Result{}, fmt.Errorf("updating status after rolling restart: %w", err)
 	}
 
-	r.recorder.Event(cluster, "Normal", "RollingRestartCompleted",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRollingRestartCompleted,
 		fmt.Sprintf("Rolling restart completed for parameters: %s", strings.Join(state.RestartParams, ", ")))
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
@@ -905,7 +907,7 @@ func (r *AdminReconciler) handleMaintenance(
 	}
 	if !validOps[maintenance] {
 		logger.Warn("unknown maintenance operation", "type", maintenance)
-		r.recorder.Event(cluster, "Warning", "MaintenanceUnknown",
+		r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMaintenanceUnknown,
 			fmt.Sprintf("Unknown maintenance operation: %s", maintenance))
 		return ctrl.Result{}, nil
 	}
@@ -920,7 +922,7 @@ func (r *AdminReconciler) handleMaintenance(
 		logger.Info("maintenance job already exists", "job", job.Name)
 	}
 
-	r.recorder.Event(cluster, "Normal", "MaintenanceStarted",
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMaintenanceStarted,
 		fmt.Sprintf("Maintenance operation %s initiated, job: %s", maintenance, job.Name))
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil

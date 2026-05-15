@@ -48,7 +48,7 @@ func TestBuildCoordinatorStatefulSet(t *testing.T) {
 	b := NewBuilder()
 	cluster := newTestCluster()
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	assert.Equal(t, util.CoordinatorName("test-cluster"), sts.Name)
@@ -82,7 +82,7 @@ func TestBuildCoordinatorStatefulSet_DefaultPort(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Coordinator.Port = 0
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	container := sts.Spec.Template.Spec.Containers[0]
@@ -97,7 +97,7 @@ func TestBuildCoordinatorStatefulSet_WithResources(t *testing.T) {
 		Limits:   &cbv1alpha1.ResourceList{CPU: "2", Memory: "4Gi"},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	container := sts.Spec.Template.Spec.Containers[0]
@@ -110,7 +110,7 @@ func TestBuildCoordinatorStatefulSet_WithNodeSelector(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Coordinator.NodeSelector = map[string]string{"role": "coordinator"}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	assert.Equal(t, "coordinator", sts.Spec.Template.Spec.NodeSelector["role"])
 }
@@ -122,7 +122,7 @@ func TestBuildCoordinatorStatefulSet_WithTolerations(t *testing.T) {
 		{Key: "dedicated", Operator: "Equal", Value: "coordinator", Effect: "NoSchedule"},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	require.Len(t, sts.Spec.Template.Spec.Tolerations, 1)
 	assert.Equal(t, "dedicated", sts.Spec.Template.Spec.Tolerations[0].Key)
@@ -135,7 +135,7 @@ func TestBuildCoordinatorStatefulSet_WithImagePullSecrets(t *testing.T) {
 		{Name: "my-registry-secret"},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
 	assert.Equal(t, "my-registry-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
@@ -147,7 +147,7 @@ func TestBuildStandbyStatefulSet(t *testing.T) {
 		cluster := newTestCluster()
 		cluster.Spec.Standby = nil
 
-		sts := b.BuildStandbyStatefulSet(cluster)
+		sts, _ := b.BuildStandbyStatefulSet(cluster)
 		assert.Nil(t, sts)
 	})
 
@@ -156,7 +156,7 @@ func TestBuildStandbyStatefulSet(t *testing.T) {
 		cluster := newTestCluster()
 		cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: false}
 
-		sts := b.BuildStandbyStatefulSet(cluster)
+		sts, _ := b.BuildStandbyStatefulSet(cluster)
 		assert.Nil(t, sts)
 	})
 
@@ -168,7 +168,7 @@ func TestBuildStandbyStatefulSet(t *testing.T) {
 			Storage: &cbv1alpha1.StorageSpec{Size: "10Gi"},
 		}
 
-		sts := b.BuildStandbyStatefulSet(cluster)
+		sts, _ := b.BuildStandbyStatefulSet(cluster)
 		require.NotNil(t, sts)
 		assert.Equal(t, util.StandbyName("test-cluster"), sts.Name)
 		assert.Equal(t, int32(1), *sts.Spec.Replicas)
@@ -181,7 +181,7 @@ func TestBuildStandbyStatefulSet(t *testing.T) {
 			Enabled: true,
 		}
 
-		sts := b.BuildStandbyStatefulSet(cluster)
+		sts, _ := b.BuildStandbyStatefulSet(cluster)
 		require.NotNil(t, sts)
 		// Should use coordinator storage
 		assert.Equal(t, "10Gi", sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().String())
@@ -192,7 +192,7 @@ func TestBuildSegmentPrimaryStatefulSet(t *testing.T) {
 	b := NewBuilder()
 	cluster := newTestCluster()
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	assert.Equal(t, util.SegmentPrimaryName("test-cluster"), sts.Name)
@@ -210,7 +210,7 @@ func TestBuildSegmentMirrorStatefulSet(t *testing.T) {
 		cluster := newTestCluster()
 		cluster.Spec.Segments.Mirroring = nil
 
-		sts := b.BuildSegmentMirrorStatefulSet(cluster)
+		sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 		assert.Nil(t, sts)
 	})
 
@@ -219,7 +219,7 @@ func TestBuildSegmentMirrorStatefulSet(t *testing.T) {
 		cluster := newTestCluster()
 		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: false}
 
-		sts := b.BuildSegmentMirrorStatefulSet(cluster)
+		sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 		assert.Nil(t, sts)
 	})
 
@@ -228,7 +228,7 @@ func TestBuildSegmentMirrorStatefulSet(t *testing.T) {
 		cluster := newTestCluster()
 		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
 
-		sts := b.BuildSegmentMirrorStatefulSet(cluster)
+		sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 		require.NotNil(t, sts)
 		assert.Equal(t, util.SegmentMirrorName("test-cluster"), sts.Name)
 		assert.Equal(t, int32(4), *sts.Spec.Replicas)
@@ -545,7 +545,7 @@ func TestBuildCoordinatorStatefulSet_WithBackupConfig(t *testing.T) {
 		},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	// Verify the StatefulSet is created with the correct name and labels.
@@ -577,7 +577,7 @@ func TestBuildCoordinatorStatefulSet_WithDataLoadingConfig(t *testing.T) {
 		},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	// Verify the StatefulSet is created with config volume.
@@ -655,7 +655,7 @@ func TestBuildSegmentPrimaryStatefulSet_WithRequiredAntiAffinity(t *testing.T) {
 		Layout:  cbv1alpha1.MirroringLayoutGroup,
 	}
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	affinity := sts.Spec.Template.Spec.Affinity
@@ -674,7 +674,7 @@ func TestBuildCoordinatorStatefulSet_WithSSL(t *testing.T) {
 		},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	// Verify TLS volume mount is present.
@@ -706,7 +706,7 @@ func TestBuildCoordinatorStatefulSet_InvalidResources(t *testing.T) {
 		Requests: &cbv1alpha1.ResourceList{CPU: "invalid-cpu"},
 	}
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when resources are invalid")
 }
 
@@ -715,7 +715,7 @@ func TestBuildCoordinatorStatefulSet_InvalidStorageSize(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Coordinator.Storage.Size = "not-a-valid-size"
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when storage size is invalid")
 }
 
@@ -729,7 +729,7 @@ func TestBuildStandbyStatefulSet_InvalidResources(t *testing.T) {
 		},
 	}
 
-	sts := b.BuildStandbyStatefulSet(cluster)
+	sts, _ := b.BuildStandbyStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when standby resources are invalid")
 }
 
@@ -741,7 +741,7 @@ func TestBuildStandbyStatefulSet_InvalidStorageSize(t *testing.T) {
 		Storage: &cbv1alpha1.StorageSpec{Size: "bad-size"},
 	}
 
-	sts := b.BuildStandbyStatefulSet(cluster)
+	sts, _ := b.BuildStandbyStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when standby storage size is invalid")
 }
 
@@ -753,7 +753,7 @@ func TestBuildStandbyStatefulSet_WithNodeSelector(t *testing.T) {
 		NodeSelector: map[string]string{"zone": "us-east-1a"},
 	}
 
-	sts := b.BuildStandbyStatefulSet(cluster)
+	sts, _ := b.BuildStandbyStatefulSet(cluster)
 	require.NotNil(t, sts)
 	assert.Equal(t, "us-east-1a", sts.Spec.Template.Spec.NodeSelector["zone"])
 }
@@ -765,7 +765,7 @@ func TestBuildSegmentPrimaryStatefulSet_InvalidResources(t *testing.T) {
 		Requests: &cbv1alpha1.ResourceList{CPU: "bad-cpu"},
 	}
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when segment resources are invalid")
 }
 
@@ -774,7 +774,7 @@ func TestBuildSegmentPrimaryStatefulSet_InvalidStorageSize(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Segments.Storage.Size = "bad-size"
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when segment storage size is invalid")
 }
 
@@ -783,7 +783,7 @@ func TestBuildSegmentPrimaryStatefulSet_DefaultPort(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Coordinator.Port = 0
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	require.NotNil(t, sts)
 	container := sts.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
@@ -797,7 +797,7 @@ func TestBuildSegmentPrimaryStatefulSet_WithNodeSelectorAndTolerations(t *testin
 		{Key: "dedicated", Operator: "Equal", Value: "segment", Effect: "NoSchedule"},
 	}
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	require.NotNil(t, sts)
 	assert.Equal(t, "segment", sts.Spec.Template.Spec.NodeSelector["role"])
 	require.Len(t, sts.Spec.Template.Spec.Tolerations, 1)
@@ -812,7 +812,7 @@ func TestBuildSegmentMirrorStatefulSet_InvalidResources(t *testing.T) {
 		Limits: &cbv1alpha1.ResourceList{CPU: "bad-cpu"},
 	}
 
-	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when mirror resources are invalid")
 }
 
@@ -822,7 +822,7 @@ func TestBuildSegmentMirrorStatefulSet_InvalidStorageSize(t *testing.T) {
 	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
 	cluster.Spec.Segments.Storage.Size = "bad-size"
 
-	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	assert.Nil(t, sts, "should return nil when mirror storage size is invalid")
 }
 
@@ -832,7 +832,7 @@ func TestBuildSegmentMirrorStatefulSet_DefaultPort(t *testing.T) {
 	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
 	cluster.Spec.Coordinator.Port = 0
 
-	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	container := sts.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
@@ -847,7 +847,7 @@ func TestBuildSegmentMirrorStatefulSet_WithNodeSelectorAndTolerations(t *testing
 		{Key: "dedicated", Operator: "Equal", Value: "segment", Effect: "NoSchedule"},
 	}
 
-	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	assert.Equal(t, "segment", sts.Spec.Template.Spec.NodeSelector["role"])
 	require.Len(t, sts.Spec.Template.Spec.Tolerations, 1)
@@ -1077,7 +1077,7 @@ func TestBuildCoordinatorStatefulSet_CustomPort(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Coordinator.Port = 6432
 
-	sts := b.BuildCoordinatorStatefulSet(cluster)
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	require.NotNil(t, sts)
 
 	container := sts.Spec.Template.Spec.Containers[0]
@@ -1090,7 +1090,7 @@ func TestBuildStandbyStatefulSet_DefaultPort(t *testing.T) {
 	cluster.Spec.Coordinator.Port = 0
 	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
 
-	sts := b.BuildStandbyStatefulSet(cluster)
+	sts, _ := b.BuildStandbyStatefulSet(cluster)
 	require.NotNil(t, sts)
 	container := sts.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, int32(5432), container.Ports[0].ContainerPort)
@@ -1104,7 +1104,7 @@ func TestBuildSegmentMirrorStatefulSet_WithImagePullSecrets(t *testing.T) {
 		{Name: "my-secret"},
 	}
 
-	sts := b.BuildSegmentMirrorStatefulSet(cluster)
+	sts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	require.NotNil(t, sts)
 	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
 	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
@@ -1118,7 +1118,7 @@ func TestBuildStandbyStatefulSet_WithImagePullSecrets(t *testing.T) {
 		{Name: "my-secret"},
 	}
 
-	sts := b.BuildStandbyStatefulSet(cluster)
+	sts, _ := b.BuildStandbyStatefulSet(cluster)
 	require.NotNil(t, sts)
 	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
 	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)
@@ -1131,7 +1131,7 @@ func TestBuildSegmentPrimaryStatefulSet_WithImagePullSecrets(t *testing.T) {
 		{Name: "my-secret"},
 	}
 
-	sts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	sts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	require.NotNil(t, sts)
 	require.Len(t, sts.Spec.Template.Spec.ImagePullSecrets, 1)
 	assert.Equal(t, "my-secret", sts.Spec.Template.Spec.ImagePullSecrets[0].Name)

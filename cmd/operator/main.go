@@ -10,10 +10,12 @@ import (
 	"syscall"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -36,9 +38,6 @@ import (
 //
 //nolint:gochecknoglobals // set by ldflags
 var version = "dev"
-
-// Version returns the build version for use by other packages.
-func Version() string { return version }
 
 var scheme = runtime.NewScheme()
 
@@ -70,6 +69,8 @@ func run(ctx context.Context) error {
 	logger := util.NewLogger(cfg.LogLevel, util.LogFormat(cfg.LogFormat), os.Stdout)
 	slog.SetDefault(logger)
 	ctrl.SetLogger(util.SlogToLogr(logger))
+
+	logger.Info("starting cloudberry operator", "version", version)
 
 	// Initialize telemetry.
 	shutdownTracer, err := telemetry.InitTracer(ctx, telemetry.Config{
@@ -201,6 +202,7 @@ func registerControllers(
 		mgr.GetScheme(),
 		eventRecorder,
 		dbFactory,
+		resourceBuilder,
 		metricsRecorder,
 		logger,
 	)
@@ -291,7 +293,13 @@ func setupWebhookCerts(
 	cfg *config.OperatorConfig,
 	logger *slog.Logger,
 ) error {
-	operatorNS := cfg.Namespace
+	// Determine the operator namespace from the POD_NAMESPACE env var (set by
+	// the Helm deployment via the downward API), falling back to the configured
+	// watch namespace, and finally to the compile-time default.
+	operatorNS := os.Getenv("POD_NAMESPACE")
+	if operatorNS == "" {
+		operatorNS = cfg.Namespace
+	}
 	if operatorNS == "" {
 		operatorNS = util.OperatorNamespace
 	}
@@ -306,7 +314,14 @@ func setupWebhookCerts(
 		VaultPKIRole:      cfg.VaultPKIRole,
 	}
 
-	cm := certmanager.New(mgr.GetClient(), nil, certCfg, logger)
+	// Use a direct API client (not the cached manager client) because the
+	// manager cache has not been started yet at this point in the lifecycle.
+	directClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+	if err != nil {
+		return fmt.Errorf("creating direct API client for cert management: %w", err)
+	}
+
+	cm := certmanager.New(directClient, nil, certCfg, logger)
 
 	caBundle, err := cm.EnsureCertificates(ctx)
 	if err != nil {
@@ -318,8 +333,66 @@ func setupWebhookCerts(
 		"certSource", cfg.WebhookCertSource,
 	)
 
+	// Inject the CA bundle into webhook configurations so the API server
+	// can verify the self-signed certificate used by the webhook server.
+	if err := injectCABundle(ctx, directClient, caBundle, logger); err != nil {
+		return fmt.Errorf("injecting CA bundle into webhook configurations: %w", err)
+	}
+
 	// Start background goroutine for certificate rotation.
 	go runCertRotation(ctx, cm, logger)
+
+	return nil
+}
+
+// injectCABundle patches ValidatingWebhookConfiguration and MutatingWebhookConfiguration
+// resources managed by the operator to include the given CA bundle.
+func injectCABundle(ctx context.Context, k8sClient client.Client, caBundle []byte, logger *slog.Logger) error {
+	// Patch validating webhook configurations.
+	vwcList := &admissionregistrationv1.ValidatingWebhookConfigurationList{}
+	if err := k8sClient.List(ctx, vwcList, client.MatchingLabels{
+		"app.kubernetes.io/part-of": "cloudberry-operator",
+	}); err != nil {
+		return fmt.Errorf("listing validating webhook configurations: %w", err)
+	}
+
+	for i := range vwcList.Items {
+		vwc := &vwcList.Items[i]
+		patched := false
+		for j := range vwc.Webhooks {
+			vwc.Webhooks[j].ClientConfig.CABundle = caBundle
+			patched = true
+		}
+		if patched {
+			if err := k8sClient.Update(ctx, vwc); err != nil {
+				return fmt.Errorf("updating validating webhook configuration %s: %w", vwc.Name, err)
+			}
+			logger.Info("injected CA bundle into validating webhook configuration", "name", vwc.Name)
+		}
+	}
+
+	// Patch mutating webhook configurations.
+	mwcList := &admissionregistrationv1.MutatingWebhookConfigurationList{}
+	if err := k8sClient.List(ctx, mwcList, client.MatchingLabels{
+		"app.kubernetes.io/part-of": "cloudberry-operator",
+	}); err != nil {
+		return fmt.Errorf("listing mutating webhook configurations: %w", err)
+	}
+
+	for i := range mwcList.Items {
+		mwc := &mwcList.Items[i]
+		patched := false
+		for j := range mwc.Webhooks {
+			mwc.Webhooks[j].ClientConfig.CABundle = caBundle
+			patched = true
+		}
+		if patched {
+			if err := k8sClient.Update(ctx, mwc); err != nil {
+				return fmt.Errorf("updating mutating webhook configuration %s: %w", mwc.Name, err)
+			}
+			logger.Info("injected CA bundle into mutating webhook configuration", "name", mwc.Name)
+		}
+	}
 
 	return nil
 }

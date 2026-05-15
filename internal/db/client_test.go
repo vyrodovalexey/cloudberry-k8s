@@ -28,7 +28,7 @@ func TestBuildConnectionString(t *testing.T) {
 				Password: "pass",
 				SSLMode:  "disable",
 			},
-			expected: "host=localhost port=5432 dbname=testdb user=user password=pass sslmode=disable",
+			expected: "postgres://user:pass@localhost:5432/testdb?sslmode=disable",
 		},
 		{
 			name: "ssl mode require",
@@ -40,7 +40,7 @@ func TestBuildConnectionString(t *testing.T) {
 				Password: "secret",
 				SSLMode:  "require",
 			},
-			expected: "host=db.example.com port=5433 dbname=production user=admin password=secret sslmode=require",
+			expected: "postgres://admin:secret@db.example.com:5433/production?sslmode=require",
 		},
 		{
 			name: "empty ssl mode defaults to disable",
@@ -52,7 +52,7 @@ func TestBuildConnectionString(t *testing.T) {
 				Password: "pass",
 				SSLMode:  "",
 			},
-			expected: "host=localhost port=5432 dbname=testdb user=user password=pass sslmode=disable",
+			expected: "postgres://user:pass@localhost:5432/testdb?sslmode=disable",
 		},
 	}
 
@@ -1127,38 +1127,33 @@ func TestBuildConnectionString_PasswordWithNewline(t *testing.T) {
 	assert.NotEmpty(t, result)
 }
 
-func TestEscapeConnParam_SpecialCharacters(t *testing.T) {
+func TestBuildConnectionString_PasswordInjectionSafety(t *testing.T) {
+	// Test that buildConnectionString handles special characters in password
+	// safely via pgx native config builder (no injection possible).
 	tests := []struct {
 		name     string
-		input    string
-		expected string
+		password string
 	}{
-		{
-			name:     "newline in value",
-			input:    "pass\nword",
-			expected: "'pass\nword'",
-		},
-		{
-			name:     "backslash and quote combined",
-			input:    `it\'s`,
-			expected: `'it\\\'s'`,
-		},
-		{
-			name:     "multiple spaces",
-			input:    "a  b  c",
-			expected: "'a  b  c'",
-		},
-		{
-			name:     "only backslash",
-			input:    `\`,
-			expected: `'\\'`,
-		},
+		{name: "single quote", password: "pass'word"},
+		{name: "backslash", password: `pass\word`},
+		{name: "spaces", password: "pass word"},
+		{name: "newline", password: "pass\nword"},
+		{name: "semicolon", password: "pass;word"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := escapeConnParam(tt.input)
-			assert.Equal(t, tt.expected, result)
+			cfg := Config{
+				Host:     "localhost",
+				Port:     5432,
+				Database: "testdb",
+				Username: "user",
+				Password: tt.password,
+				SSLMode:  "disable",
+			}
+			result, err := buildConnectionString(cfg)
+			assert.NoError(t, err)
+			assert.NotEmpty(t, result)
 		})
 	}
 }

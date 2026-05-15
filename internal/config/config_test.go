@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,6 +127,35 @@ func TestLoad_MalformedConfigFile(t *testing.T) {
 	cfg, err := loader.Load()
 	assert.Error(t, err)
 	assert.Nil(t, cfg)
+}
+
+func TestRedactedString_String(t *testing.T) {
+	secret := RedactedString("my-super-secret-token")
+	assert.Equal(t, "[REDACTED]", secret.String())
+	assert.Equal(t, "[REDACTED]", fmt.Sprintf("%s", secret))
+}
+
+func TestRedactedString_Value(t *testing.T) {
+	secret := RedactedString("my-super-secret-token")
+	assert.Equal(t, "my-super-secret-token", secret.Value())
+}
+
+func TestRedactedString_EmptyValue(t *testing.T) {
+	secret := RedactedString("")
+	assert.Equal(t, "[REDACTED]", secret.String())
+	assert.Equal(t, "", secret.Value())
+}
+
+func TestValidate_InvalidWebhookCertSource(t *testing.T) {
+	cfg := &OperatorConfig{
+		WebhookPort:       9443,
+		LogLevel:          "info",
+		LogFormat:         "json",
+		WebhookCertSource: "invalid-source",
+	}
+	err := validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "webhook-cert-source")
 }
 
 func TestValidate(t *testing.T) {

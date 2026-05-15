@@ -44,6 +44,12 @@ const (
 	AnnotationRestartTrigger = "avsoft.io/restart-trigger"
 	// AnnotationRestartPending indicates a full cluster restart is in progress.
 	AnnotationRestartPending = "avsoft.io/restart-pending"
+	// AnnotationConfirmScaleIn confirms a scale-in operation of more than 50%.
+	AnnotationConfirmScaleIn = "avsoft.io/confirm-scale-in"
+	// AnnotationScaleStarted tracks when a scale operation started.
+	AnnotationScaleStarted = "avsoft.io/scale-started"
+	// AnnotationUpgrade tracks in-progress upgrade state as JSON.
+	AnnotationUpgrade = "avsoft.io/upgrade"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"
@@ -74,6 +80,12 @@ const (
 	MaintenanceAnalyze = "analyze"
 	// MaintenanceReindex triggers a reindex operation.
 	MaintenanceReindex = "reindex"
+	// MaintenanceRedistribute triggers a data redistribution operation.
+	MaintenanceRedistribute = "redistribute"
+	// MaintenanceRebalance triggers a segment rebalance operation.
+	MaintenanceRebalance = "rebalance"
+	// MaintenanceBackupOnDelete triggers a backup before cluster deletion.
+	MaintenanceBackupOnDelete = "backup-on-delete"
 
 	// RecoveryIncremental triggers incremental recovery.
 	RecoveryIncremental = "incremental"

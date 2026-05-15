@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +33,7 @@ func newTestScheme() *runtime.Scheme {
 	_ = appsv1.AddToScheme(scheme)
 	_ = batchv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
 	return scheme
 }
 
@@ -551,9 +553,9 @@ func TestClusterReconciler_Reconcile_UpdateExistingResources(t *testing.T) {
 	b := builder.NewBuilder()
 
 	// Pre-create resources with different specs to trigger update paths.
-	coordSts := b.BuildCoordinatorStatefulSet(cluster)
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	coordSts.Spec.Template.Spec.Containers = nil // Make it different to trigger update.
-	primarySts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	primarySts.Spec.Template.Spec.Containers = nil // Make it different.
 	coordSvc := b.BuildCoordinatorService(cluster)
 	coordSvc.Spec.Ports = nil // Make it different.
@@ -649,13 +651,13 @@ func TestClusterReconciler_Reconcile_WithMirroringStatusUpdate(t *testing.T) {
 	b := builder.NewBuilder()
 
 	// Pre-create mirror StatefulSet with ready replicas.
-	mirrorSts := b.BuildSegmentMirrorStatefulSet(cluster)
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
 	mirrorSts.Status.ReadyReplicas = 4
 
 	// Pre-create standby StatefulSet with ready replicas.
-	standbySts := b.BuildStandbyStatefulSet(cluster)
+	standbySts, _ := b.BuildStandbyStatefulSet(cluster)
 	standbyReplicas := int32(1)
 	standbySts.Spec.Replicas = &standbyReplicas
 	standbySts.Status.ReadyReplicas = 1
@@ -686,11 +688,11 @@ func TestClusterReconciler_Reconcile_RunningWithAllReady(t *testing.T) {
 	b := builder.NewBuilder()
 
 	// Pre-create coordinator StatefulSet with ready replicas.
-	coordSts := b.BuildCoordinatorStatefulSet(cluster)
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	coordSts.Status.ReadyReplicas = 1
 
 	// Pre-create primary segment StatefulSet with ready replicas.
-	primarySts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	primarySts.Status.ReadyReplicas = 4
 
 	k8sClient := fake.NewClientBuilder().
@@ -988,7 +990,7 @@ func TestClusterReconciler_ReconcileSegments_BuilderReturnsNil(t *testing.T) {
 	b := builder.NewBuilder()
 	validCluster := newTestCluster()
 	validCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
-	coordSts := b.BuildCoordinatorStatefulSet(validCluster)
+	coordSts, _ := b.BuildCoordinatorStatefulSet(validCluster)
 	pgConfCM := b.BuildPostgresqlConfConfigMap(validCluster)
 	hbaCM := b.BuildPgHBAConfConfigMap(validCluster)
 	coordSvc := b.BuildCoordinatorService(validCluster)
@@ -1037,7 +1039,7 @@ func TestClusterReconciler_UpdateStatus_MirroringInSync(t *testing.T) {
 	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
 
 	b := builder.NewBuilder()
-	mirrorSts := b.BuildSegmentMirrorStatefulSet(cluster)
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
 	mirrorSts.Status.ReadyReplicas = 4
@@ -1066,7 +1068,7 @@ func TestClusterReconciler_UpdateStatus_MirroringDegraded(t *testing.T) {
 	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
 
 	b := builder.NewBuilder()
-	mirrorSts := b.BuildSegmentMirrorStatefulSet(cluster)
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
 	mirrorSts.Status.ReadyReplicas = 2 // Not all ready
@@ -1118,7 +1120,7 @@ func TestClusterReconciler_UpdateStatus_StandbyReadiness(t *testing.T) {
 	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
 
 	b := builder.NewBuilder()
-	standbySts := b.BuildStandbyStatefulSet(cluster)
+	standbySts, _ := b.BuildStandbyStatefulSet(cluster)
 	standbySts.Status.ReadyReplicas = 1
 
 	k8sClient := fake.NewClientBuilder().
@@ -1254,7 +1256,7 @@ func TestClusterReconciler_CreateOrUpdateStatefulSet_CreateError(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	desired := b.BuildCoordinatorStatefulSet(cluster)
+	desired, _ := b.BuildCoordinatorStatefulSet(cluster)
 	err := r.createOrUpdateStatefulSet(context.Background(), desired)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating statefulset")
@@ -1283,7 +1285,7 @@ func TestClusterReconciler_CreateOrUpdateStatefulSet_GetError(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	desired := b.BuildCoordinatorStatefulSet(cluster)
+	desired, _ := b.BuildCoordinatorStatefulSet(cluster)
 	err := r.createOrUpdateStatefulSet(context.Background(), desired)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "getting statefulset")
@@ -1295,7 +1297,7 @@ func TestClusterReconciler_CreateOrUpdateStatefulSet_UpdateError(t *testing.T) {
 	b := builder.NewBuilder()
 
 	// Pre-create with different spec to trigger update.
-	existing := b.BuildCoordinatorStatefulSet(cluster)
+	existing, _ := b.BuildCoordinatorStatefulSet(cluster)
 	existing.Spec.Template.Spec.Containers = nil
 
 	k8sClient := fake.NewClientBuilder().
@@ -1316,7 +1318,7 @@ func TestClusterReconciler_CreateOrUpdateStatefulSet_UpdateError(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	desired := b.BuildCoordinatorStatefulSet(cluster)
+	desired, _ := b.BuildCoordinatorStatefulSet(cluster)
 	err := r.createOrUpdateStatefulSet(context.Background(), desired)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updating statefulset")
@@ -1808,8 +1810,8 @@ func TestClusterReconciler_ReconcileCluster_StandbyError(t *testing.T) {
 
 	b := builder.NewBuilder()
 	// Pre-create coordinator and segment resources so we get past those steps.
-	coordSts := b.BuildCoordinatorStatefulSet(cluster)
-	primarySts := b.BuildSegmentPrimaryStatefulSet(cluster)
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	pgConfCM := b.BuildPostgresqlConfConfigMap(cluster)
 	hbaCM := b.BuildPgHBAConfConfigMap(cluster)
 	coordSvc := b.BuildCoordinatorService(cluster)
@@ -1827,12 +1829,1461 @@ func TestClusterReconciler_ReconcileCluster_StandbyError(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	// The standby builder will return nil because of invalid resources.
-	// But reconcileStandby returns nil when builder returns nil.
-	// So this should succeed.
-	result, err := r.Reconcile(context.Background(), ctrl.Request{
+	// The standby builder will return an error because of invalid resources.
+	// reconcileStandby now propagates the error instead of silently returning nil.
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
 	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "building standby StatefulSet")
+}
+
+// ============================================================================
+// Scale Operations Tests
+// ============================================================================
+
+func TestClusterReconciler_HandleScaleOut_Success(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(2)
+	primarySts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleOut(context.Background(), cluster, 2, 4)
+	require.NoError(t, err)
+
+	// Verify phase changed to Scaling.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseScaling, updated.Status.Phase)
+}
+
+func TestClusterReconciler_HandleScaleOut_NotRunning(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleOut(context.Background(), cluster, 2, 4)
+	require.NoError(t, err) // Should not error, just skip.
+
+	// Phase should remain Stopped.
+	assert.Equal(t, cbv1alpha1.ClusterPhaseStopped, cluster.Status.Phase)
+}
+
+func TestClusterReconciler_HandleScaleIn_Success(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleIn(context.Background(), cluster, 4, 3)
+	require.NoError(t, err)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseScaling, updated.Status.Phase)
+}
+
+func TestClusterReconciler_HandleScaleIn_NotRunning(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleIn(context.Background(), cluster, 4, 2)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseStopped, cluster.Status.Phase)
+}
+
+func TestClusterReconciler_HandleScaleIn_RequiresConfirmation(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	// Scale from 4 to 1 (>50% reduction) without confirmation.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleIn(context.Background(), cluster, 4, 1)
+	require.NoError(t, err) // Should not error, just skip.
+	// Phase should remain Running (blocked).
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, cluster.Status.Phase)
+}
+
+func TestClusterReconciler_HandleScaleIn_WithMirroring(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	mirrorSts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts, mirrorSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.handleScaleIn(context.Background(), cluster, 4, 3)
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_CheckScaleProgress_Complete(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Spec.Segments.Count = 4
+	cluster.Status.SegmentsTotal = 2 // Was 2, scaling to 4.
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.checkScaleProgress(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+}
+
+func TestClusterReconciler_CheckScaleProgress_InProgress(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Spec.Segments.Count = 4
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 2 // Not all ready yet.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.checkScaleProgress(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckScaleProgress_Timeout(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Spec.Segments.Count = 4
+	// Set scale started time to well in the past.
+	cluster.Annotations = map[string]string{
+		util.AnnotationScaleStarted: time.Now().Add(-15 * time.Minute).Format(time.RFC3339),
+	}
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 2 // Not all ready.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.checkScaleProgress(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CompleteScaleOperation_ScaleOut(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Spec.Segments.Count = 6
+	cluster.Status.SegmentsTotal = 4 // Was 4, now 6 (scale-out).
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+	b := builder.NewBuilder()
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.completeScaleOperation(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+}
+
+func TestClusterReconciler_CompleteScaleOperation_ScaleIn(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Spec.Segments.Count = 2
+	cluster.Status.SegmentsTotal = 4 // Was 4, now 2 (scale-in).
+	cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyDelete
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+	b := builder.NewBuilder()
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.completeScaleOperation(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+}
+
+func TestClusterReconciler_FinaliseScaleIn(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 2
+	cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+	b := builder.NewBuilder()
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Should not panic.
+	r.finaliseScaleIn(context.Background(), cluster)
+}
+
+func TestClusterReconciler_CleanupScaleAnnotations(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Annotations = map[string]string{
+		util.AnnotationScaleStarted:   time.Now().Format(time.RFC3339),
+		util.AnnotationConfirmScaleIn: "true",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+	b := builder.NewBuilder()
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Should not panic.
+	r.cleanupScaleAnnotations(context.Background(), cluster, true)
+}
+
+func TestClusterReconciler_HandleScaleFailure(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+	cluster.Annotations = map[string]string{
+		util.AnnotationScaleStarted: time.Now().Add(-15 * time.Minute).Format(time.RFC3339),
+	}
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 2
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.handleScaleFailure(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify failed segments were recorded.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.NotEmpty(t, updated.Status.FailedSegments)
+}
+
+func TestClusterReconciler_AllSegmentStatefulSetsReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 4
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	assert.True(t, r.allSegmentStatefulSetsReady(context.Background(), cluster))
+}
+
+func TestClusterReconciler_AllSegmentStatefulSetsReady_NotReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 4
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 2
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	assert.False(t, r.allSegmentStatefulSetsReady(context.Background(), cluster))
+}
+
+func TestClusterReconciler_ScaleStatefulSet_Success(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.scaleStatefulSet(context.Background(), "default", sts.Name, 0)
+	require.NoError(t, err)
+
+	// Verify replicas were updated.
+	updated := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: sts.Name, Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), *updated.Spec.Replicas)
+}
+
+func TestClusterReconciler_ScaleStatefulSet_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.scaleStatefulSet(context.Background(), "default", "nonexistent", 0)
+	require.NoError(t, err) // Not found is not an error.
+}
+
+func TestClusterReconciler_ScaleStatefulSet_AlreadyAtScale(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.scaleStatefulSet(context.Background(), "default", sts.Name, 1)
+	require.NoError(t, err) // Already at scale, no-op.
+}
+
+func TestClusterReconciler_IsStatefulSetAtScale(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 1
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	ready, err := r.isStatefulSetAtScale(context.Background(), "default", sts.Name, 1)
+	require.NoError(t, err)
+	assert.True(t, ready)
+}
+
+func TestClusterReconciler_IsStatefulSetAtScale_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	ready, err := r.isStatefulSetAtScale(context.Background(), "default", "nonexistent", 1)
+	require.NoError(t, err)
+	assert.True(t, ready) // Not found = at scale.
+}
+
+func TestClusterReconciler_IsStatefulSetAtScale_Zero(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(0)
+	sts.Spec.Replicas = &replicas
+	sts.Status.Replicas = 0
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	ready, err := r.isStatefulSetAtScale(context.Background(), "default", sts.Name, 0)
+	require.NoError(t, err)
+	assert.True(t, ready)
+}
+
+func TestClusterReconciler_CleanupOrphanedPVCs(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 2
+
+	// Create PVCs for segments 2 and 3 (orphaned after scale-in to 2).
+	pvc2 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-2", util.SanitizeK8sName(fmt.Sprintf("%s-%s", cluster.Name, util.ComponentSegmentPrimary))),
+			Namespace: "default",
+		},
+	}
+	pvc3 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-3", util.SanitizeK8sName(fmt.Sprintf("%s-%s", cluster.Name, util.ComponentSegmentPrimary))),
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, pvc2, pvc3).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Should not panic.
+	r.cleanupOrphanedPVCs(context.Background(), cluster, 2)
+}
+
+// ============================================================================
+// Upgrade Operations Tests
+// ============================================================================
+
+func TestClusterReconciler_HandleUpgrade_Start(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ClusterVersion = "7.6"
+	cluster.Spec.Version = "7.7"
+
+	b := builder.NewBuilder()
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	coordSts.Spec.Replicas = &replicas
+	coordSts.Status.ReadyReplicas = 1
+
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	primarySts.Spec.Replicas = &cluster.Spec.Segments.Count
+	primarySts.Status.ReadyReplicas = cluster.Spec.Segments.Count
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, coordSts, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.handleUpgrade(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.True(t, result.Requeue || result.RequeueAfter > 0)
+}
+
+func TestClusterReconciler_HandleUpgrade_NotRunning(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Status.ClusterVersion = "7.6"
+	cluster.Spec.Version = "7.7"
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.handleUpgrade(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.False(t, result.Requeue)
+}
+
+func TestClusterReconciler_ContinueUpgrade_NoAnnotation(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	// No upgrade annotation.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.continueUpgrade(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_ContinueUpgrade_InvalidJSON(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationUpgrade: "invalid-json",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.continueUpgrade(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_GetCurrentImage_FromStatefulSet(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, coordSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	image := r.getCurrentImage(context.Background(), cluster)
+	assert.NotEmpty(t, image)
+}
+
+func TestClusterReconciler_GetCurrentImage_Fallback(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	image := r.getCurrentImage(context.Background(), cluster)
+	assert.Equal(t, cluster.Spec.Image, image)
+}
+
+func TestClusterReconciler_UpdateStatefulSetImage(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.updateStatefulSetImage(context.Background(), "default", sts.Name, "cloudberrydb/cloudberry:7.8")
+	require.NoError(t, err)
+
+	updated := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: sts.Name, Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, "cloudberrydb/cloudberry:7.8", updated.Spec.Template.Spec.Containers[0].Image)
+}
+
+func TestClusterReconciler_UpdateStatefulSetImage_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	err := r.updateStatefulSetImage(context.Background(), "default", "nonexistent", "image:new")
+	require.NoError(t, err) // Not found is not an error.
+}
+
+func TestClusterReconciler_UpdateStatefulSetImage_AlreadyMatches(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Use the same image that's already set.
+	err := r.updateStatefulSetImage(context.Background(), "default", sts.Name, cluster.Spec.Image)
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_IsStatefulSetReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 1
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	assert.True(t, r.isStatefulSetReady(context.Background(), "default", sts.Name))
+}
+
+func TestClusterReconciler_IsStatefulSetReady_NotReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 0
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	assert.False(t, r.isStatefulSetReady(context.Background(), "default", sts.Name))
+}
+
+func TestClusterReconciler_IsStatefulSetReady_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	assert.True(t, r.isStatefulSetReady(context.Background(), "default", "nonexistent"))
+}
+
+func TestClusterReconciler_GetAllStatefulSetNames(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	names := r.getAllStatefulSetNames(cluster)
+	assert.Len(t, names, 4) // mirrors, primaries, standby, coordinator
+}
+
+func TestClusterReconciler_CompleteUpgrade(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Version = "7.8"
+	cluster.Annotations = map[string]string{
+		util.AnnotationUpgrade: `{"previousImage":"old:7.7","previousVersion":"7.7","phase":"verify"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := upgradeStateData{
+		PreviousImage:   "old:7.7",
+		PreviousVersion: "7.7",
+	}
+	result, err := r.completeUpgrade(context.Background(), cluster, state)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, updated.Status.Phase)
+	assert.Equal(t, "7.8", updated.Status.ClusterVersion)
+}
+
+func TestClusterReconciler_RollbackUpgrade(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationUpgrade: `{"previousImage":"old:7.7","previousVersion":"7.7","phase":"primaries"}`,
+	}
+
+	b := builder.NewBuilder()
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, coordSts, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := upgradeStateData{
+		PreviousImage:   "old:7.7",
+		PreviousVersion: "7.7",
+	}
+	result, err := r.rollbackUpgrade(context.Background(), cluster, state, "phase timed out")
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, updated.Status.Phase)
+	assert.Equal(t, "7.7", updated.Status.ClusterVersion)
+}
+
+// ============================================================================
+// Storage Expansion Tests
+// ============================================================================
+
+func TestClusterReconciler_StorageClassSupportsExpansion_True(t *testing.T) {
+	scheme := newTestScheme()
+	allowExpansion := true
+	scName := "standard"
+	sc := &storagev1.StorageClass{
+		ObjectMeta:           metav1.ObjectMeta{Name: "standard"},
+		AllowVolumeExpansion: &allowExpansion,
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &scName,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sc).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	supported, reason := r.storageClassSupportsExpansion(context.Background(), pvc)
+	assert.True(t, supported)
+	assert.Empty(t, reason)
+}
+
+func TestClusterReconciler_StorageClassSupportsExpansion_False(t *testing.T) {
+	scheme := newTestScheme()
+	allowExpansion := false
+	scName := "standard"
+	sc := &storagev1.StorageClass{
+		ObjectMeta:           metav1.ObjectMeta{Name: "standard"},
+		AllowVolumeExpansion: &allowExpansion,
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &scName,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sc).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	supported, reason := r.storageClassSupportsExpansion(context.Background(), pvc)
+	assert.False(t, supported)
+	assert.Contains(t, reason, "allowVolumeExpansion=false")
+}
+
+func TestClusterReconciler_StorageClassSupportsExpansion_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	scName := "nonexistent"
+	pvc := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &scName,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	supported, reason := r.storageClassSupportsExpansion(context.Background(), pvc)
+	assert.False(t, supported)
+	assert.Contains(t, reason, "not found")
+}
+
+func TestClusterReconciler_StorageClassSupportsExpansion_NoStorageClass(t *testing.T) {
+	scheme := newTestScheme()
+	pvc := &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	supported, _ := r.storageClassSupportsExpansion(context.Background(), pvc)
+	assert.True(t, supported) // No SC = allow attempt.
+}
+
+func TestClusterReconciler_ExpandPVCIfNeeded_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	changed, err := r.expandPVCIfNeeded(context.Background(), "default", "nonexistent-pvc", "20Gi")
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
+func TestClusterReconciler_ExpandStandbyPVC_Disabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	// No standby configured.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	changed, err := r.expandStandbyPVC(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
+// ============================================================================
+// Lifecycle Phase Tests
+// ============================================================================
+
+func TestClusterReconciler_HandleLifecyclePhase_Stopped(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	assert.False(t, result.Requeue)
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_Stopping(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	// Should either requeue or complete.
+	_ = result
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_Restricted(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRestricted
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_Maintenance(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseMaintenance
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_Scaling(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	_ = result
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_Updating(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.True(t, handled)
+	_ = result
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_WithAction(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Annotations = map[string]string{
+		util.AnnotationAction: util.ActionStart,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	_, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	assert.False(t, handled) // Action pending, should not handle lifecycle.
+}
+
+func TestClusterReconciler_CheckStopProgress_AllStopped(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
+	// No StatefulSets exist = all at scale 0.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.checkStopProgress(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Should transition to Stopped.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseStopped, updated.Status.Phase)
+	_ = result
+}
+
+func TestClusterReconciler_CheckStopProgress_RestartPending(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
+	cluster.Annotations = map[string]string{
+		util.AnnotationRestartPending: "true",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	_, err := r.checkStopProgress(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_HandleStop_WithStandby(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	_, err := r.handleStop(context.Background(), cluster, util.ActionStop)
+	require.NoError(t, err)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	// Should be Stopped (all STS not found = at scale 0).
+	assert.Equal(t, cbv1alpha1.ClusterPhaseStopped, updated.Status.Phase)
+}
+
+func TestClusterReconciler_HandleRestart_AllStopped(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	_, err := r.handleRestart(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_HandleDeletion_BackupOnDelete(t *testing.T) {
+	scheme := newTestScheme()
+	now := metav1.Now()
+	cluster := newTestCluster()
+	cluster.Finalizers = []string{util.FinalizerName}
+	cluster.DeletionTimestamp = &now
+	cluster.Spec.BackupOnDelete = true
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.handleDeletion(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.False(t, result.Requeue)
+}
+
+func TestClusterReconciler_IsUpgradeNeeded(t *testing.T) {
+	tests := []struct {
+		name     string
+		cluster  *cbv1alpha1.CloudberryCluster
+		expected bool
+	}{
+		{
+			name: "upgrade annotation present",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newTestCluster()
+				c.Annotations = map[string]string{util.AnnotationUpgrade: "{}"}
+				return c
+			}(),
+			expected: true,
+		},
+		{
+			name: "version changed",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newTestCluster()
+				c.Status.ClusterVersion = "7.6"
+				c.Spec.Version = "7.7"
+				return c
+			}(),
+			expected: true,
+		},
+		{
+			name: "no upgrade needed",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newTestCluster()
+				c.Status.ClusterVersion = "7.7"
+				c.Spec.Version = "7.7"
+				return c
+			}(),
+			expected: false,
+		},
+		{
+			name: "empty cluster version",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newTestCluster()
+				c.Status.ClusterVersion = ""
+				return c
+			}(),
+			expected: false,
+		},
+	}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, r.isUpgradeNeeded(tt.cluster))
+		})
+	}
+}
+
+func TestClusterReconciler_VerifyUpgrade_AllReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Version = "7.8"
+
+	b := builder.NewBuilder()
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	coordSts.Spec.Replicas = &replicas
+	coordSts.Status.ReadyReplicas = 1
+
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	primarySts.Spec.Replicas = &cluster.Spec.Segments.Count
+	primarySts.Status.ReadyReplicas = cluster.Spec.Segments.Count
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, coordSts, primarySts).
+		WithStatusSubresource(cluster, coordSts, primarySts).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := upgradeStateData{PreviousVersion: "7.7", PreviousImage: "old:7.7"}
+	result, err := r.verifyUpgrade(context.Background(), cluster, state)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_VerifyUpgrade_CoordNotReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+
+	b := builder.NewBuilder()
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	coordSts.Spec.Replicas = &replicas
+	coordSts.Status.ReadyReplicas = 0
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, coordSts).
+		WithStatusSubresource(cluster, coordSts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := upgradeStateData{PreviousVersion: "7.7"}
+	result, err := r.verifyUpgrade(context.Background(), cluster, state)
 	require.NoError(t, err)
 	assert.NotZero(t, result.RequeueAfter)
 }

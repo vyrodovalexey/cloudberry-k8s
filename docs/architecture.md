@@ -11,12 +11,21 @@ This document describes the system architecture of the Cloudberry Kubernetes Ope
 - [Authentication Architecture](#authentication-architecture)
 - [High Availability Design](#high-availability-design)
 - [Observability Architecture](#observability-architecture)
+- [Error Handling Patterns](#error-handling-patterns)
+  - [Error Type Hierarchy](#error-type-hierarchy)
+  - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
+  - [Reconciliation Error Flow](#reconciliation-error-flow)
+  - [Webhook Validation](#webhook-validation)
+  - [Pod Deletion Recovery](#pod-deletion-recovery)
 - [REST API Server Architecture](#rest-api-server-architecture)
   - [Rate Limiter](#rate-limiter)
   - [Trusted Proxies](#trusted-proxies)
+  - [HTTP Server Timeouts](#http-server-timeouts)
 - [DBClientFactory Pattern](#dbclientfactory-pattern)
+- [Upgrade Flow](#upgrade-lifecycle)
 - [Status Update Pattern](#status-update-pattern)
 - [Webhook Certificate Manager](#webhook-certificate-manager)
+  - [Vault PKI Certificate Issuance](#vault-pki-certificate-issuance)
 - [Design Principles](#design-principles)
 
 ## System Overview
@@ -102,7 +111,7 @@ The operator runs two server components:
 | **API Server** | `internal/api` | REST API for programmatic cluster management, with per-IP rate limiting and body size limits |
 | **Rate Limiter** | `internal/api` | Per-IP token bucket rate limiter protecting API endpoints from abuse |
 | **Auth Middleware** | `internal/auth` | Basic (bcrypt) and OIDC/JWT authentication, permission enforcement |
-| **Resource Builder** | `internal/builder` | Pure functions that construct Kubernetes resources from CRD spec |
+| **Resource Builder** | `internal/builder` | Pure functions that construct Kubernetes resources from CRD spec. Builder methods return `(*Resource, error)` to surface configuration errors early |
 | **DB Client Factory** | `internal/db` | Creates database clients from cluster connection information, resolving service endpoints and credentials from Kubernetes Secrets |
 | **DB Client** | `internal/db` | Cloudberry/PostgreSQL database operations via pgx with real SQL queries |
 | **CLI Client** | `internal/ctl` | HTTP client for `cloudberry-ctl` to communicate with the operator REST API |
@@ -226,6 +235,9 @@ CloudberryCluster
 | `MirroringHealthy` | All mirrors are in sync |
 | `AuthConfigured` | Authentication is properly configured |
 | `ConfigApplied` | All configuration parameters are applied. Reason values: `ConfigReloaded`, `RestartRequired`, `ConfigAppliedAfterRestart` |
+| `ScaleOutFailed` | Scale-out operation failed. Reason: `SegmentsNotReady` — segments did not become ready within the 10-minute timeout |
+| `UpgradeCompleted` | Cluster upgrade completed successfully. Reason: `UpgradeSucceeded` — all phases passed and verification succeeded |
+| `UpgradeFailed` | Cluster upgrade failed and was rolled back. Reason: `RolledBack` — a phase timed out after 10 minutes |
 | `VaultConnected` | Vault connection is established (if enabled) |
 
 ### Printer Columns
@@ -292,10 +304,253 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - Records **Prometheus metrics** for reconciliation duration and results via `recordMetricsSnapshot()`
 - Uses **`Status().Patch()` with MergePatch** for all status updates (see [Status Update Pattern](#status-update-pattern) below)
 
+**Scale-out lifecycle:**
+- **Detection**: `reconcileSegments()` compares `spec.segments.count` against the current primary StatefulSet's `spec.replicas`. If the desired count exceeds the current count **and** `currentCount > 0` (guard against false scale detection during restarts), it delegates to `handleScaleOut()`.
+- **Pre-flight check**: `handleScaleOut()` verifies the cluster is in `Running` phase. If not, it emits a `ScaleOutBlocked` warning event and returns without error (retries on next reconcile).
+- **`handleScaleOut()`**: Sets the `avsoft.io/scale-started` annotation with the current timestamp, sets phase to `Scaling`, updates primary and mirror StatefulSet replicas, creates a redistribution Job via `BuildMaintenanceJob(cluster, "redistribute", timestamp)`, and sets the `DataRedistribution` condition.
+- **`checkScaleProgress()`**: Called on each reconciliation when the cluster is in `Scaling` phase. Uses `allSegmentStatefulSetsReady()` to verify that both primary and mirror StatefulSets have reached the desired replica count. When ready, transitions the cluster to `Running`, emits `ScaleOutCompleted`, records the `cloudberry_scale_operations_total` metric, and removes the `avsoft.io/scale-started` annotation.
+- **Timeout detection**: `checkScaleProgress()` reads the `avsoft.io/scale-started` annotation and checks if the elapsed time exceeds `scaleTimeout` (10 minutes). If the timeout is exceeded, it delegates to `handleScaleFailure()`.
+- **`handleScaleFailure()`**: Identifies unready segments from both primary and mirror StatefulSets, populates `status.failedSegments` with details (contentID, hostname, role, status), sets the `ScaleOutFailed` condition to `True` with reason `SegmentsNotReady`, emits a `ScaleOutFailed` warning event, and removes the `avsoft.io/scale-started` annotation. The cluster **stays in `Scaling` phase** — no automatic rollback.
+- **Events**: `ScaleOutStarted` (when scaling begins), `ScaleOutCompleted` (when all pods are ready), `ScaleOutBlocked` (when cluster is not in Running phase), `ScaleOutFailed` (when timeout is exceeded).
+- **Metrics**: `cloudberry_scale_operations_total` (counter), `cloudberry_redistribution_progress` (gauge).
+
+**Scale-in lifecycle:**
+- **Detection**: `reconcileSegments()` compares `spec.segments.count` against the current primary StatefulSet's `spec.replicas`. If the desired count is less than the current count **and** `currentCount > 0` (guard against false scale detection during restarts), it delegates to `handleScaleIn()`.
+- **Pre-flight check**: `handleScaleIn()` verifies the cluster is in `Running` phase. If not, it emits a `ScaleInBlocked` warning event and returns without error (retries on next reconcile).
+- **Safety check**: If the new count is less than 50% of the current count, `handleScaleIn()` requires the `avsoft.io/confirm-scale-in=true` annotation. Without it, a `ScaleInBlocked` warning event is emitted and the operation is skipped.
+- **`handleScaleIn()`**: Sets the `avsoft.io/scale-started` annotation with the current timestamp, sets phase to `Scaling`, creates a redistribution Job to move data off segments being removed, scales down the mirror StatefulSet first (if mirroring is enabled), then scales down the primary StatefulSet, and sets the `DataRedistribution` condition.
+- **`checkScaleProgress()`**: Detects whether the completed scaling was a scale-in (by comparing `spec.segments.count < status.segmentsTotal`). For scale-in, it calls `cleanupOrphanedPVCs()` when `deletionPolicy=Delete`, emits `ScaleInCompleted`, records `cloudberry_scale_operations_total{operation="scale-in"}`, and removes the `avsoft.io/scale-started` annotation.
+- **`cleanupOrphanedPVCs()`**: Iterates over segment indices starting from the new count and deletes PVCs for both primary and mirror components. PVCs are named `data-{stsName}-{index}`. The function stops when a PVC is not found (no more orphans).
+- **Events**: `ScaleInStarted` (when scaling begins), `ScaleInCompleted` (when all pods are ready), `ScaleInBlocked` (when cluster is not in Running phase, or >50% reduction lacks confirmation).
+- **Metrics**: `cloudberry_scale_operations_total{operation="scale-in"}` (counter).
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Scale-Out Flow                                │
+│                                                                  │
+│  reconcileSegments()                                             │
+│    │                                                             │
+│    ├── Get existing primary StatefulSet                          │
+│    ├── Compare spec.segments.count vs sts.spec.replicas          │
+│    ├── Guard: currentCount > 0 (prevent false scale on restart)  │
+│    │                                                             │
+│    └── If desired > current → handleScaleOut()                   │
+│         │                                                        │
+│         ├── Pre-flight: cluster.Status.Phase == Running?          │
+│         │   └── No → emit ScaleOutBlocked, return (retry later)  │
+│         │                                                        │
+│         ├── Set avsoft.io/scale-started annotation (timestamp)   │
+│         ├── Set phase = Scaling                                  │
+│         ├── Set DataRedistribution condition (ScaleOutStarted)   │
+│         ├── Emit ScaleOutStarted event                           │
+│         ├── Update primary StatefulSet replicas                  │
+│         ├── Update mirror StatefulSet replicas (if mirroring)    │
+│         ├── Create redistribution Job                            │
+│         └── Set DataRedistribution condition (InProgress)        │
+│                                                                  │
+│  checkScaleProgress() — called when phase == Scaling             │
+│    │                                                             │
+│    ├── allSegmentStatefulSetsReady()?                             │
+│    │   ├── Yes → transition to Running                           │
+│    │   │         ├── Set phase = Running                         │
+│    │   │         ├── Update segmentsReady/segmentsTotal          │
+│    │   │         ├── Set DataRedistribution (Completed)          │
+│    │   │         ├── Emit ScaleOutCompleted event                │
+│    │   │         ├── Record scale_operations_total metric        │
+│    │   │         └── Remove avsoft.io/scale-started annotation   │
+│    │   │                                                         │
+│    │   └── No  → check timeout                                   │
+│    │              ├── time.Since(scale-started) > 10m?            │
+│    │              │   └── Yes → handleScaleFailure()              │
+│    │              │              ├── Identify unready segments    │
+│    │              │              ├── Populate failedSegments      │
+│    │              │              ├── Set ScaleOutFailed=True      │
+│    │              │              │   (reason=SegmentsNotReady)    │
+│    │              │              ├── Emit ScaleOutFailed event    │
+│    │              │              ├── Remove scale-started ann.    │
+│    │              │              └── Stay in Scaling (no rollback)│
+│    │              └── No  → requeue after 5s                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Scale-In Flow                                  │
+│                                                                  │
+│  reconcileSegments()                                             │
+│    │                                                             │
+│    ├── Get existing primary StatefulSet                          │
+│    ├── Compare spec.segments.count vs sts.spec.replicas          │
+│    ├── Guard: currentCount > 0 (prevent false scale on restart)  │
+│    │                                                             │
+│    └── If desired < current → handleScaleIn()                    │
+│         │                                                        │
+│         ├── Pre-flight: cluster.Status.Phase == Running?          │
+│         │   └── No → emit ScaleInBlocked, return (retry later)   │
+│         │                                                        │
+│         ├── Safety check: newCount < 50% of oldCount?            │
+│         │   └── Yes → require avsoft.io/confirm-scale-in=true    │
+│         │              └── Missing → emit ScaleInBlocked, return │
+│         │                                                        │
+│         ├── Set avsoft.io/scale-started annotation (timestamp)   │
+│         ├── Set phase = Scaling                                  │
+│         ├── Set DataRedistribution condition (ScaleInStarted)    │
+│         ├── Emit ScaleInStarted event                            │
+│         ├── Create redistribution Job (move data off segments)   │
+│         ├── Scale down mirror StatefulSet (mirrors first)        │
+│         ├── Scale down primary StatefulSet                       │
+│         └── Set DataRedistribution condition (InProgress)        │
+│                                                                  │
+│  checkScaleProgress() — called when phase == Scaling             │
+│    │                                                             │
+│    ├── allSegmentStatefulSetsReady()?                             │
+│    │   ├── No  → check timeout (same as scale-out)               │
+│    │   └── Yes → determine scale-in vs scale-out                 │
+│    │              │                                               │
+│    │              └── If scale-in (desired < previous total):     │
+│    │                   ├── If deletionPolicy=Delete:              │
+│    │                   │   └── cleanupOrphanedPVCs()              │
+│    │                   │       └── Delete PVCs for indices         │
+│    │                   │           [newCount..oldCount-1]          │
+│    │                   ├── Set phase = Running                    │
+│    │                   ├── Update segmentsReady/segmentsTotal     │
+│    │                   ├── Set DataRedistribution (Completed)     │
+│    │                   ├── Emit ScaleInCompleted event            │
+│    │                   ├── Record scale_operations_total{scale-in}│
+│    │                   └── Remove avsoft.io/scale-started ann.    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Upgrade lifecycle:**
+- **Detection**: `isUpgradeNeeded()` checks whether `spec.version != status.clusterVersion` or the `avsoft.io/upgrade` annotation is present (in-progress upgrade).
+- **Pre-flight check**: `handleUpgrade()` verifies the cluster is in `Running` phase. If not, it emits an `UpgradeBlocked` warning event and returns without error (retries on next reconcile).
+- **`handleUpgrade()`**: Captures the current image from the coordinator StatefulSet via `getCurrentImage()`, stores rollback state (previousImage, previousVersion, phase, startedAt, phaseStartedAt) in the `avsoft.io/upgrade` annotation as JSON, sets phase to `Updating`, emits `UpgradeStarted` event, and delegates to `continueUpgrade()`.
+- **`continueUpgrade()`**: Parses the upgrade state from the annotation, checks for phase timeout (10 minutes per phase), and dispatches to the appropriate phase handler. Phases progress in order: mirrors → primaries → standby → coordinator → verify.
+- **`upgradePhase()`**: Generic phase handler that updates the StatefulSet image via `updateStatefulSetImage()`, checks readiness via `isStatefulSetReady()`, and advances to the next phase via `advanceUpgradePhase()` when ready. Skips the phase if the component is not enabled (e.g., mirroring disabled, standby disabled).
+- **`verifyUpgrade()`**: Post-upgrade health check that confirms the coordinator and primary segments are ready. On success, delegates to `completeUpgrade()`.
+- **`completeUpgrade()`**: Sets phase to `Running`, updates `status.clusterVersion` to the new version, sets `UpgradeCompleted` condition to `True`, removes the `avsoft.io/upgrade` annotation, and emits `UpgradeCompleted` event.
+- **`rollbackUpgrade()`**: Triggered when a phase exceeds the 10-minute timeout. Reverts ALL StatefulSets (mirrors, primaries, standby, coordinator) to the `previousImage` via `revertStatefulSetImage()`. Sets phase to `Running`, restores `status.clusterVersion` to `previousVersion`, sets `UpgradeFailed` condition to `True` with reason `RolledBack`, removes the `avsoft.io/upgrade` annotation, and emits `UpgradeRollback` warning event.
+- **Events**: `UpgradeStarted` (when upgrade begins), `UpgradeCompleted` (when all phases pass verification), `UpgradeBlocked` (when cluster is not in Running phase), `UpgradeRollback` (when a phase times out and rollback occurs).
+- **Conditions**: `UpgradeCompleted` (True/UpgradeSucceeded), `UpgradeFailed` (True/RolledBack).
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Upgrade Flow                                   │
+│                                                                   │
+│  isUpgradeNeeded()                                                │
+│    │                                                              │
+│    ├── Check avsoft.io/upgrade annotation (in-progress?)          │
+│    └── Check spec.version != status.clusterVersion                │
+│                                                                   │
+│  handleUpgrade()                                                  │
+│    │                                                              │
+│    ├── Pre-flight: cluster.Status.Phase == Running?               │
+│    │   └── No → emit UpgradeBlocked, return (retry later)        │
+│    │                                                              │
+│    ├── Capture current image from coordinator StatefulSet         │
+│    ├── Store state in avsoft.io/upgrade annotation (JSON)         │
+│    ├── Set phase = Updating                                       │
+│    ├── Emit UpgradeStarted event                                  │
+│    └── Delegate to continueUpgrade()                              │
+│                                                                   │
+│  continueUpgrade() — called when avsoft.io/upgrade is present     │
+│    │                                                              │
+│    ├── Parse upgrade state from annotation                        │
+│    ├── Check phase timeout: time.Since(phaseStartedAt) > 10m?     │
+│    │   └── Yes → rollbackUpgrade()                                │
+│    │              ├── Revert ALL StatefulSets to previousImage     │
+│    │              ├── Set phase = Running                          │
+│    │              ├── Restore clusterVersion = previousVersion     │
+│    │              ├── Set UpgradeFailed=True (reason=RolledBack)   │
+│    │              ├── Remove avsoft.io/upgrade annotation          │
+│    │              └── Emit UpgradeRollback event                   │
+│    │                                                              │
+│    └── Dispatch by phase:                                         │
+│         ├── mirrors     → upgradePhase(mirror STS, next=primaries)│
+│         ├── primaries   → upgradePhase(primary STS, next=standby) │
+│         ├── standby     → upgradePhase(standby STS, next=coord)   │
+│         ├── coordinator → upgradePhase(coord STS, next=verify)    │
+│         └── verify      → verifyUpgrade()                         │
+│                            ├── Coordinator ready?                  │
+│                            ├── Primaries ready?                    │
+│                            └── Yes → completeUpgrade()             │
+│                                       ├── Set phase = Running     │
+│                                       ├── Update clusterVersion   │
+│                                       ├── Set UpgradeCompleted    │
+│                                       ├── Remove annotation       │
+│                                       └── Emit UpgradeCompleted   │
+│                                                                   │
+│  upgradePhase(stsName, componentEnabled, nextPhase)               │
+│    │                                                              │
+│    ├── Component not enabled? → skip, advance to nextPhase        │
+│    ├── Update StatefulSet image via updateStatefulSetImage()       │
+│    ├── StatefulSet ready? → advance to nextPhase                  │
+│    └── Not ready → requeue after 5s                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 **Stop/Start/Restart lifecycle:**
 - **Stop** (`stop`, `stop-fast`, `stop-immediate`): Scales down StatefulSets in order: mirrors → primaries → standby → coordinator. Uses `scaleStatefulSet()` to set replicas to 0. Phase: `Running` → `Stopping` → `Stopped`.
 - **Start** (`start`, `start-restricted`, `start-maintenance`): For normal start, triggers full reconciliation to restore all StatefulSets. For restricted/maintenance, scales up only the coordinator. Phase: `Stopped` → `Initializing`/`Restricted`/`Maintenance` → `Running`.
 - **Restart** (`restart`): Performs a stop followed by a start. Phase: `Running` → `Stopping` → `Initializing` → `Running`.
+
+**Storage expansion lifecycle:**
+- **Detection**: `reconcileStorageExpansion()` compares `spec.*.storage.size` against actual PVC sizes for coordinator, standby, and segments.
+- **`expandPVCIfNeeded()`**: For each PVC, compares the desired size against the current PVC size using `resource.Quantity.Cmp()`. If the desired size is larger, it calls `storageClassSupportsExpansion()` before patching the PVC.
+- **`storageClassSupportsExpansion()`**: Pre-flight check that verifies the PVC's StorageClass allows volume expansion. Returns `(allowed bool, reason string)`.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Storage Expansion Flow                               │
+│                                                                   │
+│  reconcileStorageExpansion()                                      │
+│    │                                                              │
+│    ├── For coordinator PVC:                                       │
+│    │     └── expandPVCIfNeeded(coordPVC, desiredSize)             │
+│    ├── For standby PVC (if enabled):                              │
+│    │     └── expandPVCIfNeeded(standbyPVC, desiredSize)           │
+│    └── For each segment PVC (primary + mirror):                   │
+│          └── expandPVCIfNeeded(segmentPVC, desiredSize)           │
+│                                                                   │
+│  expandPVCIfNeeded(pvc, desiredSize)                              │
+│    │                                                              │
+│    ├── PVC not found? → skip (no error)                           │
+│    ├── desiredSize ≤ currentSize? → skip (no shrink)              │
+│    │                                                              │
+│    └── storageClassSupportsExpansion(pvc)                         │
+│         │                                                         │
+│         ├── Read StorageClass name from:                          │
+│         │   1. pvc.spec.storageClassName                          │
+│         │   2. volume.beta.kubernetes.io/storage-class annotation │
+│         │                                                         │
+│         ├── No StorageClass specified (default SC)?               │
+│         │   └── allowed=true (cannot determine default SC caps)   │
+│         │                                                         │
+│         ├── Lookup StorageClass from API                          │
+│         │   ├── Not found → allowed=false, reason="not found"     │
+│         │   └── Transient error → allowed=true (fail-open)        │
+│         │                                                         │
+│         └── Check allowVolumeExpansion field                      │
+│             ├── true  → allowed=true                              │
+│             ├── false → allowed=false, reason="does not allow"    │
+│             └── nil   → allowed=false, reason="does not allow"    │
+│                                                                   │
+│    If allowed:                                                    │
+│      └── Patch PVC spec.resources.requests.storage                │
+│                                                                   │
+│    If blocked:                                                    │
+│      └── Log WARN with PVC name, SC name, reason,                │
+│          current size, desired size                                │
+│          (no error returned — reconciliation continues)           │
+│                                                                   │
+│  After all PVCs processed:                                        │
+│    ├── If any PVC expanded:                                       │
+│    │   ├── Set StorageExpanded condition (True/PVCsExpanded)      │
+│    │   ├── Emit StorageExpanded event                             │
+│    │   └── Record cloudberry_pvc_size_bytes metric                │
+│    └── If no PVCs expanded: no condition/event changes            │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 All metrics are registered with `ctrlmetrics.Registry` (controller-runtime's metrics registry) to ensure they are exposed on the `/metrics` endpoint.
 
@@ -534,6 +789,7 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Configuration metrics**: `cloudberry_config_reload_total`
 - **FTS metrics**: `cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`, `cloudberry_replication_lag_bytes`
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
+- **Scale metrics**: `cloudberry_scale_operations_total`, `cloudberry_redistribution_progress`
 
 ### Tracing (OpenTelemetry)
 
@@ -561,6 +817,136 @@ All logs use Go's `slog` package with standard fields:
   "duration": "1.234s"
 }
 ```
+
+## Error Handling Patterns
+
+The operator uses a layered error handling strategy that combines structured error types, retry with exponential backoff, and observability integration to ensure reliable reconciliation and easy troubleshooting.
+
+### Error Type Hierarchy
+
+All custom errors in `internal/util/errors.go` follow a consistent pattern: each typed error wraps a sentinel error via `Unwrap()`, enabling `errors.Is()` for programmatic classification.
+
+```
+Sentinel Errors (for errors.Is matching)
+├── ErrNotFound           ← ClusterNotFoundError, SegmentNotFoundError
+├── ErrInvalidInput       ← ValidationError
+├── ErrUnauthorized       ← AuthenticationError
+├── ErrForbidden          ← PermissionDeniedError
+├── ErrRetryExhausted     ← returned by RetryWithBackoff
+├── ErrTimeout
+├── ErrConnectionFailed
+└── ErrAlreadyExists
+
+Wrapper Errors (preserve inner error chain)
+└── ReconcileError        ← wraps any error with operation context
+```
+
+**Design principles:**
+
+- **Sentinel errors** (`ErrNotFound`, `ErrInvalidInput`, etc.) enable callers to classify errors without type assertions
+- **Typed errors** (`ClusterNotFoundError`, `ValidationError`, etc.) carry structured context (cluster name, field name, etc.) for logging and API responses
+- **`ReconcileError`** wraps any error with the operation name, preserving the full error chain for `errors.Is()` and `errors.As()`
+- **`ErrRetryExhausted`** is returned by `RetryWithBackoff()` when all attempts fail, wrapping the last error from the final attempt
+
+### Retry with Exponential Backoff
+
+The `RetryWithBackoff()` function in `internal/util/retry.go` provides a generic retry mechanism used throughout the operator for transient failure recovery.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  RetryWithBackoff Flow                            │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  For attempt = 0 to MaxRetries:                          │    │
+│  │                                                          │    │
+│  │  1. Check context.Err() → return if canceled/expired     │    │
+│  │  2. Call fn(ctx)                                         │    │
+│  │     ├── nil → return nil (success)                       │    │
+│  │     └── error → continue to backoff                      │    │
+│  │  3. Calculate backoff:                                   │    │
+│  │     sleep = min(initialBackoff × multiplier^attempt,     │    │
+│  │                  maxBackoff)                              │    │
+│  │     sleep += jitter(sleep × jitterFraction)              │    │
+│  │  4. select:                                              │    │
+│  │     ├── ctx.Done() → return "context canceled"           │    │
+│  │     └── time.After(sleep) → next attempt                 │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                   │
+│  All attempts exhausted → return ErrRetryExhausted + lastErr     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key behaviors:**
+
+- **Context-first**: Checks `ctx.Err()` before each attempt and during backoff sleep via `select`
+- **Exponential growth**: Backoff doubles each attempt (configurable multiplier), capped at `MaxBackoff`
+- **Jitter**: Adds randomized jitter (`JitterFraction × backoff × rand`) to prevent thundering herd
+- **Error wrapping**: Returns `fmt.Errorf("%w: after N attempts: %w", ErrRetryExhausted, lastErr)` — both sentinels are matchable via `errors.Is()`
+
+### Reconciliation Error Flow
+
+When a reconciliation cycle encounters an error, the operator follows this flow:
+
+```
+┌──────────────────┐
+│  Reconcile()     │
+│  starts timer    │
+└────────┬─────────┘
+         │
+    ┌────▼────────────┐
+    │  Execute logic   │
+    └────┬────────┬───┘
+    success       error
+         │            │
+    ┌────▼────┐  ┌────▼──────────────────────────┐
+    │ Record  │  │ Record metrics:                │
+    │ metrics:│  │   RecordReconcile(             │
+    │ success │  │     cluster, ns, "error", dur) │
+    │         │  │ Set span error:                │
+    └────┬────┘  │   SetSpanError(span, err)      │
+         │       │ Log structured error:           │
+         │       │   slog.Error("reconciliation    │
+         │       │     failed", "cluster", name,   │
+         │       │     "error", err)               │
+         │       └────────────────────────────────┘
+         │
+    ┌────▼────────────────┐
+    │  Requeue (30s/10s)  │
+    │  30s on success     │
+    │  10s on error       │
+    └─────────────────────┘
+```
+
+**Metrics recording**: Every reconciliation cycle calls `RecordReconcile(cluster, namespace, result, duration)` where `result` is `"success"` or `"error"`. This populates:
+- `cloudberry_reconcile_total` (counter with `result` label)
+- `cloudberry_reconcile_errors_total` (counter, incremented only on errors)
+- `cloudberry_reconcile_duration_seconds` (histogram)
+
+**Telemetry spans**: When OTLP tracing is enabled, `SetSpanError(span, err)` sets the span status to `codes.Error` and records an `exception` event. The function is nil-safe — calling it with `nil` error is a no-op.
+
+**Structured logging**: All reconciliation errors are logged with `slog` including `cluster`, `namespace`, `controller`, `reconcileID`, `error`, and `duration` fields.
+
+### Webhook Validation
+
+The validating admission webhook (`internal/webhook/validating.go`) rejects invalid `CloudberryCluster` resources before they enter the system. Validation runs synchronously during the Kubernetes API admission phase.
+
+**Validation chain:**
+
+1. `segments.count >= 1` — prevents zero-segment clusters
+2. `coordinator.storage.size` required — prevents clusters without coordinator storage
+3. `segments.storage.size` required — prevents clusters without segment storage
+4. OIDC: `issuerURL` required when `oidc.enabled=true`
+5. OIDC: `clientID` required when `oidc.enabled=true`
+6. Cross-namespace duplicate name check via `checkDuplicateName()`
+
+### Pod Deletion Recovery
+
+The operator detects and recovers from pod deletions automatically through the standard reconciliation loop:
+
+1. **Detection**: `recordMetricsSnapshot()` reads `StatefulSet.Status.ReadyReplicas` and updates `status.segmentsReady`. When `segmentsReady < segmentsTotal`, the cluster is degraded
+2. **Kubernetes recovery**: The StatefulSet controller automatically recreates deleted pods
+3. **Operator recovery**: On the next reconciliation cycle (requeued every 30s), the operator detects the restored pods and updates `status.segmentsReady` back to `segmentsTotal`
+4. **No phase change**: Pod deletion does not change the cluster phase — the cluster stays in `Running` with degraded segment counts
 
 ## REST API Server Architecture
 
@@ -619,13 +1005,25 @@ When a request arrives from an IP within a trusted proxy range, the rate limiter
 - **Name validation**: Cluster and namespace names are validated against DNS-1123 subdomain format
 - **Security headers**: All responses include `X-Content-Type-Options`, `X-Frame-Options`, `Strict-Transport-Security`, and other security headers
 
+### HTTP Server Timeouts
+
+The API server configures explicit timeouts on the `http.Server` to prevent resource exhaustion from slow or malicious clients:
+
+| Timeout | Value | Purpose |
+|---------|-------|---------|
+| `ReadTimeout` | 30s | Maximum duration for reading the entire request, including the body |
+| `WriteTimeout` | 60s | Maximum duration before timing out writes of the response |
+| `IdleTimeout` | 120s | Maximum time to wait for the next request when keep-alives are enabled |
+
 ### API Server Lifecycle
 
 The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled. During shutdown, the rate limiter's `Stop()` method is called to terminate the background cleanup goroutine and prevent goroutine leaks.
 
 ## DBClientFactory Pattern
 
-The `DBClientFactory` (`internal/db/factory.go`) solves the problem of creating database connections for each managed cluster. Both controllers and the API server use the factory instead of creating database clients directly.
+The `DBClientFactory` interface is defined in `internal/db/factory.go` as a shared interface. Previously, duplicate interface definitions existed in both the controller and API server packages. The interface was extracted to the `internal/db` package to serve as the single source of truth, eliminating duplication and ensuring consistent signatures across consumers.
+
+Both controllers and the API server use the factory instead of creating database clients directly.
 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
@@ -694,7 +1092,7 @@ The API server receives a `DBClientFactory` at startup (injected from `cmd/opera
 7. The database client is closed via `defer dbClient.Close()`
 8. The handler returns the result as JSON
 
-The `DBClientFactory` interface is defined in both `internal/controller/ha_controller.go` (for controllers) and `internal/api/server.go` (for the API server). Both interfaces have the same signature, and the concrete implementation in `internal/db/factory.go` satisfies both.
+The `DBClientFactory` interface is defined once in `internal/db/factory.go` and imported by both the controller and API server packages. This eliminates the previous duplication where identical interfaces existed in `internal/controller/ha_controller.go` and `internal/api/server.go`.
 
 ## Status Update Pattern
 
@@ -746,9 +1144,9 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 │  │                    │    │  - Generates ECDSA P-256    │  │
 │  │  - Issues certs    │    │    CA + server key pairs    │  │
 │  │    via PKI engine  │    │  - CA valid for 10 years    │  │
-│  │  - Configurable    │    │  - Server cert validity     │  │
-│  │    mount path and  │    │    configurable (default    │  │
-│  │    role            │    │    1 year)                   │  │
+│  │    using           │    │  - Server cert validity     │  │
+│  │    WriteSecret     │    │    configurable (default    │  │
+│  │    (write op)      │    │    1 year)                   │  │
 │  └────────┬───────────┘    └──────────────┬──────────────┘  │
 │           └──────────┬───────────────────┘                   │
 │                      ▼                                       │
@@ -775,6 +1173,10 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 3. **Storage**: Certificates are stored in a Kubernetes Secret of type `kubernetes.io/tls`
 4. **Rotation check**: `NeedsRotation()` is called periodically (every 12 hours). Rotation triggers when **2/3 of the certificate lifetime** has elapsed
 5. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources
+
+### Vault PKI Certificate Issuance
+
+The Vault PKI strategy issues certificates by calling `WriteSecretWithResponse()` on the Vault PKI issue endpoint (e.g., `pki/issue/cloudberry-operator`). This is a write operation that generates a new certificate — using `ReadSecret()` would be incorrect since PKI issuance requires a POST/PUT request. The response contains the certificate, private key, and CA chain, which are stored in the Kubernetes Secret.
 
 ### DNS SANs
 

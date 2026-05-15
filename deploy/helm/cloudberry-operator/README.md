@@ -128,13 +128,19 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 
 ### New Configuration Options
 
-The following configuration options were added in the latest release:
+The following configuration options were added or updated in the latest release:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `operator.apiAddress` | Bind address for the REST API server used by `cloudberry-ctl` | `:8090` |
-| `operator.webhookEnabled` | Controls whether admission webhooks are registered at startup. Disable in development environments where webhook certificates are not available | `false` |
+| `operator.webhookEnabled` | Controls whether admission webhooks are registered at startup. Disable in development environments where webhook certificates are not available. This value is now included in the ConfigMap template for runtime access | `false` |
 | `telemetry.otlpInsecure` | When `true`, the OTLP exporter uses plaintext (non-TLS) connections. Use for local development with collectors that do not have TLS configured | `false` |
+
+### Webhook Configuration Notes
+
+- The `webhook-enabled` field is included in the operator ConfigMap template, allowing the operator to read the webhook configuration at runtime
+- CA bundle injection is handled automatically by the operator for both `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration`
+- Webhook certificate namespace handling ensures certificates are created in the correct namespace regardless of the release namespace
 
 ### API Admin Password
 
@@ -279,6 +285,41 @@ The operator automatically detects whether a parameter change requires a restart
 - **Restart-required parameters** (e.g., `shared_buffers`, `max_connections`, `wal_level`): ConfigMap updated, rolling restart triggered
 
 Rolling restart order: mirrors → primaries → standby → coordinator.
+
+## Monitoring Stack
+
+The operator integrates with monitoring tools for metrics collection and distributed tracing:
+
+### vmagent / VictoriaMetrics
+
+Deploy with a ServiceMonitor for Prometheus-compatible metrics scraping:
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --create-namespace \
+  --set metrics.enabled=true \
+  --set serviceMonitor.enabled=true \
+  --set serviceMonitor.interval=30s
+```
+
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory of the source repository.
+
+### OpenTelemetry Collector
+
+Deploy with OTLP tracing for distributed trace collection:
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --create-namespace \
+  --set telemetry.enabled=true \
+  --set telemetry.otlpEndpoint=otel-collector:4317 \
+  --set telemetry.otlpProtocol=grpc \
+  --set telemetry.otlpInsecure=true
+```
+
+The operator emits spans for reconciliation loops, API request handling, database operations, and Vault interactions.
 
 ## CRDs
 

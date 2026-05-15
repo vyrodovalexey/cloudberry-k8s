@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -16,6 +18,10 @@ const (
 	apiPrefix = "/api/v1alpha1"
 	// defaultTimeout is the default HTTP client timeout.
 	defaultTimeout = 30 * time.Second
+	// maxResponseSize is the maximum allowed response body size (10 MiB).
+	maxResponseSize = 10 << 20
+	// queryParamNamespace is the query parameter name for namespace.
+	queryParamNamespace = "namespace"
 )
 
 // OperatorClient makes HTTP calls to the operator API.
@@ -25,6 +31,7 @@ type OperatorClient struct {
 	username   string
 	password   string
 	authMethod string
+	verbose    bool
 }
 
 // ClientConfig holds configuration for creating an OperatorClient.
@@ -39,6 +46,8 @@ type ClientConfig struct {
 	AuthMethod string
 	// Timeout is the HTTP client timeout.
 	Timeout time.Duration
+	// Verbose enables debug logging of HTTP requests and responses.
+	Verbose bool
 }
 
 // NewOperatorClient creates a new OperatorClient.
@@ -60,6 +69,7 @@ func NewOperatorClient(cfg ClientConfig) *OperatorClient {
 		username:   cfg.Username,
 		password:   cfg.Password,
 		authMethod: cfg.AuthMethod,
+		verbose:    cfg.Verbose,
 	}
 }
 
@@ -152,13 +162,24 @@ func (c *OperatorClient) do(ctx context.Context, method, path string, body inter
 	req.Header.Set("Accept", "application/json")
 	c.applyAuth(req)
 
+	if c.verbose {
+		slog.Debug("HTTP request", "method", method, "url", url)
+	}
+
+	start := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	rawBody, err := io.ReadAll(resp.Body)
+	if c.verbose {
+		slog.Debug("HTTP response",
+			"method", method, "url", url,
+			"status", resp.StatusCode, "duration", time.Since(start))
+	}
+
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
@@ -200,9 +221,9 @@ func (c *OperatorClient) applyAuth(req *http.Request) {
 
 // ClusterPath returns the API path for a cluster resource.
 func ClusterPath(name, namespace string) string {
-	path := fmt.Sprintf("/clusters/%s", name)
+	path := fmt.Sprintf("/clusters/%s", url.PathEscape(name))
 	if namespace != "" {
-		path += "?namespace=" + namespace
+		path += "?" + url.Values{queryParamNamespace: {namespace}}.Encode()
 	}
 	return path
 }
@@ -214,27 +235,27 @@ func ClustersPath() string {
 
 // ClusterStatusPath returns the API path for cluster status.
 func ClusterStatusPath(name, namespace string) string {
-	path := fmt.Sprintf("/clusters/%s/status", name)
+	path := fmt.Sprintf("/clusters/%s/status", url.PathEscape(name))
 	if namespace != "" {
-		path += "?namespace=" + namespace
+		path += "?" + url.Values{queryParamNamespace: {namespace}}.Encode()
 	}
 	return path
 }
 
 // ClusterActionPath returns the API path for a cluster action.
 func ClusterActionPath(name, action, namespace string) string {
-	path := fmt.Sprintf("/clusters/%s/%s", name, action)
+	path := fmt.Sprintf("/clusters/%s/%s", url.PathEscape(name), url.PathEscape(action))
 	if namespace != "" {
-		path += "?namespace=" + namespace
+		path += "?" + url.Values{queryParamNamespace: {namespace}}.Encode()
 	}
 	return path
 }
 
 // ClusterSubresourcePath returns the API path for a cluster subresource.
 func ClusterSubresourcePath(name, subresource, namespace string) string {
-	path := fmt.Sprintf("/clusters/%s/%s", name, subresource)
+	path := fmt.Sprintf("/clusters/%s/%s", url.PathEscape(name), subresource)
 	if namespace != "" {
-		path += "?namespace=" + namespace
+		path += "?" + url.Values{queryParamNamespace: {namespace}}.Encode()
 	}
 	return path
 }

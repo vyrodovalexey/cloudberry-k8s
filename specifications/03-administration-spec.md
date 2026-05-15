@@ -91,23 +91,29 @@ spec:
 
 **Process**:
 1. Operator detects `spec.segments.count` increased
-2. Set status phase to `Scaling`
-3. Pre-flight checks:
-   - Cluster must be in `Running` phase
-   - Sufficient node capacity for new pods
-   - If mirroring enabled, mirror count must match primary count
-4. Update primary segment StatefulSet replicas from old count to new count
-5. Wait for new primary segment pods to be ready (OrderedReady policy ensures sequential startup)
-6. If mirroring enabled, update mirror segment StatefulSet replicas
-7. Wait for new mirror segment pods to be ready
-8. Run segment expansion (gpexpand equivalent):
-   - Register new segments in `gp_segment_configuration`
-   - Initialize new segment data directories
-   - Redistribute data across all segments (rebalance)
-9. Verify all segments are healthy and data is distributed
-10. Update status: `segmentsReady`, `segmentsTotal`, phase back to `Running`
-11. Record event `ScaleOutCompleted`
-12. Update Prometheus metrics: `cloudberry_segments_total`, `cloudberry_segments_ready`
+2. Pre-flight check: cluster must be in `Running` phase
+   - If not in `Running` phase, the operator emits a `ScaleOutBlocked` warning event and skips the operation (retries on next reconcile)
+3. Set `avsoft.io/scale-started` annotation with the current timestamp (RFC 3339)
+4. Set status phase to `Scaling`
+5. Set `DataRedistribution` condition with reason `ScaleOutStarted`
+6. Emit `ScaleOutStarted` event
+7. Update primary segment StatefulSet replicas from old count to new count
+8. If mirroring enabled, update mirror segment StatefulSet replicas
+9. Create redistribution Job via `BuildMaintenanceJob(cluster, "redistribute", timestamp)`
+10. Set `DataRedistribution` condition to `InProgress`
+11. On each reconcile while in `Scaling` phase, `checkScaleProgress()` verifies all StatefulSets are ready
+12. When all pods are ready:
+    - Set phase back to `Running`
+    - Update `segmentsReady`, `segmentsTotal`
+    - Set `DataRedistribution` condition to `Completed`
+    - Emit `ScaleOutCompleted` event
+    - Record `cloudberry_scale_operations_total{operation="scale-out"}` metric
+    - Remove `avsoft.io/scale-started` annotation
+
+**Scale Timeout** (10 minutes):
+- The `avsoft.io/scale-started` annotation tracks when the scale operation began
+- On each reconcile, `checkScaleProgress()` checks whether the timeout (10 minutes) has elapsed
+- If the timeout is exceeded and pods are still not ready, `handleScaleFailure()` is invoked
 
 **Rebalancing After Scale-Out**:
 - Data redistribution runs as a background Job
@@ -120,11 +126,14 @@ spec:
 - Tables are redistributed one at a time to minimize impact
 - Redistribution respects resource limits (configurable parallelism)
 
-**Rollback**: If new segments fail health checks, the operator:
-1. Marks failed segments in `status.failedSegments`
-2. Sets condition `ScaleOutFailed` with reason
-3. Does NOT automatically scale back (manual intervention required)
+**Failure Handling**: If new segments are not ready after the 10-minute timeout, the operator:
+1. Identifies unready segments from both primary and mirror StatefulSets
+2. Populates `status.failedSegments` with details (contentID, hostname, role, status)
+3. Sets condition `ScaleOutFailed` = `True` with reason `SegmentsNotReady` and a message including the count and timeout
 4. Emits warning event `ScaleOutFailed`
+5. Removes the `avsoft.io/scale-started` annotation
+6. Does **NOT** automatically roll back — the cluster stays in `Scaling` phase
+7. Manual intervention is required to resolve (fix the underlying issue, then the operator resumes on next reconcile)
 
 ### 2.6 Scale-In (Remove Segments)
 
@@ -140,9 +149,13 @@ spec:
 
 **Process**:
 1. Operator detects `spec.segments.count` decreased
-2. Set status phase to `Scaling`
-3. Pre-flight checks:
-   - Cluster must be in `Running` phase
+2. Pre-flight check: cluster must be in `Running` phase
+   - If not in `Running` phase, the operator emits a `ScaleInBlocked` warning event and skips the operation (retries on next reconcile)
+3. Safety check: if new count < 50% of current count, require `avsoft.io/confirm-scale-in=true` annotation
+   - If missing, emit `ScaleInBlocked` warning event and skip
+4. Set `avsoft.io/scale-started` annotation with the current timestamp
+5. Set status phase to `Scaling`
+6. Additional pre-flight checks:
    - New segment count must be >= 1
    - Sufficient capacity on remaining segments for redistributed data
 4. Run data redistribution to move data OFF segments being removed:
@@ -232,10 +245,17 @@ spec:
 **Process**:
 1. Operator detects storage size increase in the CR spec
 2. Pre-flight checks:
-   - StorageClass must support volume expansion (`allowVolumeExpansion: true`)
    - New size must be greater than current size (shrinking is not supported)
-   - Cluster should be in `Running` or `Stopped` phase
-3. For each affected PVC:
+   - PVC must exist (missing PVCs are skipped without error)
+   - **StorageClass pre-flight check** via `storageClassSupportsExpansion()`:
+     a. Read the StorageClass name from `pvc.spec.storageClassName` or the legacy `volume.beta.kubernetes.io/storage-class` annotation
+     b. If no StorageClass is specified (default SC), allow the expansion attempt
+     c. Look up the StorageClass in the Kubernetes API
+     d. If the StorageClass has `allowVolumeExpansion: true`, allow the expansion
+     e. If the StorageClass has `allowVolumeExpansion: false` or `nil`, **block** the expansion
+     f. If the StorageClass is not found, **block** the expansion with a descriptive reason
+     g. On transient API errors, **allow** the expansion (fail-open)
+3. For each affected PVC that passes the pre-flight check:
    a. Patch the PVC `spec.resources.requests.storage` to the new size
    b. Wait for the PVC to report the new capacity in `status.capacity.storage`
    c. Some StorageClasses require a pod restart for the filesystem to be resized
@@ -245,6 +265,13 @@ spec:
 5. Verify filesystem size inside pods matches the new PVC size
 6. Update status condition `StorageExpanded` with details
 7. Record event `StorageExpanded`
+
+**StorageClass Blocking Behavior**:
+- When expansion is blocked by the StorageClass check, the operator logs a WARN with the PVC name, StorageClass name, reason, and current/desired sizes
+- **No error is returned** — the reconciliation continues normally for other components
+- The PVC remains at its current size
+- No `StorageExpanded` event or condition is emitted for blocked PVCs
+- This is a non-fatal, informational warning — the operator does not retry the blocked expansion until the next spec change
 
 **Scope of Expansion**:
 
@@ -256,9 +283,12 @@ spec:
 
 **Constraints**:
 - Volume shrinking is NOT supported (Kubernetes limitation)
-- The StorageClass must have `allowVolumeExpansion: true`
+- The StorageClass must have `allowVolumeExpansion: true` — the operator performs a pre-flight check via `storageClassSupportsExpansion()` and blocks expansion if the field is `false`, `nil`, or the StorageClass is not found
+- When no StorageClass is specified on the PVC (cluster default), the operator allows the expansion attempt since it cannot determine the default StorageClass's capabilities
+- On transient StorageClass lookup errors, the operator allows the expansion attempt (fail-open) rather than permanently blocking
 - Some cloud providers require the pod to be restarted for online expansion
 - Expansion of segment storage applies to ALL segments uniformly (individual segment expansion is not supported)
+- **Docker Desktop limitation**: The `hostpath` provisioner does not implement volume expansion at the storage layer. The PVC metadata is updated but the underlying volume does not resize
 
 **Monitoring**:
 - `cloudberry_disk_usage_bytes` metric tracks actual usage
@@ -286,19 +316,84 @@ This patches all segment PVCs (both primary and mirror) to 50Gi.
 
 ### 2.9 Upgrade Cluster
 
-**Trigger**: Change to `spec.version` or `spec.image`
+**Trigger**: Change to `spec.version` (when `spec.version` differs from `status.clusterVersion`) or presence of the `avsoft.io/upgrade` annotation (in-progress upgrade)
+
+**Pre-flight Check**: Cluster must be in `Running` phase. If not, the operator emits an `UpgradeBlocked` warning event and skips the operation (retries on next reconcile).
 
 **Process**:
-1. Pre-flight checks (cluster healthy, disk space, replication lag)
-2. Update mirror StatefulSets first (rolling)
-3. Update primary segment StatefulSets (rolling)
-4. Update standby coordinator
-5. Update coordinator
-6. Run version-specific upgrade hooks
-7. Verify cluster health
-8. Update status
+1. Operator detects `spec.version != status.clusterVersion` via `isUpgradeNeeded()`
+2. Pre-flight check: cluster must be in `Running` phase
+   - If not in `Running` phase, emit `UpgradeBlocked` warning event and skip
+3. Capture current image from the coordinator StatefulSet via `getCurrentImage()`
+4. Store rollback state in the `avsoft.io/upgrade` annotation as JSON (see Upgrade Annotation Format below)
+5. Set status phase to `Updating`
+6. Emit `UpgradeStarted` event
+7. Process upgrade phases in order (least critical first):
+   - **Phase 1 — Mirrors**: Update mirror segment StatefulSet image. Wait for all mirror pods to be ready. Skip if mirroring is not enabled
+   - **Phase 2 — Primaries**: Update primary segment StatefulSet image. Wait for all primary pods to be ready
+   - **Phase 3 — Standby**: Update standby coordinator StatefulSet image. Wait for standby pod to be ready. Skip if standby is not enabled
+   - **Phase 4 — Coordinator**: Update coordinator StatefulSet image. Wait for coordinator pod to be ready
+   - **Phase 5 — Verify**: Post-upgrade health check — verify coordinator and primary segments are ready via `verifyUpgrade()`
+8. On successful verification:
+   - Set phase back to `Running`
+   - Update `status.clusterVersion` to the new version
+   - Set `UpgradeCompleted` condition to `True` with reason `UpgradeSucceeded`
+   - Emit `UpgradeCompleted` event
+   - Remove `avsoft.io/upgrade` annotation
 
-**Rollback**: If any step fails health check, revert to previous image
+**Upgrade Order**: mirrors → primaries → standby → coordinator (least critical first, coordinator last)
+
+**Phase Advancement**: Each phase calls `upgradePhase()`, which updates the StatefulSet image via `updateStatefulSetImage()`, checks readiness via `isStatefulSetReady()`, and advances to the next phase via `advanceUpgradePhase()` when ready. If the StatefulSet is not yet ready, the reconciler requeues after 5 seconds.
+
+**Upgrade Annotation Format** (`avsoft.io/upgrade`):
+
+```json
+{
+  "previousImage": "postgres:16",
+  "previousVersion": "7.1.0",
+  "phase": "primaries",
+  "startedAt": "2026-05-15T10:00:00Z",
+  "phaseStartedAt": "2026-05-15T10:01:00Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `previousImage` | string | Container image before the upgrade (for rollback) |
+| `previousVersion` | string | `status.clusterVersion` before the upgrade (for rollback) |
+| `phase` | string | Current upgrade phase: `mirrors`, `primaries`, `standby`, `coordinator`, `verify` |
+| `startedAt` | string | RFC 3339 timestamp when the upgrade was initiated |
+| `phaseStartedAt` | string | RFC 3339 timestamp when the current phase started (reset on each phase transition) |
+
+**Rollback Behavior**:
+
+Each upgrade phase has a **10-minute timeout**. On each reconciliation, `continueUpgrade()` checks whether the current phase has exceeded the timeout by comparing `time.Since(phaseStartedAt)` against `upgradePhaseTimeout` (10 minutes).
+
+If the timeout is exceeded:
+1. `rollbackUpgrade()` reverts **ALL** StatefulSets (mirrors, primaries, standby, coordinator) to the `previousImage` stored in the upgrade annotation
+2. Sets phase back to `Running`
+3. Restores `status.clusterVersion` to the `previousVersion`
+4. Sets `UpgradeFailed` condition to `True` with reason `RolledBack` and a message describing which phase timed out
+5. Emits `UpgradeRollback` warning event
+6. Removes the `avsoft.io/upgrade` annotation
+
+**Status Transitions**: `Running` → `Updating` → `Running` (success) or `Running` → `Updating` → `Running` (rollback)
+
+**Events**:
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `UpgradeStarted` | Normal | Upgrade initiated with previous and new version |
+| `UpgradeCompleted` | Normal | Upgrade completed successfully |
+| `UpgradeBlocked` | Warning | Upgrade blocked because cluster is not in `Running` phase |
+| `UpgradeRollback` | Warning | Upgrade rolled back due to phase timeout |
+
+**Conditions**:
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `UpgradeCompleted` | `True` | `UpgradeSucceeded` | Upgrade completed successfully |
+| `UpgradeFailed` | `True` | `RolledBack` | Upgrade failed and was rolled back |
 
 ### 2.10 Remove Cluster
 

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,6 +18,14 @@ import (
 )
 
 const appName = "cloudberry-ctl"
+
+// appendNamespaceQuery appends the namespace query parameter to a path if namespace is non-empty.
+func appendNamespaceQuery(path, namespace string) string {
+	if namespace != "" {
+		path += "?" + url.Values{"namespace": {namespace}}.Encode()
+	}
+	return path
+}
 
 // notImplemented returns a standardized error for commands that are not yet implemented.
 func notImplemented(name string) error {
@@ -105,6 +115,7 @@ func newClient() (*ctl.OperatorClient, error) {
 		Password:   globals.password,
 		AuthMethod: globals.authMethod,
 		Timeout:    timeout,
+		Verbose:    globals.verbose,
 	}), nil
 }
 
@@ -180,7 +191,7 @@ func runAPIDelete(path string) error {
 
 // newRootCmd creates the root command.
 func newRootCmd() *cobra.Command {
-	rootCmd := &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   appName,
 		Short: "Cloudberry Database cluster management CLI",
 		Long: `cloudberry-ctl is a command-line utility that provides imperative access
@@ -189,8 +200,11 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		SilenceErrors: true,
 	}
 
+	// Store reference for initConfig to access flag.Changed.
+	rootCmd = cmd
+
 	// Bind global flags.
-	pf := rootCmd.PersistentFlags()
+	pf := cmd.PersistentFlags()
 	pf.StringVar(&globals.cluster, "cluster", "", "Target cluster name")
 	pf.StringVar(&globals.namespace, "namespace", "cloudberry-test", "Kubernetes namespace")
 	pf.StringVar(&globals.kubeconfig, "kubeconfig", "", "Path to kubeconfig")
@@ -210,7 +224,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 	cobra.OnInitialize(initConfig)
 
 	// Add subcommands.
-	rootCmd.AddCommand(
+	cmd.AddCommand(
 		newVersionCmd(),
 		newClusterCmd(),
 		newConfigCmd(),
@@ -229,7 +243,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newCompletionCmd(),
 	)
 
-	return rootCmd
+	return cmd
 }
 
 // bindEnvVars binds environment variables to flags.
@@ -256,15 +270,23 @@ func bindEnvVars() {
 	}
 }
 
-// setIfEmpty sets dst to the viper value for key when dst still holds its
-// default value.
-func setIfEmpty(dst *string, key, defaultVal string) {
-	if v := viper.GetString(key); v != "" && *dst == defaultVal {
+// rootCmd is stored so initConfig can access flag.Changed.
+var rootCmd *cobra.Command //nolint:gochecknoglobals // needed for initConfig
+
+// applyViperValue applies the viper value to dst only if the flag was not
+// explicitly set on the command line. This ensures the priority order:
+// CLI flag > env var > config file > default.
+func applyViperValue(dst *string, flagName, viperKey string) {
+	if rootCmd != nil && rootCmd.PersistentFlags().Changed(flagName) {
+		return // user explicitly set this flag on the command line
+	}
+	if v := viper.GetString(viperKey); v != "" {
 		*dst = v
 	}
 }
 
 // initConfig reads the config file and applies viper values to global flags.
+// Priority order: CLI flag > env var > config file > default.
 func initConfig() {
 	viper.SetConfigName(".cloudberry-ctl")
 	viper.SetConfigType("yaml")
@@ -274,17 +296,16 @@ func initConfig() {
 	// Config file is optional.
 	_ = viper.ReadInConfig()
 
-	// Apply all viper values to globals struct.
-	// Environment variables (set in bindEnvVars) take priority over config
-	// file values.
-	setIfEmpty(&globals.cluster, "cluster", "")
-	setIfEmpty(&globals.namespace, "namespace", "cloudberry-test")
-	setIfEmpty(&globals.operatorURL, "operator-url", "")
-	setIfEmpty(&globals.authMethod, "auth-method", "basic")
-	setIfEmpty(&globals.username, "username", "")
-	setIfEmpty(&globals.password, "password", "")
-	setIfEmpty(&globals.timeout, "timeout", "5m")
-	setIfEmpty(&globals.output, "output", "table")
+	// Apply viper values (env vars + config file) to globals struct,
+	// but only when the flag was not explicitly set on the command line.
+	applyViperValue(&globals.cluster, "cluster", "cluster")
+	applyViperValue(&globals.namespace, "namespace", "namespace")
+	applyViperValue(&globals.operatorURL, "operator-url", "operator-url")
+	applyViperValue(&globals.authMethod, "auth-method", "auth-method")
+	applyViperValue(&globals.username, "username", "username")
+	applyViperValue(&globals.password, "password", "password")
+	applyViperValue(&globals.timeout, "timeout", "timeout")
+	applyViperValue(&globals.output, "output", "output")
 }
 
 // newVersionCmd creates the version command.
@@ -383,6 +404,16 @@ func newClusterCmd() *cobra.Command {
 					return err
 				}
 				return runAPIDelete(ctl.ClusterPath(globals.cluster, globals.namespace))
+			},
+		},
+		&cobra.Command{
+			Use:   "scale-status",
+			Short: "Show scale operation status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "scale/status", globals.namespace))
 			},
 		},
 		&cobra.Command{
@@ -557,21 +588,42 @@ func newHACmd() *cobra.Command {
 		Short: "High availability management",
 	}
 
+	rebalanceCmd := &cobra.Command{
+		Use:   "rebalance",
+		Short: "Rebalance segments",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+
+			statusFlag, _ := cmd.Flags().GetBool("status")
+			if statusFlag {
+				return runAPIGet(ctl.ClusterSubresourcePath(
+					globals.cluster, "rebalance/status", globals.namespace))
+			}
+
+			tables, _ := cmd.Flags().GetString("tables")
+			if tables != "" {
+				body := map[string]interface{}{
+					"tables": strings.Split(tables, ","),
+				}
+				return runAPIPost(ctl.ClusterActionPath(
+					globals.cluster, "rebalance", globals.namespace), body)
+			}
+
+			return runAPIPost(ctl.ClusterActionPath(
+				globals.cluster, "rebalance", globals.namespace), nil)
+		},
+	}
+	rebalanceCmd.Flags().Bool("status", false, "Show rebalance status")
+	rebalanceCmd.Flags().String("tables", "", "Comma-separated list of tables to rebalance")
+
 	cmd.AddCommand(
 		newMirroringCmd(),
 		newRecoveryCmd(),
 		newStandbyCmd(),
 		newFTSCmd(),
-		&cobra.Command{
-			Use:   "rebalance",
-			Short: "Rebalance segments",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIPost(ctl.ClusterActionPath(globals.cluster, "rebalance", globals.namespace), nil)
-			},
-		},
+		rebalanceCmd,
 	)
 
 	return cmd
@@ -773,10 +825,11 @@ func newSessionsCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/sessions/%s/cancel", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/sessions/%s/cancel",
+						url.PathEscape(globals.cluster),
+						url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIPost(path, nil)
 			},
 		},
@@ -788,10 +841,11 @@ func newSessionsCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/sessions/%s", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/sessions/%s",
+						url.PathEscape(globals.cluster),
+						url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIDelete(path)
 			},
 		},
@@ -1100,11 +1154,10 @@ func newResourceGroupCmd() *cobra.Command {
 			if err := requireCluster(); err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/clusters/%s/workload/resource-groups/%s",
-				globals.cluster, deleteName)
-			if globals.namespace != "" {
-				path += "?namespace=" + globals.namespace
-			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/workload/resource-groups/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(deleteName)),
+				globals.namespace)
 			return runAPIDelete(path)
 		},
 	}
@@ -1120,11 +1173,10 @@ func newResourceGroupCmd() *cobra.Command {
 			if err := requireCluster(); err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/clusters/%s/workload/resource-groups/%s/assign",
-				globals.cluster, assignGroup)
-			if globals.namespace != "" {
-				path += "?namespace=" + globals.namespace
-			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/workload/resource-groups/%s/assign",
+					url.PathEscape(globals.cluster), url.PathEscape(assignGroup)),
+				globals.namespace)
 			body := map[string]interface{}{
 				"role": assignRole,
 			}
@@ -1283,10 +1335,9 @@ func newBackupCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/backups/%s", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/backups/%s", url.PathEscape(globals.cluster), url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIDelete(path)
 			},
 		},
@@ -1298,10 +1349,11 @@ func newBackupCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/backups/%s/restore", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/backups/%s/restore",
+						url.PathEscape(globals.cluster),
+						url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIPost(path, nil)
 			},
 		},
@@ -1361,10 +1413,10 @@ func newStorageCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/storage/tables/%s/%s", globals.cluster, args[0], args[1])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/storage/tables/%s/%s",
+						url.PathEscape(globals.cluster), url.PathEscape(args[0]), url.PathEscape(args[1])),
+					globals.namespace)
 				return runAPIGet(path)
 			},
 		},
@@ -1479,10 +1531,10 @@ func newDataLoadingCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/start", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/start",
+						url.PathEscape(globals.cluster), url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIPost(path, nil)
 			},
 		},
@@ -1494,10 +1546,10 @@ func newDataLoadingCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/stop", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/stop",
+						url.PathEscape(globals.cluster), url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIPost(path, nil)
 			},
 		},
@@ -1509,10 +1561,10 @@ func newDataLoadingCmd() *cobra.Command {
 				if err := requireCluster(); err != nil {
 					return err
 				}
-				path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s", globals.cluster, args[0])
-				if globals.namespace != "" {
-					path += "?namespace=" + globals.namespace
-				}
+				path := appendNamespaceQuery(
+					fmt.Sprintf("/clusters/%s/data-loading/jobs/%s",
+						url.PathEscape(globals.cluster), url.PathEscape(args[0])),
+					globals.namespace)
 				return runAPIDelete(path)
 			},
 		},

@@ -753,3 +753,27 @@ func (m *mockMetricsRecorder) SetTableBloatRatio(cluster, namespace, table strin
 		"cluster": cluster, "namespace": namespace, "table": table, "ratio": ratio,
 	})
 }
+
+func (m *mockMetricsRecorder) RecordScaleOperation(cluster, namespace, operation string) {
+	m.record("RecordScaleOperation", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "operation": operation,
+	})
+}
+
+func (m *mockMetricsRecorder) SetRedistributionProgress(cluster, namespace string, progress float64) {
+	m.record("SetRedistributionProgress", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "progress": progress,
+	})
+}
+
+func (m *mockMetricsRecorder) SetDataSkewCoefficient(cluster, namespace string, coefficient float64) {
+	m.record("SetDataSkewCoefficient", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "coefficient": coefficient,
+	})
+}
+
+func (m *mockMetricsRecorder) SetPVCSizeBytes(cluster, namespace, component string, sizeBytes float64) {
+	m.record("SetPVCSizeBytes", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "component": component, "bytes": sizeBytes,
+	})
+}

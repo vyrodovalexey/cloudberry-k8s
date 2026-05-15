@@ -21,7 +21,7 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
-// mockDBClientFactory implements DBClientFactory for testing.
+// mockDBClientFactory implements db.DBClientFactory for testing.
 type mockDBClientFactory struct {
 	client db.Client
 	err    error
@@ -132,7 +132,7 @@ func TestNewHAReconciler(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 	require.NotNil(t, r)
 }
 
@@ -142,7 +142,7 @@ func TestHAReconciler_Reconcile_NotFound(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"},
@@ -165,7 +165,7 @@ func TestHAReconciler_Reconcile_NotRunning(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -191,7 +191,7 @@ func TestHAReconciler_Reconcile_Running(t *testing.T) {
 		client: &mockDBClient{},
 	}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -217,7 +217,7 @@ func TestHAReconciler_Reconcile_RecoveryAnnotation(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -243,7 +243,7 @@ func TestHAReconciler_Reconcile_RebalanceAnnotation(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -269,7 +269,7 @@ func TestHAReconciler_Reconcile_ActivateStandbyAnnotation(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -282,7 +282,7 @@ func TestHAReconciler_Reconcile_ActivateStandbyAnnotation(t *testing.T) {
 func TestHAReconciler_ProbeInterval(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := NewHAReconciler(k8sClient, scheme, record.NewFakeRecorder(10), nil, &metrics.NoopRecorder{}, nil)
+	r := NewHAReconciler(k8sClient, scheme, record.NewFakeRecorder(10), nil, nil, &metrics.NoopRecorder{}, nil)
 
 	t.Run("default interval", func(t *testing.T) {
 		cluster := newTestCluster()
@@ -323,7 +323,7 @@ func TestHAReconciler_RunFTSProbe_AllHealthy(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.NoError(t, err)
@@ -355,7 +355,7 @@ func TestHAReconciler_RunFTSProbe_DegradedSegments(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.NoError(t, err)
@@ -382,7 +382,7 @@ func TestHAReconciler_MonitorStandby(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.monitorStandby(context.Background(), cluster)
 	require.NoError(t, err)
@@ -410,7 +410,7 @@ func TestHAReconciler_RunFTSProbe_DBClientError(t *testing.T) {
 		err: fmt.Errorf("connection refused"),
 	}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.Error(t, err)
@@ -435,7 +435,7 @@ func TestHAReconciler_MonitorStandby_DBClientError(t *testing.T) {
 		err: fmt.Errorf("connection refused"),
 	}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.monitorStandby(context.Background(), cluster)
 	require.Error(t, err)
@@ -461,7 +461,7 @@ func TestHAReconciler_MonitorStandby_ReplicationLagError(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.monitorStandby(context.Background(), cluster)
 	require.Error(t, err)
@@ -496,7 +496,7 @@ func TestHAReconciler_Reconcile_RunningWithMirroringAndStandby(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -508,7 +508,7 @@ func TestHAReconciler_Reconcile_RunningWithMirroringAndStandby(t *testing.T) {
 func TestHAReconciler_ProbeInterval_CustomHA(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := NewHAReconciler(k8sClient, scheme, record.NewFakeRecorder(10), nil, &metrics.NoopRecorder{}, nil)
+	r := NewHAReconciler(k8sClient, scheme, record.NewFakeRecorder(10), nil, nil, &metrics.NoopRecorder{}, nil)
 
 	cluster := newTestCluster()
 	cluster.Spec.HA = &cbv1alpha1.HASpec{FTSProbeInterval: 120}
@@ -535,7 +535,7 @@ func TestHAReconciler_RunFTSProbe_SegmentConfigError(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.Error(t, err)
@@ -557,7 +557,7 @@ func TestHAReconciler_RunFTSProbe_NilDBFactory(t *testing.T) {
 	m := &metrics.NoopRecorder{}
 
 	// Create reconciler with nil dbFactory.
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	err := r.runFTSProbe(context.Background(), cluster)
 	require.Error(t, err)
@@ -578,7 +578,7 @@ func TestHAReconciler_MonitorStandby_NilDBFactory(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	err := r.monitorStandby(context.Background(), cluster)
 	require.Error(t, err)
@@ -601,7 +601,7 @@ func TestHAReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -630,7 +630,7 @@ func TestHAReconciler_Reconcile_ObservedGenerationNotSkippedWithRecoveryAnnotati
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -666,7 +666,7 @@ func TestHAReconciler_Reconcile_ObservedGenerationNotSkippedWithActionAnnotation
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -697,7 +697,7 @@ func TestHAReconciler_RunHealthChecks_MirroringEnabled(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	// Should not panic.
 	r.runHealthChecks(context.Background(), cluster, r.logger)
@@ -722,7 +722,7 @@ func TestHAReconciler_RunHealthChecks_StandbyEnabled(t *testing.T) {
 	}
 	dbFactory := &mockDBClientFactory{client: dbClient}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, m, nil)
 
 	// Should not panic.
 	r.runHealthChecks(context.Background(), cluster, r.logger)
@@ -742,7 +742,7 @@ func TestHAReconciler_RunHealthChecks_BothDisabled(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	// Should not panic and should be a no-op.
 	r.runHealthChecks(context.Background(), cluster, r.logger)
@@ -763,7 +763,7 @@ func TestHAReconciler_RunHealthChecks_FTSProbeError(t *testing.T) {
 	m := &metrics.NoopRecorder{}
 
 	// nil dbFactory will cause FTS probe to fail.
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	// Should not panic even when FTS probe fails.
 	r.runHealthChecks(context.Background(), cluster, r.logger)
@@ -784,7 +784,7 @@ func TestHAReconciler_RunHealthChecks_StandbyMonitorError(t *testing.T) {
 	m := &metrics.NoopRecorder{}
 
 	// nil dbFactory will cause standby monitoring to fail.
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	// Should not panic even when standby monitoring fails.
 	r.runHealthChecks(context.Background(), cluster, r.logger)
@@ -803,7 +803,7 @@ func TestHAReconciler_HandleAnnotations_NoAnnotations(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, handled, err := r.handleAnnotations(context.Background(), cluster)
 	require.NoError(t, err)
@@ -826,7 +826,7 @@ func TestHAReconciler_HandleAnnotations_UnknownAction(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, handled, err := r.handleAnnotations(context.Background(), cluster)
 	require.NoError(t, err)
@@ -850,7 +850,7 @@ func TestHAReconciler_Reconcile_GetError(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -880,7 +880,7 @@ func TestHAReconciler_HandleRecovery_PatchError(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, err := r.handleRecovery(context.Background(), cluster, util.RecoveryIncremental)
 	require.Error(t, err)
@@ -908,7 +908,7 @@ func TestHAReconciler_HandleRebalance_PatchError(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, err := r.handleRebalance(context.Background(), cluster)
 	require.Error(t, err)
@@ -936,7 +936,7 @@ func TestHAReconciler_HandleStandbyActivation_PatchError(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewHAReconciler(k8sClient, scheme, recorder, nil, m, nil)
+	r := NewHAReconciler(k8sClient, scheme, recorder, nil, nil, m, nil)
 
 	_, err := r.handleStandbyActivation(context.Background(), cluster)
 	require.Error(t, err)

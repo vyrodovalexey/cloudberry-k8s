@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -28,6 +29,13 @@ const (
 	// maxBodySize is the maximum allowed request body size (1 MiB).
 	maxBodySize = 1 << 20
 
+	// httpReadTimeout is the maximum duration for reading the entire request, including the body.
+	httpReadTimeout = 30 * time.Second
+	// httpWriteTimeout is the maximum duration before timing out writes of the response.
+	httpWriteTimeout = 60 * time.Second
+	// httpIdleTimeout is the maximum amount of time to wait for the next request when keep-alives are enabled.
+	httpIdleTimeout = 120 * time.Second
+
 	responseKeyStatus  = "status"
 	responseKeyTotal   = "total"
 	responseKeyJob     = "job"
@@ -38,8 +46,9 @@ const (
 	// msgDBNotAvailable is the message returned when the database factory is not configured.
 	msgDBNotAvailable = "database connection not available"
 
-	responseKeyGroup = "group"
-	responseKeyName  = "name"
+	responseKeyGroup     = "group"
+	responseKeyName      = "name"
+	responseKeyNamespace = "namespace"
 
 	statusDeleted = "deleted"
 )
@@ -62,18 +71,12 @@ func limitBody(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 }
 
-// DBClientFactory creates database clients for cluster operations.
-type DBClientFactory interface {
-	// NewClient creates a new database client for the given cluster.
-	NewClient(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) (db.Client, error)
-}
-
 // Server is the REST API server for the cloudberry operator.
 type Server struct {
 	k8sClient   client.Client
 	authMW      *auth.AuthMiddleware
 	rateLimiter *RateLimiter
-	dbFactory   DBClientFactory
+	dbFactory   db.DBClientFactory
 	metrics     metrics.Recorder
 	logger      *slog.Logger
 	mux         *http.ServeMux
@@ -83,7 +86,7 @@ type Server struct {
 func NewServer(
 	k8sClient client.Client,
 	authMW *auth.AuthMiddleware,
-	dbFactory DBClientFactory,
+	dbFactory db.DBClientFactory,
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 ) *Server {
@@ -103,6 +106,13 @@ func NewServer(
 
 	s.registerRoutes()
 	return s
+}
+
+// Close releases resources held by the server, including stopping the rate limiter.
+func (s *Server) Close() {
+	if s.rateLimiter != nil {
+		s.rateLimiter.Stop()
+	}
 }
 
 // Handler returns the HTTP handler for the API server.
@@ -128,6 +138,10 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleCreateCluster)))
 	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}",
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteCluster)))
+
+	// Scale status.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/scale/status",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetScaleStatus)))
 
 	// Cluster operations.
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/start",
@@ -178,6 +192,8 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStartRecovery)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/rebalance",
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleRebalance)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/rebalance/status",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetRebalanceStatus)))
 
 	// Workload management.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload",
@@ -212,6 +228,10 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteBackup)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups/{id}/restore",
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleRestoreBackup)))
+
+	// PVC listing.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/pvcs",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListPVCs)))
 
 	// Storage and recommendations.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/disk-usage",
@@ -324,10 +344,45 @@ func (s *Server) handleGetClusterStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		responseKeyName: cluster.Name,
-		"namespace":     cluster.Namespace,
-		"status":        cluster.Status,
+		responseKeyName:      cluster.Name,
+		responseKeyNamespace: cluster.Namespace,
+		"status":             cluster.Status,
 	})
+}
+
+// handleGetScaleStatus returns the current scaling state of a cluster.
+func (s *Server) handleGetScaleStatus(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	scaling := cluster.Status.Phase == "Scaling"
+	response := map[string]interface{}{
+		responseKeyName:      cluster.Name,
+		responseKeyNamespace: cluster.Namespace,
+		"scaling":            scaling,
+		"phase":              string(cluster.Status.Phase),
+		"segmentsReady":      cluster.Status.SegmentsReady,
+		"segmentsTotal":      cluster.Status.SegmentsTotal,
+	}
+
+	// Include DataRedistribution condition if present.
+	for _, cond := range cluster.Status.Conditions {
+		if cond.Type == string(cbv1alpha1.ConditionDataRedistribution) {
+			response["redistribution"] = map[string]interface{}{
+				responseKeyStatus:  string(cond.Status),
+				"reason":           cond.Reason,
+				responseKeyMessage: cond.Message,
+			}
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleCreateCluster creates a new CloudberryCluster.
@@ -708,6 +763,46 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 // handleRebalance starts a rebalance operation.
 func (s *Server) handleRebalance(w http.ResponseWriter, r *http.Request) {
 	s.setClusterAnnotation(w, r, "rebalance")
+}
+
+// handleGetRebalanceStatus returns the rebalance status for a cluster.
+func (s *Server) handleGetRebalanceStatus(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	response := map[string]interface{}{
+		responseKeyName:      cluster.Name,
+		responseKeyNamespace: cluster.Namespace,
+	}
+
+	// Include rebalance configuration if present.
+	if cluster.Spec.Segments.Rebalance != nil {
+		response["config"] = map[string]interface{}{
+			"skewThreshold": cluster.Spec.Segments.Rebalance.SkewThreshold,
+			"parallelism":   cluster.Spec.Segments.Rebalance.Parallelism,
+			"excludeTables": cluster.Spec.Segments.Rebalance.ExcludeTables,
+		}
+	}
+
+	// Include DataRedistribution condition if present.
+	for _, cond := range cluster.Status.Conditions {
+		if cond.Type == string(cbv1alpha1.ConditionDataRedistribution) {
+			response["redistribution"] = map[string]interface{}{
+				responseKeyStatus:  string(cond.Status),
+				"reason":           cond.Reason,
+				responseKeyMessage: cond.Message,
+				"lastTransition":   cond.LastTransitionTime.Time,
+			}
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleGetWorkload gets the workload management configuration.
@@ -1252,6 +1347,54 @@ func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// handleListPVCs lists all PVCs for a cluster with their sizes.
+func (s *Server) handleListPVCs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if listErr := s.k8sClient.List(r.Context(), pvcList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{util.LabelCluster: cluster.Name},
+	); listErr != nil {
+		s.logger.Error("failed to list PVCs", "cluster", name, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list PVCs")
+		return
+	}
+
+	type pvcInfo struct {
+		Name      string `json:"name"`
+		Component string `json:"component"`
+		Size      string `json:"size"`
+		Phase     string `json:"phase"`
+	}
+
+	items := make([]pvcInfo, 0, len(pvcList.Items))
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		size := ""
+		if qty, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+			size = qty.String()
+		}
+		items = append(items, pvcInfo{
+			Name:      pvc.Name,
+			Component: pvc.Labels[util.LabelComponent],
+			Size:      size,
+			Phase:     string(pvc.Status.Phase),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pvcs":           items,
+		responseKeyTotal: len(items),
+	})
+}
+
 // handleGetDiskUsage returns disk usage information for a cluster.
 func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -1446,19 +1589,23 @@ func (s *Server) getCluster(
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		slog.Error("failed to encode JSON response", "error", err)
+	}
 }
 
 // writeErrorJSON writes a JSON error response.
 func writeErrorJSON(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{
 			"code":             code,
 			responseKeyMessage: message,
 		},
-	})
+	}); err != nil {
+		slog.Error("failed to encode JSON error response", "error", err)
+	}
 }
 
 // StartServer starts the API server.
@@ -1467,6 +1614,9 @@ func StartServer(ctx context.Context, addr string, handler http.Handler, logger 
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 
 	//nolint:contextcheck,gosec // fresh ctx needed for graceful shutdown

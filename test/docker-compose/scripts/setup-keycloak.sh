@@ -409,7 +409,7 @@ main() {
     log_info "OIDC:"
     log_info "  Realm:         ${REALM}"
     log_info "  Issuer URL:    ${KEYCLOAK_ADDR}/realms/${REALM}"
-    log_info "  Gateway client: ${CLOUDBERRY_OPERATOR_CLIENT_ID} / ${CLOUDBERRY_OPERATOR_CLIENT_SECRET}"
+    log_info "  Operator client: ${CLOUDBERRY_OPERATOR_CLIENT_ID} / ${CLOUDBERRY_OPERATOR_CLIENT_SECRET}"
     log_info ""
     log_info "User authentication:"
     log_info "  Realm:         ${REALM}"

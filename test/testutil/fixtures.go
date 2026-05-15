@@ -69,6 +69,18 @@ func (b *ClusterBuilder) WithSegments(count int32) *ClusterBuilder {
 	return b
 }
 
+// WithCoordinatorStorage sets the coordinator storage size.
+func (b *ClusterBuilder) WithCoordinatorStorage(size string) *ClusterBuilder {
+	b.cluster.Spec.Coordinator.Storage.Size = size
+	return b
+}
+
+// WithSegmentStorage sets the segment storage size.
+func (b *ClusterBuilder) WithSegmentStorage(size string) *ClusterBuilder {
+	b.cluster.Spec.Segments.Storage.Size = size
+	return b
+}
+
 // WithMirroring enables or disables mirroring.
 func (b *ClusterBuilder) WithMirroring(enabled bool, layout cbv1alpha1.MirroringLayout) *ClusterBuilder {
 	b.cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
@@ -82,6 +94,18 @@ func (b *ClusterBuilder) WithMirroring(enabled bool, layout cbv1alpha1.Mirroring
 func (b *ClusterBuilder) WithStandby(enabled bool) *ClusterBuilder {
 	b.cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
 		Enabled: enabled,
+	}
+	return b
+}
+
+// WithStandbyStorage enables the standby coordinator with the given storage size.
+func (b *ClusterBuilder) WithStandbyStorage(size string) *ClusterBuilder {
+	if b.cluster.Spec.Standby == nil {
+		b.cluster.Spec.Standby = &cbv1alpha1.StandbySpec{}
+	}
+	b.cluster.Spec.Standby.Enabled = true
+	b.cluster.Spec.Standby.Storage = &cbv1alpha1.StorageSpec{
+		Size: size,
 	}
 	return b
 }
@@ -277,6 +301,16 @@ func (b *ClusterBuilder) WithRoleParameters(params map[string]map[string]string)
 		b.cluster.Spec.Config = &cbv1alpha1.ConfigSpec{}
 	}
 	b.cluster.Spec.Config.RoleParameters = params
+	return b
+}
+
+// WithRebalance configures segment rebalancing.
+func (b *ClusterBuilder) WithRebalance(skewThreshold, parallelism int32, excludeTables []string) *ClusterBuilder {
+	b.cluster.Spec.Segments.Rebalance = &cbv1alpha1.RebalanceSpec{
+		SkewThreshold: skewThreshold,
+		Parallelism:   parallelism,
+		ExcludeTables: excludeTables,
+	}
 	return b
 }
 

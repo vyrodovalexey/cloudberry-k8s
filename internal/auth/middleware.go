@@ -171,5 +171,7 @@ func writeErrorResponse(w http.ResponseWriter, status int, code, message string)
 			Message: message,
 		},
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode auth error response", "error", err)
+	}
 }

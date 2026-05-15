@@ -390,7 +390,7 @@ jobs:
             dockerfile: Dockerfile.operator
             image_env: DOCKER_IMAGE_OPERATOR
           - name: ctl
-            dockerfile: Dockerfile.operator.ctl
+            dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -569,7 +569,7 @@ jobs:
             dockerfile: Dockerfile.operator
             image_key: DOCKER_IMAGE_OPERATOR
           - name: ctl
-            dockerfile: Dockerfile.operator.ctl
+            dockerfile: Dockerfile.ctl
             image_key: DOCKER_IMAGE_CTL
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

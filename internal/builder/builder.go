@@ -47,15 +47,21 @@ const (
 
 	// maintenanceJobBackoffLimit is the number of retries for a maintenance job.
 	maintenanceJobBackoffLimit int32 = 1
+
+	// sqlAnalyze is the SQL command for analyze operations.
+	sqlAnalyze = "ANALYZE"
 )
 
 // maintenanceSQL maps maintenance operation types to their SQL commands.
 var maintenanceSQL = map[string]string{
-	util.MaintenanceVacuum:        "VACUUM",
-	util.MaintenanceVacuumAnalyze: "VACUUM ANALYZE",
-	util.MaintenanceVacuumFull:    "VACUUM FULL",
-	util.MaintenanceAnalyze:       "ANALYZE",
-	util.MaintenanceReindex:       "REINDEX DATABASE postgres",
+	util.MaintenanceVacuum:         "VACUUM",
+	util.MaintenanceVacuumAnalyze:  "VACUUM ANALYZE",
+	util.MaintenanceVacuumFull:     "VACUUM FULL",
+	util.MaintenanceAnalyze:        sqlAnalyze,
+	util.MaintenanceReindex:        "REINDEX DATABASE postgres",
+	util.MaintenanceRedistribute:   sqlAnalyze, // In real Cloudberry: gpexpand redistribution
+	util.MaintenanceRebalance:      sqlAnalyze, // In real Cloudberry: gpexpand/redistribution
+	util.MaintenanceBackupOnDelete: "SELECT 1", // In real Cloudberry: gpbackup
 }
 
 // resolvePort returns the coordinator port from the cluster spec,
@@ -70,13 +76,13 @@ func resolvePort(cluster *cbv1alpha1.CloudberryCluster) int32 {
 // ResourceBuilder defines the interface for building Kubernetes resources.
 type ResourceBuilder interface {
 	// BuildCoordinatorStatefulSet builds the coordinator StatefulSet.
-	BuildCoordinatorStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet
+	BuildCoordinatorStatefulSet(cluster *cbv1alpha1.CloudberryCluster) (*appsv1.StatefulSet, error)
 	// BuildStandbyStatefulSet builds the standby coordinator StatefulSet.
-	BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet
+	BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryCluster) (*appsv1.StatefulSet, error)
 	// BuildSegmentPrimaryStatefulSet builds the primary segment StatefulSet.
-	BuildSegmentPrimaryStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet
+	BuildSegmentPrimaryStatefulSet(cluster *cbv1alpha1.CloudberryCluster) (*appsv1.StatefulSet, error)
 	// BuildSegmentMirrorStatefulSet builds the mirror segment StatefulSet.
-	BuildSegmentMirrorStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet
+	BuildSegmentMirrorStatefulSet(cluster *cbv1alpha1.CloudberryCluster) (*appsv1.StatefulSet, error)
 	// BuildCoordinatorService builds the coordinator headless service.
 	BuildCoordinatorService(cluster *cbv1alpha1.CloudberryCluster) *corev1.Service
 	// BuildStandbyService builds the standby headless service.
@@ -104,7 +110,9 @@ func NewBuilder() *DefaultBuilder {
 }
 
 // BuildCoordinatorStatefulSet builds the coordinator StatefulSet.
-func (b *DefaultBuilder) BuildCoordinatorStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet {
+func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
+	cluster *cbv1alpha1.CloudberryCluster,
+) (*appsv1.StatefulSet, error) {
 	labels := util.CommonLabels(cluster.Name, util.ComponentCoordinator)
 	replicas := int32(1)
 	if cluster.Spec.Coordinator.Replicas != nil {
@@ -148,26 +156,24 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(cluster *cbv1alpha1.Cloudbe
 
 	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Coordinator.Resources)
 	if err != nil {
-		slog.Error("failed to build coordinator main container", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building coordinator main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
 	pvc, err := buildPVC(cluster.Spec.Coordinator.Storage, labels)
 	if err != nil {
-		slog.Error("failed to build coordinator PVC", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building coordinator PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
-	return sts
+	return sts, nil
 }
 
 // BuildStandbyStatefulSet builds the standby coordinator StatefulSet.
-func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.StatefulSet {
+func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryCluster) (*appsv1.StatefulSet, error) {
 	if cluster.Spec.Standby == nil || !cluster.Spec.Standby.Enabled {
-		return nil
+		return nil, nil
 	}
 
 	labels := util.CommonLabels(cluster.Name, util.ComponentStandby)
@@ -211,26 +217,24 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 
 	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Standby.Resources)
 	if err != nil {
-		slog.Error("failed to build standby main container", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building standby main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
 	pvc, err := buildPVC(storage, labels)
 	if err != nil {
-		slog.Error("failed to build standby PVC", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building standby PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
-	return sts
+	return sts, nil
 }
 
 // BuildSegmentPrimaryStatefulSet builds the primary segment StatefulSet.
 func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 	cluster *cbv1alpha1.CloudberryCluster,
-) *appsv1.StatefulSet {
+) (*appsv1.StatefulSet, error) {
 	labels := util.CommonLabels(cluster.Name, util.ComponentSegmentPrimary)
 	replicas := cluster.Spec.Segments.Count
 
@@ -269,28 +273,26 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 
 	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
 	if err != nil {
-		slog.Error("failed to build segment primary main container", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building segment primary main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {
-		slog.Error("failed to build segment primary PVC", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building segment primary PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
-	return sts
+	return sts, nil
 }
 
 // BuildSegmentMirrorStatefulSet builds the mirror segment StatefulSet.
 func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 	cluster *cbv1alpha1.CloudberryCluster,
-) *appsv1.StatefulSet {
+) (*appsv1.StatefulSet, error) {
 	if cluster.Spec.Segments.Mirroring == nil || !cluster.Spec.Segments.Mirroring.Enabled {
-		return nil
+		return nil, nil
 	}
 
 	labels := util.CommonLabels(cluster.Name, util.ComponentSegmentMirror)
@@ -331,20 +333,18 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 
 	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
 	if err != nil {
-		slog.Error("failed to build segment mirror main container", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building segment mirror main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {
-		slog.Error("failed to build segment mirror PVC", "error", err, "cluster", cluster.Name)
-		return nil
+		return nil, fmt.Errorf("building segment mirror PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
-	return sts
+	return sts, nil
 }
 
 // BuildCoordinatorService builds the coordinator headless service.

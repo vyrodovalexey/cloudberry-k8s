@@ -10,6 +10,7 @@ This guide covers installing the Cloudberry Operator on a Kubernetes cluster, co
   - [Webhook Certificate Configuration](#webhook-certificate-configuration)
   - [API Admin Password](#api-admin-password)
   - [Environment Variable Configuration](#environment-variable-configuration)
+  - [Monitoring Stack Setup](#monitoring-stack-setup)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
@@ -380,6 +381,40 @@ All operator settings can be configured via environment variables with the `CLOU
 | `CLOUDBERRY_TELEMETRY_OTLP_INSECURE` | `telemetry.otlp-insecure` | Disable TLS for OTLP |
 | `CLOUDBERRY_LOG_LEVEL` | `log-level` | Log level |
 | `CLOUDBERRY_NAMESPACE` | `namespace` | Namespace to watch |
+
+### Monitoring Stack Setup
+
+The project includes monitoring configurations for metrics collection and distributed tracing. Deploy these alongside the operator for full observability.
+
+#### vmagent (VictoriaMetrics Agent)
+
+vmagent collects Prometheus metrics from the operator and forwards them to a VictoriaMetrics or Prometheus-compatible backend:
+
+```bash
+# Deploy the operator with metrics enabled
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set metrics.enabled=true \
+  --set serviceMonitor.enabled=true
+```
+
+Pre-built Grafana dashboards for operator metrics are available in the `monitoring/grafana/` directory.
+
+#### OpenTelemetry Collector
+
+The otel-collector receives OTLP traces from the operator and exports them to a tracing backend (e.g., Tempo, Jaeger):
+
+```bash
+# Deploy the operator with telemetry enabled
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set telemetry.enabled=true \
+  --set telemetry.otlpEndpoint=otel-collector:4317 \
+  --set telemetry.otlpProtocol=grpc \
+  --set telemetry.otlpInsecure=true
+```
+
+For local development, the Docker Compose test environment includes VictoriaMetrics (port 8428), Grafana (port 3000), and Tempo (ports 3200/4317/4318) pre-configured for metrics and tracing.
 
 ## Upgrading
 

@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -39,6 +40,7 @@ func NewTestK8sEnv(initObjects ...client.Object) *TestK8sEnv {
 	_ = corev1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
 	_ = batchv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
 
 	// Build the fake client with status subresource for CloudberryCluster.
 	fakeClientBuilder := fake.NewClientBuilder().
@@ -479,13 +481,13 @@ func (m *MockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageRe
 	return []db.UsageReportEntry{}, nil
 }
 
-// MockDBClientFactory implements controller.DBClientFactory for testing.
+// MockDBClientFactory implements db.DBClientFactory for testing.
 type MockDBClientFactory struct {
 	Client *MockDBClient
 	Err    error
 }
 
-// NewClient implements controller.DBClientFactory.
+// NewClient implements db.DBClientFactory.
 func (f *MockDBClientFactory) NewClient(_ context.Context, _ *cbv1alpha1.CloudberryCluster) (db.Client, error) {
 	if f.Err != nil {
 		return nil, f.Err

@@ -87,8 +87,23 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - **Start modes**: normal (all components), restricted (coordinator only), maintenance (utility mode)
   - **Restart**: stop + start with phase transitions (Running → Stopping → Initializing → Running)
 - New cluster phases: `Stopped`, `Stopping`, `Restricted`, `Maintenance`
+- Scale-out with automatic data redistribution (increase `segments.count` to add segments)
+  - Pre-flight check blocks scaling when cluster is not in `Running` phase
+  - 10-minute timeout with failure detection and `status.failedSegments` reporting
+  - No automatic rollback on failure — manual intervention required
+- Scale-in with PVC policy support (decrease `segments.count` to remove segments)
+  - Scale-in by more than 50% requires `avsoft.io/confirm-scale-in=true` annotation (safety guard)
+  - Confirmation annotation automatically cleaned up after successful completion
 - Rolling upgrades with automatic rollback on failure
-- Configurable PVC retention policy on deletion
+  - Phase-by-phase upgrade: mirrors → primaries → standby → coordinator → verify
+  - 10-minute per-phase timeout with automatic rollback to previous image
+  - Upgrade state tracked via `avsoft.io/upgrade` annotation
+  - Pre-flight check blocks upgrades when cluster is not in `Running` phase
+- Online PVC storage expansion for coordinator, standby, and segments (no shrink)
+- Cluster deletion with configurable PVC policy (`Retain` or `Delete`) and event reporting
+  - Backup-on-delete: optional pre-deletion backup Job when `backupOnDelete: true`
+  - PVC events: `PVCsRetained` for Retain policy, `PVCsDeleted` for Delete policy
+  - Deletion lifecycle events: `Deleting` → `BackupOnDelete` → `PVCsRetained`/`PVCsDeleted` → `Deleted`
 
 **High Availability**
 - Segment mirroring with group and spread layouts
@@ -96,7 +111,9 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Automatic failover from primary to mirror segments
 - Coordinator standby with WAL streaming replication
 - Incremental, full, and differential segment recovery
-- Segment rebalancing after recovery
+- Manual segment rebalancing with configurable skew threshold, parallelism, and table exclusion patterns
+- Rebalance status API and CLI (`--status`, `--tables` flags)
+- Data skew coefficient metric (`cloudberry_data_skew_coefficient`)
 
 **Authentication & Authorization**
 - Dual-mode authentication: Basic + OIDC (Keycloak)
@@ -108,9 +125,23 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - HashiCorp Vault integration for secrets management
 
 **Observability**
-- Prometheus metrics for cluster health, reconciliation, FTS, and connections
+- Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, and PVC sizes
+- Reconciliation metrics: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` with cluster/namespace/result labels
 - OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters
-- Structured logging (slog) with JSON output
+- Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
+- Structured logging (slog) with JSON output including cluster, namespace, controller, and reconcileID fields
+- Structured error types with sentinel errors (`ErrNotFound`, `ErrInvalidInput`, `ErrRetryExhausted`) supporting `errors.Is()` classification
+- Retry with exponential backoff for transient failures (configurable max retries, backoff, jitter)
+- Webhook validation rejects invalid cluster specs at admission time (segments, OIDC, storage)
+- Automatic pod deletion detection and recovery with degraded state reporting
+
+**Security Hardening**
+- SQL injection prevention with parameterized queries (pgx native config builder)
+- HTTP server timeouts (ReadTimeout, WriteTimeout, IdleTimeout) to prevent resource exhaustion
+- Response body size limits in CLI client (10 MiB)
+- URL encoding for all path parameters in CLI
+- Rate limiter goroutine leak prevention with `sync.Once`-guarded shutdown
+- DB connection pool leak prevention on retry failures
 
 **Administration**
 - Configuration management with automatic hot-reload vs rolling restart detection
@@ -119,7 +150,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Rolling restart order: mirrors → primaries → standby → coordinator
   - Rolling restart state tracked via `avsoft.io/rolling-restart` annotation
 - Cluster-wide, coordinator-only, per-database, and per-role parameters
-- Maintenance operations via Kubernetes Jobs: vacuum, vacuum-analyze, vacuum-full, analyze, reindex
+- Maintenance operations via Kubernetes Jobs: vacuum, vacuum-analyze, vacuum-full, analyze, reindex, backup-on-delete
   - Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
   - `PGPASSWORD` sourced from admin password Secret
 - Session management: list active sessions from `pg_stat_activity`, cancel queries via `pg_cancel_backend()`, terminate sessions via `pg_terminate_backend()` (with PID validation and graceful degradation when DB is unavailable)
@@ -133,7 +164,9 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - `cloudberry-ctl` for imperative operations through the operator API
 - Table, JSON, and YAML output formats with deterministic column ordering
 - Shell completion for bash, zsh, and fish
-- Environment variable and config file support
+- Environment variable and config file support (priority: CLI flag > env var > config file > default)
+- Verbose mode (`-v`) for HTTP request/response debugging
+- Response body size limit (10 MiB) and URL-encoded path parameters
 - Stub commands return clear "not yet implemented" errors
 
 ## Quick Start
@@ -303,6 +336,32 @@ cloudberry-ctl cluster start --cluster my-cluster
 cloudberry-ctl cluster restart --cluster my-cluster
 ```
 
+### Scaling Operations
+
+```bash
+# Scale out by increasing segment count
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"count": 6}}}'
+
+# Scale in by decreasing segment count
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"count": 4}}}'
+
+# Scale-in >50% requires confirmation annotation
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/confirm-scale-in=true
+
+# Monitor scale progress
+cloudberry-ctl cluster scale-status --cluster my-cluster
+
+# Check for failed segments after a scale-out failure
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.failedSegments}' | jq .
+
+# Check scale events (blocked, failed, completed)
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'Scale'
+```
+
 ### Configuration Management
 
 ```bash
@@ -327,6 +386,12 @@ cloudberry-ctl ha recovery start --cluster my-cluster --type incremental
 
 # Rebalance segments
 cloudberry-ctl ha rebalance --cluster my-cluster
+
+# Rebalance specific tables
+cloudberry-ctl ha rebalance --cluster my-cluster --tables orders,customers
+
+# Check rebalance status
+cloudberry-ctl ha rebalance --cluster my-cluster --status
 
 # Check standby status
 cloudberry-ctl ha standby status --cluster my-cluster
@@ -363,9 +428,9 @@ See [docs/installation.md](docs/installation.md) for the full values reference.
 
 The `CloudberryCluster` CRD supports configuration for:
 
-- **Coordinator**: resources, storage, port, node selectors
-- **Standby**: enable/disable, resources, storage
-- **Segments**: count, primaries per host, mirroring layout, anti-affinity
+- **Coordinator**: resources, storage (with online expansion), port, node selectors
+- **Standby**: enable/disable, resources, storage (with online expansion)
+- **Segments**: count, primaries per host, mirroring layout, anti-affinity, rebalance configuration, storage (with online expansion)
 - **Authentication**: basic auth, OIDC, HBA rules, SSL/TLS
 - **Configuration**: cluster-wide, coordinator-only, per-database, per-role parameters
 - **High Availability**: FTS probe settings, checksums
@@ -481,8 +546,11 @@ make test-cover
 # Functional tests
 make test-functional
 
-# Integration tests (requires Docker)
+# Integration tests (requires Docker Compose test environment)
+make test-env-up       # Start 9 services: Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo
+make test-env-setup    # Configure services (Vault PKI, Keycloak realm, MinIO buckets, etc.)
 make test-integration
+make test-env-down     # Tear down
 
 # End-to-end tests (requires Kubernetes cluster)
 make test-e2e
@@ -500,7 +568,7 @@ bash test/scenarios/scenario7_load_data.sh
 
 Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
 
-The project targets **90%+ unit test statement coverage**. Key packages: `internal/db` at 92.9%, `internal/vault` at 99.1%. See [docs/development.md](docs/development.md) for the full development and testing guide.
+The project targets **90%+ unit test statement coverage** per package. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/db` at 93%, `internal/certmanager` at ~90%, `internal/controller` at ~83%. See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Documentation
 

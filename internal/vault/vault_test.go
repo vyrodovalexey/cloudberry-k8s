@@ -204,6 +204,11 @@ func (m *mockVaultClient) WriteSecret(_ context.Context, _ string, _ map[string]
 	return m.writeErr
 }
 
+// WriteSecretWithResponse is a mock implementation for testing.
+func (m *mockVaultClient) WriteSecretWithResponse(_ context.Context, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+	return m.readData, m.writeErr
+}
+
 func (m *mockVaultClient) IsEnabled() bool {
 	return m.enabled
 }
@@ -842,6 +847,11 @@ func (c *changingMockClient) WriteSecret(_ context.Context, _ string, _ map[stri
 	return nil
 }
 
+// WriteSecretWithResponse is a mock implementation for testing.
+func (c *changingMockClient) WriteSecretWithResponse(_ context.Context, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+	return c.readFunc()
+}
+
 func (c *changingMockClient) IsEnabled() bool {
 	return true
 }
@@ -1301,6 +1311,111 @@ func TestNewClient_KubernetesAuth_NoAuthData(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "no auth data")
+}
+
+func TestNoopClient_WriteSecretWithResponse(t *testing.T) {
+	client := &noopClient{}
+	data, err := client.WriteSecretWithResponse(context.Background(), "pki/issue/role", map[string]interface{}{
+		"common_name": "test.example.com",
+	})
+	assert.NoError(t, err)
+	assert.Nil(t, data)
+}
+
+func TestVaultClient_WriteSecretWithResponse_WithMockServer(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pki/issue/test-role", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			resp := map[string]interface{}{
+				"data": map[string]interface{}{
+					"certificate": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+					"private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----",
+					"issuing_ca":  "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.WriteSecretWithResponse(context.Background(), "pki/issue/test-role", map[string]interface{}{
+		"common_name": "test.example.com",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	assert.NotEmpty(t, data["certificate"])
+	assert.NotEmpty(t, data["private_key"])
+	assert.NotEmpty(t, data["issuing_ca"])
+}
+
+func TestVaultClient_WriteSecretWithResponse_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pki/issue/test-role", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.WriteSecretWithResponse(context.Background(), "pki/issue/test-role", map[string]interface{}{
+		"common_name": "test.example.com",
+	})
+	assert.Error(t, err)
+	assert.Nil(t, data)
+}
+
+func TestVaultClient_WriteSecretWithResponse_EmptyResponse(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pki/issue/test-role", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := Config{
+		Enabled:    true,
+		Address:    server.URL,
+		AuthMethod: "token",
+		Token:      "s.test-token",
+		RetryOpts:  util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+	}
+
+	client, err := NewClient(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	data, err := client.WriteSecretWithResponse(context.Background(), "pki/issue/test-role", map[string]interface{}{
+		"common_name": "test.example.com",
+	})
+	assert.Error(t, err)
+	assert.Nil(t, data)
+	assert.Contains(t, err.Error(), "no data returned")
 }
 
 func TestNewClient_KubernetesAuth_ServerError(t *testing.T) {

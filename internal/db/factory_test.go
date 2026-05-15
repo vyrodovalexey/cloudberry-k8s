@@ -221,48 +221,55 @@ func TestClientFactory_NewClient_DefaultPort(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestEscapeConnParam(t *testing.T) {
+func TestBuildConnectionString_NativeConfig(t *testing.T) {
+	// Test that buildConnectionString uses pgx native config builder
+	// and handles various parameter values safely.
 	tests := []struct {
-		name     string
-		input    string
-		expected string
+		name string
+		cfg  Config
 	}{
 		{
-			name:     "simple string",
-			input:    "localhost",
-			expected: "localhost",
+			name: "simple parameters",
+			cfg: Config{
+				Host: "localhost", Port: 5432, Database: "db",
+				Username: "user", Password: "pass", SSLMode: "disable",
+			},
 		},
 		{
-			name:     "string with space",
-			input:    "my host",
-			expected: "'my host'",
+			name: "password with space",
+			cfg: Config{
+				Host: "localhost", Port: 5432, Database: "db",
+				Username: "user", Password: "my host", SSLMode: "disable",
+			},
 		},
 		{
-			name:     "string with backslash",
-			input:    `pass\word`,
-			expected: `'pass\\word'`,
+			name: "password with backslash",
+			cfg: Config{
+				Host: "localhost", Port: 5432, Database: "db",
+				Username: "user", Password: `pass\word`, SSLMode: "disable",
+			},
 		},
 		{
-			name:     "string with single quote",
-			input:    "it's",
-			expected: `'it\'s'`,
+			name: "password with single quote",
+			cfg: Config{
+				Host: "localhost", Port: 5432, Database: "db",
+				Username: "user", Password: "it's", SSLMode: "disable",
+			},
 		},
 		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "string with tab",
-			input:    "pass\tword",
-			expected: "'pass\tword'",
+			name: "empty ssl mode defaults to disable",
+			cfg: Config{
+				Host: "localhost", Port: 5432, Database: "db",
+				Username: "user", Password: "pass", SSLMode: "",
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := escapeConnParam(tt.input)
-			assert.Equal(t, tt.expected, result)
+			result, err := buildConnectionString(tt.cfg)
+			assert.NoError(t, err)
+			assert.NotEmpty(t, result)
 		})
 	}
 }

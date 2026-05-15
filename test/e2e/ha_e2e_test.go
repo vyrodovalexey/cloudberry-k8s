@@ -73,7 +73,7 @@ func (s *HAE2ESuite) TestE2E_HA_MirroringLifecycle() {
 
 	haReconciler := controller.NewHAReconciler(
 		s.client, s.scheme, record.NewFakeRecorder(100),
-		healthyFactory, &metrics.NoopRecorder{}, s.logger,
+		healthyFactory, nil, &metrics.NoopRecorder{}, s.logger,
 	)
 
 	_, err = haReconciler.Reconcile(s.ctx, req)
@@ -96,7 +96,7 @@ func (s *HAE2ESuite) TestE2E_HA_MirroringLifecycle() {
 
 	haReconcilerDegraded := controller.NewHAReconciler(
 		s.client, s.scheme, record.NewFakeRecorder(100),
-		degradedFactory, &metrics.NoopRecorder{}, s.logger,
+		degradedFactory, nil, &metrics.NoopRecorder{}, s.logger,
 	)
 
 	_, err = haReconcilerDegraded.Reconcile(s.ctx, req)
@@ -173,7 +173,7 @@ func (s *HAE2ESuite) TestE2E_HA_StandbyMonitoring() {
 
 	haReconciler := controller.NewHAReconciler(
 		s.client, s.scheme, record.NewFakeRecorder(100),
-		dbFactory, &metrics.NoopRecorder{}, s.logger,
+		dbFactory, nil, &metrics.NoopRecorder{}, s.logger,
 	)
 
 	_, err = haReconciler.Reconcile(s.ctx, req)
@@ -216,7 +216,7 @@ func (s *HAE2ESuite) TestE2E_HA_StandbyActivation() {
 
 	haReconciler := controller.NewHAReconciler(
 		s.client, s.scheme, record.NewFakeRecorder(100),
-		dbFactory, &metrics.NoopRecorder{}, s.logger,
+		dbFactory, nil, &metrics.NoopRecorder{}, s.logger,
 	)
 
 	_, err = haReconciler.Reconcile(s.ctx, req)
@@ -257,7 +257,7 @@ func (s *HAE2ESuite) TestE2E_HA_RebalanceOperation() {
 
 	haReconciler := controller.NewHAReconciler(
 		s.client, s.scheme, record.NewFakeRecorder(100),
-		dbFactory, &metrics.NoopRecorder{}, s.logger,
+		dbFactory, nil, &metrics.NoopRecorder{}, s.logger,
 	)
 
 	_, err = haReconciler.Reconcile(s.ctx, req)
@@ -306,7 +306,7 @@ func (s *HAE2ESuite) TestE2E_HA_RecoveryTypes() {
 
 			haReconciler := controller.NewHAReconciler(
 				s.client, s.scheme, record.NewFakeRecorder(100),
-				dbFactory, &metrics.NoopRecorder{}, s.logger,
+				dbFactory, nil, &metrics.NoopRecorder{}, s.logger,
 			)
 
 			_, err = haReconciler.Reconcile(s.ctx, req)

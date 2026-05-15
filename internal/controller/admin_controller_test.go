@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -1161,6 +1162,523 @@ func TestAdminReconciler_ReconcileConfig_GetError(t *testing.T) {
 	err := r.reconcileConfig(context.Background(), cluster)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "getting postgresql.conf configmap")
+}
+
+// ============================================================================
+// Rolling Restart Tests
+// ============================================================================
+
+func TestAdminReconciler_ContinueRollingRestart_InvalidAnnotation(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationRollingRestart: "invalid-json",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.continueRollingRestart(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAdminReconciler_ContinueRollingRestart_PhaseComplete(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	// Create the primary STS with all replicas ready.
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 4
+
+	// Create coordinator STS with all replicas ready.
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	coordReplicas := int32(1)
+	coordSts.Spec.Replicas = &coordReplicas
+	coordSts.Status.ReadyReplicas = 1
+
+	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
+	cluster.Annotations = map[string]string{
+		util.AnnotationRollingRestart: state,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts, coordSts).
+		WithStatusSubresource(cluster, primarySts, coordSts).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.continueRollingRestart(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAdminReconciler_ContinueRollingRestart_WaitingForReady(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 2 // Not all ready.
+
+	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
+	cluster.Annotations = map[string]string{
+		util.AnnotationRollingRestart: state,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster, primarySts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.continueRollingRestart(context.Background(), cluster)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterShort, result.RequeueAfter)
+}
+
+func TestAdminReconciler_CompleteRollingRestart(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationRollingRestart: `{"phase":"completed"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	state := rollingRestartState{
+		Phase:         "completed",
+		RestartParams: []string{"max_connections"},
+	}
+	result, err := r.completeRollingRestart(context.Background(), cluster, state)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+}
+
+func TestAdminReconciler_UpdateRestartAnnotation(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	state := rollingRestartState{
+		Phase:         "coordinator",
+		RestartParams: []string{"max_connections"},
+	}
+	result, err := r.updateRestartAnnotation(context.Background(), cluster, state)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterShort, result.RequeueAfter)
+}
+
+func TestAdminReconciler_RestartStatefulSet_Success(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.restartStatefulSet(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+
+	// Verify the restart trigger annotation was set.
+	updated := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: sts.Name, Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.NotEmpty(t, updated.Spec.Template.Annotations[util.AnnotationRestartTrigger])
+}
+
+func TestAdminReconciler_RestartStatefulSet_NotFound(t *testing.T) {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.restartStatefulSet(context.Background(), "default", "nonexistent")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting statefulset")
+}
+
+func TestAdminReconciler_IsStatefulSetReady_True(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 1
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+	assert.True(t, ready)
+}
+
+func TestAdminReconciler_IsStatefulSetReady_False(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 0
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+	assert.False(t, ready)
+}
+
+func TestAdminReconciler_IsStatefulSetReady_NilReplicas(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	sts.Spec.Replicas = nil
+	sts.Status.ReadyReplicas = 1
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+	assert.True(t, ready)
+}
+
+func TestAdminReconciler_StatefulSetNameForPhase(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	tests := []struct {
+		phase    string
+		expected string
+	}{
+		{"mirrors", util.SegmentMirrorName(cluster.Name)},
+		{"primaries", util.SegmentPrimaryName(cluster.Name)},
+		{"standby", util.StandbyName(cluster.Name)},
+		{"coordinator", util.CoordinatorName(cluster.Name)},
+		{"unknown", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.phase, func(t *testing.T) {
+			name := r.statefulSetNameForPhase(cluster, tt.phase)
+			assert.Equal(t, tt.expected, name)
+		})
+	}
+}
+
+func TestAdminReconciler_StatefulSetNameForPhase_MirroringDisabled(t *testing.T) {
+	cluster := newTestCluster()
+	// No mirroring.
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	name := r.statefulSetNameForPhase(cluster, "mirrors")
+	assert.Empty(t, name)
+}
+
+func TestAdminReconciler_NextRestartPhase(t *testing.T) {
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	assert.Equal(t, "primaries", r.nextRestartPhase(cluster, "mirrors"))
+	assert.Equal(t, "standby", r.nextRestartPhase(cluster, "primaries"))
+	assert.Equal(t, "coordinator", r.nextRestartPhase(cluster, "standby"))
+	assert.Equal(t, "completed", r.nextRestartPhase(cluster, "coordinator"))
+}
+
+func TestAdminReconciler_NextRestartPhase_SkipDisabled(t *testing.T) {
+	cluster := newTestCluster()
+	// No mirroring, no standby.
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	// From mirrors (disabled), should skip to primaries.
+	assert.Equal(t, "primaries", r.nextRestartPhase(cluster, "mirrors"))
+	// From primaries, should skip standby (disabled) to coordinator.
+	assert.Equal(t, "coordinator", r.nextRestartPhase(cluster, "primaries"))
+}
+
+func TestAdminReconciler_ApplyReloadSafe(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.applyReloadSafe(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ApplyRestartRequired(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.applyRestartRequired(context.Background(), cluster, []string{"max_connections"})
+	require.NoError(t, err)
+}
+
+// ============================================================================
+// Config Classification Tests
+// ============================================================================
+
+func TestClassifyConfigChanges_RestartRequired(t *testing.T) {
+	current := map[string]string{"max_connections": "200", "work_mem": "64MB"}
+	previous := map[string]string{"max_connections": "100", "work_mem": "64MB"}
+
+	changes := classifyConfigChanges(current, previous)
+	assert.Contains(t, changes.restartNeeded, "max_connections")
+	assert.Empty(t, changes.reloadSafe)
+}
+
+func TestClassifyConfigChanges_ReloadSafe(t *testing.T) {
+	current := map[string]string{"work_mem": "128MB"}
+	previous := map[string]string{"work_mem": "64MB"}
+
+	changes := classifyConfigChanges(current, previous)
+	assert.Empty(t, changes.restartNeeded)
+	assert.Contains(t, changes.reloadSafe, "work_mem")
+}
+
+func TestClassifyConfigChanges_Mixed(t *testing.T) {
+	current := map[string]string{"max_connections": "200", "work_mem": "128MB"}
+	previous := map[string]string{"max_connections": "100", "work_mem": "64MB"}
+
+	changes := classifyConfigChanges(current, previous)
+	assert.Contains(t, changes.restartNeeded, "max_connections")
+	assert.Contains(t, changes.reloadSafe, "work_mem")
+}
+
+func TestClassifyConfigChanges_RemovedParam(t *testing.T) {
+	current := map[string]string{}
+	previous := map[string]string{"max_connections": "100", "work_mem": "64MB"}
+
+	changes := classifyConfigChanges(current, previous)
+	assert.Contains(t, changes.restartNeeded, "max_connections")
+	assert.Contains(t, changes.reloadSafe, "work_mem")
+}
+
+func TestAdminReconciler_HandleMaintenance_UnknownType(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Annotations = map[string]string{
+		util.AnnotationMaintenance: "unknown-type",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.handleMaintenance(context.Background(), cluster, "unknown-type")
+	require.NoError(t, err)
+	assert.False(t, result.Requeue)
+}
+
+func TestAdminReconciler_Reconcile_WithRollingRestartAnnotation(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(4)
+	primarySts.Spec.Replicas = &replicas
+	primarySts.Status.ReadyReplicas = 4
+
+	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	coordReplicas := int32(1)
+	coordSts.Spec.Replicas = &coordReplicas
+	coordSts.Status.ReadyReplicas = 1
+
+	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
+	cluster.Annotations = map[string]string{
+		util.AnnotationRollingRestart: state,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts, coordSts).
+		WithStatusSubresource(cluster, primarySts, coordSts).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestAdminReconciler_ReconcileSubComponents_AllEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{Enabled: true}
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:     true,
+		Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "b"},
+	}
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{DiskMonitoring: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(30)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	// Should not panic.
+	r.reconcileSubComponents(context.Background(), r.logger, cluster)
 }
 
 func TestAdminReconciler_Reconcile_GetError(t *testing.T) {

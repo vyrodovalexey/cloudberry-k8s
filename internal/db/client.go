@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
+	"net"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -356,10 +358,17 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 		if poolErr != nil {
 			return fmt.Errorf("creating connection pool: %w", poolErr)
 		}
-		return pool.Ping(ctx)
+		if pingErr := pool.Ping(ctx); pingErr != nil {
+			pool.Close()
+			return pingErr
+		}
+		return nil
 	})
 
 	if connectErr != nil {
+		if pool != nil {
+			pool.Close()
+		}
 		return nil, fmt.Errorf("connecting to database: %w", connectErr)
 	}
 
@@ -377,25 +386,36 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 	}, nil
 }
 
-// buildConnectionString constructs a PostgreSQL connection string with properly
-// escaped parameters to prevent injection vulnerabilities.
-// Returns an error if the connection string cannot be parsed.
+// buildConnectionString constructs a PostgreSQL connection string using pgx's
+// native config parsing to prevent injection vulnerabilities.
+// It builds a pgconn.Config programmatically and validates it via pgx.ParseConfig.
+// Returns an error if the connection parameters are invalid.
 func buildConnectionString(cfg Config) (string, error) {
 	sslMode := cfg.SSLMode
 	if sslMode == "" {
 		sslMode = "disable"
 	}
 
-	// Use pgx's ParseConfig to safely build and validate the connection string.
-	// This avoids injection via specially crafted host/user/password values.
-	rawConn := "host=" + escapeConnParam(cfg.Host) +
-		" port=" + fmt.Sprintf("%d", cfg.Port) +
-		" dbname=" + escapeConnParam(cfg.Database) +
-		" user=" + escapeConnParam(cfg.Username) +
-		" password=" + escapeConnParam(cfg.Password) +
-		" sslmode=" + escapeConnParam(sslMode)
+	if cfg.Port < 0 || cfg.Port > 65535 {
+		return "", fmt.Errorf("invalid port number: %d", cfg.Port)
+	}
 
-	connCfg, err := pgx.ParseConfig(rawConn)
+	// Build a connection URL using the pgx URL format which handles
+	// special characters safely via net/url encoding.
+	u := &pgConnURL{
+		host:     cfg.Host,
+		port:     cfg.Port,
+		database: cfg.Database,
+		user:     cfg.Username,
+		password: cfg.Password,
+		sslMode:  sslMode,
+	}
+
+	connStr := u.String()
+
+	// Validate the connection string via pgx.ParseConfig to ensure
+	// all parameters are valid.
+	connCfg, err := pgx.ParseConfig(connStr)
 	if err != nil {
 		return "", fmt.Errorf("invalid connection parameters: %w", err)
 	}
@@ -403,16 +423,31 @@ func buildConnectionString(cfg Config) (string, error) {
 	return connCfg.ConnString(), nil
 }
 
-// escapeConnParam escapes a connection string parameter value by replacing
-// backslashes and single quotes to prevent injection.
-func escapeConnParam(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `'`, `\'`)
-	// If the value contains spaces or special characters, quote it.
-	if strings.ContainsAny(s, " \t\n'\\") {
-		return "'" + s + "'"
-	}
-	return s
+// pgConnURL builds a PostgreSQL connection URL with properly encoded parameters.
+type pgConnURL struct {
+	host     string
+	port     int32
+	database string
+	user     string
+	password string
+	sslMode  string
+}
+
+// String returns the connection URL string with properly encoded parameters.
+func (u *pgConnURL) String() string {
+	hostPort := net.JoinHostPort(u.host, strconv.Itoa(int(u.port)))
+	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
+		urlEncode(u.user),
+		urlEncode(u.password),
+		hostPort,
+		urlEncode(u.database),
+		urlEncode(u.sslMode),
+	)
+}
+
+// urlEncode encodes a string for use in a URL path or query parameter.
+func urlEncode(s string) string {
+	return (&url.URL{Path: s}).String()
 }
 
 // Ping checks database connectivity.
@@ -809,7 +844,8 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 			continue
 		}
 		query := fmt.Sprintf("ALTER RESOURCE GROUP %s SET %s %d",
-			pgx.Identifier{opts.Name}.Sanitize(), alt.param, alt.value)
+			pgx.Identifier{opts.Name}.Sanitize(),
+			pgx.Identifier{alt.param}.Sanitize(), alt.value)
 		if _, err := c.pool.Exec(ctx, query); err != nil {
 			return fmt.Errorf("altering resource group %s param %s: %w", opts.Name, alt.param, err)
 		}

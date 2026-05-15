@@ -11,6 +11,8 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
   - [Cluster Management](#cluster-management)
   - [Cluster Operations](#cluster-operations)
   - [Configuration](#configuration)
+  - [Storage](#storage)
+  - [Scale Status](#scale-status)
   - [High Availability](#high-availability)
   - [Sessions](#sessions)
   - [Resource Groups](#resource-groups)
@@ -20,7 +22,9 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
 - [Error Handling](#error-handling)
 - [Pagination](#pagination)
 - [Rate Limiting](#rate-limiting)
+- [HTTP Server Timeouts](#http-server-timeouts)
 - [Request Body Limits](#request-body-limits)
+- [Response Body Limits (CLI)](#response-body-limits-cli)
 - [Input Validation](#input-validation)
 - [Annotations Reference](#annotations-reference)
   - [Action Annotations](#action-annotations-avsoftioaction)
@@ -341,6 +345,248 @@ curl -u admin:password -X PUT \
   }'
 ```
 
+### Storage
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/storage/pvcs` | Basic | List all PVCs for a cluster with sizes |
+
+#### List Cluster PVCs
+
+Returns all PersistentVolumeClaims associated with a cluster, including their current sizes, component labels, and binding status.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/pvcs?namespace=cloudberry-test"
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | No | Kubernetes namespace (defaults to operator's configured namespace) |
+
+**Response (200 OK):**
+
+```json
+{
+  "pvcs": [
+    {
+      "name": "data-my-cluster-coordinator-0",
+      "component": "coordinator",
+      "size": "10Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-standby-0",
+      "component": "standby",
+      "size": "5Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-segment-primary-0",
+      "component": "segment-primary",
+      "size": "20Gi",
+      "phase": "Bound"
+    },
+    {
+      "name": "data-my-cluster-segment-mirror-0",
+      "component": "segment-mirror",
+      "size": "20Gi",
+      "phase": "Bound"
+    }
+  ],
+  "total": 4
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pvcs` | array | List of PVC objects |
+| `pvcs[].name` | string | PVC name (e.g., `data-my-cluster-coordinator-0`) |
+| `pvcs[].component` | string | Component label (`coordinator`, `standby`, `segment-primary`, `segment-mirror`) |
+| `pvcs[].size` | string | Requested storage size (e.g., `10Gi`) |
+| `pvcs[].phase` | string | PVC binding phase (`Bound`, `Pending`, `Lost`) |
+| `total` | int | Total number of PVCs |
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (500 Internal Server Error — list failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to list PVCs"
+  }
+}
+```
+
+### Scale Status
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/scale/status` | Basic | Get scale operation status |
+
+#### Get Scale Status
+
+Returns the current scaling state of a cluster, including whether a scale-out or scale-in is in progress, segment readiness, and data redistribution status.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/scale/status?namespace=cloudberry-test"
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | No | Kubernetes namespace (defaults to operator's configured namespace) |
+
+**Response (200 OK — scaling in progress):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": true,
+  "phase": "Scaling",
+  "segmentsReady": 4,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "InProgress",
+    "message": "Data redistribution in progress"
+  }
+}
+```
+
+**Response (200 OK — scaling completed):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": false,
+  "phase": "Running",
+  "segmentsReady": 6,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "Completed",
+    "message": "Data redistribution completed"
+  }
+}
+```
+
+**Response (200 OK — scale-in in progress):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": true,
+  "phase": "Scaling",
+  "segmentsReady": 6,
+  "segmentsTotal": 4,
+  "redistribution": {
+    "status": "True",
+    "reason": "InProgress",
+    "message": "Data redistribution in progress for scale-in"
+  }
+}
+```
+
+**Response (200 OK — scale-out failed):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": true,
+  "phase": "Scaling",
+  "segmentsReady": 4,
+  "segmentsTotal": 6,
+  "redistribution": {
+    "status": "True",
+    "reason": "SegmentsNotReady",
+    "message": "Scale-out failed: 2 segments not ready after 10m0s"
+  },
+  "failedSegments": [
+    {
+      "contentID": 4,
+      "hostname": "my-cluster-segment-primary-4",
+      "role": "primary",
+      "status": "NotReady"
+    },
+    {
+      "contentID": 5,
+      "hostname": "my-cluster-segment-primary-5",
+      "role": "primary",
+      "status": "NotReady"
+    }
+  ],
+  "conditions": [
+    {
+      "type": "ScaleOutFailed",
+      "status": "True",
+      "reason": "SegmentsNotReady",
+      "message": "Scale-out failed: 2 segments not ready after 10m0s"
+    }
+  ]
+}
+```
+
+**Response (200 OK — no scaling activity):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "scaling": false,
+  "phase": "Running",
+  "segmentsReady": 4,
+  "segmentsTotal": 4
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Cluster name |
+| `namespace` | string | Cluster namespace |
+| `scaling` | bool | `true` if the cluster is currently in the `Scaling` phase |
+| `phase` | string | Current cluster phase (`Running`, `Scaling`, etc.) |
+| `segmentsReady` | int | Number of segment pods that are ready |
+| `segmentsTotal` | int | Total desired segment count |
+| `redistribution` | object | Present only when a `DataRedistribution` condition exists |
+| `redistribution.status` | string | Condition status (`True` or `False`) |
+| `redistribution.reason` | string | Condition reason (`ScaleOutStarted`, `ScaleInStarted`, `InProgress`, `Completed`, `SegmentsNotReady`) |
+| `redistribution.message` | string | Human-readable description |
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
 ### High Availability
 
 | Method | Path | Permission | Description |
@@ -350,6 +596,7 @@ curl -u admin:password -X PUT \
 | `GET` | `/clusters/{name}/mirroring` | Basic | Get mirroring status |
 | `POST` | `/clusters/{name}/recovery` | Operator | Start recovery |
 | `POST` | `/clusters/{name}/rebalance` | Operator | Rebalance segments |
+| `GET` | `/clusters/{name}/rebalance/status` | Basic | Get rebalance status |
 | `GET` | `/clusters/{name}/standby` | Basic | Get standby status |
 | `POST` | `/clusters/{name}/standby/activate` | Admin | Activate standby |
 | `POST` | `/clusters/{name}/standby/reinitialize` | Operator | Reinitialize standby |
@@ -391,6 +638,97 @@ curl -u admin:password -X POST \
 {
   "status": "recovery started",
   "type": "incremental"
+}
+```
+
+#### Rebalance Status
+
+Returns the current rebalance configuration and status for a cluster, including the `DataRedistribution` condition.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/rebalance/status?namespace=cloudberry-test"
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | No | Kubernetes namespace (defaults to operator's configured namespace) |
+
+**Response (200 OK — rebalance configured, completed):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "config": {
+    "skewThreshold": 10,
+    "parallelism": 2,
+    "excludeTables": ["audit_log", "temp_*"]
+  },
+  "redistribution": {
+    "status": "True",
+    "reason": "RebalanceCompleted",
+    "message": "Rebalance completed successfully",
+    "lastTransition": "2026-05-14T10:05:00Z"
+  }
+}
+```
+
+**Response (200 OK — rebalance in progress):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test",
+  "config": {
+    "skewThreshold": 10,
+    "parallelism": 2,
+    "excludeTables": ["audit_log", "temp_*"]
+  },
+  "redistribution": {
+    "status": "True",
+    "reason": "RebalanceStarted",
+    "message": "Rebalance started: threshold=10%, parallelism=2, excluded=[audit_log temp_*]",
+    "lastTransition": "2026-05-14T10:00:00Z"
+  }
+}
+```
+
+**Response (200 OK — no rebalance configuration):**
+
+```json
+{
+  "name": "my-cluster",
+  "namespace": "cloudberry-test"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Cluster name |
+| `namespace` | string | Cluster namespace |
+| `config` | object | Present only when `spec.segments.rebalance` is configured |
+| `config.skewThreshold` | int | Percentage skew threshold |
+| `config.parallelism` | int | Number of concurrent table redistributions |
+| `config.excludeTables` | string[] | Tables excluded from rebalance (supports glob patterns) |
+| `redistribution` | object | Present only when a `DataRedistribution` condition exists |
+| `redistribution.status` | string | Condition status (`True` or `False`) |
+| `redistribution.reason` | string | Condition reason (`RebalanceStarted`, `RebalanceCompleted`) |
+| `redistribution.message` | string | Human-readable description |
+| `redistribution.lastTransition` | string | ISO 8601 timestamp of the last condition transition |
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
 }
 ```
 
@@ -1105,9 +1443,23 @@ Retry-After: 7
 
 The `Retry-After` value is calculated from the token refill rate. Clients should wait at least this many seconds before retrying.
 
+## HTTP Server Timeouts
+
+The API server enforces the following timeouts to prevent resource exhaustion from slow or malicious clients:
+
+| Timeout | Value | Description |
+|---------|-------|-------------|
+| `ReadTimeout` | 30s | Maximum duration for reading the entire request, including the body |
+| `WriteTimeout` | 60s | Maximum duration before timing out writes of the response |
+| `IdleTimeout` | 120s | Maximum time to wait for the next request when keep-alives are enabled |
+
 ## Request Body Limits
 
 All endpoints that accept a request body enforce a maximum body size of **1 MiB** (1,048,576 bytes). Requests exceeding this limit receive a `400 Bad Request` response.
+
+## Response Body Limits (CLI)
+
+The `cloudberry-ctl` CLI enforces a maximum response body size of **10 MiB** (10,485,760 bytes) when reading API responses. This prevents the CLI from consuming excessive memory if the server returns an unexpectedly large response. Responses exceeding this limit are truncated.
 
 ## Input Validation
 
@@ -1138,7 +1490,7 @@ Set this annotation to trigger lifecycle operations. The operator processes and 
 | `stop-fast` | Fast stop — rollback active transactions | `Stopped` |
 | `stop-immediate` | Immediate stop — abort all connections | `Stopped` |
 | `restart` | Stop then start all components | `Running` |
-| `rebalance` | Rebalance segment roles after recovery | `Running` |
+| `rebalance` | Rebalance segment data distribution | `Running` |
 | `activate-standby` | Promote standby to coordinator | `Running` |
 
 ### Maintenance Annotations (`avsoft.io/maintenance`)
@@ -1152,6 +1504,7 @@ Set this annotation to trigger maintenance operations. The operator creates a Ku
 | `vacuum-full` | Full vacuum (exclusive lock) | `VACUUM FULL` |
 | `analyze` | Refresh planner statistics | `ANALYZE` |
 | `reindex` | Rebuild indexes | `REINDEX DATABASE` |
+| `rebalance` | Segment data rebalance | `ANALYZE` (maps to `gpexpand` in production) |
 
 ### Rolling Restart Annotation (`avsoft.io/rolling-restart`)
 
@@ -1171,6 +1524,30 @@ This annotation is managed by the operator to track rolling restart progress. It
 | `startedAt` | string | ISO 8601 timestamp when the rolling restart started |
 | `restartParams` | string[] | List of parameter names that triggered the restart |
 
+### Upgrade Annotation (`avsoft.io/upgrade`)
+
+This annotation is managed by the operator to track in-progress cluster upgrade state. It contains a JSON payload:
+
+```json
+{
+  "previousImage": "postgres:16",
+  "previousVersion": "7.1.0",
+  "phase": "primaries",
+  "startedAt": "2026-05-15T10:00:00Z",
+  "phaseStartedAt": "2026-05-15T10:01:00Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `previousImage` | string | Container image before the upgrade (used for rollback) |
+| `previousVersion` | string | `status.clusterVersion` before the upgrade (used for rollback) |
+| `phase` | string | Current upgrade phase: `mirrors`, `primaries`, `standby`, `coordinator`, `verify` |
+| `startedAt` | string | ISO 8601 / RFC 3339 timestamp when the upgrade was initiated |
+| `phaseStartedAt` | string | ISO 8601 / RFC 3339 timestamp when the current phase started. Reset on each phase transition. Used for 10-minute per-phase timeout detection |
+
+The annotation is set when an upgrade begins and removed when the upgrade completes (success or rollback). The presence of this annotation indicates an upgrade is in progress.
+
 ### Other Annotations
 
 | Annotation | Description |
@@ -1179,6 +1556,9 @@ This annotation is managed by the operator to track rolling restart progress. It
 | `avsoft.io/restart-trigger` | Triggers a pod restart when changed |
 | `avsoft.io/restart-pending` | Indicates a full cluster restart is in progress |
 | `avsoft.io/recovery` | Triggers recovery operations (`incremental`, `full`, `differential`) |
+| `avsoft.io/confirm-scale-in` | Set to `"true"` to confirm a scale-in of more than 50% of segments |
+| `avsoft.io/scale-started` | Managed by operator — RFC 3339 timestamp tracking when a scale operation started. Used for timeout detection (10 minutes). Removed on success or failure |
+| `avsoft.io/upgrade` | Managed by operator — JSON state tracking an in-progress cluster upgrade. Contains previousImage, previousVersion, phase, startedAt, and phaseStartedAt. Used for phase-by-phase upgrade progression and rollback. Removed on success or rollback |
 
 ### Status Phases
 

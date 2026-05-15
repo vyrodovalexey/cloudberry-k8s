@@ -29,6 +29,12 @@ type Client interface {
 	ReadSecret(ctx context.Context, path string) (map[string]interface{}, error)
 	// WriteSecret writes a secret to Vault KV v2.
 	WriteSecret(ctx context.Context, path string, data map[string]interface{}) error
+	// WriteSecretWithResponse writes data to a Vault path and returns the response data.
+	// This is used for operations like PKI certificate issuance that require a POST
+	// and return response data.
+	WriteSecretWithResponse(
+		ctx context.Context, path string, data map[string]interface{},
+	) (map[string]interface{}, error)
 	// IsEnabled returns whether Vault integration is active.
 	IsEnabled() bool
 }
@@ -252,6 +258,34 @@ func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[str
 	return nil
 }
 
+// WriteSecretWithResponse writes data to a Vault path and returns the response data.
+// This is used for operations like PKI certificate issuance that require a POST
+// and return response data.
+func (v *vaultClient) WriteSecretWithResponse(
+	ctx context.Context, path string, data map[string]interface{},
+) (map[string]interface{}, error) {
+	var result map[string]interface{}
+
+	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
+		secret, writeErr := v.client.Logical().WriteWithContext(ctx, path, data)
+		if writeErr != nil {
+			return fmt.Errorf("writing to %s: %w", path, writeErr)
+		}
+		if secret == nil || secret.Data == nil {
+			return fmt.Errorf("no data returned from %s", path)
+		}
+		result = secret.Data
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	v.logger.Debug("wrote to vault with response", "path", path)
+	return result, nil
+}
+
 // IsEnabled returns whether Vault integration is active.
 func (v *vaultClient) IsEnabled() bool {
 	return true
@@ -268,6 +302,13 @@ func (n *noopClient) ReadSecret(_ context.Context, _ string) (map[string]interfa
 // WriteSecret is a no-op when Vault is disabled.
 func (n *noopClient) WriteSecret(_ context.Context, _ string, _ map[string]interface{}) error {
 	return nil
+}
+
+// WriteSecretWithResponse is a no-op when Vault is disabled.
+func (n *noopClient) WriteSecretWithResponse(
+	_ context.Context, _ string, _ map[string]interface{},
+) (map[string]interface{}, error) {
+	return nil, nil
 }
 
 // IsEnabled returns false for the no-op client.

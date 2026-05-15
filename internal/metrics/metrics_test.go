@@ -249,6 +249,7 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetRecommendationsTotal("c", "n", "bloat", 3)
 	recorder.ObserveRecommendationScanDuration("c", "n", time.Second)
 	recorder.SetTableBloatRatio("c", "n", "public.t", 0.1)
+	recorder.SetPVCSizeBytes("c", "n", "coordinator", 10737418240)
 }
 
 func TestRecordBackup(t *testing.T) {
@@ -313,6 +314,212 @@ func TestSetTableBloatRatio(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
 	recorder.SetTableBloatRatio("test", "default", "public.orders", 0.25)
+}
+
+func TestSetPVCSizeBytes(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetPVCSizeBytes("test", "default", "coordinator", 10737418240)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_pvc_size_bytes" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_pvc_size_bytes metric should be registered")
+}
+
+func TestSetActiveQueries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetActiveQueries("test", "default", 15)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_active_queries" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 15.0, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_active_queries metric should be registered")
+}
+
+func TestSetQueuedQueries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetQueuedQueries("test", "default", 5)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_queued_queries" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 5.0, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_queued_queries metric should be registered")
+}
+
+func TestSetBlockedQueries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetBlockedQueries("test", "default", 3)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_blocked_queries" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 3.0, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_blocked_queries metric should be registered")
+}
+
+func TestRecordWorkloadRuleAction(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordWorkloadRuleAction("test", "default", "cancel-long", "cancel")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_workload_rule_actions_total" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_workload_rule_actions_total metric should be registered")
+}
+
+func TestSetResourceGroupUsage(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetResourceGroupUsage("test", "default", "analytics", 45.5, 60.2)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	cpuFound := false
+	memFound := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_resource_group_cpu_usage" {
+			cpuFound = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 45.5, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+		}
+		if f.GetName() == "cloudberry_resource_group_memory_usage" {
+			memFound = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 60.2, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+		}
+	}
+	assert.True(t, cpuFound, "cloudberry_resource_group_cpu_usage metric should be registered")
+	assert.True(t, memFound, "cloudberry_resource_group_memory_usage metric should be registered")
+}
+
+func TestRecordIdleSessionTermination(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordIdleSessionTermination("test", "default", "idle-30m")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_idle_session_terminations_total" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_idle_session_terminations_total metric should be registered")
+}
+
+func TestRecordSlowQuery(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordSlowQuery("test", "default")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_slow_queries_total" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_slow_queries_total metric should be registered")
+}
+
+func TestRecordScaleOperation(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordScaleOperation("test", "default", "scale-out")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_scale_operations_total" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_scale_operations_total metric should be registered")
+}
+
+func TestSetRedistributionProgress(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetRedistributionProgress("test", "default", 0.75)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_redistribution_progress" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 0.75, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_redistribution_progress metric should be registered")
+}
+
+func TestSetDataSkewCoefficient(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetDataSkewCoefficient("test", "default", 0.15)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_data_skew_coefficient" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 0.15, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_data_skew_coefficient metric should be registered")
 }
 
 func TestNoopRecorder_ImplementsInterface(t *testing.T) {

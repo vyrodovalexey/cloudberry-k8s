@@ -108,18 +108,30 @@ const (
 type AuthMethod string
 
 const (
-	AuthMethodTrust       AuthMethod = "trust"
-	AuthMethodReject      AuthMethod = "reject"
-	AuthMethodMD5         AuthMethod = "md5"
+	// AuthMethodTrust allows connections without authentication.
+	AuthMethodTrust AuthMethod = "trust"
+	// AuthMethodReject rejects all connections unconditionally.
+	AuthMethodReject AuthMethod = "reject"
+	// AuthMethodMD5 uses MD5-hashed password authentication.
+	AuthMethodMD5 AuthMethod = "md5"
+	// AuthMethodScramSHA256 uses SCRAM-SHA-256 password authentication.
 	AuthMethodScramSHA256 AuthMethod = "scram-sha-256"
-	AuthMethodPassword    AuthMethod = "password"
-	AuthMethodIdent       AuthMethod = "ident"
-	AuthMethodPeer        AuthMethod = "peer"
-	AuthMethodGSS         AuthMethod = "gss"
-	AuthMethodLDAP        AuthMethod = "ldap"
-	AuthMethodCert        AuthMethod = "cert"
-	AuthMethodPAM         AuthMethod = "pam"
-	AuthMethodRadius      AuthMethod = "radius"
+	// AuthMethodPassword uses plain-text password authentication.
+	AuthMethodPassword AuthMethod = "password"
+	// AuthMethodIdent uses ident server-based authentication.
+	AuthMethodIdent AuthMethod = "ident"
+	// AuthMethodPeer uses peer OS user name-based authentication.
+	AuthMethodPeer AuthMethod = "peer"
+	// AuthMethodGSS uses GSSAPI/Kerberos authentication.
+	AuthMethodGSS AuthMethod = "gss"
+	// AuthMethodLDAP uses LDAP directory-based authentication.
+	AuthMethodLDAP AuthMethod = "ldap"
+	// AuthMethodCert uses SSL client certificate authentication.
+	AuthMethodCert AuthMethod = "cert"
+	// AuthMethodPAM uses PAM (Pluggable Authentication Modules) authentication.
+	AuthMethodPAM AuthMethod = "pam"
+	// AuthMethodRadius uses RADIUS server-based authentication.
+	AuthMethodRadius AuthMethod = "radius"
 )
 
 // VaultAuthMethod represents the Vault authentication method.
@@ -196,6 +208,62 @@ const (
 	ConditionDataLoadingConfigured ConditionType = "DataLoadingConfigured"
 	// ConditionStorageConfigured indicates storage management is configured.
 	ConditionStorageConfigured ConditionType = "StorageConfigured"
+	// ConditionDataRedistribution indicates data redistribution status during scaling.
+	ConditionDataRedistribution ConditionType = "DataRedistribution"
+	// ConditionScaleOutFailed indicates a scale-out operation has failed.
+	ConditionScaleOutFailed ConditionType = "ScaleOutFailed"
+	// ConditionUpgradeCompleted indicates a cluster upgrade has completed successfully.
+	ConditionUpgradeCompleted ConditionType = "UpgradeCompleted"
+	// ConditionUpgradeFailed indicates a cluster upgrade has failed and was rolled back.
+	ConditionUpgradeFailed ConditionType = "UpgradeFailed"
+	// ConditionStorageExpanded indicates PVC storage has been expanded.
+	ConditionStorageExpanded ConditionType = "StorageExpanded"
+)
+
+// Event reason constants for use in recorder.Event() calls.
+const (
+	// EventReasonScaleOutStarted indicates a scale-out operation has started.
+	EventReasonScaleOutStarted = "ScaleOutStarted"
+	// EventReasonScaleOutCompleted indicates a scale-out operation has completed.
+	EventReasonScaleOutCompleted = "ScaleOutCompleted"
+	// EventReasonScaleOutFailed indicates a scale-out operation has failed.
+	EventReasonScaleOutFailed = "ScaleOutFailed"
+	// EventReasonScaleInStarted indicates a scale-in operation has started.
+	EventReasonScaleInStarted = "ScaleInStarted"
+	// EventReasonScaleInCompleted indicates a scale-in operation has completed.
+	EventReasonScaleInCompleted = "ScaleInCompleted"
+	// EventReasonUpgradeStarted indicates a cluster upgrade has started.
+	EventReasonUpgradeStarted = "UpgradeStarted"
+	// EventReasonUpgradeCompleted indicates a cluster upgrade has completed.
+	EventReasonUpgradeCompleted = "UpgradeCompleted"
+	// EventReasonUpgradeRollback indicates a cluster upgrade has been rolled back.
+	EventReasonUpgradeRollback = "UpgradeRollback"
+	// EventReasonRebalanceStarted indicates a segment rebalance has started.
+	EventReasonRebalanceStarted = "RebalanceStarted"
+	// EventReasonRebalanceCompleted indicates a segment rebalance has completed.
+	EventReasonRebalanceCompleted = "RebalanceCompleted"
+	// EventReasonStorageExpanded indicates PVC storage has been expanded.
+	EventReasonStorageExpanded = "StorageExpanded"
+	// EventReasonWorkloadReconciled indicates workload management has been reconciled.
+	EventReasonWorkloadReconciled = "WorkloadReconciled"
+	// EventReasonQueryMonitoringReconciled indicates query monitoring has been reconciled.
+	EventReasonQueryMonitoringReconciled = "QueryMonitoringReconciled"
+	// EventReasonBackupReconciled indicates backup configuration has been reconciled.
+	EventReasonBackupReconciled = "BackupReconciled"
+	// EventReasonDataLoadingReconciled indicates data loading has been reconciled.
+	EventReasonDataLoadingReconciled = "DataLoadingReconciled"
+	// EventReasonStorageReconciled indicates storage management has been reconciled.
+	EventReasonStorageReconciled = "StorageReconciled"
+	// EventReasonConfigReloaded indicates configuration has been reloaded.
+	EventReasonConfigReloaded = "ConfigReloaded"
+	// EventReasonRollingRestartStarted indicates a rolling restart has started.
+	EventReasonRollingRestartStarted = "RollingRestartStarted"
+	// EventReasonRollingRestartCompleted indicates a rolling restart has completed.
+	EventReasonRollingRestartCompleted = "RollingRestartCompleted"
+	// EventReasonMaintenanceStarted indicates a maintenance operation has started.
+	EventReasonMaintenanceStarted = "MaintenanceStarted"
+	// EventReasonMaintenanceUnknown indicates an unknown maintenance operation was requested.
+	EventReasonMaintenanceUnknown = "MaintenanceUnknown"
 )
 
 // +kubebuilder:object:root=true
@@ -384,6 +452,10 @@ type SegmentsSpec struct {
 	// +optional
 	Mirroring *MirroringSpec `json:"mirroring,omitempty"`
 
+	// Rebalance defines segment rebalancing configuration.
+	// +optional
+	Rebalance *RebalanceSpec `json:"rebalance,omitempty"`
+
 	// Resources defines compute resource requirements.
 	// +optional
 	Resources *ResourceRequirements `json:"resources,omitempty"`
@@ -404,6 +476,23 @@ type SegmentsSpec struct {
 	// +kubebuilder:default="preferred"
 	// +optional
 	AntiAffinity AntiAffinityType `json:"antiAffinity,omitempty"`
+}
+
+// RebalanceSpec defines segment rebalancing configuration.
+type RebalanceSpec struct {
+	// SkewThreshold is the percentage skew threshold to trigger rebalance.
+	// +kubebuilder:default=10
+	// +optional
+	SkewThreshold int32 `json:"skewThreshold,omitempty"`
+
+	// Parallelism is the number of tables to redistribute concurrently.
+	// +kubebuilder:default=2
+	// +optional
+	Parallelism int32 `json:"parallelism,omitempty"`
+
+	// ExcludeTables lists tables to skip during rebalance (supports glob patterns).
+	// +optional
+	ExcludeTables []string `json:"excludeTables,omitempty"`
 }
 
 // MirroringSpec defines segment mirroring configuration.

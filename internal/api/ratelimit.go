@@ -35,6 +35,7 @@ type RateLimiter struct {
 	interval       time.Duration
 	logger         *slog.Logger
 	stopCh         chan struct{}
+	stopOnce       sync.Once
 	trustedProxies []net.IPNet
 }
 
@@ -91,8 +92,11 @@ func WithTrustedProxies(cidrs []string) RateLimiterOption {
 
 // Stop stops the background cleanup goroutine. It should be called when the
 // RateLimiter is no longer needed to prevent goroutine leaks.
+// Stop is safe to call multiple times.
 func (rl *RateLimiter) Stop() {
-	close(rl.stopCh)
+	rl.stopOnce.Do(func() {
+		close(rl.stopCh)
+	})
 }
 
 // Allow checks whether a request from the given IP is allowed.

@@ -59,7 +59,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_SkipsNonRunningCluster() 
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -90,7 +90,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RunsFTSProbe_AllHealthy()
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -127,7 +127,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RunsFTSProbe_DegradedSegm
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -163,7 +163,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_FTSProbeFailure() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act - should not return error, just log it
@@ -189,7 +189,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_DBClientCreationFailure()
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act - should not return error, just log it
@@ -219,7 +219,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_StandbyMonitoring() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -244,7 +244,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RecoveryAnnotation() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -274,7 +274,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_RebalanceAction() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -305,7 +305,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_ActivateStandby() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -329,7 +329,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_ProbeInterval() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act
@@ -349,7 +349,7 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_ClusterNotFound() {
 
 	reconciler := controller.NewHAReconciler(
 		s.env.Client, s.env.Scheme, s.env.Recorder,
-		dbFactory, s.env.Metrics, s.env.Logger,
+		dbFactory, s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
 	// Act

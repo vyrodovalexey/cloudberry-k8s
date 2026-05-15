@@ -147,7 +147,7 @@ func (m *scenario6MockDBClient) GetUsageReport(_ context.Context, _ string) ([]d
 	return nil, nil
 }
 
-// scenario6MockDBFactory implements api.DBClientFactory for testing.
+// scenario6MockDBFactory implements db.DBClientFactory for testing.
 type scenario6MockDBFactory struct {
 	client db.Client
 	err    error
@@ -187,7 +187,7 @@ func newScenario6Cluster() *cbv1alpha1.CloudberryCluster {
 }
 
 // newScenario6Server creates an API server with a mock DB factory for testing.
-func newScenario6Server(cluster *cbv1alpha1.CloudberryCluster, dbFactory api.DBClientFactory) *api.Server {
+func newScenario6Server(cluster *cbv1alpha1.CloudberryCluster, dbFactory db.DBClientFactory) *api.Server {
 	scheme := runtime.NewScheme()
 	_ = cbv1alpha1.AddToScheme(scheme)
 

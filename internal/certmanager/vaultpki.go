@@ -54,18 +54,9 @@ func issueVaultPKICert(
 		"ttl":         fmt.Sprintf("%ds", int(validity.Seconds())),
 	}
 
-	result, err := vaultClient.ReadSecret(ctx, issuePath)
+	result, err := vaultClient.WriteSecretWithResponse(ctx, issuePath, data)
 	if err != nil {
-		// ReadSecret is for KV; for PKI issue we need to write.
-		// Use WriteSecret as a workaround since the vault.Client interface
-		// only exposes ReadSecret/WriteSecret for KV v2.
-		// In production, the Vault client should be extended with a PKI-specific method.
-		// For now, we attempt to read the result from the write path.
-		_ = result
-		return nil, nil, nil, fmt.Errorf(
-			"vault PKI issue not directly supported via current vault.Client interface; "+
-				"issue path: %s, data: %v: %w", issuePath, data, err,
-		)
+		return nil, nil, nil, fmt.Errorf("issuing certificate via vault PKI at %s: %w", issuePath, err)
 	}
 
 	// Parse the response.
