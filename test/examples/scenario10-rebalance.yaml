@@ -1,0 +1,170 @@
+# Scenario 10: Manual Segment Rebalancing
+#
+# This file documents the manual segment rebalancing procedure for a Cloudberry cluster.
+# Rebalancing analyzes data skew across segments and redistributes tables that exceed
+# the configured skew threshold using REORGANIZE=TRUE.
+#
+# Architecture:
+#   User --> kubectl annotate CR / cloudberry-ctl ha rebalance -->
+#     Phase 1: Analyze data skew across all user tables
+#     Phase 2: Filter out excluded tables (exact match and glob patterns)
+#     Phase 3: Redistribute tables exceeding skew threshold
+#     Phase 4: Record metrics and update status
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the cloudberry-test namespace
+#   2. kubectl access to the cluster
+#   3. The cluster must be in "Running" phase
+#   4. Tables with data distributed across segments
+#
+# ============================================================================
+# 10a. Trigger Rebalance via Annotation
+# ============================================================================
+#
+# Set the rebalance action annotation:
+#
+#   kubectl annotate cloudberrycluster scenario10-cluster -n cloudberry-test \
+#     avsoft.io/action=rebalance
+#
+# The operator will:
+#   1. Read rebalance config from spec.segments.rebalance
+#   2. Analyze data skew across all user tables
+#   3. Filter out excluded tables (supports glob patterns like "temp_*")
+#   4. Redistribute tables exceeding the skew threshold
+#   5. Record cloudberry_data_skew_coefficient metric
+#   6. Update DataRedistribution condition
+#
+# ============================================================================
+# 10b. Trigger Rebalance via CLI
+# ============================================================================
+#
+# Show rebalance status:
+#
+#   cloudberry-ctl ha rebalance --cluster scenario10-cluster --status
+#
+# Rebalance all tables above threshold:
+#
+#   cloudberry-ctl ha rebalance --cluster scenario10-cluster
+#
+# Rebalance specific tables:
+#
+#   cloudberry-ctl ha rebalance --cluster scenario10-cluster \
+#     --tables public.orders,public.customers
+#
+# ============================================================================
+# 10c. Trigger Rebalance via API
+# ============================================================================
+#
+# Trigger rebalance:
+#
+#   curl -X POST http://localhost:8080/api/v1alpha1/clusters/scenario10-cluster/rebalance \
+#     -H "Content-Type: application/json" \
+#     -d '{"tables": ["public.orders", "public.customers"]}'
+#
+# Get rebalance status:
+#
+#   curl http://localhost:8080/api/v1alpha1/clusters/scenario10-cluster/rebalance/status
+#
+# ============================================================================
+# 10d. Monitor Rebalance Progress
+# ============================================================================
+#
+# Watch the cluster status:
+#
+#   kubectl get cloudberrycluster scenario10-cluster -n cloudberry-test -w
+#
+# Check the DataRedistribution condition:
+#
+#   kubectl get cloudberrycluster scenario10-cluster -n cloudberry-test \
+#     -o jsonpath='{.status.conditions[?(@.type=="DataRedistribution")]}'
+#
+# Expected condition progression:
+#   - Reason: "RebalanceStarted"  -> Rebalance is in progress
+#   - Reason: "RebalanceCompleted" -> Rebalance finished successfully
+#
+# ============================================================================
+# 10e. Verify Data Distribution After Rebalance
+# ============================================================================
+#
+# Check skew for a specific table:
+#
+#   kubectl exec -n cloudberry-test scenario10-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d mydb -c "
+#     SELECT gp_segment_id, count(*) AS row_count
+#     FROM public.orders
+#     GROUP BY gp_segment_id
+#     ORDER BY gp_segment_id;"
+#
+# Calculate skew coefficient:
+#
+#   kubectl exec -n cloudberry-test scenario10-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d mydb -c "
+#     SELECT
+#       CASE WHEN AVG(cnt) = 0 THEN 0
+#           ELSE ((MAX(cnt) - AVG(cnt)) / AVG(cnt) * 100)::numeric(5,1)
+#       END AS skew_coefficient
+#     FROM (
+#       SELECT gp_segment_id, count(*) AS cnt
+#       FROM public.orders
+#       GROUP BY gp_segment_id
+#     ) seg_counts;"
+#
+# ============================================================================
+# 10f. Prometheus Metrics
+# ============================================================================
+#
+# The rebalance operation records the following metrics:
+#
+#   cloudberry_data_skew_coefficient{cluster="...", namespace="..."}
+#     - Maximum skew coefficient across all analyzed tables (0-100)
+#
+#   cloudberry_scale_operations_total{cluster="...", namespace="...", operation="rebalance"}
+#     - Counter incremented on each rebalance completion
+#
+# ============================================================================
+# 10g. Troubleshooting
+# ============================================================================
+#
+# If rebalance fails:
+#   - Check operator logs: kubectl logs -n cloudberry-system deploy/cloudberry-operator
+#   - Verify coordinator connectivity
+#   - Check for long-running queries that may block ALTER TABLE
+#   - Individual table failures are logged but don't block other tables
+#
+# If skew persists after rebalance:
+#   - The distribution key may not be optimal for the data pattern
+#   - Consider changing the distribution key:
+#     ALTER TABLE public.orders SET DISTRIBUTED BY (customer_id);
+#
+# ============================================================================
+# 10h. Rebalance CR Example
+# ============================================================================
+#
+# Full CR with rebalance configuration:
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario10-cluster
+  namespace: cloudberry-test
+spec:
+  version: "7.1.0"
+  image: cloudberrydb/cloudberry:7.1.0
+  coordinator:
+    storage:
+      size: 10Gi
+      storageClass: standard
+  segments:
+    count: 4
+    storage:
+      size: 20Gi
+      storageClass: standard
+    mirroring:
+      enabled: true
+      layout: group
+    rebalance:
+      skewThreshold: 10      # Rebalance tables with >10% skew
+      parallelism: 2          # Redistribute 2 tables concurrently
+      excludeTables:          # Tables to skip during rebalance
+        - audit_log           # Exact match
+        - "temp_*"            # Glob pattern: all tables starting with temp_
+        - "staging.*"         # Glob pattern: all tables in staging schema

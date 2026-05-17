@@ -1,0 +1,201 @@
+# Scenario 11: Scale-Out Failure and Rollback
+#
+# This file documents the scale-out failure handling for a Cloudberry cluster.
+# When a scale-out operation fails (e.g., pods cannot start due to insufficient
+# resources), the operator detects the timeout, marks failed segments, sets the
+# ScaleOutFailed condition, and leaves the cluster in Scaling phase for manual
+# intervention — it does NOT automatically roll back.
+#
+# Architecture:
+#   User --> kubectl patch CR (increase segments) --> Operator detects scale-out -->
+#     Phase 1: Scale StatefulSets (new pods start)
+#     Phase 2: Timeout detection (pods not ready within 10 minutes)
+#     Phase 3: Mark failed segments in status.failedSegments
+#     Phase 4: Set ScaleOutFailed condition, emit warning event
+#     Phase 5: Cluster stays in Scaling phase (manual intervention required)
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the cloudberry-test namespace
+#   2. kubectl access to the cluster
+#   3. The cluster must be in "Running" phase before scale-out
+#
+# ============================================================================
+# 11a. Pre-flight Block (Cluster Not Running)
+# ============================================================================
+#
+# The operator blocks scale-out if the cluster is not in Running phase.
+# This prevents scale operations during stop/start transitions.
+#
+# Stop the cluster:
+#
+#   kubectl annotate cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     avsoft.io/action=stop --overwrite
+#
+# Wait for Stopped phase, then attempt scale-out:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":6}}}'
+#
+# Expected behavior:
+#   - Operator logs: "cluster is stopped, skipping reconciliation"
+#   - Phase remains "Stopped" (scale-out is not processed)
+#   - No ScaleOutStarted event is emitted
+#   - The spec change is stored but not acted upon until cluster restarts
+#
+# If the cluster is in any non-Running phase (Stopping, Initializing, etc.),
+# the operator emits a ScaleOutBlocked warning event:
+#   "Scale-out blocked: cluster is in <phase> phase, must be Running"
+#
+# Revert and restart:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":4}}}'
+#   kubectl annotate cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     avsoft.io/action=start --overwrite
+#
+# ============================================================================
+# 11b. Scale-Out Failure (Insufficient Resources)
+# ============================================================================
+#
+# Trigger a scale-out that will fail by requesting impossible resources:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{
+#       "spec": {
+#         "segments": {
+#           "count": 6,
+#           "resources": {
+#             "requests": {
+#               "memory": "100Gi"
+#             }
+#           }
+#         }
+#       }
+#     }'
+#
+# The operator will:
+#   1. Detect the segment count change and transition to "Scaling" phase
+#   2. Scale StatefulSets to 6 replicas
+#   3. New pods will be Pending (insufficient memory on node)
+#   4. After 10 minutes (scaleTimeout), detect the timeout
+#   5. Identify which segments are not ready
+#   6. Set ScaleOutFailed condition to True
+#   7. Record failed segments in status.failedSegments
+#   8. Emit ScaleOutFailed warning event
+#   9. Leave cluster in Scaling phase (NO automatic rollback)
+#
+# Monitor progress:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -w
+#
+# Check for ScaleOutFailed condition:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     -o jsonpath='{range .status.conditions[?(@.type=="ScaleOutFailed")]}{.type}: {.status} ({.reason}) - {.message}{end}'
+#
+# Check failed segments:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     -o jsonpath='{.status.failedSegments}' | python3 -m json.tool
+#
+# ============================================================================
+# 11c. Manual Recovery (After Scale-Out Failure)
+# ============================================================================
+#
+# Option 1: Revert segment count (scale back down)
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":4,"resources":{"requests":{"memory":"512Mi"}}}}}'
+#
+# Option 2: Fix the resource issue and retry
+#   - Add more nodes to the cluster
+#   - Reduce resource requests to fit available capacity
+#   - Then remove the scale-started annotation to reset:
+#
+#   kubectl annotate cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     avsoft.io/scale-started- avsoft.io/scale-state-
+#
+# After recovery, wait for the cluster to return to Running:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -w
+#
+# ============================================================================
+# 11d. Verify Cluster Health After Recovery
+# ============================================================================
+#
+# Check all segments are up:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres \
+#     -c "SELECT count(*) FROM gp_segment_configuration WHERE status='u';"
+#
+# Expected: 9 segments up (1 coordinator + 4 primaries + 4 mirrors)
+#
+# Check cluster conditions are healthy:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     -o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}){"\n"}{end}'
+#
+# ============================================================================
+# 11e. Key Design Decisions
+# ============================================================================
+#
+# 1. NO automatic rollback: The operator does NOT automatically scale back
+#    on failure. This prevents data loss if segments were partially registered.
+#
+# 2. Timeout-based detection: The operator uses a 10-minute timeout
+#    (scaleTimeout) to detect stuck scale operations.
+#
+# 3. Failed segments tracking: status.failedSegments lists which specific
+#    segments failed to become ready, aiding diagnosis.
+#
+# 4. Phase preservation: The cluster stays in "Scaling" phase after failure,
+#    clearly indicating manual intervention is needed.
+#
+# 5. Pre-flight checks: Scale-out is blocked if the cluster is not Running,
+#    preventing cascading failures during other operations.
+#
+# ============================================================================
+# 11f. Prometheus Metrics and Events
+# ============================================================================
+#
+# Events emitted:
+#   - ScaleOutStarted (Normal): "Scale-out from X to Y segments initiated"
+#   - ScaleOutBlocked (Warning): "Scale-out blocked: cluster is in <phase> phase"
+#   - ScaleOutFailed (Warning): "Scale-out failed: N segments not ready after timeout"
+#
+# Status conditions:
+#   - ScaleOutFailed: True/False — indicates whether the last scale-out failed
+#
+# ============================================================================
+# 11g. Example CR (for reference)
+# ============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario11-cluster
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: cloudberrydb/cloudberry:2.1.0
+  coordinator:
+    storage:
+      size: 5Gi
+  segments:
+    count: 4
+    storage:
+      size: 5Gi
+    mirroring:
+      enabled: true
+      layout: group
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+  standby:
+    enabled: true
+    storage:
+      size: 5Gi

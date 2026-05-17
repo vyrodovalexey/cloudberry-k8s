@@ -168,6 +168,15 @@ func (m *mockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
 func (m *mockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ db.ScaleInRedistributionOptions) error {
 	return nil
 }
+func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewInfo, error) {
+	return []db.TableSkewInfo{}, nil
+}
+func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
+	return []string{"postgres", "mydb"}, nil
+}
 
 func TestNewHAReconciler(t *testing.T) {
 	scheme := newTestScheme()

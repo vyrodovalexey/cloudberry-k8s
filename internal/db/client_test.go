@@ -363,6 +363,15 @@ func (m *mockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
 func (m *mockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ ScaleInRedistributionOptions) error {
 	return nil
 }
+func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]TableSkewInfo, error) {
+	return []TableSkewInfo{}, nil
+}
+func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
+	return []string{"postgres"}, nil
+}
 
 func TestMockDBClient_ImplementsInterface(t *testing.T) {
 	var _ Client = &mockDBClient{}
@@ -621,6 +630,17 @@ func TestMockDBClient_AllMethods(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Nil(t, entries)
 	})
+
+	t.Run("AnalyzeSkew", func(t *testing.T) {
+		results, err := client.AnalyzeSkew(ctx, "mydb")
+		assert.NoError(t, err)
+		assert.NotNil(t, results)
+	})
+
+	t.Run("RebalanceTable", func(t *testing.T) {
+		err := client.RebalanceTable(ctx, "mydb", "public", "orders", "customer_id")
+		assert.NoError(t, err)
+	})
 }
 
 func TestBackupOptions_Construction(t *testing.T) {
@@ -729,6 +749,21 @@ func TestDataLoadingJobStatus_Construction(t *testing.T) {
 	}
 	assert.Equal(t, "loader1", status.Name)
 	assert.Equal(t, int64(1000000), status.RowsLoaded)
+}
+
+func TestTableSkewInfo_Construction(t *testing.T) {
+	info := TableSkewInfo{
+		Schema:          "public",
+		Table:           "orders",
+		SkewCoefficient: 25.5,
+		DistributionKey: "customer_id",
+		RowCount:        1000000,
+	}
+	assert.Equal(t, "public", info.Schema)
+	assert.Equal(t, "orders", info.Table)
+	assert.Equal(t, 25.5, info.SkewCoefficient)
+	assert.Equal(t, "customer_id", info.DistributionKey)
+	assert.Equal(t, int64(1000000), info.RowCount)
 }
 
 func TestDiskUsageInfo_Construction(t *testing.T) {

@@ -1,0 +1,87 @@
+# Scenario 14: Cluster Upgrade with Rollback
+#
+# This scenario demonstrates the rolling upgrade mechanism and automatic rollback.
+#
+# Upgrade Order: mirrors -> primaries -> standby -> coordinator
+# Each phase waits for pods to be ready (ReadyReplicas AND UpdatedReplicas match desired)
+# before advancing to the next phase.
+#
+# Rollback is triggered automatically if any phase times out (10 minutes per phase).
+# After rollback, the UpgradeFailed condition is set and the operator will NOT
+# re-attempt the upgrade until the user fixes the spec or removes the condition.
+#
+# Usage:
+#   # 1. Deploy the cluster (or use an existing running cluster)
+#   kubectl apply -f test/examples/scenario1-cluster.yaml
+#
+#   # 2. Wait for cluster to be Running
+#   kubectl wait --for=jsonpath='{.status.phase}'=Running cloudberrycluster/scenario1-cluster -n cloudberry-test --timeout=300s
+#
+#   # 3. Happy Path: Upgrade to a new version
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test --type=merge -p '{"spec":{"image":"cloudberrydb/cloudberry:2.1.1","version":"2.1.1"}}'
+#
+#   # 4. Monitor upgrade progress
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -w
+#
+#   # 5. Rollback Test: Upgrade to a broken image
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test --type=merge -p '{"spec":{"image":"cloudberrydb/cloudberry:nonexistent","version":"broken"}}'
+#
+#   # 6. After ~10 minutes, the upgrade will time out and rollback automatically
+#   kubectl get events -n cloudberry-test --sort-by=.lastTimestamp | grep -i upgrade
+#
+#   # 7. Verify rollback: UpgradeFailed condition should be True
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -o jsonpath='{.status.conditions[?(@.type=="UpgradeFailed")].status}'
+#
+#   # 8. Fix the spec to resume normal operations
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test --type=merge -p '{"spec":{"image":"cloudberrydb/cloudberry:2.1.1","version":"2.1.1"}}'
+#   # Remove the UpgradeFailed condition to allow future upgrades
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test --type=merge --subresource=status -p '{"status":{"conditions":[]}}'
+#
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario14-cluster
+  namespace: cloudberry-test
+spec:
+  # Change this image/version to trigger an upgrade
+  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: true
+      layout: "group"
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  deletionPolicy: Retain

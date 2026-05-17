@@ -121,8 +121,9 @@ func (s *Scenario14UpgradeSuite) createReadyStatefulSet(name, namespace, image s
 			},
 		},
 		Status: appsv1.StatefulSetStatus{
-			Replicas:      replicas,
-			ReadyReplicas: replicas,
+			Replicas:        replicas,
+			ReadyReplicas:   replicas,
+			UpdatedReplicas: replicas,
 		},
 	}
 	err := s.env.Client.Create(s.ctx, sts)

@@ -183,6 +183,8 @@ type MockDBClient struct {
 	GetRedistributionProgressFunc func(ctx context.Context) (int32, error)
 	DeregisterSegmentsFunc        func(ctx context.Context, newCount int32) error
 	RedistributeBeforeScaleInFunc func(ctx context.Context, opts db.ScaleInRedistributionOptions) error
+	AnalyzeSkewFunc               func(ctx context.Context, database string) ([]db.TableSkewInfo, error)
+	RebalanceTableFunc            func(ctx context.Context, database, schema, table, distKey string) error
 	Closed                        bool
 }
 
@@ -616,6 +618,27 @@ func (m *MockDBClient) RedistributeBeforeScaleIn(ctx context.Context, opts db.Sc
 		return m.RedistributeBeforeScaleInFunc(ctx, opts)
 	}
 	return nil
+}
+
+// AnalyzeSkew implements db.Client.
+func (m *MockDBClient) AnalyzeSkew(ctx context.Context, database string) ([]db.TableSkewInfo, error) {
+	if m.AnalyzeSkewFunc != nil {
+		return m.AnalyzeSkewFunc(ctx, database)
+	}
+	return []db.TableSkewInfo{}, nil
+}
+
+// RebalanceTable implements db.Client.
+func (m *MockDBClient) RebalanceTable(ctx context.Context, database, schema, table, distKey string) error {
+	if m.RebalanceTableFunc != nil {
+		return m.RebalanceTableFunc(ctx, database, schema, table, distKey)
+	}
+	return nil
+}
+
+// ListUserDatabases returns a list of user databases.
+func (m *MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
+	return []string{"mydb"}, nil
 }
 
 // MockDBClientFactory implements db.DBClientFactory for testing.

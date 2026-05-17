@@ -154,6 +154,13 @@ type Client interface {
 	// RedistributeBeforeScaleIn redistributes data to only the remaining segments
 	// before scaling in. This ensures no data is left on segments being removed.
 	RedistributeBeforeScaleIn(ctx context.Context, opts ScaleInRedistributionOptions) error
+	// AnalyzeSkew analyzes data skew across segments for all user tables in a database.
+	// Returns skew coefficient per table (0 = perfectly balanced, 100 = all on one segment).
+	AnalyzeSkew(ctx context.Context, database string) ([]TableSkewInfo, error)
+	// RebalanceTable redistributes a single table across all segments using REORGANIZE=TRUE.
+	RebalanceTable(ctx context.Context, database, schema, table, distKey string) error
+	// ListUserDatabases returns all non-template, non-system databases.
+	ListUserDatabases(ctx context.Context) ([]string, error)
 }
 
 // ParameterScope defines the scope for parameter changes.
@@ -428,6 +435,22 @@ type ScaleInRedistributionOptions struct {
 	Database string
 	// ExcludeTables is the list of tables to exclude from redistribution.
 	ExcludeTables []string
+}
+
+// TableSkewInfo holds skew analysis results for a single table.
+type TableSkewInfo struct {
+	// Database is the database containing this table.
+	Database string `json:"database"`
+	// Schema is the table's schema name.
+	Schema string `json:"schema"`
+	// Table is the table name.
+	Table string `json:"table"`
+	// SkewCoefficient is the skew percentage (0 = balanced, 100 = all on one segment).
+	SkewCoefficient float64 `json:"skewCoefficient"`
+	// DistributionKey is the table's distribution key (empty for randomly distributed).
+	DistributionKey string `json:"distributionKey"`
+	// RowCount is the total number of rows in the table.
+	RowCount int64 `json:"rowCount"`
 }
 
 // scaleInTableInfo holds table metadata for scale-in redistribution.
@@ -1831,6 +1854,11 @@ func (c *pgxClient) RedistributeData(ctx context.Context, opts RedistributionOpt
 	return nil
 }
 
+// ListUserDatabases returns all non-template, non-system databases.
+func (c *pgxClient) ListUserDatabases(ctx context.Context) ([]string, error) {
+	return c.listUserDatabases(ctx)
+}
+
 // listUserDatabases returns all non-template, non-system databases.
 func (c *pgxClient) listUserDatabases(ctx context.Context) ([]string, error) {
 	query := `SELECT datname FROM pg_database 
@@ -2251,6 +2279,163 @@ func (c *pgxClient) updateNumsegments(
 	if commitErr := tx.Commit(ctx); commitErr != nil {
 		return fmt.Errorf("committing numsegments update: %w", commitErr)
 	}
+	return nil
+}
+
+// AnalyzeSkew analyzes data skew across segments for all user tables in a database.
+// It calculates the skew coefficient per table: (max_rows - avg_rows) / avg_rows * 100.
+// A coefficient of 0 means perfectly balanced; 100 means all data is on one segment.
+func (c *pgxClient) AnalyzeSkew(ctx context.Context, database string) ([]TableSkewInfo, error) {
+	c.logger.Info("analyzing data skew", "database", database)
+
+	if err := c.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("database not reachable for skew analysis: %w", err)
+	}
+
+	// Connect to the target database if different from the pool's default.
+	pool := c.pool
+	if database != "" && database != c.config.Database {
+		connStr := c.pool.Config().ConnString()
+		dbConfig, err := pgxpool.ParseConfig(connStr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing connection config for skew analysis: %w", err)
+		}
+		dbConfig.ConnConfig.Database = database
+
+		var poolErr error
+		pool, poolErr = pgxpool.NewWithConfig(ctx, dbConfig)
+		if poolErr != nil {
+			return nil, fmt.Errorf("connecting to database %s for skew analysis: %w", database, poolErr)
+		}
+		defer pool.Close()
+	}
+
+	// Query all user tables with their distribution keys.
+	tableQuery := `SELECT n.nspname AS schema_name, c.relname AS table_name,
+		COALESCE(
+			(SELECT string_agg(a.attname, ', ' ORDER BY dp.distkey_ord)
+			 FROM (SELECT unnest(d.distkey) AS attnum,
+			       generate_subscripts(d.distkey, 1) AS distkey_ord
+			       FROM gp_distribution_policy d WHERE d.localoid = c.oid) dp
+			 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = dp.attnum),
+			''
+		) AS dist_key
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'r'
+		AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'gp_toolkit', 'pg_ext_aux')
+		ORDER BY n.nspname, c.relname`
+
+	rows, err := pool.Query(ctx, tableQuery)
+	if err != nil {
+		return nil, fmt.Errorf("querying user tables for skew analysis: %w", err)
+	}
+	defer rows.Close()
+
+	type tableEntry struct {
+		schema  string
+		table   string
+		distKey string
+	}
+
+	var tables []tableEntry
+	for rows.Next() {
+		var t tableEntry
+		if scanErr := rows.Scan(&t.schema, &t.table, &t.distKey); scanErr != nil {
+			return nil, fmt.Errorf("scanning table entry for skew analysis: %w", scanErr)
+		}
+		tables = append(tables, t)
+	}
+	if rowErr := rows.Err(); rowErr != nil {
+		return nil, fmt.Errorf("iterating table entries for skew analysis: %w", rowErr)
+	}
+
+	// For each table, calculate the skew coefficient.
+	var results []TableSkewInfo
+	for _, t := range tables {
+		qualifiedName := fmt.Sprintf("%s.%s",
+			pgx.Identifier{t.schema}.Sanitize(),
+			pgx.Identifier{t.table}.Sanitize())
+
+		skewQuery := fmt.Sprintf(`SELECT
+			COALESCE(SUM(cnt), 0) AS total_rows,
+			CASE WHEN AVG(cnt) = 0 THEN 0
+			     ELSE ((MAX(cnt) - AVG(cnt)) / AVG(cnt) * 100)
+			END AS skew_coefficient
+			FROM (
+				SELECT gp_segment_id, count(*) AS cnt
+				FROM %s
+				GROUP BY gp_segment_id
+			) seg_counts`, qualifiedName)
+
+		var totalRows int64
+		var skewCoeff float64
+		if scanErr := pool.QueryRow(ctx, skewQuery).Scan(&totalRows, &skewCoeff); scanErr != nil {
+			c.logger.Warn("failed to calculate skew for table, skipping",
+				"table", qualifiedName, "error", scanErr)
+			continue
+		}
+
+		// Only include tables with data.
+		if totalRows > 0 {
+			results = append(results, TableSkewInfo{
+				Database:        database,
+				Schema:          t.schema,
+				Table:           t.table,
+				SkewCoefficient: skewCoeff,
+				DistributionKey: t.distKey,
+				RowCount:        totalRows,
+			})
+		}
+	}
+
+	c.logger.Info("skew analysis completed", "database", database, "tablesAnalyzed", len(results))
+	return results, nil
+}
+
+// RebalanceTable redistributes a single table across all segments using REORGANIZE=TRUE.
+// If distKey is empty, the table is redistributed randomly.
+func (c *pgxClient) RebalanceTable(ctx context.Context, database, schema, table, distKey string) error {
+	c.logger.Info("rebalancing table",
+		"database", database, "schema", schema, "table", table, "distKey", distKey)
+
+	// Connect to the target database if different from the pool's default.
+	pool := c.pool
+	if database != "" && database != c.config.Database {
+		connStr := c.pool.Config().ConnString()
+		dbConfig, err := pgxpool.ParseConfig(connStr)
+		if err != nil {
+			return fmt.Errorf("parsing connection config for rebalance: %w", err)
+		}
+		dbConfig.ConnConfig.Database = database
+
+		var poolErr error
+		pool, poolErr = pgxpool.NewWithConfig(ctx, dbConfig)
+		if poolErr != nil {
+			return fmt.Errorf("connecting to database %s for rebalance: %w", database, poolErr)
+		}
+		defer pool.Close()
+	}
+
+	qualifiedName := fmt.Sprintf("%s.%s",
+		pgx.Identifier{schema}.Sanitize(),
+		pgx.Identifier{table}.Sanitize())
+
+	var alterSQL string
+	if distKey == "" {
+		alterSQL = fmt.Sprintf(
+			"ALTER TABLE %s SET WITH (REORGANIZE=TRUE) DISTRIBUTED RANDOMLY", qualifiedName)
+	} else {
+		alterSQL = fmt.Sprintf(
+			"ALTER TABLE %s SET WITH (REORGANIZE=TRUE) DISTRIBUTED BY (%s)", qualifiedName, distKey)
+	}
+
+	if _, err := pool.Exec(ctx, alterSQL); err != nil {
+		return fmt.Errorf("rebalancing table %s: %w", qualifiedName, err)
+	}
+
+	c.logger.Info("table rebalanced successfully",
+		"database", database, "table", qualifiedName)
 	return nil
 }
 

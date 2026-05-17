@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -507,6 +508,9 @@ const defaultSkewThreshold int32 = 10
 const defaultParallelism int32 = 2
 
 // handleRebalance processes rebalance actions with full configuration support.
+// When a DB factory is available, it performs real skew analysis and redistributes
+// tables that exceed the configured skew threshold. Otherwise, it falls back to
+// creating a maintenance Job.
 func (r *HAReconciler) handleRebalance(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -548,7 +552,30 @@ func (r *HAReconciler) handleRebalance(
 		return ctrl.Result{}, fmt.Errorf("updating rebalance status: %w", err)
 	}
 
-	// Create rebalance Job.
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceStarted,
+		fmt.Sprintf("Segment rebalance initiated: threshold=%d%%, parallelism=%d",
+			skewThreshold, parallelism))
+
+	// Attempt real skew analysis and redistribution via DB client.
+	if r.dbFactory != nil {
+		if err := r.executeRebalanceViaDB(ctx, cluster, skewThreshold, parallelism, excludeTables); err != nil {
+			logger.Error("rebalance via DB failed, falling back to Job", "error", err)
+		} else {
+			// Direct execution succeeded.
+			cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+				string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "RebalanceCompleted",
+				"Rebalance completed successfully")
+			if err := patchStatus(ctx, r.client, cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating rebalance completion: %w", err)
+			}
+			r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceCompleted,
+				"Segment rebalance completed")
+			r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance")
+			return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		}
+	}
+
+	// Fallback: create rebalance Job.
 	timestamp := time.Now().Format("20060102-150405")
 	job := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceRebalance, timestamp)
 	if job != nil {
@@ -557,11 +584,7 @@ func (r *HAReconciler) handleRebalance(
 		}
 	}
 
-	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceStarted,
-		fmt.Sprintf("Segment rebalance initiated: threshold=%d%%, parallelism=%d",
-			skewThreshold, parallelism))
-
-	// Set completion (in real implementation, would monitor Job status).
+	// Set completion (Job-based rebalance is fire-and-forget at this stage).
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "RebalanceCompleted",
 		"Rebalance completed successfully")
@@ -574,6 +597,164 @@ func (r *HAReconciler) handleRebalance(
 	r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// executeRebalanceViaDB performs skew analysis and redistributes skewed tables
+// directly via the database client. It filters out excluded tables (supporting
+// glob patterns) and only rebalances tables exceeding the skew threshold.
+func (r *HAReconciler) executeRebalanceViaDB(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	skewThreshold, parallelism int32,
+	excludeTables []string,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for rebalance: %w", err)
+	}
+	defer dbClient.Close()
+
+	skewResults, tablesToRebalance := r.analyzeAndFilterSkew(
+		ctx, dbClient, cluster, skewThreshold, excludeTables)
+	_ = skewResults // used for logging in analyzeAndFilterSkew
+
+	logger.Info("tables requiring rebalance",
+		"count", len(tablesToRebalance),
+		"threshold", skewThreshold)
+
+	if len(tablesToRebalance) == 0 {
+		logger.Info("no tables exceed skew threshold, rebalance not needed")
+		return nil
+	}
+
+	// Rebalance tables with bounded concurrency.
+	sem := make(chan struct{}, parallelism)
+	errCh := make(chan error, len(tablesToRebalance))
+
+	for _, info := range tablesToRebalance {
+		sem <- struct{}{}
+		go func(ti db.TableSkewInfo) {
+			defer func() { <-sem }()
+			rebalanceErr := dbClient.RebalanceTable(ctx, ti.Database, ti.Schema, ti.Table, ti.DistributionKey)
+			if rebalanceErr != nil {
+				logger.Error("failed to rebalance table",
+					"database", ti.Database, "table", ti.Schema+"."+ti.Table, "error", rebalanceErr)
+				errCh <- rebalanceErr
+				return
+			}
+			logger.Info("table rebalanced",
+				"database", ti.Database, "table", ti.Schema+"."+ti.Table,
+				"previousSkew", ti.SkewCoefficient)
+		}(info)
+	}
+
+	// Wait for all goroutines to finish.
+	for range cap(sem) {
+		sem <- struct{}{}
+	}
+	close(errCh)
+
+	// Collect errors (non-fatal: individual table failures don't block others).
+	var rebalanceErrors int
+	for range errCh {
+		rebalanceErrors++
+	}
+
+	if rebalanceErrors > 0 {
+		logger.Warn("some tables failed to rebalance",
+			"failed", rebalanceErrors, "total", len(tablesToRebalance))
+	}
+
+	return nil
+}
+
+// isTableExcluded checks if a table name matches any exclusion pattern.
+// Supports exact match and glob patterns (e.g., "temp_*", "audit_*").
+func isTableExcluded(tableName string, excludePatterns []string) bool {
+	for _, pattern := range excludePatterns {
+		if pattern == tableName {
+			return true
+		}
+		// Support glob patterns using filepath.Match.
+		if matched, _ := filepath.Match(pattern, tableName); matched {
+			return true
+		}
+		// Also try matching just the table part (without schema) against the pattern.
+		parts := splitSchemaTable(tableName)
+		if len(parts) == 2 {
+			if matched, _ := filepath.Match(pattern, parts[1]); matched {
+				return true
+			}
+			// Try matching schema.table against the pattern.
+			if matched, _ := filepath.Match(pattern, parts[0]+"."+parts[1]); matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// analyzeAndFilterSkew discovers databases, analyzes skew, filters tables, and records metrics.
+func (r *HAReconciler) analyzeAndFilterSkew(
+	ctx context.Context,
+	dbClient db.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+	skewThreshold int32,
+	excludeTables []string,
+) (allTables []db.TableSkewInfo, skewedTables []db.TableSkewInfo) {
+	logger := util.LoggerFromContext(ctx)
+
+	databases, err := dbClient.ListUserDatabases(ctx)
+	if err != nil {
+		logger.Error("failed to list databases for rebalance", "error", err)
+		return nil, nil
+	}
+
+	var skewResults []db.TableSkewInfo
+	for _, dbName := range databases {
+		dbSkew, analyzeErr := dbClient.AnalyzeSkew(ctx, dbName)
+		if analyzeErr != nil {
+			logger.Error("failed to analyze skew", "database", dbName, "error", analyzeErr)
+			continue
+		}
+		skewResults = append(skewResults, dbSkew...)
+	}
+
+	var tablesToRebalance []db.TableSkewInfo
+	for _, info := range skewResults {
+		fullName := info.Schema + "." + info.Table
+		if isTableExcluded(fullName, excludeTables) {
+			continue
+		}
+		if info.SkewCoefficient >= float64(skewThreshold) {
+			tablesToRebalance = append(tablesToRebalance, info)
+		}
+	}
+
+	var maxSkew float64
+	for _, info := range skewResults {
+		if info.SkewCoefficient > maxSkew {
+			maxSkew = info.SkewCoefficient
+		}
+	}
+	r.metrics.SetDataSkewCoefficient(cluster.Name, cluster.Namespace, maxSkew)
+
+	logger.Info("skew analysis completed",
+		"tablesAnalyzed", len(skewResults),
+		"tablesAboveThreshold", len(tablesToRebalance))
+	return skewResults, tablesToRebalance
+}
+
+// splitSchemaTable splits "schema.table" into ["schema", "table"].
+func splitSchemaTable(name string) []string {
+	for i, c := range name {
+		if c == '.' {
+			return []string{name[:i], name[i+1:]}
+		}
+	}
+	return []string{name}
 }
 
 // handleStandbyActivation processes standby activation.

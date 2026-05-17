@@ -258,6 +258,28 @@ spec:
                         - preferred
                         - required
                       default: preferred
+                    rebalance:
+                      description: Rebalance defines segment rebalancing configuration.
+                      type: object
+                      properties:
+                        skewThreshold:
+                          description: SkewThreshold is the percentage skew threshold to trigger rebalance.
+                          type: integer
+                          format: int32
+                          minimum: 1
+                          maximum: 100
+                          default: 20
+                        parallelism:
+                          description: Parallelism is the number of tables to rebalance concurrently.
+                          type: integer
+                          format: int32
+                          minimum: 1
+                          default: 2
+                        excludeTables:
+                          description: ExcludeTables lists tables to skip during rebalance (supports glob patterns).
+                          type: array
+                          items:
+                            type: string
                 auth:
                   description: Auth defines authentication and authorization configuration.
                   type: object

@@ -38,6 +38,9 @@ const (
 	scaleTimeout           = 10 * time.Minute
 	upgradePhaseTimeout    = 10 * time.Minute
 	mirroringEnableTimeout = 30 * time.Minute
+
+	// annotationValueTrue is the canonical string value for boolean-true annotations.
+	annotationValueTrue = "true"
 )
 
 // ClusterReconciler reconciles a CloudberryCluster object.
@@ -133,21 +136,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// and we must continue processing it even if the phase was reset to Running.
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
-		_, hasScaleState := cluster.Annotations[annotationScaleState]
-		_, hasScaleInState := cluster.Annotations[annotationScaleInState]
-		if hasScaleState || hasScaleInState {
-			// Scale operation in progress but phase was reset — restore Scaling phase and continue.
-			logger.Info("scale state annotation found but phase is Running, restoring Scaling phase")
-			cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
-			if err := r.client.Status().Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("restoring scaling phase: %w", err)
-			}
-			return ctrl.Result{Requeue: true}, nil
+		if res := r.handleGenerationUnchanged(ctx, cluster); res.handled {
+			return res.result, res.err
 		}
-		logger.Debug("skipping reconciliation, generation unchanged and cluster running",
-			"generation", cluster.Generation)
-		r.recordMetricsSnapshot(cluster)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
 	// Handle deletion.
@@ -231,6 +222,49 @@ func (r *ClusterReconciler) handleLifecyclePhase(
 	}
 }
 
+// generationUnchangedResult holds the result of handleGenerationUnchanged.
+type generationUnchangedResult struct {
+	result  ctrl.Result
+	err     error
+	handled bool
+}
+
+// handleGenerationUnchanged handles the case where the cluster generation has not changed
+// and the cluster is in Running phase. It checks for in-progress scale operations and
+// confirm-scale-in annotations.
+func (r *ClusterReconciler) handleGenerationUnchanged(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) generationUnchangedResult {
+	logger := util.LoggerFromContext(ctx)
+
+	_, hasScaleState := cluster.Annotations[annotationScaleState]
+	_, hasScaleInState := cluster.Annotations[annotationScaleInState]
+	if hasScaleState || hasScaleInState {
+		// Scale operation in progress but phase was reset — restore Scaling phase and continue.
+		logger.Info("scale state annotation found but phase is Running, restoring Scaling phase")
+		cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+		if err := r.client.Status().Update(ctx, cluster); err != nil {
+			return generationUnchangedResult{
+				err: fmt.Errorf("restoring scaling phase: %w", err), handled: true,
+			}
+		}
+		return generationUnchangedResult{result: ctrl.Result{Requeue: true}, handled: true}
+	}
+	// If confirm-scale-in annotation is present, a previously blocked scale-in
+	// may now be ready to proceed. Force reconciliation to re-evaluate.
+	if cluster.Annotations[util.AnnotationConfirmScaleIn] == annotationValueTrue {
+		logger.Info("confirm-scale-in annotation detected, forcing reconciliation")
+		return generationUnchangedResult{handled: false}
+	}
+	logger.Debug("skipping reconciliation, generation unchanged and cluster running",
+		"generation", cluster.Generation)
+	r.recordMetricsSnapshot(cluster)
+	return generationUnchangedResult{
+		result: ctrl.Result{RequeueAfter: requeueAfterDefault}, handled: true,
+	}
+}
+
 // reconcileCluster performs the main reconciliation logic.
 func (r *ClusterReconciler) reconcileCluster(
 	ctx context.Context,
@@ -261,6 +295,18 @@ func (r *ClusterReconciler) reconcileCluster(
 	// Check for in-progress or needed upgrade before reconciling StatefulSets.
 	if r.isUpgradeNeeded(cluster) {
 		return r.handleUpgrade(ctx, cluster)
+	}
+
+	// If a previous upgrade failed and was rolled back, do NOT reconcile
+	// StatefulSets — the spec still contains the broken image. The user must
+	// fix the spec (set a valid image/version) or remove the UpgradeFailed
+	// condition before the operator will update StatefulSets again.
+	if r.isUpgradeRolledBack(cluster) {
+		logger.Info("upgrade previously failed and rolled back, skipping STS reconciliation")
+		if err := r.updateStatus(ctx, cluster); err != nil {
+			return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating status: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
 	// Reconcile coordinator StatefulSet.
@@ -416,30 +462,15 @@ func (r *ClusterReconciler) reconcileSegments(
 ) error {
 	logger := util.LoggerFromContext(ctx)
 
-	// Check for scale-out by comparing desired vs actual replicas.
+	// Check for scale-out/scale-in by comparing desired vs actual replicas.
 	existingSts := &appsv1.StatefulSet{}
 	getErr := r.client.Get(ctx, types.NamespacedName{
 		Name:      util.SegmentPrimaryName(cluster.Name),
 		Namespace: cluster.Namespace,
 	}, existingSts)
 
-	if getErr == nil && existingSts.Spec.Replicas != nil {
-		currentCount := *existingSts.Spec.Replicas
-		desiredCount := cluster.Spec.Segments.Count
-
-		// Only detect scale operations when the current count is > 0.
-		// A currentCount of 0 indicates a restart or initial creation,
-		// which should be handled by the normal reconciliation path.
-		if currentCount > 0 && desiredCount > currentCount {
-			logger.Info("scale-out detected in reconcileSegments",
-				"from", currentCount, "to", desiredCount)
-			return r.handleScaleOut(ctx, cluster, currentCount, desiredCount)
-		}
-		if currentCount > 0 && desiredCount < currentCount {
-			logger.Info("scale-in detected in reconcileSegments",
-				"from", currentCount, "to", desiredCount)
-			return r.handleScaleIn(ctx, cluster, currentCount, desiredCount)
-		}
+	if handled, scaleErr := r.detectAndHandleScale(ctx, cluster, existingSts, getErr); handled {
+		return scaleErr
 	}
 
 	// Check for mirroring enable transition.
@@ -456,6 +487,15 @@ func (r *ClusterReconciler) reconcileSegments(
 	if err != nil {
 		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
+	// Safety: never scale down replicas via the normal path — scale-in must go
+	// through handleScaleIn to ensure data redistribution and segment deregistration.
+	if getErr == nil && existingSts.Spec.Replicas != nil && primarySts.Spec.Replicas != nil {
+		if *primarySts.Spec.Replicas < *existingSts.Spec.Replicas {
+			logger.Info("scale-in required but not yet confirmed/processed, preserving current replicas",
+				"current", *existingSts.Spec.Replicas, "desired", *primarySts.Spec.Replicas)
+			primarySts.Spec.Replicas = existingSts.Spec.Replicas
+		}
+	}
 	if err := r.createOrUpdateStatefulSet(ctx, primarySts); err != nil {
 		return fmt.Errorf("primary segments: %w", err)
 	}
@@ -465,13 +505,83 @@ func (r *ClusterReconciler) reconcileSegments(
 	if err != nil {
 		return fmt.Errorf("building mirror segment StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
-	if mirrorSts != nil {
-		if err := r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
-			return fmt.Errorf("mirror segments: %w", err)
-		}
+	if mirrorSts == nil {
+		return nil
+	}
+	r.preserveMirrorReplicasIfNeeded(ctx, mirrorSts, getErr)
+	if err := r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
+		return fmt.Errorf("mirror segments: %w", err)
 	}
 
 	return nil
+}
+
+// detectAndHandleScale checks for scale-out/scale-in by comparing desired vs actual replicas.
+// Returns (true, err) if a scale operation was detected (caller should return err),
+// or (false, nil) if no scale change was detected and normal reconciliation should continue.
+func (r *ClusterReconciler) detectAndHandleScale(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	existingSts *appsv1.StatefulSet,
+	getErr error,
+) (bool, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	if getErr != nil {
+		logger.Debug("could not get existing primary StatefulSet for scale check", "error", getErr)
+		return false, nil
+	}
+	if existingSts.Spec.Replicas == nil {
+		return false, nil
+	}
+
+	currentCount := *existingSts.Spec.Replicas
+	desiredCount := cluster.Spec.Segments.Count
+
+	logger.Debug("segment scale check",
+		"currentReplicas", currentCount, "desiredCount", desiredCount)
+
+	// Only detect scale operations when the current count is > 0.
+	// A currentCount of 0 indicates a restart or initial creation,
+	// which should be handled by the normal reconciliation path.
+	if currentCount > 0 && desiredCount > currentCount {
+		logger.Info("scale-out detected in reconcileSegments",
+			"from", currentCount, "to", desiredCount)
+		return true, r.handleScaleOut(ctx, cluster, currentCount, desiredCount)
+	}
+	if currentCount > 0 && desiredCount < currentCount {
+		logger.Info("scale-in detected in reconcileSegments",
+			"from", currentCount, "to", desiredCount)
+		return true, r.handleScaleIn(ctx, cluster, currentCount, desiredCount)
+	}
+
+	return false, nil
+}
+
+// preserveMirrorReplicasIfNeeded applies the safety check for mirrors: never scale down
+// replicas via the normal path. Scale-in must go through handleScaleIn.
+func (r *ClusterReconciler) preserveMirrorReplicasIfNeeded(
+	ctx context.Context,
+	mirrorSts *appsv1.StatefulSet,
+	primaryGetErr error,
+) {
+	if primaryGetErr != nil {
+		return
+	}
+	logger := util.LoggerFromContext(ctx)
+	mirrorExisting := &appsv1.StatefulSet{}
+	mirrorGetErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      mirrorSts.Name,
+		Namespace: mirrorSts.Namespace,
+	}, mirrorExisting)
+	if mirrorGetErr != nil || mirrorExisting.Spec.Replicas == nil || mirrorSts.Spec.Replicas == nil {
+		return
+	}
+	if *mirrorSts.Spec.Replicas < *mirrorExisting.Spec.Replicas {
+		logger.Info("mirror scale-in required but not yet confirmed/processed, preserving current replicas",
+			"current", *mirrorExisting.Spec.Replicas, "desired", *mirrorSts.Spec.Replicas)
+		mirrorSts.Spec.Replicas = mirrorExisting.Spec.Replicas
+	}
 }
 
 // handleScaleOut orchestrates a scale-out operation: transitions the cluster
@@ -591,7 +701,7 @@ func (r *ClusterReconciler) handleScaleIn(
 
 	// Safety check: scale-in by more than 50% requires confirmation annotation.
 	if float64(newCount) < float64(oldCount)*0.5 {
-		if cluster.Annotations[util.AnnotationConfirmScaleIn] != "true" {
+		if cluster.Annotations[util.AnnotationConfirmScaleIn] != annotationValueTrue {
 			logger.Warn("scale-in by more than 50% requires confirmation annotation",
 				"from", oldCount, "to", newCount)
 			r.recorder.Event(cluster, corev1.EventTypeWarning, "ScaleInBlocked",
@@ -1319,7 +1429,8 @@ func (r *ClusterReconciler) handleRestart(
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "Restarting", "Cluster restart initiated")
 
 	// Mark restart as pending so the lifecycle handler knows to start after stop.
-	if err := setAnnotationPatch(ctx, r.client, cluster, util.AnnotationRestartPending, "true"); err != nil {
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationRestartPending, annotationValueTrue); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting restart-pending annotation: %w", err)
 	}
 
@@ -1932,7 +2043,7 @@ func (r *ClusterReconciler) cleanupScaleAnnotations(
 
 	// Clean up confirmation annotation after successful scale-in to avoid
 	// stale annotations persisting across future reconciliation cycles.
-	if isScaleIn && cluster.Annotations[util.AnnotationConfirmScaleIn] == "true" {
+	if isScaleIn && cluster.Annotations[util.AnnotationConfirmScaleIn] == annotationValueTrue {
 		if err := removeAnnotationPatch(ctx, r.client, cluster,
 			util.AnnotationConfirmScaleIn); err != nil {
 			logger.Error("failed to remove confirm-scale-in annotation", "error", err)
@@ -2216,61 +2327,120 @@ func (r *ClusterReconciler) updatePhase(
 func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	now := metav1.Now()
 	cluster.Status.LastReconcileTime = &now
-	cluster.Status.ObservedGeneration = cluster.Generation
-	cluster.Status.ClusterVersion = cluster.Spec.Version
+	// Only update ClusterVersion if no upgrade is pending. During an upgrade,
+	// ClusterVersion is updated by completeUpgrade after verification passes.
+	// Setting it prematurely would defeat the upgrade detection logic.
+	if !r.isUpgradeNeeded(cluster) {
+		cluster.Status.ClusterVersion = cluster.Spec.Version
+	}
 	cluster.Status.SegmentsTotal = cluster.Spec.Segments.Count
 
+	r.updateObservedGeneration(ctx, cluster)
+	r.updateComponentReadiness(ctx, cluster)
+	r.updateMirroringStatus(ctx, cluster)
+	r.determineOverallPhase(cluster)
+
+	// Update metrics.
+	r.metrics.UpdateClusterInfo(
+		cluster.Name, cluster.Namespace,
+		cluster.Spec.Version, string(cluster.Status.Phase),
+		float64(cluster.Status.SegmentsReady),
+	)
+	r.metrics.SetCoordinatorUp(cluster.Name, cluster.Namespace, cluster.Status.CoordinatorReady)
+	r.metrics.SetStandbyUp(cluster.Name, cluster.Namespace, cluster.Status.StandbyReady)
+	r.metrics.SetSegmentsReady(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsReady))
+	r.metrics.SetSegmentsTotal(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsTotal))
+
+	return r.client.Status().Update(ctx, cluster)
+}
+
+// updateObservedGeneration advances ObservedGeneration unless a blocked scale-in is pending.
+// A blocked scale-in occurs when the desired segment count is less than the actual
+// StatefulSet replicas but the confirmation annotation is missing.
+func (r *ClusterReconciler) updateObservedGeneration(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+	primaryStsForGen := &appsv1.StatefulSet{}
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name:      util.SegmentPrimaryName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, primaryStsForGen); err == nil && primaryStsForGen.Spec.Replicas != nil {
+		currentReplicas := *primaryStsForGen.Spec.Replicas
+		desiredCount := cluster.Spec.Segments.Count
+		if desiredCount < currentReplicas {
+			_, hasScaleInState := cluster.Annotations[annotationScaleInState]
+			if !hasScaleInState {
+				logger.Debug("not advancing ObservedGeneration due to pending blocked scale-in",
+					"currentReplicas", currentReplicas, "desiredCount", desiredCount)
+				return
+			}
+		}
+	}
+	cluster.Status.ObservedGeneration = cluster.Generation
+}
+
+// updateComponentReadiness checks the readiness of coordinator, standby, and segment StatefulSets.
+func (r *ClusterReconciler) updateComponentReadiness(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
 	// Check coordinator readiness.
 	coordSts := &appsv1.StatefulSet{}
-	coordErr := r.client.Get(ctx, types.NamespacedName{
+	if err := r.client.Get(ctx, types.NamespacedName{
 		Name:      util.CoordinatorName(cluster.Name),
 		Namespace: cluster.Namespace,
-	}, coordSts)
-	if coordErr == nil {
+	}, coordSts); err == nil {
 		cluster.Status.CoordinatorReady = coordSts.Status.ReadyReplicas > 0
 	}
 
 	// Check standby readiness.
 	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
 		standbySts := &appsv1.StatefulSet{}
-		standbyErr := r.client.Get(ctx, types.NamespacedName{
+		if err := r.client.Get(ctx, types.NamespacedName{
 			Name:      util.StandbyName(cluster.Name),
 			Namespace: cluster.Namespace,
-		}, standbySts)
-		if standbyErr == nil {
+		}, standbySts); err == nil {
 			cluster.Status.StandbyReady = standbySts.Status.ReadyReplicas > 0
 		}
 	}
 
 	// Check segment readiness.
 	primarySts := &appsv1.StatefulSet{}
-	primaryErr := r.client.Get(ctx, types.NamespacedName{
+	if err := r.client.Get(ctx, types.NamespacedName{
 		Name:      util.SegmentPrimaryName(cluster.Name),
 		Namespace: cluster.Namespace,
-	}, primarySts)
-	if primaryErr == nil {
+	}, primarySts); err == nil {
 		cluster.Status.SegmentsReady = primarySts.Status.ReadyReplicas
 	}
+}
 
-	// Determine mirroring status.
-	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
-		mirrorSts := &appsv1.StatefulSet{}
-		mirrorErr := r.client.Get(ctx, types.NamespacedName{
-			Name:      util.SegmentMirrorName(cluster.Name),
-			Namespace: cluster.Namespace,
-		}, mirrorSts)
-		if mirrorErr == nil && mirrorSts.Spec.Replicas != nil &&
-			mirrorSts.Status.ReadyReplicas == *mirrorSts.Spec.Replicas {
-			cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
-		} else {
-			cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
-		}
-	} else {
+// updateMirroringStatus determines the mirroring status based on the mirror StatefulSet state.
+func (r *ClusterReconciler) updateMirroringStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	if cluster.Spec.Segments.Mirroring == nil || !cluster.Spec.Segments.Mirroring.Enabled {
 		cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+		return
 	}
+	mirrorSts := &appsv1.StatefulSet{}
+	mirrorErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      util.SegmentMirrorName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, mirrorSts)
+	if mirrorErr == nil && mirrorSts.Spec.Replicas != nil &&
+		mirrorSts.Status.ReadyReplicas == *mirrorSts.Spec.Replicas {
+		cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	} else {
+		cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
+	}
+}
 
-	// Determine overall phase.
-	// Preserve intentional lifecycle phases that should not be overridden.
+// determineOverallPhase sets the cluster phase based on component readiness.
+// Intentional lifecycle phases (Deleting, Stopped, etc.) are preserved.
+func (r *ClusterReconciler) determineOverallPhase(cluster *cbv1alpha1.CloudberryCluster) {
 	switch cluster.Status.Phase {
 	case cbv1alpha1.ClusterPhaseDeleting,
 		cbv1alpha1.ClusterPhaseStopped,
@@ -2303,19 +2473,6 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *cbv1alpha
 			)
 		}
 	}
-
-	// Update metrics.
-	r.metrics.UpdateClusterInfo(
-		cluster.Name, cluster.Namespace,
-		cluster.Spec.Version, string(cluster.Status.Phase),
-		float64(cluster.Status.SegmentsReady),
-	)
-	r.metrics.SetCoordinatorUp(cluster.Name, cluster.Namespace, cluster.Status.CoordinatorReady)
-	r.metrics.SetStandbyUp(cluster.Name, cluster.Namespace, cluster.Status.StandbyReady)
-	r.metrics.SetSegmentsReady(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsReady))
-	r.metrics.SetSegmentsTotal(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsTotal))
-
-	return r.client.Status().Update(ctx, cluster)
 }
 
 // recordReconcileResult records the reconciliation result in metrics.
@@ -2954,6 +3111,18 @@ const (
 	upgradePhaseVerify      = "verify"
 )
 
+// isUpgradeRolledBack checks whether a previous upgrade failed and was rolled back.
+// When this is true, the operator should NOT reconcile StatefulSets because the
+// spec still contains the broken image that caused the failure.
+func (r *ClusterReconciler) isUpgradeRolledBack(cluster *cbv1alpha1.CloudberryCluster) bool {
+	for _, c := range cluster.Status.Conditions {
+		if c.Type == string(cbv1alpha1.ConditionUpgradeFailed) && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
 // isUpgradeNeeded checks whether a cluster upgrade is needed or in progress.
 func (r *ClusterReconciler) isUpgradeNeeded(cluster *cbv1alpha1.CloudberryCluster) bool {
 	// Check if an upgrade is already in progress.
@@ -3337,7 +3506,8 @@ func (r *ClusterReconciler) revertStatefulSetImage(
 	return r.updateStatefulSetImage(ctx, namespace, name, image)
 }
 
-// isStatefulSetReady checks whether a StatefulSet has all desired replicas ready.
+// isStatefulSetReady checks whether a StatefulSet has all desired replicas ready
+// AND fully updated (i.e., the rolling update has completed).
 func (r *ClusterReconciler) isStatefulSetReady(
 	ctx context.Context,
 	namespace, name string,
@@ -3353,10 +3523,17 @@ func (r *ClusterReconciler) isStatefulSetReady(
 		return false
 	}
 
-	if sts.Spec.Replicas == nil {
-		return sts.Status.ReadyReplicas >= 1
+	desired := int32(1)
+	if sts.Spec.Replicas != nil {
+		desired = *sts.Spec.Replicas
 	}
-	return sts.Status.ReadyReplicas >= *sts.Spec.Replicas
+
+	// Both ReadyReplicas and UpdatedReplicas must match the desired count.
+	// UpdatedReplicas tracks pods that have been updated to the current spec
+	// (i.e., the rolling update has reached them). Without this check, the
+	// operator may consider a StatefulSet "ready" while old pods are still
+	// serving — which is incorrect during an upgrade.
+	return sts.Status.ReadyReplicas >= desired && sts.Status.UpdatedReplicas >= desired
 }
 
 // getAllStatefulSetNames returns all StatefulSet names for a cluster,

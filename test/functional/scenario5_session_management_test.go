@@ -175,6 +175,15 @@ func (m *scenario5MockDBClient) DeregisterSegments(_ context.Context, _ int32) e
 func (m *scenario5MockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ db.ScaleInRedistributionOptions) error {
 	return nil
 }
+func (m *scenario5MockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewInfo, error) {
+	return nil, nil
+}
+func (m *scenario5MockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (m *scenario5MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
+	return nil, nil
+}
 
 // scenario5MockDBFactory implements db.DBClientFactory for testing.
 type scenario5MockDBFactory struct {

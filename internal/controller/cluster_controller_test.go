@@ -2623,6 +2623,7 @@ func TestClusterReconciler_IsStatefulSetReady(t *testing.T) {
 	replicas := int32(1)
 	sts.Spec.Replicas = &replicas
 	sts.Status.ReadyReplicas = 1
+	sts.Status.UpdatedReplicas = 1
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3242,10 +3243,12 @@ func TestClusterReconciler_VerifyUpgrade_AllReady(t *testing.T) {
 	replicas := int32(1)
 	coordSts.Spec.Replicas = &replicas
 	coordSts.Status.ReadyReplicas = 1
+	coordSts.Status.UpdatedReplicas = 1
 
 	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	primarySts.Spec.Replicas = &cluster.Spec.Segments.Count
 	primarySts.Status.ReadyReplicas = cluster.Spec.Segments.Count
+	primarySts.Status.UpdatedReplicas = cluster.Spec.Segments.Count
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3726,7 +3729,8 @@ func TestClusterReconciler_CheckMirroringProgress_Complete(t *testing.T) {
 	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
-	mirrorSts.Status.ReadyReplicas = 4 // All ready.
+	mirrorSts.Status.ReadyReplicas = 4   // All ready.
+	mirrorSts.Status.UpdatedReplicas = 4 // All updated.
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -4514,6 +4518,7 @@ func TestClusterReconciler_MonitorMirrorSync_NoDBFactory(t *testing.T) {
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
 	mirrorSts.Status.ReadyReplicas = 4
+	mirrorSts.Status.UpdatedReplicas = 4
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -4544,6 +4549,7 @@ func TestClusterReconciler_MonitorMirrorSync_EmptySyncStatus(t *testing.T) {
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
 	mirrorSts.Status.ReadyReplicas = 4
+	mirrorSts.Status.UpdatedReplicas = 4
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -4915,7 +4921,8 @@ func TestClusterReconciler_CheckMirroringProgress_STSReady_AdvancesToInit(t *tes
 	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
 	replicas := int32(4)
 	mirrorSts.Spec.Replicas = &replicas
-	mirrorSts.Status.ReadyReplicas = 4 // All ready.
+	mirrorSts.Status.ReadyReplicas = 4   // All ready.
+	mirrorSts.Status.UpdatedReplicas = 4 // All updated.
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
