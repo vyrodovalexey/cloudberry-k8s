@@ -1362,9 +1362,7 @@ func TestBuildRoleOptions_CombinedOptions(t *testing.T) {
 	}
 	result := buildRoleOptions(opts)
 
-	// Verify order: LOGIN, SUPERUSER, CREATEDB, CREATEROLE, PASSWORD, VALID UNTIL
-	loginIdx := len(result) - len(result) // just check contains
-	_ = loginIdx
+	// Verify all expected clauses are present.
 	assert.Contains(t, result, "LOGIN")
 	assert.Contains(t, result, "SUPERUSER")
 	assert.Contains(t, result, "CREATEDB")
