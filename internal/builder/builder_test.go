@@ -973,7 +973,7 @@ func TestBuildMainContainer_WithSSL(t *testing.T) {
 		},
 	}
 
-	container, err := buildMainContainer(cluster, 5432, nil)
+	container, err := buildMainContainer(cluster, 5432, nil, util.ComponentCoordinator)
 	require.NoError(t, err)
 
 	// Verify TLS volume mount is present.
@@ -991,7 +991,7 @@ func TestBuildMainContainer_WithSSL(t *testing.T) {
 func TestBuildMainContainer_WithoutSSL(t *testing.T) {
 	cluster := newTestCluster()
 
-	container, err := buildMainContainer(cluster, 5432, nil)
+	container, err := buildMainContainer(cluster, 5432, nil, util.ComponentCoordinator)
 	require.NoError(t, err)
 
 	// Verify TLS volume mount is NOT present.
@@ -1007,7 +1007,7 @@ func TestBuildMainContainer_WithResources(t *testing.T) {
 		Limits:   &cbv1alpha1.ResourceList{CPU: "2", Memory: "4Gi"},
 	}
 
-	container, err := buildMainContainer(cluster, 5432, resources)
+	container, err := buildMainContainer(cluster, 5432, resources, util.ComponentCoordinator)
 	require.NoError(t, err)
 	assert.NotEmpty(t, container.Resources.Requests)
 	assert.NotEmpty(t, container.Resources.Limits)
@@ -1019,9 +1019,119 @@ func TestBuildMainContainer_InvalidResources(t *testing.T) {
 		Requests: &cbv1alpha1.ResourceList{CPU: "invalid"},
 	}
 
-	_, err := buildMainContainer(cluster, 5432, resources)
+	_, err := buildMainContainer(cluster, 5432, resources, util.ComponentCoordinator)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "converting resources")
+}
+
+func TestBuildMainContainer_CloudberryEnvVars(t *testing.T) {
+	tests := []struct {
+		name          string
+		component     string
+		expectedRole  string
+		expectPodName bool
+	}{
+		{
+			name:          "coordinator",
+			component:     util.ComponentCoordinator,
+			expectedRole:  "coordinator",
+			expectPodName: true,
+		},
+		{
+			name:          "standby",
+			component:     util.ComponentStandby,
+			expectedRole:  "standby",
+			expectPodName: false,
+		},
+		{
+			name:          "segment primary",
+			component:     util.ComponentSegmentPrimary,
+			expectedRole:  "primary",
+			expectPodName: true,
+		},
+		{
+			name:          "segment mirror",
+			component:     util.ComponentSegmentMirror,
+			expectedRole:  "mirror",
+			expectPodName: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cluster := newTestCluster()
+			container, err := buildMainContainer(cluster, 5432, nil, tt.component)
+			require.NoError(t, err)
+
+			envMap := make(map[string]corev1.EnvVar)
+			for _, env := range container.Env {
+				envMap[env.Name] = env
+			}
+
+			// Verify CLOUDBERRY_ROLE is set correctly.
+			roleEnv, ok := envMap["CLOUDBERRY_ROLE"]
+			require.True(t, ok, "CLOUDBERRY_ROLE env var should be present")
+			assert.Equal(t, tt.expectedRole, roleEnv.Value)
+
+			// Verify CLOUDBERRY_COORDINATOR_HOST is set.
+			coordHostEnv, ok := envMap["CLOUDBERRY_COORDINATOR_HOST"]
+			require.True(t, ok, "CLOUDBERRY_COORDINATOR_HOST env var should be present")
+			assert.Equal(t, util.CoordinatorServiceName(cluster.Name), coordHostEnv.Value)
+
+			// Verify CLOUDBERRY_SEGMENT_COUNT is set.
+			segCountEnv, ok := envMap["CLOUDBERRY_SEGMENT_COUNT"]
+			require.True(t, ok, "CLOUDBERRY_SEGMENT_COUNT env var should be present")
+			assert.Equal(t, "4", segCountEnv.Value)
+
+			// Verify CLOUDBERRY_CONTENT_ID is set.
+			_, ok = envMap["CLOUDBERRY_CONTENT_ID"]
+			assert.True(t, ok, "CLOUDBERRY_CONTENT_ID env var should be present")
+
+			// Verify POD_NAME is set for segments only.
+			_, hasPodName := envMap["POD_NAME"]
+			assert.Equal(t, tt.expectPodName, hasPodName,
+				"POD_NAME env var presence should match expectation")
+		})
+	}
+}
+
+func TestBuildMainContainer_SecurityContext(t *testing.T) {
+	cluster := newTestCluster()
+	container, err := buildMainContainer(cluster, 5432, nil, util.ComponentCoordinator)
+	require.NoError(t, err)
+
+	require.NotNil(t, container.SecurityContext, "security context should be set")
+	require.NotNil(t, container.SecurityContext.RunAsUser, "RunAsUser should be set")
+	assert.Equal(t, int64(1000), *container.SecurityContext.RunAsUser)
+	require.NotNil(t, container.SecurityContext.RunAsGroup, "RunAsGroup should be set")
+	assert.Equal(t, int64(1000), *container.SecurityContext.RunAsGroup)
+}
+
+func TestBuildInitContainer_SecurityContext(t *testing.T) {
+	container := buildInitContainer()
+	require.NotNil(t, container.SecurityContext, "init container security context should be set")
+	require.NotNil(t, container.SecurityContext.RunAsUser, "init container RunAsUser should be set")
+	assert.Equal(t, int64(0), *container.SecurityContext.RunAsUser,
+		"init container should run as root to set ownership")
+}
+
+func TestCloudberryRoleForComponent(t *testing.T) {
+	tests := []struct {
+		component string
+		expected  string
+	}{
+		{util.ComponentCoordinator, "coordinator"},
+		{util.ComponentStandby, "standby"},
+		{util.ComponentSegmentPrimary, "primary"},
+		{util.ComponentSegmentMirror, "mirror"},
+		{"unknown", "coordinator"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.component, func(t *testing.T) {
+			assert.Equal(t, tt.expected, cloudberryRoleForComponent(tt.component))
+		})
+	}
 }
 
 func TestBuildInitContainer(t *testing.T) {
@@ -1030,6 +1140,10 @@ func TestBuildInitContainer(t *testing.T) {
 	assert.Equal(t, "busybox:1.36", container.Image)
 	require.Len(t, container.VolumeMounts, 1)
 	assert.Equal(t, "data", container.VolumeMounts[0].Name)
+	// Init container must run as root to chown the data directory.
+	require.NotNil(t, container.SecurityContext)
+	require.NotNil(t, container.SecurityContext.RunAsUser)
+	assert.Equal(t, int64(0), *container.SecurityContext.RunAsUser)
 }
 
 func TestOwnerRef(t *testing.T) {

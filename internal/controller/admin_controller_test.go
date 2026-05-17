@@ -1198,17 +1198,23 @@ func TestAdminReconciler_ContinueRollingRestart_PhaseComplete(t *testing.T) {
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
 
 	b := builder.NewBuilder()
-	// Create the primary STS with all replicas ready.
+	// Create the primary STS with all replicas rolled (ready + updated + revisions match).
 	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	replicas := int32(4)
 	primarySts.Spec.Replicas = &replicas
 	primarySts.Status.ReadyReplicas = 4
+	primarySts.Status.UpdatedReplicas = 4
+	primarySts.Status.CurrentRevision = "rev-2"
+	primarySts.Status.UpdateRevision = "rev-2"
 
-	// Create coordinator STS with all replicas ready.
+	// Create coordinator STS with all replicas rolled.
 	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	coordReplicas := int32(1)
 	coordSts.Spec.Replicas = &coordReplicas
 	coordSts.Status.ReadyReplicas = 1
+	coordSts.Status.UpdatedReplicas = 1
+	coordSts.Status.CurrentRevision = "rev-2"
+	coordSts.Status.UpdateRevision = "rev-2"
 
 	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
 	cluster.Annotations = map[string]string{
@@ -1230,7 +1236,7 @@ func TestAdminReconciler_ContinueRollingRestart_PhaseComplete(t *testing.T) {
 	assert.NotZero(t, result.RequeueAfter)
 }
 
-func TestAdminReconciler_ContinueRollingRestart_WaitingForReady(t *testing.T) {
+func TestAdminReconciler_ContinueRollingRestart_WaitingForRolled(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
@@ -1239,7 +1245,10 @@ func TestAdminReconciler_ContinueRollingRestart_WaitingForReady(t *testing.T) {
 	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	replicas := int32(4)
 	primarySts.Spec.Replicas = &replicas
-	primarySts.Status.ReadyReplicas = 2 // Not all ready.
+	primarySts.Status.ReadyReplicas = 4
+	primarySts.Status.UpdatedReplicas = 2 // Not all updated yet.
+	primarySts.Status.CurrentRevision = "rev-1"
+	primarySts.Status.UpdateRevision = "rev-2"
 
 	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
 	cluster.Annotations = map[string]string{
@@ -1353,7 +1362,7 @@ func TestAdminReconciler_RestartStatefulSet_NotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "getting statefulset")
 }
 
-func TestAdminReconciler_IsStatefulSetReady_True(t *testing.T) {
+func TestAdminReconciler_IsStatefulSetRolled_True(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	b := builder.NewBuilder()
@@ -1361,6 +1370,9 @@ func TestAdminReconciler_IsStatefulSetReady_True(t *testing.T) {
 	replicas := int32(1)
 	sts.Spec.Replicas = &replicas
 	sts.Status.ReadyReplicas = 1
+	sts.Status.UpdatedReplicas = 1
+	sts.Status.CurrentRevision = "rev-2"
+	sts.Status.UpdateRevision = "rev-2"
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1372,12 +1384,12 @@ func TestAdminReconciler_IsStatefulSetReady_True(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	rolled, err := r.isStatefulSetRolled(context.Background(), "default", sts.Name)
 	require.NoError(t, err)
-	assert.True(t, ready)
+	assert.True(t, rolled)
 }
 
-func TestAdminReconciler_IsStatefulSetReady_False(t *testing.T) {
+func TestAdminReconciler_IsStatefulSetRolled_NotReady(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	b := builder.NewBuilder()
@@ -1385,6 +1397,9 @@ func TestAdminReconciler_IsStatefulSetReady_False(t *testing.T) {
 	replicas := int32(1)
 	sts.Spec.Replicas = &replicas
 	sts.Status.ReadyReplicas = 0
+	sts.Status.UpdatedReplicas = 0
+	sts.Status.CurrentRevision = "rev-1"
+	sts.Status.UpdateRevision = "rev-2"
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1396,12 +1411,40 @@ func TestAdminReconciler_IsStatefulSetReady_False(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	rolled, err := r.isStatefulSetRolled(context.Background(), "default", sts.Name)
 	require.NoError(t, err)
-	assert.False(t, ready)
+	assert.False(t, rolled)
 }
 
-func TestAdminReconciler_IsStatefulSetReady_NilReplicas(t *testing.T) {
+func TestAdminReconciler_IsStatefulSetRolled_RevisionMismatch(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(1)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 1
+	sts.Status.UpdatedReplicas = 1
+	// Revisions don't match — rolling update not yet complete.
+	sts.Status.CurrentRevision = "rev-1"
+	sts.Status.UpdateRevision = "rev-2"
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	rolled, err := r.isStatefulSetRolled(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+	assert.False(t, rolled)
+}
+
+func TestAdminReconciler_IsStatefulSetRolled_NilReplicas(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	b := builder.NewBuilder()
@@ -1419,9 +1462,37 @@ func TestAdminReconciler_IsStatefulSetReady_NilReplicas(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	ready, err := r.isStatefulSetReady(context.Background(), "default", sts.Name)
+	rolled, err := r.isStatefulSetRolled(context.Background(), "default", sts.Name)
 	require.NoError(t, err)
-	assert.True(t, ready)
+	assert.False(t, rolled)
+}
+
+func TestAdminReconciler_IsStatefulSetRolled_UpdatedReplicasMismatch(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	b := builder.NewBuilder()
+	sts, _ := b.BuildCoordinatorStatefulSet(cluster)
+	replicas := int32(3)
+	sts.Spec.Replicas = &replicas
+	sts.Status.ReadyReplicas = 3
+	// Only 2 of 3 replicas updated so far.
+	sts.Status.UpdatedReplicas = 2
+	sts.Status.CurrentRevision = "rev-1"
+	sts.Status.UpdateRevision = "rev-2"
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sts).
+		WithStatusSubresource(sts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	rolled, err := r.isStatefulSetRolled(context.Background(), "default", sts.Name)
+	require.NoError(t, err)
+	assert.False(t, rolled)
 }
 
 func TestAdminReconciler_StatefulSetNameForPhase(t *testing.T) {
@@ -1529,6 +1600,57 @@ func TestAdminReconciler_ApplyReloadSafe(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestAdminReconciler_ApplyReloadSafe_WithDBFactory(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	// Use a mock DB factory that returns a mock client.
+	dbFactory := &mockDBClientFactory{
+		client: &mockDBClient{},
+	}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
+
+	err := r.applyReloadSafe(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
+func TestAdminReconciler_ApplyReloadSafe_DBFactoryError(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	// Use a mock DB factory that returns an error.
+	dbFactory := &mockDBClientFactory{
+		err: fmt.Errorf("connection refused"),
+	}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
+
+	// Should not return an error — DB reload failure is non-fatal.
+	err := r.applyReloadSafe(context.Background(), cluster)
+	require.NoError(t, err)
+}
+
 func TestAdminReconciler_ApplyRestartRequired(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -1625,11 +1747,17 @@ func TestAdminReconciler_Reconcile_WithRollingRestartAnnotation(t *testing.T) {
 	replicas := int32(4)
 	primarySts.Spec.Replicas = &replicas
 	primarySts.Status.ReadyReplicas = 4
+	primarySts.Status.UpdatedReplicas = 4
+	primarySts.Status.CurrentRevision = "rev-2"
+	primarySts.Status.UpdateRevision = "rev-2"
 
 	coordSts, _ := b.BuildCoordinatorStatefulSet(cluster)
 	coordReplicas := int32(1)
 	coordSts.Spec.Replicas = &coordReplicas
 	coordSts.Status.ReadyReplicas = 1
+	coordSts.Status.UpdatedReplicas = 1
+	coordSts.Status.CurrentRevision = "rev-2"
+	coordSts.Status.UpdateRevision = "rev-2"
 
 	state := `{"phase":"primaries","startedAt":"2026-01-01T00:00:00Z","restartParams":["max_connections"]}`
 	cluster.Annotations = map[string]string{

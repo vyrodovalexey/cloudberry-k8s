@@ -46,6 +46,8 @@ const (
 	MirroringDegraded MirroringStatus = "Degraded"
 	// MirroringDown indicates mirroring is completely down.
 	MirroringDown MirroringStatus = "Down"
+	// MirroringInitializing indicates mirrors are being initialized from primaries.
+	MirroringInitializing MirroringStatus = "Initializing"
 )
 
 // MirroringLayout represents the mirror placement strategy.
@@ -262,8 +264,24 @@ const (
 	EventReasonRollingRestartCompleted = "RollingRestartCompleted"
 	// EventReasonMaintenanceStarted indicates a maintenance operation has started.
 	EventReasonMaintenanceStarted = "MaintenanceStarted"
+	// EventReasonMaintenanceCompleted indicates a maintenance operation has completed.
+	EventReasonMaintenanceCompleted = "MaintenanceCompleted"
 	// EventReasonMaintenanceUnknown indicates an unknown maintenance operation was requested.
 	EventReasonMaintenanceUnknown = "MaintenanceUnknown"
+	// EventReasonMirroringEnabled indicates mirroring has been enabled on the cluster.
+	EventReasonMirroringEnabled = "MirroringEnabled"
+	// EventReasonMirroringDisabled indicates mirroring has been disabled on the cluster.
+	EventReasonMirroringDisabled = "MirroringDisabled"
+	// EventReasonMirroringInitializing indicates mirror initialization is in progress.
+	EventReasonMirroringInitializing = "MirroringInitializing"
+	// EventReasonMirroringInSync indicates all mirrors are synchronized.
+	EventReasonMirroringInSync = "MirroringInSync"
+	// EventReasonMirroringFailed indicates a mirroring operation has failed.
+	EventReasonMirroringFailed = "MirroringFailed"
+	// EventReasonSegmentFailover indicates a segment failover has been triggered.
+	EventReasonSegmentFailover = "SegmentFailover"
+	// EventReasonSegmentFailoverCompleted indicates a segment failover has completed.
+	EventReasonSegmentFailoverCompleted = "SegmentFailoverCompleted"
 )
 
 // +kubebuilder:object:root=true

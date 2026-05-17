@@ -37,7 +37,7 @@
 | CLI | cloudberry-ctl (cobra / viper) |
 | CRD | CloudberryCluster (v1alpha1, group: avsoft.io) |
 | Test Coverage Target | 90%+ unit test statement coverage |
-| Total Tasks | 60 |
+| Total Tasks | 61 |
 | Estimated Effort | 93-130 developer-days |
 
 ---
@@ -1733,6 +1733,124 @@ I.7 ──> J.1..J.3
 
 ---
 
+### I.8b - Scenario 19: Enable/Disable Mirroring Tests
+
+| Attribute | Value |
+|-----------|-------|
+| **Dependencies** | I.6, I.7, D.1, D.2 |
+| **Priority** | P1 |
+| **Complexity** | XL |
+
+**Description**: Functional and E2E tests for enabling and disabling mirroring on existing clusters (Scenario 19). Covers the full mirroring lifecycle including state machine transitions, webhook validation, timeout handling, and metrics recording.
+
+**Test Cases — Enable Mirroring**:
+- Enable mirroring on Running cluster with group layout → phase transitions through `Updating` → `Running`, mirroring status through `Initializing` → `Syncing` → `InSync`
+- Enable mirroring on Running cluster with spread layout → mirrors distributed correctly
+- Enable mirroring creates mirror StatefulSet `{cluster}-segment-mirror` with correct replica count
+- Enable mirroring sets `avsoft.io/mirroring-state` annotation with `creating-sts` phase
+- Mirror STS readiness advances state to `initializing` phase
+- DB client `InitializeMirrors()` called with correct layout and segment count
+- DB client `ConfigureReplication()` called with sync mode
+- `GetMirrorSyncStatus()` polled during syncing phase; `SetReplicationLag` metric updated per segment
+- On completion: `MirroringInSync` event emitted, `cloudberry_mirroring_operations_total{operation="enable"}` incremented
+- On completion: `avsoft.io/mirroring-state` annotation removed
+- `MirroringHealthy` condition transitions: `False/MirroringInitializing` → `True/MirroringInSync`
+
+**Test Cases — Enable Mirroring Validation**:
+- Enable mirroring on non-Running cluster → blocked with `MirroringFailed` event
+- Enable mirroring with insufficient segments for group layout → blocked with warning event
+- Enable mirroring with insufficient segments for spread layout → blocked with warning event
+- Webhook rejects enable on non-Running cluster with descriptive error
+- Webhook rejects enable with insufficient segment count
+- Webhook warns on spread layout with marginal segment count
+
+**Test Cases — Enable Mirroring Timeout**:
+- Mirroring enable exceeding 30-minute timeout → `mirroringStatus: Degraded`
+- Timeout sets `MirroringHealthy` condition to `False/MirroringTimeout`
+- Timeout emits `MirroringFailed` event with timeout message
+- Timeout removes `avsoft.io/mirroring-state` annotation
+
+**Test Cases — Disable Mirroring**:
+- Disable mirroring on Running cluster → mirror StatefulSet deleted, `mirroringStatus: NotConfigured`
+- Disable mirroring with `deletionPolicy: Delete` → mirror PVCs cleaned up
+- Disable mirroring with `deletionPolicy: Retain` → mirror PVCs preserved
+- Disable mirroring emits `MirroringDisabled` events (warning on initiation, normal on completion)
+- Disable mirroring records `cloudberry_mirroring_operations_total{operation="disable"}`
+- Disable mirroring on non-Running cluster → blocked with `MirroringFailed` event
+- `MirroringHealthy` condition set to `False/MirroringDisabled`
+
+**Test Cases — Webhook Validation**:
+- Layout change while mirroring enabled → rejected ("disable mirroring first")
+- Layout change while mirroring disabled → allowed
+- Enable with group layout and `count >= 2 * primariesPerHost` → allowed
+- Enable with spread layout and `count > primariesPerHost` → allowed
+- Enable with spread layout and `count <= primariesPerHost` → rejected
+
+**Test Cases — Edge Cases**:
+- Enable mirroring without dbFactory → DB-level init skipped, STS readiness used as sync indicator
+- Disable mirroring when mirror StatefulSet does not exist → no error (idempotent)
+- `checkMirroringProgress` called without state annotation → requeue with default interval
+- Unknown mirroring phase in state annotation → auto-completes
+- Re-enable mirroring after previous disable → full cycle works correctly
+
+---
+
+### I.8c - Scenario 20: Automatic Segment Failover via FTS Tests
+
+| Attribute | Value |
+|-----------|-------|
+| **Dependencies** | I.6, I.7, D.2 |
+| **Priority** | P1 |
+| **Complexity** | XL |
+
+**Description**: Functional and E2E tests for automatic segment failover via the FTS probe mechanism (Scenario 20). Covers the full detection → failover → verification flow, retry logic, metrics recording, event emission, and edge cases.
+
+**Test Cases — Detection Phase (probeSegmentConfigWithRetries)**:
+- FTS probe succeeds on first attempt → segments returned, no failure metric incremented
+- FTS probe fails once then succeeds on retry → `fts_probe_failures_total` incremented once, success logged with attempt number
+- FTS probe fails all `ftsProbeRetries` attempts → error returned with "after N retries" message, `fts_probe_failures_total` incremented N times
+- Each retry attempt uses a fresh context with `ftsProbeTimeout` deadline (default 20s)
+- Custom `ftsProbeTimeout` from HASpec is respected (e.g., 10s)
+- Custom `ftsProbeRetries` from HASpec is respected (e.g., 3)
+- Default timeout (20s) used when HASpec.FTSProbeTimeout is 0 or unset
+- Default retries (5) used when HASpec.FTSProbeRetries is 0 or unset
+
+**Test Cases — Segment Analysis (analyzeSegments)**:
+- All segments healthy (status="u") → `allHealthy=true`, no failed segments
+- One primary down (role="p", status!="u") → `failedPrimaries` contains that segment, `allHealthy=false`
+- Multiple primaries down → all appear in `failedPrimaries`
+- Mirror down but primary healthy → `failedSegments` populated but `failedPrimaries` empty (no failover triggered)
+- Coordinator entries (contentID < 0) are skipped
+- Per-segment `cloudberry_segment_status` metric set for each non-coordinator segment
+
+**Test Cases — Failover Flow (handleFailover)**:
+- Single failed primary with successful mirror promotion → `SegmentFailover` event emitted with "failover completed" message, `cloudberry_fts_failover_total` incremented
+- Multiple failed primaries → `SegmentFailover` event emitted per failed primary, `cloudberry_fts_failover_total` incremented once (not per segment)
+- Mirror promoted successfully → event includes original and new primary hostnames
+- Mirror not promoted (pending) → event includes "mirror promotion pending" message
+- `TriggerFTSProbe()` calls `gp_request_fts_probe_scan()` on coordinator
+- `TriggerFTSProbe()` failure → failover continues, events still emitted for detected failures, `RecordFTSFailover` still called
+- Post-failover `GetSegmentConfiguration()` failure → events emitted for originally detected failures, `RecordFTSFailover` called, error returned
+- `cloudberry_segment_status` set to 0 for each failed primary during failover
+
+**Test Cases — Status Update (updateFTSProbeStatus)**:
+- All healthy → `mirroringStatus: InSync`, `cloudberry_mirroring_in_sync` set to true
+- Segments failed → `mirroringStatus: Degraded`, `cloudberry_mirroring_in_sync` set to false, `cloudberry_segments_failed` set to count, `MirroringDegraded` event emitted
+
+**Test Cases — Integration (runFTSProbe → handleFailover)**:
+- Full flow: probe detects failure → `analyzeSegments` identifies failed primary → `handleFailover` triggers FTS scan → re-read verifies promotion → events and metrics recorded → status patched
+- Mirroring disabled → `handleFailover` not called even if primaries are down
+- All segments healthy → no failover triggered, status set to `InSync`
+- `dbFactory` is nil → probe fails immediately with failure metric
+
+**Test Cases — Edge Cases**:
+- Empty `failedPrimaries` list passed to `handleFailover` → `TriggerFTSProbe` still called, re-read still performed (no short-circuit)
+- Failover when cluster is not in Running phase → FTS probe skipped entirely (HA controller guard)
+- Concurrent FTS probe cycles → handled by controller-runtime's single-threaded reconciliation per resource
+- `AnnotationFailoverState` (`avsoft.io/failover-state`) set during failover lifecycle
+
+---
+
 ### I.9 - E2E Tests: Authentication and Authorization
 
 | Attribute | Value |
@@ -1948,6 +2066,8 @@ I.7 ──> J.1..J.3
 | 50 | F.9 | Inspect Commands |
 | 51 | F.10 | Resource Group Commands |
 | 52 | I.8 | E2E Tests: HA and Recovery |
+| 52b | I.8b | Scenario 19: Enable/Disable Mirroring Tests |
+| 52c | I.8c | Scenario 20: Automatic Segment Failover via FTS Tests |
 | 53 | I.9 | E2E Tests: Authentication and Authorization |
 | 54 | J.1 | Reconciliation Performance Benchmarks |
 | 55 | J.2 | API Server Load Tests |
@@ -1995,9 +2115,9 @@ I.7 ──> J.1..J.3
 | F - CLI | 10 | XL | 10-14 |
 | G - Unit Tests | 7 | XXL | 10-14 |
 | H - DevOps | 5 | L | 6-8 |
-| I - Integration + E2E | 9 | XXL | 14-20 |
+| I - Integration + E2E | 10 | XXL | 16-22 |
 | J - Performance | 3 | M | 3-5 |
 | K - Documentation | 3 | L | 5-7 |
-| **TOTAL** | **60** | | **93-130 days** |
+| **TOTAL** | **61** | | **95-132 days** |
 
 > **Note**: Unit tests (Phase G) are listed as a separate phase for the final coverage sweep, but tests should be written alongside implementation in each phase. The G phase represents the gap analysis and additional tests needed to reach 90%+ coverage.

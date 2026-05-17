@@ -1,0 +1,112 @@
+# =============================================================================
+# Scenario 2: Configuration Hot-Reload Testing
+# =============================================================================
+# This example demonstrates how to test the config hot-reload feature of the
+# Cloudberry operator. The operator detects parameter changes, classifies them
+# as reload-safe (sighup) or restart-required (postmaster), and applies them
+# accordingly.
+#
+# Phase A: Initial cluster with baseline configuration.
+# Phase B: Patch the cluster to change reload-safe parameters (no restart needed).
+# Phase C: Patch the cluster to change restart-required parameters (rolling restart).
+#
+# Usage:
+#   # Deploy Phase A (initial cluster)
+#   kubectl apply -f scenario2-config-hotreload.yaml
+#
+#   # Wait for cluster to be Running
+#   kubectl wait --for=condition=Ready cloudberrycluster/scenario2-cluster -n cloudberry-test --timeout=300s
+#
+#   # Phase B: Change reload-safe parameters (work_mem, statement_timeout)
+#   kubectl patch cloudberrycluster scenario2-cluster -n cloudberry-test --type=merge -p '
+#   spec:
+#     config:
+#       parameters:
+#         work_mem: "128MB"
+#         statement_timeout: "60000"
+#   '
+#   # Verify: ConfigApplied condition should become True with reason "ConfigReloaded"
+#   kubectl get cloudberrycluster scenario2-cluster -n cloudberry-test -o jsonpath='{.status.conditions}'
+#
+#   # Phase C: Change restart-required parameters (max_connections)
+#   kubectl patch cloudberrycluster scenario2-cluster -n cloudberry-test --type=merge -p '
+#   spec:
+#     config:
+#       parameters:
+#         max_connections: "300"
+#   '
+#   # Verify: Rolling restart annotation should appear, then complete
+#   kubectl get cloudberrycluster scenario2-cluster -n cloudberry-test -o jsonpath='{.metadata.annotations}'
+#   # After completion, ConfigApplied condition should be True with reason "ConfigAppliedAfterRestart"
+#
+# Rolling Restart Order:
+#   mirrors -> primaries -> standby -> coordinator
+#   (segments are restarted first to minimize downtime)
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario2-cluster
+  namespace: cloudberry-test
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: true
+      layout: "group"
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  # Phase A: Initial configuration
+  config:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+      work_mem: "64MB"
+      statement_timeout: "30000"
+      gp_enable_global_deadlock_detector: "on"
+    coordinatorParameters:
+      log_min_duration_statement: "500"
+    databaseParameters:
+      mydb:
+        work_mem: "256MB"
+    roleParameters:
+      analyst:
+        statement_mem: "1GB"
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 5
+    ftsProbeRetries: 3
+  deletionPolicy: Retain
+  backupOnDelete: false

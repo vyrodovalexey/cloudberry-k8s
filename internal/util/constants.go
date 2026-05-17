@@ -50,6 +50,14 @@ const (
 	AnnotationScaleStarted = "avsoft.io/scale-started"
 	// AnnotationUpgrade tracks in-progress upgrade state as JSON.
 	AnnotationUpgrade = "avsoft.io/upgrade"
+	// AnnotationMirroringState tracks in-progress mirroring enable/disable state as JSON.
+	AnnotationMirroringState = "avsoft.io/mirroring-state"
+	// AnnotationFailoverState tracks in-progress failover state.
+	AnnotationFailoverState = "avsoft.io/failover-state"
+	// AnnotationPendingReload tracks a pending pg_reload_conf() call.
+	// The value is the RFC3339 timestamp when the ConfigMap was updated.
+	// The operator waits for ConfigMap volume propagation before calling reload.
+	AnnotationPendingReload = "avsoft.io/pending-reload"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"
@@ -84,6 +92,8 @@ const (
 	MaintenanceRedistribute = "redistribute"
 	// MaintenanceRebalance triggers a segment rebalance operation.
 	MaintenanceRebalance = "rebalance"
+	// MaintenanceLogRotate triggers a log file rotation.
+	MaintenanceLogRotate = "log-rotate"
 	// MaintenanceBackupOnDelete triggers a backup before cluster deletion.
 	MaintenanceBackupOnDelete = "backup-on-delete"
 

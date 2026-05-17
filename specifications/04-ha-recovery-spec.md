@@ -44,23 +44,119 @@ Each host's mirrors are distributed across multiple remaining hosts.
   - Host N's mirror M goes to Host (N + M + 1) % total_hosts
 - Pod topology spread constraints enforce distribution
 
-### 2.4 Adding Mirrors to Existing Cluster
+### 2.4 Adding Mirrors to Existing Cluster (Enable Mirroring)
 
-**Trigger**: Change `spec.segments.mirroring.enabled` from `false` to `true`
+**Trigger**: Change `spec.segments.mirroring.enabled` from `false` to `true` on a Running cluster.
+
+**Pre-flight Validation**:
+- Cluster must be in `Running` phase (rejected otherwise)
+- Segment count must be sufficient for the chosen layout:
+  - **Group layout**: requires `count >= 2 * primariesPerHost`
+  - **Spread layout**: requires `count > primariesPerHost`
+- Validated at both webhook admission and controller level
+
+**State Machine**:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotConfigured
+    NotConfigured --> Initializing : spec.mirroring.enabled=true
+    Initializing --> Syncing : base backup complete
+    Syncing --> InSync : all mirrors synchronized
+    Initializing --> Degraded : timeout (30min)
+    Syncing --> Degraded : timeout (30min)
+    InSync --> NotConfigured : spec.mirroring.enabled=false
+    Degraded --> NotConfigured : spec.mirroring.enabled=false
+```
+
+**Phase Transitions** (tracked via `avsoft.io/mirroring-state` annotation):
+
+| Phase | Description | Next Phase |
+|-------|-------------|------------|
+| `creating-sts` | Mirror StatefulSet created, waiting for pods to be ready | `initializing` |
+| `initializing` | Base backup from primaries via `InitializeMirrors()`, WAL replication configured via `ConfigureReplication()` | `syncing` |
+| `syncing` | Monitoring mirror sync status via `GetMirrorSyncStatus()` | `completed` |
+| `completed` | All mirrors synchronized, operation finalized | — |
+
+**Detailed Process**:
+
+1. **Transition to Updating phase**: Set `status.phase: Updating`, `status.mirroringStatus: Initializing`, and `MirroringHealthy` condition to `False` with reason `MirroringInitializing`.
+2. **Save state annotation**: Write `avsoft.io/mirroring-state` JSON annotation with phase, timestamps, and layout.
+3. **Create mirror StatefulSet**: Build and apply `{cluster}-segment-mirror` StatefulSet via resource builder.
+4. **Emit event**: `MirroringEnabled` — "Mirroring enable initiated with {layout} layout".
+5. **Wait for STS readiness** (requeue loop): Poll until all mirror pods are ready.
+6. **Initialize mirrors**: Call `DBClient.InitializeMirrors()` with layout, segment count, and parallelism (default: 2). Then call `DBClient.ConfigureReplication()` with sync mode.
+7. **Monitor sync**: Call `DBClient.GetMirrorSyncStatus()` to check per-segment sync status. Update `SetReplicationLag` metric per segment. Set `status.mirroringStatus: Syncing` during this phase.
+8. **Complete**: Set `status.phase: Running`, `status.mirroringStatus: InSync`, `MirroringHealthy` condition to `True`. Remove `avsoft.io/mirroring-state` annotation. Emit `MirroringInSync` event. Record `cloudberry_mirroring_operations_total{operation="enable"}` metric.
+
+**Cluster Phase Transition**: `Running` → `Updating` → `Running`
+
+**Timeout Handling**:
+- **Timeout**: 30 minutes from operation start
+- **On timeout**: Set `status.mirroringStatus: Degraded`, set `MirroringHealthy` condition to `False` with reason `MirroringTimeout`, remove state annotation, emit `MirroringFailed` event with timeout message.
+- The cluster remains in a usable state; the partially initialized mirrors may require manual intervention.
+
+**Error Handling**:
+- If the cluster is not in `Running` phase, the operation is silently skipped with a warning event (`MirroringFailed`).
+- If node count validation fails, the operation is skipped with a warning event.
+- Transient errors during STS creation, DB initialization, or sync monitoring trigger requeue with backoff.
+- If no `dbFactory` is configured, DB-level initialization is skipped (mirrors initialize via in-pod utilities).
+
+### 2.5 Removing Mirrors from Existing Cluster (Disable Mirroring)
+
+**Trigger**: Change `spec.segments.mirroring.enabled` from `true` to `false` on a Running cluster.
+
+**Pre-flight Validation**:
+- Cluster must be in `Running` phase (rejected otherwise)
+- Disabling is allowed from any mirroring status (`InSync`, `Degraded`, `Syncing`, etc.)
 
 **Process**:
-1. Validate sufficient nodes for mirror placement
-2. Create mirror StatefulSet
-3. Initialize mirror segments from primaries
-4. Start WAL replication
-5. Wait for mirrors to sync
-6. Update status `mirroringStatus: InSync`
 
-### 2.5 Transaction Log Replication
+1. **Emit warning event**: `MirroringDisabled` — "Mirroring disable initiated — data protection will be reduced".
+2. **Delete mirror StatefulSet**: Delete `{cluster}-segment-mirror` StatefulSet. Ignore `NotFound` errors (idempotent).
+3. **Clean up PVCs** (conditional):
+   - If `spec.deletionPolicy: Delete` — delete all mirror PVCs (`data-{cluster}-segment-mirror-{i}` for each segment).
+   - If `spec.deletionPolicy: Retain` — retain PVCs for potential re-enable.
+4. **Update status**: Set `status.mirroringStatus: NotConfigured`, set `MirroringHealthy` condition to `False` with reason `MirroringDisabled`.
+5. **Emit event**: `MirroringDisabled` — "Mirroring disabled successfully".
+6. **Record metric**: `cloudberry_mirroring_operations_total{operation="disable"}`.
+
+**Note**: Disabling mirroring does not change the cluster phase — it remains `Running` throughout.
+
+### 2.6 Replication Lag Monitoring in FTS Probe
+
+The FTS probe loop (see Section 3) includes replication lag monitoring for mirror segments:
+
+1. During each FTS probe cycle, the HA controller calls `DBClient.GetMirrorSyncStatus()`.
+2. For each mirror segment, the replication lag is reported via `SetReplicationLag(cluster, namespace, segmentID, lagBytes)`.
+3. This updates the `cloudberry_replication_lag_bytes` Prometheus gauge per segment.
+4. The same monitoring is performed during the mirroring enable `syncing` phase by the cluster controller.
+
+### 2.7 Webhook Validation for Mirroring Transitions
+
+The validating webhook (`validateMirroringTransition`) enforces the following rules on UPDATE operations:
+
+| Transition | Validation | Result |
+|-----------|------------|--------|
+| Enable mirroring (`false` → `true`) | Cluster must be in `Running` phase | Reject if not Running |
+| Enable mirroring (`false` → `true`) | Segment count must satisfy layout requirements | Reject with count details |
+| Enable spread mirroring | Marginal segment count (`count <= primariesPerHost + 1`) | Admit with warning |
+| Disable mirroring (`true` → `false`) | No restrictions beyond Running phase | Always allowed |
+| Change layout while enabled | Layout change (`group` ↔ `spread`) | Reject — must disable first |
+| No mirroring change | Layout change while both disabled | Allowed |
+
+**Validation Functions**:
+- `validateMirroringTransition(old, new)` — entry point, dispatches to sub-validators
+- `validateMirroringEnable(old, new)` — checks Running phase and node count
+- `validateMirroringLayoutChange(old, new, bothEnabled)` — rejects layout changes while enabled
+- `validateNodeCountForMirroring(layout, count, primariesPerHost)` — arithmetic validation
+
+### 2.8 Transaction Log Replication
 
 - Continuous WAL streaming from primary to mirror
-- Synchronous or asynchronous mode (configurable)
-- Replication lag monitoring via Prometheus metrics
+- Synchronous or asynchronous mode (configurable via `ReplicationOptions.Mode`)
+- Replication lag monitoring via `cloudberry_replication_lag_bytes` Prometheus metric
+- Lag reported per segment during FTS probe cycle and mirroring sync monitoring
 
 ## 3. Fault Tolerance Service (FTS)
 
@@ -78,36 +174,85 @@ ha:
 
 ### 3.2 Probe Mechanism
 
-The operator implements FTS probing:
+The operator implements FTS probing via `runFTSProbe()` in the HA controller:
 
-1. **Probe Loop**: Every `ftsProbeInterval` seconds
-2. **Health Check**: TCP connection + SQL ping to each primary segment
-3. **Failure Detection**: If probe fails after `ftsProbeRetries` attempts with `ftsProbeTimeout` per attempt
-4. **Action**: Mark segment as down, promote mirror
+1. **Probe Loop**: Every `ftsProbeInterval` seconds (default: 60s), the HA controller runs a probe cycle for clusters with mirroring enabled.
+2. **Segment Configuration Read**: The probe calls `GetSegmentConfiguration()` to read `gp_segment_configuration` from the coordinator, wrapped in a retry loop (`probeSegmentConfigWithRetries`).
+3. **Retry Logic**: Each probe attempt uses a dedicated context with `ftsProbeTimeout` deadline (default: 20s). If the attempt fails, the `fts_probe_failures_total` metric is incremented and the next attempt begins. Up to `ftsProbeRetries` attempts (default: 5) are made before the probe is considered failed.
+4. **Segment Analysis**: On successful read, `analyzeSegments()` evaluates each segment's health. Segments with `status != "u"` are marked as failed. Per-segment status is reported via `cloudberry_segment_status` (1=up, 0=down).
+5. **Failover Trigger**: If any primary segments (role="p") are failed and mirroring is enabled, `handleFailover()` is called (see Section 3.3).
+6. **Status Update**: `updateFTSProbeStatus()` updates the cluster's `mirroringStatus` (`InSync` or `Degraded`), `failedSegments` list, and related metrics (`cloudberry_segments_failed`, `cloudberry_mirroring_in_sync`).
+7. **Replication Lag**: Mirror replication lag is reported per segment via `GetMirrorSyncStatus()` and the `cloudberry_replication_lag_bytes` metric.
+
+**Retry Flow**:
+
+```
+for attempt = 1 to ftsProbeRetries:
+    ctx = context.WithTimeout(parentCtx, ftsProbeTimeout)
+    segments, err = GetSegmentConfiguration(ctx)
+    if err == nil:
+        return segments
+    fts_probe_failures_total++
+    log warning with attempt number
+return error("after N retries: last error")
+```
 
 ### 3.3 Automatic Failover
 
-**Trigger**: FTS detects primary segment failure
+**Trigger**: FTS probe detects one or more primary segments with `status != "u"` while mirroring is enabled.
 
-**Process**:
-1. Mark primary segment as `Down` in status
-2. Promote mirror to primary role
-3. Update `gp_segment_configuration` equivalent
-4. Continue query processing on promoted mirror
-5. Emit event: `SegmentFailover`
-6. Update Prometheus metric: `cloudberry_segments_failed`
-7. Update CR status: `failedSegments` list
+**Process** (`handleFailover()`):
+
+1. **Identify failed primaries**: `analyzeSegments()` identifies segments where `role="p"` and `status != "u"`.
+2. **Trigger Cloudberry internal FTS**: Call `TriggerFTSProbe()` which executes `SELECT gp_request_fts_probe_scan()` on the coordinator. This triggers Cloudberry's built-in FTS daemon to detect the failure and promote the mirror to primary role. If this call fails, the failover continues with status reporting (best-effort).
+3. **Verify failover result**: Re-read segment configuration via `GetSegmentConfiguration()` to check whether mirrors were promoted. The controller builds a lookup map by `(contentID, role)` to verify each failed primary.
+4. **Emit events per failed segment**: For each failed primary:
+   - If a different DBID now holds the primary role for that contentID → emit `SegmentFailover` event: "Segment failover completed: contentID=N, original primary=X, new primary=Y"
+   - If the mirror was not promoted → emit `SegmentFailover` event: "Primary segment failed: contentID=N, hostname=X, mirror promotion pending"
+5. **Update per-segment metrics**: Set `cloudberry_segment_status` to 0 (down) for each failed primary.
+6. **Record failover metric**: Increment `cloudberry_fts_failover_total` once per failover event (not per segment).
+7. **Update CR status**: Set `failedSegments` list and `mirroringStatus: Degraded`.
+
+**Failover Flow Diagram**:
+
+```mermaid
+sequenceDiagram
+    participant HA as HA Controller
+    participant DB as Coordinator DB
+    participant FTS as Cloudberry FTS Daemon
+
+    HA->>DB: GetSegmentConfiguration() [with retries]
+    DB-->>HA: segments (primary status != "u")
+    HA->>HA: analyzeSegments() → failed primaries detected
+    HA->>DB: SELECT gp_request_fts_probe_scan()
+    DB->>FTS: Trigger internal FTS scan
+    FTS->>FTS: Detect failure, promote mirror
+    FTS-->>DB: Scan complete
+    DB-->>HA: OK
+    HA->>DB: GetSegmentConfiguration() [verify]
+    DB-->>HA: updated segments (mirror now primary)
+    HA->>HA: Emit SegmentFailover events
+    HA->>HA: Record cloudberry_fts_failover_total
+    HA->>HA: Update CR status (failedSegments, Degraded)
+```
+
+**Error Handling**:
+- If `TriggerFTSProbe()` fails, the controller logs the error but continues to emit events and update metrics for the originally detected failures.
+- If the post-failover `GetSegmentConfiguration()` fails, events are emitted for the originally detected failures and `RecordFTSFailover` is still called.
+- If no `dbFactory` is configured, the FTS probe is skipped entirely with a failure metric recorded.
 
 ### 3.4 Prometheus Metrics for FTS
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `cloudberry_fts_probe_total` | Counter | Total FTS probes |
-| `cloudberry_fts_probe_failures_total` | Counter | Failed FTS probes |
-| `cloudberry_fts_probe_duration_seconds` | Histogram | Probe duration |
-| `cloudberry_fts_failover_total` | Counter | Total failovers |
-| `cloudberry_segment_status` | Gauge | Per-segment status (1=up, 0=down) |
-| `cloudberry_replication_lag_bytes` | Gauge | Replication lag per segment |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_fts_probe_total` | Counter | cluster, namespace | Total FTS probes (recorded with result label: "success", "degraded", or "failure") |
+| `cloudberry_fts_probe_failures_total` | Counter | cluster, namespace | Failed FTS probe attempts. Incremented per retry failure in `probeSegmentConfigWithRetries` — a single probe cycle with 3 failed attempts before success increments this counter by 3. |
+| `cloudberry_fts_probe_duration_seconds` | Histogram | cluster, namespace | Probe duration |
+| `cloudberry_fts_failover_total` | Counter | cluster, namespace | Total failover events. Incremented once per `handleFailover()` invocation (not per failed segment). Triggered when failed primaries are detected and mirroring is enabled. |
+| `cloudberry_segment_status` | Gauge | cluster, namespace, segment | Per-segment status (1=up, 0=down). Updated by `analyzeSegments()` for all segments and set to 0 for failed primaries during `handleFailover()`. |
+| `cloudberry_segments_failed` | Gauge | cluster, namespace | Count of currently failed segments. Set by `updateFTSProbeStatus()` when segments are unhealthy. |
+| `cloudberry_replication_lag_bytes` | Gauge | cluster, namespace, segment | Replication lag per segment (updated by FTS probe and mirroring sync monitor) |
+| `cloudberry_mirroring_operations_total` | Counter | cluster, namespace, operation | Mirroring enable/disable operations (operation: "enable" or "disable") |
 
 ## 4. Segment Recovery
 
@@ -338,11 +483,17 @@ spec:
 
 | Event | Type | Reason | Description |
 |-------|------|--------|-------------|
-| SegmentFailover | Warning | SegmentDown | Primary segment failed, mirror promoted |
+| SegmentFailover | Warning | SegmentFailover | Primary segment failed, mirror promotion triggered via `gp_request_fts_probe_scan()`. Emitted per failed primary with details: contentID, original hostname, and new primary hostname (if promotion verified) or "mirror promotion pending" (if not yet confirmed). |
+| SegmentFailoverCompleted | Normal | SegmentFailoverCompleted | Segment failover has completed and been verified |
 | SegmentRecovered | Normal | SegmentRecovered | Failed segment recovered |
 | SegmentsRebalanced | Normal | Rebalanced | Segment roles restored to preferred |
 | CoordinatorFailover | Warning | CoordinatorDown | Coordinator failed, standby activated |
 | StandbyInitialized | Normal | StandbyReady | Standby coordinator initialized |
+| MirroringEnabled | Normal | MirroringEnabled | Mirroring enable initiated with layout |
+| MirroringDisabled | Warning/Normal | MirroringDisabled | Mirroring disable initiated / completed |
+| MirroringInitializing | Normal | MirroringInitializing | Mirror StatefulSet created, initialization in progress |
+| MirroringInSync | Normal | MirroringInSync | All mirrors synchronized after enable |
+| MirroringFailed | Warning | MirroringFailed | Mirroring operation failed (validation, timeout, or error) |
 | MirroringDegraded | Warning | MirroringDegraded | One or more mirrors out of sync |
 | MirroringRestored | Normal | MirroringInSync | All mirrors back in sync |
 | RecoveryStarted | Normal | RecoveryStarted | Recovery operation initiated |

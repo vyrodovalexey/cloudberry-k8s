@@ -62,10 +62,20 @@ func (v *CloudberryClusterValidator) checkDuplicateName(
 // ValidateUpdate validates a CloudberryCluster on update.
 func (v *CloudberryClusterValidator) ValidateUpdate(
 	_ context.Context,
-	_ *cbv1alpha1.CloudberryCluster,
+	oldCluster *cbv1alpha1.CloudberryCluster,
 	newCluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
-	return validateCluster(newCluster)
+	warnings, err := validateCluster(newCluster)
+	if err != nil {
+		return warnings, err
+	}
+	// Validate mirroring state transitions.
+	mirrorWarnings, mirrorErr := validateMirroringTransition(oldCluster, newCluster)
+	warnings = append(warnings, mirrorWarnings...)
+	if mirrorErr != nil {
+		return warnings, mirrorErr
+	}
+	return warnings, nil
 }
 
 // ValidateDelete validates a CloudberryCluster on deletion.
@@ -284,6 +294,117 @@ func validateStorageManagement(cluster *cbv1alpha1.CloudberryCluster) error {
 		)
 	}
 
+	return nil
+}
+
+// validateMirroringTransition validates mirroring state transitions during updates.
+// It ensures that mirroring can only be enabled on a Running cluster with sufficient
+// segments, and that the layout cannot be changed while mirroring is enabled.
+func validateMirroringTransition(
+	oldCluster, newCluster *cbv1alpha1.CloudberryCluster,
+) (admission.Warnings, error) {
+	oldEnabled := isMirroringEnabled(oldCluster)
+	newEnabled := isMirroringEnabled(newCluster)
+
+	// No mirroring change — check for layout change only.
+	if oldEnabled == newEnabled {
+		return validateMirroringLayoutChange(oldCluster, newCluster, oldEnabled)
+	}
+
+	// Enabling mirroring (disabled -> enabled).
+	if !oldEnabled && newEnabled {
+		return validateMirroringEnable(oldCluster, newCluster)
+	}
+
+	// Disabling mirroring (enabled -> disabled) is allowed from any Running state.
+	return nil, nil
+}
+
+// isMirroringEnabled returns true if mirroring is enabled in the cluster spec.
+func isMirroringEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled
+}
+
+// validateMirroringLayoutChange rejects layout changes while mirroring is enabled.
+func validateMirroringLayoutChange(
+	oldCluster, newCluster *cbv1alpha1.CloudberryCluster,
+	bothEnabled bool,
+) (admission.Warnings, error) {
+	if !bothEnabled {
+		return nil, nil
+	}
+	oldLayout := oldCluster.Spec.Segments.Mirroring.Layout
+	newLayout := newCluster.Spec.Segments.Mirroring.Layout
+	if oldLayout != newLayout {
+		return nil, fmt.Errorf(
+			"cannot change mirroring layout from %s to %s while mirroring is enabled; "+
+				"disable mirroring first", oldLayout, newLayout)
+	}
+	return nil, nil
+}
+
+// validateMirroringEnable validates that mirroring can be enabled on the cluster.
+func validateMirroringEnable(
+	oldCluster, newCluster *cbv1alpha1.CloudberryCluster,
+) (admission.Warnings, error) {
+	var warnings admission.Warnings
+
+	// Cluster must be in Running phase.
+	if oldCluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		return warnings, fmt.Errorf(
+			"cannot enable mirroring: cluster must be in Running phase, current phase is %s",
+			oldCluster.Status.Phase)
+	}
+
+	layout := newCluster.Spec.Segments.Mirroring.Layout
+	if layout == "" {
+		layout = cbv1alpha1.MirroringLayoutGroup
+	}
+	primariesPerHost := newCluster.Spec.Segments.PrimariesPerHost
+	if primariesPerHost == 0 {
+		primariesPerHost = 2
+	}
+
+	if err := validateNodeCountForMirroring(
+		layout, newCluster.Spec.Segments.Count, primariesPerHost,
+	); err != nil {
+		return warnings, err
+	}
+
+	// Warn for spread layout with marginal segment count.
+	if layout == cbv1alpha1.MirroringLayoutSpread &&
+		newCluster.Spec.Segments.Count <= primariesPerHost+1 {
+		warnings = append(warnings,
+			"spread mirroring layout with marginal segment count may limit fault tolerance")
+	}
+
+	return warnings, nil
+}
+
+// validateNodeCountForMirroring checks whether the segment count is sufficient
+// for the chosen mirroring layout.
+func validateNodeCountForMirroring(
+	layout cbv1alpha1.MirroringLayout,
+	segmentCount, primariesPerHost int32,
+) error {
+	switch layout {
+	case cbv1alpha1.MirroringLayoutGroup:
+		// Group layout requires at least 2 * primariesPerHost segments
+		// to place all mirrors on a different host.
+		minCount := 2 * primariesPerHost
+		if segmentCount < minCount {
+			return fmt.Errorf(
+				"cannot enable group mirroring: need at least %d segments (2 * primariesPerHost=%d), got %d",
+				minCount, primariesPerHost, segmentCount)
+		}
+	case cbv1alpha1.MirroringLayoutSpread:
+		// Spread layout requires more segments than primariesPerHost.
+		if segmentCount <= primariesPerHost {
+			return fmt.Errorf(
+				"cannot enable spread mirroring: need more than %d segments (primariesPerHost), got %d",
+				primariesPerHost, segmentCount)
+		}
+	}
 	return nil
 }
 

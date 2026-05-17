@@ -336,13 +336,14 @@ func (s *Scenario3StopStartSuite) TestScenario3b_FastStop_RestrictedStart() {
 	assert.Equal(s.T(), cbv1alpha1.ClusterPhaseRestricted, restricted.Status.Phase,
 		"phase should be Restricted after start-restricted")
 
-	// Verify only coordinator is scaled up, segments remain at 0.
+	// Verify all components are scaled up (restricted mode starts the full cluster
+	// but only allows superuser connections, matching gpstart -R behavior).
 	assert.Equal(s.T(), int32(1), s.getStatefulSetReplicas(util.CoordinatorName(cluster.Name), cluster.Namespace),
 		"coordinator should be scaled to 1 in restricted mode")
-	assert.Equal(s.T(), int32(0), s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
-		"primary segments should remain at 0 in restricted mode")
-	assert.Equal(s.T(), int32(0), s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
-		"mirror segments should remain at 0 in restricted mode")
+	assert.Greater(s.T(), s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace), int32(0),
+		"primary segments should be scaled up in restricted mode")
+	assert.Greater(s.T(), s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace), int32(0),
+		"mirror segments should be scaled up in restricted mode")
 
 	// Verify events.
 	events := collectEvents(fakeRecorder)

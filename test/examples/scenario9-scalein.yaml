@@ -1,0 +1,158 @@
+# Scenario 9: Scale-In Procedure
+#
+# This file documents the scale-in procedure for a Cloudberry cluster.
+# Scale-in removes segment pods after redistributing data off them,
+# deregistering them from gp_segment_configuration, and cleaning up PVCs.
+#
+# Architecture:
+#   User --> kubectl patch CR --> Operator detects scale-in -->
+#     Phase 1: Redistribute data OFF segments being removed
+#     Phase 2: Deregister segments from gp_segment_configuration
+#     Phase 3: Scale down mirror StatefulSet (if mirroring enabled)
+#     Phase 4: Scale down primary StatefulSet
+#     Phase 5: Clean up PVCs (based on deletionPolicy)
+#     Phase 6: Complete (cluster returns to Running)
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the cloudberry-test namespace
+#   2. kubectl access to the cluster
+#   3. The cluster must be in "Running" phase
+#   4. For reductions > 50%, the confirm-scale-in annotation is required
+#
+# ============================================================================
+# 9a. Trigger Scale-In
+# ============================================================================
+#
+# Scale from 6 to 4 segments by patching the CR:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":4}}}'
+#
+# The operator will:
+#   1. Detect the segment count reduction in reconcileSegments()
+#   2. Transition the cluster to "Scaling" phase
+#   3. Store scale-in state annotation for multi-phase tracking
+#   4. Begin the multi-phase scale-in process
+#
+# ============================================================================
+# 9b. Scale-In Safety Check (>50% Reduction)
+# ============================================================================
+#
+# If the reduction is more than 50%, the operator requires a confirmation
+# annotation before proceeding:
+#
+#   kubectl annotate cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     avsoft.io/confirm-scale-in=true
+#
+# Then patch the segment count:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":2}}}'
+#
+# ============================================================================
+# 9c. Monitor Scale-In Progress
+# ============================================================================
+#
+# Watch the cluster status:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -w
+#
+# Check the scale-in state annotation:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     -o jsonpath='{.metadata.annotations.avsoft\.io/scale-in-state}'
+#
+# Expected phases in order:
+#   - "redistributing"     : Moving data off segments being removed
+#   - "deregistering"      : Removing segments from gp_segment_configuration
+#   - "scaling-mirrors"    : Scaling down mirror StatefulSet (if mirroring enabled)
+#   - "scaling-primaries"  : Scaling down primary StatefulSet
+#   - "cleanup"            : Deleting orphaned PVCs (if deletionPolicy=Delete)
+#   - "completed"          : Scale-in finished, transitioning to Running
+#
+# ============================================================================
+# 9d. Verify Data Redistribution
+# ============================================================================
+#
+# After scale-in completes, verify data is only on remaining segments:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d mydb -c "
+#     SELECT gp_segment_id, count(*)
+#     FROM customers
+#     GROUP BY gp_segment_id
+#     ORDER BY gp_segment_id;"
+#
+# Expected: Data should only be on segments 0-3 (not 4 or 5)
+#
+# ============================================================================
+# 9e. Verify Segment Deregistration
+# ============================================================================
+#
+# After scale-in completes, verify removed segments are deregistered:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d postgres -c "
+#     SELECT content, dbid, role, preferred_role, mode, status, hostname, port
+#     FROM gp_segment_configuration
+#     WHERE content >= 0
+#     ORDER BY content, role;"
+#
+# Expected: Only 4 primary segments (content 0-3) and 4 mirror segments
+#
+# ============================================================================
+# 9f. PVC Cleanup
+# ============================================================================
+#
+# With deletionPolicy: Delete, PVCs for removed segments are automatically deleted.
+# With deletionPolicy: Retain, PVCs are preserved for potential data recovery.
+#
+# Check PVC status:
+#
+#   kubectl get pvc -n cloudberry-test -l avsoft.io/cluster=scenario1-cluster
+#
+# ============================================================================
+# 9g. Troubleshooting
+# ============================================================================
+#
+# If scale-in times out (default: 10 minutes):
+#   - Check pod status: kubectl get pods -n cloudberry-test
+#   - Check events: kubectl describe cloudberrycluster scenario1-cluster -n cloudberry-test
+#   - Check operator logs: kubectl logs -n cloudberry-system deploy/cloudberry-operator
+#
+# If redistribution fails:
+#   - Check for long-running queries that may block ALTER TABLE
+#   - The operator will retry on the next reconciliation cycle
+#   - Individual table failures are logged but don't block other tables
+#
+# If segment deregistration fails:
+#   - Verify coordinator connectivity
+#   - Check gp_segment_configuration manually
+#   - The operator will retry on the next reconciliation cycle
+#
+# ============================================================================
+# 9h. Scale-In CR Example
+# ============================================================================
+#
+# Full CR with scale-in configuration (from 6 to 4 segments):
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario9-cluster
+  namespace: cloudberry-test
+spec:
+  version: "7.1.0"
+  image: cloudberrydb/cloudberry:7.1.0
+  coordinator:
+    storage:
+      size: 10Gi
+      storageClass: standard
+  segments:
+    count: 4  # Scaled from 6 to 4
+    storage:
+      size: 20Gi
+      storageClass: standard
+    mirroring:
+      enabled: true
+      layout: group
+  deletionPolicy: Delete  # PVCs for removed segments will be deleted

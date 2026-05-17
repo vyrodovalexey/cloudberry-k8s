@@ -320,6 +320,30 @@ func (b *ClusterBuilder) WithBackupOnDelete(enabled bool) *ClusterBuilder {
 	return b
 }
 
+// WithMirroringStatus sets the cluster mirroring status.
+func (b *ClusterBuilder) WithMirroringStatus(status cbv1alpha1.MirroringStatus) *ClusterBuilder {
+	b.cluster.Status.MirroringStatus = status
+	return b
+}
+
+// WithFailedSegments sets the cluster failed segments.
+func (b *ClusterBuilder) WithFailedSegments(segments []cbv1alpha1.FailedSegment) *ClusterBuilder {
+	b.cluster.Status.FailedSegments = segments
+	return b
+}
+
+// WithCondition adds or updates a status condition on the cluster.
+func (b *ClusterBuilder) WithCondition(
+	condType string,
+	status metav1.ConditionStatus,
+	reason, message string,
+) *ClusterBuilder {
+	b.cluster.Status.Conditions = util.SetCondition(
+		b.cluster.Status.Conditions, condType, status, reason, message,
+	)
+	return b
+}
+
 // Build returns the constructed CloudberryCluster.
 func (b *ClusterBuilder) Build() *cbv1alpha1.CloudberryCluster {
 	return b.cluster.DeepCopy()
@@ -367,6 +391,18 @@ func CustomHBARules() []cbv1alpha1.HBARule {
 // MinimalCluster creates a minimal valid CloudberryCluster for testing.
 func MinimalCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
 	return NewClusterBuilder(name, namespace).Build()
+}
+
+// UnmirroredRunningCluster creates a running cluster without mirroring for testing.
+func UnmirroredRunningCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
+	return NewClusterBuilder(name, namespace).
+		WithSegments(4).
+		WithMirroring(false, "").
+		WithStatusReady().
+		WithMirroringStatus(cbv1alpha1.MirroringNotConfigured).
+		WithFinalizer().
+		WithPendingGeneration().
+		Build()
 }
 
 // FullCluster creates a fully configured CloudberryCluster for testing.

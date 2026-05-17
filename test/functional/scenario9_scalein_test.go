@@ -240,7 +240,7 @@ func (s *Scenario9ScaleInSuite) TestScenario9a_ScaleInRetainPolicy() {
 	err = s.env.Client.Update(s.ctx, current)
 	require.NoError(s.T(), err, "updating cluster spec should succeed")
 
-	// Run reconciliation — should detect scale-in.
+	// Run reconciliation — should detect scale-in and set up multi-phase state machine.
 	_, err = reconciler.Reconcile(s.ctx, scenario9Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
 
@@ -262,20 +262,11 @@ func (s *Scenario9ScaleInSuite) TestScenario9a_ScaleInRetainPolicy() {
 	assert.True(s.T(), scaleInStartedFound,
 		"ScaleInStarted event should be emitted; events: %v", events)
 
-	// Verify mirror StatefulSet scaled to 4.
-	assert.Equal(s.T(), scenario9ScaleCount,
-		s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
-		"mirror segments should be scaled to 4")
+	// Verify scale-in state annotation is set (multi-phase state machine).
+	assert.NotEmpty(s.T(), updated.Annotations["avsoft.io/scale-in-state"],
+		"scale-in-state annotation should be set")
 
-	// Verify primary StatefulSet scaled to 4.
-	assert.Equal(s.T(), scenario9ScaleCount,
-		s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
-		"primary segments should be scaled to 4")
-
-	// Simulate pods ready at new count.
-	s.simulateSegmentsReady(updated, scenario9ScaleCount)
-
-	// Update cluster status to reflect the old total (6) so checkScaleProgress
+	// Update cluster status to reflect the old total (6) so completeScaleOperation
 	// can detect this was a scale-in.
 	updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
@@ -283,9 +274,22 @@ func (s *Scenario9ScaleInSuite) TestScenario9a_ScaleInRetainPolicy() {
 	err = s.env.Client.Status().Update(s.ctx, updated)
 	require.NoError(s.T(), err, "updating cluster status should succeed")
 
-	// Run reconciliation again — should detect Scaling phase and check progress.
-	_, err = reconciler.Reconcile(s.ctx, scenario9Req())
-	require.NoError(s.T(), err, "second reconciliation should succeed")
+	// Run reconciliation multiple times to progress through all scale-in phases.
+	// Phase: redistributing -> deregistering -> scaling-mirrors -> scaling-primaries -> cleanup -> completed
+	for i := 0; i < 10; i++ {
+		_, err = reconciler.Reconcile(s.ctx, scenario9Req())
+		require.NoError(s.T(), err, "reconciliation %d should succeed", i+2)
+
+		// Simulate pods ready at new count after STS scale-down.
+		s.simulateSegmentsReady(cluster, scenario9ScaleCount)
+
+		// Check if we've reached Running phase.
+		updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+		require.NoError(s.T(), err)
+		if updated.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
+			break
+		}
+	}
 
 	// Verify phase -> Running.
 	updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -310,6 +314,16 @@ func (s *Scenario9ScaleInSuite) TestScenario9a_ScaleInRetainPolicy() {
 		"segmentsReady should be 4")
 	assert.Equal(s.T(), scenario9ScaleCount, updated.Status.SegmentsTotal,
 		"segmentsTotal should be 4")
+
+	// Verify mirror StatefulSet scaled to 4.
+	assert.Equal(s.T(), scenario9ScaleCount,
+		s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
+		"mirror segments should be scaled to 4")
+
+	// Verify primary StatefulSet scaled to 4.
+	assert.Equal(s.T(), scenario9ScaleCount,
+		s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
+		"primary segments should be scaled to 4")
 
 	// Verify PVCs for segments 4,5 still exist (Retain policy).
 	primaryStsName := util.SanitizeK8sName(
@@ -349,7 +363,7 @@ func (s *Scenario9ScaleInSuite) TestScenario9b_ScaleInDeletePolicy() {
 	err = s.env.Client.Update(s.ctx, current)
 	require.NoError(s.T(), err, "updating cluster spec should succeed")
 
-	// Run reconciliation — should detect scale-in.
+	// Run reconciliation — should detect scale-in and set up multi-phase state machine.
 	_, err = reconciler.Reconcile(s.ctx, scenario9Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
 
@@ -359,10 +373,7 @@ func (s *Scenario9ScaleInSuite) TestScenario9b_ScaleInDeletePolicy() {
 	assert.Equal(s.T(), cbv1alpha1.ClusterPhaseScaling, updated.Status.Phase,
 		"phase should be Scaling after scale-in detected")
 
-	// Simulate pods ready at new count.
-	s.simulateSegmentsReady(updated, scenario9ScaleCount)
-
-	// Update cluster status to reflect the old total (6) so checkScaleProgress
+	// Update cluster status to reflect the old total (6) so completeScaleOperation
 	// can detect this was a scale-in.
 	updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
@@ -370,9 +381,21 @@ func (s *Scenario9ScaleInSuite) TestScenario9b_ScaleInDeletePolicy() {
 	err = s.env.Client.Status().Update(s.ctx, updated)
 	require.NoError(s.T(), err, "updating cluster status should succeed")
 
-	// Run reconciliation again — should complete scale-in.
-	_, err = reconciler.Reconcile(s.ctx, scenario9Req())
-	require.NoError(s.T(), err, "second reconciliation should succeed")
+	// Run reconciliation multiple times to progress through all scale-in phases.
+	for i := 0; i < 10; i++ {
+		_, err = reconciler.Reconcile(s.ctx, scenario9Req())
+		require.NoError(s.T(), err, "reconciliation %d should succeed", i+2)
+
+		// Simulate pods ready at new count after STS scale-down.
+		s.simulateSegmentsReady(cluster, scenario9ScaleCount)
+
+		// Check if we've reached Running phase.
+		updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+		require.NoError(s.T(), err)
+		if updated.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
+			break
+		}
+	}
 
 	// Verify phase -> Running.
 	updated, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -509,13 +532,9 @@ func (s *Scenario9ScaleInSuite) TestScenario9_ScaleInWithConfirmation() {
 	assert.True(s.T(), scaleInStartedFound,
 		"ScaleInStarted event should be emitted; events: %v", events)
 
-	// Verify StatefulSets scaled to 2.
-	assert.Equal(s.T(), int32(2),
-		s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
-		"primary segments should be scaled to 2")
-	assert.Equal(s.T(), int32(2),
-		s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
-		"mirror segments should be scaled to 2")
+	// Verify scale-in state annotation is set (multi-phase state machine).
+	assert.NotEmpty(s.T(), updated.Annotations["avsoft.io/scale-in-state"],
+		"scale-in-state annotation should be set for multi-phase scale-in")
 }
 
 // --- Test: Scale-In Metrics ---

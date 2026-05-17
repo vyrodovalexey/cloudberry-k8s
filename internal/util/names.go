@@ -23,18 +23,20 @@ func SegmentMirrorName(cluster string) string {
 }
 
 // CoordinatorServiceName returns the coordinator headless service name.
+// Short name ensures pod FQDN (<pod>.<svc>) stays within Cloudberry's 64-char hostname limit.
 func CoordinatorServiceName(cluster string) string {
-	return SanitizeK8sName(fmt.Sprintf("%s-coordinator-svc", cluster))
+	return SanitizeK8sName(fmt.Sprintf("%s-coord-hl", cluster))
 }
 
 // StandbyServiceName returns the standby headless service name.
 func StandbyServiceName(cluster string) string {
-	return SanitizeK8sName(fmt.Sprintf("%s-standby-svc", cluster))
+	return SanitizeK8sName(fmt.Sprintf("%s-standby-hl", cluster))
 }
 
 // SegmentServiceName returns the segment headless service name.
+// Short name ensures pod FQDN (<pod>.<svc>) stays within Cloudberry's 64-char hostname limit.
 func SegmentServiceName(cluster string) string {
-	return SanitizeK8sName(fmt.Sprintf("%s-segment-svc", cluster))
+	return SanitizeK8sName(fmt.Sprintf("%s-seg-hl", cluster))
 }
 
 // ClientServiceName returns the client-facing service name.

@@ -34,6 +34,25 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
 - [Authentication Setup](#authentication-setup)
 - [Webhook Certificate Setup](#webhook-certificate-setup)
 - [High Availability](#high-availability)
+  - [Automatic Segment Failover](#automatic-segment-failover)
+    - [How FTS Detects Failures](#how-fts-detects-failures)
+    - [What Happens During Automatic Failover](#what-happens-during-automatic-failover)
+    - [Monitoring Failover](#monitoring-failover)
+    - [Post-Failover State](#post-failover-state)
+    - [Recovering After Failover](#recovering-after-failover)
+    - [Troubleshooting Failover Issues](#troubleshooting-failover-issues)
+  - [Enable Mirroring on Existing Cluster](#enable-mirroring-on-existing-cluster)
+    - [Prerequisites](#prerequisites)
+    - [Enabling Mirroring](#enabling-mirroring-1)
+    - [Monitoring Mirroring Progress](#monitoring-mirroring-progress)
+    - [Status Transitions](#status-transitions)
+    - [Mirroring Events](#mirroring-events)
+    - [Mirroring Metrics](#mirroring-metrics)
+    - [Troubleshooting Mirroring Enable](#troubleshooting-mirroring-enable)
+  - [Disable Mirroring](#disable-mirroring)
+    - [Implications of Disabling Mirroring](#implications-of-disabling-mirroring)
+    - [Disabling Mirroring](#disabling-mirroring)
+    - [PVC Cleanup Behavior](#pvc-cleanup-behavior)
 - [Maintenance Operations](#maintenance-operations)
   - [Maintenance Jobs](#maintenance-jobs)
   - [Maintenance Annotations](#maintenance-annotations)
@@ -1101,6 +1120,401 @@ spec:
 **Group layout**: All mirrors for one host's primaries go to one other host. Simpler but a single host failure loses all its mirrors.
 
 **Spread layout**: Mirrors are distributed across multiple hosts. Better fault tolerance but requires more hosts than `primariesPerHost`.
+
+### Automatic Segment Failover
+
+When segment mirroring is enabled, the operator automatically detects primary segment failures and triggers Cloudberry's internal failover mechanism to promote mirrors to the primary role. The cluster remains available during and after failover.
+
+> **Prerequisite**: Automatic failover requires mirroring to be enabled (`spec.segments.mirroring.enabled: true`). Without mirroring, failed primary segments are reported in `status.failedSegments` but no automatic promotion occurs.
+
+#### How FTS Detects Failures
+
+The Fault Tolerance Service (FTS) probe runs on every HA reconciliation cycle (controlled by `ha.ftsProbeInterval`). For each probe cycle, the operator:
+
+1. Connects to the coordinator database via the `DBClientFactory`
+2. Queries `gp_segment_configuration` to retrieve the status of all segments
+3. If the query fails, retries up to `FTSProbeRetries` times with `FTSProbeTimeout` per attempt
+4. Analyzes the returned segment statuses — any segment with status `d` (down) is flagged
+
+**Retry behavior**: Each probe attempt uses a dedicated context with the configured timeout. If an attempt fails, the operator logs a warning and retries. If all attempts fail, the probe reports an error and retries on the next reconciliation cycle.
+
+**Default FTS settings and detection timeline**:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ftsProbeInterval` | `60s` | Seconds between FTS probe cycles |
+| `ftsProbeTimeout` | `20s` | Timeout per probe attempt |
+| `ftsProbeRetries` | `5` | Number of retry attempts before declaring failure |
+
+With default settings, a segment failure is detected within approximately **60 seconds** (one probe interval). With aggressive settings (`ftsProbeInterval=5`, `ftsProbeTimeout=5`, `ftsProbeRetries=3`), detection can occur in approximately **15 seconds**.
+
+Configure FTS settings in the CRD:
+
+```yaml
+spec:
+  ha:
+    ftsProbeInterval: 10   # probe every 10 seconds
+    ftsProbeTimeout: 5     # 5 seconds per attempt
+    ftsProbeRetries: 3     # 3 retries before marking down
+```
+
+Or via CLI:
+
+```bash
+cloudberry-ctl ha fts configure --cluster my-cluster \
+  --probe-interval 10 \
+  --probe-timeout 5 \
+  --probe-retries 3
+```
+
+#### What Happens During Automatic Failover
+
+When the FTS probe detects one or more primary segments as down and mirroring is enabled, the operator performs the following steps:
+
+1. **Trigger Cloudberry FTS scan**: The operator calls `TriggerFTSProbe()` on the coordinator database, which initiates Cloudberry's internal failover mechanism. Cloudberry promotes the corresponding mirror segment to the primary role
+2. **Verify promotion**: The operator re-reads `gp_segment_configuration` to confirm the mirror has been promoted. It checks whether a different DBID now holds the primary role for the affected content ID
+3. **Emit events**: A `SegmentFailover` warning event is emitted for each failed primary segment, including the content ID, original primary hostname, and new primary hostname (if promotion succeeded)
+4. **Update metrics**: The `cloudberry_fts_failover_total` counter is incremented once per failover event. Per-segment status metrics are updated via `SetSegmentStatus()`
+5. **Update status**: `status.failedSegments` is populated with the details of each failed segment, and `status.mirroringStatus` transitions to `MirroringDegraded`
+
+> **Note**: If the `TriggerFTSProbe()` call fails (e.g., coordinator is unreachable), the operator still emits `SegmentFailover` events and updates status based on the originally detected failures. The failover is retried on the next probe cycle.
+
+#### Monitoring Failover
+
+**Kubernetes events**:
+
+```bash
+# Watch for failover events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'SegmentFailover|MirroringDegraded'
+```
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `SegmentFailover` | Warning | Primary segment failed; includes content ID, original and new primary hostnames |
+| `MirroringDegraded` | Warning | One or more segments are down; includes count of failed segments |
+
+**Prometheus metrics**:
+
+```promql
+# Total failover events
+cloudberry_fts_failover_total{cluster="my-cluster"}
+
+# Total FTS probes by result (success, failure, degraded)
+cloudberry_fts_probe_total{cluster="my-cluster"}
+
+# Number of currently failed segments
+cloudberry_segments_failed{cluster="my-cluster"}
+
+# Mirroring sync status (0 = degraded, 1 = in sync)
+cloudberry_mirroring_in_sync{cluster="my-cluster"}
+
+# Replication lag per segment (bytes)
+cloudberry_replication_lag_bytes{cluster="my-cluster"}
+```
+
+**Cluster status**:
+
+```bash
+# Check mirroring status
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.mirroringStatus}'
+# Output: Degraded
+
+# Check failed segments
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.failedSegments}' | jq .
+
+# Check via CLI
+cloudberry-ctl ha mirroring status --cluster my-cluster
+```
+
+#### Post-Failover State
+
+After a successful failover:
+
+- **`status.mirroringStatus`**: Transitions to `MirroringDegraded` — the cluster is operational but running without full redundancy for the affected segments
+- **`status.failedSegments`**: Contains the list of segments that failed, with their content ID, hostname, role, and status
+- **Cluster availability**: The cluster remains available for reads and writes. The promoted mirror now serves as the primary for the affected content ID
+- **Segment roles**: The original primary is marked as down (`d`), and the former mirror is now the primary (`p`). There is no mirror for the affected content ID until recovery is performed
+
+**Example `status.failedSegments`**:
+
+```json
+[
+  {
+    "contentID": 0,
+    "hostname": "my-cluster-segment-primary-0",
+    "role": "p",
+    "status": "d"
+  }
+]
+```
+
+#### Recovering After Failover
+
+After failover, you should recover the failed segment to restore full redundancy. Use the recovery annotation or CLI:
+
+```bash
+# Incremental recovery (preferred when data is intact)
+cloudberry-ctl ha recovery start --cluster my-cluster --type incremental
+
+# Full recovery (when data is corrupted)
+cloudberry-ctl ha recovery start --cluster my-cluster --type full
+```
+
+Or via annotation:
+
+```bash
+kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
+  avsoft.io/recovery=incremental
+```
+
+After recovery completes, rebalance segments to restore original roles:
+
+```bash
+cloudberry-ctl ha rebalance --cluster my-cluster
+```
+
+Once all segments are healthy, `status.mirroringStatus` returns to `InSync`, `status.failedSegments` is cleared, and the `cloudberry_mirroring_in_sync` metric returns to `1`.
+
+#### Troubleshooting Failover Issues
+
+| Symptom | Possible Cause | Resolution |
+|---------|---------------|------------|
+| No `SegmentFailover` events | Mirroring not enabled | Enable mirroring: `spec.segments.mirroring.enabled: true` |
+| `SegmentFailover` event but mirror not promoted | Cloudberry FTS scan failed | Check coordinator logs; the operator retries on the next probe cycle |
+| `MirroringDegraded` persists after recovery | Recovery not completed | Run `cloudberry-ctl ha recovery status --cluster my-cluster` to check progress |
+| `failedSegments` not clearing | Segment pod still down | Check pod status: `kubectl get pods -l avsoft.io/cluster=my-cluster` |
+| FTS probe errors in operator logs | Database connection issues | Verify coordinator is reachable; check `DBClientFactory` configuration |
+| Slow detection time | Probe interval too high | Reduce `ftsProbeInterval` (e.g., to 10s) for faster detection |
+
+```bash
+# Check operator logs for FTS probe details
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.msg | test("FTS|failover|segment.*down"))'
+
+# Check segment pod status
+kubectl get pods -n cloudberry-test -l avsoft.io/cluster=my-cluster,avsoft.io/component=segment-primary
+
+# Verify mirroring configuration
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.spec.segments.mirroring}'
+```
+
+### Enable Mirroring on Existing Cluster
+
+You can enable segment mirroring on an existing cluster that was created without mirroring. The operator creates mirror StatefulSets, initializes mirrors from primaries via WAL replication, and transitions the mirroring status through a well-defined state machine.
+
+#### Prerequisites
+
+Before enabling mirroring, ensure:
+
+- **Cluster is in `Running` phase** — The operator blocks mirroring enable on clusters in any other phase (e.g., `Stopped`, `Initializing`, `Scaling`). The webhook rejects the patch if the cluster is not `Running`.
+- **Sufficient nodes for the layout** — For `group` layout, you need at least 2 hosts. For `spread` layout, you need more hosts than `primariesPerHost`. The operator validates node count and emits a `MirroringEnableBlocked` event if nodes are insufficient.
+- **Mirroring status is `NotConfigured`** — The operator only initiates mirroring enable when `status.mirroringStatus` is `NotConfigured` and no mirror StatefulSet exists.
+
+#### Enabling Mirroring
+
+Patch the cluster CR to set `spec.segments.mirroring.enabled: true`:
+
+```bash
+# Enable mirroring with group layout (default)
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"mirroring": {"enabled": true}}}}'
+
+# Enable mirroring with spread layout
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"mirroring": {"enabled": true, "layout": "spread"}}}}'
+```
+
+Or update the CRD manifest directly:
+
+```yaml
+spec:
+  segments:
+    mirroring:
+      enabled: true
+      layout: spread  # or "group" (default)
+```
+
+Or via CLI:
+
+```bash
+cloudberry-ctl ha mirroring enable --cluster my-cluster
+cloudberry-ctl ha mirroring enable --cluster my-cluster --layout spread
+```
+
+The operator automatically:
+1. Validates the cluster is in `Running` phase and has sufficient nodes
+2. Sets the cluster phase to `Updating`
+3. Creates the mirror segment StatefulSet with the same replica count as the primary StatefulSet
+4. Sets `status.mirroringStatus` to `Initializing`
+5. Initiates WAL replication from primaries to mirrors via the DB client
+6. Transitions `status.mirroringStatus` to `Syncing` as data synchronization progresses
+7. Monitors replication lag and transitions to `InSync` when all mirrors are fully synchronized
+8. Returns the cluster phase to `Running`
+
+#### Monitoring Mirroring Progress
+
+```bash
+# Watch the cluster status during mirroring enable
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+
+# Check mirroring status
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.mirroringStatus}'
+
+# Check the MirroringHealthy condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="MirroringHealthy")]}' | jq .
+
+# Watch mirroring events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -i mirroring
+
+# Check mirror StatefulSet readiness
+kubectl get statefulsets -n cloudberry-test -l avsoft.io/cluster=my-cluster
+
+# Via CLI
+cloudberry-ctl ha mirroring status --cluster my-cluster
+
+# Via API
+curl -u admin:password \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/mirroring
+```
+
+#### Status Transitions
+
+The mirroring status progresses through the following states during enable:
+
+```
+NotConfigured → Initializing → Syncing → InSync
+```
+
+| Status | Description |
+|--------|-------------|
+| `NotConfigured` | Mirroring is not set up. Starting state before enable. |
+| `Initializing` | Mirror StatefulSet created, mirrors are being initialized from primaries. The operator creates the mirror pods and begins WAL replication setup via the DB client. |
+| `Syncing` | Mirrors are actively synchronizing data from primaries. Replication lag is decreasing. The operator monitors `cloudberry_replication_lag_bytes` during this phase. |
+| `InSync` | All mirrors are fully synchronized with their primaries. Mirroring enable is complete. |
+| `Degraded` | Set if the mirroring enable operation times out after 30 minutes. Requires manual investigation. |
+
+**Expected timeline**: The time to complete mirroring enable depends on the data volume. For a typical cluster with moderate data, expect:
+- `Initializing` → `Syncing`: 1–5 minutes (mirror pod creation and WAL setup)
+- `Syncing` → `InSync`: Depends on data volume (WAL replay and catch-up)
+- **Timeout**: 30 minutes. If mirrors do not reach `InSync` within this window, the status transitions to `Degraded`.
+
+#### Mirroring Events
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `MirroringEnabled` | Normal | Mirroring enable initiated — mirror StatefulSet created |
+| `MirroringInitializing` | Normal | Mirror initialization in progress |
+| `MirroringInSync` | Normal | All mirrors synchronized — mirroring enable complete |
+| `MirroringDegraded` | Warning | Mirroring enable timed out after 30 minutes |
+| `MirroringEnableBlocked` | Warning | Mirroring enable blocked — cluster not in `Running` phase or insufficient nodes |
+
+```bash
+# View mirroring events
+kubectl get events -n cloudberry-test --sort-by='.lastTimestamp' | grep -E 'Mirroring'
+```
+
+#### Mirroring Metrics
+
+The operator exposes the following metrics for mirroring operations:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_mirroring_operations_total` | Counter | `cluster`, `namespace`, `operation` | Total mirroring enable/disable operations. `operation` is `enable` or `disable` |
+| `cloudberry_replication_lag_bytes` | Gauge | `cluster`, `namespace`, `segment` | Replication lag in bytes per segment. Decreases during `Syncing` phase, reaches 0 at `InSync` |
+
+```promql
+# Total mirroring enable operations
+cloudberry_mirroring_operations_total{operation="enable"}
+
+# Total mirroring disable operations
+cloudberry_mirroring_operations_total{operation="disable"}
+
+# Replication lag for all segments (should approach 0 during sync)
+cloudberry_replication_lag_bytes{cluster="my-cluster"}
+```
+
+#### Troubleshooting Mirroring Enable
+
+If mirroring enable fails or times out:
+
+1. **Check why mirror pods are not ready**:
+
+   ```bash
+   kubectl get pods -n cloudberry-test -l avsoft.io/cluster=my-cluster,avsoft.io/component=segment-mirror
+   kubectl describe pod <mirror-pod> -n cloudberry-test
+   kubectl logs <mirror-pod> -n cloudberry-test
+   ```
+
+2. **Common causes and fixes**:
+
+   | Cause | Symptoms | Resolution |
+   |-------|----------|------------|
+   | Insufficient nodes | Mirror pods stuck in `Pending` | Add nodes to satisfy anti-affinity and layout requirements |
+   | Insufficient storage | PVC provisioning failure | Check StorageClass and available storage capacity |
+   | Cluster not Running | `MirroringEnableBlocked` event | Wait for cluster to reach `Running` phase, then retry |
+   | DB client error | Mirroring stuck in `Initializing` | Check operator logs for database connection errors |
+   | Timeout (30 min) | Status transitions to `Degraded` | Check replication lag metrics, investigate slow WAL replay |
+
+3. **After fixing the issue**, the operator automatically detects mirror readiness on the next reconciliation cycle and completes the transition to `InSync`.
+
+### Disable Mirroring
+
+You can disable mirroring on a cluster that currently has mirroring enabled. The operator removes the mirror StatefulSet and updates the mirroring status.
+
+#### Implications of Disabling Mirroring
+
+> **Warning**: Disabling mirroring reduces data protection. Without mirrors, a primary segment failure results in data unavailability until recovery is performed. Consider the following before disabling:
+
+- **No automatic failover** — Primary segment failures require manual recovery (incremental, full, or differential)
+- **Reduced fault tolerance** — The cluster can no longer survive a single host failure without data loss
+- **No rollback** — Re-enabling mirroring requires a full mirror initialization, which takes time proportional to data volume
+
+#### Disabling Mirroring
+
+Patch the cluster CR to set `spec.segments.mirroring.enabled: false`:
+
+```bash
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge \
+  -p '{"spec": {"segments": {"mirroring": {"enabled": false}}}}'
+```
+
+Or update the CRD manifest directly:
+
+```yaml
+spec:
+  segments:
+    mirroring:
+      enabled: false
+```
+
+The operator automatically:
+1. Validates the cluster is in `Running` phase
+2. Scales down and deletes the mirror segment StatefulSet
+3. Sets `status.mirroringStatus` to `NotConfigured`
+4. Emits a `MirroringDisabled` event
+5. Records the `cloudberry_mirroring_operations_total{operation="disable"}` metric
+
+#### PVC Cleanup Behavior
+
+When mirroring is disabled, the behavior of mirror PVCs depends on the cluster's `deletionPolicy`:
+
+| Policy | Behavior |
+|--------|----------|
+| `Retain` (default) | Mirror PVCs are preserved after the mirror StatefulSet is deleted. You can manually clean them up later or use them for data recovery. |
+| `Delete` | Mirror PVCs are automatically deleted when the mirror StatefulSet is removed. |
+
+```bash
+# Check for orphaned mirror PVCs after disabling mirroring
+kubectl get pvc -n cloudberry-test -l avsoft.io/cluster=my-cluster,avsoft.io/component=segment-mirror
+
+# Manually delete orphaned mirror PVCs (if using Retain policy)
+kubectl delete pvc -n cloudberry-test -l avsoft.io/cluster=my-cluster,avsoft.io/component=segment-mirror
+```
 
 ### Coordinator Standby
 
@@ -2722,6 +3136,7 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_fts_probe_total` | Counter | Total FTS probes |
 | `cloudberry_fts_failover_total` | Counter | Total failovers |
 | `cloudberry_replication_lag_bytes` | Gauge | Replication lag per segment |
+| `cloudberry_mirroring_operations_total` | Counter | Total mirroring enable/disable operations (labels: `operation` = `enable`, `disable`) |
 | `cloudberry_connections_active` | Gauge | Active database connections |
 | `cloudberry_scale_operations_total` | Counter | Total scale operations (labels: `operation` = `scale-out`, `scale-in`, `rebalance`) |
 | `cloudberry_redistribution_progress` | Gauge | Data redistribution progress (0.0–1.0) |
@@ -2852,7 +3267,11 @@ Key event types:
 | `SegmentsRebalanced` | Normal | Segment roles restored |
 | `CoordinatorFailover` | Warning | Coordinator failed, standby activated |
 | `StandbyInitialized` | Normal | Standby coordinator initialized |
-| `MirroringDegraded` | Warning | One or more mirrors out of sync |
+| `MirroringEnabled` | Normal | Mirroring enable initiated — mirror StatefulSet created |
+| `MirroringDisabled` | Normal | Mirroring disabled — mirror StatefulSet deleted |
+| `MirroringInitializing` | Normal | Mirror initialization in progress |
+| `MirroringInSync` | Normal | All mirrors synchronized — mirroring enable complete |
+| `MirroringDegraded` | Warning | One or more mirrors out of sync, or mirroring enable timed out |
 | `MirroringRestored` | Normal | All mirrors back in sync |
 | `RecoveryStarted` | Normal | Recovery operation initiated |
 | `RecoveryCompleted` | Normal | Recovery operation completed |

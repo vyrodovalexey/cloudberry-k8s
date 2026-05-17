@@ -529,3 +529,73 @@ func TestNoopRecorder_ImplementsInterface(t *testing.T) {
 func TestPrometheusRecorder_ImplementsInterface(t *testing.T) {
 	var _ Recorder = &PrometheusRecorder{}
 }
+
+// ============================================================================
+// Mirroring Operation Metrics Tests
+// ============================================================================
+
+func TestRecordMirroringOperation_Enable(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordMirroringOperation("test", "default", "enable")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_mirroring_operations_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 1.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_mirroring_operations_total metric should be registered")
+}
+
+func TestRecordMirroringOperation_Disable(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordMirroringOperation("test", "default", "disable")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_mirroring_operations_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 1.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_mirroring_operations_total metric should be registered")
+}
+
+func TestNoopRecorder_RecordMirroringOperation(t *testing.T) {
+	recorder := &NoopRecorder{}
+	// Should not panic.
+	recorder.RecordMirroringOperation("c", "n", "enable")
+	recorder.RecordMirroringOperation("c", "n", "disable")
+}
+
+func TestRecordMirroringOperation_MultipleIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordMirroringOperation("test", "default", "enable")
+	recorder.RecordMirroringOperation("test", "default", "enable")
+	recorder.RecordMirroringOperation("test", "default", "disable")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_mirroring_operations_total" {
+			found = true
+			// Should have 2 metric series (enable and disable).
+			assert.Len(t, f.GetMetric(), 2)
+			break
+		}
+	}
+	assert.True(t, found)
+}

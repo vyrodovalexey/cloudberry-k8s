@@ -321,6 +321,39 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 The operator emits spans for reconciliation loops, API request handling, database operations, and Vault interactions.
 
+## Mirroring Configuration
+
+The operator supports enabling and disabling segment mirroring on existing clusters. Mirroring is configured in the `CloudberryCluster` CRD:
+
+```yaml
+spec:
+  segments:
+    mirroring:
+      enabled: true       # Enable or disable mirroring
+      layout: spread      # "group" (default) or "spread"
+```
+
+You can toggle mirroring on a running cluster by patching the CR:
+
+```bash
+# Enable mirroring
+kubectl patch cloudberrycluster my-cluster --type merge \
+  -p '{"spec": {"segments": {"mirroring": {"enabled": true}}}}'
+
+# Disable mirroring
+kubectl patch cloudberrycluster my-cluster --type merge \
+  -p '{"spec": {"segments": {"mirroring": {"enabled": false}}}}'
+```
+
+**Requirements:**
+- The cluster must be in `Running` phase to enable or disable mirroring
+- For `spread` layout, the number of hosts must exceed `primariesPerHost`
+- Mirroring enable has a 30-minute timeout; status transitions to `Degraded` on timeout
+
+**Mirroring status values:** `NotConfigured` → `Initializing` → `Syncing` → `InSync`
+
+See the [User Guide](../../docs/user-guide.md#enable-mirroring-on-existing-cluster) for detailed instructions.
+
 ## CRDs
 
 The chart includes the CloudberryCluster CRD. Set `installCRDs: false` to skip CRD installation if they are managed separately.

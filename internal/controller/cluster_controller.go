@@ -24,31 +24,36 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 const (
-	clusterControllerName = "cluster-controller"
-	requeueAfterDefault   = 30 * time.Second
-	requeueAfterError     = 10 * time.Second
-	requeueAfterStopping  = 5 * time.Second
-	scaleTimeout          = 10 * time.Minute
-	upgradePhaseTimeout   = 10 * time.Minute
+	clusterControllerName  = "cluster-controller"
+	requeueAfterDefault    = 30 * time.Second
+	requeueAfterError      = 10 * time.Second
+	requeueAfterStopping   = 5 * time.Second
+	scaleTimeout           = 10 * time.Minute
+	upgradePhaseTimeout    = 10 * time.Minute
+	mirroringEnableTimeout = 30 * time.Minute
 )
 
 // ClusterReconciler reconciles a CloudberryCluster object.
 type ClusterReconciler struct {
-	client   client.Client
-	scheme   *runtime.Scheme
-	recorder record.EventRecorder
-	builder  builder.ResourceBuilder
-	metrics  metrics.Recorder
-	logger   *slog.Logger
+	client    client.Client
+	scheme    *runtime.Scheme
+	recorder  record.EventRecorder
+	builder   builder.ResourceBuilder
+	metrics   metrics.Recorder
+	dbFactory db.DBClientFactory
+	logger    *slog.Logger
 }
 
 // NewClusterReconciler creates a new ClusterReconciler.
+// The dbFactory parameter is optional (nil-safe) and is only used for
+// mirroring initialization operations that require database connectivity.
 func NewClusterReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
@@ -56,17 +61,23 @@ func NewClusterReconciler(
 	b builder.ResourceBuilder,
 	m metrics.Recorder,
 	logger *slog.Logger,
+	dbFactory ...db.DBClientFactory,
 ) *ClusterReconciler {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var factory db.DBClientFactory
+	if len(dbFactory) > 0 {
+		factory = dbFactory[0]
+	}
 	return &ClusterReconciler{
-		client:   c,
-		scheme:   scheme,
-		recorder: recorder,
-		builder:  b,
-		metrics:  m,
-		logger:   logger.With("controller", clusterControllerName),
+		client:    c,
+		scheme:    scheme,
+		recorder:  recorder,
+		builder:   b,
+		metrics:   m,
+		dbFactory: factory,
+		logger:    logger.With("controller", clusterControllerName),
 	}
 }
 
@@ -80,6 +91,8 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	defer span.End()
 
 	logger.Info("starting reconciliation")
+	logger.Debug("reconciliation details",
+		"name", req.Name, "namespace", req.Namespace, "startTime", startTime)
 
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
@@ -91,9 +104,16 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
 	}
 
+	logger.Debug("cluster resource fetched",
+		"phase", cluster.Status.Phase,
+		"generation", cluster.Generation,
+		"observedGeneration", cluster.Status.ObservedGeneration,
+		"deletionTimestamp", cluster.DeletionTimestamp)
+
 	// Handle annotation-based actions FIRST — annotations don't change the
 	// generation, so they must be checked before the generation skip.
 	if action, ok := cluster.Annotations[util.AnnotationAction]; ok {
+		logger.Debug("handling action annotation", "action", action)
 		result, err := r.handleAction(ctx, cluster, action)
 		if err != nil {
 			r.recordReconcileResult(cluster, startTime, "error")
@@ -104,24 +124,41 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Check if the cluster is in a lifecycle phase that should short-circuit reconciliation.
 	if result, handled := r.handleLifecyclePhase(ctx, cluster); handled {
+		logger.Debug("lifecycle phase handled, short-circuiting", "phase", cluster.Status.Phase)
 		return result, nil
 	}
 
 	// Skip full reconciliation if only status changed (ObservedGeneration matches).
+	// However, if a scale-state annotation is present, the scale operation is still in progress
+	// and we must continue processing it even if the phase was reset to Running.
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
-		logger.Info("skipping reconciliation, generation unchanged and cluster running")
+		_, hasScaleState := cluster.Annotations[annotationScaleState]
+		_, hasScaleInState := cluster.Annotations[annotationScaleInState]
+		if hasScaleState || hasScaleInState {
+			// Scale operation in progress but phase was reset — restore Scaling phase and continue.
+			logger.Info("scale state annotation found but phase is Running, restoring Scaling phase")
+			cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+			if err := r.client.Status().Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("restoring scaling phase: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+		logger.Debug("skipping reconciliation, generation unchanged and cluster running",
+			"generation", cluster.Generation)
 		r.recordMetricsSnapshot(cluster)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
 	// Handle deletion.
 	if !cluster.DeletionTimestamp.IsZero() {
+		logger.Debug("handling cluster deletion")
 		return r.handleDeletion(ctx, cluster)
 	}
 
 	// Ensure finalizer is set.
 	if !controllerutil.ContainsFinalizer(cluster, util.FinalizerName) {
+		logger.Debug("adding finalizer to cluster")
 		controllerutil.AddFinalizer(cluster, util.FinalizerName)
 		if err := r.client.Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
@@ -130,6 +167,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Main reconciliation flow.
+	logger.Debug("entering main reconciliation flow")
 	result, err := r.reconcileCluster(ctx, cluster)
 	if err != nil {
 		r.recordReconcileResult(cluster, startTime, "error")
@@ -139,6 +177,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.recordReconcileResult(cluster, startTime, "success")
 	logger.Info("reconciliation completed", "duration", time.Since(startTime))
+	logger.Debug("reconciliation result", "requeue", result.Requeue, "requeueAfter", result.RequeueAfter)
 	return result, nil
 }
 
@@ -179,6 +218,11 @@ func (r *ClusterReconciler) handleLifecyclePhase(
 		return result, true
 
 	case cbv1alpha1.ClusterPhaseUpdating:
+		// Check if this is a mirroring operation (vs upgrade).
+		if cluster.Annotations[util.AnnotationMirroringState] != "" {
+			result, _ := r.checkMirroringProgress(ctx, cluster)
+			return result, true
+		}
 		result, _ := r.continueUpgrade(ctx, cluster)
 		return result, true
 
@@ -398,6 +442,15 @@ func (r *ClusterReconciler) reconcileSegments(
 		}
 	}
 
+	// Check for mirroring enable transition.
+	if r.isMirroringEnableNeeded(ctx, cluster) {
+		return r.handleEnableMirroring(ctx, cluster)
+	}
+	// Check for mirroring disable transition.
+	if r.isMirroringDisableNeeded(ctx, cluster) {
+		return r.handleDisableMirroring(ctx, cluster)
+	}
+
 	// Normal reconciliation — primary segments.
 	primarySts, err := r.builder.BuildSegmentPrimaryStatefulSet(cluster)
 	if err != nil {
@@ -422,8 +475,9 @@ func (r *ClusterReconciler) reconcileSegments(
 }
 
 // handleScaleOut orchestrates a scale-out operation: transitions the cluster
-// to the Scaling phase, updates StatefulSet replicas, creates a redistribution
-// Job, and records the appropriate events and conditions.
+// to the Scaling phase, updates StatefulSet replicas, and stores scale state
+// for the multi-phase scale-out process (STS scaling → segment registration →
+// data redistribution).
 func (r *ClusterReconciler) handleScaleOut(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -447,6 +501,22 @@ func (r *ClusterReconciler) handleScaleOut(
 	if err := setAnnotationPatch(ctx, r.client, cluster,
 		util.AnnotationScaleStarted, scaleStartTime); err != nil {
 		return fmt.Errorf("setting scale-started annotation: %w", err)
+	}
+
+	// Store scale state for multi-phase operation.
+	state := scaleStateData{
+		Phase:     scalePhaseScalingSTS,
+		OldCount:  oldCount,
+		NewCount:  newCount,
+		StartedAt: scaleStartTime,
+	}
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshaling scale state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		annotationScaleState, string(stateJSON)); err != nil {
+		return fmt.Errorf("setting scale-state annotation: %w", err)
 	}
 
 	// Set phase to Scaling.
@@ -483,19 +553,10 @@ func (r *ClusterReconciler) handleScaleOut(
 		}
 	}
 
-	// Create redistribution Job.
-	timestamp := time.Now().Format("20060102-150405")
-	redistJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceRedistribute, timestamp)
-	if redistJob != nil {
-		if err := r.client.Create(ctx, redistJob); err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error("failed to create redistribution job", "error", err)
-		}
-	}
-
-	// Set redistribution in progress.
+	// Set redistribution pending.
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "InProgress",
-		"Data redistribution in progress")
+		"Waiting for new segment pods to be ready")
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return fmt.Errorf("updating redistribution status: %w", err)
 	}
@@ -503,10 +564,13 @@ func (r *ClusterReconciler) handleScaleOut(
 	return nil
 }
 
-// handleScaleIn orchestrates a scale-in operation: validates the reduction,
-// transitions the cluster to the Scaling phase, scales down StatefulSets
-// (mirrors first, then primaries), creates a redistribution Job, and records
-// the appropriate events and conditions.
+// handleScaleIn orchestrates a scale-in operation using a multi-phase state machine:
+//  1. Redistribute data OFF segments being removed
+//  2. Deregister segments from gp_segment_configuration
+//  3. Scale down mirror StatefulSet (if mirroring enabled)
+//  4. Scale down primary StatefulSet
+//  5. Clean up PVCs based on deletionPolicy
+//  6. Complete: transition back to Running
 func (r *ClusterReconciler) handleScaleIn(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -544,48 +608,33 @@ func (r *ClusterReconciler) handleScaleIn(
 		return fmt.Errorf("setting scale-started annotation: %w", err)
 	}
 
+	// Store scale-in state for multi-phase operation.
+	state := scaleInStateData{
+		Phase:     scaleInPhaseRedistributing,
+		OldCount:  oldCount,
+		NewCount:  newCount,
+		StartedAt: scaleStartTime,
+	}
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshaling scale-in state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		annotationScaleInState, string(stateJSON)); err != nil {
+		return fmt.Errorf("setting scale-in-state annotation: %w", err)
+	}
+
 	// Set phase to Scaling.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
-		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionFalse, "ScaleInStarted",
-		fmt.Sprintf("Scaling from %d to %d segments", oldCount, newCount))
+		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "ScaleInRedistributing",
+		fmt.Sprintf("Redistributing data off segments %d-%d before scale-in", newCount, oldCount-1))
 	if err := r.client.Status().Update(ctx, cluster); err != nil {
 		return fmt.Errorf("setting scaling phase: %w", err)
 	}
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonScaleInStarted,
-		fmt.Sprintf("Scale-in from %d to %d segments initiated", oldCount, newCount))
-
-	// Create redistribution Job (move data OFF segments being removed).
-	timestamp := time.Now().Format("20060102-150405")
-	redistJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceRedistribute, timestamp)
-	if redistJob != nil {
-		if err := r.client.Create(ctx, redistJob); err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error("failed to create redistribution job", "error", err)
-		}
-	}
-
-	// Scale down mirror StatefulSet FIRST (if mirroring enabled).
-	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
-		mirrorName := util.SegmentMirrorName(cluster.Name)
-		if err := r.scaleStatefulSet(ctx, cluster.Namespace, mirrorName, newCount); err != nil {
-			return fmt.Errorf("scaling down mirror segments: %w", err)
-		}
-	}
-
-	// Scale down primary StatefulSet.
-	primaryName := util.SegmentPrimaryName(cluster.Name)
-	if err := r.scaleStatefulSet(ctx, cluster.Namespace, primaryName, newCount); err != nil {
-		return fmt.Errorf("scaling down primary segments: %w", err)
-	}
-
-	// Set redistribution in progress.
-	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
-		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "InProgress",
-		"Data redistribution in progress for scale-in")
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		return fmt.Errorf("updating redistribution status: %w", err)
-	}
+		fmt.Sprintf("Scale-in from %d to %d segments initiated — redistributing data", oldCount, newCount))
 
 	return nil
 }
@@ -1076,8 +1125,16 @@ func (r *ClusterReconciler) handleAction(
 }
 
 // handleStop processes stop actions (stop, stop-fast, stop-immediate).
-// It sets the phase to Stopping, scales all StatefulSets to 0, and transitions
+// It performs mode-specific graceful shutdown via the database client,
+// sets the phase to Stopping, scales all StatefulSets to 0, and transitions
 // to Stopped once all pods are terminated.
+//
+// Stop modes:
+//   - stop (smart): Cancel active queries, wait briefly for clients to disconnect,
+//     then terminate remaining backends before scaling down.
+//   - stop-fast: Immediately terminate all backends (rollback active transactions),
+//     then scale down.
+//   - stop-immediate: Scale to 0 without any DB-level graceful shutdown.
 func (r *ClusterReconciler) handleStop(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -1086,14 +1143,20 @@ func (r *ClusterReconciler) handleStop(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("stopping cluster", "mode", mode)
 
-	// Set phase to Stopping.
+	// Set phase to Stopping using status patch to avoid conflicts.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopping phase: %w", err)
 	}
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopping",
 		fmt.Sprintf("Cluster stop initiated (mode: %s)", mode))
+
+	// Perform DB-level graceful shutdown based on mode.
+	// The stop-immediate mode skips DB-level operations entirely.
+	if mode != util.ActionStopImmediate {
+		r.performGracefulShutdown(ctx, cluster, mode)
+	}
 
 	// Scale StatefulSets to 0 in order: mirrors, primaries, standby, coordinator.
 	for _, name := range r.getScaleDownOrder(cluster) {
@@ -1108,18 +1171,74 @@ func (r *ClusterReconciler) handleStop(
 		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 	}
 
-	// All stopped — update status.
+	// All stopped — update status using patch to avoid conflicts.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
 	}
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "Stopped",
 		fmt.Sprintf("Cluster stopped (mode: %s)", mode))
 	return ctrl.Result{}, nil
+}
+
+// performGracefulShutdown executes DB-level shutdown operations based on the stop mode.
+// For smart stop: cancels active queries first, then terminates remaining backends.
+// For fast stop: immediately terminates all backends.
+// Errors are logged but do not block the scale-down — the cluster will still stop
+// even if the DB client is unreachable (e.g., coordinator already unhealthy).
+func (r *ClusterReconciler) performGracefulShutdown(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	mode string,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping DB-level graceful shutdown")
+		return
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		// DB client creation may fail if the coordinator is already unhealthy.
+		// Log and continue — the scale-down will still proceed.
+		logger.Warn("failed to create DB client for graceful shutdown, proceeding with scale-down",
+			"error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	switch mode {
+	case util.ActionStop:
+		// Smart stop: cancel active queries first, then terminate remaining backends.
+		canceled, cancelErr := dbClient.CancelAllQueries(ctx)
+		if cancelErr != nil {
+			logger.Warn("failed to cancel active queries during smart stop", "error", cancelErr)
+		} else {
+			logger.Info("canceled active queries for smart stop", "count", canceled)
+		}
+
+		// Terminate remaining backends after cancellation.
+		terminated, termErr := dbClient.TerminateAllBackends(ctx)
+		if termErr != nil {
+			logger.Warn("failed to terminate backends during smart stop", "error", termErr)
+		} else {
+			logger.Info("terminated backends for smart stop", "count", terminated)
+		}
+
+	case util.ActionStopFast:
+		// Fast stop: immediately terminate all backends.
+		terminated, termErr := dbClient.TerminateAllBackends(ctx)
+		if termErr != nil {
+			logger.Warn("failed to terminate backends during fast stop", "error", termErr)
+		} else {
+			logger.Info("terminated backends for fast stop", "count", terminated)
+		}
+	}
 }
 
 // handleStart processes start actions (start, start-restricted, start-maintenance).
@@ -1136,23 +1255,21 @@ func (r *ClusterReconciler) handleStart(
 
 	switch mode {
 	case util.ActionStartRestricted:
-		// Only coordinator, restricted connections.
-		coordName := util.CoordinatorName(cluster.Name)
-		if err := r.scaleStatefulSet(ctx, cluster.Namespace, coordName, 1); err != nil {
-			return ctrl.Result{}, fmt.Errorf("scaling coordinator for restricted start: %w", err)
+		// Restricted mode: start all components but only allow superuser connections.
+		// Scale up in order: coordinator, standby, primaries, mirrors.
+		for _, name := range r.getScaleUpOrder(cluster) {
+			replicas := r.getDesiredReplicas(cluster, name)
+			if err := r.scaleStatefulSet(ctx, cluster.Namespace, name, replicas); err != nil {
+				return ctrl.Result{}, fmt.Errorf("scaling %s for restricted start: %w", name, err)
+			}
 		}
-		// Re-fetch to get the latest resourceVersion before status update.
-		if err := r.client.Get(ctx, types.NamespacedName{
-			Name: cluster.Name, Namespace: cluster.Namespace,
-		}, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for restricted start: %w", err)
-		}
+		// Use status patch to avoid conflicts with concurrent metadata changes.
 		cluster.Status.Phase = cbv1alpha1.ClusterPhaseRestricted
-		if err := r.client.Status().Update(ctx, cluster); err != nil {
+		if err := patchStatus(ctx, r.client, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("setting restricted phase: %w", err)
 		}
 		r.recorder.Event(cluster, corev1.EventTypeNormal, "Started",
-			"Cluster started in restricted mode")
+			"Cluster started in restricted mode (superuser connections only)")
 		return ctrl.Result{}, nil
 
 	case util.ActionStartMaintenance:
@@ -1161,14 +1278,9 @@ func (r *ClusterReconciler) handleStart(
 		if err := r.scaleStatefulSet(ctx, cluster.Namespace, coordName, 1); err != nil {
 			return ctrl.Result{}, fmt.Errorf("scaling coordinator for maintenance start: %w", err)
 		}
-		// Re-fetch to get the latest resourceVersion before status update.
-		if err := r.client.Get(ctx, types.NamespacedName{
-			Name: cluster.Name, Namespace: cluster.Namespace,
-		}, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for maintenance start: %w", err)
-		}
+		// Use status patch to avoid conflicts with concurrent metadata changes.
 		cluster.Status.Phase = cbv1alpha1.ClusterPhaseMaintenance
-		if err := r.client.Status().Update(ctx, cluster); err != nil {
+		if err := patchStatus(ctx, r.client, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("setting maintenance phase: %w", err)
 		}
 		r.recorder.Event(cluster, corev1.EventTypeNormal, "Started",
@@ -1178,15 +1290,16 @@ func (r *ClusterReconciler) handleStart(
 	default:
 		// Normal start — reset phase so updateStatus can transition to Running,
 		// then scale everything back via full reconciliation.
-		// Re-fetch to get the latest resourceVersion before status update.
+		// Use status patch to avoid conflicts with concurrent metadata changes.
+		cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+		if err := patchStatus(ctx, r.client, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("resetting phase for normal start: %w", err)
+		}
+		// Re-fetch to get the latest state after the status patch for reconciliation.
 		if err := r.client.Get(ctx, types.NamespacedName{
 			Name: cluster.Name, Namespace: cluster.Namespace,
 		}, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("re-fetching cluster for start: %w", err)
-		}
-		cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
-		if err := r.client.Status().Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("resetting phase for normal start: %w", err)
 		}
 		return r.reconcileCluster(ctx, cluster)
 	}
@@ -1210,9 +1323,9 @@ func (r *ClusterReconciler) handleRestart(
 		return ctrl.Result{}, fmt.Errorf("setting restart-pending annotation: %w", err)
 	}
 
-	// Set phase to Stopping.
+	// Set phase to Stopping using status patch to avoid conflicts.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopping
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopping phase for restart: %w", err)
 	}
 
@@ -1243,20 +1356,20 @@ func (r *ClusterReconciler) completeRestart(
 		return ctrl.Result{}, fmt.Errorf("removing restart-pending annotation: %w", err)
 	}
 
-	// Re-fetch to get the latest resourceVersion before status update.
-	if err := r.client.Get(ctx, types.NamespacedName{
-		Name: cluster.Name, Namespace: cluster.Namespace,
-	}, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("re-fetching cluster for restart: %w", err)
-	}
-
-	// Reset phase to Initializing so updateStatus can transition to Running.
+	// Reset phase to Initializing using status patch to avoid conflicts.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("resetting phase for restart: %w", err)
+	}
+
+	// Re-fetch to get the latest state after the status patch for reconciliation.
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name: cluster.Name, Namespace: cluster.Namespace,
+	}, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching cluster for restart: %w", err)
 	}
 
 	// Start everything back up via full reconciliation.
@@ -1283,12 +1396,12 @@ func (r *ClusterReconciler) checkStopProgress(
 		return r.completeRestart(ctx, cluster)
 	}
 
-	// All stopped.
+	// All stopped — use status patch to avoid conflicts.
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := r.client.Status().Update(ctx, cluster); err != nil {
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
 	}
 
@@ -1297,19 +1410,16 @@ func (r *ClusterReconciler) checkStopProgress(
 }
 
 // checkScaleProgress checks whether a cluster in Scaling phase has completed
-// the scale operation (scale-out or scale-in). When all segment StatefulSets
-// are ready at the desired replica count, it transitions the cluster back to
-// Running and handles PVC cleanup for scale-in when the deletion policy is Delete.
+// the scale operation (scale-out or scale-in). For scale-out, it follows a
+// multi-phase process: wait for pods → register segments → redistribute data.
+// For scale-in, it follows: redistribute → deregister → scale mirrors → scale primaries → cleanup.
+// When all phases complete, it transitions the cluster back to Running.
 func (r *ClusterReconciler) checkScaleProgress(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (ctrl.Result, error) {
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("checking scale progress")
-
-	if r.allSegmentStatefulSetsReady(ctx, cluster) {
-		return r.completeScaleOperation(ctx, cluster)
-	}
 
 	// Check for timeout — if scaling has been in progress too long, mark as failed.
 	startedStr := cluster.Annotations[util.AnnotationScaleStarted]
@@ -1320,7 +1430,436 @@ func (r *ClusterReconciler) checkScaleProgress(
 		}
 	}
 
+	// Check if this is a multi-phase scale-in with state annotation.
+	scaleInJSON := cluster.Annotations[annotationScaleInState]
+	if scaleInJSON != "" {
+		return r.checkScaleInPhases(ctx, cluster, scaleInJSON)
+	}
+
+	// Check if this is a multi-phase scale-out with state annotation.
+	stateJSON := cluster.Annotations[annotationScaleState]
+	if stateJSON != "" {
+		return r.checkScaleOutPhases(ctx, cluster, stateJSON)
+	}
+
+	// Fallback: simple scale check (for legacy scale operations without state).
+	if r.allSegmentStatefulSetsReady(ctx, cluster) {
+		return r.completeScaleOperation(ctx, cluster)
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+}
+
+// checkScaleOutPhases processes the multi-phase scale-out operation.
+func (r *ClusterReconciler) checkScaleOutPhases(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	stateJSON string,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	var state scaleStateData
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		logger.Error("failed to parse scale state, falling back to simple check", "error", err)
+		if r.allSegmentStatefulSetsReady(ctx, cluster) {
+			return r.completeScaleOperation(ctx, cluster)
+		}
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+
+	logger.Info("scale-out phase check", "phase", state.Phase,
+		"oldCount", state.OldCount, "newCount", state.NewCount)
+
+	switch state.Phase {
+	case scalePhaseScalingSTS:
+		// Wait for all segment StatefulSets to be ready.
+		if !r.allSegmentStatefulSetsReady(ctx, cluster) {
+			return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+		}
+		// Advance to registering phase.
+		logger.Info("all segment pods ready, advancing to segment registration")
+		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseRegistering)
+
+	case scalePhaseRegistering:
+		// Register new segments in gp_segment_configuration.
+		if err := r.registerNewSegments(ctx, cluster, state); err != nil {
+			logger.Error("segment registration failed", "error", err)
+			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		}
+		// Advance to redistribution phase.
+		logger.Info("segment registration completed, advancing to redistribution")
+		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseRedistributing)
+
+	case scalePhaseRedistributing:
+		// Run data redistribution.
+		if err := r.redistributeData(ctx, cluster); err != nil {
+			logger.Error("data redistribution failed", "error", err)
+			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		}
+		// Advance to completed.
+		logger.Info("data redistribution completed")
+		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseCompleted)
+
+	case scalePhaseCompleted:
+		// Remove scale state annotation and complete.
+		if err := removeAnnotationPatch(ctx, r.client, cluster, annotationScaleState); err != nil {
+			logger.Error("failed to remove scale-state annotation", "error", err)
+		}
+		return r.completeScaleOperation(ctx, cluster)
+
+	default:
+		logger.Warn("unknown scale phase, completing", "phase", state.Phase)
+		if err := removeAnnotationPatch(ctx, r.client, cluster, annotationScaleState); err != nil {
+			logger.Error("failed to remove scale-state annotation", "error", err)
+		}
+		return r.completeScaleOperation(ctx, cluster)
+	}
+}
+
+// advanceScalePhase updates the scale state to the next phase.
+func (r *ClusterReconciler) advanceScalePhase(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+	nextPhase string,
+) (ctrl.Result, error) {
+	state.Phase = nextPhase
+
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("marshaling scale state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		annotationScaleState, string(stateJSON)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating scale-state annotation: %w", err)
+	}
+
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// checkScaleInPhases processes the multi-phase scale-in operation.
+func (r *ClusterReconciler) checkScaleInPhases(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	stateJSON string,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	var state scaleInStateData
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		logger.Error("failed to parse scale-in state, falling back to simple check", "error", err)
+		if r.allSegmentStatefulSetsReady(ctx, cluster) {
+			return r.completeScaleOperation(ctx, cluster)
+		}
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+
+	logger.Info("scale-in phase check", "phase", state.Phase,
+		"oldCount", state.OldCount, "newCount", state.NewCount)
+
+	switch state.Phase {
+	case scaleInPhaseRedistributing:
+		return r.processScaleInRedistributing(ctx, cluster, &state)
+	case scaleInPhaseDeregistering:
+		return r.processScaleInDeregistering(ctx, cluster, &state)
+	case scaleInPhaseScalingMirrors:
+		return r.processScaleInScalingMirrors(ctx, cluster, &state)
+	case scaleInPhaseScalingPrimaries:
+		return r.processScaleInScalingPrimaries(ctx, cluster, &state)
+	case scaleInPhaseCleanup:
+		return r.processScaleInCleanup(ctx, cluster, &state)
+	case scaleInPhaseCompleted:
+		return r.processScaleInCompleted(ctx, cluster)
+	default:
+		logger.Warn("unknown scale-in phase, completing", "phase", state.Phase)
+		return r.processScaleInCompleted(ctx, cluster)
+	}
+}
+
+// processScaleInRedistributing handles the redistribution phase of scale-in.
+func (r *ClusterReconciler) processScaleInRedistributing(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	if err := r.redistributeBeforeScaleIn(ctx, cluster, *state); err != nil {
+		logger.Error("scale-in redistribution failed, will retry", "error", err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil //nolint:nilerr // retry on next reconcile
+	}
+	logger.Info("scale-in redistribution completed, advancing to deregistration")
+	return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseDeregistering)
+}
+
+// processScaleInDeregistering handles the segment deregistration phase of scale-in.
+func (r *ClusterReconciler) processScaleInDeregistering(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	if err := r.deregisterSegments(ctx, cluster, *state); err != nil {
+		logger.Error("segment deregistration failed, will retry", "error", err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil //nolint:nilerr // retry on next reconcile
+	}
+	logger.Info("segment deregistration completed, advancing to scale-down")
+	// If mirroring is enabled, scale mirrors first; otherwise skip to primaries.
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseScalingMirrors)
+	}
+	return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseScalingPrimaries)
+}
+
+// processScaleInScalingMirrors handles the mirror scale-down phase of scale-in.
+func (r *ClusterReconciler) processScaleInScalingMirrors(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	mirrorName := util.SegmentMirrorName(cluster.Name)
+	if err := r.scaleStatefulSet(ctx, cluster.Namespace, mirrorName, state.NewCount); err != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("scaling down mirrors: %w", err)
+	}
+	ready, _ := r.isStatefulSetAtScale(ctx, cluster.Namespace, mirrorName, state.NewCount)
+	if !ready {
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+	logger.Info("mirror scale-down completed, advancing to primary scale-down")
+	return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseScalingPrimaries)
+}
+
+// processScaleInScalingPrimaries handles the primary scale-down phase of scale-in.
+func (r *ClusterReconciler) processScaleInScalingPrimaries(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	primaryName := util.SegmentPrimaryName(cluster.Name)
+	if err := r.scaleStatefulSet(ctx, cluster.Namespace, primaryName, state.NewCount); err != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("scaling down primaries: %w", err)
+	}
+	ready, _ := r.isStatefulSetAtScale(ctx, cluster.Namespace, primaryName, state.NewCount)
+	if !ready {
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+	}
+	logger.Info("primary scale-down completed, advancing to cleanup")
+	return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseCleanup)
+}
+
+// processScaleInCleanup handles the PVC cleanup phase of scale-in.
+func (r *ClusterReconciler) processScaleInCleanup(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	if cluster.Spec.DeletionPolicy == cbv1alpha1.DeletionPolicyDelete {
+		r.cleanupOrphanedPVCs(ctx, cluster, state.NewCount)
+	}
+	logger.Info("cleanup completed, advancing to completed")
+	return r.advanceScaleInPhase(ctx, cluster, state, scaleInPhaseCompleted)
+}
+
+// processScaleInCompleted handles the final phase of scale-in.
+func (r *ClusterReconciler) processScaleInCompleted(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	if err := removeAnnotationPatch(ctx, r.client, cluster, annotationScaleInState); err != nil {
+		logger.Error("failed to remove scale-in-state annotation", "error", err)
+	}
+	return r.completeScaleOperation(ctx, cluster)
+}
+
+// advanceScaleInPhase updates the scale-in state to the next phase.
+func (r *ClusterReconciler) advanceScaleInPhase(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleInStateData,
+	nextPhase string,
+) (ctrl.Result, error) {
+	state.Phase = nextPhase
+
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("marshaling scale-in state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		annotationScaleInState, string(stateJSON)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating scale-in-state annotation: %w", err)
+	}
+
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// redistributeBeforeScaleIn calls the DB client to redistribute data off segments
+// being removed. If no dbFactory is configured, it logs a warning and returns nil.
+func (r *ClusterReconciler) redistributeBeforeScaleIn(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state scaleInStateData,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping scale-in redistribution")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for scale-in redistribution: %w", err)
+	}
+	defer dbClient.Close()
+
+	if redistErr := dbClient.RedistributeBeforeScaleIn(ctx, db.ScaleInRedistributionOptions{
+		NewCount: state.NewCount,
+	}); redistErr != nil {
+		return fmt.Errorf("redistributing data before scale-in: %w", redistErr)
+	}
+
+	// Update condition to reflect redistribution completion.
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "ScaleInRedistributed",
+		"Data redistributed off segments being removed")
+	if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
+		logger.Error("failed to update redistribution status", "error", statusErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "ScaleInRedistributed",
+		fmt.Sprintf("Data redistributed off segments %d-%d", state.NewCount, state.OldCount-1))
+
+	logger.Info("scale-in redistribution completed",
+		"oldCount", state.OldCount, "newCount", state.NewCount)
+	return nil
+}
+
+// deregisterSegments calls the DB client to remove segment entries from
+// gp_segment_configuration for segments being removed during scale-in.
+// If no dbFactory is configured, it logs a warning and returns nil.
+func (r *ClusterReconciler) deregisterSegments(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state scaleInStateData,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping segment deregistration")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for segment deregistration: %w", err)
+	}
+	defer dbClient.Close()
+
+	if deregErr := dbClient.DeregisterSegments(ctx, state.NewCount); deregErr != nil {
+		return fmt.Errorf("deregistering segments: %w", deregErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "SegmentsDeregistered",
+		fmt.Sprintf("Deregistered segments with content >= %d from gp_segment_configuration",
+			state.NewCount))
+
+	logger.Info("segments deregistered successfully",
+		"removedContentIDs", fmt.Sprintf("%d-%d", state.NewCount, state.OldCount-1))
+	return nil
+}
+
+// registerNewSegments calls the DB client to register new segments in gp_segment_configuration.
+// If no dbFactory is configured, it logs a warning and returns nil.
+func (r *ClusterReconciler) registerNewSegments(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state scaleStateData,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping segment registration")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for segment registration: %w", err)
+	}
+	defer dbClient.Close()
+
+	port := cluster.Spec.Coordinator.Port
+	if port == 0 {
+		port = int32(util.DefaultCoordinatorPort)
+	}
+
+	segmentSvc := util.SegmentServiceName(cluster.Name)
+
+	mirrorEnabled := cluster.Spec.Segments.Mirroring != nil &&
+		cluster.Spec.Segments.Mirroring.Enabled
+
+	if regErr := dbClient.RegisterNewSegments(ctx, db.SegmentRegistrationOptions{
+		OldCount:       state.OldCount,
+		NewCount:       state.NewCount,
+		MirrorEnabled:  mirrorEnabled,
+		SegmentService: segmentSvc,
+		ClusterName:    cluster.Name,
+		Port:           port,
+	}); regErr != nil {
+		return fmt.Errorf("registering new segments: %w", regErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "SegmentsRegistered",
+		fmt.Sprintf("Registered %d new segments in gp_segment_configuration",
+			state.NewCount-state.OldCount))
+
+	logger.Info("new segments registered successfully",
+		"oldCount", state.OldCount, "newCount", state.NewCount)
+	return nil
+}
+
+// redistributeData calls the DB client to redistribute data across all segments.
+// If no dbFactory is configured, it logs a warning and returns nil.
+func (r *ClusterReconciler) redistributeData(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping data redistribution")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for redistribution: %w", err)
+	}
+	defer dbClient.Close()
+
+	if redistErr := dbClient.RedistributeData(ctx, db.RedistributionOptions{
+		Database:    "postgres",
+		Parallelism: 2,
+	}); redistErr != nil {
+		return fmt.Errorf("redistributing data: %w", redistErr)
+	}
+
+	// Update condition to reflect redistribution completion.
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "Completed",
+		"Data redistribution completed across all segments")
+	if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
+		logger.Error("failed to update redistribution status", "error", statusErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "RedistributionCompleted",
+		"Data redistribution completed across all segments")
+
+	logger.Info("data redistribution completed")
+	return nil
 }
 
 // completeScaleOperation finalizes a scale-in or scale-out that has reached
@@ -1397,6 +1936,14 @@ func (r *ClusterReconciler) cleanupScaleAnnotations(
 		if err := removeAnnotationPatch(ctx, r.client, cluster,
 			util.AnnotationConfirmScaleIn); err != nil {
 			logger.Error("failed to remove confirm-scale-in annotation", "error", err)
+		}
+	}
+
+	// Clean up scale-in state annotation if still present.
+	if _, hasScaleInState := cluster.Annotations[annotationScaleInState]; hasScaleInState {
+		if err := removeAnnotationPatch(ctx, r.client, cluster,
+			annotationScaleInState); err != nil {
+			logger.Error("failed to remove scale-in-state annotation", "error", err)
 		}
 	}
 }
@@ -1607,6 +2154,51 @@ func (r *ClusterReconciler) getScaleDownOrder(
 	return names
 }
 
+// getScaleUpOrder returns the StatefulSet names in the order they should be
+// scaled up: coordinator first, then standby, then primaries, then mirrors.
+func (r *ClusterReconciler) getScaleUpOrder(
+	cluster *cbv1alpha1.CloudberryCluster,
+) []string {
+	var names []string
+
+	// Coordinator first.
+	names = append(names, util.CoordinatorName(cluster.Name))
+
+	// Standby coordinator.
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
+		names = append(names, util.StandbyName(cluster.Name))
+	}
+
+	// Primary segments.
+	names = append(names, util.SegmentPrimaryName(cluster.Name))
+
+	// Mirrors last.
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		names = append(names, util.SegmentMirrorName(cluster.Name))
+	}
+
+	return names
+}
+
+// getDesiredReplicas returns the desired replica count for a given StatefulSet name.
+func (r *ClusterReconciler) getDesiredReplicas(
+	cluster *cbv1alpha1.CloudberryCluster,
+	stsName string,
+) int32 {
+	switch stsName {
+	case util.CoordinatorName(cluster.Name):
+		return 1
+	case util.StandbyName(cluster.Name):
+		return 1
+	case util.SegmentPrimaryName(cluster.Name):
+		return cluster.Spec.Segments.Count
+	case util.SegmentMirrorName(cluster.Name):
+		return cluster.Spec.Segments.Count
+	default:
+		return 1
+	}
+}
+
 // updatePhase updates the cluster phase in the status.
 func (r *ClusterReconciler) updatePhase(
 	ctx context.Context,
@@ -1754,6 +2346,594 @@ func (r *ClusterReconciler) recordMetricsSnapshot(cluster *cbv1alpha1.Cloudberry
 		cluster.Status.MirroringStatus == cbv1alpha1.MirroringInSync,
 	)
 	r.metrics.SetConnectionsMax(cluster.Name, cluster.Namespace, 0)
+}
+
+// scaleStateData holds the state of an in-progress scale-out operation.
+type scaleStateData struct {
+	// Phase is the current scale operation phase.
+	Phase string `json:"phase"` // "scaling-sts", "registering", "redistributing", "completed"
+	// OldCount is the previous segment count.
+	OldCount int32 `json:"oldCount"`
+	// NewCount is the new segment count.
+	NewCount int32 `json:"newCount"`
+	// StartedAt is the timestamp when the operation started.
+	StartedAt string `json:"startedAt"`
+}
+
+// Scale-out phase constants define the ordered phases of a scale-out operation.
+const (
+	scalePhaseScalingSTS     = "scaling-sts"
+	scalePhaseRegistering    = "registering"
+	scalePhaseRedistributing = "redistributing"
+	scalePhaseCompleted      = "completed"
+
+	// AnnotationScaleState tracks in-progress scale-out state as JSON.
+	annotationScaleState = "avsoft.io/scale-state"
+)
+
+// Scale-in phase constants define the ordered phases of a scale-in operation.
+const (
+	scaleInPhaseRedistributing   = "redistributing"
+	scaleInPhaseDeregistering    = "deregistering"
+	scaleInPhaseScalingMirrors   = "scaling-mirrors"
+	scaleInPhaseScalingPrimaries = "scaling-primaries"
+	scaleInPhaseCleanup          = "cleanup"
+	scaleInPhaseCompleted        = "completed"
+
+	// annotationScaleInState tracks in-progress scale-in state as JSON.
+	annotationScaleInState = "avsoft.io/scale-in-state"
+)
+
+// scaleInStateData holds the state of an in-progress scale-in operation.
+type scaleInStateData struct {
+	// Phase is the current scale-in operation phase.
+	Phase string `json:"phase"`
+	// OldCount is the previous segment count.
+	OldCount int32 `json:"oldCount"`
+	// NewCount is the new (target) segment count.
+	NewCount int32 `json:"newCount"`
+	// StartedAt is the timestamp when the operation started.
+	StartedAt string `json:"startedAt"`
+}
+
+// mirroringStateData holds the state of an in-progress mirroring enable/disable operation.
+type mirroringStateData struct {
+	// Phase is the current mirroring operation phase.
+	Phase string `json:"phase"` // "creating-sts", "initializing", "syncing", "completed"
+	// StartedAt is the timestamp when the operation started.
+	StartedAt string `json:"startedAt"`
+	// PhaseStartedAt is the timestamp when the current phase started.
+	PhaseStartedAt string `json:"phaseStartedAt"`
+	// Layout is the mirroring layout being configured.
+	Layout string `json:"layout"`
+}
+
+// Mirroring phase constants define the ordered phases of a mirroring enable operation.
+const (
+	mirroringPhaseCreatingSTS = "creating-sts"
+	mirroringPhaseInit        = "initializing"
+	mirroringPhaseSyncing     = "syncing"
+	mirroringPhaseCompleted   = "completed"
+)
+
+// isMirroringEnableNeeded detects whether mirroring needs to be enabled as a
+// day-2 operation on an existing running cluster. It only triggers when the
+// cluster is in Running phase with MirroringNotConfigured status, meaning the
+// cluster was initially created without mirroring and the user is now enabling it.
+// During initial cluster creation, the normal reconcileSegments path handles
+// creating the mirror StatefulSet.
+func (r *ClusterReconciler) isMirroringEnableNeeded(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) bool {
+	// Mirroring must be requested in spec.
+	if cluster.Spec.Segments.Mirroring == nil || !cluster.Spec.Segments.Mirroring.Enabled {
+		return false
+	}
+
+	// Only trigger for day-2 enable on a Running cluster.
+	// During initial creation (Initializing/Pending), the normal path handles it.
+	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		return false
+	}
+
+	// Status must indicate mirroring is not yet configured.
+	if cluster.Status.MirroringStatus != cbv1alpha1.MirroringNotConfigured {
+		return false
+	}
+
+	// Mirror StatefulSet must NOT exist.
+	mirrorSts := &appsv1.StatefulSet{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Name:      util.SegmentMirrorName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, mirrorSts)
+
+	// If the STS exists, mirroring is already being set up or is configured.
+	return apierrors.IsNotFound(err)
+}
+
+// isMirroringDisableNeeded detects whether mirroring needs to be disabled as a
+// day-2 operation. It only triggers when the cluster is in Running phase with
+// mirroring currently configured but the spec requests it disabled.
+func (r *ClusterReconciler) isMirroringDisableNeeded(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) bool {
+	// Mirroring must be disabled in spec (nil or enabled=false).
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		return false
+	}
+
+	// Only trigger for day-2 disable on a Running cluster.
+	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		return false
+	}
+
+	// Status must indicate mirroring is currently configured.
+	if cluster.Status.MirroringStatus == cbv1alpha1.MirroringNotConfigured ||
+		cluster.Status.MirroringStatus == "" {
+		return false
+	}
+
+	// Mirror StatefulSet must exist.
+	mirrorSts := &appsv1.StatefulSet{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Name:      util.SegmentMirrorName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, mirrorSts)
+
+	return err == nil
+}
+
+// handleEnableMirroring orchestrates enabling mirroring on an existing unmirrored cluster.
+// It validates prerequisites, transitions the cluster to Updating phase, creates the
+// mirror StatefulSet, and requeues for progress monitoring.
+func (r *ClusterReconciler) handleEnableMirroring(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	// Phase 1: Pre-flight validation.
+	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		logger.Warn("mirroring enable blocked: cluster not in Running phase",
+			"currentPhase", cluster.Status.Phase)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringFailed,
+			fmt.Sprintf("Mirroring enable blocked: cluster is in %s phase, must be Running",
+				cluster.Status.Phase))
+		return nil
+	}
+
+	// Validate node count for layout.
+	layout := cluster.Spec.Segments.Mirroring.Layout
+	if layout == "" {
+		layout = cbv1alpha1.MirroringLayoutGroup
+	}
+	primariesPerHost := cluster.Spec.Segments.PrimariesPerHost
+	if primariesPerHost == 0 {
+		primariesPerHost = 2
+	}
+
+	if !r.validateMirroringNodeCount(cluster, layout, primariesPerHost) {
+		logger.Warn("mirroring enable blocked: insufficient segments for layout",
+			"layout", layout, "segmentCount", cluster.Spec.Segments.Count,
+			"primariesPerHost", primariesPerHost)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringFailed,
+			fmt.Sprintf("Mirroring enable blocked: insufficient segments (%d) for %s layout",
+				cluster.Spec.Segments.Count, layout))
+		return nil
+	}
+
+	logger.Info("enabling mirroring", "layout", layout,
+		"segmentCount", cluster.Spec.Segments.Count)
+
+	// Phase 2: Transition to Updating phase.
+	now := time.Now().Format(time.RFC3339)
+	state := mirroringStateData{
+		Phase:          mirroringPhaseCreatingSTS,
+		StartedAt:      now,
+		PhaseStartedAt: now,
+		Layout:         string(layout),
+	}
+
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInitializing
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionMirroringHealthy), metav1.ConditionFalse,
+		"MirroringInitializing", "Mirror initialization in progress")
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("setting updating phase for mirroring: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMirroringEnabled,
+		fmt.Sprintf("Mirroring enable initiated with %s layout", layout))
+
+	// Save mirroring state annotation.
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshaling mirroring state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationMirroringState, string(stateJSON)); err != nil {
+		return fmt.Errorf("setting mirroring state annotation: %w", err)
+	}
+
+	// Phase 3: Create mirror StatefulSet.
+	mirrorSts, buildErr := r.builder.BuildSegmentMirrorStatefulSet(cluster)
+	if buildErr != nil {
+		return fmt.Errorf("building mirror StatefulSet for cluster %s: %w", cluster.Name, buildErr)
+	}
+	if mirrorSts != nil {
+		if createErr := r.createOrUpdateStatefulSet(ctx, mirrorSts); createErr != nil {
+			return fmt.Errorf("creating mirror StatefulSet: %w", createErr)
+		}
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMirroringInitializing,
+		"Mirror StatefulSet created, waiting for pods to be ready")
+
+	// Requeue to check progress.
+	return nil
+}
+
+// validateMirroringNodeCount checks whether the segment count is sufficient
+// for the chosen mirroring layout.
+func (r *ClusterReconciler) validateMirroringNodeCount(
+	cluster *cbv1alpha1.CloudberryCluster,
+	layout cbv1alpha1.MirroringLayout,
+	primariesPerHost int32,
+) bool {
+	count := cluster.Spec.Segments.Count
+	switch layout {
+	case cbv1alpha1.MirroringLayoutGroup:
+		return count >= 2*primariesPerHost
+	case cbv1alpha1.MirroringLayoutSpread:
+		return count > primariesPerHost
+	default:
+		return count >= 2*primariesPerHost
+	}
+}
+
+// checkMirroringProgress checks the progress of an in-flight mirroring enable operation.
+// It is called from handleLifecyclePhase when the cluster is in Updating phase
+// with a mirroring state annotation.
+func (r *ClusterReconciler) checkMirroringProgress(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	stateJSON := cluster.Annotations[util.AnnotationMirroringState]
+	if stateJSON == "" {
+		logger.Warn("checkMirroringProgress called but no mirroring state annotation found")
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	}
+
+	var state mirroringStateData
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		logger.Error("failed to parse mirroring state", "error", err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+
+	// Check for timeout.
+	if state.StartedAt != "" {
+		started, parseErr := time.Parse(time.RFC3339, state.StartedAt)
+		if parseErr == nil && time.Since(started) > mirroringEnableTimeout {
+			return r.handleMirroringTimeout(ctx, cluster)
+		}
+	}
+
+	logger.Info("checking mirroring progress", "phase", state.Phase)
+
+	switch state.Phase {
+	case mirroringPhaseCreatingSTS:
+		// Check if mirror STS is ready.
+		if r.isStatefulSetReady(ctx, cluster.Namespace, util.SegmentMirrorName(cluster.Name)) {
+			logger.Info("mirror StatefulSet is ready, advancing to initialization")
+			return r.advanceMirroringPhase(ctx, cluster, &state, mirroringPhaseInit)
+		}
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+
+	case mirroringPhaseInit:
+		// Initialize mirrors via DB client.
+		if err := r.initializeMirrors(ctx, cluster); err != nil {
+			logger.Error("mirror initialization failed", "error", err)
+			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		}
+		return r.advanceMirroringPhase(ctx, cluster, &state, mirroringPhaseSyncing)
+
+	case mirroringPhaseSyncing:
+		// Monitor sync progress.
+		allSynced, err := r.monitorMirrorSync(ctx, cluster)
+		if err != nil {
+			logger.Error("mirror sync monitoring failed", "error", err)
+			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		}
+		if allSynced {
+			return r.completeMirroringEnable(ctx, cluster)
+		}
+		// Update status to Syncing.
+		cluster.Status.MirroringStatus = cbv1alpha1.MirroringSyncing
+		if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
+			logger.Error("failed to update syncing status", "error", statusErr)
+		}
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
+
+	default:
+		logger.Warn("unknown mirroring phase, completing", "phase", state.Phase)
+		return r.completeMirroringEnable(ctx, cluster)
+	}
+}
+
+// advanceMirroringPhase updates the mirroring state to the next phase.
+func (r *ClusterReconciler) advanceMirroringPhase(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *mirroringStateData,
+	nextPhase string,
+) (ctrl.Result, error) {
+	state.Phase = nextPhase
+	state.PhaseStartedAt = time.Now().Format(time.RFC3339)
+
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("marshaling mirroring state: %w", err)
+	}
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationMirroringState, string(stateJSON)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating mirroring state annotation: %w", err)
+	}
+
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// completeMirroringEnable finalizes a successful mirroring enable operation.
+func (r *ClusterReconciler) completeMirroringEnable(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	// Update status: phase → Running, mirroringStatus → InSync.
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionMirroringHealthy), metav1.ConditionTrue,
+		"MirroringInSync", "All mirrors are synchronized")
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating status after mirroring enable: %w", err)
+	}
+
+	// Remove mirroring state annotation (after status update to avoid re-fetch overwriting).
+	if err := removeAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationMirroringState); err != nil {
+		logger.Error("failed to remove mirroring state annotation", "error", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMirroringInSync,
+		"Mirroring enabled and all mirrors are synchronized")
+	r.metrics.RecordMirroringOperation(cluster.Name, cluster.Namespace, "enable")
+
+	logger.Info("mirroring enable completed successfully")
+	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// handleMirroringTimeout handles a mirroring enable operation that has exceeded
+// the timeout. It sets the mirroring status to Degraded and emits a failure event.
+func (r *ClusterReconciler) handleMirroringTimeout(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Error("mirroring enable timed out", "timeout", mirroringEnableTimeout)
+
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionMirroringHealthy), metav1.ConditionFalse,
+		"MirroringTimeout",
+		fmt.Sprintf("Mirroring initialization timed out after %v", mirroringEnableTimeout))
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating status after mirroring timeout: %w", err)
+	}
+
+	// Remove mirroring state annotation.
+	if err := removeAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationMirroringState); err != nil {
+		logger.Error("failed to remove mirroring state annotation after timeout", "error", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringFailed,
+		fmt.Sprintf("Mirroring initialization timed out after %v", mirroringEnableTimeout))
+
+	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// handleDisableMirroring orchestrates disabling mirroring on a cluster.
+// It deletes the mirror StatefulSet, optionally cleans up PVCs, and updates status.
+func (r *ClusterReconciler) handleDisableMirroring(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	// Pre-flight: cluster must be in Running phase.
+	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		logger.Warn("mirroring disable blocked: cluster not in Running phase",
+			"currentPhase", cluster.Status.Phase)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringFailed,
+			fmt.Sprintf("Mirroring disable blocked: cluster is in %s phase, must be Running",
+				cluster.Status.Phase))
+		return nil
+	}
+
+	logger.Info("disabling mirroring")
+
+	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringDisabled,
+		"Mirroring disable initiated — data protection will be reduced")
+
+	// Delete mirror StatefulSet.
+	mirrorSts := &appsv1.StatefulSet{}
+	mirrorName := util.SegmentMirrorName(cluster.Name)
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name:      mirrorName,
+		Namespace: cluster.Namespace,
+	}, mirrorSts); err == nil {
+		if delErr := r.client.Delete(ctx, mirrorSts); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("deleting mirror StatefulSet %s: %w", mirrorName, delErr)
+		}
+		logger.Info("deleted mirror StatefulSet", "name", mirrorName)
+	}
+
+	// Clean up mirror PVCs based on deletion policy.
+	if cluster.Spec.DeletionPolicy == cbv1alpha1.DeletionPolicyDelete {
+		r.cleanupMirrorPVCs(ctx, cluster)
+	} else {
+		logger.Info("retaining mirror PVCs (deletionPolicy: Retain)")
+	}
+
+	// Update status.
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	// Remove MirroringHealthy condition by setting it to False with a clear reason.
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionMirroringHealthy), metav1.ConditionFalse,
+		"MirroringDisabled", "Mirroring has been disabled")
+	if err := r.client.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("updating status after mirroring disable: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMirroringDisabled,
+		"Mirroring disabled successfully")
+	r.metrics.RecordMirroringOperation(cluster.Name, cluster.Namespace, "disable")
+
+	logger.Info("mirroring disable completed")
+	return nil
+}
+
+// cleanupMirrorPVCs deletes PVCs associated with mirror segments.
+func (r *ClusterReconciler) cleanupMirrorPVCs(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+	mirrorStsName := util.SegmentMirrorName(cluster.Name)
+
+	for i := int32(0); i < cluster.Spec.Segments.Count; i++ {
+		pvcName := fmt.Sprintf("data-%s-%d", mirrorStsName, i)
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Name:      pvcName,
+			Namespace: cluster.Namespace,
+		}, pvc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Error("failed to get mirror PVC", "pvc", pvcName, "error", err)
+			}
+			continue
+		}
+		if delErr := r.client.Delete(ctx, pvc); delErr != nil {
+			logger.Error("failed to delete mirror PVC", "pvc", pvcName, "error", delErr)
+		} else {
+			logger.Info("deleted mirror PVC", "pvc", pvcName)
+		}
+	}
+}
+
+// initializeMirrors calls the DB client to initialize mirror segments.
+// If no dbFactory is configured, it logs a warning and returns nil (the mirrors
+// will be initialized by the Cloudberry utilities running inside the pods).
+func (r *ClusterReconciler) initializeMirrors(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Info("no database client factory configured, skipping DB-level mirror initialization")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating db client for mirror initialization: %w", err)
+	}
+	defer dbClient.Close()
+
+	layout := string(cbv1alpha1.MirroringLayoutGroup)
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Layout != "" {
+		layout = string(cluster.Spec.Segments.Mirroring.Layout)
+	}
+
+	// Initialize mirrors.
+	if initErr := dbClient.InitializeMirrors(ctx, db.MirrorInitOptions{
+		Layout:       layout,
+		SegmentCount: cluster.Spec.Segments.Count,
+		Parallelism:  2,
+	}); initErr != nil {
+		return fmt.Errorf("initializing mirrors: %w", initErr)
+	}
+
+	// Configure replication.
+	if repErr := dbClient.ConfigureReplication(ctx, db.ReplicationOptions{
+		Mode: "sync",
+	}); repErr != nil {
+		return fmt.Errorf("configuring replication: %w", repErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMirroringInitializing,
+		"Mirror initialization and replication configuration completed")
+
+	logger.Info("mirror initialization completed")
+	return nil
+}
+
+// monitorMirrorSync checks the synchronization status of all mirror segments.
+// Returns true when all mirrors are synced, false otherwise.
+func (r *ClusterReconciler) monitorMirrorSync(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (bool, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		// Without a DB factory, assume mirrors are synced once the STS is ready.
+		logger.Info("no database client factory, assuming mirrors synced based on STS readiness")
+		return r.isStatefulSetReady(ctx, cluster.Namespace,
+			util.SegmentMirrorName(cluster.Name)), nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return false, fmt.Errorf("creating db client for sync monitoring: %w", err)
+	}
+	defer dbClient.Close()
+
+	syncStatus, err := dbClient.GetMirrorSyncStatus(ctx)
+	if err != nil {
+		return false, fmt.Errorf("getting mirror sync status: %w", err)
+	}
+
+	// If no mirror segments found, check STS readiness as fallback.
+	if len(syncStatus) == 0 {
+		return r.isStatefulSetReady(ctx, cluster.Namespace,
+			util.SegmentMirrorName(cluster.Name)), nil
+	}
+
+	allSynced := true
+	for _, ms := range syncStatus {
+		segID := fmt.Sprintf("%d", ms.ContentID)
+		r.metrics.SetReplicationLag(cluster.Name, cluster.Namespace,
+			segID, float64(ms.ReplicationLag))
+
+		if !ms.IsSynced {
+			allSynced = false
+			logger.Info("mirror segment not yet synced",
+				"contentID", ms.ContentID,
+				"state", ms.State,
+				"replicationLag", ms.ReplicationLag)
+		}
+	}
+
+	return allSynced, nil
 }
 
 // upgradeStateData holds the state of an in-progress cluster upgrade.

@@ -313,6 +313,8 @@ cloudberry-k8s/
 │   │   ├── scenario13_pv_expansion_test.go
 │   │   ├── scenario15_error_handling_test.go
 │   │   ├── scenario16_deletion_test.go
+│   │   ├── scenario19_enable_mirroring_test.go
+│   │   ├── scenario20_automatic_failover_test.go
 │   │   └── webhook_test.go
 │   ├── scenarios/                    # SQL/shell scripts for test scenarios
 │   │   ├── scenario7_load_data.sql   # Test data loading (5 tables, ~1.45M rows)
@@ -389,8 +391,11 @@ make build-operator
 # Build CLI only
 make build-ctl
 
-# Build Docker images
+# Build Docker images (operator + CLI)
 make docker-build
+
+# Build all Docker images (operator, CLI, and Cloudberry DB)
+make docker-build-all
 
 # Build operator Docker image only
 make docker-build-operator
@@ -398,9 +403,57 @@ make docker-build-operator
 # Build CLI Docker image only
 make docker-build-ctl
 
+# Build Apache Cloudberry database image (compiles from source)
+make docker-build-cloudberry
+
 # Push Docker images
 make docker-push
 ```
+
+### Building the Cloudberry DB Image
+
+The project includes `Dockerfile.cloudberry`, a multi-stage build that compiles Apache Cloudberry 2.1.0 from source on Rocky Linux 9.6. The resulting image (`cloudberrydb/cloudberry:2.1.0`) is used by the operator to run real Cloudberry clusters.
+
+```bash
+# Build the Cloudberry DB image (takes 15-30 minutes on first build)
+make docker-build-cloudberry
+
+# The image is tagged as cloudberrydb/cloudberry:2.1.0
+docker images | grep cloudberry
+```
+
+**Image details:**
+- **Base**: Rocky Linux 9.6 (build stage) / Rocky Linux 9.6-minimal (runtime stage)
+- **Source**: Apache Cloudberry 2.1.0-incubating
+- **Platforms**: linux/amd64, linux/arm64
+- **User**: `gpadmin` (non-root)
+- **Entrypoint**: `hack/docker-entrypoint-cloudberry.sh`
+
+**Entrypoint script** (`hack/docker-entrypoint-cloudberry.sh`):
+
+The entrypoint handles initialization and startup for all Cloudberry roles:
+
+| Role | `CLOUDBERRY_ROLE` | Behavior |
+|------|-------------------|----------|
+| Coordinator | `coordinator` | Runs in `dispatch` mode (`gp_role=dispatch`). Registers segments in `gp_segment_configuration` on first startup. Sets up streaming replication to standby. |
+| Standby | `standby` | Connects to coordinator via `pg_basebackup` for initial sync, then runs as a streaming replica. |
+| Primary segment | `primary` | Runs in `execute` mode (`gp_role=execute`). Content ID and DB ID are derived from the StatefulSet pod ordinal. |
+| Mirror segment | `mirror` | Connects to the corresponding primary via `pg_basebackup`, then runs as a streaming replica of that primary. |
+
+Key environment variables consumed by the entrypoint:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGDATA` | Data directory path | `/data/pgdata` |
+| `POSTGRES_PASSWORD` | Admin password for gpadmin | (required) |
+| `CLOUDBERRY_ROLE` | Role: coordinator, standby, primary, mirror | `coordinator` |
+| `CLOUDBERRY_CONTENT_ID` | Segment content ID (-1 for coordinator) | Derived from pod name |
+| `CLOUDBERRY_COORDINATOR_HOST` | Hostname of the coordinator | `localhost` |
+| `CLOUDBERRY_SEGMENT_PORT` | Port for this segment | `5432` |
+| `CLOUDBERRY_DB_ID` | Database ID for this segment | Derived from pod name |
+| `CLOUDBERRY_SEGMENT_COUNT` | Total number of primary segments | `4` |
+
+**Segment registration**: On coordinator first startup, the entrypoint inserts rows into `gp_segment_configuration` for all segments (primaries and mirrors). This populates the Cloudberry catalog so the coordinator knows about all segments in the cluster.
 
 ### Build Variables
 
@@ -936,6 +989,121 @@ Tests the cluster deletion flow with both `Retain` and `Delete` PVC policies, in
 | `TestScenario16_BackupJobCreated` | backupOnDelete=true: Job with `backup-on-delete` in name created, correct `avsoft.io/cluster` and `avsoft.io/operation` labels |
 | `TestScenario16_DeletionPhaseTransition` | Phase transition: `Running` → `Deleting` confirmed by `Deleting` event, cluster deleted after finalizer removal, `Deleted` event emitted |
 
+#### Scenario 19 — Enable/Disable Mirroring on Existing Cluster
+
+Tests enabling and disabling segment mirroring on an existing running cluster, including pre-flight validation, state machine transitions, DB client interactions, timeout handling, and webhook validation.
+
+- **Pre-flight validation**: Mirroring enable requires the cluster to be in `Running` phase. The webhook rejects the patch if the cluster is not running. The operator also validates that the segment count is sufficient for the requested layout (e.g., group layout requires at least 2 segments)
+- **Enable flow**: `handleMirroringEnable()` creates the mirror StatefulSet, sets `status.mirroringStatus` to `Initializing`, initiates WAL replication via the DB client, and emits `MirroringEnabled` event
+- **Status transitions**: `NotConfigured` → `Initializing` → `Syncing` → `InSync`. Each transition is verified via status assertions
+- **Phase transitions**: `Running` → `Updating` → `Running` during mirroring enable
+- **Condition updates**: `MirroringHealthy` condition set with reason `MirroringInitializing` during enable, then `True` after completion
+- **Mirror StatefulSet**: Created with the same replica count as the primary StatefulSet. Verified via StatefulSet lookup
+- **Replication lag**: DB client `SetReplicationLag` metric populated during `Syncing` phase, decreases to 0 at `InSync`
+- **WAL replication**: DB client `InitializeMirrors()` called to set up streaming replication from primaries to mirrors
+- **Completion**: `completeMirroringEnable()` sets `status.mirroringStatus` to `InSync`, phase to `Running`, emits `MirroringInSync` event
+- **Data verification**: DB client confirms mirror data matches primary data after synchronization
+- **DB error handling**: When the DB client returns an error during mirror initialization, the operator logs the error and retries on the next reconciliation
+- **Timeout**: 30-minute timeout. If mirrors do not reach `InSync` within this window, `status.mirroringStatus` transitions to `Degraded` and a `MirroringDegraded` warning event is emitted
+- **Disable flow**: `handleMirroringDisable()` deletes the mirror StatefulSet, sets `status.mirroringStatus` to `NotConfigured`, handles PVC cleanup based on `deletionPolicy`, and emits `MirroringDisabled` event
+- **PVC cleanup (Retain)**: Mirror PVCs preserved after disable
+- **PVC cleanup (Delete)**: Mirror PVCs deleted after disable
+- **Idempotency**: Enabling mirroring twice does not create duplicate StatefulSets
+- **Webhook validation**: Enabling mirroring on a non-Running cluster is rejected. Changing layout while mirroring is enabled is rejected
+- **Metrics**: `cloudberry_mirroring_operations_total{operation="enable"}` and `cloudberry_mirroring_operations_total{operation="disable"}` incremented
+- **Functional tests**: `test/functional/scenario19_enable_mirroring_test.go`
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `MirroringEnabled` | Normal | Mirroring enable initiated — mirror StatefulSet created |
+| `MirroringInitializing` | Normal | Mirror initialization in progress |
+| `MirroringInSync` | Normal | All mirrors synchronized — mirroring enable complete |
+| `MirroringDegraded` | Warning | Mirroring enable timed out after 30 minutes |
+| `MirroringDisabled` | Normal | Mirroring disabled — mirror StatefulSet deleted |
+
+**Functional tests (17 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestEnableMirroring_ValidatesNodeCount` | Insufficient segments for layout → blocked with event |
+| `TestEnableMirroring_RequiresRunningPhase` | Non-Running cluster → blocked, no mirror StatefulSet created |
+| `TestEnableMirroring_CreatesMirrorStatefulSet` | Mirror StatefulSet created with correct name and labels |
+| `TestEnableMirroring_MirrorSTSMatchesPrimaryCount` | Mirror replica count matches primary replica count |
+| `TestEnableMirroring_StatusTransitions` | `NotConfigured` → `Initializing` verified via status |
+| `TestEnableMirroring_PhaseTransitions` | `Running` → `Updating` during enable |
+| `TestEnableMirroring_ConditionUpdates` | `MirroringHealthy` condition set with `MirroringInitializing` reason |
+| `TestEnableMirroring_ReplicationLagDecreases` | `SetReplicationLag` metric called during sync |
+| `TestEnableMirroring_WALReplicationStarts` | DB client `InitializeMirrors()` called |
+| `TestEnableMirroring_CompletesSuccessfully` | Full flow: `NotConfigured` → `InSync`, phase → `Running`, `MirroringInSync` event |
+| `TestEnableMirroring_DataMatchesPrimaries` | DB client verifies mirror data matches primaries |
+| `TestEnableMirroring_HandlesDBError` | DB error during init → logged, retried on next reconcile |
+| `TestEnableMirroring_HandlesTimeout` | 30-minute timeout → `Degraded` status, `MirroringDegraded` event |
+| `TestDisableMirroring_DeletesMirrorSTS` | Mirror StatefulSet deleted, status → `NotConfigured` |
+| `TestDisableMirroring_PVCRetainPolicy` | Mirror PVCs preserved with Retain policy |
+| `TestDisableMirroring_PVCDeletePolicy` | Mirror PVCs deleted with Delete policy |
+| `TestEnableMirroring_Idempotent` | Second enable does not create duplicate StatefulSet |
+| `TestWebhook_MirroringEnableOnRunning` | Webhook allows enable on Running cluster |
+| `TestWebhook_MirroringEnableOnNonRunning` | Webhook rejects enable on non-Running cluster |
+| `TestWebhook_MirroringLayoutChangeRejected` | Webhook rejects layout change while mirroring is enabled |
+
+#### Scenario 20 — Automatic Segment Failover via FTS
+
+Tests the automatic segment failover flow via the Fault Tolerance Service (FTS), including probe retry mechanism, failure detection, Cloudberry internal FTS scan triggering, mirror promotion verification, event emission, metric recording, and edge cases.
+
+- **FTS probe retry**: `probeSegmentConfigWithRetries()` retries `GetSegmentConfiguration()` up to `FTSProbeRetries` times with `FTSProbeTimeout` per attempt. Each attempt uses a dedicated `context.WithTimeout`. On success after retry, logs "FTS probe succeeded after retry"
+- **Failure detection**: `analyzeSegments()` iterates over segment configuration, identifies segments with status `d` (down), and builds `failedSegments` and `failedPrimaries` lists. Coordinator entries (contentID < 0) are skipped
+- **Automatic failover**: When failed primaries are detected and mirroring is enabled, `handleFailover()` calls `dbClient.TriggerFTSProbe()` to initiate Cloudberry's internal FTS scan, which promotes mirrors to primary role
+- **Promotion verification**: After triggering failover, the operator re-reads `gp_segment_configuration` and verifies that a different DBID now holds the primary role for the affected content ID
+- **SegmentFailover event**: Emitted per failed primary segment with content ID, original primary hostname, and new primary hostname (if promotion succeeded)
+- **FTS failover metric**: `cloudberry_fts_failover_total` incremented once per failover cycle (not per segment)
+- **Status updates**: `status.failedSegments` populated with failed segment details; `status.mirroringStatus` set to `MirroringDegraded`; `MirroringDegraded` warning event emitted
+- **Resilience**: If `TriggerFTSProbe()` fails, the operator still emits events and updates status based on originally detected failures. If re-read fails, events are emitted for the originally detected failures
+- **Mirroring disabled**: When mirroring is not enabled, failed primaries are reported but no failover is triggered and no `SegmentFailover` events are emitted
+- **Multiple primaries down**: Handles simultaneous failure of multiple primary segments, emitting `SegmentFailover` events for each
+- **Cluster availability**: The cluster remains available during and after failover — the promoted mirror serves as the new primary
+- **Subsequent reconciliation**: After failover, subsequent reconciliation cycles succeed and correctly report the post-failover state
+- **Functional tests**: `test/functional/scenario20_automatic_failover_test.go`
+
+**Events:**
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `SegmentFailover` | Warning | Primary segment failed; mirror promotion triggered or pending |
+| `MirroringDegraded` | Warning | One or more segments are down |
+
+**Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `cloudberry_fts_failover_total` | Incremented once per failover cycle |
+| `cloudberry_fts_probe_total{result=failure}` | Incremented per failed probe attempt |
+| `cloudberry_fts_probe_total{result=degraded}` | Recorded when probe succeeds but segments are down |
+| `cloudberry_segments_failed` | Set to the count of failed segments |
+
+**Functional tests (16 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestDetection_FTSProbeFailsForKilledSegment` | Primary down → `MirroringDegraded`, `failedSegments` populated |
+| `TestDetection_RetriesOccurUpToFTSProbeRetries` | Probe retries on failure, succeeds on Nth attempt → `InSync` |
+| `TestDetection_AllRetriesExhausted_ProbeFailureRecorded` | All retries fail → probe failure metric recorded |
+| `TestDetection_ProbeTimeoutRespected` | Per-attempt timeout is applied via `context.WithTimeout` |
+| `TestFailover_MirrorPromotedToPrimary` | After failover, mirror DBID holds primary role for affected contentID |
+| `TestFailover_SegmentConfigurationUpdated` | Post-failover segment config reflects role swap |
+| `TestFailover_SegmentFailoverEventEmitted` | `SegmentFailover` event emitted with content ID and hostnames |
+| `TestFailover_FTSFailoverMetricIncrements` | `cloudberry_fts_failover_total` incremented |
+| `TestFailover_SegmentStatusDropsToZero` | Per-segment status metric set to `false` for failed segment |
+| `TestFailover_SegmentsFailedIncrements` | `cloudberry_segments_failed` gauge set to count of failures |
+| `TestFailover_FailedSegmentsListUpdated` | `status.failedSegments` contains contentID, hostname, role, status |
+| `TestFailover_ClusterRemainsAvailable` | Cluster phase stays `Running` during failover |
+| `TestFailover_SubsequentReconcileSucceeds` | Post-failover reconciliation succeeds with updated state |
+| `TestFailover_MultiplePrimariesDown` | Two primaries down → both reported, events for each |
+| `TestFailover_TriggerFTSProbeError` | `TriggerFTSProbe` fails → events still emitted, status still updated |
+| `TestFailover_MirroringDisabled_NoFailover` | No mirroring → no `SegmentFailover` events, no failover triggered |
+| `TestFailover_AllHealthy_NoFailover` | All segments healthy → `InSync`, no failover, `failedSegments` empty |
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -981,6 +1149,71 @@ go test ./test/functional/... -v -tags functional -run TestScenario15
 
 # Run cluster deletion functional tests
 go test ./test/functional/... -v -tags functional -run TestScenario16
+
+# Run mirroring enable/disable functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario19
+
+# Run automatic failover functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario20
+```
+
+### Scenario 1 Live Cluster Test
+
+Scenario 1 validates the full cluster bootstrap with a real Apache Cloudberry 2.1.0 image on a live Kubernetes cluster. The test CR is at `test/examples/scenario1-cluster.yaml`.
+
+**Prerequisites:**
+
+1. Build the Cloudberry DB image:
+   ```bash
+   make docker-build-cloudberry
+   kind load docker-image cloudberrydb/cloudberry:2.1.0 --name cloudberry-dev
+   ```
+
+2. Deploy the operator:
+   ```bash
+   make docker-build
+   kind load docker-image cloudberry-operator:latest --name cloudberry-dev
+   helm install cloudberry-operator deploy/helm/cloudberry-operator \
+     --namespace cloudberry-system --create-namespace
+   ```
+
+3. Deploy the Scenario 1 cluster:
+   ```bash
+   kubectl create namespace cloudberry-test
+   kubectl apply -f test/examples/scenario1-cluster.yaml
+   ```
+
+**What the test validates:**
+
+| Check | Verification |
+|-------|-------------|
+| Cluster status | Phase = `Running` |
+| Database creation | `CREATE DATABASE mydb` succeeds |
+| Webhook validation | `segments.count=0` rejected |
+| RBAC, ConfigMaps, Secrets | All created with correct labels |
+| Headless Services | Created for coordinator and segments |
+| Init container | Runs successfully (data dir preparation) |
+| Segment registration | `gp_segment_configuration` populated (9 rows: 1 coordinator + 1 standby + 4 primaries + 4 mirrors - 1 coordinator entry = 9 segment entries) |
+| Config layers | All 4 layers applied (cluster-wide, coordinator-only, database-specific, role-specific) |
+| Status fields | `coordinatorReady=true`, `standbyReady=true`, `segmentsReady=4`, `mirroringStatus=InSync` |
+| Prometheus metrics | `cloudberry_cluster_info`, `cloudberry_coordinator_up`, etc. |
+| Structured logging | JSON logs with `cluster`, `namespace`, `controller` fields |
+| Replication | Coordinator→standby and primary→mirror streaming replication working |
+| Data distribution | Data distributed across 4 segments |
+
+**Cluster topology** (10 pods total):
+
+```
+scenario1-cluster-coordinator-0       (coordinator, dispatch mode)
+scenario1-cluster-standby-0           (standby, streaming replica of coordinator)
+scenario1-cluster-segment-primary-0   (primary, content_id=0)
+scenario1-cluster-segment-primary-1   (primary, content_id=1)
+scenario1-cluster-segment-primary-2   (primary, content_id=2)
+scenario1-cluster-segment-primary-3   (primary, content_id=3)
+scenario1-cluster-segment-mirror-0    (mirror of primary-0)
+scenario1-cluster-segment-mirror-1    (mirror of primary-1)
+scenario1-cluster-segment-mirror-2    (mirror of primary-2)
+scenario1-cluster-segment-mirror-3    (mirror of primary-3)
 ```
 
 ### Coverage
@@ -1292,6 +1525,37 @@ Run `make generate && make manifests` after:
 ## Adding New Features
 
 ### Key Implementation Details
+
+#### Mirroring Enable/Disable Implementation
+
+The mirroring enable/disable feature (Scenario 19) is implemented in `internal/controller/cluster_controller.go` with the following key methods:
+
+- **`isMirroringEnableNeeded()`**: Detection method that checks four conditions: `spec.segments.mirroring.enabled=true`, `status.mirroringStatus=NotConfigured`, cluster phase is `Running`, and no mirror StatefulSet exists. All four must be true.
+- **`handleMirroringEnable()`**: Creates the mirror StatefulSet via `BuildMirrorStatefulSet()`, sets phase to `Updating`, sets `status.mirroringStatus` to `Initializing`, initiates WAL replication via the DB client, and emits `MirroringEnabled` event.
+- **`checkMirroringProgress()`**: Called on each reconciliation when status is `Initializing` or `Syncing`. Monitors mirror StatefulSet readiness and replication lag. Transitions through `Initializing` → `Syncing` → `InSync`. Detects 30-minute timeout and sets `Degraded`.
+- **`completeMirroringEnable()`**: Sets `status.mirroringStatus` to `InSync`, phase to `Running`, and emits `MirroringInSync` event.
+- **`isMirroringDisableNeeded()`**: Checks `spec.segments.mirroring.enabled=false`, status is not `NotConfigured`, and cluster is `Running`.
+- **`handleMirroringDisable()`**: Deletes the mirror StatefulSet, handles PVC cleanup based on `deletionPolicy`, sets `status.mirroringStatus` to `NotConfigured`, and emits `MirroringDisabled` event.
+
+The webhook (`internal/webhook/validating.go`) validates mirroring changes on UPDATE:
+- `validateMirroringChange()` checks that enabling mirroring is only allowed on `Running` clusters with sufficient nodes
+- `isMirroringEnabled()` helper determines if mirroring is enabled in the spec
+- Changing layout while mirroring is enabled is rejected
+
+Metrics are recorded via `RecordMirroringOperation(cluster, namespace, operation)` where `operation` is `"enable"` or `"disable"`, and `SetReplicationLag(cluster, namespace, segment, lagBytes)` for replication monitoring.
+
+#### Automatic Failover Implementation (Scenario 20)
+
+The automatic segment failover feature is implemented in `internal/controller/ha_controller.go` with the following key methods:
+
+- **`probeSegmentConfigWithRetries()`**: Retry wrapper around `dbClient.GetSegmentConfiguration()`. Creates a `context.WithTimeout` per attempt using `probeTimeout()`. Retries up to `probeRetries()` times. Records `fts_probe_total{result=failure}` per failed attempt. Returns segments on first success or the last error after exhaustion.
+- **`analyzeSegments()`**: Iterates over segment configuration, skips coordinator entries (contentID < 0), records per-segment status metrics, and builds `failedSegments` and `failedPrimaries` lists. Returns a `segmentAnalysisResult` struct.
+- **`handleFailover()`**: Called when `len(failedPrimaries) > 0` and mirroring is enabled. Calls `dbClient.TriggerFTSProbe()` to initiate Cloudberry's internal FTS scan. Re-reads segment configuration to verify promotion. Emits `SegmentFailover` events per failed primary. Increments `cloudberry_fts_failover_total`. Continues with status updates even if trigger or re-read fails.
+- **`updateFTSProbeStatus()`**: Sets `status.failedSegments`, updates `mirroringStatus` to `InSync` or `MirroringDegraded`, and emits `MirroringDegraded` event when segments are down.
+- **`reportMirrorReplicationLag()`**: Best-effort replication lag reporting via `dbClient.GetMirrorSyncStatus()`. Errors are logged but do not fail the probe.
+- **`patchFTSStatus()`**: Manually constructs a MergePatch that always includes `failedSegments` (even when empty) to work around `omitempty` JSON tag behavior.
+
+The failover verification uses a DBID comparison: after triggering the FTS scan, the operator checks whether a different DBID now holds the primary role (`role="p"`) for the same content ID. If the DBID changed, the mirror was successfully promoted.
 
 #### Builder Interface Error Handling
 

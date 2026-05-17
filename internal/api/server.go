@@ -51,6 +51,9 @@ const (
 	responseKeyNamespace = "namespace"
 
 	statusDeleted = "deleted"
+	statusPending = "pending"
+
+	responseKeyMemoryLimit = "memoryLimit"
 )
 
 // dns1123SubdomainRegex validates DNS-1123 subdomain names used for cluster and namespace names.
@@ -210,6 +213,14 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceGroup)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}/assign",
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleAssignResourceGroup)))
+
+	// Resource queue management.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-queues",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceQueues)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-queues",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceQueue)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-queues/{queueName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceQueue)))
 
 	// Query monitoring.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
@@ -905,11 +916,11 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 		s.logger.Warn("create resource group requested but database factory not available",
 			"cluster", cluster.Name, "group", req.Name)
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			responseKeyName:    req.Name,
-			"concurrency":      req.Concurrency,
-			"cpuMaxPercent":    req.CPUMaxPercent,
-			"memoryLimit":      req.MemoryLimit,
-			responseKeyMessage: "resource group creation pending; database connection not available",
+			responseKeyName:        req.Name,
+			"concurrency":          req.Concurrency,
+			"cpuMaxPercent":        req.CPUMaxPercent,
+			responseKeyMemoryLimit: req.MemoryLimit,
+			responseKeyMessage:     "resource group creation pending; database connection not available",
 		})
 		return
 	}
@@ -941,11 +952,11 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 	s.logger.Info("resource group created",
 		"cluster", cluster.Name, "group", req.Name)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		responseKeyName:   req.Name,
-		"concurrency":     req.Concurrency,
-		"cpuMaxPercent":   req.CPUMaxPercent,
-		"memoryLimit":     req.MemoryLimit,
-		responseKeyStatus: "created",
+		responseKeyName:        req.Name,
+		"concurrency":          req.Concurrency,
+		"cpuMaxPercent":        req.CPUMaxPercent,
+		responseKeyMemoryLimit: req.MemoryLimit,
+		responseKeyStatus:      "created",
 	})
 }
 
@@ -966,7 +977,7 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 			"cluster", cluster.Name, "group", groupName)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			responseKeyGroup:   groupName,
-			responseKeyStatus:  "pending",
+			responseKeyStatus:  statusPending,
 			responseKeyMessage: msgDBNotAvailable,
 		})
 		return
@@ -1032,7 +1043,7 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			responseKeyGroup:   groupName,
 			"role":             req.Role,
-			responseKeyStatus:  "pending",
+			responseKeyStatus:  statusPending,
 			responseKeyMessage: msgDBNotAvailable,
 		})
 		return
@@ -1062,6 +1073,182 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 		responseKeyGroup:  groupName,
 		"role":            req.Role,
 		responseKeyStatus: "assigned",
+	})
+}
+
+// handleListResourceQueues lists resource queues from the database.
+func (s *Server) handleListResourceQueues(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("list resource queues requested but database factory not available",
+			"cluster", cluster.Name)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"resourceQueues":   []interface{}{},
+			responseKeyTotal:   0,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource queue listing",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	queues, listErr := dbClient.ListResourceQueues(r.Context())
+	if listErr != nil {
+		s.logger.Error("failed to list resource queues",
+			"cluster", cluster.Name, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to list resource queues")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"resourceQueues": queues,
+		responseKeyTotal: len(queues),
+	})
+}
+
+// handleCreateResourceQueue creates a new resource queue in the database.
+func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	var req struct {
+		Name             string  `json:"name"`
+		ActiveStatements int32   `json:"activeStatements"`
+		MemoryLimit      string  `json:"memoryLimit"`
+		Priority         string  `json:"priority"`
+		MaxCost          float64 `json:"maxCost"`
+		MinCost          float64 `json:"minCost"`
+	}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if req.Name == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource queue name is required")
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("create resource queue requested but database factory not available",
+			"cluster", cluster.Name, "queue", req.Name)
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			responseKeyName:        req.Name,
+			"activeStatements":     req.ActiveStatements,
+			responseKeyMemoryLimit: req.MemoryLimit,
+			"priority":             req.Priority,
+			responseKeyMessage:     "resource queue creation pending; database connection not available",
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource queue creation",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	opts := db.ResourceQueueOptions{
+		Name:             req.Name,
+		ActiveStatements: req.ActiveStatements,
+		MemoryLimit:      req.MemoryLimit,
+		Priority:         req.Priority,
+		MaxCost:          req.MaxCost,
+		MinCost:          req.MinCost,
+	}
+	if createErr := dbClient.CreateResourceQueue(r.Context(), opts); createErr != nil {
+		s.logger.Error("failed to create resource queue",
+			"cluster", cluster.Name, "queue", req.Name, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to create resource queue")
+		return
+	}
+
+	s.logger.Info("resource queue created",
+		"cluster", cluster.Name, "queue", req.Name)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		responseKeyName:        req.Name,
+		"activeStatements":     req.ActiveStatements,
+		responseKeyMemoryLimit: req.MemoryLimit,
+		"priority":             req.Priority,
+		responseKeyStatus:      "created",
+	})
+}
+
+// handleDeleteResourceQueue deletes a resource queue from the database.
+func (s *Server) handleDeleteResourceQueue(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	queueName := r.PathValue("queueName")
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q not found", name))
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("delete resource queue requested but database factory not available",
+			"cluster", cluster.Name, "queue", queueName)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyName:    queueName,
+			responseKeyStatus:  statusPending,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource queue deletion",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	if dropErr := dbClient.DropResourceQueue(r.Context(), queueName); dropErr != nil {
+		s.logger.Error("failed to drop resource queue",
+			"cluster", cluster.Name, "queue", queueName, "error", dropErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to drop resource queue")
+		return
+	}
+
+	s.logger.Info("resource queue dropped",
+		"cluster", cluster.Name, "queue", queueName)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyName:   queueName,
+		responseKeyStatus: statusDeleted,
 	})
 }
 

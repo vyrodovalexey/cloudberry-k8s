@@ -1075,3 +1075,285 @@ func TestValidateCreate_DuplicateNameDetection(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+// ============================================================================
+// Mirroring Transition Validation Tests
+// ============================================================================
+
+func TestValidateUpdate_MirroringEnable_Running_Allowed(t *testing.T) {
+	// Arrange: Old cluster is Running, new cluster enables mirroring with sufficient segments.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 4
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	// Act
+	warnings, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.NoError(t, err)
+	_ = warnings
+}
+
+func TestValidateUpdate_MirroringEnable_Stopped_Rejected(t *testing.T) {
+	// Arrange: Old cluster is Stopped, new cluster enables mirroring.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 4
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	// Act
+	_, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Running phase")
+}
+
+func TestValidateUpdate_MirroringEnable_InsufficientSegments_Rejected(t *testing.T) {
+	// Arrange: Old cluster is Running, new cluster enables mirroring with too few segments.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 1 // Too few for group layout.
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	// Act
+	_, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot enable group mirroring")
+}
+
+func TestValidateUpdate_MirroringDisable_Allowed(t *testing.T) {
+	// Arrange: Old cluster has mirroring enabled, new cluster disables it.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	oldCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	newCluster := newValidCluster()
+	// Mirroring disabled (nil).
+
+	// Act
+	warnings, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.NoError(t, err)
+	_ = warnings
+}
+
+func TestValidateUpdate_MirroringLayoutChange_Rejected(t *testing.T) {
+	// Arrange: Both old and new have mirroring enabled but different layouts.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutSpread,
+	}
+
+	// Act
+	_, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot change mirroring layout")
+}
+
+func TestValidateUpdate_NoMirroringChange_NoValidation(t *testing.T) {
+	// Arrange: Both old and new have mirroring disabled.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	newCluster := newValidCluster()
+
+	// Act
+	warnings, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.NoError(t, err)
+	_ = warnings
+}
+
+func TestValidateUpdate_MirroringLayoutChange_SameLayout_Allowed(t *testing.T) {
+	// Arrange: Both old and new have mirroring enabled with same layout.
+	v := NewCloudberryClusterValidator(nil)
+	oldCluster := newValidCluster()
+	oldCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	// Act
+	warnings, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster)
+
+	// Assert
+	require.NoError(t, err)
+	_ = warnings
+}
+
+func TestValidateNodeCountForMirroring_Group_Sufficient(t *testing.T) {
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutGroup, 4, 2)
+	require.NoError(t, err)
+}
+
+func TestValidateNodeCountForMirroring_Group_Insufficient(t *testing.T) {
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutGroup, 2, 2)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot enable group mirroring")
+}
+
+func TestValidateNodeCountForMirroring_Spread_Sufficient(t *testing.T) {
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutSpread, 3, 2)
+	require.NoError(t, err)
+}
+
+func TestValidateNodeCountForMirroring_Spread_Insufficient(t *testing.T) {
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutSpread, 2, 2)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot enable spread mirroring")
+}
+
+func TestValidateNodeCountForMirroring_Group_ExactMinimum(t *testing.T) {
+	// Exact minimum: 2 * primariesPerHost = 4.
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutGroup, 4, 2)
+	require.NoError(t, err)
+}
+
+func TestValidateNodeCountForMirroring_Spread_ExactBoundary(t *testing.T) {
+	// Spread requires > primariesPerHost, so equal is insufficient.
+	err := validateNodeCountForMirroring(cbv1alpha1.MirroringLayoutSpread, 2, 2)
+	require.Error(t, err)
+}
+
+func TestValidateMirroringEnable_DefaultLayout(t *testing.T) {
+	// Arrange: Enable mirroring with empty layout (should default to group).
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 4
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  "", // Empty layout defaults to group.
+	}
+
+	// Act
+	warnings, err := validateMirroringEnable(oldCluster, newCluster)
+
+	// Assert
+	require.NoError(t, err)
+	_ = warnings
+}
+
+func TestValidateMirroringEnable_SpreadWithMarginalCount(t *testing.T) {
+	// Arrange: Enable spread mirroring with marginal segment count.
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 3
+	newCluster.Spec.Segments.PrimariesPerHost = 2
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutSpread,
+	}
+
+	// Act
+	warnings, err := validateMirroringEnable(oldCluster, newCluster)
+
+	// Assert: Should succeed but with warning.
+	require.NoError(t, err)
+	assert.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "marginal segment count")
+}
+
+func TestValidateMirroringEnable_ScalingPhase_Rejected(t *testing.T) {
+	// Arrange: Old cluster is in Scaling phase.
+	oldCluster := newValidCluster()
+	oldCluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
+
+	newCluster := newValidCluster()
+	newCluster.Spec.Segments.Count = 4
+	newCluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	// Act
+	_, err := validateMirroringEnable(oldCluster, newCluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Running phase")
+}
+
+func TestIsMirroringEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cluster  *cbv1alpha1.CloudberryCluster
+		expected bool
+	}{
+		{
+			name:     "nil mirroring spec",
+			cluster:  newValidCluster(),
+			expected: false,
+		},
+		{
+			name: "mirroring disabled",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: false}
+				return c
+			}(),
+			expected: false,
+		},
+		{
+			name: "mirroring enabled",
+			cluster: func() *cbv1alpha1.CloudberryCluster {
+				c := newValidCluster()
+				c.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+				return c
+			}(),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isMirroringEnabled(tt.cluster))
+		})
+	}
+}

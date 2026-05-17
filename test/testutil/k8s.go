@@ -143,32 +143,47 @@ func (e *TestK8sEnv) GetSecret(ctx context.Context, name, namespace string) (*co
 
 // MockDBClient implements db.Client for testing.
 type MockDBClient struct {
-	PingFunc                    func(ctx context.Context) error
-	GetSegmentConfigurationFunc func(ctx context.Context) ([]db.SegmentInfo, error)
-	GetClusterStateFunc         func(ctx context.Context) (*db.ClusterState, error)
-	SetParameterFunc            func(ctx context.Context, name, value string, scope db.ParameterScope) error
-	ShowParameterFunc           func(ctx context.Context, name string) (string, error)
-	ReloadConfigFunc            func(ctx context.Context) error
-	ListSessionsFunc            func(ctx context.Context) ([]db.Session, error)
-	CancelQueryFunc             func(ctx context.Context, pid int32) (bool, error)
-	TerminateSessionFunc        func(ctx context.Context, pid int32) (bool, error)
-	CreateRoleFunc              func(ctx context.Context, opts db.RoleOptions) error
-	AlterRoleFunc               func(ctx context.Context, opts db.RoleOptions) error
-	DropRoleFunc                func(ctx context.Context, name string) error
-	VacuumFunc                  func(ctx context.Context, opts db.VacuumOptions) error
-	AnalyzeFunc                 func(ctx context.Context, table string) error
-	ReindexFunc                 func(ctx context.Context, opts db.ReindexOptions) error
-	GetDiskUsageFunc            func(ctx context.Context, database string) ([]db.DiskUsage, error)
-	GetReplicationLagFunc       func(ctx context.Context) (int64, error)
-	PromoteStandbyFunc          func(ctx context.Context) error
-	GetActiveQueryCountFunc     func(ctx context.Context) (int32, int32, int32, error)
-	GetResourceGroupUsageFunc   func(ctx context.Context, group string) (float64, float64, error)
-	CreateResourceGroupFunc     func(ctx context.Context, opts db.ResourceGroupOptions) error
-	AlterResourceGroupFunc      func(ctx context.Context, opts db.ResourceGroupOptions) error
-	DropResourceGroupFunc       func(ctx context.Context, name string) error
-	ListResourceGroupsFunc      func(ctx context.Context) ([]db.ResourceGroupInfo, error)
-	AssignRoleResourceGroupFunc func(ctx context.Context, role, group string) error
-	Closed                      bool
+	PingFunc                      func(ctx context.Context) error
+	GetSegmentConfigurationFunc   func(ctx context.Context) ([]db.SegmentInfo, error)
+	GetClusterStateFunc           func(ctx context.Context) (*db.ClusterState, error)
+	SetParameterFunc              func(ctx context.Context, name, value string, scope db.ParameterScope) error
+	ShowParameterFunc             func(ctx context.Context, name string) (string, error)
+	ReloadConfigFunc              func(ctx context.Context) error
+	ListSessionsFunc              func(ctx context.Context) ([]db.Session, error)
+	CancelQueryFunc               func(ctx context.Context, pid int32) (bool, error)
+	TerminateSessionFunc          func(ctx context.Context, pid int32) (bool, error)
+	CreateRoleFunc                func(ctx context.Context, opts db.RoleOptions) error
+	AlterRoleFunc                 func(ctx context.Context, opts db.RoleOptions) error
+	DropRoleFunc                  func(ctx context.Context, name string) error
+	VacuumFunc                    func(ctx context.Context, opts db.VacuumOptions) error
+	AnalyzeFunc                   func(ctx context.Context, table string) error
+	ReindexFunc                   func(ctx context.Context, opts db.ReindexOptions) error
+	GetDiskUsageFunc              func(ctx context.Context, database string) ([]db.DiskUsage, error)
+	GetReplicationLagFunc         func(ctx context.Context) (int64, error)
+	PromoteStandbyFunc            func(ctx context.Context) error
+	GetActiveQueryCountFunc       func(ctx context.Context) (int32, int32, int32, error)
+	GetResourceGroupUsageFunc     func(ctx context.Context, group string) (float64, float64, error)
+	CreateResourceGroupFunc       func(ctx context.Context, opts db.ResourceGroupOptions) error
+	AlterResourceGroupFunc        func(ctx context.Context, opts db.ResourceGroupOptions) error
+	DropResourceGroupFunc         func(ctx context.Context, name string) error
+	ListResourceGroupsFunc        func(ctx context.Context) ([]db.ResourceGroupInfo, error)
+	AssignRoleResourceGroupFunc   func(ctx context.Context, role, group string) error
+	CreateResourceQueueFunc       func(ctx context.Context, opts db.ResourceQueueOptions) error
+	DropResourceQueueFunc         func(ctx context.Context, name string) error
+	ListResourceQueuesFunc        func(ctx context.Context) ([]db.ResourceQueueInfo, error)
+	InitializeMirrorsFunc         func(ctx context.Context, opts db.MirrorInitOptions) error
+	ConfigureReplicationFunc      func(ctx context.Context, opts db.ReplicationOptions) error
+	GetMirrorSyncStatusFunc       func(ctx context.Context) ([]db.MirrorSyncInfo, error)
+	TriggerFTSProbeFunc           func(ctx context.Context) error
+	TerminateAllBackendsFunc      func(ctx context.Context) (int32, error)
+	CancelAllQueriesFunc          func(ctx context.Context) (int32, error)
+	LogRotateFunc                 func(ctx context.Context) error
+	RegisterNewSegmentsFunc       func(ctx context.Context, opts db.SegmentRegistrationOptions) error
+	RedistributeDataFunc          func(ctx context.Context, opts db.RedistributionOptions) error
+	GetRedistributionProgressFunc func(ctx context.Context) (int32, error)
+	DeregisterSegmentsFunc        func(ctx context.Context, newCount int32) error
+	RedistributeBeforeScaleInFunc func(ctx context.Context, opts db.ScaleInRedistributionOptions) error
+	Closed                        bool
 }
 
 // Ping implements db.Client.
@@ -397,6 +412,32 @@ func (m *MockDBClient) AssignRoleResourceGroup(ctx context.Context, role, group 
 	return nil
 }
 
+// CreateResourceQueue implements db.Client.
+func (m *MockDBClient) CreateResourceQueue(ctx context.Context, opts db.ResourceQueueOptions) error {
+	if m.CreateResourceQueueFunc != nil {
+		return m.CreateResourceQueueFunc(ctx, opts)
+	}
+	return nil
+}
+
+// DropResourceQueue implements db.Client.
+func (m *MockDBClient) DropResourceQueue(ctx context.Context, name string) error {
+	if m.DropResourceQueueFunc != nil {
+		return m.DropResourceQueueFunc(ctx, name)
+	}
+	return nil
+}
+
+// ListResourceQueues implements db.Client.
+func (m *MockDBClient) ListResourceQueues(ctx context.Context) ([]db.ResourceQueueInfo, error) {
+	if m.ListResourceQueuesFunc != nil {
+		return m.ListResourceQueuesFunc(ctx)
+	}
+	return []db.ResourceQueueInfo{
+		{Name: "pg_default", ActiveStatements: 20, MemoryLimit: "-1", Priority: "MEDIUM"},
+	}, nil
+}
+
 // CreateBackup implements db.Client.
 func (m *MockDBClient) CreateBackup(_ context.Context, opts db.BackupOptions) (*db.BackupInfo, error) {
 	return &db.BackupInfo{
@@ -479,6 +520,102 @@ func (m *MockDBClient) GetTableDetails(_ context.Context, schema, table string) 
 // GetUsageReport implements db.Client.
 func (m *MockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageReportEntry, error) {
 	return []db.UsageReportEntry{}, nil
+}
+
+// InitializeMirrors implements db.Client.
+func (m *MockDBClient) InitializeMirrors(ctx context.Context, opts db.MirrorInitOptions) error {
+	if m.InitializeMirrorsFunc != nil {
+		return m.InitializeMirrorsFunc(ctx, opts)
+	}
+	return nil
+}
+
+// ConfigureReplication implements db.Client.
+func (m *MockDBClient) ConfigureReplication(ctx context.Context, opts db.ReplicationOptions) error {
+	if m.ConfigureReplicationFunc != nil {
+		return m.ConfigureReplicationFunc(ctx, opts)
+	}
+	return nil
+}
+
+// GetMirrorSyncStatus implements db.Client.
+func (m *MockDBClient) GetMirrorSyncStatus(ctx context.Context) ([]db.MirrorSyncInfo, error) {
+	if m.GetMirrorSyncStatusFunc != nil {
+		return m.GetMirrorSyncStatusFunc(ctx)
+	}
+	return []db.MirrorSyncInfo{}, nil
+}
+
+// TriggerFTSProbe implements db.Client.
+func (m *MockDBClient) TriggerFTSProbe(ctx context.Context) error {
+	if m.TriggerFTSProbeFunc != nil {
+		return m.TriggerFTSProbeFunc(ctx)
+	}
+	return nil
+}
+
+// TerminateAllBackends implements db.Client.
+func (m *MockDBClient) TerminateAllBackends(ctx context.Context) (int32, error) {
+	if m.TerminateAllBackendsFunc != nil {
+		return m.TerminateAllBackendsFunc(ctx)
+	}
+	return 0, nil
+}
+
+// CancelAllQueries implements db.Client.
+func (m *MockDBClient) CancelAllQueries(ctx context.Context) (int32, error) {
+	if m.CancelAllQueriesFunc != nil {
+		return m.CancelAllQueriesFunc(ctx)
+	}
+	return 0, nil
+}
+
+// LogRotate implements db.Client.
+func (m *MockDBClient) LogRotate(ctx context.Context) error {
+	if m.LogRotateFunc != nil {
+		return m.LogRotateFunc(ctx)
+	}
+	return nil
+}
+
+// RegisterNewSegments implements db.Client.
+func (m *MockDBClient) RegisterNewSegments(ctx context.Context, opts db.SegmentRegistrationOptions) error {
+	if m.RegisterNewSegmentsFunc != nil {
+		return m.RegisterNewSegmentsFunc(ctx, opts)
+	}
+	return nil
+}
+
+// RedistributeData implements db.Client.
+func (m *MockDBClient) RedistributeData(ctx context.Context, opts db.RedistributionOptions) error {
+	if m.RedistributeDataFunc != nil {
+		return m.RedistributeDataFunc(ctx, opts)
+	}
+	return nil
+}
+
+// GetRedistributionProgress implements db.Client.
+func (m *MockDBClient) GetRedistributionProgress(ctx context.Context) (int32, error) {
+	if m.GetRedistributionProgressFunc != nil {
+		return m.GetRedistributionProgressFunc(ctx)
+	}
+	return 100, nil
+}
+
+// DeregisterSegments implements db.Client.
+func (m *MockDBClient) DeregisterSegments(ctx context.Context, newCount int32) error {
+	if m.DeregisterSegmentsFunc != nil {
+		return m.DeregisterSegmentsFunc(ctx, newCount)
+	}
+	return nil
+}
+
+// RedistributeBeforeScaleIn implements db.Client.
+func (m *MockDBClient) RedistributeBeforeScaleIn(ctx context.Context, opts db.ScaleInRedistributionOptions) error {
+	if m.RedistributeBeforeScaleInFunc != nil {
+		return m.RedistributeBeforeScaleInFunc(ctx, opts)
+	}
+	return nil
 }
 
 // MockDBClientFactory implements db.DBClientFactory for testing.

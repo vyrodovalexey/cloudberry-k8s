@@ -107,8 +107,19 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 
 **High Availability**
 - Segment mirroring with group and spread layouts
-- Fault Tolerance Service (FTS) with configurable probe intervals
-- Automatic failover from primary to mirror segments
+- Enable/disable mirroring on existing clusters with state machine tracking (NotConfigured → Initializing → Syncing → InSync)
+  - Pre-flight validation: cluster must be Running, sufficient nodes for layout
+  - 30-minute timeout with MirroringDegraded on timeout
+  - Webhook validation prevents enabling on non-Running clusters
+  - Metrics: `cloudberry_mirroring_operations_total`, `cloudberry_replication_lag_bytes`
+- Fault Tolerance Service (FTS) with configurable probe intervals, retries, and timeouts
+- Automatic failover from primary to mirror segments via Cloudberry's internal FTS scan
+  - FTS probe retries up to `FTSProbeRetries` times with `FTSProbeTimeout` per attempt
+  - Detects primary segment failures and triggers mirror promotion
+  - Emits `SegmentFailover` events per failed segment with promotion details
+  - Increments `cloudberry_fts_failover_total` metric on failover
+  - Cluster remains available during and after failover
+  - Post-failover state: `MirroringDegraded` with `failedSegments` in status
 - Coordinator standby with WAL streaming replication
 - Incremental, full, and differential segment recovery
 - Manual segment rebalancing with configurable skew threshold, parallelism, and table exclusion patterns
@@ -125,7 +136,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - HashiCorp Vault integration for secrets management
 
 **Observability**
-- Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, and PVC sizes
+- Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, mirroring operations, and PVC sizes
 - Reconciliation metrics: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` with cluster/namespace/result labels
 - OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters
 - Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
@@ -567,6 +578,8 @@ bash test/scenarios/scenario7_load_data.sh
 ```
 
 Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
+
+**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), and automatic segment failover via FTS (20). See [docs/development.md](docs/development.md) for detailed test descriptions.
 
 The project targets **90%+ unit test statement coverage** per package. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/db` at 93%, `internal/certmanager` at ~90%, `internal/controller` at ~83%. See [docs/development.md](docs/development.md) for the full development and testing guide.
 

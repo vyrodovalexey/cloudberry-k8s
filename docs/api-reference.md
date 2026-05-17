@@ -732,6 +732,99 @@ curl -u admin:password \
 }
 ```
 
+#### Get Mirroring Status
+
+Returns the current mirroring configuration and synchronization status for a cluster.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/mirroring"
+```
+
+**Response (200 OK — mirroring enabled and in sync):**
+
+```json
+{
+  "enabled": true,
+  "layout": "spread",
+  "status": "InSync",
+  "segments": 4
+}
+```
+
+**Response (200 OK — mirroring initializing after enable):**
+
+```json
+{
+  "enabled": true,
+  "layout": "group",
+  "status": "Initializing",
+  "segments": 4
+}
+```
+
+**Response (200 OK — mirroring syncing):**
+
+```json
+{
+  "enabled": true,
+  "layout": "group",
+  "status": "Syncing",
+  "segments": 4
+}
+```
+
+**Response (200 OK — mirroring not configured):**
+
+```json
+{
+  "enabled": false,
+  "status": "NotConfigured"
+}
+```
+
+**Response (200 OK — mirroring degraded after timeout):**
+
+```json
+{
+  "enabled": true,
+  "layout": "group",
+  "status": "Degraded",
+  "segments": 4
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Whether mirroring is enabled in the cluster spec |
+| `layout` | string | Mirroring layout (`group` or `spread`). Present only when mirroring is enabled |
+| `status` | string | Current mirroring status: `NotConfigured`, `Initializing`, `Syncing`, `InSync`, `Degraded`, or `Down` |
+| `segments` | int | Number of mirror segments. Present only when mirroring is enabled |
+
+**Mirroring status values:**
+
+| Status | Description |
+|--------|-------------|
+| `NotConfigured` | Mirroring is not set up |
+| `Initializing` | Mirror StatefulSet created, mirrors are being initialized from primaries via WAL replication |
+| `Syncing` | Mirrors are actively synchronizing data from primaries. Replication lag is decreasing |
+| `InSync` | All mirrors are fully synchronized with their primaries |
+| `Degraded` | One or more mirrors are out of sync, or mirroring enable timed out after 30 minutes |
+| `Down` | Mirroring is completely down |
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
 #### Get Standby Status
 
 ```bash
@@ -1593,6 +1686,8 @@ Validates `CloudberryCluster` resources before admission. Enforces:
 - **Cross-namespace name uniqueness**: Rejects creation if a `CloudberryCluster` with the same name already exists in any namespace. This prevents naming collisions across the entire Kubernetes cluster
 - `segments.count >= 1`
 - Spread mirroring requires hosts > `primariesPerHost`
+- Enabling mirroring requires cluster to be in `Running` phase with sufficient nodes for the layout
+- Changing mirroring layout while mirroring is enabled is rejected (disable first, then re-enable)
 - OIDC enabled requires `issuerURL` and `clientID`
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
@@ -1637,6 +1732,44 @@ Sets defaults on `CloudberryCluster` resources:
 | `monitoring.enabled` | `true` |
 | `monitoring.metricsPort` | `9187` |
 | `deletionPolicy` | `Retain` |
+
+### Kubernetes Events Reference
+
+The operator emits Kubernetes events for significant state changes. Events related to FTS and automatic failover:
+
+| Event | Type | Description |
+|-------|------|-------------|
+| `SegmentFailover` | Warning | Primary segment failed and mirror promotion was triggered. Includes content ID, original primary hostname, and new primary hostname |
+| `SegmentFailoverCompleted` | Normal | Segment failover completed successfully |
+| `MirroringDegraded` | Warning | One or more segments are down; includes count of failed segments |
+
+**Example `SegmentFailover` event message:**
+
+```
+Segment failover completed: contentID=0, original primary=my-cluster-segment-primary-0, new primary=my-cluster-segment-mirror-0
+```
+
+### FTS and Failover Metrics
+
+The operator exposes the following Prometheus metrics related to FTS probing and automatic failover:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_fts_probe_total` | Counter | `cluster`, `namespace`, `result` | Total FTS probe executions. `result` is `success`, `failure`, or `degraded` |
+| `cloudberry_fts_failover_total` | Counter | `cluster`, `namespace` | Total automatic failover events triggered. Incremented once per failover cycle (not per segment) |
+| `cloudberry_segments_failed` | Gauge | `cluster`, `namespace` | Number of currently failed segments |
+| `cloudberry_replication_lag_bytes` | Gauge | `cluster`, `namespace`, `segment` | Replication lag in bytes per mirror segment |
+
+```promql
+# Failover events in the last hour
+increase(cloudberry_fts_failover_total{cluster="my-cluster"}[1h])
+
+# FTS probe failure rate
+rate(cloudberry_fts_probe_total{result="failure"}[5m])
+
+# Currently failed segments
+cloudberry_segments_failed{cluster="my-cluster"}
+```
 
 ### OpenAPI Specification
 

@@ -33,6 +33,7 @@ bin/
 .dockerignore
 Dockerfile.operator
 Dockerfile.ctl
+Dockerfile.cloudberry
 
 # CI/CD
 .github/

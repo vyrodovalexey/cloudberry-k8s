@@ -235,6 +235,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newAuthCmd(),
 		newInspectCmd(),
 		newResourceGroupCmd(),
+		newResourceQueueCmd(),
 		newWorkloadCmd(),
 		newQueryCmd(),
 		newBackupCmd(),
@@ -1198,6 +1199,83 @@ func newResourceGroupCmd() *cobra.Command {
 		},
 		deleteCmd,
 		assignCmd,
+	)
+
+	return cmd
+}
+
+// newResourceQueueCmd creates the resource-queue command group.
+func newResourceQueueCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "resource-queue",
+		Short: "Resource queue management",
+	}
+
+	// list subcommand.
+	listCmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List resource queues",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-queues", globals.namespace))
+		},
+	}
+
+	// create subcommand with flags.
+	var createName string
+	var createActiveStatements int32
+	var createMemoryLimit string
+	var createPriority string
+	var createMaxCost float64
+	createCmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create resource queue",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			body := map[string]interface{}{
+				"name":             createName,
+				"activeStatements": createActiveStatements,
+				"memoryLimit":      createMemoryLimit,
+				"priority":         createPriority,
+				"maxCost":          createMaxCost,
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-queues", globals.namespace), body)
+		},
+	}
+	createCmd.Flags().StringVar(&createName, "name", "", "Resource queue name")
+	createCmd.Flags().Int32Var(&createActiveStatements, "active-statements", 0, "Maximum active statements")
+	createCmd.Flags().StringVar(&createMemoryLimit, "memory-limit", "", "Memory limit (e.g., 2GB)")
+	createCmd.Flags().StringVar(&createPriority, "priority", "", "Queue priority (LOW, MEDIUM, HIGH, MAX)")
+	createCmd.Flags().Float64Var(&createMaxCost, "max-cost", 0, "Maximum query cost")
+
+	// delete subcommand with flag.
+	var deleteName string
+	deleteCmd := &cobra.Command{
+		Use:   cmdDelete,
+		Short: "Delete resource queue",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/workload/resource-queues/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(deleteName)),
+				globals.namespace)
+			return runAPIDelete(path)
+		},
+	}
+	deleteCmd.Flags().StringVar(&deleteName, "name", "", "Resource queue name to delete")
+
+	cmd.AddCommand(
+		listCmd,
+		createCmd,
+		deleteCmd,
 	)
 
 	return cmd

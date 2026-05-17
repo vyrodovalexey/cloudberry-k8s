@@ -103,6 +103,10 @@ type Recorder interface {
 	SetDataSkewCoefficient(cluster, namespace string, coefficient float64)
 	// SetPVCSizeBytes sets the PVC size in bytes for a specific component.
 	SetPVCSizeBytes(cluster, namespace, component string, sizeBytes float64)
+	// RecordMirroringOperation records a mirroring enable/disable operation.
+	RecordMirroringOperation(cluster, namespace, operation string)
+	// RecordMaintenanceOperation records a maintenance operation event.
+	RecordMaintenanceOperation(cluster, namespace, operation string)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -155,10 +159,12 @@ type PrometheusRecorder struct {
 	recommendationScanDur *prometheus.HistogramVec
 	tableBloatRatio       *prometheus.GaugeVec
 
-	scaleOperationsTotal      *prometheus.CounterVec
-	redistributionProgressVec *prometheus.GaugeVec
-	dataSkewCoefficient       *prometheus.GaugeVec
-	pvcSizeBytes              *prometheus.GaugeVec
+	scaleOperationsTotal       *prometheus.CounterVec
+	redistributionProgressVec  *prometheus.GaugeVec
+	dataSkewCoefficient        *prometheus.GaugeVec
+	pvcSizeBytes               *prometheus.GaugeVec
+	mirroringOperationsTotal   *prometheus.CounterVec
+	maintenanceOperationsTotal *prometheus.CounterVec
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -407,6 +413,16 @@ func (r *PrometheusRecorder) initStorageMetrics() {
 		Name:      "pvc_size_bytes",
 		Help:      "PVC size in bytes per component.",
 	}, []string{labelCluster, labelNamespace, labelComponent})
+	r.mirroringOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "mirroring_operations_total",
+		Help:      "Total number of mirroring enable/disable operations.",
+	}, []string{labelCluster, labelNamespace, labelOperation})
+	r.maintenanceOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "maintenance_operations_total",
+		Help:      "Total number of maintenance operations (vacuum, analyze, reindex, log-rotate).",
+	}, []string{labelCluster, labelNamespace, labelOperation})
 }
 
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
@@ -441,6 +457,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.recommendationScanDur, r.tableBloatRatio,
 		r.scaleOperationsTotal, r.redistributionProgressVec,
 		r.dataSkewCoefficient, r.pvcSizeBytes,
+		r.mirroringOperationsTotal, r.maintenanceOperationsTotal,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -660,6 +677,16 @@ func (r *PrometheusRecorder) SetPVCSizeBytes(cluster, namespace, component strin
 	r.pvcSizeBytes.WithLabelValues(cluster, namespace, component).Set(sizeBytes)
 }
 
+// RecordMirroringOperation records a mirroring enable/disable operation.
+func (r *PrometheusRecorder) RecordMirroringOperation(cluster, namespace, operation string) {
+	r.mirroringOperationsTotal.WithLabelValues(cluster, namespace, operation).Inc()
+}
+
+// RecordMaintenanceOperation records a maintenance operation event.
+func (r *PrometheusRecorder) RecordMaintenanceOperation(cluster, namespace, operation string) {
+	r.maintenanceOperationsTotal.WithLabelValues(cluster, namespace, operation).Inc()
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -789,3 +816,9 @@ func (n *NoopRecorder) SetDataSkewCoefficient(_, _ string, _ float64) {}
 
 // SetPVCSizeBytes is a no-op implementation for testing.
 func (n *NoopRecorder) SetPVCSizeBytes(_, _, _ string, _ float64) {}
+
+// RecordMirroringOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMirroringOperation(_, _, _ string) {}
+
+// RecordMaintenanceOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMaintenanceOperation(_, _, _ string) {}

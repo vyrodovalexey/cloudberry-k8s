@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -115,7 +116,8 @@ func newScenario2AdminReconciler(
 	)
 }
 
-// createReadyStatefulSet creates a StatefulSet in the fake client with ready replicas.
+// createReadyStatefulSet creates a StatefulSet in the fake client with ready replicas
+// and matching revisions to simulate a fully rolled StatefulSet.
 func (s *Scenario2ConfigHotReloadSuite) createReadyStatefulSet(name, namespace string, replicas int32) {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -139,8 +141,11 @@ func (s *Scenario2ConfigHotReloadSuite) createReadyStatefulSet(name, namespace s
 			},
 		},
 		Status: appsv1.StatefulSetStatus{
-			Replicas:      replicas,
-			ReadyReplicas: replicas,
+			Replicas:        replicas,
+			ReadyReplicas:   replicas,
+			UpdatedReplicas: replicas,
+			CurrentRevision: name + "-rev",
+			UpdateRevision:  name + "-rev",
 		},
 	}
 	err := s.env.Client.Create(s.ctx, sts)
@@ -178,6 +183,42 @@ func (s *Scenario2ConfigHotReloadSuite) drainRollingRestart(
 	return maxCycles
 }
 
+// completePendingReloadForTest simulates the two-phase reload completion by:
+// 1. Setting ObservedGeneration = Generation (simulating cluster controller)
+// 2. Setting the pending-reload annotation timestamp to the past (bypassing 30s wait)
+// 3. Running a reconcile to trigger completePendingReload
+// This is needed because reload-safe changes use a two-phase mechanism:
+// first reconcile sets the pending annotation, second reconcile (after propagation delay)
+// calls pg_reload_conf() and records the metric/event.
+func (s *Scenario2ConfigHotReloadSuite) completePendingReloadForTest(
+	reconciler *controller.AdminReconciler,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	s.T().Helper()
+
+	current, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+	require.NoError(s.T(), err)
+
+	// Simulate cluster controller updating ObservedGeneration so that
+	// completePendingReload is reached (it requires ObservedGeneration == Generation).
+	current.Status.ObservedGeneration = current.Generation
+	err = s.env.UpdateClusterStatus(s.ctx, current)
+	require.NoError(s.T(), err)
+
+	// Set the pending-reload annotation timestamp to the past to bypass the 30s wait.
+	current, err = s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+	require.NoError(s.T(), err)
+	if _, hasPending := current.Annotations[util.AnnotationPendingReload]; hasPending {
+		current.Annotations[util.AnnotationPendingReload] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		err = s.env.Client.Update(s.ctx, current)
+		require.NoError(s.T(), err)
+	}
+
+	// Run reconcile to trigger completePendingReload.
+	_, err = reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
+	require.NoError(s.T(), err, "reconcile for completePendingReload should succeed")
+}
+
 // --- Phase A: Reload-safe change ---
 
 func (s *Scenario2ConfigHotReloadSuite) TestScenario2_PhaseA_ReloadSafeChange() {
@@ -193,13 +234,14 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_PhaseA_ReloadSafeChange() 
 	require.NoError(s.T(), err, "initial reconciliation should succeed")
 	assert.NotZero(s.T(), result.RequeueAfter, "should requeue after reconciliation")
 
-	// Verify initial ConfigApplied condition reason is "ConfigReloaded" (reload-safe only).
+	// Verify initial ConfigApplied condition reason is "ConfigReloadPending" (reload-safe,
+	// waiting for ConfigMap volume propagation before calling pg_reload_conf).
 	initial, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	cond := util.FindCondition(initial.Status.Conditions, string(cbv1alpha1.ConditionConfigApplied))
 	require.NotNil(s.T(), cond, "ConfigApplied condition should exist after initial reconciliation")
-	assert.Equal(s.T(), "ConfigReloaded", cond.Reason,
-		"initial config with only reload-safe params should have reason ConfigReloaded")
+	assert.Equal(s.T(), "ConfigReloadPending", cond.Reason,
+		"initial config with only reload-safe params should have reason ConfigReloadPending")
 
 	// Record initial pod restart counts (all zero in fake env).
 	initialRestartCounts := s.getPodRestartCounts(cluster)
@@ -225,15 +267,14 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_PhaseA_ReloadSafeChange() 
 	assert.Contains(s.T(), cm.Data["postgresql.conf"], "WARNING",
 		"ConfigMap should contain WARNING value")
 
-	// Assert: ConfigApplied condition is True with reason "ConfigReloaded".
+	// Assert: ConfigApplied condition is set with reason "ConfigReloadPending"
+	// (the actual pg_reload_conf() happens on a subsequent reconcile after ConfigMap propagation).
 	final, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
-	assert.True(s.T(), util.IsConditionTrue(final.Status.Conditions, string(cbv1alpha1.ConditionConfigApplied)),
-		"ConfigApplied condition should be True")
 	cond = util.FindCondition(final.Status.Conditions, string(cbv1alpha1.ConditionConfigApplied))
 	require.NotNil(s.T(), cond)
-	assert.Equal(s.T(), "ConfigReloaded", cond.Reason,
-		"ConfigApplied reason should be ConfigReloaded for reload-safe change")
+	assert.Equal(s.T(), "ConfigReloadPending", cond.Reason,
+		"ConfigApplied reason should be ConfigReloadPending for reload-safe change")
 
 	// Assert: No pod restarts (restart counts unchanged).
 	currentRestartCounts := s.getPodRestartCounts(cluster)
@@ -369,7 +410,7 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_ConfigHashDetectsChanges()
 	mockMetrics := &mockMetricsRecorder{}
 	reconciler := newScenario2AdminReconciler(s.env, mockMetrics, s.logger)
 
-	// First reconciliation: stores initial hash and creates ConfigMap.
+	// First reconciliation: stores initial hash, creates ConfigMap, and sets pending-reload.
 	_, err := reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
 	require.NoError(s.T(), err, "initial reconciliation should succeed")
 
@@ -377,19 +418,22 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_ConfigHashDetectsChanges()
 	_, err = s.env.GetConfigMap(s.ctx, util.PostgresqlConfConfigMapName(cluster.Name), cluster.Namespace)
 	require.NoError(s.T(), err, "ConfigMap should be created after first reconciliation")
 
+	// Complete the pending reload (two-phase: metric is recorded in completePendingReload).
+	s.completePendingReloadForTest(reconciler, cluster)
+
 	initialReloadCount := countCalls(mockMetrics.getCalls(), "RecordConfigReload")
 	assert.Equal(s.T(), 1, initialReloadCount,
-		"RecordConfigReload should be called once after initial reconciliation")
+		"RecordConfigReload should be called once after initial reconciliation and pending reload completion")
 
-	// Second reconciliation without changes: should skip (no ConfigMap update).
+	// Reconciliation without changes: should skip (no ConfigMap update).
 	_, err = reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
-	require.NoError(s.T(), err, "second reconciliation should succeed")
+	require.NoError(s.T(), err, "reconciliation without changes should succeed")
 
 	afterNoChangeReloadCount := countCalls(mockMetrics.getCalls(), "RecordConfigReload")
 	assert.Equal(s.T(), initialReloadCount, afterNoChangeReloadCount,
 		"RecordConfigReload should NOT be called again when config is unchanged")
 
-	// Third reconciliation with a reload-safe parameter change: should detect change and update.
+	// Reconciliation with a reload-safe parameter change: should detect change and update.
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	updated.Spec.Config.Parameters["log_statement"] = "all"
@@ -398,11 +442,14 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_ConfigHashDetectsChanges()
 	require.NoError(s.T(), err)
 
 	_, err = reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
-	require.NoError(s.T(), err, "third reconciliation should succeed")
+	require.NoError(s.T(), err, "reconciliation after config change should succeed")
+
+	// Complete the pending reload for the new change.
+	s.completePendingReloadForTest(reconciler, cluster)
 
 	afterChangeReloadCount := countCalls(mockMetrics.getCalls(), "RecordConfigReload")
 	assert.Equal(s.T(), initialReloadCount+1, afterChangeReloadCount,
-		"RecordConfigReload should be called again after config change")
+		"RecordConfigReload should be called again after config change and pending reload completion")
 
 	// Verify ConfigMap was updated with the new parameter.
 	cm, err := s.env.GetConfigMap(s.ctx, util.PostgresqlConfConfigMapName(cluster.Name), cluster.Namespace)
@@ -423,15 +470,18 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_MetricsRecordedOnConfigCha
 	mockMetrics := &mockMetricsRecorder{}
 	reconciler := newScenario2AdminReconciler(s.env, mockMetrics, s.logger)
 
-	// First reconciliation: establishes the initial config hash.
+	// First reconciliation: establishes the initial config hash and sets pending-reload.
 	_, err := reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
 	require.NoError(s.T(), err, "initial reconciliation should succeed")
 
-	// Clear metrics calls to isolate the change detection.
+	// Complete the pending reload (two-phase: metric is recorded in completePendingReload).
+	s.completePendingReloadForTest(reconciler, cluster)
+
+	// Verify metric was recorded after completing the pending reload.
 	initialCalls := mockMetrics.getCalls()
 	initialReloadCount := countCalls(initialCalls, "RecordConfigReload")
 	require.Equal(s.T(), 1, initialReloadCount,
-		"RecordConfigReload should be called once during initial reconciliation")
+		"RecordConfigReload should be called once after initial reconciliation and pending reload completion")
 
 	// Act: change a reload-safe config parameter and reconcile.
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -443,6 +493,9 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_MetricsRecordedOnConfigCha
 
 	_, err = reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
 	require.NoError(s.T(), err, "reconciliation after config change should succeed")
+
+	// Complete the pending reload for the new change.
+	s.completePendingReloadForTest(reconciler, cluster)
 
 	// Assert: RecordConfigReload was called again.
 	allCalls := mockMetrics.getCalls()
@@ -477,9 +530,12 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_EventEmittedOnConfigChange
 		s.env.Builder, dbFactory, s.env.Metrics, s.logger,
 	)
 
-	// First reconciliation: creates ConfigMap and emits initial ConfigReloaded event.
+	// First reconciliation: creates ConfigMap and sets pending-reload annotation.
 	_, err := reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
 	require.NoError(s.T(), err, "initial reconciliation should succeed")
+
+	// Complete the initial pending reload (emits ConfigReloaded event).
+	s.completePendingReloadForTest(reconciler, cluster)
 
 	// Drain initial events.
 	drainEvents(fakeRecorder)
@@ -494,6 +550,9 @@ func (s *Scenario2ConfigHotReloadSuite) TestScenario2_EventEmittedOnConfigChange
 
 	_, err = reconciler.Reconcile(s.ctx, scenario2AdminReq(cluster))
 	require.NoError(s.T(), err, "reconciliation after config change should succeed")
+
+	// Complete the pending reload for the new change (emits ConfigReloaded event).
+	s.completePendingReloadForTest(reconciler, cluster)
 
 	// Assert: "ConfigReloaded" event was emitted.
 	events := collectEvents(fakeRecorder)

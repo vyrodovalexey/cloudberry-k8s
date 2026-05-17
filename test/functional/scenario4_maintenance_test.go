@@ -4,6 +4,7 @@ package functional
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/controller"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 	"github.com/cloudberry-contrib/cloudberry-k8s/test/testutil"
 )
@@ -128,17 +130,16 @@ func getJobCommand(job *batchv1.Job) []string {
 	return job.Spec.Template.Spec.Containers[0].Command
 }
 
-// --- Test: Vacuum Variants ---
+// --- Test: Vacuum Variants (Direct DB Execution) ---
 
 func (s *Scenario4MaintenanceSuite) TestScenario4a_VacuumVariants() {
 	tests := []struct {
-		name       string
-		operation  string
-		sqlContain string
+		name      string
+		operation string
 	}{
-		{"vacuum", util.MaintenanceVacuum, "VACUUM"},
-		{"vacuum-analyze", util.MaintenanceVacuumAnalyze, "VACUUM ANALYZE"},
-		{"vacuum-full", util.MaintenanceVacuumFull, "VACUUM FULL"},
+		{"vacuum", util.MaintenanceVacuum},
+		{"vacuum-analyze", util.MaintenanceVacuumAnalyze},
+		{"vacuum-full", util.MaintenanceVacuumFull},
 	}
 
 	for _, tt := range tests {
@@ -156,28 +157,18 @@ func (s *Scenario4MaintenanceSuite) TestScenario4a_VacuumVariants() {
 			require.NoError(s.T(), err, "reconciliation should succeed for %s", tt.name)
 			assert.NotZero(s.T(), result.RequeueAfter, "should requeue after maintenance")
 
-			// Verify a Job was created with the correct operation in its name.
-			job := s.findMaintenanceJob(cluster.Namespace, tt.operation)
-			require.NotNil(s.T(), job, "maintenance job should be created for %s", tt.name)
-
-			// Verify the Job's command contains the expected SQL.
-			cmd := getJobCommand(job)
-			require.NotEmpty(s.T(), cmd, "job command should not be empty")
-			cmdStr := strings.Join(cmd, " ")
-			assert.Contains(s.T(), cmdStr, tt.sqlContain,
-				"job command should contain %q for %s", tt.sqlContain, tt.name)
-
-			// Verify MaintenanceStarted event was emitted.
+			// With a working DB client, the operation completes directly (no Job needed).
+			// Verify MaintenanceCompleted event was emitted.
 			events := collectEvents(fakeRecorder)
-			maintenanceStartedFound := false
+			maintenanceCompletedFound := false
 			for _, event := range events {
-				if containsSubstring(event, "MaintenanceStarted") {
-					maintenanceStartedFound = true
+				if containsSubstring(event, "MaintenanceCompleted") {
+					maintenanceCompletedFound = true
 					break
 				}
 			}
-			assert.True(s.T(), maintenanceStartedFound,
-				"MaintenanceStarted event should be emitted for %s; events: %v", tt.name, events)
+			assert.True(s.T(), maintenanceCompletedFound,
+				"MaintenanceCompleted event should be emitted for %s; events: %v", tt.name, events)
 
 			// Verify annotation was removed.
 			updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -205,14 +196,17 @@ func (s *Scenario4MaintenanceSuite) TestScenario4b_Analyze() {
 	require.NoError(s.T(), err, "reconciliation should succeed for analyze")
 	assert.NotZero(s.T(), result.RequeueAfter)
 
-	// Verify Job created with ANALYZE command.
-	job := s.findMaintenanceJob(cluster.Namespace, util.MaintenanceAnalyze)
-	require.NotNil(s.T(), job, "maintenance job should be created for analyze")
-
-	cmd := getJobCommand(job)
-	cmdStr := strings.Join(cmd, " ")
-	assert.Contains(s.T(), cmdStr, "ANALYZE",
-		"job command should contain ANALYZE")
+	// With a working DB client, the operation completes directly.
+	events := collectEvents(fakeRecorder)
+	completedFound := false
+	for _, event := range events {
+		if containsSubstring(event, "MaintenanceCompleted") {
+			completedFound = true
+			break
+		}
+	}
+	assert.True(s.T(), completedFound,
+		"MaintenanceCompleted event should be emitted for analyze; events: %v", events)
 }
 
 // --- Test: Reindex ---
@@ -231,14 +225,17 @@ func (s *Scenario4MaintenanceSuite) TestScenario4c_Reindex() {
 	require.NoError(s.T(), err, "reconciliation should succeed for reindex")
 	assert.NotZero(s.T(), result.RequeueAfter)
 
-	// Verify Job created with REINDEX command.
-	job := s.findMaintenanceJob(cluster.Namespace, util.MaintenanceReindex)
-	require.NotNil(s.T(), job, "maintenance job should be created for reindex")
-
-	cmd := getJobCommand(job)
-	cmdStr := strings.Join(cmd, " ")
-	assert.Contains(s.T(), cmdStr, "REINDEX",
-		"job command should contain REINDEX")
+	// With a working DB client, the operation completes directly.
+	events := collectEvents(fakeRecorder)
+	completedFound := false
+	for _, event := range events {
+		if containsSubstring(event, "MaintenanceCompleted") {
+			completedFound = true
+			break
+		}
+	}
+	assert.True(s.T(), completedFound,
+		"MaintenanceCompleted event should be emitted for reindex; events: %v", events)
 }
 
 // --- Test: Unknown Maintenance ---
@@ -278,7 +275,7 @@ func (s *Scenario4MaintenanceSuite) TestScenario4d_UnknownMaintenance() {
 		"MaintenanceUnknown warning event should be emitted; events: %v", events)
 }
 
-// --- Test: Job Properties ---
+// --- Test: Job Properties (Fallback when DB client fails) ---
 
 func (s *Scenario4MaintenanceSuite) TestScenario4_JobProperties() {
 	clusterName := scenario4ClusterName + "-props"
@@ -286,16 +283,27 @@ func (s *Scenario4MaintenanceSuite) TestScenario4_JobProperties() {
 	cluster.Annotations[util.AnnotationMaintenance] = util.MaintenanceVacuum
 	s.env = testutil.NewTestK8sEnv(cluster)
 
+	// Use a DB client that fails, forcing the Job fallback path.
+	failingDB := &testutil.MockDBClient{
+		VacuumFunc: func(_ context.Context, _ db.VacuumOptions) error {
+			return fmt.Errorf("simulated vacuum failure")
+		},
+	}
+	dbFactory := &testutil.MockDBClientFactory{Client: failingDB}
+
 	fakeRecorder := record.NewFakeRecorder(100)
-	reconciler := newScenario4AdminReconciler(s.env, fakeRecorder, s.logger)
+	reconciler := controller.NewAdminReconciler(
+		s.env.Client, s.env.Scheme, fakeRecorder,
+		s.env.Builder, dbFactory, s.env.Metrics, s.logger,
+	)
 
 	// Act.
 	_, err := reconciler.Reconcile(s.ctx, scenario4Req(cluster))
 	require.NoError(s.T(), err, "reconciliation should succeed")
 
-	// Find the created Job.
+	// Find the created Job (fallback path).
 	job := s.findMaintenanceJob(cluster.Namespace, util.MaintenanceVacuum)
-	require.NotNil(s.T(), job, "maintenance job should be created")
+	require.NotNil(s.T(), job, "maintenance job should be created when DB client fails")
 
 	// Verify labels.
 	assert.Equal(s.T(), util.LabelManagedByValue, job.Labels[util.LabelManagedBy],
@@ -366,4 +374,91 @@ func (s *Scenario4MaintenanceSuite) TestScenario4_JobProperties() {
 		"command should reference coordinator service")
 	assert.Contains(s.T(), cmd, util.DefaultAdminUser,
 		"command should use admin user")
+
+	// Verify MaintenanceStarted event was emitted (fallback path).
+	events := collectEvents(fakeRecorder)
+	startedFound := false
+	for _, event := range events {
+		if containsSubstring(event, "MaintenanceStarted") {
+			startedFound = true
+			break
+		}
+	}
+	assert.True(s.T(), startedFound,
+		"MaintenanceStarted event should be emitted for fallback; events: %v", events)
+}
+
+// --- Test: Log Rotate ---
+
+func (s *Scenario4MaintenanceSuite) TestScenario4e_LogRotate() {
+	clusterName := scenario4ClusterName + "-logrotate"
+	cluster := buildScenario4Cluster(clusterName)
+	cluster.Annotations[util.AnnotationMaintenance] = util.MaintenanceLogRotate
+	s.env = testutil.NewTestK8sEnv(cluster)
+
+	fakeRecorder := record.NewFakeRecorder(100)
+	reconciler := newScenario4AdminReconciler(s.env, fakeRecorder, s.logger)
+
+	// Act.
+	result, err := reconciler.Reconcile(s.ctx, scenario4Req(cluster))
+	require.NoError(s.T(), err, "reconciliation should succeed for log-rotate")
+	assert.NotZero(s.T(), result.RequeueAfter)
+
+	// With a working DB client, log rotation completes directly.
+	events := collectEvents(fakeRecorder)
+	completedFound := false
+	for _, event := range events {
+		if containsSubstring(event, "MaintenanceCompleted") {
+			completedFound = true
+			break
+		}
+	}
+	assert.True(s.T(), completedFound,
+		"MaintenanceCompleted event should be emitted for log-rotate; events: %v", events)
+
+	// Verify annotation was removed.
+	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+	require.NoError(s.T(), err)
+	_, hasMaintenance := updated.Annotations[util.AnnotationMaintenance]
+	assert.False(s.T(), hasMaintenance,
+		"maintenance annotation should be removed after log-rotate")
+}
+
+// --- Test: Log Rotate Job Fallback ---
+
+func (s *Scenario4MaintenanceSuite) TestScenario4f_LogRotateJobFallback() {
+	clusterName := scenario4ClusterName + "-logrotate-fb"
+	cluster := buildScenario4Cluster(clusterName)
+	cluster.Annotations[util.AnnotationMaintenance] = util.MaintenanceLogRotate
+	s.env = testutil.NewTestK8sEnv(cluster)
+
+	// Use a DB client that fails log rotation, forcing the Job fallback.
+	failingDB := &testutil.MockDBClient{
+		LogRotateFunc: func(_ context.Context) error {
+			return fmt.Errorf("simulated log rotate failure")
+		},
+	}
+	dbFactory := &testutil.MockDBClientFactory{Client: failingDB}
+
+	fakeRecorder := record.NewFakeRecorder(100)
+	reconciler := controller.NewAdminReconciler(
+		s.env.Client, s.env.Scheme, fakeRecorder,
+		s.env.Builder, dbFactory, s.env.Metrics, s.logger,
+	)
+
+	// Act.
+	result, err := reconciler.Reconcile(s.ctx, scenario4Req(cluster))
+	require.NoError(s.T(), err, "reconciliation should succeed for log-rotate fallback")
+	assert.NotZero(s.T(), result.RequeueAfter)
+
+	// Verify a Job was created with the log-rotate operation.
+	job := s.findMaintenanceJob(cluster.Namespace, util.MaintenanceLogRotate)
+	require.NotNil(s.T(), job, "maintenance job should be created when log-rotate DB call fails")
+
+	// Verify the Job's command contains pg_rotate_logfile.
+	cmd := getJobCommand(job)
+	require.NotEmpty(s.T(), cmd, "job command should not be empty")
+	cmdStr := strings.Join(cmd, " ")
+	assert.Contains(s.T(), cmdStr, "pg_rotate_logfile",
+		"job command should contain pg_rotate_logfile")
 }

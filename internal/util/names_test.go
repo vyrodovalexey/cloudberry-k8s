@@ -75,17 +75,17 @@ func TestSegmentMirrorName(t *testing.T) {
 
 func TestCoordinatorServiceName(t *testing.T) {
 	result := CoordinatorServiceName("test-cluster")
-	assert.Equal(t, "test-cluster-coordinator-svc", result)
+	assert.Equal(t, "test-cluster-coord-hl", result)
 }
 
 func TestStandbyServiceName(t *testing.T) {
 	result := StandbyServiceName("test-cluster")
-	assert.Equal(t, "test-cluster-standby-svc", result)
+	assert.Equal(t, "test-cluster-standby-hl", result)
 }
 
 func TestSegmentServiceName(t *testing.T) {
 	result := SegmentServiceName("test-cluster")
-	assert.Equal(t, "test-cluster-segment-svc", result)
+	assert.Equal(t, "test-cluster-seg-hl", result)
 }
 
 func TestClientServiceName(t *testing.T) {

@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/api"
@@ -384,21 +383,28 @@ func (s *Scenario8ScaleOutSuite) TestScenario8_RedistributionJobCreated() {
 	_, err = reconciler.Reconcile(s.ctx, scenario8Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
 
-	// Verify a Job is created with "redistribute" in the name.
-	jobList := &batchv1.JobList{}
-	err = s.env.Client.List(s.ctx, jobList, client.InNamespace(scenario8Namespace))
-	require.NoError(s.T(), err, "listing jobs should succeed")
+	// Verify the scale-state annotation is set with the correct phase.
+	// The new scale-out flow uses DB client for redistribution instead of a Job.
+	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+	require.NoError(s.T(), err)
 
-	redistributeJobFound := false
-	for i := range jobList.Items {
-		if containsSubstring(jobList.Items[i].Name, "redistribute") {
-			redistributeJobFound = true
-			break
+	scaleStateJSON := updated.Annotations["avsoft.io/scale-state"]
+	assert.NotEmpty(s.T(), scaleStateJSON,
+		"scale-state annotation should be set during scale-out")
+
+	if scaleStateJSON != "" {
+		var scaleState struct {
+			Phase    string `json:"phase"`
+			OldCount int32  `json:"oldCount"`
+			NewCount int32  `json:"newCount"`
 		}
+		err = json.Unmarshal([]byte(scaleStateJSON), &scaleState)
+		require.NoError(s.T(), err, "scale-state annotation should be valid JSON")
+		assert.Equal(s.T(), "scaling-sts", scaleState.Phase,
+			"initial scale phase should be 'scaling-sts'")
+		assert.Equal(s.T(), scenario8InitCount, scaleState.OldCount)
+		assert.Equal(s.T(), scenario8ScaleCount, scaleState.NewCount)
 	}
-	assert.True(s.T(), redistributeJobFound,
-		"a Job with 'redistribute' in the name should be created; jobs: %v",
-		jobNames(jobList))
 }
 
 // --- Test: Scale Status API ---

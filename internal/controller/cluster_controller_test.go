@@ -12,6 +12,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,6 +24,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
@@ -3286,4 +3288,1719 @@ func TestClusterReconciler_VerifyUpgrade_CoordNotReady(t *testing.T) {
 	result, err := r.verifyUpgrade(context.Background(), cluster, state)
 	require.NoError(t, err)
 	assert.NotZero(t, result.RequeueAfter)
+}
+
+// ============================================================================
+// Mirroring Enable/Disable Tests
+// ============================================================================
+
+func TestClusterReconciler_IsMirroringEnableNeeded_True(t *testing.T) {
+	// Arrange: Running cluster with mirroring enabled in spec but NotConfigured in status,
+	// and no mirror STS exists.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringEnableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.True(t, result)
+}
+
+func TestClusterReconciler_IsMirroringEnableNeeded_False_AlreadyEnabled(t *testing.T) {
+	// Arrange: Running cluster with mirroring enabled and mirror STS already exists.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringEnableNeeded(context.Background(), cluster)
+
+	// Assert: STS exists, so enable is not needed.
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_IsMirroringEnableNeeded_False_MirroringDisabled(t *testing.T) {
+	// Arrange: Running cluster with mirroring disabled in spec.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	// Mirroring not enabled in spec.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringEnableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_IsMirroringEnableNeeded_False_NotRunning(t *testing.T) {
+	// Arrange: Cluster not in Running phase.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringEnableNeeded(context.Background(), cluster)
+
+	// Assert: Not Running, so enable is not needed (handled by normal path).
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_IsMirroringEnableNeeded_False_StatusAlreadyConfigured(t *testing.T) {
+	// Arrange: Running cluster with mirroring already InSync.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringEnableNeeded(context.Background(), cluster)
+
+	// Assert: Status is already InSync, not NotConfigured.
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_HandleEnableMirroring_Success(t *testing.T) {
+	// Arrange: Running cluster with sufficient segments for group layout.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+	cluster.Spec.Segments.Count = 4
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleEnableMirroring(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+
+	// Verify phase changed to Updating.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseUpdating, updated.Status.Phase)
+	assert.Equal(t, cbv1alpha1.MirroringInitializing, updated.Status.MirroringStatus)
+
+	// Verify mirror STS was created.
+	mirrorSts := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.SegmentMirrorName("test-cluster"),
+		Namespace: "default",
+	}, mirrorSts)
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_HandleEnableMirroring_NotRunning(t *testing.T) {
+	// Arrange: Cluster not in Running phase.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleEnableMirroring(context.Background(), cluster)
+
+	// Assert: Should not error, just skip.
+	require.NoError(t, err)
+	// Phase should remain Stopped.
+	assert.Equal(t, cbv1alpha1.ClusterPhaseStopped, cluster.Status.Phase)
+}
+
+func TestClusterReconciler_HandleEnableMirroring_InsufficientNodes(t *testing.T) {
+	// Arrange: Running cluster with insufficient segments for group layout.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Count = 1 // Too few for group layout (needs 2*primariesPerHost=4).
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleEnableMirroring(context.Background(), cluster)
+
+	// Assert: Should not error, just skip.
+	require.NoError(t, err)
+	// Phase should remain Running (blocked).
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, cluster.Status.Phase)
+}
+
+func TestClusterReconciler_HandleEnableMirroring_CreatesStatefulSet(t *testing.T) {
+	// Arrange: Running cluster with sufficient segments.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Count = 4
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleEnableMirroring(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Assert: Mirror STS was created.
+	mirrorSts := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.SegmentMirrorName("test-cluster"),
+		Namespace: "default",
+	}, mirrorSts)
+	require.NoError(t, err)
+	assert.NotNil(t, mirrorSts.Spec.Replicas)
+}
+
+func TestClusterReconciler_HandleEnableMirroring_DefaultLayout(t *testing.T) {
+	// Arrange: Running cluster with empty layout (should default to group).
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Count = 4
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  "", // Empty layout should default to group.
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleEnableMirroring(context.Background(), cluster)
+
+	// Assert: Should succeed with default group layout.
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_STSNotReady(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state at creating-sts,
+	// mirror STS not ready.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	b := builder.NewBuilder()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 2 // Not all ready.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue since STS is not ready.
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_Initializing(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state at initializing.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"initializing","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	// No dbFactory, so initializeMirrors will skip DB-level init.
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should advance to syncing phase.
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_Syncing(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state at syncing,
+	// mirror STS not ready (not all synced).
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"syncing","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 2 // Not all ready.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	// No dbFactory, so monitorMirrorSync will check STS readiness.
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue since not all synced.
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_Complete(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state at syncing,
+	// all mirrors synced (STS ready).
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"syncing","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 4 // All ready.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	// No dbFactory, so monitorMirrorSync will check STS readiness (all ready = synced).
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should complete mirroring enable.
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify status updated.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, updated.Status.Phase)
+	assert.Equal(t, cbv1alpha1.MirroringInSync, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_Timeout(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state started long ago.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	// Set started time to well past the timeout.
+	startedAt := time.Now().Add(-35 * time.Minute).Format(time.RFC3339)
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + startedAt + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should handle timeout.
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	// Verify status set to Degraded.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.MirroringDegraded, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_NoAnnotation(t *testing.T) {
+	// Arrange: Cluster in Updating phase but no mirroring state annotation.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: "", // Empty annotation.
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue with default interval.
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_InvalidJSON(t *testing.T) {
+	// Arrange: Cluster with invalid JSON in mirroring state annotation.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: "invalid-json",
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue with error interval.
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterError, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_UnknownPhase(t *testing.T) {
+	// Arrange: Cluster with unknown mirroring phase.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"unknown-phase","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should complete (default case).
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CompleteMirroringEnable(t *testing.T) {
+	// Arrange
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringSyncing
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"syncing","startedAt":"` + time.Now().Format(time.RFC3339) + `"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.completeMirroringEnable(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRunning, updated.Status.Phase)
+	assert.Equal(t, cbv1alpha1.MirroringInSync, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_HandleMirroringTimeout(t *testing.T) {
+	// Arrange
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInitializing
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + time.Now().Add(-35*time.Minute).Format(time.RFC3339) + `"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.handleMirroringTimeout(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+	assert.NotZero(t, result.RequeueAfter)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.MirroringDegraded, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_ValidateMirroringNodeCount_Group(t *testing.T) {
+	tests := []struct {
+		name             string
+		segmentCount     int32
+		primariesPerHost int32
+		expected         bool
+	}{
+		{"sufficient segments", 4, 2, true},
+		{"exact minimum", 4, 2, true},
+		{"insufficient segments", 2, 2, false},
+		{"one segment", 1, 2, false},
+	}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cluster := newTestCluster()
+			cluster.Spec.Segments.Count = tt.segmentCount
+			result := r.validateMirroringNodeCount(cluster, cbv1alpha1.MirroringLayoutGroup, tt.primariesPerHost)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestClusterReconciler_ValidateMirroringNodeCount_Spread(t *testing.T) {
+	tests := []struct {
+		name             string
+		segmentCount     int32
+		primariesPerHost int32
+		expected         bool
+	}{
+		{"sufficient segments", 4, 2, true},
+		{"exact boundary", 3, 2, true},
+		{"insufficient segments", 2, 2, false},
+		{"equal to primariesPerHost", 2, 2, false},
+	}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cluster := newTestCluster()
+			cluster.Spec.Segments.Count = tt.segmentCount
+			result := r.validateMirroringNodeCount(cluster, cbv1alpha1.MirroringLayoutSpread, tt.primariesPerHost)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestClusterReconciler_ValidateMirroringNodeCount_DefaultLayout(t *testing.T) {
+	// Unknown layout should default to group behavior.
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 4
+	result := r.validateMirroringNodeCount(cluster, "unknown", 2)
+	assert.True(t, result)
+}
+
+func TestClusterReconciler_IsMirroringDisableNeeded_True(t *testing.T) {
+	// Arrange: Running cluster with mirroring disabled in spec but InSync in status,
+	// and mirror STS exists.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	// Mirroring disabled in spec (nil).
+
+	b := builder.NewBuilder()
+	// Create a mirror STS manually.
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	cluster.Spec.Segments.Mirroring = nil // Now disable in spec.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringDisableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.True(t, result)
+}
+
+func TestClusterReconciler_IsMirroringDisableNeeded_False_MirroringEnabled(t *testing.T) {
+	// Arrange: Running cluster with mirroring still enabled in spec.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringDisableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_IsMirroringDisableNeeded_False_NotConfigured(t *testing.T) {
+	// Arrange: Running cluster with mirroring not configured.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringNotConfigured
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringDisableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_IsMirroringDisableNeeded_False_NotRunning(t *testing.T) {
+	// Arrange: Cluster not in Running phase.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result := r.isMirroringDisableNeeded(context.Background(), cluster)
+
+	// Assert
+	assert.False(t, result)
+}
+
+func TestClusterReconciler_HandleDisableMirroring_Success(t *testing.T) {
+	// Arrange: Running cluster with mirroring enabled and mirror STS exists.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
+
+	b := builder.NewBuilder()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	cluster.Spec.Segments.Mirroring = nil // Disable in spec.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleDisableMirroring(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.MirroringNotConfigured, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_HandleDisableMirroring_DeletesSTS(t *testing.T) {
+	// Arrange
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+
+	b := builder.NewBuilder()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	cluster.Spec.Segments.Mirroring = nil
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleDisableMirroring(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Assert: Mirror STS should be deleted.
+	deletedSts := &appsv1.StatefulSet{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.SegmentMirrorName("test-cluster"),
+		Namespace: "default",
+	}, deletedSts)
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestClusterReconciler_HandleDisableMirroring_CleansPVCs(t *testing.T) {
+	// Arrange: Deletion policy is Delete, so PVCs should be cleaned up.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyDelete
+	cluster.Spec.Segments.Count = 2
+
+	b := builder.NewBuilder()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	cluster.Spec.Segments.Mirroring = nil
+
+	// Create mirror PVCs.
+	mirrorStsName := util.SegmentMirrorName("test-cluster")
+	pvc0 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-0", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+	pvc1 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-1", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts, pvc0, pvc1).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleDisableMirroring(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Assert: PVCs should be deleted.
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = k8sClient.List(context.Background(), pvcList)
+	require.NoError(t, err)
+	assert.Empty(t, pvcList.Items)
+}
+
+func TestClusterReconciler_HandleDisableMirroring_RetainsPVCs(t *testing.T) {
+	// Arrange: Deletion policy is Retain, so PVCs should be kept.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+	cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
+	cluster.Spec.Segments.Count = 2
+
+	b := builder.NewBuilder()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	cluster.Spec.Segments.Mirroring = nil
+
+	mirrorStsName := util.SegmentMirrorName("test-cluster")
+	pvc0 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-0", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts, pvc0).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleDisableMirroring(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Assert: PVCs should be retained.
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err = k8sClient.List(context.Background(), pvcList)
+	require.NoError(t, err)
+	assert.Len(t, pvcList.Items, 1)
+}
+
+func TestClusterReconciler_HandleDisableMirroring_NotRunning(t *testing.T) {
+	// Arrange: Cluster not in Running phase.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.handleDisableMirroring(context.Background(), cluster)
+
+	// Assert: Should not error, just skip.
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.MirroringInSync, cluster.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_InitializeMirrors_Success(t *testing.T) {
+	// Arrange: Cluster with dbFactory configured.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+	cluster.Spec.Segments.Count = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	err := r.initializeMirrors(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_InitializeMirrors_NoDBFactory(t *testing.T) {
+	// Arrange: No dbFactory configured.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	err := r.initializeMirrors(context.Background(), cluster)
+
+	// Assert: Should succeed (skip DB-level init).
+	require.NoError(t, err)
+}
+
+func TestClusterReconciler_InitializeMirrors_DBError(t *testing.T) {
+	// Arrange: dbFactory returns error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbFactory := &mockDBClientFactory{err: fmt.Errorf("connection refused")}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	err := r.initializeMirrors(context.Background(), cluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating db client")
+}
+
+func TestClusterReconciler_MonitorMirrorSync_AllSynced(t *testing.T) {
+	// Arrange: dbFactory returns all synced segments.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{}
+	// Override GetMirrorSyncStatus to return synced segments.
+	syncClient := &mockDBClientWithSync{
+		mockDBClient: dbClient,
+		syncStatus: []db.MirrorSyncInfo{
+			{ContentID: 0, IsSynced: true, ReplicationLag: 0, State: "streaming"},
+			{ContentID: 1, IsSynced: true, ReplicationLag: 0, State: "streaming"},
+		},
+	}
+	dbFactory := &mockDBClientFactory{client: syncClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	allSynced, err := r.monitorMirrorSync(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+	assert.True(t, allSynced)
+}
+
+func TestClusterReconciler_MonitorMirrorSync_PartialSync(t *testing.T) {
+	// Arrange: dbFactory returns partially synced segments.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{}
+	syncClient := &mockDBClientWithSync{
+		mockDBClient: dbClient,
+		syncStatus: []db.MirrorSyncInfo{
+			{ContentID: 0, IsSynced: true, ReplicationLag: 0, State: "streaming"},
+			{ContentID: 1, IsSynced: false, ReplicationLag: 1024, State: "catchup"},
+		},
+	}
+	dbFactory := &mockDBClientFactory{client: syncClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	allSynced, err := r.monitorMirrorSync(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+	assert.False(t, allSynced)
+}
+
+func TestClusterReconciler_MonitorMirrorSync_DBError(t *testing.T) {
+	// Arrange: dbFactory returns error on GetMirrorSyncStatus.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{}
+	syncClient := &mockDBClientWithSync{
+		mockDBClient: dbClient,
+		syncErr:      fmt.Errorf("query failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: syncClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	_, err := r.monitorMirrorSync(context.Background(), cluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting mirror sync status")
+}
+
+func TestClusterReconciler_MonitorMirrorSync_NoDBFactory(t *testing.T) {
+	// Arrange: No dbFactory, should fall back to STS readiness check.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	allSynced, err := r.monitorMirrorSync(context.Background(), cluster)
+
+	// Assert: STS is ready, so should be considered synced.
+	require.NoError(t, err)
+	assert.True(t, allSynced)
+}
+
+func TestClusterReconciler_MonitorMirrorSync_EmptySyncStatus(t *testing.T) {
+	// Arrange: dbFactory returns empty sync status (no mirror segments found).
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClient{}
+	syncClient := &mockDBClientWithSync{
+		mockDBClient: dbClient,
+		syncStatus:   []db.MirrorSyncInfo{}, // Empty.
+	}
+	dbFactory := &mockDBClientFactory{client: syncClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	allSynced, err := r.monitorMirrorSync(context.Background(), cluster)
+
+	// Assert: Falls back to STS readiness.
+	require.NoError(t, err)
+	assert.True(t, allSynced)
+}
+
+func TestClusterReconciler_CleanupMirrorPVCs(t *testing.T) {
+	// Arrange
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 2
+
+	mirrorStsName := util.SegmentMirrorName("test-cluster")
+	pvc0 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-0", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+	pvc1 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-1", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, pvc0, pvc1).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	r.cleanupMirrorPVCs(context.Background(), cluster)
+
+	// Assert: PVCs should be deleted.
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := k8sClient.List(context.Background(), pvcList)
+	require.NoError(t, err)
+	assert.Empty(t, pvcList.Items)
+}
+
+func TestClusterReconciler_AdvanceMirroringPhase(t *testing.T) {
+	// Arrange
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + time.Now().Format(time.RFC3339) + `"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := &mirroringStateData{
+		Phase:     mirroringPhaseCreatingSTS,
+		StartedAt: time.Now().Format(time.RFC3339),
+	}
+
+	// Act
+	result, err := r.advanceMirroringPhase(context.Background(), cluster, state, mirroringPhaseInit)
+
+	// Assert
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+	assert.Equal(t, mirroringPhaseInit, state.Phase)
+}
+
+func TestClusterReconciler_HandleLifecyclePhase_UpdatingWithMirroringAnnotation(t *testing.T) {
+	// Arrange: Cluster in Updating phase with mirroring state annotation.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+
+	// Assert: Should be handled (mirroring progress check).
+	assert.True(t, handled)
+	_ = result
+}
+
+// mockDBClientWithSync extends mockDBClient with configurable GetMirrorSyncStatus.
+type mockDBClientWithSync struct {
+	*mockDBClient
+	syncStatus []db.MirrorSyncInfo
+	syncErr    error
+	initErr    error
+	repErr     error
+}
+
+func (m *mockDBClientWithSync) GetMirrorSyncStatus(_ context.Context) ([]db.MirrorSyncInfo, error) {
+	return m.syncStatus, m.syncErr
+}
+
+func (m *mockDBClientWithSync) InitializeMirrors(_ context.Context, _ db.MirrorInitOptions) error {
+	if m.initErr != nil {
+		return m.initErr
+	}
+	return nil
+}
+
+func (m *mockDBClientWithSync) ConfigureReplication(_ context.Context, _ db.ReplicationOptions) error {
+	if m.repErr != nil {
+		return m.repErr
+	}
+	return nil
+}
+
+func TestClusterReconciler_CleanupMirrorPVCs_GetError(t *testing.T) {
+	// Arrange: PVC get returns non-NotFound error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 2
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+					return fmt.Errorf("get failed")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act: Should not panic even with get errors.
+	r.cleanupMirrorPVCs(context.Background(), cluster)
+}
+
+func TestClusterReconciler_CleanupMirrorPVCs_DeleteError(t *testing.T) {
+	// Arrange: PVC delete returns error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Count = 1
+
+	mirrorStsName := util.SegmentMirrorName("test-cluster")
+	pvc0 := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("data-%s-0", mirrorStsName),
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, pvc0).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+					return fmt.Errorf("delete failed")
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act: Should not panic even with delete errors.
+	r.cleanupMirrorPVCs(context.Background(), cluster)
+}
+
+func TestClusterReconciler_AdvanceMirroringPhase_PatchError(t *testing.T) {
+	// Arrange: Patch returns error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return fmt.Errorf("patch failed")
+			},
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	state := &mirroringStateData{
+		Phase:     mirroringPhaseCreatingSTS,
+		StartedAt: time.Now().Format(time.RFC3339),
+	}
+
+	// Act
+	_, err := r.advanceMirroringPhase(context.Background(), cluster, state, mirroringPhaseInit)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "updating mirroring state annotation")
+}
+
+func TestClusterReconciler_InitializeMirrors_InitError(t *testing.T) {
+	// Arrange: DB client returns error on InitializeMirrors.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutGroup,
+	}
+	cluster.Spec.Segments.Count = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClientWithSync{
+		mockDBClient: &mockDBClient{},
+		initErr:      fmt.Errorf("init failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	err := r.initializeMirrors(context.Background(), cluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "initializing mirrors")
+}
+
+func TestClusterReconciler_InitializeMirrors_ReplicationError(t *testing.T) {
+	// Arrange: DB client returns error on ConfigureReplication.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{
+		Enabled: true,
+		Layout:  cbv1alpha1.MirroringLayoutSpread,
+	}
+	cluster.Spec.Segments.Count = 4
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClientWithSync{
+		mockDBClient: &mockDBClient{},
+		repErr:       fmt.Errorf("replication config failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	err := r.initializeMirrors(context.Background(), cluster)
+
+	// Assert
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "configuring replication")
+}
+
+func TestClusterReconciler_HandleDisableMirroring_STSNotFound(t *testing.T) {
+	// Arrange: Running cluster but mirror STS doesn't exist.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act: Should succeed even if STS doesn't exist.
+	err := r.handleDisableMirroring(context.Background(), cluster)
+
+	// Assert
+	require.NoError(t, err)
+	updated := &cbv1alpha1.CloudberryCluster{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
+	require.NoError(t, err)
+	assert.Equal(t, cbv1alpha1.MirroringNotConfigured, updated.Status.MirroringStatus)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_STSReady_AdvancesToInit(t *testing.T) {
+	// Arrange: Cluster in creating-sts phase with mirror STS ready.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"creating-sts","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	b := builder.NewBuilder()
+	mirrorSts, _ := b.BuildSegmentMirrorStatefulSet(cluster)
+	replicas := int32(4)
+	mirrorSts.Spec.Replicas = &replicas
+	mirrorSts.Status.ReadyReplicas = 4 // All ready.
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, mirrorSts).
+		WithStatusSubresource(cluster, mirrorSts).
+		Build()
+	recorder := record.NewFakeRecorder(20)
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should advance to init phase.
+	require.NoError(t, err)
+	assert.True(t, result.Requeue)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_SyncingWithDBError(t *testing.T) {
+	// Arrange: Cluster in syncing phase, DB returns error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"syncing","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClientWithSync{
+		mockDBClient: &mockDBClient{},
+		syncErr:      fmt.Errorf("sync query failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue with error interval.
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterError, result.RequeueAfter)
+}
+
+func TestClusterReconciler_CheckMirroringProgress_InitWithDBError(t *testing.T) {
+	// Arrange: Cluster in init phase, DB returns error.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseUpdating
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Annotations = map[string]string{
+		util.AnnotationMirroringState: `{"phase":"initializing","startedAt":"` + time.Now().Format(time.RFC3339) + `","layout":"group"}`,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	dbClient := &mockDBClientWithSync{
+		mockDBClient: &mockDBClient{},
+		initErr:      fmt.Errorf("init failed"),
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil, dbFactory)
+
+	// Act
+	result, err := r.checkMirroringProgress(context.Background(), cluster)
+
+	// Assert: Should requeue with error interval.
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterError, result.RequeueAfter)
 }

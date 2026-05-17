@@ -70,17 +70,28 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	ctx, span := telemetry.StartSpan(ctx, haControllerName, "Reconcile")
 	defer span.End()
 
+	logger.Debug("starting HA reconciliation",
+		"name", req.Name, "namespace", req.Namespace)
+
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
 	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
+			logger.Debug("cluster not found, skipping HA reconciliation")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
 	}
 
+	logger.Debug("cluster fetched for HA",
+		"phase", cluster.Status.Phase,
+		"generation", cluster.Generation,
+		"observedGeneration", cluster.Status.ObservedGeneration)
+
 	// Skip if cluster is not running.
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		logger.Debug("cluster not running, deferring HA reconciliation",
+			"phase", cluster.Status.Phase)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
@@ -89,16 +100,18 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Annotations[util.AnnotationRecovery] == "" &&
 		cluster.Annotations[util.AnnotationAction] == "" {
-		logger.Info("skipping HA reconciliation, generation unchanged")
+		logger.Debug("skipping HA reconciliation, generation unchanged")
 		return ctrl.Result{RequeueAfter: r.probeInterval(cluster)}, nil
 	}
 
 	// Handle annotation-based actions first.
 	if result, handled, err := r.handleAnnotations(ctx, cluster); handled {
+		logger.Debug("HA annotation action handled")
 		return result, err
 	}
 
 	// Run periodic health checks.
+	logger.Debug("running periodic health checks")
 	r.runHealthChecks(ctx, cluster, logger)
 
 	return ctrl.Result{RequeueAfter: r.probeInterval(cluster)}, nil
@@ -156,7 +169,114 @@ func (r *HAReconciler) probeInterval(cluster *cbv1alpha1.CloudberryCluster) time
 	return time.Duration(interval) * time.Second
 }
 
-// runFTSProbe performs FTS health checks on all primary segments.
+// probeTimeout returns the FTS probe timeout for the cluster.
+func (r *HAReconciler) probeTimeout(cluster *cbv1alpha1.CloudberryCluster) time.Duration {
+	timeout := 20 // default timeout in seconds
+	if cluster.Spec.HA != nil && cluster.Spec.HA.FTSProbeTimeout > 0 {
+		timeout = int(cluster.Spec.HA.FTSProbeTimeout)
+	}
+	return time.Duration(timeout) * time.Second
+}
+
+// probeRetries returns the FTS probe retry count for the cluster.
+func (r *HAReconciler) probeRetries(cluster *cbv1alpha1.CloudberryCluster) int {
+	retries := 5 // default retry count
+	if cluster.Spec.HA != nil && cluster.Spec.HA.FTSProbeRetries > 0 {
+		retries = int(cluster.Spec.HA.FTSProbeRetries)
+	}
+	return retries
+}
+
+// probeSegmentConfigWithRetries retries GetSegmentConfiguration up to maxRetries times
+// with the given timeout per attempt. Returns the segments on success or the last error.
+func (r *HAReconciler) probeSegmentConfigWithRetries(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+	startTime time.Time,
+) ([]db.SegmentInfo, error) {
+	logger := util.LoggerFromContext(ctx)
+	maxRetries := r.probeRetries(cluster)
+	timeout := r.probeTimeout(cluster)
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		segments, err := dbClient.GetSegmentConfiguration(probeCtx)
+		cancel()
+
+		if err == nil {
+			if attempt > 1 {
+				logger.Info("FTS probe succeeded after retry",
+					"attempt", attempt,
+					"maxRetries", maxRetries,
+				)
+			}
+			return segments, nil
+		}
+
+		lastErr = err
+		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
+		logger.Warn("FTS probe attempt failed",
+			"attempt", attempt,
+			"maxRetries", maxRetries,
+			"error", lastErr,
+		)
+	}
+
+	return nil, fmt.Errorf("getting segment configuration after %d retries: %w", maxRetries, lastErr)
+}
+
+// segmentAnalysisResult holds the results of analyzing segment health.
+type segmentAnalysisResult struct {
+	failedSegments  []cbv1alpha1.FailedSegment
+	failedPrimaries []db.SegmentInfo
+	allHealthy      bool
+}
+
+// analyzeSegments evaluates segment health and records per-segment metrics.
+func (r *HAReconciler) analyzeSegments(
+	cluster *cbv1alpha1.CloudberryCluster,
+	segments []db.SegmentInfo,
+) segmentAnalysisResult {
+	logger := r.logger.With("cluster", cluster.Name, "namespace", cluster.Namespace)
+	result := segmentAnalysisResult{allHealthy: true}
+
+	for _, seg := range segments {
+		if seg.ContentID < 0 {
+			continue // Skip coordinator entries.
+		}
+
+		isUp := seg.Status == "u"
+		segmentID := fmt.Sprintf("%d", seg.ContentID)
+		r.metrics.SetSegmentStatus(cluster.Name, cluster.Namespace, segmentID, isUp)
+
+		if isUp {
+			continue
+		}
+
+		result.allHealthy = false
+		result.failedSegments = append(result.failedSegments, cbv1alpha1.FailedSegment{
+			ContentID: seg.ContentID,
+			Hostname:  seg.Hostname,
+			Role:      seg.Role,
+			Status:    seg.Status,
+		})
+		logger.Warn("segment is down",
+			"contentID", seg.ContentID,
+			"hostname", seg.Hostname,
+			"role", seg.Role,
+		)
+
+		if seg.Role == "p" {
+			result.failedPrimaries = append(result.failedPrimaries, seg)
+		}
+	}
+
+	return result
+}
+
+// runFTSProbe performs FTS health checks on all primary segments with retry support.
 func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	logger := util.LoggerFromContext(ctx)
 	startTime := time.Now()
@@ -173,64 +293,152 @@ func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.Clou
 	}
 	defer dbClient.Close()
 
-	segments, err := dbClient.GetSegmentConfiguration(ctx)
+	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, startTime)
 	if err != nil {
-		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
-		return fmt.Errorf("getting segment configuration: %w", err)
+		return err
 	}
 
-	var failedSegments []cbv1alpha1.FailedSegment
-	allHealthy := true
+	analysis := r.analyzeSegments(cluster, segments)
 
-	for _, seg := range segments {
-		if seg.ContentID < 0 {
-			continue // Skip coordinator entries.
-		}
-
-		isUp := seg.Status == "u"
-		segmentID := fmt.Sprintf("%d", seg.ContentID)
-		r.metrics.SetSegmentStatus(cluster.Name, cluster.Namespace, segmentID, isUp)
-
-		if !isUp {
-			allHealthy = false
-			failedSegments = append(failedSegments, cbv1alpha1.FailedSegment{
-				ContentID: seg.ContentID,
-				Hostname:  seg.Hostname,
-				Role:      seg.Role,
-				Status:    seg.Status,
-			})
-			logger.Warn("segment is down",
-				"contentID", seg.ContentID,
-				"hostname", seg.Hostname,
-				"role", seg.Role,
-			)
+	// Trigger failover for failed primaries when mirroring is enabled.
+	mirroringEnabled := cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled
+	if len(analysis.failedPrimaries) > 0 && mirroringEnabled {
+		if failoverErr := r.handleFailover(ctx, cluster, dbClient, analysis.failedPrimaries); failoverErr != nil {
+			logger.Error("failover handling failed", "error", failoverErr)
 		}
 	}
 
 	// Update cluster status.
-	cluster.Status.FailedSegments = failedSegments
-	if allHealthy {
-		cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
-		r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, true)
-	} else {
-		cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
-		r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, false)
-		r.metrics.SetSegmentsFailed(cluster.Name, cluster.Namespace, float64(len(failedSegments)))
-		r.recorder.Event(cluster, corev1.EventTypeWarning, "MirroringDegraded",
-			fmt.Sprintf("%d segments are down", len(failedSegments)))
-	}
+	r.updateFTSProbeStatus(cluster, analysis)
 
-	if err := patchFTSStatus(ctx, r.client, cluster, failedSegments); err != nil {
+	// Report replication lag for mirror segments.
+	r.reportMirrorReplicationLag(ctx, cluster, dbClient)
+
+	if err := patchFTSStatus(ctx, r.client, cluster, analysis.failedSegments); err != nil {
 		return fmt.Errorf("updating cluster status after FTS probe: %w", err)
 	}
 
 	result := "success"
-	if !allHealthy {
+	if !analysis.allHealthy {
 		result = "degraded"
 	}
 	r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, result, time.Since(startTime))
 
 	return nil
+}
+
+// updateFTSProbeStatus updates cluster status and metrics based on segment analysis.
+func (r *HAReconciler) updateFTSProbeStatus(
+	cluster *cbv1alpha1.CloudberryCluster,
+	analysis segmentAnalysisResult,
+) {
+	cluster.Status.FailedSegments = analysis.failedSegments
+	if analysis.allHealthy {
+		cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
+		r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, true)
+		return
+	}
+
+	cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
+	r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, false)
+	r.metrics.SetSegmentsFailed(cluster.Name, cluster.Namespace, float64(len(analysis.failedSegments)))
+	r.recorder.Event(cluster, corev1.EventTypeWarning, "MirroringDegraded",
+		fmt.Sprintf("%d segments are down", len(analysis.failedSegments)))
+}
+
+// handleFailover processes automatic failover for failed primary segments.
+// It triggers Cloudberry's internal FTS probe scan which promotes mirrors
+// to primary role, then verifies the result and updates observability.
+func (r *HAReconciler) handleFailover(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+	failedPrimaries []db.SegmentInfo,
+) error {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("initiating failover for failed primary segments",
+		"failedPrimaryCount", len(failedPrimaries),
+	)
+
+	// Trigger Cloudberry's internal FTS scan to promote mirrors.
+	if err := dbClient.TriggerFTSProbe(ctx); err != nil {
+		logger.Error("failed to trigger FTS probe scan for failover", "error", err)
+		// Continue with status update even if trigger fails — report what we know.
+	}
+
+	// Re-read segment configuration to verify failover result.
+	updatedSegments, err := dbClient.GetSegmentConfiguration(ctx)
+	if err != nil {
+		logger.Error("failed to re-read segment configuration after failover trigger", "error", err)
+		// Emit events for the originally detected failures even without re-read.
+		for _, fp := range failedPrimaries {
+			r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonSegmentFailover,
+				fmt.Sprintf("Primary segment failover detected: contentID=%d, hostname=%s",
+					fp.ContentID, fp.Hostname))
+		}
+		r.metrics.RecordFTSFailover(cluster.Name, cluster.Namespace)
+		return fmt.Errorf("re-reading segment configuration after failover: %w", err)
+	}
+
+	// Build a lookup of updated segments by contentID and role for verification.
+	type segKey struct {
+		contentID int32
+		role      string
+	}
+	updatedMap := make(map[segKey]db.SegmentInfo, len(updatedSegments))
+	for _, seg := range updatedSegments {
+		updatedMap[segKey{contentID: seg.ContentID, role: seg.Role}] = seg
+	}
+
+	// Verify failover results and emit events per failed primary.
+	for _, fp := range failedPrimaries {
+		segID := fmt.Sprintf("%d", fp.ContentID)
+
+		// Check if the mirror for this contentID is now acting as primary.
+		if mirror, ok := updatedMap[segKey{contentID: fp.ContentID, role: "p"}]; ok && mirror.DBID != fp.DBID {
+			// Mirror was promoted to primary — successful failover.
+			r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonSegmentFailover,
+				fmt.Sprintf("Segment failover completed: contentID=%d, original primary=%s, new primary=%s",
+					fp.ContentID, fp.Hostname, mirror.Hostname))
+		} else {
+			// Mirror was not promoted — partial or failed failover.
+			r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonSegmentFailover,
+				fmt.Sprintf("Primary segment failed: contentID=%d, hostname=%s, mirror promotion pending",
+					fp.ContentID, fp.Hostname))
+		}
+
+		r.metrics.SetSegmentStatus(cluster.Name, cluster.Namespace, segID, false)
+	}
+
+	// Record failover metric once per failover event (not per segment).
+	r.metrics.RecordFTSFailover(cluster.Name, cluster.Namespace)
+
+	return nil
+}
+
+// reportMirrorReplicationLag queries mirror sync status and reports replication
+// lag per segment to Prometheus metrics. Errors are logged but do not fail the
+// FTS probe — replication lag reporting is best-effort observability.
+func (r *HAReconciler) reportMirrorReplicationLag(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	syncStatus, err := dbClient.GetMirrorSyncStatus(ctx)
+	if err != nil {
+		logger.Warn("failed to get mirror sync status for replication lag reporting", "error", err)
+		return
+	}
+
+	for _, ms := range syncStatus {
+		segID := fmt.Sprintf("%d", ms.ContentID)
+		r.metrics.SetReplicationLag(
+			cluster.Name, cluster.Namespace,
+			segID, float64(ms.ReplicationLag),
+		)
+	}
 }
 
 // monitorStandby checks the standby coordinator health and replication lag.

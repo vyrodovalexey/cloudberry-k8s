@@ -1002,10 +1002,10 @@ func TestPgxClient_GetUsageReport_Error(t *testing.T) {
 }
 
 func TestPgxClient_ListResourceGroups_Mock(t *testing.T) {
-	rgFields := []fieldDesc{textField("rsgname"), int4Field("num_running"), int4Field("num_queueing"), float8Field("cpu_usage"), float8Field("memory_usage")}
+	rgFields := []fieldDesc{textField("rsgname"), int4Field("concurrency"), int4Field("cpu_max_percent"), int4Field("cpu_weight")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(rgFields, [][]string{
-			{"default_group", "5", "2", "0.45", "0.30"},
+			{"analytics", "10", "50", "100"},
 		})
 	})
 	defer cleanup()
@@ -1013,8 +1013,10 @@ func TestPgxClient_ListResourceGroups_Mock(t *testing.T) {
 	groups, err := client.ListResourceGroups(context.Background())
 	assert.NoError(t, err)
 	require.Len(t, groups, 1)
-	assert.Equal(t, "default_group", groups[0].Name)
-	assert.Equal(t, int32(7), groups[0].Concurrency) // numRunning + numQueueing
+	assert.Equal(t, "analytics", groups[0].Name)
+	assert.Equal(t, int32(10), groups[0].Concurrency)
+	assert.Equal(t, int32(50), groups[0].CPUMaxPercent)
+	assert.Equal(t, int32(100), groups[0].CPUWeight)
 }
 
 func TestPgxClient_ListResourceGroups_Error(t *testing.T) {

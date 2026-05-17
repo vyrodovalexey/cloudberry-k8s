@@ -1,0 +1,249 @@
+# =============================================================================
+# Dockerfile.cloudberry — Apache Cloudberry Database 2.1.0 for Kubernetes
+# =============================================================================
+# Multi-stage build that compiles Apache Cloudberry 2.1.0 from source and
+# produces a minimal runtime image suitable for the cloudberry-k8s operator.
+#
+# Supports: linux/amd64, linux/arm64
+#
+# Usage:
+#   docker build -f Dockerfile.cloudberry -t cloudberrydb/cloudberry:2.1.0 .
+#   docker run -e POSTGRES_PASSWORD=secret cloudberrydb/cloudberry:2.1.0
+# =============================================================================
+
+# =============================================================================
+# Stage 1: Build Apache Cloudberry from source
+# =============================================================================
+FROM rockylinux/rockylinux:9.6 AS builder
+
+# Install build toolchains and development headers
+RUN dnf makecache && \
+    dnf install -y \
+        epel-release \
+        git && \
+    dnf config-manager --disable epel-cisco-openh264 && \
+    dnf makecache && \
+    dnf config-manager --disable epel && \
+    dnf install -y --enablerepo=epel \
+        the_silver_searcher && \
+    dnf install -y \
+        apr-devel \
+        bison \
+        bzip2-devel \
+        cmake3 \
+        ed \
+        file \
+        flex \
+        gcc \
+        gcc-c++ \
+        glibc-langpack-en \
+        glibc-locale-source \
+        iproute \
+        java-11-openjdk \
+        java-11-openjdk-devel \
+        krb5-devel \
+        less \
+        libcurl-devel \
+        libevent-devel \
+        libuuid-devel \
+        libxml2-devel \
+        libzstd-devel \
+        lz4 \
+        lz4-devel \
+        m4 \
+        net-tools \
+        openldap-devel \
+        openssh-clients \
+        openssh-server \
+        openssl-devel \
+        pam-devel \
+        perl \
+        perl-ExtUtils-Embed \
+        perl-Test-Simple \
+        perl-core \
+        python3-devel \
+        readline-devel \
+        rpm-build \
+        rsync \
+        sudo \
+        tar \
+        unzip \
+        wget \
+        which \
+        zlib-devel && \
+    dnf install -y --enablerepo=crb \
+        liburing-devel \
+        libuv-devel \
+        libyaml-devel \
+        perl-IPC-Run \
+        protobuf-devel && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# Build xerces-c from source (required by Cloudberry on Rocky Linux)
+ARG XERCES_VERSION=3.3.0
+RUN cd /tmp && \
+    wget -nv "https://archive.apache.org/dist/xerces/c/3/sources/xerces-c-${XERCES_VERSION}.tar.gz" && \
+    tar xf "xerces-c-${XERCES_VERSION}.tar.gz" && \
+    cd "xerces-c-${XERCES_VERSION}" && \
+    ./configure --prefix=/usr/local/xerces-c && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/xerces-c*
+
+# Create gpadmin user for the build
+RUN groupadd -r gpadmin && \
+    useradd -m -r -g gpadmin -s /bin/bash gpadmin && \
+    echo "gpadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gpadmin && \
+    chmod 440 /etc/sudoers.d/gpadmin
+
+USER gpadmin
+WORKDIR /home/gpadmin
+
+# Download and extract Apache Cloudberry 2.1.0 source
+ARG CB_RELEASE_VERSION=2.1.0-incubating
+RUN curl -L -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
+    "https://www.apache.org/dyn/closer.lua/incubator/cloudberry/${CB_RELEASE_VERSION}/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz?action=download" && \
+    tar -xzf "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" -C /home/gpadmin && \
+    rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
+    mv "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}" /home/gpadmin/cloudberry
+
+# Build Cloudberry using the official build scripts
+RUN cd /home/gpadmin/cloudberry && \
+    export SRC_DIR=/home/gpadmin/cloudberry && \
+    mkdir -p "${SRC_DIR}/build-logs" && \
+    ./devops/build/automation/cloudberry/scripts/configure-cloudberry.sh && \
+    ./devops/build/automation/cloudberry/scripts/build-cloudberry.sh
+
+# =============================================================================
+# Stage 2: Runtime image
+# =============================================================================
+FROM rockylinux/rockylinux:9.6-minimal
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-database" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 for Kubernetes" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="rockylinux/rockylinux:9.6-minimal"
+
+# Install runtime dependencies (sorted alphanumerically)
+RUN microdnf -y install \
+      apr \
+      bash \
+      bzip2-libs \
+      ca-certificates \
+      glibc-langpack-en \
+      hostname \
+      iproute \
+      keyutils \
+      krb5-libs \
+      libevent \
+      libicu \
+      libstdc++ \
+      liburing \
+      libuuid \
+      libuv \
+      libxml2 \
+      libyaml \
+      libzstd \
+      lz4 \
+      ncurses \
+      net-tools \
+      openldap \
+      openssh-clients \
+      openssh-server \
+      openssl \
+      pam \
+      pcre2 \
+      perl \
+      procps-ng \
+      protobuf \
+      python3 \
+      readline \
+      rsync \
+      shadow-utils \
+      sudo \
+      which \
+      zlib && \
+    microdnf clean all && rm -rf /var/cache/yum
+
+# Create gpadmin user (UID 1000 for Kubernetes compatibility)
+RUN groupadd -g 1000 gpadmin && \
+    useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin && \
+    echo "gpadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gpadmin && \
+    chmod 440 /etc/sudoers.d/gpadmin
+
+# Prepare SSH daemon for inter-segment communication
+RUN ssh-keygen -A && \
+    mkdir -p /run/sshd && \
+    chmod 755 /run/sshd
+
+# Copy built Cloudberry from builder stage
+COPY --from=builder --chown=gpadmin:gpadmin /usr/local/cloudberry-db /usr/local/cloudberry-db
+
+# Copy Xerces libs into Cloudberry lib dir
+COPY --from=builder /usr/local/xerces-c/lib/libxerces-c.so /usr/local/cloudberry-db/lib/
+COPY --from=builder /usr/local/xerces-c/lib/libxerces-c-3.*.so /usr/local/cloudberry-db/lib/
+
+# Create operator-expected directory layout
+RUN mkdir -p /data/pgdata /etc/cloudberry /var/run/cloudberry && \
+    chown -R gpadmin:gpadmin /data /etc/cloudberry /var/run/cloudberry
+
+# Configure system limits for Cloudberry
+RUN printf '* soft core unlimited\n\
+* hard core unlimited\n\
+* soft nofile 524288\n\
+* hard nofile 524288\n\
+* soft nproc 131072\n\
+* hard nproc 131072\n' > /etc/security/limits.d/90-cbdb-limits.conf
+
+# Generate SSH keypair for gpadmin (inter-segment communication)
+RUN mkdir -p /home/gpadmin/.ssh && \
+    ssh-keygen -t ed25519 -N '' -C 'gpadmin@cloudberry-k8s' \
+               -f /home/gpadmin/.ssh/id_ed25519 && \
+    cat /home/gpadmin/.ssh/id_ed25519.pub >> /home/gpadmin/.ssh/authorized_keys && \
+    chmod 700 /home/gpadmin/.ssh && \
+    chmod 600 /home/gpadmin/.ssh/id_ed25519 /home/gpadmin/.ssh/authorized_keys && \
+    chmod 644 /home/gpadmin/.ssh/id_ed25519.pub && \
+    chown -R gpadmin:gpadmin /home/gpadmin/.ssh
+
+# Configure gpadmin environment
+RUN { \
+      echo ''; \
+      echo '# Apache Cloudberry environment'; \
+      echo 'if [ -f /usr/local/cloudberry-db/cloudberry-env.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/cloudberry-env.sh'; \
+      echo 'elif [ -f /usr/local/cloudberry-db/greenplum_path.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/greenplum_path.sh'; \
+      echo 'fi'; \
+      echo 'export COORDINATOR_DATA_DIRECTORY="${COORDINATOR_DATA_DIRECTORY:-/data/pgdata/gpseg-1}"'; \
+    } >> /home/gpadmin/.bashrc
+
+# Copy entrypoint script
+COPY --chmod=755 hack/docker-entrypoint-cloudberry.sh /usr/local/bin/docker-entrypoint.sh
+
+# Environment variables for operator integration
+# Note: POSTGRES_PASSWORD is intentionally NOT set here to avoid Docker
+# build warnings. It must be provided at runtime via -e or Kubernetes secrets.
+ENV PGDATA=/data/pgdata \
+    CLOUDBERRY_ROLE=coordinator \
+    CLOUDBERRY_CONTENT_ID=-1 \
+    CLOUDBERRY_COORDINATOR_HOST=localhost \
+    GPHOME=/usr/local/cloudberry-db \
+    COORDINATOR_DATA_DIRECTORY=/data/pgdata/gpseg-1 \
+    LANG=en_US.UTF-8
+
+# Switch to gpadmin user
+USER 1000:1000
+WORKDIR /home/gpadmin
+
+EXPOSE 5432 22
+
+# Health check: TCP connection to PostgreSQL port
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD pg_isready -h localhost -p 5432 -U gpadmin -d postgres || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["postgres"]

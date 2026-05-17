@@ -126,22 +126,42 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "Reconcile")
 	defer span.End()
 
+	logger.Debug("starting admin reconciliation",
+		"name", req.Name, "namespace", req.Namespace)
+
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
 	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
+			logger.Debug("cluster not found, skipping reconciliation")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
 	}
 
+	logger.Debug("cluster fetched",
+		"phase", cluster.Status.Phase,
+		"generation", cluster.Generation,
+		"observedGeneration", cluster.Status.ObservedGeneration)
+
 	// Check for in-progress rolling restart (must continue regardless of generation).
 	if _, hasRestart := cluster.Annotations[util.AnnotationRollingRestart]; hasRestart {
+		logger.Debug("continuing in-progress rolling restart")
 		return r.continueRollingRestart(ctx, cluster)
+	}
+
+	// Check for pending config reload. If the generation changed (new config applied),
+	// skip the pending reload and let reconcileConfig handle the new change.
+	if cluster.Status.ObservedGeneration == cluster.Generation {
+		if result, handled := r.completePendingReload(ctx, cluster); handled {
+			return result, nil
+		}
 	}
 
 	// Skip if cluster is not running.
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		logger.Debug("cluster not running, deferring admin reconciliation",
+			"phase", cluster.Status.Phase)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
@@ -149,22 +169,32 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// and there are no maintenance annotations pending.
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Annotations[util.AnnotationMaintenance] == "" {
-		logger.Info("skipping admin reconciliation, generation unchanged")
+		logger.Debug("skipping admin reconciliation, generation unchanged")
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
 	// Handle maintenance annotations.
 	if maintenance, ok := cluster.Annotations[util.AnnotationMaintenance]; ok {
+		logger.Debug("handling maintenance annotation", "operation", maintenance)
 		return r.handleMaintenance(ctx, cluster, maintenance)
 	}
 
 	// Reconcile configuration parameters.
+	logger.Debug("reconciling configuration parameters")
 	if err := r.reconcileConfig(ctx, cluster); err != nil {
 		return r.handleConfigError(ctx, logger, cluster, err)
 	}
 
 	// Reconcile all sub-components and patch status.
+	logger.Debug("reconciling sub-components")
 	r.reconcileSubComponents(ctx, logger, cluster)
+
+	// Re-read the current phase from the API server to avoid overwriting phase changes
+	// made by the cluster-controller (e.g., Scaling phase during scale-out).
+	var latest cbv1alpha1.CloudberryCluster
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err == nil {
+		cluster.Status.Phase = latest.Status.Phase
+	}
 
 	// Perform a single status patch for all sub-reconciler changes.
 	// Using MergePatch prevents clobbering status changes from other controllers.
@@ -173,6 +203,7 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating cluster status: %w", err)
 	}
 
+	logger.Debug("admin reconciliation completed successfully")
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }
 
@@ -464,22 +495,34 @@ func (r *AdminReconciler) updateConfigMap(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
 	desired := r.builder.BuildPostgresqlConfConfigMap(cluster)
-	existing := desired.DeepCopy()
-	err := r.client.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("getting postgresql.conf configmap: %w", err)
-	}
 
-	if apierrors.IsNotFound(err) {
-		if createErr := r.client.Create(ctx, desired); createErr != nil {
-			return fmt.Errorf("creating postgresql.conf configmap: %w", createErr)
+	// Retry on conflict (another controller may be updating the same ConfigMap).
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		existing := desired.DeepCopy()
+		err := r.client.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("getting postgresql.conf configmap: %w", err)
 		}
-	} else {
+
+		if apierrors.IsNotFound(err) {
+			if createErr := r.client.Create(ctx, desired); createErr != nil {
+				return fmt.Errorf("creating postgresql.conf configmap: %w", createErr)
+			}
+			return nil
+		}
+
 		existing.Data = desired.Data
 		existing.Annotations = desired.Annotations
 		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			if apierrors.IsConflict(updateErr) && attempt < maxRetries-1 {
+				r.logger.Debug("configmap update conflict, retrying", "attempt", attempt+1)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			return fmt.Errorf("updating postgresql.conf configmap: %w", updateErr)
 		}
+		return nil
 	}
 	return nil
 }
@@ -528,6 +571,9 @@ func (r *AdminReconciler) applyRestartRequired(
 }
 
 // applyReloadSafe handles the case where only reload-safe parameters changed.
+// It sets a pending-reload annotation so that on the next reconciliation (after
+// ConfigMap volume propagation), pg_reload_conf() is called to apply the new
+// configuration without requiring a restart.
 func (r *AdminReconciler) applyReloadSafe(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -535,23 +581,109 @@ func (r *AdminReconciler) applyReloadSafe(
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionConfigApplied),
-		metav1.ConditionTrue,
-		"ConfigReloaded",
-		"All configuration parameters are applied via reload",
+		metav1.ConditionFalse,
+		"ConfigReloadPending",
+		"Configuration updated, waiting for ConfigMap volume propagation before reload",
 	)
 
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return fmt.Errorf("updating config status: %w", err)
 	}
 
+	// Set the pending-reload annotation with the current timestamp using a patch
+	// to avoid conflicts with other controllers updating the same resource.
+	now := time.Now().UTC().Format(time.RFC3339)
+	patch := client.MergeFrom(cluster.DeepCopy())
+	if cluster.Annotations == nil {
+		cluster.Annotations = make(map[string]string)
+	}
+	cluster.Annotations[util.AnnotationPendingReload] = now
+
+	if err := r.client.Patch(ctx, cluster, patch); err != nil {
+		return fmt.Errorf("setting pending-reload annotation: %w", err)
+	}
+
+	r.logger.Info("pending-reload annotation set, will reload after ConfigMap propagation")
+	return nil
+}
+
+// completePendingReload checks if a pending reload annotation exists and enough
+// time has passed for ConfigMap volume propagation, then calls pg_reload_conf().
+func (r *AdminReconciler) completePendingReload(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, bool) {
+	pendingTime, hasPending := cluster.Annotations[util.AnnotationPendingReload]
+	if !hasPending {
+		return ctrl.Result{}, false
+	}
+
+	// Parse the timestamp and check if enough time has passed.
+	// Kubernetes ConfigMap volume propagation typically takes up to
+	// kubelet sync period + cache propagation delay (~30-60s).
+	// We use 30s to account for most environments while keeping responsiveness.
+	const configMapPropagationDelay = 30 * time.Second
+
+	parsedTime, err := time.Parse(time.RFC3339, pendingTime)
+	if err != nil {
+		r.logger.Error("failed to parse pending-reload timestamp, executing reload now", "error", err)
+	} else {
+		elapsed := time.Since(parsedTime)
+		if elapsed < configMapPropagationDelay {
+			remaining := configMapPropagationDelay - elapsed
+			r.logger.Info("waiting for ConfigMap propagation before reload",
+				"elapsed", elapsed.Round(time.Second),
+				"remaining", remaining.Round(time.Second))
+			return ctrl.Result{RequeueAfter: remaining}, true
+		}
+	}
+
+	// Enough time has passed — call pg_reload_conf().
+	if r.dbFactory != nil {
+		dbClient, dbErr := r.dbFactory.NewClient(ctx, cluster)
+		if dbErr != nil {
+			r.logger.Error("failed to create DB client for config reload", "error", dbErr)
+		} else {
+			defer dbClient.Close()
+			if reloadErr := dbClient.ReloadConfig(ctx); reloadErr != nil {
+				r.logger.Error("failed to reload config on coordinator", "error", reloadErr)
+			} else {
+				r.logger.Info("configuration reloaded on coordinator via pg_reload_conf()")
+			}
+		}
+	}
+
+	// Remove the pending-reload annotation using a patch to avoid conflicts.
+	patch := client.MergeFrom(cluster.DeepCopy())
+	delete(cluster.Annotations, util.AnnotationPendingReload)
+	if err := r.client.Patch(ctx, cluster, patch); err != nil {
+		r.logger.Error("failed to remove pending-reload annotation", "error", err)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, true
+	}
+
+	// Update status to reflect successful reload.
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionConfigApplied),
+		metav1.ConditionTrue,
+		"ConfigReloaded",
+		"All configuration parameters are applied via reload",
+	)
+	if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
+		r.logger.Error("failed to update config status after reload", "error", statusErr)
+	}
+
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonConfigReloaded,
 		"Configuration parameters reloaded without restart")
-	return nil
+	r.metrics.RecordConfigReload(cluster.Name, cluster.Namespace)
+
+	return ctrl.Result{}, true
 }
 
 // reconcileConfig detects and applies configuration changes.
 // It classifies changed parameters into reload-safe (sighup) and restart-required
 // (postmaster) categories and triggers the appropriate action.
+// Additionally, it applies coordinator-only, database-specific, and role-specific parameters.
 func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	logger := util.LoggerFromContext(ctx)
 
@@ -559,8 +691,8 @@ func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alph
 		return nil
 	}
 
-	// Compute current config hash.
-	currentHash := util.ComputeHash(cluster.Spec.Config.Parameters)
+	// Compute current config hash including all config layers.
+	currentHash := r.computeFullConfigHash(cluster.Spec.Config)
 	clusterKey := fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name)
 	lastHashVal, _ := r.configHashes.Load(clusterKey)
 	lastHash, _ := lastHashVal.(string)
@@ -591,16 +723,197 @@ func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alph
 		return err
 	}
 
-	// Update config hash and stored parameters.
-	r.configHashes.Store(clusterKey, currentHash)
-	r.storeConfigParams(clusterKey, cluster.Spec.Config.Parameters)
+	// Apply coordinator-only parameters via the database client.
+	if err := r.applyCoordinatorParameters(ctx, cluster); err != nil {
+		logger.Error("failed to apply coordinator parameters", "error", err)
+		// Non-fatal: continue with other config layers.
+	}
+
+	// Apply database-specific parameters via ALTER DATABASE SET.
+	if err := r.applyDatabaseParameters(ctx, cluster); err != nil {
+		logger.Error("failed to apply database parameters", "error", err)
+		// Non-fatal: continue with other config layers.
+	}
+
+	// Apply role-specific parameters via ALTER ROLE SET.
+	if err := r.applyRoleParameters(ctx, cluster); err != nil {
+		logger.Error("failed to apply role parameters", "error", err)
+		// Non-fatal: continue with other config layers.
+	}
 
 	// Apply the change (restart or reload).
 	if err := r.applyConfigChange(ctx, cluster, changes); err != nil {
 		return err
 	}
 
-	r.metrics.RecordConfigReload(cluster.Name, cluster.Namespace)
+	// Update config hash and stored parameters AFTER successful apply.
+	// This ensures retries will re-detect the change if apply fails.
+	r.configHashes.Store(clusterKey, currentHash)
+	r.storeConfigParams(clusterKey, cluster.Spec.Config.Parameters)
+
+	// Record metric for restart-required changes immediately.
+	// For reload-safe changes, the metric is recorded in completePendingReload
+	// after the actual pg_reload_conf() call succeeds.
+	if len(changes.restartNeeded) > 0 {
+		r.metrics.RecordConfigReload(cluster.Name, cluster.Namespace)
+	}
+	return nil
+}
+
+// computeFullConfigHash computes a hash over all config layers to detect any change.
+func (r *AdminReconciler) computeFullConfigHash(config *cbv1alpha1.ConfigSpec) string {
+	// Combine all config layers into a single map for hashing.
+	combined := make(map[string]string)
+	for k, v := range config.Parameters {
+		combined["param:"+k] = v
+	}
+	for k, v := range config.CoordinatorParameters {
+		combined["coord:"+k] = v
+	}
+	for dbName, params := range config.DatabaseParameters {
+		for k, v := range params {
+			combined["db:"+dbName+":"+k] = v
+		}
+	}
+	for roleName, params := range config.RoleParameters {
+		for k, v := range params {
+			combined["role:"+roleName+":"+k] = v
+		}
+	}
+	return util.ComputeHash(combined)
+}
+
+// applyCoordinatorParameters applies coordinator-only parameters via ALTER SYSTEM SET
+// on the coordinator. These parameters are only applied to the coordinator node.
+func (r *AdminReconciler) applyCoordinatorParameters(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if len(cluster.Spec.Config.CoordinatorParameters) == 0 {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Debug("applying coordinator-only parameters",
+		"count", len(cluster.Spec.Config.CoordinatorParameters))
+
+	if r.dbFactory == nil {
+		logger.Debug("database client factory not available, skipping coordinator parameters")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating database client for coordinator parameters: %w", err)
+	}
+	defer dbClient.Close()
+
+	for name, value := range cluster.Spec.Config.CoordinatorParameters {
+		if setErr := dbClient.SetParameter(ctx, name, value, db.ParameterScope{Level: "cluster"}); setErr != nil {
+			logger.Error("failed to set coordinator parameter",
+				"name", name, "value", value, "error", setErr)
+			continue
+		}
+		logger.Debug("coordinator parameter applied", "name", name, "value", value)
+	}
+
+	// Reload configuration to apply changes.
+	if reloadErr := dbClient.ReloadConfig(ctx); reloadErr != nil {
+		return fmt.Errorf("reloading config after coordinator parameters: %w", reloadErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonConfigReloaded,
+		fmt.Sprintf("Coordinator-only parameters applied: %d parameters",
+			len(cluster.Spec.Config.CoordinatorParameters)))
+
+	return nil
+}
+
+// applyDatabaseParameters applies per-database parameters via ALTER DATABASE SET.
+func (r *AdminReconciler) applyDatabaseParameters(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if len(cluster.Spec.Config.DatabaseParameters) == 0 {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Debug("applying database-specific parameters",
+		"databases", len(cluster.Spec.Config.DatabaseParameters))
+
+	if r.dbFactory == nil {
+		logger.Debug("database client factory not available, skipping database parameters")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating database client for database parameters: %w", err)
+	}
+	defer dbClient.Close()
+
+	for dbName, params := range cluster.Spec.Config.DatabaseParameters {
+		for name, value := range params {
+			scope := db.ParameterScope{Level: "database", Target: dbName}
+			if setErr := dbClient.SetParameter(ctx, name, value, scope); setErr != nil {
+				logger.Error("failed to set database parameter",
+					"database", dbName, "name", name, "value", value, "error", setErr)
+				continue
+			}
+			logger.Debug("database parameter applied",
+				"database", dbName, "name", name, "value", value)
+		}
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonConfigReloaded,
+		fmt.Sprintf("Database-specific parameters applied for %d databases",
+			len(cluster.Spec.Config.DatabaseParameters)))
+
+	return nil
+}
+
+// applyRoleParameters applies per-role parameters via ALTER ROLE SET.
+func (r *AdminReconciler) applyRoleParameters(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if len(cluster.Spec.Config.RoleParameters) == 0 {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+	logger.Debug("applying role-specific parameters",
+		"roles", len(cluster.Spec.Config.RoleParameters))
+
+	if r.dbFactory == nil {
+		logger.Debug("database client factory not available, skipping role parameters")
+		return nil
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating database client for role parameters: %w", err)
+	}
+	defer dbClient.Close()
+
+	for roleName, params := range cluster.Spec.Config.RoleParameters {
+		for name, value := range params {
+			scope := db.ParameterScope{Level: "role", Target: roleName}
+			if setErr := dbClient.SetParameter(ctx, name, value, scope); setErr != nil {
+				logger.Error("failed to set role parameter",
+					"role", roleName, "name", name, "value", value, "error", setErr)
+				continue
+			}
+			logger.Debug("role parameter applied",
+				"role", roleName, "name", name, "value", value)
+		}
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonConfigReloaded,
+		fmt.Sprintf("Role-specific parameters applied for %d roles",
+			len(cluster.Spec.Config.RoleParameters)))
+
 	return nil
 }
 
@@ -699,8 +1012,11 @@ func (r *AdminReconciler) continueRollingRestart(
 		return r.updateRestartAnnotation(ctx, cluster, state)
 	}
 
-	// Check if the StatefulSet for the current phase is ready.
-	ready, err := r.isStatefulSetReady(ctx, cluster.Namespace, stsName)
+	// Check if the StatefulSet for the current phase has completed its rolling update.
+	// Using isStatefulSetRolled instead of isStatefulSetReady ensures we wait for
+	// the StatefulSet controller to actually roll all pods (CurrentRevision == UpdateRevision),
+	// not just check that replicas are ready (which is already true before rolling starts).
+	rolled, err := r.isStatefulSetRolled(ctx, cluster.Namespace, stsName)
 	if err != nil {
 		// StatefulSet may not exist; skip this phase.
 		logger.Info("statefulset not found, skipping phase", "phase", state.Phase, "sts", stsName, "error", err)
@@ -712,9 +1028,10 @@ func (r *AdminReconciler) continueRollingRestart(
 		return r.updateRestartAnnotation(ctx, cluster, state)
 	}
 
-	if !ready {
+	if !rolled {
 		// StatefulSet is still rolling; requeue to check again.
-		logger.Info("waiting for statefulset to become ready", "phase", state.Phase, "sts", stsName)
+		logger.Info("waiting for statefulset rolling update to complete",
+			"phase", state.Phase, "sts", stsName)
 		return ctrl.Result{RequeueAfter: requeueAfterShort}, nil
 	}
 
@@ -762,6 +1079,13 @@ func (r *AdminReconciler) completeRollingRestart(
 		fmt.Sprintf("Configuration applied after rolling restart of parameters: %s",
 			strings.Join(state.RestartParams, ", ")),
 	)
+
+	// Re-read the current phase from the API server to avoid overwriting phase changes
+	// made by the cluster-controller (e.g., Scaling phase during scale-out).
+	var latest cbv1alpha1.CloudberryCluster
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err == nil {
+		cluster.Status.Phase = latest.Status.Phase
+	}
 
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status after rolling restart: %w", err)
@@ -817,17 +1141,24 @@ func (r *AdminReconciler) restartStatefulSet(ctx context.Context, namespace, nam
 	return nil
 }
 
-// isStatefulSetReady checks whether a StatefulSet has all replicas ready.
-func (r *AdminReconciler) isStatefulSetReady(ctx context.Context, namespace, name string) (bool, error) {
+// isStatefulSetRolled checks whether a StatefulSet has completed its rolling update.
+// It verifies that all replicas are ready, all replicas are updated to the latest
+// revision, and the current revision matches the update revision. This prevents
+// the controller from advancing to the next phase before pods are actually rolled.
+func (r *AdminReconciler) isStatefulSetRolled(ctx context.Context, namespace, name string) (bool, error) {
 	sts := &appsv1.StatefulSet{}
 	if err := r.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sts); err != nil {
 		return false, fmt.Errorf("getting statefulset %s/%s: %w", namespace, name, err)
 	}
 
 	if sts.Spec.Replicas == nil {
-		return sts.Status.ReadyReplicas > 0, nil
+		return false, nil
 	}
-	return sts.Status.ReadyReplicas == *sts.Spec.Replicas, nil
+
+	desired := *sts.Spec.Replicas
+	return sts.Status.ReadyReplicas == desired &&
+		sts.Status.UpdatedReplicas == desired &&
+		sts.Status.CurrentRevision == sts.Status.UpdateRevision, nil
 }
 
 // statefulSetNameForPhase returns the StatefulSet name for the given restart phase,
@@ -882,8 +1213,10 @@ func (r *AdminReconciler) nextRestartPhase(
 	return restartPhaseCompleted
 }
 
-// handleMaintenance processes maintenance annotations by creating a Kubernetes Job
-// for the requested database maintenance operation (vacuum, analyze, reindex, etc.).
+// handleMaintenance processes maintenance annotations by executing the requested
+// database maintenance operation (vacuum, analyze, reindex, log-rotate) directly
+// via the DB client on the coordinator. For operations that may be long-running
+// (vacuum-full), a Kubernetes Job is also created as a fallback mechanism.
 func (r *AdminReconciler) handleMaintenance(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -904,6 +1237,7 @@ func (r *AdminReconciler) handleMaintenance(
 		util.MaintenanceVacuumFull:    true,
 		util.MaintenanceAnalyze:       true,
 		util.MaintenanceReindex:       true,
+		util.MaintenanceLogRotate:     true,
 	}
 	if !validOps[maintenance] {
 		logger.Warn("unknown maintenance operation", "type", maintenance)
@@ -912,7 +1246,24 @@ func (r *AdminReconciler) handleMaintenance(
 		return ctrl.Result{}, nil
 	}
 
-	// Create the maintenance Job.
+	// Attempt to execute the maintenance operation directly via the DB client.
+	// This is preferred over Jobs for simplicity and immediate feedback.
+	if r.dbFactory != nil {
+		if err := r.executeMaintenanceViaDB(ctx, cluster, maintenance); err != nil {
+			logger.Error("direct maintenance execution failed, falling back to Job",
+				"operation", maintenance, "error", err)
+		} else {
+			// Direct execution succeeded — emit completion event and record metric.
+			r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMaintenanceCompleted,
+				fmt.Sprintf("Maintenance operation %s completed successfully", maintenance))
+			r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance)
+			logger.Info("maintenance operation completed via DB client", "operation", maintenance)
+			return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		}
+	}
+
+	// Fallback: create a maintenance Job for operations that failed via DB client
+	// or when the DB factory is not available.
 	timestamp := time.Now().Format("20060102-150405")
 	job := r.builder.BuildMaintenanceJob(cluster, maintenance, timestamp)
 	if err := r.client.Create(ctx, job); err != nil {
@@ -924,8 +1275,48 @@ func (r *AdminReconciler) handleMaintenance(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMaintenanceStarted,
 		fmt.Sprintf("Maintenance operation %s initiated, job: %s", maintenance, job.Name))
+	r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance)
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// executeMaintenanceViaDB executes a maintenance operation directly on the coordinator
+// via the database client. This provides immediate feedback and avoids the overhead
+// of creating a Kubernetes Job for simple operations.
+func (r *AdminReconciler) executeMaintenanceViaDB(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	operation string,
+) error {
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("creating database client: %w", err)
+	}
+	defer dbClient.Close()
+
+	switch operation {
+	case util.MaintenanceVacuum:
+		return dbClient.Vacuum(ctx, db.VacuumOptions{})
+	case util.MaintenanceVacuumAnalyze:
+		return dbClient.Vacuum(ctx, db.VacuumOptions{Analyze: true})
+	case util.MaintenanceVacuumFull:
+		return dbClient.Vacuum(ctx, db.VacuumOptions{Full: true})
+	case util.MaintenanceAnalyze:
+		return dbClient.Analyze(ctx, "")
+	case util.MaintenanceReindex:
+		return dbClient.Reindex(ctx, db.ReindexOptions{Database: "postgres"})
+	case util.MaintenanceLogRotate:
+		return r.executeLogRotate(ctx, dbClient)
+	default:
+		return fmt.Errorf("unsupported maintenance operation for direct execution: %s", operation)
+	}
+}
+
+// executeLogRotate rotates the PostgreSQL log file by calling pg_rotate_logfile().
+// This is a Cloudberry/PostgreSQL built-in function that signals the logger process
+// to switch to a new log file immediately.
+func (r *AdminReconciler) executeLogRotate(ctx context.Context, dbClient db.Client) error {
+	return dbClient.LogRotate(ctx)
 }
 
 // SetupWithManager sets up the controller with the Manager.

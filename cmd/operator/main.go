@@ -191,6 +191,7 @@ func registerControllers(
 		resourceBuilder,
 		metricsRecorder,
 		logger,
+		dbFactory,
 	)
 	if err := clusterReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setting up cluster controller: %w", err)

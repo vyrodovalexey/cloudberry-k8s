@@ -50,6 +50,18 @@ const (
 
 	// sqlAnalyze is the SQL command for analyze operations.
 	sqlAnalyze = "ANALYZE"
+
+	// gpadminUID is the UID of the gpadmin user in the Cloudberry container image.
+	gpadminUID int64 = 1000
+
+	// envCloudberryRole is the environment variable name for the Cloudberry role.
+	envCloudberryRole = "CLOUDBERRY_ROLE"
+	// envCloudberryContentID is the environment variable name for the segment content ID.
+	envCloudberryContentID = "CLOUDBERRY_CONTENT_ID"
+	// envCloudberryCoordinatorHost is the environment variable name for the coordinator host.
+	envCloudberryCoordinatorHost = "CLOUDBERRY_COORDINATOR_HOST"
+	// envCloudberrySegmentCount is the environment variable name for the segment count.
+	envCloudberrySegmentCount = "CLOUDBERRY_SEGMENT_COUNT"
 )
 
 // maintenanceSQL maps maintenance operation types to their SQL commands.
@@ -59,9 +71,10 @@ var maintenanceSQL = map[string]string{
 	util.MaintenanceVacuumFull:     "VACUUM FULL",
 	util.MaintenanceAnalyze:        sqlAnalyze,
 	util.MaintenanceReindex:        "REINDEX DATABASE postgres",
-	util.MaintenanceRedistribute:   sqlAnalyze, // In real Cloudberry: gpexpand redistribution
-	util.MaintenanceRebalance:      sqlAnalyze, // In real Cloudberry: gpexpand/redistribution
-	util.MaintenanceBackupOnDelete: "SELECT 1", // In real Cloudberry: gpbackup
+	util.MaintenanceLogRotate:      "SELECT pg_rotate_logfile()",
+	util.MaintenanceRedistribute:   "SELECT gp_expand.status()", // Redistribution handled via DB client
+	util.MaintenanceRebalance:      "SELECT gp_expand.status()", // Rebalance handled via DB client
+	util.MaintenanceBackupOnDelete: "SELECT 1",                  // In real Cloudberry: gpbackup
 }
 
 // resolvePort returns the coordinator port from the cluster spec,
@@ -154,7 +167,9 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 		},
 	}
 
-	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Coordinator.Resources)
+	mainContainer, err := buildMainContainer(
+		cluster, port, cluster.Spec.Coordinator.Resources, util.ComponentCoordinator,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("building coordinator main container: %w", err)
 	}
@@ -206,6 +221,9 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						buildInitContainer(),
+					},
 					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Standby.NodeSelector,
@@ -215,7 +233,7 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 		},
 	}
 
-	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Standby.Resources)
+	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Standby.Resources, util.ComponentStandby)
 	if err != nil {
 		return nil, fmt.Errorf("building standby main container: %w", err)
 	}
@@ -260,6 +278,9 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						buildInitContainer(),
+					},
 					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Segments.NodeSelector,
@@ -271,7 +292,9 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 		},
 	}
 
-	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
+	mainContainer, err := buildMainContainer(
+		cluster, port, cluster.Spec.Segments.Resources, util.ComponentSegmentPrimary,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("building segment primary main container: %w", err)
 	}
@@ -320,6 +343,9 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						buildInitContainer(),
+					},
 					Containers:   []corev1.Container{},
 					Volumes:      buildVolumes(cluster),
 					NodeSelector: cluster.Spec.Segments.NodeSelector,
@@ -331,7 +357,9 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 		},
 	}
 
-	mainContainer, err := buildMainContainer(cluster, port, cluster.Spec.Segments.Resources)
+	mainContainer, err := buildMainContainer(
+		cluster, port, cluster.Spec.Segments.Resources, util.ComponentSegmentMirror,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("building segment mirror main container: %w", err)
 	}
@@ -365,6 +393,12 @@ func (b *DefaultBuilder) BuildCoordinatorService(cluster *cbv1alpha1.CloudberryC
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: corev1.ClusterIPNone,
 			Selector:  labels,
+			// PublishNotReadyAddresses ensures DNS records are available before
+			// the pod passes its readiness probe. Cloudberry's FTS probe resolves
+			// all hostnames in gp_segment_configuration at startup; without this
+			// setting the coordinator's own hostname is unresolvable during init,
+			// causing FTS to crash and blocking distributed transaction recovery.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       portName,
@@ -395,6 +429,9 @@ func (b *DefaultBuilder) BuildStandbyService(cluster *cbv1alpha1.CloudberryClust
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: corev1.ClusterIPNone,
 			Selector:  labels,
+			// PublishNotReadyAddresses ensures standby DNS is available before
+			// readiness probe passes, required for WAL replication setup.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       portName,
@@ -430,6 +467,10 @@ func (b *DefaultBuilder) BuildSegmentService(cluster *cbv1alpha1.CloudberryClust
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: corev1.ClusterIPNone,
 			Selector:  selectorLabels,
+			// PublishNotReadyAddresses ensures segment DNS records are available
+			// before pods pass readiness probes. Required for FTS hostname
+			// resolution during coordinator startup.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "segment",
@@ -625,17 +666,26 @@ func ownerRef(cluster *cbv1alpha1.CloudberryCluster) metav1.OwnerReference {
 
 // buildInitContainer creates the init container that prepares the data directory.
 // Uses a lightweight busybox image to avoid entrypoint interference from database images.
+// The container runs as root to ensure correct ownership (UID 1000 / gpadmin) of the
+// data directory, then the main container runs as the unprivileged gpadmin user.
 func buildInitContainer() corev1.Container {
+	rootUser := int64(0)
 	return corev1.Container{
 		Name:  initContainerN,
 		Image: initImage,
 		Command: []string{
 			"/bin/sh", "-c",
-			"if [ ! -d " + pgDataSubDir + " ]; then " +
-				"echo 'Creating pgdata subdirectory...'; " +
+			"echo 'Preparing data directory...'; " +
 				"mkdir -p " + pgDataSubDir + "; " +
+				"chown -R " + fmt.Sprintf("%d:%d", gpadminUID, gpadminUID) + " " + dataVolumePath + "; " +
 				"chmod 700 " + pgDataSubDir + "; " +
-				"fi",
+				// Also fix permissions on any existing segment data directories
+				"find " + pgDataSubDir + " -maxdepth 1 -type d -name 'gpseg*'" +
+				" -exec chmod 700 {} \\; 2>/dev/null || true; " +
+				"echo 'Data directory ready'",
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: &rootUser,
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: dataVolumeName, MountPath: dataVolumePath},
@@ -643,13 +693,142 @@ func buildInitContainer() corev1.Container {
 	}
 }
 
+// cloudberryRoleForComponent maps a component label to the CLOUDBERRY_ROLE env var value.
+func cloudberryRoleForComponent(component string) string {
+	switch component {
+	case util.ComponentCoordinator:
+		return "coordinator"
+	case util.ComponentStandby:
+		return "standby"
+	case util.ComponentSegmentPrimary:
+		return "primary"
+	case util.ComponentSegmentMirror:
+		return "mirror"
+	default:
+		return "coordinator"
+	}
+}
+
+// buildCloudberryEnvVars returns the Cloudberry-specific environment variables
+// for the given component type.
+func buildCloudberryEnvVars(
+	cluster *cbv1alpha1.CloudberryCluster, component string,
+) []corev1.EnvVar {
+	coordinatorSvc := util.CoordinatorServiceName(cluster.Name)
+	segmentSvc := util.SegmentServiceName(cluster.Name)
+	role := cloudberryRoleForComponent(component)
+	isSegment := component == util.ComponentSegmentPrimary ||
+		component == util.ComponentSegmentMirror
+	isCoordinator := component == util.ComponentCoordinator
+
+	hasMirroring := cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled
+
+	// Pre-allocate: 3 base vars + content ID + optional POD_NAME + segment service + mirroring.
+	capacity := 7
+	envVars := make([]corev1.EnvVar, 0, capacity)
+
+	envVars = append(envVars,
+		corev1.EnvVar{Name: envCloudberryRole, Value: role},
+		corev1.EnvVar{Name: envCloudberryCoordinatorHost, Value: coordinatorSvc},
+		corev1.EnvVar{
+			Name:  envCloudberrySegmentCount,
+			Value: fmt.Sprintf("%d", cluster.Spec.Segments.Count),
+		},
+	)
+
+	// Segments derive their content ID from the pod ordinal via the downward
+	// API. We inject POD_NAME so the entrypoint can extract the ordinal.
+	if isSegment {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.name",
+					},
+				},
+			},
+			// Default content ID; overridden by entrypoint based on POD_NAME ordinal.
+			corev1.EnvVar{
+				Name:  envCloudberryContentID,
+				Value: "-1",
+			},
+			// Segment service name for mirror-to-primary DNS resolution.
+			corev1.EnvVar{
+				Name:  "CLOUDBERRY_SEGMENT_SERVICE",
+				Value: segmentSvc,
+			},
+		)
+	} else {
+		// Coordinator and standby use content ID -1.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  envCloudberryContentID,
+			Value: "-1",
+		})
+	}
+
+	// Coordinator needs POD_NAME and segment service for segment registration.
+	if isCoordinator {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.name",
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name:  "CLOUDBERRY_SEGMENT_SERVICE",
+				Value: segmentSvc,
+			},
+		)
+	}
+
+	// Indicate whether mirroring is enabled so the entrypoint can register mirrors.
+	if hasMirroring {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "CLOUDBERRY_MIRRORING_ENABLED",
+			Value: "true",
+		})
+	}
+
+	return envVars
+}
+
 // buildMainContainer creates the main database container.
+// The component parameter identifies the Cloudberry role (coordinator, standby,
+// segment-primary, segment-mirror) and is used to set role-specific environment
+// variables expected by the Cloudberry entrypoint script.
 // Returns an error if resource quantities are invalid.
 func buildMainContainer(
 	cluster *cbv1alpha1.CloudberryCluster,
 	port int32,
 	resources *cbv1alpha1.ResourceRequirements,
+	component string,
 ) (corev1.Container, error) {
+	runAsUser := gpadminUID
+	runAsGroup := gpadminUID
+
+	cloudberryEnvVars := buildCloudberryEnvVars(cluster, component)
+	// 2 base env vars (PGDATA, POSTGRES_PASSWORD) + Cloudberry-specific vars.
+	envVars := make([]corev1.EnvVar, 0, 2+len(cloudberryEnvVars))
+	envVars = append(envVars,
+		corev1.EnvVar{Name: "PGDATA", Value: pgDataSubDir},
+		corev1.EnvVar{
+			Name: "POSTGRES_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: util.AdminPasswordSecretName(cluster.Name),
+					},
+					Key: secretKeyPassword,
+				},
+			},
+		},
+	)
+	envVars = append(envVars, cloudberryEnvVars...)
+
 	container := corev1.Container{
 		Name:  containerName,
 		Image: cluster.Spec.Image,
@@ -660,20 +839,7 @@ func buildMainContainer(
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env: []corev1.EnvVar{
-			{Name: "PGDATA", Value: pgDataSubDir},
-			{
-				Name: "POSTGRES_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: util.AdminPasswordSecretName(cluster.Name),
-						},
-						Key: secretKeyPassword,
-					},
-				},
-			},
-		},
+		Env: envVars,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: dataVolumeName, MountPath: dataVolumePath},
 			{Name: configVolumeName, MountPath: configVolumePath, ReadOnly: true},
@@ -699,6 +865,10 @@ func buildMainContainer(
 			TimeoutSeconds:      5,
 		},
 		ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:  &runAsUser,
+			RunAsGroup: &runAsGroup,
+		},
 	}
 
 	if resources != nil {
@@ -896,6 +1066,9 @@ func addImagePullSecrets(spec *corev1.PodSpec, secrets []cbv1alpha1.ImagePullSec
 }
 
 // renderPostgresqlConf renders the postgresql.conf content from the cluster spec.
+// Includes cluster-wide parameters and coordinator-only parameters (since the
+// ConfigMap is mounted on the coordinator; coordinator-only params are also applied
+// via ALTER SYSTEM SET for runtime changes).
 func renderPostgresqlConf(cluster *cbv1alpha1.CloudberryCluster) string {
 	var sb strings.Builder
 	sb.WriteString("# Generated by cloudberry-operator\n")
@@ -918,7 +1091,7 @@ func renderPostgresqlConf(cluster *cbv1alpha1.CloudberryCluster) string {
 		fmt.Fprintf(&sb, "ssl_min_protocol_version = '%s'\n", minTLS)
 	}
 
-	// User-defined parameters.
+	// User-defined cluster-wide parameters.
 	if cluster.Spec.Config != nil && len(cluster.Spec.Config.Parameters) > 0 {
 		sb.WriteString("\n# User-defined parameters\n")
 		keys := make([]string, 0, len(cluster.Spec.Config.Parameters))
@@ -928,6 +1101,20 @@ func renderPostgresqlConf(cluster *cbv1alpha1.CloudberryCluster) string {
 		sort.Strings(keys)
 		for _, k := range keys {
 			fmt.Fprintf(&sb, "%s = '%s'\n", k, cluster.Spec.Config.Parameters[k])
+		}
+	}
+
+	// Coordinator-only parameters (applied to the shared ConfigMap which is
+	// mounted on the coordinator; segments ignore these via ALTER SYSTEM SET scope).
+	if cluster.Spec.Config != nil && len(cluster.Spec.Config.CoordinatorParameters) > 0 {
+		sb.WriteString("\n# Coordinator-only parameters\n")
+		keys := make([]string, 0, len(cluster.Spec.Config.CoordinatorParameters))
+		for k := range cluster.Spec.Config.CoordinatorParameters {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&sb, "%s = '%s'\n", k, cluster.Spec.Config.CoordinatorParameters[k])
 		}
 	}
 

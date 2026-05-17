@@ -23,6 +23,7 @@ LDFLAGS          := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X
 # --- Docker settings ---------------------------------------------------------
 IMG_OPERATOR     ?= cloudberry-operator:latest
 IMG_CTL          ?= cloudberry-ctl:latest
+IMG_CLOUDBERRY   ?= cloudberrydb/cloudberry:2.1.0
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
@@ -142,10 +143,17 @@ endif
 .PHONY: docker-build
 docker-build: docker-build-operator docker-build-ctl ## Build Docker images for operator and ctl
 
+.PHONY: docker-build-all
+docker-build-all: docker-build docker-build-cloudberry ## Build all Docker images (operator, ctl, cloudberry)
+
 .PHONY: docker-push
 docker-push: ## Push Docker images
 	$(DOCKER) push $(IMG_OPERATOR)
 	$(DOCKER) push $(IMG_CTL)
+
+.PHONY: docker-push-cloudberry
+docker-push-cloudberry: ## Push Cloudberry database image
+	$(DOCKER) push $(IMG_CLOUDBERRY)
 
 .PHONY: docker-build-operator
 docker-build-operator: ## Build operator Docker image
@@ -160,6 +168,12 @@ docker-build-ctl: ## Build cloudberry-ctl Docker image
 		$(DOCKER_BUILD_ARGS) \
 		-t $(IMG_CTL) \
 		-f Dockerfile.ctl .
+
+.PHONY: docker-build-cloudberry
+docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles from source)
+	$(DOCKER) build \
+		-t $(IMG_CLOUDBERRY) \
+		-f Dockerfile.cloudberry .
 
 # =============================================================================
 # Kubernetes / Helm targets

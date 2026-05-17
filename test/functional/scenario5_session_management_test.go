@@ -136,6 +136,45 @@ func (m *scenario5MockDBClient) GetTableDetails(_ context.Context, _, _ string) 
 func (m *scenario5MockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageReportEntry, error) {
 	return nil, nil
 }
+func (m *scenario5MockDBClient) InitializeMirrors(_ context.Context, _ db.MirrorInitOptions) error {
+	return nil
+}
+func (m *scenario5MockDBClient) ConfigureReplication(_ context.Context, _ db.ReplicationOptions) error {
+	return nil
+}
+func (m *scenario5MockDBClient) GetMirrorSyncStatus(_ context.Context) ([]db.MirrorSyncInfo, error) {
+	return nil, nil
+}
+func (m *scenario5MockDBClient) TriggerFTSProbe(_ context.Context) error { return nil }
+func (m *scenario5MockDBClient) TerminateAllBackends(_ context.Context) (int32, error) {
+	return 0, nil
+}
+func (m *scenario5MockDBClient) CancelAllQueries(_ context.Context) (int32, error) {
+	return 0, nil
+}
+func (m *scenario5MockDBClient) LogRotate(_ context.Context) error { return nil }
+func (m *scenario5MockDBClient) CreateResourceQueue(_ context.Context, _ db.ResourceQueueOptions) error {
+	return nil
+}
+func (m *scenario5MockDBClient) DropResourceQueue(_ context.Context, _ string) error { return nil }
+func (m *scenario5MockDBClient) ListResourceQueues(_ context.Context) ([]db.ResourceQueueInfo, error) {
+	return nil, nil
+}
+func (m *scenario5MockDBClient) RegisterNewSegments(_ context.Context, _ db.SegmentRegistrationOptions) error {
+	return nil
+}
+func (m *scenario5MockDBClient) RedistributeData(_ context.Context, _ db.RedistributionOptions) error {
+	return nil
+}
+func (m *scenario5MockDBClient) GetRedistributionProgress(_ context.Context) (int32, error) {
+	return 100, nil
+}
+func (m *scenario5MockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
+	return nil
+}
+func (m *scenario5MockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ db.ScaleInRedistributionOptions) error {
+	return nil
+}
 
 // scenario5MockDBFactory implements db.DBClientFactory for testing.
 type scenario5MockDBFactory struct {

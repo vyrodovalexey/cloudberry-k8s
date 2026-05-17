@@ -1,0 +1,79 @@
+# Scenario 4: Maintenance Operations
+#
+# This file documents the annotation commands used to trigger maintenance
+# operations on a running Cloudberry cluster. The operator detects the
+# annotation, executes the operation via the DB client (or falls back to
+# a Kubernetes Job), removes the annotation, and emits events.
+#
+# Usage:
+#   kubectl annotate cloudberrycluster <cluster-name> avsoft.io/maintenance=<operation>
+#
+# Supported operations:
+#   - vacuum          : Standard VACUUM to reclaim dead tuple space
+#   - vacuum-analyze  : VACUUM followed by ANALYZE to update statistics
+#   - vacuum-full     : VACUUM FULL to fully compact tables (requires exclusive lock)
+#   - analyze         : ANALYZE to update query planner statistics
+#   - reindex         : REINDEX DATABASE to rebuild all indexes
+#   - log-rotate      : Rotate the PostgreSQL/Cloudberry log file
+#
+# The operator will:
+#   1. Detect the annotation on the CloudberryCluster resource
+#   2. Remove the annotation immediately (to prevent re-processing)
+#   3. Execute the SQL command on the coordinator via the DB client
+#   4. If direct execution fails, create a Kubernetes Job as fallback
+#   5. Emit a MaintenanceCompleted (or MaintenanceStarted for Job) event
+#   6. Record a maintenance_operations_total Prometheus metric
+#
+# Examples:
+# ---------
+
+# 4a. Trigger VACUUM
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum
+
+# 4b. Trigger VACUUM ANALYZE
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum-analyze
+
+# 4c. Trigger VACUUM FULL (caution: acquires exclusive locks)
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=vacuum-full
+
+# 4d. Trigger ANALYZE
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=analyze
+
+# 4e. Trigger REINDEX DATABASE
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=reindex
+
+# 4f. Trigger log file rotation
+# kubectl annotate cloudberrycluster my-cluster avsoft.io/maintenance=log-rotate
+
+---
+# Example CloudberryCluster resource for maintenance testing
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: maintenance-test
+  namespace: cloudberry-test
+  annotations:
+    # Uncomment one of the following to trigger a maintenance operation:
+    # avsoft.io/maintenance: vacuum
+    # avsoft.io/maintenance: vacuum-analyze
+    # avsoft.io/maintenance: vacuum-full
+    # avsoft.io/maintenance: analyze
+    # avsoft.io/maintenance: reindex
+    # avsoft.io/maintenance: log-rotate
+    {}
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    replicas: 1
+    port: 5432
+    storage:
+      size: "10Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    storage:
+      size: "20Gi"
+    mirroring:
+      enabled: true
+      layout: group

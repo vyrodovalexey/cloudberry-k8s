@@ -342,11 +342,11 @@ spec:
                     ftsProbeTimeout:
                       type: integer
                       default: 20
-                      description: "FTS probe timeout in seconds"
+                      description: "Per-attempt timeout in seconds for FTS probe calls to GetSegmentConfiguration. Each retry attempt uses a fresh context with this deadline. Used by probeSegmentConfigWithRetries in the HA controller."
                     ftsProbeRetries:
                       type: integer
                       default: 5
-                      description: "FTS probe retry count"
+                      description: "Maximum number of retry attempts for GetSegmentConfiguration during FTS probe. Each failed attempt increments fts_probe_failures_total. After all retries are exhausted, the probe cycle fails."
                     checksums:
                       type: boolean
                       default: true
@@ -434,7 +434,7 @@ spec:
                   type: integer
                 mirroringStatus:
                   type: string
-                  enum: [NotConfigured, InSync, Syncing, Degraded, Down]
+                  enum: [NotConfigured, Initializing, InSync, Syncing, Degraded, Down]
                 clusterVersion:
                   type: string
                 lastReconcileTime:
@@ -526,6 +526,92 @@ func (v *CloudberryClusterValidator) validateNameUniqueness(ctx context.Context,
     return nil
 }
 ```
+
+### 1.5 Mirroring Status Values
+
+| Status | Description |
+|--------|-------------|
+| `NotConfigured` | Mirroring is not enabled (`spec.segments.mirroring.enabled: false`) |
+| `Initializing` | Mirrors are being initialized from primaries (base backup in progress) |
+| `Syncing` | Mirrors are catching up via WAL streaming replication |
+| `InSync` | All mirrors are fully synchronized with their primaries |
+| `Degraded` | One or more mirrors are out of sync or initialization timed out |
+| `Down` | Mirroring is completely down |
+
+The `Initializing` status is set when mirroring is first enabled on an existing cluster. It indicates the base-backup phase before WAL streaming begins.
+
+### 1.6 Event Reasons
+
+#### 1.6.1 Mirroring Operations
+
+| Event Reason | Event Type | Description |
+|-------------|------------|-------------|
+| `MirroringEnabled` | Normal | Mirroring enable initiated with the specified layout |
+| `MirroringDisabled` | Warning/Normal | Mirroring disable initiated (warning) or completed (normal) |
+| `MirroringInitializing` | Normal | Mirror StatefulSet created, base backup in progress |
+| `MirroringInSync` | Normal | All mirrors synchronized after enable operation |
+| `MirroringFailed` | Warning | Mirroring operation failed (validation error, timeout, or runtime error) |
+
+These events are emitted by the cluster controller during mirroring enable/disable operations and provide visibility into the operation progress.
+
+#### 1.6.2 Segment Failover
+
+| Event Reason | Event Type | Description |
+|-------------|------------|-------------|
+| `SegmentFailover` | Warning | A primary segment has failed and automatic failover has been triggered. Emitted per failed primary segment with details including contentID, original hostname, and new primary hostname (if mirror promotion was verified) or "mirror promotion pending" status. |
+| `SegmentFailoverCompleted` | Normal | A segment failover has completed and been verified. The mirror has been successfully promoted to primary role. |
+
+These events are emitted by the HA controller during automatic failover via `handleFailover()`. The failover is triggered when the FTS probe detects primary segments with `status != "u"` while mirroring is enabled. The controller calls `gp_request_fts_probe_scan()` to trigger Cloudberry's internal FTS daemon for mirror promotion, then verifies the result.
+
+### 1.7 Annotations
+
+| Annotation | Description | Managed By |
+|-----------|-------------|------------|
+| `avsoft.io/mirroring-state` | JSON-encoded state of an in-progress mirroring enable operation. Contains `phase`, `startedAt`, `phaseStartedAt`, and `layout` fields. Automatically removed on completion or timeout. | Controller |
+| `avsoft.io/failover-state` | Tracks in-progress automatic failover state. Set by the HA controller when segment failover is detected and `handleFailover()` is invoked. Used to coordinate failover lifecycle and prevent duplicate failover actions. | Controller |
+| `avsoft.io/recovery` | Recovery type to trigger (`incremental`, `full`, `differential`) | User |
+| `avsoft.io/action` | Cluster action to trigger (`rebalance`, `activate-standby`) | User |
+| `avsoft.io/confirm-scale-in` | Confirmation for large scale-in operations (`"true"`) | User |
+
+**Mirroring State Annotation Schema**:
+
+```json
+{
+  "phase": "creating-sts",
+  "startedAt": "2026-05-15T10:00:00Z",
+  "phaseStartedAt": "2026-05-15T10:00:00Z",
+  "layout": "group"
+}
+```
+
+Phase values: `creating-sts` → `initializing` → `syncing` → `completed`.
+
+### 1.8 Day-2 Operations: Mirroring Enable/Disable
+
+Mirroring can be enabled or disabled on an existing cluster as a day-2 operation by patching `spec.segments.mirroring.enabled`.
+
+**Enable Mirroring**:
+- Requires cluster in `Running` phase
+- Requires sufficient segment count for the chosen layout
+- Transitions: `status.phase` → `Updating`, `status.mirroringStatus` → `Initializing` → `Syncing` → `InSync`
+- 30-minute timeout; on timeout `mirroringStatus` → `Degraded`
+
+**Disable Mirroring**:
+- Requires cluster in `Running` phase
+- Deletes mirror StatefulSet and optionally cleans up PVCs (based on `deletionPolicy`)
+- Transitions: `status.mirroringStatus` → `NotConfigured`
+- Cluster phase remains `Running` throughout
+
+See specification 04 (HA & Recovery), sections 2.4 and 2.5 for full implementation details.
+
+### 1.9 Webhook Validation for Mirroring
+
+The validating webhook enforces the following rules for mirroring transitions on UPDATE:
+
+1. **Enabling mirroring**: Cluster must be in `Running` phase. Segment count must satisfy layout requirements (group: `count >= 2 * primariesPerHost`, spread: `count > primariesPerHost`).
+2. **Disabling mirroring**: Allowed from any Running state without additional restrictions.
+3. **Layout change while enabled**: Rejected. You must disable mirroring before changing the layout.
+4. **Spread layout warning**: If enabling spread mirroring with marginal segment count (`count <= primariesPerHost + 1`), the webhook admits the request but returns a warning about limited fault tolerance.
 
 ## 2. Sample Manifests
 
@@ -718,6 +804,67 @@ spec:
       storageClass: fast-ssd
       size: 500Gi       # increased from 200Gi — applies to ALL primary and mirror PVCs
 ```
+
+### 2.5 Enable Mirroring on Existing Cluster
+
+```yaml
+# Enable group mirroring on a running cluster without mirrors
+# Patch: kubectl patch cloudberrycluster my-cluster --type=merge -p '...'
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: my-cluster
+  namespace: cloudberry-test
+spec:
+  segments:
+    count: 8
+    primariesPerHost: 2
+    mirroring:
+      enabled: true        # changed from false to true
+      layout: group
+    storage:
+      storageClass: fast-ssd
+      size: 200Gi
+```
+
+**kubectl patch example**:
+
+```bash
+# Enable mirroring with group layout
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test \
+  --type=merge \
+  -p '{"spec":{"segments":{"mirroring":{"enabled":true,"layout":"group"}}}}'
+
+# Monitor progress
+kubectl get cloudberrycluster my-cluster -n cloudberry-test -w
+```
+
+**Expected status progression**:
+
+```
+NAME         PHASE      MIRRORING
+my-cluster   Updating   Initializing
+my-cluster   Updating   Syncing
+my-cluster   Running    InSync
+```
+
+### 2.6 Disable Mirroring on Existing Cluster
+
+```bash
+# Disable mirroring
+kubectl patch cloudberrycluster my-cluster -n cloudberry-test \
+  --type=merge \
+  -p '{"spec":{"segments":{"mirroring":{"enabled":false}}}}'
+```
+
+**Expected status progression**:
+
+```
+NAME         PHASE      MIRRORING
+my-cluster   Running    NotConfigured
+```
+
+**Note**: If `spec.deletionPolicy` is `Delete`, mirror PVCs are cleaned up automatically. If `Retain` (default), PVCs are preserved for potential re-enable.
 
 ## 3. Printer Columns
 

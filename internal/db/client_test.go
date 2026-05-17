@@ -330,6 +330,39 @@ func (m *mockDBClient) GetTableDetails(_ context.Context, s, t string) (*TableDe
 func (m *mockDBClient) GetUsageReport(_ context.Context, _ string) ([]UsageReportEntry, error) {
 	return nil, nil
 }
+func (m *mockDBClient) InitializeMirrors(_ context.Context, _ MirrorInitOptions) error { return nil }
+func (m *mockDBClient) ConfigureReplication(_ context.Context, _ ReplicationOptions) error {
+	return nil
+}
+func (m *mockDBClient) GetMirrorSyncStatus(_ context.Context) ([]MirrorSyncInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) TriggerFTSProbe(_ context.Context) error               { return nil }
+func (m *mockDBClient) TerminateAllBackends(_ context.Context) (int32, error) { return 0, nil }
+func (m *mockDBClient) CancelAllQueries(_ context.Context) (int32, error)     { return 0, nil }
+func (m *mockDBClient) LogRotate(_ context.Context) error                     { return nil }
+func (m *mockDBClient) CreateResourceQueue(_ context.Context, _ ResourceQueueOptions) error {
+	return nil
+}
+func (m *mockDBClient) DropResourceQueue(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) ListResourceQueues(_ context.Context) ([]ResourceQueueInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) RegisterNewSegments(_ context.Context, _ SegmentRegistrationOptions) error {
+	return nil
+}
+func (m *mockDBClient) RedistributeData(_ context.Context, _ RedistributionOptions) error {
+	return nil
+}
+func (m *mockDBClient) GetRedistributionProgress(_ context.Context) (int32, error) {
+	return 100, nil
+}
+func (m *mockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
+	return nil
+}
+func (m *mockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ ScaleInRedistributionOptions) error {
+	return nil
+}
 
 func TestMockDBClient_ImplementsInterface(t *testing.T) {
 	var _ Client = &mockDBClient{}

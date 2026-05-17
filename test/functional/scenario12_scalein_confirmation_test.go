@@ -343,35 +343,15 @@ func (s *Scenario12ScaleInConfirmationSuite) TestScenario12b_ScaleInProceedsWith
 	assert.True(s.T(), scaleInStartedFound,
 		"ScaleInStarted event should be emitted; events: %v", events)
 
-	// Verify primary StatefulSet replicas updated to 3.
-	assert.Equal(s.T(), scenario12ScaleCount,
-		s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
-		"primary segments should be scaled to 3")
+	// Verify scale-in state annotation is set (multi-phase state machine).
+	assert.NotEmpty(s.T(), updated.Annotations["avsoft.io/scale-in-state"],
+		"scale-in-state annotation should be set for multi-phase scale-in")
 
-	// Verify mirror StatefulSet replicas updated to 3.
-	assert.Equal(s.T(), scenario12ScaleCount,
-		s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
-		"mirror segments should be scaled to 3")
-
-	// Verify redistribution Job created.
-	jobList := &batchv1.JobList{}
-	err = s.env.Client.List(s.ctx, jobList, client.InNamespace(scenario12Namespace))
-	require.NoError(s.T(), err, "listing jobs should succeed")
-	redistributeJobFound := false
-	for i := range jobList.Items {
-		if containsSubstring(jobList.Items[i].Name, "redistribute") {
-			redistributeJobFound = true
-			break
-		}
-	}
-	assert.True(s.T(), redistributeJobFound,
-		"a redistribution Job should be created; jobs: %v", jobNames(jobList))
-
-	// Verify DataRedistribution condition set to InProgress.
+	// Verify DataRedistribution condition set to ScaleInRedistributing.
 	redistCond := util.FindCondition(updated.Status.Conditions, "DataRedistribution")
 	require.NotNil(s.T(), redistCond, "DataRedistribution condition should exist")
-	assert.Equal(s.T(), "InProgress", redistCond.Reason,
-		"DataRedistribution reason should be InProgress")
+	assert.Equal(s.T(), "ScaleInRedistributing", redistCond.Reason,
+		"DataRedistribution reason should be ScaleInRedistributing")
 
 	// Verify scale-started annotation set.
 	assert.NotEmpty(s.T(), updated.Annotations[util.AnnotationScaleStarted],
@@ -506,13 +486,9 @@ func (s *Scenario12ScaleInConfirmationSuite) TestScenario12_ExactlyAt50PercentNo
 			"ScaleInBlocked event should NOT be emitted for exactly 50%% reduction; events: %v", events)
 	}
 
-	// Verify StatefulSets scaled to 4.
-	assert.Equal(s.T(), int32(4),
-		s.getStatefulSetReplicas(util.SegmentPrimaryName(cluster.Name), cluster.Namespace),
-		"primary segments should be scaled to 4")
-	assert.Equal(s.T(), int32(4),
-		s.getStatefulSetReplicas(util.SegmentMirrorName(cluster.Name), cluster.Namespace),
-		"mirror segments should be scaled to 4")
+	// Verify scale-in state annotation is set (multi-phase state machine initiated).
+	assert.NotEmpty(s.T(), updated.Annotations["avsoft.io/scale-in-state"],
+		"scale-in-state annotation should be set for multi-phase scale-in")
 }
 
 // --- Test: Just Over 50% Blocked ---

@@ -777,3 +777,15 @@ func (m *mockMetricsRecorder) SetPVCSizeBytes(cluster, namespace, component stri
 		"cluster": cluster, "namespace": namespace, "component": component, "bytes": sizeBytes,
 	})
 }
+
+func (m *mockMetricsRecorder) RecordMirroringOperation(cluster, namespace, operation string) {
+	m.record("RecordMirroringOperation", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "operation": operation,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordMaintenanceOperation(cluster, namespace, operation string) {
+	m.record("RecordMaintenanceOperation", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "operation": operation,
+	})
+}

@@ -1,0 +1,208 @@
+# Scenario 5: Session Management
+#
+# This file documents the CLI commands and API endpoints used for session
+# management on a running Cloudberry cluster. The operator API connects to
+# the Cloudberry coordinator via pg_stat_activity to list sessions, and uses
+# pg_cancel_backend / pg_terminate_backend to cancel queries or terminate sessions.
+#
+# Architecture:
+#   cloudberry-ctl --> Operator REST API (port 8090) --> DB Client Factory
+#                                                        --> Coordinator (pg_stat_activity)
+#
+# The DBClientFactory resolves the coordinator service endpoint:
+#   <cluster-name>-coordinator.<namespace>.svc:<port>
+# and reads the admin password from the Kubernetes Secret:
+#   <cluster-name>-admin-password
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the target namespace
+#   2. The operator API accessible (via port-forward or service)
+#   3. Valid credentials (basic auth or OIDC)
+#
+# Port-forward the operator API:
+#   kubectl port-forward -n cloudberry-test svc/cloudberry-operator 8090:8090
+#
+# Environment setup:
+#   export CLOUDBERRY_OPERATOR_URL=http://localhost:8090
+#   export CLOUDBERRY_CLUSTER=my-cluster
+#   export CLOUDBERRY_NAMESPACE=cloudberry-test
+#   export CLOUDBERRY_USERNAME=admin
+#   export CLOUDBERRY_PASSWORD=<admin-password>
+#
+# ============================================================================
+# 5a. List Active Sessions
+# ============================================================================
+#
+# Lists all active database sessions from pg_stat_activity on the coordinator.
+# Excludes the operator's own backend connection.
+#
+# CLI:
+#   cloudberry-ctl sessions list --cluster my-cluster --namespace cloudberry-test
+#
+# API endpoint:
+#   GET /api/v1alpha1/clusters/{name}/sessions?namespace={namespace}
+#
+# Response fields per session:
+#   - pid:           Process ID of the backend
+#   - username:      Database user
+#   - application:   Application name (e.g., psql, pgbench)
+#   - clientAddress: Client IP address
+#   - state:         Session state (active, idle, idle in transaction)
+#   - query:         Current or last query text
+#   - queryStart:    Timestamp when the current query started
+#   - duration:      How long the current query has been running
+#
+# Example output (JSON):
+# {
+#   "sessions": [
+#     {
+#       "pid": 12345,
+#       "username": "gpadmin",
+#       "application": "psql",
+#       "clientAddress": "10.244.0.15",
+#       "state": "active",
+#       "query": "SELECT * FROM large_table",
+#       "queryStart": "2026-05-16T10:30:00Z",
+#       "duration": "00:05:23"
+#     }
+#   ],
+#   "total": 1
+# }
+#
+# ============================================================================
+# 5b. Cancel a Running Query
+# ============================================================================
+#
+# Cancels a running query by PID using pg_cancel_backend(). The session
+# remains connected but the current query is interrupted. This is the
+# graceful way to stop a long-running query.
+#
+# CLI:
+#   cloudberry-ctl sessions cancel-query 12345 --cluster my-cluster --namespace cloudberry-test
+#
+# API endpoint:
+#   POST /api/v1alpha1/clusters/{name}/sessions/{pid}/cancel?namespace={namespace}
+#
+# Response:
+# {
+#   "pid": 12345,
+#   "canceled": true
+# }
+#
+# Notes:
+#   - Returns "canceled": true if the signal was sent successfully
+#   - Returns "canceled": false if the PID does not exist or is not cancellable
+#   - The session remains connected after cancellation
+#   - Only superusers can cancel other users' queries
+#
+# ============================================================================
+# 5c. Terminate a Session
+# ============================================================================
+#
+# Terminates a database session by PID using pg_terminate_backend(). This
+# forcefully disconnects the client. Use this when cancel-query is not
+# sufficient (e.g., session is stuck in "idle in transaction").
+#
+# CLI:
+#   cloudberry-ctl sessions terminate 12345 --cluster my-cluster --namespace cloudberry-test
+#
+# API endpoint:
+#   DELETE /api/v1alpha1/clusters/{name}/sessions/{pid}?namespace={namespace}
+#
+# Response:
+# {
+#   "pid": 12345,
+#   "terminated": true
+# }
+#
+# Notes:
+#   - Returns "terminated": true if the backend was terminated
+#   - Returns "terminated": false if the PID does not exist
+#   - The client will receive a "connection reset" error
+#   - Only superusers can terminate other users' sessions
+#
+# ============================================================================
+# 5d. Inspect Connections (alternative view)
+# ============================================================================
+#
+# The inspect connections command provides the same session data as
+# sessions list, useful for quick connection overview.
+#
+# CLI:
+#   cloudberry-ctl inspect connections --cluster my-cluster --namespace cloudberry-test
+#
+# ============================================================================
+# Error Handling
+# ============================================================================
+#
+# If the database connection is not available (e.g., cluster is stopped):
+# {
+#   "sessions": [],
+#   "total": 0,
+#   "message": "database connection not available"
+# }
+#
+# If the cluster is not found:
+# {
+#   "error": {
+#     "code": "CLUSTER_NOT_FOUND",
+#     "message": "cluster \"nonexistent\" not found"
+#   }
+# }
+#
+# If the PID is invalid:
+# {
+#   "error": {
+#     "code": "INVALID_REQUEST",
+#     "message": "invalid PID"
+#   }
+# }
+#
+# ============================================================================
+# SQL Queries Used
+# ============================================================================
+#
+# List sessions:
+#   SELECT pid, COALESCE(usename, ''), COALESCE(application_name, ''),
+#     COALESCE(client_addr::text, ''), COALESCE(state, ''),
+#     COALESCE(query, ''), COALESCE(query_start, now()),
+#     COALESCE(now() - query_start, interval '0')::text
+#     FROM pg_stat_activity
+#     WHERE pid != pg_backend_pid()
+#     AND usename IS NOT NULL
+#     ORDER BY query_start DESC NULLS LAST
+#
+# Cancel query:
+#   SELECT pg_cancel_backend($1)
+#
+# Terminate session:
+#   SELECT pg_terminate_backend($1)
+#
+
+---
+# Example CloudberryCluster resource for session management testing
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: session-test
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    replicas: 1
+    port: 5432
+    storage:
+      size: "10Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    storage:
+      size: "20Gi"
+    mirroring:
+      enabled: true
+      layout: group
+  auth:
+    basic:
+      adminUser: gpadmin
+      adminPasswordSecret: session-test-admin-password
