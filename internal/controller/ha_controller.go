@@ -656,7 +656,8 @@ func (r *HAReconciler) executeRebalanceViaDB(
 	}
 	close(errCh)
 
-	// Collect errors (non-fatal: individual table failures don't block others).
+	// Collect errors (individual table failures don't block others, but the
+	// caller is informed so it can set the appropriate status condition).
 	var rebalanceErrors int
 	for range errCh {
 		rebalanceErrors++
@@ -665,6 +666,8 @@ func (r *HAReconciler) executeRebalanceViaDB(
 	if rebalanceErrors > 0 {
 		logger.Warn("some tables failed to rebalance",
 			"failed", rebalanceErrors, "total", len(tablesToRebalance))
+		return fmt.Errorf("%d of %d tables failed to rebalance",
+			rebalanceErrors, len(tablesToRebalance))
 	}
 
 	return nil

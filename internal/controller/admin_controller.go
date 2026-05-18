@@ -253,8 +253,11 @@ func (r *AdminReconciler) reconcileSubComponents(
 }
 
 // reconcileWorkload reconciles workload management configuration.
-//
-//nolint:unparam // error return reserved for future DB operations
+// When a DB client factory is available, it creates/alters/drops resource groups
+// in the database to match the desired state from the CRD spec, stores workload
+// and idle session rules in a ConfigMap, and updates resource group usage metrics.
+// When no DB client factory is available (e.g. unit tests), it falls back to
+// condition-only mode (log + event + condition).
 func (r *AdminReconciler) reconcileWorkload(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -270,16 +273,60 @@ func (r *AdminReconciler) reconcileWorkload(
 		"idleRules", len(cluster.Spec.Workload.IdleRules),
 	)
 
-	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonWorkloadReconciled,
-		fmt.Sprintf("Workload management reconciled: %d resource groups, %d rules",
-			len(cluster.Spec.Workload.ResourceGroups), len(cluster.Spec.Workload.Rules)))
-
-	// Update workload-related metrics for each resource group.
-	for _, rg := range cluster.Spec.Workload.ResourceGroups {
-		r.metrics.SetResourceGroupUsage(cluster.Name, cluster.Namespace, rg.Name, 0, 0)
+	// If no dbFactory, fall back to condition-only mode (log + event + condition).
+	if r.dbFactory == nil {
+		r.reconcileWorkloadConditionOnly(cluster)
+		return nil
 	}
 
-	// Set workload reconciliation status (persisted by the caller).
+	// Create DB client for workload reconciliation.
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		logger.Error("failed to create DB client for workload reconciliation", "error", err)
+		// Fall back to condition-only mode — don't fail the whole reconciliation.
+		cluster.Status.Conditions = util.SetCondition(
+			cluster.Status.Conditions,
+			string(cbv1alpha1.ConditionWorkloadConfigured),
+			metav1.ConditionFalse,
+			"DBUnavailable",
+			fmt.Sprintf("Database client unavailable for workload reconciliation: %v", err),
+		)
+		return nil
+	}
+	defer dbClient.Close()
+
+	// 1. Reconcile resource groups (diff desired vs actual).
+	if err := r.reconcileResourceGroups(ctx, cluster, dbClient); err != nil {
+		logger.Error("failed to reconcile resource groups", "error", err)
+		cluster.Status.Conditions = util.SetCondition(
+			cluster.Status.Conditions,
+			string(cbv1alpha1.ConditionWorkloadConfigured),
+			metav1.ConditionFalse,
+			"ResourceGroupReconcileFailed",
+			fmt.Sprintf("Failed to reconcile resource groups: %v", err),
+		)
+		return nil
+	}
+
+	// 2. Apply workload rules to ConfigMap.
+	if err := r.applyWorkloadRules(ctx, cluster); err != nil {
+		logger.Error("failed to apply workload rules", "error", err)
+	}
+
+	// 3. Apply idle session rules to ConfigMap.
+	if err := r.applyIdleSessionRules(ctx, cluster); err != nil {
+		logger.Error("failed to apply idle session rules", "error", err)
+	}
+
+	// 4. Update resource group usage metrics from DB.
+	for _, rg := range cluster.Spec.Workload.ResourceGroups {
+		cpu, mem, usageErr := dbClient.GetResourceGroupUsage(ctx, rg.Name)
+		if usageErr == nil {
+			r.metrics.SetResourceGroupUsage(cluster.Name, cluster.Namespace, rg.Name, cpu, mem)
+		}
+	}
+
+	// Set success condition.
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionWorkloadConfigured),
@@ -288,7 +335,278 @@ func (r *AdminReconciler) reconcileWorkload(
 		"Workload management is configured",
 	)
 
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonWorkloadReconciled,
+		fmt.Sprintf("Workload management reconciled: %d resource groups, %d rules",
+			len(cluster.Spec.Workload.ResourceGroups), len(cluster.Spec.Workload.Rules)))
+
 	return nil
+}
+
+// reconcileWorkloadConditionOnly sets the workload condition and emits events
+// without performing any DB operations. Used when dbFactory is nil.
+func (r *AdminReconciler) reconcileWorkloadConditionOnly(
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonWorkloadReconciled,
+		fmt.Sprintf("Workload management reconciled: %d resource groups, %d rules",
+			len(cluster.Spec.Workload.ResourceGroups), len(cluster.Spec.Workload.Rules)))
+
+	// Update workload-related metrics for each resource group (zero usage without DB).
+	for _, rg := range cluster.Spec.Workload.ResourceGroups {
+		r.metrics.SetResourceGroupUsage(cluster.Name, cluster.Namespace, rg.Name, 0, 0)
+	}
+
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionWorkloadConfigured),
+		metav1.ConditionTrue,
+		"WorkloadReconciled",
+		"Workload management is configured",
+	)
+}
+
+// reconcileResourceGroups diffs the desired resource groups (from the CRD spec)
+// against the actual resource groups in the database, and creates, alters, or
+// drops resource groups as needed to converge to the desired state.
+func (r *AdminReconciler) reconcileResourceGroups(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+) error {
+	// Get existing resource groups from DB.
+	existing, err := dbClient.ListResourceGroups(ctx)
+	if err != nil {
+		return fmt.Errorf("list resource groups: %w", err)
+	}
+
+	// Build maps for diffing.
+	existingMap := make(map[string]db.ResourceGroupInfo, len(existing))
+	for _, rg := range existing {
+		existingMap[rg.Name] = rg
+	}
+
+	desiredMap := make(map[string]struct{}, len(cluster.Spec.Workload.ResourceGroups))
+	for _, rg := range cluster.Spec.Workload.ResourceGroups {
+		desiredMap[rg.Name] = struct{}{}
+	}
+
+	// Create or alter resource groups that are in desired but not in actual (or changed).
+	desiredGroups := cluster.Spec.Workload.ResourceGroups
+	if err := r.ensureDesiredResourceGroups(ctx, desiredGroups, existingMap, dbClient); err != nil {
+		return err
+	}
+
+	// Drop resource groups that are in actual but not in desired.
+	if err := r.dropOrphanedResourceGroups(ctx, existingMap, desiredMap, dbClient); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureDesiredResourceGroups creates or alters resource groups to match the desired spec.
+func (r *AdminReconciler) ensureDesiredResourceGroups(
+	ctx context.Context,
+	desired []cbv1alpha1.ResourceGroupSpec,
+	existingMap map[string]db.ResourceGroupInfo,
+	dbClient db.Client,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	for _, rg := range desired {
+		opts := db.ResourceGroupOptions{
+			Name:          rg.Name,
+			Concurrency:   rg.Concurrency,
+			CPUMaxPercent: rg.CPUMaxPercent,
+			CPUWeight:     rg.CPUWeight,
+			MemoryLimit:   rg.MemoryLimit,
+			MinCost:       rg.MinCost,
+		}
+
+		if actual, exists := existingMap[rg.Name]; exists {
+			if needsAlter(rg, actual) {
+				logger.Info("altering resource group", "name", rg.Name)
+				if alterErr := dbClient.AlterResourceGroup(ctx, opts); alterErr != nil {
+					return fmt.Errorf("alter resource group %s: %w", rg.Name, alterErr)
+				}
+			}
+		} else {
+			logger.Info("creating resource group", "name", rg.Name)
+			if createErr := dbClient.CreateResourceGroup(ctx, opts); createErr != nil {
+				return fmt.Errorf("create resource group %s: %w", rg.Name, createErr)
+			}
+		}
+	}
+
+	return nil
+}
+
+// dropOrphanedResourceGroups drops resource groups that exist in the database
+// but are not in the desired spec.
+func (r *AdminReconciler) dropOrphanedResourceGroups(
+	ctx context.Context,
+	existingMap map[string]db.ResourceGroupInfo,
+	desiredMap map[string]struct{},
+	dbClient db.Client,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	for name := range existingMap {
+		if _, desired := desiredMap[name]; !desired {
+			logger.Info("dropping resource group", "name", name)
+			if dropErr := dbClient.DropResourceGroup(ctx, name); dropErr != nil {
+				return fmt.Errorf("drop resource group %s: %w", name, dropErr)
+			}
+		}
+	}
+
+	return nil
+}
+
+// needsAlter returns true if the desired resource group spec differs from the
+// actual resource group info in the database, indicating an ALTER is needed.
+func needsAlter(desired cbv1alpha1.ResourceGroupSpec, actual db.ResourceGroupInfo) bool {
+	if desired.Concurrency != 0 && desired.Concurrency != actual.Concurrency {
+		return true
+	}
+	if desired.CPUMaxPercent != 0 && desired.CPUMaxPercent != actual.CPUMaxPercent {
+		return true
+	}
+	if desired.CPUWeight != 0 && desired.CPUWeight != actual.CPUWeight {
+		return true
+	}
+	if desired.MemoryLimit != actual.MemoryLimit {
+		return true
+	}
+	return desired.MinCost != actual.MinCost
+}
+
+// applyWorkloadRules serializes workload rules to JSON and stores them in a
+// ConfigMap named "{cluster}-workload-rules". The ConfigMap is created if it
+// does not exist, or updated if it already exists.
+func (r *AdminReconciler) applyWorkloadRules(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if len(cluster.Spec.Workload.Rules) == 0 {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	rulesJSON, err := json.Marshal(cluster.Spec.Workload.Rules)
+	if err != nil {
+		return fmt.Errorf("marshal workload rules: %w", err)
+	}
+
+	cm := &corev1.ConfigMap{}
+	cmName := types.NamespacedName{
+		Name:      cluster.Name + "-workload-rules",
+		Namespace: cluster.Namespace,
+	}
+
+	err = r.client.Get(ctx, cmName, cm)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		cm = r.buildWorkloadRulesConfigMap(cluster, cmName)
+		cm.Data["rules.json"] = string(rulesJSON)
+		if createErr := r.client.Create(ctx, cm); createErr != nil {
+			return fmt.Errorf("create workload rules ConfigMap: %w", createErr)
+		}
+		logger.Info("created workload rules ConfigMap",
+			"name", cmName.Name, "rules", len(cluster.Spec.Workload.Rules))
+	case err != nil:
+		return fmt.Errorf("get workload rules ConfigMap: %w", err)
+	default:
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		cm.Data["rules.json"] = string(rulesJSON)
+		if updateErr := r.client.Update(ctx, cm); updateErr != nil {
+			return fmt.Errorf("update workload rules ConfigMap: %w", updateErr)
+		}
+		logger.Info("updated workload rules ConfigMap",
+			"name", cmName.Name, "rules", len(cluster.Spec.Workload.Rules))
+	}
+
+	return nil
+}
+
+// applyIdleSessionRules serializes idle session rules to JSON and stores them
+// in the same ConfigMap ("{cluster}-workload-rules") under the key
+// "idle-rules.json". The ConfigMap is created if it does not exist, or updated
+// if it already exists.
+func (r *AdminReconciler) applyIdleSessionRules(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	if len(cluster.Spec.Workload.IdleRules) == 0 {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	idleRulesJSON, err := json.Marshal(cluster.Spec.Workload.IdleRules)
+	if err != nil {
+		return fmt.Errorf("marshal idle session rules: %w", err)
+	}
+
+	cm := &corev1.ConfigMap{}
+	cmName := types.NamespacedName{
+		Name:      cluster.Name + "-workload-rules",
+		Namespace: cluster.Namespace,
+	}
+
+	err = r.client.Get(ctx, cmName, cm)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		cm = r.buildWorkloadRulesConfigMap(cluster, cmName)
+		cm.Data["idle-rules.json"] = string(idleRulesJSON)
+		if createErr := r.client.Create(ctx, cm); createErr != nil {
+			return fmt.Errorf("create idle rules ConfigMap: %w", createErr)
+		}
+		logger.Info("created idle session rules ConfigMap",
+			"name", cmName.Name, "idleRules", len(cluster.Spec.Workload.IdleRules))
+	case err != nil:
+		return fmt.Errorf("get idle rules ConfigMap: %w", err)
+	default:
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		cm.Data["idle-rules.json"] = string(idleRulesJSON)
+		if updateErr := r.client.Update(ctx, cm); updateErr != nil {
+			return fmt.Errorf("update idle rules ConfigMap: %w", updateErr)
+		}
+		logger.Info("updated idle session rules ConfigMap",
+			"name", cmName.Name, "idleRules", len(cluster.Spec.Workload.IdleRules))
+	}
+
+	return nil
+}
+
+// buildWorkloadRulesConfigMap creates a new ConfigMap skeleton for workload rules
+// with standard labels and owner references.
+func (r *AdminReconciler) buildWorkloadRulesConfigMap(
+	cluster *cbv1alpha1.CloudberryCluster,
+	cmName types.NamespacedName,
+) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName.Name,
+			Namespace: cmName.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "cloudberry-operator",
+				"app.kubernetes.io/component":  "workload-rules",
+				"app.kubernetes.io/instance":   cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(cluster, cbv1alpha1.GroupVersion.WithKind("CloudberryCluster")),
+			},
+		},
+		Data: make(map[string]string),
+	}
 }
 
 // reconcileQueryMonitoring reconciles query monitoring status.
@@ -517,7 +835,11 @@ func (r *AdminReconciler) updateConfigMap(
 		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
 			if apierrors.IsConflict(updateErr) && attempt < maxRetries-1 {
 				r.logger.Debug("configmap update conflict, retrying", "attempt", attempt+1)
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(100 * time.Millisecond):
+				}
 				continue
 			}
 			return fmt.Errorf("updating postgresql.conf configmap: %w", updateErr)

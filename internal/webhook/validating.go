@@ -349,7 +349,14 @@ func validateMirroringEnable(
 ) (admission.Warnings, error) {
 	var warnings admission.Warnings
 
-	// Cluster must be in Running phase.
+	// If the cluster has never reached Running phase (empty phase or Initializing),
+	// allow the update — this covers operator adding finalizers or initial setup
+	// where CRD schema defaults may set mirroring.enabled=true.
+	if oldCluster.Status.Phase == "" || oldCluster.Status.Phase == cbv1alpha1.ClusterPhaseInitializing {
+		return warnings, nil
+	}
+
+	// Cluster must be in Running phase for intentional mirroring enable.
 	if oldCluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
 		return warnings, fmt.Errorf(
 			"cannot enable mirroring: cluster must be in Running phase, current phase is %s",

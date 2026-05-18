@@ -175,9 +175,8 @@ RUN groupadd -g 1000 gpadmin && \
     echo "gpadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gpadmin && \
     chmod 440 /etc/sudoers.d/gpadmin
 
-# Prepare SSH daemon for inter-segment communication
-RUN ssh-keygen -A && \
-    mkdir -p /run/sshd && \
+# Prepare SSH daemon directory (host keys generated at runtime by entrypoint)
+RUN mkdir -p /run/sshd && \
     chmod 755 /run/sshd
 
 # Copy built Cloudberry from builder stage
@@ -199,14 +198,10 @@ RUN printf '* soft core unlimited\n\
 * soft nproc 131072\n\
 * hard nproc 131072\n' > /etc/security/limits.d/90-cbdb-limits.conf
 
-# Generate SSH keypair for gpadmin (inter-segment communication)
+# Prepare SSH directory (keypair generated at runtime by entrypoint to avoid
+# storing secrets in the image layer)
 RUN mkdir -p /home/gpadmin/.ssh && \
-    ssh-keygen -t ed25519 -N '' -C 'gpadmin@cloudberry-k8s' \
-               -f /home/gpadmin/.ssh/id_ed25519 && \
-    cat /home/gpadmin/.ssh/id_ed25519.pub >> /home/gpadmin/.ssh/authorized_keys && \
     chmod 700 /home/gpadmin/.ssh && \
-    chmod 600 /home/gpadmin/.ssh/id_ed25519 /home/gpadmin/.ssh/authorized_keys && \
-    chmod 644 /home/gpadmin/.ssh/id_ed25519.pub && \
     chown -R gpadmin:gpadmin /home/gpadmin/.ssh
 
 # Configure gpadmin environment

@@ -67,6 +67,13 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Listing Resource Groups](#listing-resource-groups)
   - [Assigning a Role to a Resource Group](#assigning-a-role-to-a-resource-group)
   - [Deleting a Resource Group](#deleting-a-resource-group)
+- [Declarative Workload Management](#declarative-workload-management)
+  - [Enabling Workload Management](#enabling-workload-management)
+  - [Resource Group Reconciliation](#resource-group-reconciliation)
+  - [Workload Rules ConfigMap](#workload-rules-configmap)
+  - [Idle Session Rules ConfigMap](#idle-session-rules-configmap)
+  - [WorkloadConfigured Condition](#workloadconfigured-condition)
+  - [DB Unavailable Fallback](#db-unavailable-fallback)
 - [Storage Expansion](#storage-expansion)
   - [StorageClass Requirements](#storageclass-requirements)
   - [Expansion Scopes](#expansion-scopes)
@@ -493,6 +500,8 @@ All lifecycle actions are triggered by setting the `avsoft.io/action` annotation
 | `activate-standby` | Promote standby to coordinator | `Running` |
 
 > **Note**: Action annotations are checked **before** the generation-based skip logic. This ensures that lifecycle actions (which do not change the CRD generation) are always processed.
+
+> **Retry on failure**: Action annotations are removed **after** successful processing. If the action handler fails (e.g., due to a transient error), the annotation remains on the resource and the action is retried on the next reconciliation cycle. This ensures that failed actions are not silently lost.
 
 ### Upgrading a Cluster
 
@@ -1016,20 +1025,19 @@ spec:
 ### Role Management
 
 ```bash
-# List roles
-cloudberry-ctl auth roles list --cluster my-cluster
+# Basic auth login
+cloudberry-ctl auth login --cluster my-cluster --basic --username admin
 
-# Create a role
-cloudberry-ctl auth roles create --cluster my-cluster \
-  --name analyst --login --password mypass
-
-# Update a role
-cloudberry-ctl auth roles update --cluster my-cluster \
-  --name analyst --valid-until "2026-12-31"
-
-# Delete a role
-cloudberry-ctl auth roles delete --cluster my-cluster --name analyst
+# Check auth status
+cloudberry-ctl auth status --cluster my-cluster
 ```
+
+> **Security note**: Avoid passing passwords via the `--password` CLI flag, as they may be visible in shell history and process listings. Use the `CLOUDBERRY_PASSWORD` environment variable instead:
+>
+> ```bash
+> export CLOUDBERRY_PASSWORD='your-secure-password'
+> cloudberry-ctl auth login --cluster my-cluster --basic --username admin
+> ```
 
 ## Webhook Certificate Setup
 
@@ -1594,6 +1602,8 @@ cloudberry-ctl ha recovery start --cluster my-cluster \
   --type differential --parallel 4
 ```
 
+> **Recovery type validation**: The `--type` flag accepts only `incremental`, `full`, or `differential`. Any other value is rejected by the API with a `400 INVALID_REQUEST` error. This validation prevents typos and invalid recovery modes from being silently accepted.
+
 #### Recovery to a Different Node
 
 ```bash
@@ -1994,6 +2004,141 @@ DROP RESOURCE GROUP analytics;
 ```
 
 > **Note**: You cannot delete a resource group that has roles assigned to it. Reassign or drop the roles first.
+
+## Declarative Workload Management
+
+The operator supports fully declarative workload management through the `spec.workload` section of the `CloudberryCluster` CRD. When workload management is enabled, the operator automatically reconciles resource groups, workload rules, and idle session rules from the CRD spec into the database and ConfigMaps.
+
+### Enabling Workload Management
+
+Enable workload management by setting `spec.workload.enabled: true` and defining resource groups, rules, and idle rules:
+
+```yaml
+spec:
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: analytics
+        concurrency: 10
+        cpuMaxPercent: 50
+        cpuWeight: 100
+        memoryLimit: 30
+        minCost: 500
+      - name: etl
+        concurrency: 5
+        cpuMaxPercent: 30
+        cpuWeight: 50
+        memoryLimit: 20
+    rules:
+      - name: cancel-long-queries
+        enabled: true
+        resourceGroup: analytics
+        action: cancel
+        thresholdType: running_time
+        threshold: "3600"
+        priority: 1
+      - name: move-heavy-queries
+        enabled: true
+        queryTag: heavy
+        action: move
+        moveTarget: etl
+        thresholdType: spill_size
+        threshold: "1073741824"
+        priority: 2
+    idleRules:
+      - name: terminate-idle-analytics
+        enabled: true
+        resourceGroup: analytics
+        idleTimeout: "30m"
+        excludeInTransaction: true
+        terminateMessage: "Session terminated due to inactivity"
+```
+
+### Resource Group Reconciliation
+
+The operator diffs desired (CRD spec) vs actual (database) resource groups on every reconciliation cycle:
+
+1. **Creates** resource groups that are in the spec but not in the database via `CREATE RESOURCE GROUP`
+2. **Alters** resource groups whose parameters have changed via `ALTER RESOURCE GROUP`
+3. **Drops** resource groups that are in the database but not in the spec via `DROP RESOURCE GROUP`
+
+The reconciliation is idempotent — running it multiple times with the same spec produces no additional changes. Resource groups that already match the desired state are left untouched.
+
+```bash
+# View the current workload configuration
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.spec.workload}' | jq .
+
+# Check the WorkloadConfigured condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="WorkloadConfigured")]}' | jq .
+```
+
+### Workload Rules ConfigMap
+
+Workload rules from `spec.workload.rules` are serialized to JSON and stored in a ConfigMap named `{cluster}-workload-rules` under the `rules.json` key. The ConfigMap has owner references to the cluster for automatic garbage collection.
+
+```bash
+# View the workload rules ConfigMap
+kubectl get configmap my-cluster-workload-rules -n cloudberry-test -o yaml
+
+# View just the rules
+kubectl get configmap my-cluster-workload-rules -n cloudberry-test \
+  -o jsonpath='{.data.rules\.json}' | jq .
+```
+
+**ConfigMap labels:**
+- `app.kubernetes.io/managed-by=cloudberry-operator`
+- `app.kubernetes.io/component=workload-rules`
+- `app.kubernetes.io/instance={cluster}`
+
+### Idle Session Rules ConfigMap
+
+Idle session rules from `spec.workload.idleRules` are stored in the same `{cluster}-workload-rules` ConfigMap under the `idle-rules.json` key:
+
+```bash
+# View idle session rules
+kubectl get configmap my-cluster-workload-rules -n cloudberry-test \
+  -o jsonpath='{.data.idle-rules\.json}' | jq .
+```
+
+### WorkloadConfigured Condition
+
+The operator sets the `WorkloadConfigured` status condition to report the state of workload reconciliation:
+
+| Status | Reason | Description |
+|--------|--------|-------------|
+| `True` | `WorkloadReconciled` | All resource groups, workload rules, and idle rules reconciled successfully |
+| `False` | `DBUnavailable` | Database connection unavailable — resource groups not reconciled to the database |
+
+```bash
+# Check the condition
+kubectl get cloudberrycluster my-cluster -n cloudberry-test \
+  -o jsonpath='{.status.conditions[?(@.type=="WorkloadConfigured")]}' | jq .
+```
+
+**Example condition (success):**
+
+```json
+{
+  "type": "WorkloadConfigured",
+  "status": "True",
+  "reason": "WorkloadReconciled",
+  "message": "Workload management reconciled successfully",
+  "lastTransitionTime": "2026-05-18T10:00:00Z"
+}
+```
+
+### DB Unavailable Fallback
+
+When the database is unavailable (e.g., coordinator is down or the DB client factory is not configured), the operator falls back gracefully:
+
+- Sets `WorkloadConfigured=False` with reason `DBUnavailable`
+- Includes the error details in the condition message
+- Does **not** fail the overall reconciliation — other reconciliation steps continue normally
+- Retries on the next reconciliation cycle
+
+This ensures that workload configuration is eventually consistent once the database becomes available.
 
 ## Storage Expansion
 
@@ -3142,6 +3287,8 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_redistribution_progress` | Gauge | Data redistribution progress (0.0–1.0) |
 | `cloudberry_data_skew_coefficient` | Gauge | Data skew coefficient across segments |
 | `cloudberry_pvc_size_bytes` | Gauge | PVC size in bytes (labels: `cluster`, `namespace`, `component`) |
+| `cloudberry_resource_group_cpu_usage` | Gauge | CPU usage per resource group (labels: `cluster`, `namespace`, `group`) |
+| `cloudberry_resource_group_memory_usage` | Gauge | Memory usage per resource group (labels: `cluster`, `namespace`, `group`) |
 
 ### ServiceMonitor
 
@@ -3276,6 +3423,7 @@ Key event types:
 | `RecoveryStarted` | Normal | Recovery operation initiated |
 | `RecoveryCompleted` | Normal | Recovery operation completed |
 | `RecoveryFailed` | Warning | Recovery operation failed |
+| `WorkloadReconciled` | Normal | Workload management reconciled successfully |
 | `AuthReconciled` | Normal | Authentication configuration reconciled |
 | `OIDCValidationFailed` | Warning | OIDC validation failed (with details) |
 | `OIDCConfigured` | Normal | OIDC authentication properly configured |

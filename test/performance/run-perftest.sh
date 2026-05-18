@@ -42,7 +42,7 @@ set -euo pipefail
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCENARIO="smoke"
-TARGET="localhost:8090"
+TARGET="localhost:8190"
 SSL="false"
 RPS_OVERRIDE=""
 DURATION_OVERRIDE=""

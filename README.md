@@ -148,11 +148,15 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 
 **Security Hardening**
 - SQL injection prevention with parameterized queries (pgx native config builder)
+- Input validation on all API path parameters (SQL identifier regex)
+- Recovery type validation (`incremental`, `full`, `differential` only)
 - HTTP server timeouts (ReadTimeout, WriteTimeout, IdleTimeout) to prevent resource exhaustion
 - Response body size limits in CLI client (10 MiB)
 - URL encoding for all path parameters in CLI
 - Rate limiter goroutine leak prevention with `sync.Once`-guarded shutdown
 - DB connection pool leak prevention on retry failures
+- Admin password persisted to K8s Secret (survives pod restarts)
+- CLI password flag security warning (recommends env var)
 
 **Administration**
 - Configuration management with automatic hot-reload vs rolling restart detection
@@ -169,7 +173,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Create groups with concurrency, CPU, and memory limits
   - Assign database roles to resource groups (`ALTER ROLE ... RESOURCE GROUP`)
   - Query live resource groups from the database with CRD spec fallback
-- API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated
+- API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated (persisted to K8s Secret `cloudberry-operator-admin-password`)
 
 **CLI Companion**
 - `cloudberry-ctl` for imperative operations through the operator API
@@ -424,7 +428,7 @@ Key configuration options in `values.yaml`:
 | `operator.leaderElection` | Enable leader election | `true` |
 | `operator.apiAddress` | REST API bind address | `:8090` |
 | `operator.webhookEnabled` | Enable admission webhooks | `false` |
-| `env.CLOUDBERRY_API_ADMIN_PASSWORD` | Admin password for the REST API (auto-generated if not set) | (generated) |
+| `env.CLOUDBERRY_API_ADMIN_PASSWORD` | Admin password for the REST API (auto-generated and persisted to Secret if not set) | (generated) |
 | `vault.enabled` | Enable Vault integration | `false` |
 | `oidc.enabled` | Enable OIDC authentication | `false` |
 | `telemetry.enabled` | Enable OTLP tracing | `false` |
@@ -579,9 +583,9 @@ bash test/scenarios/scenario7_load_data.sh
 
 Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
 
-**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), and automatic segment failover via FTS (20). See [docs/development.md](docs/development.md) for detailed test descriptions.
+**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), automatic segment failover via FTS (20), and bootstrap workload management via CRD (25). See [docs/development.md](docs/development.md) for detailed test descriptions.
 
-The project targets **90%+ unit test statement coverage** per package. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/db` at 93%, `internal/certmanager` at ~90%, `internal/controller` at ~83%. See [docs/development.md](docs/development.md) for the full development and testing guide.
+The project targets **90%+ unit test statement coverage** per package. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90%, `internal/auth` at ~91%. See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Documentation
 

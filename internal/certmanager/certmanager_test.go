@@ -467,6 +467,115 @@ func TestNeedsRotation_GetError(t *testing.T) {
 	assert.Contains(t, err.Error(), "getting cert secret")
 }
 
+func TestEnsureCertificates_GetError(t *testing.T) {
+	scheme := newTestScheme()
+	cfg := newTestConfig()
+
+	interceptClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(fakeinterceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return fmt.Errorf("connection refused")
+			},
+		}).
+		Build()
+
+	cm := New(interceptClient, nil, cfg, nil)
+
+	_, err := cm.EnsureCertificates(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "getting cert secret")
+}
+
+func TestEnsureCertificates_CreateError(t *testing.T) {
+	scheme := newTestScheme()
+	cfg := newTestConfig()
+
+	interceptClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(fakeinterceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				return fmt.Errorf("create forbidden")
+			},
+		}).
+		Build()
+
+	cm := New(interceptClient, nil, cfg, nil)
+
+	_, err := cm.EnsureCertificates(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating cert secret")
+}
+
+func TestEnsureCertificates_UpdateError(t *testing.T) {
+	scheme := newTestScheme()
+	cfg := newTestConfig()
+
+	// Pre-create a secret with invalid cert data to trigger rotation.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfg.SecretName,
+			Namespace: cfg.SecretNamespace,
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			secretKeyCACert:  []byte("invalid-pem"),
+			secretKeyTLSCert: []byte("invalid-pem"),
+			secretKeyTLSKey:  []byte("invalid-key"),
+		},
+	}
+
+	interceptClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(secret).
+		WithInterceptorFuncs(fakeinterceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return fmt.Errorf("update forbidden")
+			},
+		}).
+		Build()
+
+	cm := New(interceptClient, nil, cfg, nil)
+
+	_, err := cm.EnsureCertificates(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "updating cert secret")
+}
+
+func TestCheckCertRotation_InvalidCertDER(t *testing.T) {
+	cm := &certManager{}
+	// Valid PEM block but invalid DER content
+	invalidCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not-valid-der")})
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			secretKeyTLSCert: invalidCert,
+		},
+	}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.Error(t, err)
+	assert.True(t, needs)
+	assert.Contains(t, err.Error(), "parsing certificate")
+}
+
+func TestIssueVaultPKICert_EmptyDNSNames(t *testing.T) {
+	cfg := newTestConfig()
+	mockVault := &mockVaultClient{
+		enabled: true,
+		writeData: map[string]interface{}{
+			"certificate": "cert-pem",
+			"private_key": "key-pem",
+			"issuing_ca":  "ca-pem",
+		},
+	}
+
+	ca, cert, key, err := issueVaultPKICert(context.Background(), mockVault, cfg, []string{}, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("ca-pem"), ca)
+	assert.Equal(t, []byte("cert-pem"), cert)
+	assert.Equal(t, []byte("key-pem"), key)
+}
+
 // mockVaultClient implements vault.Client for testing.
 type mockVaultClient struct {
 	enabled   bool

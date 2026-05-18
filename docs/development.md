@@ -315,6 +315,7 @@ cloudberry-k8s/
 │   │   ├── scenario16_deletion_test.go
 │   │   ├── scenario19_enable_mirroring_test.go
 │   │   ├── scenario20_automatic_failover_test.go
+│   │   ├── scenario25_bootstrap_workload_test.go
 │   │   └── webhook_test.go
 │   ├── scenarios/                    # SQL/shell scripts for test scenarios
 │   │   ├── scenario7_load_data.sql   # Test data loading (5 tables, ~1.45M rows)
@@ -1104,6 +1105,40 @@ Tests the automatic segment failover flow via the Fault Tolerance Service (FTS),
 | `TestFailover_MirroringDisabled_NoFailover` | No mirroring → no `SegmentFailover` events, no failover triggered |
 | `TestFailover_AllHealthy_NoFailover` | All segments healthy → `InSync`, no failover, `failedSegments` empty |
 
+#### Scenario 25 — Bootstrap Workload Management via CRD
+
+Tests the full workload bootstrap flow with a mock DB client, verifying resource group CRUD operations, ConfigMap creation for workload/idle rules, and fallback behavior when the database is unavailable.
+
+- **Resource group creation**: When the CRD spec contains resource groups that do not exist in the database, the operator creates them via `dbClient.CreateResourceGroup()` with the correct attributes (concurrency, cpuMaxPercent, cpuWeight, memoryLimit, minCost)
+- **Resource group update (alter)**: When a resource group exists in the database but has different parameters than the CRD spec, the operator alters it via `dbClient.AlterResourceGroup()`. Groups with matching parameters are left untouched
+- **Resource group removal (drop)**: When a resource group exists in the database but is not in the CRD spec, the operator drops it via `dbClient.DropResourceGroup()`
+- **Workload rules ConfigMap**: Workload rules from `spec.workload.rules` are serialized to JSON and stored in a `{cluster}-workload-rules` ConfigMap under the `rules.json` key. Rules include cancel, move, and log actions with threshold types and priorities
+- **Idle session rules ConfigMap**: Idle session rules from `spec.workload.idleRules` are serialized to JSON and stored in the same ConfigMap under the `idle-rules.json` key. Rules include idle timeout, excludeInTransaction, and custom terminate messages
+- **Full bootstrap**: All components (resource groups, workload rules, idle rules, metrics) are reconciled in a single pass with `WorkloadConfigured=True/WorkloadReconciled` condition
+- **DB unavailable fallback**: When the DB client factory returns an error, the operator sets `WorkloadConfigured=False/DBUnavailable` without failing the overall reconciliation. When `dbFactory` is nil (unit tests), falls back to condition-only mode
+- **Metrics**: Resource group CPU and memory usage metrics updated from actual DB values after successful reconciliation
+- **Functional tests**: `test/functional/scenario25_bootstrap_workload_test.go`
+- **Example CR**: `test/examples/scenario25-bootstrap-workload.yaml`
+
+**Conditions:**
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `WorkloadConfigured` | `True` | `WorkloadReconciled` | All resource groups, workload rules, and idle rules reconciled successfully |
+| `WorkloadConfigured` | `False` | `DBUnavailable` | Database connection unavailable — resource groups not reconciled |
+
+**Functional tests (7 test cases):**
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestScenario25a_BootstrapResourceGroups_CreatesInDB` | Two resource groups (analytics, etl) created with correct parameters; `WorkloadConfigured=True/WorkloadReconciled` condition set |
+| `TestScenario25b_BootstrapWorkloadRules_CreatesConfigMap` | ConfigMap created with `rules.json` containing 2 workload rules (cancel, move) with correct action, thresholdType, threshold, priority |
+| `TestScenario25c_BootstrapIdleRules_CreatesConfigMap` | ConfigMap created with `idle-rules.json` containing 1 idle session rule with correct idleTimeout, excludeInTransaction, terminateMessage |
+| `TestScenario25d_FullBootstrap_AllComponents` | Full bootstrap: 2 resource groups created, ConfigMap with both `rules.json` and `idle-rules.json`, `WorkloadConfigured=True` condition |
+| `TestScenario25e_ResourceGroupUpdate_AltersInDB` | Existing resource group with different parameters triggers `ALTER RESOURCE GROUP` (not CREATE); parameters updated correctly |
+| `TestScenario25f_ResourceGroupRemoval_DropsFromDB` | Orphaned resource group (in DB but not in spec) triggers `DROP RESOURCE GROUP`; matching groups are not altered or created |
+| `TestScenario25g_DBUnavailable_FallsBackToConditionOnly` | DB factory error → `WorkloadConfigured=False/DBUnavailable` with error message; reconciliation succeeds without error |
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -1155,6 +1190,9 @@ go test ./test/functional/... -v -tags functional -run TestScenario19
 
 # Run automatic failover functional tests
 go test ./test/functional/... -v -tags functional -run TestScenario20
+
+# Run workload bootstrap functional tests
+go test ./test/functional/... -v -tags functional -run TestScenario25
 ```
 
 ### Scenario 1 Live Cluster Test
@@ -1218,18 +1256,18 @@ scenario1-cluster-segment-mirror-3    (mirror of primary-3)
 
 ### Coverage
 
-The project targets **90%+ unit test statement coverage** per package. Approximately 121 new test cases were added during the latest refactoring cycle, improving overall coverage from ~71% to ~85%+. Current coverage for key packages:
+The project targets **90%+ unit test statement coverage** per package. Current coverage for key packages:
 
 | Package | Coverage | Notes |
 |---------|----------|-------|
-| `internal/controller` | ~83% | Improved from 57% with comprehensive scenario tests |
-| `internal/certmanager` | ~90% | Improved from 64% with Vault PKI and self-signed tests |
+| `internal/controller` | ~90% | Improved from ~83% with mock DB client tests, action annotation retry, and lifecycle phase error logging |
+| `internal/certmanager` | ~93% | Improved from ~90% with additional rotation and edge case tests |
 | `internal/vault` | 99.1% | Near-complete coverage |
 | `internal/metrics` | 100% | Full coverage |
-| `internal/db` | 92.9% | Includes SQL injection fix tests |
-| `internal/api` | ~85% | Rate limiter, server timeout, and handler tests |
+| `internal/db` | ~92% | Improved from ~48% with mock DB client factory, SSL config tests, and connection string builder tests |
+| `internal/api` | ~96% | Improved from ~74% with input validation, recovery type validation, and rate limiter shutdown tests |
 | `internal/ctl` | ~85% | URL encoding and response size limit tests |
-| `internal/auth` | ~90% | Basic and OIDC provider tests |
+| `internal/auth` | ~91% | Improved from ~90% with auth controller log level and unused field removal tests |
 
 ```bash
 # Generate coverage report
@@ -1241,6 +1279,33 @@ open coverage/coverage.html
 # View coverage summary
 go tool cover -func=coverage/coverage.out
 ```
+
+### Test Patterns
+
+#### Mock DB Client
+
+Controller and API tests use a mock `DBClientFactory` to test database-dependent code paths without a real database. The mock implements the `db.DBClientFactory` interface and returns configurable responses:
+
+```go
+type mockDBClientFactory struct {
+    client db.Client
+    err    error
+}
+
+func (m *mockDBClientFactory) NewClient(ctx context.Context, cluster *v1alpha1.CloudberryCluster) (db.Client, error) {
+    return m.client, m.err
+}
+```
+
+The mock DB client supports configurable SSL modes (`disable`, `require`, `verify-full`) matching the cluster's `spec.auth.ssl` configuration. Tests verify that the factory respects the cluster's SSL settings when creating connections.
+
+#### Action Annotation Retry Pattern
+
+Action annotations (e.g., `avsoft.io/action=start`) are now removed **after** successful processing rather than before. This ensures that if the action handler fails, the annotation remains on the resource and the action is retried on the next reconciliation cycle. Tests verify this behavior by simulating handler failures and confirming the annotation persists.
+
+#### Context-Aware Backoff
+
+The `RetryWithBackoff` function and ConfigMap retry logic now respect context cancellation during backoff sleep. Tests verify that a canceled context interrupts the backoff wait rather than sleeping for the full duration.
 
 ### Writing Unit Tests
 
@@ -1408,6 +1473,31 @@ The following security and reliability fixes were applied during a comprehensive
 | MEDIUM-06 | Silent JSON encoding failures | Added error logging for `json.Encode` failures in API handlers | `internal/api` |
 | MEDIUM-08 | Vault PKI using `ReadSecret` for cert issuance | Changed to `WriteSecretWithResponse` (PKI issue is a write operation) | `internal/certmanager` |
 | MEDIUM-09 | ENV var priority incorrect in CLI | Fixed to: CLI flag > env var > config file > default | `cmd/cloudberry-ctl` |
+
+### Refactoring Session Fixes (Group A — Critical/Security)
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| A-01 | Admin password lost on pod restart | Persisted to K8s Secret `cloudberry-operator-admin-password` (survives pod restarts) | `cmd/operator` |
+| A-02 | RateLimiter goroutine leak | `Server.Close()` called on shutdown, which calls `rateLimiter.Stop()` | `internal/api` |
+| A-03 | Action annotation removed before processing | Annotation now removed AFTER successful processing; failed actions retry on next reconcile | `internal/controller` |
+| A-04 | ConfigMap retry ignores context cancellation | Context-aware backoff in ConfigMap retry (respects `ctx.Done()` during sleep) | `internal/controller` |
+| A-05 | No input validation on API path parameters | SQL identifier regex validation on cluster name, namespace, and resource group names | `internal/api` |
+| A-06 | No recovery type validation | Recovery type restricted to `incremental`, `full`, `differential` only | `internal/api` |
+| A-07 | CLI password flag exposes credentials | Security warning recommending `CLOUDBERRY_PASSWORD` env var instead of `--password` flag | `cmd/cloudberry-ctl` |
+
+### Refactoring Session Fixes (Group B — Quality)
+
+| ID | Issue | Fix | Package |
+|----|-------|-----|---------|
+| B-01 | Rebalance silently ignores errors | Error collection returns aggregate error from rebalance operations | `internal/controller` |
+| B-02 | Lifecycle phase errors silently ignored | Phase transition errors now logged at WARN level | `internal/controller` |
+| B-03 | DB factory ignores cluster SSL config | `DBClientFactory` now respects `spec.auth.ssl` settings (`disable`, `require`, `verify-full`) | `internal/db` |
+| B-04 | Duplicated "cluster not found" strings | Extracted to `ErrMsgClusterNotFound` constant in `internal/util/constants.go` | `internal/util` |
+| B-05 | Auth controller logs at INFO for unchanged generation | Changed to DEBUG level for unchanged generation skip (reduces log noise) | `internal/controller` |
+| B-06 | Unused `scheme` field in `AuthReconciler` | Removed unused field from struct | `internal/controller` |
+| B-07 | CLI ignores SIGINT/SIGTERM | Signal-aware context in CLI main — `SIGINT`/`SIGTERM` triggers context cancellation | `cmd/cloudberry-ctl` |
+| B-08 | Magic numbers in code | Extracted to named constants (timeouts, limits, retry counts, etc.) | Multiple |
 
 ### Low-Priority Fixes
 

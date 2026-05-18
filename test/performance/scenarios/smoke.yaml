@@ -18,7 +18,7 @@
 # =============================================================================
 
 phantom:
-  address: localhost:8090
+  address: localhost:8190
   ssl: false
   ammo_type: uri
   ammofile: ammo/health.txt
@@ -26,7 +26,7 @@ phantom:
     load_type: rps
     # Gentle ramp from 1 to 10 RPS over 15 seconds, then hold 10 RPS for 60 seconds
     schedule: line(1, 10, 15s) const(10, 60s)
-  timeout: 3000
+  timeout: 3s
   instances: 20
   connection_test: true
   writelog: all

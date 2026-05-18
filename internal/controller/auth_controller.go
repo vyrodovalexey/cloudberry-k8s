@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,7 +26,6 @@ const authControllerName = "auth-controller"
 // AuthReconciler reconciles the authentication aspects of a CloudberryCluster.
 type AuthReconciler struct {
 	client   client.Client
-	scheme   *runtime.Scheme
 	recorder record.EventRecorder
 	builder  builder.ResourceBuilder
 	metrics  metrics.Recorder
@@ -33,9 +33,10 @@ type AuthReconciler struct {
 }
 
 // NewAuthReconciler creates a new AuthReconciler.
+// The scheme parameter is accepted for backward compatibility but is unused.
 func NewAuthReconciler(
 	c client.Client,
-	scheme *runtime.Scheme,
+	_ *runtime.Scheme,
 	recorder record.EventRecorder,
 	b builder.ResourceBuilder,
 	m metrics.Recorder,
@@ -46,7 +47,6 @@ func NewAuthReconciler(
 	}
 	return &AuthReconciler{
 		client:   c,
-		scheme:   scheme,
 		recorder: recorder,
 		builder:  b,
 		metrics:  m,
@@ -79,7 +79,7 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	// Skip full reconciliation if only status changed (ObservedGeneration matches).
 	if cluster.Status.ObservedGeneration == cluster.Generation {
-		logger.Info("skipping auth reconciliation, generation unchanged")
+		logger.Debug("skipping auth reconciliation, generation unchanged")
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
@@ -100,16 +100,16 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Record event for auth configuration changes.
-	r.recorder.Event(cluster, "Normal", "AuthReconciled", "Authentication configuration reconciled")
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "AuthReconciled", "Authentication configuration reconciled")
 
 	// Validate OIDC configuration if enabled.
 	if cluster.Spec.Auth != nil && cluster.Spec.Auth.OIDC != nil && cluster.Spec.Auth.OIDC.Enabled {
 		if err := r.validateOIDCConfig(ctx, cluster); err != nil {
 			logger.Warn("OIDC validation failed", "error", err)
-			r.recorder.Event(cluster, "Warning", "OIDCValidationFailed",
+			r.recorder.Event(cluster, corev1.EventTypeWarning, "OIDCValidationFailed",
 				fmt.Sprintf("OIDC validation failed: %v", err))
 		} else {
-			r.recorder.Event(cluster, "Normal", "OIDCConfigured",
+			r.recorder.Event(cluster, corev1.EventTypeNormal, "OIDCConfigured",
 				"OIDC authentication is properly configured")
 		}
 	}

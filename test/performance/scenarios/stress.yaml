@@ -24,7 +24,7 @@
 # =============================================================================
 
 phantom:
-  address: localhost:8090
+  address: localhost:8190
   ssl: false
   ammo_type: uri
   ammofile: ammo/api-read.txt
@@ -44,7 +44,7 @@ phantom:
       const(500, 120s)
       line(500, 1000, 15s)
       const(1000, 120s)
-  timeout: 10000
+  timeout: 10s
   instances: 2000
   connection_test: true
   writelog: all

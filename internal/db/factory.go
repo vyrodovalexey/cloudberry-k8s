@@ -80,13 +80,23 @@ func (f *ClientFactory) NewClient(ctx context.Context, cluster *cbv1alpha1.Cloud
 		username = cluster.Spec.Auth.Basic.AdminUser
 	}
 
+	// Determine SSL mode from the cluster's auth configuration.
+	sslMode := "disable"
+	if cluster.Spec.Auth != nil && cluster.Spec.Auth.SSL != nil &&
+		cluster.Spec.Auth.SSL.Enabled {
+		sslMode = "require"
+		if cluster.Spec.Auth.SSL.CertSecret != nil {
+			sslMode = "verify-full"
+		}
+	}
+
 	cfg := Config{
 		Host:     host,
 		Port:     port,
 		Database: defaultDatabase,
 		Username: username,
 		Password: password,
-		SSLMode:  "disable",
+		SSLMode:  sslMode,
 		RetryOpts: util.RetryOptions{
 			MaxRetries:     3,
 			InitialBackoff: util.DefaultRetryOptions().InitialBackoff,

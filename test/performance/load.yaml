@@ -13,7 +13,7 @@
 
 phantom:
   # Target address (operator API server)
-  address: localhost:8090
+  address: localhost:8190
   # Use HTTP (set to true for HTTPS)
   ssl: false
   # Ammo type: uri-style for simple GET requests, request-style for full HTTP
@@ -28,7 +28,7 @@ phantom:
   # Connection settings
   connection_test: true
   # Timeout for each request (milliseconds)
-  timeout: 3000
+  timeout: 3s
   # Number of instances (concurrent connections)
   instances: 100
   # Use HTTP/1.1 keep-alive

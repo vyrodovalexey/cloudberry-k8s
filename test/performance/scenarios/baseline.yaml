@@ -23,7 +23,7 @@
 # =============================================================================
 
 phantom:
-  address: localhost:8090
+  address: localhost:8190
   ssl: false
   ammo_type: uri
   ammofile: ammo/api-read.txt
@@ -33,7 +33,7 @@ phantom:
     # Ramp: increase from 50 to 100 RPS over 30 seconds
     # Sustain: hold 100 RPS for 5 minutes (300 seconds)
     schedule: line(1, 50, 30s) line(50, 100, 30s) const(100, 300s)
-  timeout: 5000
+  timeout: 5s
   instances: 200
   connection_test: true
   writelog: all

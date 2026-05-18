@@ -235,7 +235,7 @@ func newScenario5Server(cluster *cbv1alpha1.CloudberryCluster, dbFactory db.DBCl
 	}
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return api.NewServer(k8sClient, nil, dbFactory, &metrics.NoopRecorder{}, nil)
+	return api.NewServer(k8sClient, nil, dbFactory, &metrics.NoopRecorder{}, nil, 0)
 }
 
 // scenario5AuthRequest adds an admin identity to the request context so that

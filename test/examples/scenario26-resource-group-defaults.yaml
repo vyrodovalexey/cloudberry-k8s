@@ -1,0 +1,45 @@
+# Scenario 26: Resource Group Default Values
+#
+# This scenario verifies that when a resource group is created with only a name
+# (no explicit parameters), the mutating webhook and database defaults produce
+# the correct values:
+#
+#   concurrency:   20   (webhook default)
+#   cpuMaxPercent: 100  (webhook default)
+#   cpuWeight:     100  (webhook default)
+#   memoryLimit:   0    (Go zero value — unlimited)
+#   minCost:       0    (Go zero value — no minimum)
+#
+# The operator should create the resource group in the database using the
+# defaulted values. Since memoryLimit and minCost are 0, they are omitted
+# from the CREATE RESOURCE GROUP SQL (0 = database default).
+#
+# ============================================================================
+
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario26-cluster
+  namespace: cloudberry-test
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+    storage:
+      size: "5Gi"
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: defaults-test

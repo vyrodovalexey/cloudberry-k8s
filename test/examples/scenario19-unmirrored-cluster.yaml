@@ -1,0 +1,44 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario19-cluster
+  namespace: cloudberry-test
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  standby:
+    enabled: false
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: false
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  config:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 5
+    ftsProbeRetries: 3
+  deletionPolicy: Retain

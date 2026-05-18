@@ -279,6 +279,7 @@ type ResourceGroupInfo struct {
 	CPUMaxPercent int32   `json:"cpuMaxPercent"`
 	CPUWeight     int32   `json:"cpuWeight"`
 	MemoryLimit   int32   `json:"memoryLimit"`
+	MinCost       int32   `json:"minCost"`
 	CPUUsage      float64 `json:"cpuUsage"`
 	MemoryUsage   float64 `json:"memoryUsage"`
 }
@@ -994,6 +995,12 @@ func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupO
 	if opts.CPUWeight > 0 {
 		params = append(params, fmt.Sprintf("cpu_weight=%d", opts.CPUWeight))
 	}
+	if opts.MemoryLimit > 0 {
+		params = append(params, fmt.Sprintf("memory_limit=%d", opts.MemoryLimit))
+	}
+	if opts.MinCost > 0 {
+		params = append(params, fmt.Sprintf("min_cost=%d", opts.MinCost))
+	}
 
 	if len(params) == 0 {
 		params = append(params, "cpu_max_percent=20")
@@ -1018,6 +1025,8 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 		{"concurrency", opts.Concurrency},
 		{"cpu_max_percent", opts.CPUMaxPercent},
 		{"cpu_weight", opts.CPUWeight},
+		{"memory_limit", opts.MemoryLimit},
+		{"min_cost", opts.MinCost},
 	}
 
 	for _, alt := range alterations {
@@ -1054,7 +1063,11 @@ func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo
 		COALESCE((SELECT c.value::int FROM pg_resgroupcapability c
 			WHERE c.resgroupid = g.oid AND c.reslimittype = 2), 0) AS cpu_max_percent,
 		COALESCE((SELECT c.value::int FROM pg_resgroupcapability c
-			WHERE c.resgroupid = g.oid AND c.reslimittype = 3), 0) AS cpu_weight
+			WHERE c.resgroupid = g.oid AND c.reslimittype = 3), 0) AS cpu_weight,
+		COALESCE((SELECT c.value::int FROM pg_resgroupcapability c
+			WHERE c.resgroupid = g.oid AND c.reslimittype = 4), 0) AS memory_limit,
+		COALESCE((SELECT c.value::int FROM pg_resgroupcapability c
+			WHERE c.resgroupid = g.oid AND c.reslimittype = 5), 0) AS min_cost
 		FROM pg_resgroup g
 		WHERE g.rsgname NOT IN ('default_group', 'admin_group', 'system_group')
 		ORDER BY g.rsgname`
@@ -1068,7 +1081,9 @@ func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo
 	var groups []ResourceGroupInfo
 	for rows.Next() {
 		var g ResourceGroupInfo
-		if scanErr := rows.Scan(&g.Name, &g.Concurrency, &g.CPUMaxPercent, &g.CPUWeight); scanErr != nil {
+		scanErr := rows.Scan(&g.Name, &g.Concurrency, &g.CPUMaxPercent,
+			&g.CPUWeight, &g.MemoryLimit, &g.MinCost)
+		if scanErr != nil {
 			return nil, fmt.Errorf("scanning resource group row: %w", scanErr)
 		}
 		groups = append(groups, g)

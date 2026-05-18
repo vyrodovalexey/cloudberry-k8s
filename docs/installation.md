@@ -113,6 +113,19 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --values custom-values.yaml
 ```
 
+### Install with Webhooks Enabled
+
+For production deployments, enable admission webhooks to enforce cluster validation (e.g., cross-namespace name uniqueness, segment count validation):
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set webhook.enabled=true \
+  --set operator.webhookEnabled=true
+```
+
+The operator automatically manages webhook TLS certificates (self-signed by default, or via Vault PKI). See [Webhook Certificate Configuration](#webhook-certificate-configuration) for details.
+
 ### Verify Installation
 
 ```bash
@@ -128,6 +141,10 @@ kubectl get crd cloudberryclusters.avsoft.io
 
 # Check operator logs
 kubectl logs -n cloudberry-system deployment/cloudberry-operator
+
+# Verify webhook configuration (if webhooks are enabled)
+kubectl get validatingwebhookconfigurations | grep cloudberry
+kubectl get mutatingwebhookconfigurations | grep cloudberry
 ```
 
 ## Configuration Options
@@ -363,11 +380,12 @@ env:
 ```
 
 **Behavior:**
-- If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it as the admin password for the REST API
-- If **not** set, the operator auto-generates a cryptographically secure random password (including special characters) and logs a warning with a hint to set the variable for production use
-- The generated password is logged only as a warning hint — it is not persisted. Restarting the operator without `CLOUDBERRY_API_ADMIN_PASSWORD` generates a new password each time
+- If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it as the admin password for the REST API and persists it to a Kubernetes Secret (`cloudberry-operator-admin-password`)
+- If **not** set but the Secret exists (from a previous run), the operator reads the password from the Secret — this ensures the password survives pod restarts
+- If neither the env var nor the Secret exists, the operator auto-generates a cryptographically secure random password (including special characters), persists it to the Secret, and logs a warning with a hint to set the variable for production use
+- The admin password is always persisted to the `cloudberry-operator-admin-password` Secret in the operator's namespace, ensuring consistent API access across pod restarts
 
-> **Production recommendation**: Always set `CLOUDBERRY_API_ADMIN_PASSWORD` via a Kubernetes Secret reference to ensure a stable, known password for API access.
+> **Production recommendation**: Set `CLOUDBERRY_API_ADMIN_PASSWORD` via a Kubernetes Secret reference for explicit control over the password. For development environments, the auto-generated password is persisted and stable across restarts.
 
 ### Environment Variable Configuration
 
@@ -415,6 +433,20 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 ```
 
 For local development, the Docker Compose test environment includes VictoriaMetrics (port 8428), Grafana (port 3000), and Tempo (ports 3200/4317/4318) pre-configured for metrics and tracing.
+
+#### Kubernetes Monitoring Charts
+
+The `monitoring/` directory contains deployment configurations for vmagent (VictoriaMetrics agent) and otel-collector (OpenTelemetry Collector) that can be deployed alongside the operator in a Kubernetes cluster:
+
+```bash
+# Deploy vmagent for Prometheus-compatible metrics collection
+kubectl apply -f monitoring/vmagent/
+
+# Deploy otel-collector for distributed tracing
+kubectl apply -f monitoring/otel-collector/
+```
+
+These charts are pre-configured to scrape the operator's `/metrics` endpoint and receive OTLP traces on ports 4317 (gRPC) and 4318 (HTTP).
 
 ## Upgrading
 

@@ -108,10 +108,28 @@ This priority order is enforced consistently across all settings. For example, i
 | `--operator-url` | | Operator API URL | `http://localhost:8090` (auto-discover) |
 | `--auth-method` | | Auth method (`basic` or `oidc`) | `basic` |
 | `--username` | | Basic auth username | |
-| `--password` | | Basic auth password | (prompted if not set) |
+| `--password` | | Basic auth password (see security note below) | (prompted if not set) |
 | `--output` | `-o` | Output format (`table`, `json`, `yaml`) | `table` |
 | `--verbose` | `-v` | Enable verbose output (logs HTTP requests and responses) | `false` |
 | `--timeout` | | Operation timeout | `5m` |
+
+> **Security warning**: Avoid using the `--password` flag on the command line, as the password may be visible in shell history and process listings. Use the `CLOUDBERRY_PASSWORD` environment variable instead:
+>
+> ```bash
+> export CLOUDBERRY_PASSWORD='your-secure-password'
+> cloudberry-ctl cluster status --cluster my-cluster
+> ```
+
+## Signal Handling
+
+`cloudberry-ctl` handles `SIGINT` (Ctrl+C) and `SIGTERM` signals gracefully. When a signal is received, the CLI cancels the current operation's context, allowing in-flight HTTP requests to be terminated cleanly. This prevents the CLI from hanging when interrupted during long-running operations.
+
+```bash
+# Ctrl+C cancels the current operation
+cloudberry-ctl ha rebalance --cluster my-cluster
+# Press Ctrl+C to cancel
+# Output: "operation canceled"
+```
 
 ## Environment Variables
 

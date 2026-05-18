@@ -11,7 +11,11 @@ import (
 	"time"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,6 +42,19 @@ import (
 //
 //nolint:gochecknoglobals // set by ldflags
 var version = "dev"
+
+const (
+	// shutdownTimeout is the maximum time to wait for graceful shutdown of
+	// background components (tracer, API server, etc.).
+	shutdownTimeout = 5 * time.Second
+
+	// operatorAdminPasswordSecretName is the name of the Kubernetes Secret
+	// used to persist the auto-generated API admin password across pod restarts.
+	operatorAdminPasswordSecretName = "cloudberry-operator-admin-password"
+
+	// passwordSecretKey is the key within the admin password Secret.
+	passwordSecretKey = "password"
+)
 
 var scheme = runtime.NewScheme()
 
@@ -90,7 +107,7 @@ func run(ctx context.Context) error {
 			// Use a fresh context with timeout for shutdown, since the parent
 			// context may already be canceled when this deferred function runs.
 			shutdownCtx, shutdownCancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
+				context.Background(), shutdownTimeout,
 			)
 			defer shutdownCancel()
 			if shutdownErr := shutdownTracer(shutdownCtx); shutdownErr != nil {
@@ -261,15 +278,9 @@ func startAPIServer(
 ) error {
 	// Create an in-memory credential store with an admin user.
 	credStore := auth.NewInMemoryCredentialStore()
-	adminPassword := os.Getenv("CLOUDBERRY_API_ADMIN_PASSWORD")
-	if adminPassword == "" {
-		generated, genErr := util.GenerateRandomPassword()
-		if genErr != nil {
-			return fmt.Errorf("generating admin password: %w", genErr)
-		}
-		adminPassword = generated
-		logger.Warn("CLOUDBERRY_API_ADMIN_PASSWORD not set, using generated password",
-			"hint", "set CLOUDBERRY_API_ADMIN_PASSWORD environment variable for production use")
+	adminPassword, err := resolveAdminPassword(ctx, mgr.GetClient(), logger)
+	if err != nil {
+		return fmt.Errorf("resolving admin password: %w", err)
 	}
 	credStore.SetCredentials("admin", adminPassword, auth.PermissionAdmin)
 
@@ -281,10 +292,92 @@ func startAPIServer(
 	dbFactory := db.NewClientFactory(mgr.GetClient(), logger)
 
 	// Create and start the API server.
-	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger)
+	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger, cfg.APIRateLimit)
+	defer apiServer.Close()
 
-	logger.Info("starting REST API server", "address", cfg.APIAddress)
+	logger.Info("starting REST API server", "address", cfg.APIAddress, "rateLimit", cfg.APIRateLimit)
 	return api.StartServer(ctx, cfg.APIAddress, apiServer.Handler(), logger)
+}
+
+// resolveAdminPassword determines the API admin password using the following
+// priority order:
+//  1. CLOUDBERRY_API_ADMIN_PASSWORD environment variable (highest priority).
+//  2. Existing Kubernetes Secret (survives pod restarts).
+//  3. Generate a new random password and persist it to a Secret.
+func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *slog.Logger) (string, error) {
+	// 1. Check environment variable first (highest priority).
+	if envPassword := os.Getenv("CLOUDBERRY_API_ADMIN_PASSWORD"); envPassword != "" {
+		return envPassword, nil
+	}
+
+	// Determine the operator namespace.
+	operatorNS := os.Getenv("POD_NAMESPACE")
+	if operatorNS == "" {
+		operatorNS = util.OperatorNamespace
+	}
+
+	// 2. Check if a persisted Secret already exists.
+	existing := &corev1.Secret{}
+	err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      operatorAdminPasswordSecretName,
+		Namespace: operatorNS,
+	}, existing)
+
+	if err == nil {
+		// Secret exists — use the stored password.
+		if pw, ok := existing.Data[passwordSecretKey]; ok && len(pw) > 0 {
+			logger.Info("using admin password from existing Secret",
+				"secret", operatorAdminPasswordSecretName, "namespace", operatorNS)
+			return string(pw), nil
+		}
+		// Secret exists but has no password key — fall through to generate.
+		logger.Warn("admin password Secret exists but is empty, generating new password",
+			"secret", operatorAdminPasswordSecretName)
+	} else if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("checking admin password secret: %w", err)
+	}
+
+	// 3. Generate a new random password and persist it.
+	generated, genErr := util.GenerateRandomPassword()
+	if genErr != nil {
+		return "", fmt.Errorf("generating admin password: %w", genErr)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      operatorAdminPasswordSecretName,
+			Namespace: operatorNS,
+			Labels: map[string]string{
+				util.LabelManagedBy: util.LabelManagedByValue,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			passwordSecretKey: []byte(generated),
+		},
+	}
+
+	if createErr := k8sClient.Create(ctx, secret); createErr != nil {
+		if apierrors.IsAlreadyExists(createErr) {
+			// Race condition: another replica created it first — re-read.
+			if getErr := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      operatorAdminPasswordSecretName,
+				Namespace: operatorNS,
+			}, existing); getErr != nil {
+				return "", fmt.Errorf("re-reading admin password secret after conflict: %w", getErr)
+			}
+			if pw, ok := existing.Data[passwordSecretKey]; ok && len(pw) > 0 {
+				return string(pw), nil
+			}
+		}
+		return "", fmt.Errorf("creating admin password secret: %w", createErr)
+	}
+
+	logger.Warn("CLOUDBERRY_API_ADMIN_PASSWORD not set, generated and persisted password to Secret",
+		"secret", operatorAdminPasswordSecretName, "namespace", operatorNS,
+		"hint", "set CLOUDBERRY_API_ADMIN_PASSWORD environment variable for production use")
+
+	return generated, nil
 }
 
 // setupWebhookCerts creates and manages webhook TLS certificates.

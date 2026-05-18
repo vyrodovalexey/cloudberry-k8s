@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -232,6 +233,57 @@ func TestBasicAuthProvider_Authenticate_SpecialCharacters(t *testing.T) {
 			assert.Equal(t, PermissionAdmin, identity.Permission)
 		})
 	}
+}
+
+// errorCredentialStore is a credential store that returns errors.
+type errorCredentialStore struct {
+	getPasswordErr   error
+	getPermissionErr error
+	password         string
+	permission       PermissionLevel
+}
+
+func (s *errorCredentialStore) GetPassword(_ context.Context, _ string) (string, error) {
+	return s.password, s.getPasswordErr
+}
+
+func (s *errorCredentialStore) GetPermissionLevel(_ context.Context, _ string) (PermissionLevel, error) {
+	return s.permission, s.getPermissionErr
+}
+
+func TestBasicAuthProvider_Authenticate_GetPasswordError(t *testing.T) {
+	store := &errorCredentialStore{
+		getPasswordErr: fmt.Errorf("database connection failed"),
+	}
+	provider := NewBasicAuthProvider(store, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("admin", "pass")
+
+	identity, err := provider.Authenticate(context.Background(), req)
+	require.Error(t, err)
+	assert.Nil(t, identity)
+	assert.Contains(t, err.Error(), "retrieving credentials")
+}
+
+func TestBasicAuthProvider_Authenticate_GetPermissionError(t *testing.T) {
+	// Need a valid bcrypt hash for the password
+	hash, err := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
+	require.NoError(t, err)
+
+	store := &errorCredentialStore{
+		password:         string(hash),
+		getPermissionErr: fmt.Errorf("permission lookup failed"),
+	}
+	provider := NewBasicAuthProvider(store, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("admin", "pass")
+
+	identity, authErr := provider.Authenticate(context.Background(), req)
+	require.Error(t, authErr)
+	assert.Nil(t, identity)
+	assert.Contains(t, authErr.Error(), "retrieving permission level")
 }
 
 func TestBasicAuthProvider_Authenticate_AllPermissionLevels(t *testing.T) {

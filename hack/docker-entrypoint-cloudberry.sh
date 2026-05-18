@@ -109,11 +109,30 @@ log_warn()  { echo "[entrypoint] WARN:  $*" >&2; }
 log_error() { echo "[entrypoint] ERROR: $*" >&2; }
 
 # ---------------------------------------------------------------------------
-# Start SSH daemon (needed for inter-segment communication)
+# Start SSH daemon (needed for inter-segment communication).
+# Host keys and user keypair are generated at runtime (not baked into the image)
+# to avoid storing secrets in container layers.
 # ---------------------------------------------------------------------------
 start_sshd() {
     log_info "Starting SSH daemon..."
     sudo mkdir -p /run/sshd 2>/dev/null || true
+
+    # Generate SSH host keys if they don't exist (first start)
+    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+        log_info "Generating SSH host keys..."
+        sudo ssh-keygen -A 2>/dev/null || log_warn "Failed to generate SSH host keys"
+    fi
+
+    # Generate gpadmin SSH keypair if it doesn't exist (first start)
+    if [ ! -f /home/gpadmin/.ssh/id_ed25519 ]; then
+        log_info "Generating gpadmin SSH keypair..."
+        ssh-keygen -t ed25519 -N '' -C 'gpadmin@cloudberry-k8s' \
+                   -f /home/gpadmin/.ssh/id_ed25519 2>/dev/null || true
+        cat /home/gpadmin/.ssh/id_ed25519.pub >> /home/gpadmin/.ssh/authorized_keys 2>/dev/null || true
+        chmod 600 /home/gpadmin/.ssh/id_ed25519 /home/gpadmin/.ssh/authorized_keys 2>/dev/null || true
+        chmod 644 /home/gpadmin/.ssh/id_ed25519.pub 2>/dev/null || true
+    fi
+
     sudo /usr/sbin/sshd 2>/dev/null || log_warn "SSH daemon failed to start (non-fatal)"
 }
 

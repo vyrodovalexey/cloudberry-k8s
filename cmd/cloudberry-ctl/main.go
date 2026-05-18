@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -132,13 +134,22 @@ func requireCluster() error {
 	return nil
 }
 
-// cmdContext creates a context with the configured timeout.
+// cmdContext creates a context that respects both the configured timeout and
+// OS signals (SIGINT, SIGTERM). Pressing Ctrl+C will cancel in-flight API
+// requests. The returned cancel function releases both the signal handler
+// and the timeout resources.
 func cmdContext() (context.Context, context.CancelFunc) {
+	sigCtx, sigCancel := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
 	timeout, err := time.ParseDuration(globals.timeout)
 	if err != nil {
 		timeout = 5 * time.Minute
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	tCtx, tCancel := context.WithTimeout(sigCtx, timeout)
+	return tCtx, func() {
+		tCancel()
+		sigCancel()
+	}
 }
 
 // runAPIGet is a helper that creates a client, performs a GET request, and formats the output.
@@ -307,6 +318,15 @@ func initConfig() {
 	applyViperValue(&globals.password, "password", "password")
 	applyViperValue(&globals.timeout, "timeout", "timeout")
 	applyViperValue(&globals.output, "output", "output")
+
+	// Warn if password was provided via the --password CLI flag (visible in
+	// process listings and shell history). Environment variable is preferred.
+	if rootCmd != nil && rootCmd.PersistentFlags().Changed("password") {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: Password provided via --password flag is visible in process "+
+				"listings and shell history. Use the CLOUDBERRY_PASSWORD environment "+
+				"variable instead for improved security.")
+	}
 }
 
 // newVersionCmd creates the version command.

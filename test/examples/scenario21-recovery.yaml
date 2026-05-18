@@ -1,0 +1,178 @@
+# Scenario 21: Failover then Incremental Recovery
+#
+# This scenario tests the full failover-recovery cycle: killing a primary
+# segment pod, observing Kubernetes StatefulSet auto-recovery, and then
+# triggering the operator's incremental recovery annotation to reconcile
+# cluster state.
+#
+# Prerequisites:
+#   - Scenario 19 cluster running with mirrors (9 pods: 1 coord + 4 pri + 4 mir)
+#   - All segments status='u', mode='s' (up and synced)
+#   - Cluster phase=Running, mirroringStatus=InSync
+#
+# Test Flow:
+#
+#   Step 1: Create failover precondition (kill primary-2)
+#     # Record baseline segment config
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#       "SELECT content, role, status FROM gp_segment_configuration WHERE content=2 ORDER BY role;"
+#     # Force-kill primary-2 pod
+#     kubectl delete pod scenario19-cluster-segment-primary-2 \
+#       -n cloudberry-test --grace-period=0 --force
+#
+#   Step 2: Wait for pod recovery (StatefulSet auto-recreates)
+#     # The StatefulSet controller recreates the pod immediately.
+#     # The entrypoint script restarts postgres from the existing data directory.
+#     # WAL replication re-syncs with the mirror automatically.
+#     kubectl wait --for=condition=ready \
+#       pod/scenario19-cluster-segment-primary-2 \
+#       -n cloudberry-test --timeout=120s
+#     # Verify segment config returns to synced state
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#       "SELECT content, role, preferred_role, mode, status FROM gp_segment_configuration WHERE content=2 ORDER BY role;"
+#
+#   Step 3: Trigger operator incremental recovery annotation
+#     kubectl annotate cloudberrycluster scenario19-cluster \
+#       -n cloudberry-test avsoft.io/recovery=incremental --overwrite
+#     # Operator logs: "handling recovery", type="incremental"
+#     # Operator emits: RecoveryStarted event
+#     # Annotation is removed after processing
+#
+#   Step 4: Verify all acceptance criteria
+#     # All 9 cluster pods Running 1/1
+#     kubectl get pods -n cloudberry-test -l avsoft.io/cluster=scenario19-cluster
+#     # All segments up and synchronized
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#       "SELECT content, role, preferred_role, mode, status FROM gp_segment_configuration ORDER BY content, role;"
+#     # WAL replication streaming on all primaries
+#     for i in 0 1 2 3; do
+#       kubectl exec -n cloudberry-test scenario19-cluster-segment-primary-$i -- \
+#         env PGOPTIONS="-c gp_role=utility" /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#         "SELECT client_addr, state FROM pg_stat_replication;"
+#     done
+#     # All mirrors in recovery mode
+#     for i in 0 1 2 3; do
+#       kubectl exec -n cloudberry-test scenario19-cluster-segment-mirror-$i -- \
+#         env PGOPTIONS="-c gp_role=utility" /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#         "SELECT pg_is_in_recovery();"
+#     done
+#     # Data operations succeed across all segments
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d mydb -c \
+#       "INSERT INTO orders (customer_id, amount, status) VALUES (21, 21.21, 'scenario21_test');
+#        SELECT count(*) FROM orders;
+#        SELECT gp_segment_id, count(*) FROM orders GROUP BY gp_segment_id ORDER BY gp_segment_id;"
+#
+# Key Observations:
+#   - Kubernetes StatefulSet auto-recovery is fast (~30s for pod recreation)
+#   - The entrypoint script restarts postgres from existing PVC data
+#   - WAL replication re-syncs automatically without operator intervention
+#   - The recovery annotation triggers the operator's HA controller which
+#     verifies cluster health and emits a RecoveryStarted event
+#   - The annotation is removed after processing (idempotent)
+#
+# Alternative: Mirror Recovery with PVC Re-initialization
+#   If a mirror has corrupted data (CrashLoopBackOff):
+#     1. Scale down mirror StatefulSet to release the PVC
+#     2. Delete the corrupted PVC
+#     3. Scale back up to trigger fresh pg_basebackup from primary
+#     4. Trigger recovery annotation
+#   Or wipe data directory without PVC deletion:
+#     kubectl exec scenario19-cluster-segment-mirror-N -n cloudberry-test -- \
+#       rm -rf /data/pgdata/gpsegN
+#     kubectl delete pod scenario19-cluster-segment-mirror-N \
+#       -n cloudberry-test --grace-period=0 --force
+#
+# Handling Orphaned Distributed Transactions:
+#   If the coordinator is stuck in "waiting for distributed transaction recovery":
+#     1. Check for prepared transactions on segments:
+#        kubectl exec scenario19-cluster-segment-primary-N -n cloudberry-test -- \
+#          env PGOPTIONS="-c gp_role=utility" psql -U gpadmin -d postgres -c \
+#          "SELECT * FROM pg_prepared_xacts;"
+#     2. Rollback orphaned transactions (connect to correct database):
+#        kubectl exec scenario19-cluster-segment-primary-N -n cloudberry-test -- \
+#          env PGOPTIONS="-c gp_role=utility" psql -U gpadmin -d mydb -c \
+#          "ROLLBACK PREPARED '<gid>';"
+#     3. If sync replication blocks rollback (mirror disconnected):
+#        kubectl exec scenario19-cluster-segment-primary-N -n cloudberry-test -- \
+#          env PGOPTIONS="-c gp_role=utility" psql -U gpadmin -d postgres -c \
+#          "ALTER SYSTEM SET synchronous_standby_names TO '';"
+#        kubectl exec scenario19-cluster-segment-primary-N -n cloudberry-test -- \
+#          env PGOPTIONS="-c gp_role=utility" psql -U gpadmin -d postgres -c \
+#          "SELECT pg_reload_conf();"
+#        # After rollback, re-enable sync replication:
+#        "ALTER SYSTEM SET synchronous_standby_names TO '*';"
+#     4. Restart coordinator to clear DTM state:
+#        kubectl delete pod scenario19-cluster-coordinator-0 -n cloudberry-test
+#
+# Expected Results:
+#   - All 9 cluster pods Running 1/1
+#   - gp_segment_configuration: all segments status='u', mode='s'
+#   - pg_stat_replication: streaming with matching LSNs on all primaries
+#   - pg_is_in_recovery() = true on all mirrors
+#   - Cluster phase=Running, mirroringStatus=InSync
+#   - failedSegments=[]
+#   - Data operations (INSERT/SELECT) succeed across all segments
+#   - Operator emits RecoveryStarted event
+#   - Recovery annotation removed after processing
+#
+# Metrics to verify:
+#   - cloudberry_mirroring_in_sync = 1
+#   - cloudberry_replication_lag_bytes{segment="N"} = 0 for all segments
+#   - cloudberry_segments_failed = 0 (eventually consistent; see note below)
+#
+# Note: cloudberry_segments_failed gauge may remain stale at 1 after recovery
+# because updateFTSProbeStatus() only calls SetSegmentsFailed() in the degraded
+# path but does not reset it to 0 in the healthy path. The authoritative source
+# is status.failedSegments=[] which is always correct.
+#
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario19-cluster
+  namespace: cloudberry-test
+  annotations:
+    avsoft.io/recovery: incremental
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  standby:
+    enabled: false
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: true
+      layout: group
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  config:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+  ha:
+    ftsProbeInterval: 10
+    ftsProbeTimeout: 5
+    ftsProbeRetries: 2
+  deletionPolicy: Retain

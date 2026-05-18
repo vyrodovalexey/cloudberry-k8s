@@ -167,7 +167,7 @@ func (s *Scenario10RebalanceSuite) TestScenario10b_RebalanceStatusAPI() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	// Create API server.
-	srv := api.NewServer(s.env.Client, nil, nil, &metrics.NoopRecorder{}, s.logger)
+	srv := api.NewServer(s.env.Client, nil, nil, &metrics.NoopRecorder{}, s.logger, 0)
 
 	// Act: GET /clusters/{name}/rebalance/status.
 	req := httptest.NewRequest(http.MethodGet,
@@ -220,7 +220,7 @@ func (s *Scenario10RebalanceSuite) TestScenario10c_RebalanceSpecificTables() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	// Create API server.
-	srv := api.NewServer(s.env.Client, nil, nil, &metrics.NoopRecorder{}, s.logger)
+	srv := api.NewServer(s.env.Client, nil, nil, &metrics.NoopRecorder{}, s.logger, 0)
 
 	// Act: POST /clusters/{name}/rebalance (sets annotation).
 	req := httptest.NewRequest(http.MethodPost,

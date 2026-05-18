@@ -35,6 +35,9 @@ const (
 	httpWriteTimeout = 60 * time.Second
 	// httpIdleTimeout is the maximum amount of time to wait for the next request when keep-alives are enabled.
 	httpIdleTimeout = 120 * time.Second
+	// httpShutdownTimeout is the maximum time to wait for the HTTP server to
+	// gracefully shut down (finish in-flight requests) before forcing closure.
+	httpShutdownTimeout = 5 * time.Second
 
 	responseKeyStatus  = "status"
 	responseKeyTotal   = "total"
@@ -54,6 +57,9 @@ const (
 	statusPending = "pending"
 
 	responseKeyMemoryLimit = "memoryLimit"
+
+	// errCodeClusterNotFound is the error code for cluster-not-found responses.
+	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
 )
 
 // dns1123SubdomainRegex validates DNS-1123 subdomain names used for cluster and namespace names.
@@ -61,12 +67,30 @@ const (
 // an alphanumeric character.
 var dns1123SubdomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$`)
 
+// identifierRegex validates safe SQL identifiers for database operations.
+// Allows alphanumeric characters and underscores, must start with a letter or underscore.
+// Maximum length 63 (PostgreSQL identifier limit).
+var identifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
+
 // isValidDNS1123Name validates that a name conforms to DNS-1123 subdomain format.
 func isValidDNS1123Name(name string) bool {
 	if name == "" || len(name) > 253 {
 		return false
 	}
 	return dns1123SubdomainRegex.MatchString(name)
+}
+
+// writeClusterNotFound writes a standardized cluster-not-found error response.
+func writeClusterNotFound(w http.ResponseWriter, name string) {
+	writeErrorJSON(w, http.StatusNotFound, errCodeClusterNotFound,
+		fmt.Sprintf("cluster %q not found", name))
+}
+
+// isValidIdentifier validates that a name is a safe SQL identifier.
+// Allows alphanumeric characters, underscores, and must start with
+// a letter or underscore. Max length 63 (PostgreSQL limit).
+func isValidIdentifier(name string) bool {
+	return identifierRegex.MatchString(name)
 }
 
 // limitBody wraps the request body with a size-limited reader to prevent oversized payloads.
@@ -86,21 +110,28 @@ type Server struct {
 }
 
 // NewServer creates a new API server.
+// rateLimit controls the per-IP request rate limit (requests per minute).
+// Use 0 to disable rate limiting (useful for performance testing).
 func NewServer(
 	k8sClient client.Client,
 	authMW *auth.AuthMiddleware,
 	dbFactory db.DBClientFactory,
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
+	rateLimit int,
 ) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	if rateLimit <= 0 {
+		rateLimit = defaultRateLimit
+	}
+
 	s := &Server{
 		k8sClient:   k8sClient,
 		authMW:      authMW,
-		rateLimiter: NewRateLimiter(defaultRateLimit, defaultRateInterval, logger),
+		rateLimiter: NewRateLimiter(rateLimit, defaultRateInterval, logger),
 		dbFactory:   dbFactory,
 		metrics:     metricsRecorder,
 		logger:      logger.With("component", "api-server"),
@@ -337,8 +368,7 @@ func (s *Server) handleGetCluster(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 	writeJSON(w, http.StatusOK, cluster)
@@ -349,8 +379,7 @@ func (s *Server) handleGetClusterStatus(w http.ResponseWriter, r *http.Request) 
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -366,8 +395,7 @@ func (s *Server) handleGetScaleStatus(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -427,8 +455,7 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -466,8 +493,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 	writeJSON(w, http.StatusOK, cluster.Spec.Config)
@@ -481,8 +507,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -507,8 +532,7 @@ func (s *Server) handleListSegments(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -524,8 +548,7 @@ func (s *Server) handleGetMirroring(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -540,8 +563,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -598,8 +620,7 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -658,8 +679,7 @@ func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) 
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -721,8 +741,7 @@ func (s *Server) handleGetStandby(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -750,11 +769,22 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate recovery type against known values.
+	validRecoveryTypes := map[string]bool{
+		util.RecoveryIncremental:  true,
+		util.RecoveryFull:         true,
+		util.RecoveryDifferential: true,
+	}
+	if !validRecoveryTypes[req.Type] {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid recovery type %q; valid types: incremental, full, differential", req.Type))
+		return
+	}
+
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -781,8 +811,7 @@ func (s *Server) handleGetRebalanceStatus(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -821,8 +850,7 @@ func (s *Server) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -843,8 +871,7 @@ func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -891,8 +918,7 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -909,6 +935,12 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 
 	if req.Name == "" {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource group name is required")
+		return
+	}
+
+	if !isValidIdentifier(req.Name) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource group name: must be a valid SQL identifier")
 		return
 	}
 
@@ -965,10 +997,15 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	groupName := r.PathValue("groupName")
 
+	if !isValidIdentifier(groupName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource group name: must be a valid SQL identifier")
+		return
+	}
+
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1017,10 +1054,15 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	groupName := r.PathValue("groupName")
 
+	if !isValidIdentifier(groupName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource group name: must be a valid SQL identifier")
+		return
+	}
+
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1034,6 +1076,12 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 
 	if req.Role == "" {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "role is required")
+		return
+	}
+
+	if !isValidIdentifier(req.Role) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid role name: must be a valid SQL identifier")
 		return
 	}
 
@@ -1081,8 +1129,7 @@ func (s *Server) handleListResourceQueues(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1130,8 +1177,7 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1150,6 +1196,12 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 
 	if req.Name == "" {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource queue name is required")
+		return
+	}
+
+	if !isValidIdentifier(req.Name) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource queue name: must be a valid SQL identifier")
 		return
 	}
 
@@ -1208,10 +1260,15 @@ func (s *Server) handleDeleteResourceQueue(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	queueName := r.PathValue("queueName")
 
+	if !isValidIdentifier(queueName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource queue name: must be a valid SQL identifier")
+		return
+	}
+
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1257,8 +1314,7 @@ func (s *Server) handleListWorkloadRules(w http.ResponseWriter, r *http.Request)
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1280,8 +1336,7 @@ func (s *Server) handleGetQueryMonitoring(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1303,8 +1358,7 @@ func (s *Server) handleGetActiveQueries(w http.ResponseWriter, r *http.Request) 
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1320,8 +1374,7 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1339,8 +1392,7 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1361,8 +1413,7 @@ func (s *Server) handleGetBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	backupID := r.PathValue("id")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1375,8 +1426,7 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	backupID := r.PathValue("id")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1391,8 +1441,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	backupID := r.PathValue("id")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1407,8 +1456,7 @@ func (s *Server) handleListDataLoadingJobs(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1430,8 +1478,7 @@ func (s *Server) handleCreateDataLoadingJob(w http.ResponseWriter, r *http.Reque
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1452,8 +1499,7 @@ func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request)
 	jobName := r.PathValue("job")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1475,8 +1521,7 @@ func (s *Server) handleUpdateDataLoadingJob(w http.ResponseWriter, r *http.Reque
 	name := r.PathValue("name")
 	jobName := r.PathValue("job")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1491,8 +1536,7 @@ func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Reque
 	name := r.PathValue("name")
 	jobName := r.PathValue("job")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1507,8 +1551,7 @@ func (s *Server) handleStartDataLoadingJob(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	jobName := r.PathValue("job")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1523,8 +1566,7 @@ func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	jobName := r.PathValue("job")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1539,8 +1581,7 @@ func (s *Server) handleListPVCs(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1587,8 +1628,7 @@ func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1603,8 +1643,7 @@ func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1620,8 +1659,7 @@ func (s *Server) handleGetTableDetail(w http.ResponseWriter, r *http.Request) {
 	schema := r.PathValue("schema")
 	table := r.PathValue("table")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1636,8 +1674,7 @@ func (s *Server) handleListRecommendations(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1654,8 +1691,7 @@ func (s *Server) handleTriggerRecommendationScan(w http.ResponseWriter, r *http.
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1676,8 +1712,7 @@ func (s *Server) handleTriggerRecommendationScan(w http.ResponseWriter, r *http.
 func (s *Server) handleGetUsageReport(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1694,8 +1729,7 @@ func (s *Server) setClusterAnnotation(w http.ResponseWriter, r *http.Request, ac
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1717,8 +1751,7 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusNotFound, "CLUSTER_NOT_FOUND",
-			fmt.Sprintf("cluster %q not found", name))
+		writeClusterNotFound(w, name)
 		return
 	}
 
@@ -1810,7 +1843,7 @@ func StartServer(ctx context.Context, addr string, handler http.Handler, logger 
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
+			context.Background(), httpShutdownTimeout,
 		)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

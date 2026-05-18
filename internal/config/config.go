@@ -39,6 +39,9 @@ type OperatorConfig struct {
 	ListenAddress string `mapstructure:"listen-address"`
 	// APIAddress is the address the REST API server listens on.
 	APIAddress string `mapstructure:"api-address"`
+	// APIRateLimit is the maximum number of API requests per minute per IP.
+	// Set to 0 to disable rate limiting (useful for performance testing).
+	APIRateLimit int `mapstructure:"api-rate-limit"`
 	// MetricsAddress is the address the metrics server listens on.
 	MetricsAddress string `mapstructure:"metrics-address"`
 	// HealthProbeAddress is the address the health probe server listens on.
@@ -195,6 +198,7 @@ func (l *viperLoader) Load() (*OperatorConfig, error) {
 func (l *viperLoader) setDefaults() {
 	l.v.SetDefault("listen-address", defaultListenAddress)
 	l.v.SetDefault("api-address", defaultAPIAddress)
+	l.v.SetDefault("api-rate-limit", 10)
 	l.v.SetDefault("metrics-address", defaultMetricsAddress)
 	l.v.SetDefault("health-probe-address", defaultHealthProbeAddress)
 	l.v.SetDefault("webhook-port", defaultWebhookPort)

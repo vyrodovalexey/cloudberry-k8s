@@ -518,7 +518,7 @@ type MirroringSpec struct {
 	// Enabled controls whether segment mirroring is active.
 	// +kubebuilder:default=true
 	// +optional
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled"`
 
 	// Layout defines the mirror placement strategy.
 	// +kubebuilder:validation:Enum=group;spread

@@ -1,0 +1,112 @@
+# Scenario 25: Bootstrap Workload Management via CRD
+#
+# This scenario demonstrates how the operator reconciles workload management
+# configuration from the CloudberryCluster CRD spec into the database.
+#
+# When the operator detects that workload management is enabled in the CRD:
+#   1. It connects to the coordinator via the DB client factory
+#   2. Lists existing resource groups from the database
+#   3. Diffs desired (CRD spec) vs actual (database) resource groups
+#   4. Creates new resource groups that are in the spec but not in the DB
+#   5. Alters existing resource groups whose parameters have changed
+#   6. Drops resource groups that are in the DB but not in the spec
+#   7. Stores workload rules and idle session rules in a ConfigMap
+#   8. Updates Prometheus metrics with resource group usage from the DB
+#
+# Architecture:
+#   CloudberryCluster CRD --> Admin Controller --> DB Client Factory
+#                                                   --> Coordinator (SQL DDL)
+#                             Admin Controller --> ConfigMap (workload rules)
+#                             Admin Controller --> Prometheus (usage metrics)
+#
+# The reconciliation is idempotent: running it multiple times with the same
+# spec produces no additional changes. Resource groups that already match
+# the desired state are left untouched.
+#
+# Fallback behavior:
+#   - If the DB client factory is nil (e.g., unit tests), the operator falls
+#     back to condition-only mode: it sets the WorkloadConfigured condition
+#     and emits events, but does not perform any DB operations.
+#   - If the DB client cannot be created (e.g., coordinator is down), the
+#     operator sets WorkloadConfigured=False with reason "DBUnavailable"
+#     and does not fail the overall reconciliation.
+#
+# ConfigMap storage:
+#   Workload rules and idle session rules are serialized to JSON and stored
+#   in a ConfigMap named "{cluster}-workload-rules" in the cluster namespace.
+#   The ConfigMap has owner references to the cluster for garbage collection.
+#
+# ============================================================================
+
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: workload-bootstrap
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    replicas: 1
+    port: 5432
+    storage:
+      size: "10Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    storage:
+      size: "20Gi"
+    mirroring:
+      enabled: true
+      layout: group
+  auth:
+    basic:
+      adminUser: gpadmin
+      adminPasswordSecret: workload-bootstrap-admin-password
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: analytics
+        concurrency: 20
+        cpuMaxPercent: 60
+        cpuWeight: 100
+        memoryLimit: 40
+      - name: etl_batch
+        concurrency: 5
+        cpuMaxPercent: 30
+        cpuWeight: 50
+        memoryLimit: 20
+      - name: adhoc_queries
+        concurrency: 10
+        cpuMaxPercent: 20
+        cpuWeight: 30
+        memoryLimit: 15
+        minCost: 500
+    rules:
+      - name: cancel-long-running
+        action: cancel
+        thresholdType: running_time
+        threshold: "3600"
+        priority: 1
+      - name: move-heavy-to-etl
+        action: move
+        thresholdType: cpu_skew
+        threshold: "80"
+        moveTarget: etl_batch
+        priority: 2
+      - name: log-slow-queries
+        action: log
+        thresholdType: running_time
+        threshold: "300"
+        priority: 3
+    idleRules:
+      - name: idle-analytics
+        resourceGroup: analytics
+        idleTimeout: "30m"
+        excludeInTransaction: true
+        terminateMessage: "Session terminated due to 30m idle timeout"
+      - name: idle-adhoc
+        resourceGroup: adhoc_queries
+        idleTimeout: "15m"
+        terminateMessage: "Ad-hoc session terminated due to 15m idle timeout"

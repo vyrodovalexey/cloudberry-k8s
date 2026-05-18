@@ -142,6 +142,7 @@ For each `CloudberryCluster`, the operator creates and manages:
 | Service | `{cluster}-client` | ClusterIP service for client access |
 | ConfigMap | `{cluster}-postgresql-conf` | PostgreSQL configuration |
 | ConfigMap | `{cluster}-pg-hba-conf` | Host-based authentication rules |
+| ConfigMap | `{cluster}-workload-rules` | Workload rules and idle session rules (JSON) |
 | Secret | `{cluster}-admin-password` | Admin credentials (auto-created by operator if not present) |
 | Job | `{cluster}-recovery-{timestamp}` | Recovery operations |
 | Job | `{cluster}-maintenance-{timestamp}` | Maintenance operations |
@@ -243,6 +244,7 @@ CloudberryCluster
 | `ScaleOutFailed` | Scale-out operation failed. Reason: `SegmentsNotReady` — segments did not become ready within the 10-minute timeout |
 | `UpgradeCompleted` | Cluster upgrade completed successfully. Reason: `UpgradeSucceeded` — all phases passed and verification succeeded |
 | `UpgradeFailed` | Cluster upgrade failed and was rolled back. Reason: `RolledBack` — a phase timed out after 10 minutes |
+| `WorkloadConfigured` | Workload management reconciled. Reason values: `WorkloadReconciled`, `DBUnavailable` |
 | `VaultConnected` | Vault connection is established (if enabled) |
 
 ### Printer Columns
@@ -302,7 +304,9 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - Uses a **finalizer** (`avsoft.io/finalizer`) to ensure cleanup before deletion
 - Supports **annotation-based actions** for start, stop, restart operations
 - Checks **action annotations before generation skip** — annotations don't change the CRD generation, so they must be processed before the `ObservedGeneration` check
+- **Annotation removal after processing** — action annotations are removed only after successful processing. If the handler fails, the annotation remains and the action is retried on the next reconciliation cycle
 - Handles **lifecycle phases** (`Stopped`, `Stopping`, `Restricted`, `Maintenance`) that short-circuit normal reconciliation when no action annotation is pending
+- **Lifecycle phase errors are logged** — errors during phase transitions (e.g., failed stop or start) are logged at WARN level rather than silently ignored
 - Implements **create-or-update** pattern for idempotent resource management
 - **Requeues** every 30 seconds for periodic health checks (10 seconds on error, 5 seconds during stopping)
 - Emits **Kubernetes events** for state transitions (Stopping, Stopped, Starting, Started, Restarting, Restarted)
@@ -625,7 +629,7 @@ Manages authentication configuration:
 
 ### Admin Controller
 
-Manages configuration, rolling restarts, and maintenance:
+Manages configuration, rolling restarts, maintenance, and workload management:
 
 1. Detects parameter changes via hash comparison
 2. Classifies changed parameters using `restartRequiredParams` map (shared_buffers, max_connections, wal_level, etc.)
@@ -641,6 +645,50 @@ Manages configuration, rolling restarts, and maintenance:
 7. Monitors Job completion and cleans up finished Jobs
 8. Performs a single consolidated status update per reconciliation cycle to reduce API server load
 9. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
+10. **Workload reconciliation** (`reconcileWorkload()`): When `spec.workload.enabled` is true, reconciles resource groups, workload rules, and idle session rules:
+
+**Workload reconciliation flow:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Workload Reconciliation Flow                         │
+│                                                                   │
+│  reconcileWorkload()                                              │
+│    │                                                              │
+│    ├── spec.workload.enabled == false? → skip                     │
+│    │                                                              │
+│    ├── dbFactory == nil? → condition-only mode                    │
+│    │   └── Set WorkloadConfigured (condition only, no DB ops)     │
+│    │                                                              │
+│    ├── dbFactory.NewClient() fails?                               │
+│    │   └── Set WorkloadConfigured=False/DBUnavailable             │
+│    │       (reconciliation continues, no error returned)          │
+│    │                                                              │
+│    └── DB available:                                              │
+│         │                                                         │
+│         ├── 1. Resource Group Diff                                │
+│         │   ├── ListResourceGroups() → actual groups from DB      │
+│         │   ├── Build desired map from spec.workload.resourceGroups│
+│         │   ├── For each desired not in actual:                   │
+│         │   │   └── CreateResourceGroup(opts)                     │
+│         │   ├── For each desired in actual with changed params:   │
+│         │   │   └── AlterResourceGroup(opts)                      │
+│         │   └── For each actual not in desired:                   │
+│         │       └── DropResourceGroup(name)                       │
+│         │                                                         │
+│         ├── 2. ConfigMap Storage                                  │
+│         │   ├── Serialize spec.workload.rules → rules.json        │
+│         │   ├── Serialize spec.workload.idleRules → idle-rules.json│
+│         │   └── Create/Update {cluster}-workload-rules ConfigMap  │
+│         │                                                         │
+│         ├── 3. Metrics Update                                     │
+│         │   └── For each resource group:                          │
+│         │       └── GetResourceGroupUsage() → update CPU/mem      │
+│         │           metrics gauges                                 │
+│         │                                                         │
+│         └── 4. Set WorkloadConfigured=True/WorkloadReconciled     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Authentication Architecture
 
@@ -957,6 +1005,7 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
 - **Scale metrics**: `cloudberry_scale_operations_total`, `cloudberry_redistribution_progress`
 - **Mirroring metrics**: `cloudberry_mirroring_operations_total`, `cloudberry_replication_lag_bytes`
+- **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`
 
 ### Tracing (OpenTelemetry)
 
@@ -1169,7 +1218,9 @@ When a request arrives from an IP within a trusted proxy range, the rate limiter
 ### Input Validation
 
 - **Body size limit**: All request bodies are limited to 1 MiB via `http.MaxBytesReader`
+- **Path parameter validation**: All path parameters (cluster name, namespace, resource group name, role name) are validated against a SQL identifier regex (`^[a-zA-Z_][a-zA-Z0-9_-]*$`) to prevent injection attacks. Invalid parameters return `400 INVALID_REQUEST`
 - **Name validation**: Cluster and namespace names are validated against DNS-1123 subdomain format
+- **Recovery type validation**: The recovery endpoint accepts only `incremental`, `full`, or `differential` as valid recovery types. Other values return `400 INVALID_REQUEST`
 - **Security headers**: All responses include `X-Content-Type-Options`, `X-Frame-Options`, `Strict-Transport-Security`, and other security headers
 
 ### HTTP Server Timeouts
@@ -1184,7 +1235,7 @@ The API server configures explicit timeouts on the `http.Server` to prevent reso
 
 ### API Server Lifecycle
 
-The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled. During shutdown, the rate limiter's `Stop()` method is called to terminate the background cleanup goroutine and prevent goroutine leaks.
+The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled. During shutdown, `Server.Close()` is called, which invokes the rate limiter's `Stop()` method to terminate the background cleanup goroutine and prevent goroutine leaks. This ensures all resources are properly released on operator shutdown.
 
 ## DBClientFactory Pattern
 
@@ -1216,6 +1267,7 @@ Both controllers and the API server use the factory instead of creating database
 **Key behaviors:**
 - Reads the admin password from the cluster's `{cluster}-admin-password` Secret
 - Resolves the coordinator service endpoint as `{cluster}-coordinator.{namespace}.svc`
+- Respects the cluster's SSL configuration (`spec.auth.ssl`): `disable` (no SSL), `require` (SSL without verification), or `verify-full` (SSL with CA verification)
 - Configures retry options with exponential backoff
 - Returns a `Client` interface for testability
 
@@ -1362,6 +1414,18 @@ Server certificates include the following Subject Alternative Names:
 | `VaultPKIMountPath` | Vault PKI engine mount path | `pki` |
 | `VaultPKIRole` | Vault PKI role name | `cloudberry-operator` |
 | `CertValidityDuration` | Certificate validity period | `365d` |
+
+## Admin Password Persistence
+
+The operator REST API admin password is persisted to a Kubernetes Secret (`cloudberry-operator-admin-password`) in the operator's namespace. This ensures the password survives operator pod restarts.
+
+**Startup behavior:**
+
+1. If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it and persists it to the Secret
+2. If the Secret already exists (from a previous run), the operator reads the password from it
+3. If neither the env var nor the Secret exists, the operator auto-generates a cryptographically secure random password, persists it to the Secret, and logs a warning
+
+This eliminates the previous behavior where a new random password was generated on every restart when `CLOUDBERRY_API_ADMIN_PASSWORD` was not set, which made API access unreliable across pod restarts.
 
 ## Design Principles
 

@@ -56,8 +56,10 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      - run: govulncheck ./...
+      - run: |
+          go get golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
 
   unit-tests:
     name: Unit Tests

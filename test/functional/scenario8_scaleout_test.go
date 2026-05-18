@@ -432,7 +432,7 @@ func (s *Scenario8ScaleOutSuite) TestScenario8_ScaleStatusAPI() {
 	err = env.Client.Status().Update(s.ctx, current)
 	require.NoError(s.T(), err, "updating cluster status should succeed")
 
-	apiServer := api.NewServer(env.Client, nil, nil, &metrics.NoopRecorder{}, slog.Default())
+	apiServer := api.NewServer(env.Client, nil, nil, &metrics.NoopRecorder{}, slog.Default(), 0)
 	handler := apiServer.Handler()
 
 	// Act: GET /clusters/{name}/scale/status.

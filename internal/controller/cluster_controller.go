@@ -195,7 +195,10 @@ func (r *ClusterReconciler) handleLifecyclePhase(
 		return ctrl.Result{}, true
 
 	case cbv1alpha1.ClusterPhaseStopping:
-		result, _ := r.checkStopProgress(ctx, cluster)
+		result, err := r.checkStopProgress(ctx, cluster)
+		if err != nil {
+			logger.Error("error checking stop progress", "error", err)
+		}
 		return result, true
 
 	case cbv1alpha1.ClusterPhaseRestricted, cbv1alpha1.ClusterPhaseMaintenance:
@@ -205,16 +208,25 @@ func (r *ClusterReconciler) handleLifecyclePhase(
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true
 
 	case cbv1alpha1.ClusterPhaseScaling:
-		result, _ := r.checkScaleProgress(ctx, cluster)
+		result, err := r.checkScaleProgress(ctx, cluster)
+		if err != nil {
+			logger.Error("error checking scale progress", "error", err)
+		}
 		return result, true
 
 	case cbv1alpha1.ClusterPhaseUpdating:
 		// Check if this is a mirroring operation (vs upgrade).
 		if cluster.Annotations[util.AnnotationMirroringState] != "" {
-			result, _ := r.checkMirroringProgress(ctx, cluster)
+			result, err := r.checkMirroringProgress(ctx, cluster)
+			if err != nil {
+				logger.Error("error checking mirroring progress", "error", err)
+			}
 			return result, true
 		}
-		result, _ := r.continueUpgrade(ctx, cluster)
+		result, err := r.continueUpgrade(ctx, cluster)
+		if err != nil {
+			logger.Error("error continuing upgrade", "error", err)
+		}
 		return result, true
 
 	default:
@@ -1187,6 +1199,8 @@ func (r *ClusterReconciler) deletePVCs(ctx context.Context, cluster *cbv1alpha1.
 }
 
 // handleAction processes annotation-based actions.
+// The annotation is removed AFTER successful processing so that failed actions
+// are retried on the next reconciliation.
 func (r *ClusterReconciler) handleAction(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -1195,7 +1209,30 @@ func (r *ClusterReconciler) handleAction(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling action", "action", action)
 
-	// Remove the action annotation using a MergePatch to avoid conflicts with stale objects.
+	// Process the action first — annotation removal happens only on success.
+	var result ctrl.Result
+	var actionErr error
+
+	switch action {
+	case util.ActionStart, util.ActionStartRestricted, util.ActionStartMaintenance:
+		result, actionErr = r.handleStart(ctx, cluster, action)
+	case util.ActionStop, util.ActionStopFast, util.ActionStopImmediate:
+		result, actionErr = r.handleStop(ctx, cluster, action)
+	case util.ActionRestart:
+		result, actionErr = r.handleRestart(ctx, cluster)
+	default:
+		logger.Warn("unknown action", "action", action)
+		// Unknown actions are removed to prevent infinite reconciliation loops.
+	}
+
+	if actionErr != nil {
+		// Action failed — leave the annotation in place for retry on next reconcile.
+		logger.Error("action processing failed, annotation retained for retry",
+			"action", action, "error", actionErr)
+		return result, actionErr
+	}
+
+	// Action succeeded — remove the annotation using a MergePatch to avoid conflicts.
 	annotationKey := util.AnnotationAction
 	patchData, err := json.Marshal(map[string]interface{}{
 		"metadata": map[string]interface{}{
@@ -1209,7 +1246,7 @@ func (r *ClusterReconciler) handleAction(
 	}
 
 	if patchErr := r.client.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patchData)); patchErr != nil {
-		logger.Error("failed to remove action annotation", "error", patchErr)
+		logger.Error("failed to remove action annotation after successful processing", "error", patchErr)
 		return ctrl.Result{}, fmt.Errorf("removing action annotation: %w", patchErr)
 	}
 
@@ -1221,17 +1258,7 @@ func (r *ClusterReconciler) handleAction(
 		return ctrl.Result{}, fmt.Errorf("re-fetching cluster after annotation removal: %w", fetchErr)
 	}
 
-	switch action {
-	case util.ActionStart, util.ActionStartRestricted, util.ActionStartMaintenance:
-		return r.handleStart(ctx, cluster, action)
-	case util.ActionStop, util.ActionStopFast, util.ActionStopImmediate:
-		return r.handleStop(ctx, cluster, action)
-	case util.ActionRestart:
-		return r.handleRestart(ctx, cluster)
-	default:
-		logger.Warn("unknown action", "action", action)
-		return ctrl.Result{}, nil
-	}
+	return result, nil
 }
 
 // handleStop processes stop actions (stop, stop-fast, stop-immediate).

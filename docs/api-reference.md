@@ -627,7 +627,7 @@ curl -u admin:password -X POST \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | `incremental`, `full`, or `differential` |
+| `type` | string | Yes | `incremental`, `full`, or `differential`. Other values are rejected with `400 INVALID_REQUEST` |
 | `targetSegments` | int[] | No | Specific segments to recover (all failed if omitted) |
 | `targetNode` | string | No | Target node for recovery (in-place if omitted) |
 | `parallelStreams` | int | No | Parallel copy streams for differential recovery |
@@ -638,6 +638,17 @@ curl -u admin:password -X POST \
 {
   "status": "recovery started",
   "type": "incremental"
+}
+```
+
+**Error (400 Bad Request — invalid recovery type):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "invalid recovery type \"partial\": must be one of incremental, full, differential"
+  }
 }
 ```
 
@@ -1562,6 +1573,8 @@ The API validates all input parameters:
 |-----------|------|------------|
 | Cluster name | Must be a valid DNS-1123 subdomain (lowercase alphanumeric, `-`, max 253 chars) | `INVALID_REQUEST` |
 | Namespace | Must be a valid DNS-1123 subdomain (if provided) | `INVALID_REQUEST` |
+| Path parameters | All path parameters (cluster name, namespace, resource group name, role name) are validated against a SQL identifier regex (`^[a-zA-Z_][a-zA-Z0-9_-]*$`). This prevents SQL injection and path traversal attacks | `INVALID_REQUEST` |
+| Recovery type | Must be one of `incremental`, `full`, or `differential`. Other values are rejected | `INVALID_REQUEST` |
 | PID (sessions) | Must be a valid positive integer (> 0). Zero, negative, and non-numeric values are rejected | `INVALID_REQUEST` |
 | Request body | Must be valid JSON | `INVALID_REQUEST` |
 | Body size | Must not exceed 1 MiB | `INVALID_REQUEST` |
