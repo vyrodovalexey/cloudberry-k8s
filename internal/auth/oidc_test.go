@@ -772,15 +772,20 @@ func TestOIDCProvider_MatchRole_EmptyStrings(t *testing.T) {
 // Verify that the redirect limit works.
 func TestNewOIDCProvider_RedirectLimit(t *testing.T) {
 	redirectCount := 0
+	// Use a mutable variable so the handler can reference the server URL
+	// without relying on user-controlled request data for the redirect target.
+	var serverURL string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		redirectCount++
 		if strings.Contains(r.URL.Path, "openid-configuration") {
-			http.Redirect(w, r, r.URL.String()+"?r="+fmt.Sprint(redirectCount), http.StatusFound)
+			target := serverURL + r.URL.Path + "?r=" + fmt.Sprint(redirectCount)
+			http.Redirect(w, r, target, http.StatusFound)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	serverURL = server.URL
 
 	cfg := OIDCConfig{
 		IssuerURL: server.URL,

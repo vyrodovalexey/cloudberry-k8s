@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,10 +26,16 @@ const (
 var dummyHash []byte
 
 func init() {
-	// Generate a bcrypt hash at init time instead of using a constant value.
-	h, err := bcrypt.GenerateFromPassword([]byte("cloudberry-dummy-hash-init-value"), bcrypt.DefaultCost)
+	// Generate a bcrypt hash from random bytes at init time.
+	// The value is never matched against real credentials; it exists solely
+	// so that a bcrypt comparison is performed even when the user is not found,
+	// ensuring constant-time behavior to prevent timing attacks.
+	randomBytes := make([]byte, 32)
+	if _, err := rand.Read(randomBytes); err != nil {
+		panic(fmt.Sprintf("failed to generate random bytes for dummy hash: %v", err))
+	}
+	h, err := bcrypt.GenerateFromPassword(randomBytes, bcrypt.DefaultCost)
 	if err != nil {
-		// This should never fail with a valid input; panic during init is acceptable.
 		panic(fmt.Sprintf("failed to generate dummy bcrypt hash: %v", err))
 	}
 	dummyHash = h
