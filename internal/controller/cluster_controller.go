@@ -168,7 +168,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.recordReconcileResult(cluster, startTime, "success")
 	logger.Info("reconciliation completed", "duration", time.Since(startTime))
-	logger.Debug("reconciliation result", "requeue", result.Requeue, "requeueAfter", result.RequeueAfter)
+	logger.Debug("reconciliation result", "requeue", result.RequeueAfter > 0, "requeueAfter", result.RequeueAfter)
 	return result, nil
 }
 
