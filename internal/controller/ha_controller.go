@@ -629,14 +629,57 @@ func (r *HAReconciler) executeRebalanceViaDB(
 		return nil
 	}
 
-	// Rebalance tables with bounded concurrency.
+	return r.dispatchRebalanceTables(ctx, logger, dbClient, tablesToRebalance, parallelism)
+}
+
+// interTableDelay is the pause between dispatching rebalance goroutines to
+// rate-limit database operations and prevent overwhelming the cluster.
+const interTableDelay = 100 * time.Millisecond
+
+// dispatchRebalanceTables dispatches concurrent rebalance operations for the
+// given tables with bounded concurrency and inter-table rate limiting.
+func (r *HAReconciler) dispatchRebalanceTables(
+	ctx context.Context,
+	logger *slog.Logger,
+	dbClient db.Client,
+	tablesToRebalance []db.TableSkewInfo,
+	parallelism int32,
+) error {
 	sem := make(chan struct{}, parallelism)
 	errCh := make(chan error, len(tablesToRebalance))
 
+	var dispatched int
 	for _, info := range tablesToRebalance {
-		sem <- struct{}{}
+		// Check context cancellation before acquiring the semaphore to avoid
+		// goroutine leaks when the parent context is canceled.
+		select {
+		case <-ctx.Done():
+			logger.Warn("context canceled, stopping rebalance dispatch",
+				"dispatched", dispatched, "total", len(tablesToRebalance))
+			goto waitForCompletion
+		case sem <- struct{}{}:
+			// Semaphore acquired — proceed.
+		}
+
+		// Add a small delay between dispatching goroutines to rate-limit
+		// database operations and prevent overwhelming the cluster.
+		if dispatched > 0 {
+			if err := waitWithContext(ctx, interTableDelay); err != nil {
+				logger.Warn("context canceled during inter-table delay",
+					"dispatched", dispatched, "total", len(tablesToRebalance))
+				goto waitForCompletion
+			}
+		}
+
+		dispatched++
 		go func(ti db.TableSkewInfo) {
 			defer func() { <-sem }()
+			// Check context cancellation before starting the rebalance operation.
+			if ctx.Err() != nil {
+				logger.Warn("context canceled, skipping table rebalance",
+					"database", ti.Database, "table", ti.Schema+"."+ti.Table)
+				return
+			}
 			rebalanceErr := dbClient.RebalanceTable(ctx, ti.Database, ti.Schema, ti.Table, ti.DistributionKey)
 			if rebalanceErr != nil {
 				logger.Error("failed to rebalance table",
@@ -650,7 +693,8 @@ func (r *HAReconciler) executeRebalanceViaDB(
 		}(info)
 	}
 
-	// Wait for all goroutines to finish.
+waitForCompletion:
+	// Wait for all dispatched goroutines to finish.
 	for range cap(sem) {
 		sem <- struct{}{}
 	}
@@ -671,6 +715,17 @@ func (r *HAReconciler) executeRebalanceViaDB(
 	}
 
 	return nil
+}
+
+// waitWithContext waits for the specified duration or until the context is canceled.
+// Returns nil if the duration elapsed, or the context error if canceled.
+func waitWithContext(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // isTableExcluded checks if a table name matches any exclusion pattern.

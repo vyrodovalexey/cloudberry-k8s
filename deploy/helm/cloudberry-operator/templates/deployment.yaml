@@ -52,6 +52,24 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.vault.enabled }}
+            - name: CLOUDBERRY_VAULT_ENABLED
+              value: "true"
+            - name: CLOUDBERRY_VAULT_ADDRESS
+              value: {{ .Values.vault.address | quote }}
+            - name: CLOUDBERRY_VAULT_AUTH_METHOD
+              value: {{ .Values.vault.authMethod | quote }}
+            - name: CLOUDBERRY_VAULT_AUTH_PATH
+              value: {{ .Values.vault.authPath | quote }}
+            - name: CLOUDBERRY_VAULT_ROLE
+              value: {{ .Values.vault.role | quote }}
+            - name: CLOUDBERRY_VAULT_SECRET_PATH
+              value: {{ .Values.vault.secretPath | quote }}
+            {{- if and (eq .Values.vault.authMethod "token") .Values.vault.token }}
+            - name: CLOUDBERRY_VAULT_TOKEN
+              value: {{ .Values.vault.token | quote }}
+            {{- end }}
+            {{- end }}
             {{- if and .Values.oidc.enabled (or .Values.oidc.existingSecret .Values.oidc.clientSecret) }}
             - name: CLOUDBERRY_OIDC_CLIENT_SECRET
               valueFrom:
@@ -59,7 +77,23 @@ spec:
                   name: {{ include "cloudberry-operator.oidcSecretName" . }}
                   key: {{ .Values.oidc.existingSecretKey | default "client-secret" }}
             {{- end }}
+            {{- if .Values.telemetry.enabled }}
+            - name: CLOUDBERRY_TELEMETRY_ENABLED
+              value: "true"
+            - name: CLOUDBERRY_TELEMETRY_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlpEndpoint | quote }}
+            - name: CLOUDBERRY_TELEMETRY_OTLP_PROTOCOL
+              value: {{ .Values.telemetry.otlpProtocol | quote }}
+            - name: CLOUDBERRY_TELEMETRY_OTLP_INSECURE
+              value: {{ .Values.telemetry.otlpInsecure | quote }}
+            - name: CLOUDBERRY_TELEMETRY_SAMPLING_RATE
+              value: {{ .Values.telemetry.samplingRate | quote }}
+            - name: CLOUDBERRY_TELEMETRY_SERVICE_NAME
+              value: {{ .Values.telemetry.serviceName | quote }}
+            {{- end }}
             {{- if .Values.webhook.enabled }}
+            - name: CLOUDBERRY_WEBHOOK_ENABLED
+              value: "true"
             - name: CLOUDBERRY_WEBHOOK_CERT_SOURCE
               value: {{ .Values.webhook.certSource | quote }}
             - name: CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME
@@ -68,9 +102,9 @@ spec:
               value: {{ include "cloudberry-operator.webhookServiceName" . }}
             {{- if eq .Values.webhook.certSource "vault-pki" }}
             - name: CLOUDBERRY_WEBHOOK_VAULT_PKI_MOUNT
-              value: {{ .Values.webhook.vaultPKI.mountPath | quote }}
+              value: {{ .Values.webhook.vaultPKI.mountPath | default .Values.vault.pkiMountPath | quote }}
             - name: CLOUDBERRY_WEBHOOK_VAULT_PKI_ROLE
-              value: {{ .Values.webhook.vaultPKI.role | quote }}
+              value: {{ .Values.webhook.vaultPKI.role | default .Values.vault.pkiRole | quote }}
             {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}

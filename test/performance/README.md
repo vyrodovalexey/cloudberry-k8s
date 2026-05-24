@@ -84,7 +84,8 @@ Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API serve
 
 ### Test Infrastructure Status
 
-- All unit, functional, integration, and e2e tests pass
+- All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38)
+- Overall test coverage: **91.3%** (`internal/controller`: 90.1%, `cmd/cloudberry-ctl`: 91.6%)
 - Docker images build successfully (`make docker-build`)
 - Helm chart deploys to local Kubernetes clusters
 - Monitoring stack (vmagent, otel-collector) can be deployed alongside the operator
@@ -494,6 +495,64 @@ chmod +x run-perftest.sh
 - Check Docker volume mounts
 - Ensure `.yandextank/` directory exists and is writable
 - Check Yandex Tank output for configuration errors
+
+## Performance Test Results (2026-05-19)
+
+The latest performance test was run on 2026-05-19 against a live operator deployment with a Scenario 1 cluster (4 segments, mirroring InSync). The test used `hey` (Go HTTP load generator) on macOS with `kubectl port-forward` to the operator pod.
+
+### Summary
+
+| Category | Result |
+|----------|--------|
+| Health Endpoints | **Excellent** — p50=2.7ms, 0% errors, 12,637 RPS peak |
+| API Endpoints | **Needs Improvement** — p50=605ms (bcrypt bottleneck), ~6 RPS max |
+| Stability | **Excellent** — Zero errors across 287,122 requests |
+| Memory | **Stable** — 82MB resident, 19MB heap, no growth |
+
+### Health Endpoint Results (Sustained ~1000 RPS, 60 seconds)
+
+| Metric | Value |
+|--------|-------|
+| p50 Latency | 2.7ms |
+| p95 Latency | 6.5ms |
+| p99 Latency | 10.6ms |
+| Peak RPS | 12,637 (at 1,000 concurrent connections) |
+| Error Rate | 0% |
+
+### API Endpoint Results (2 concurrent connections)
+
+| Metric | Value |
+|--------|-------|
+| p50 Latency | 605ms |
+| p95 Latency | 794ms |
+| p99 Latency | 885ms |
+| Throughput | ~3.3 RPS |
+| Error Rate | 0% |
+
+### Latency Breakdown (API Endpoints)
+
+| Component | Contribution | Percentage |
+|-----------|-------------|------------|
+| bcrypt auth (cost 10) | ~100ms/req | ~80% |
+| Kubernetes API call | ~20-30ms/req | ~16% |
+| HTTP/JSON overhead | ~5ms/req | ~4% |
+
+### Stress Test — Health Endpoints vs Concurrency
+
+| Concurrency | RPS | p50 | p95 | p99 | Errors |
+|-------------|-----|-----|-----|-----|--------|
+| 10 | 6,598 | 1.4ms | 2.1ms | 3.0ms | 0% |
+| 100 | 5,644 | 5.5ms | 52.5ms | 179.3ms | 0% |
+| 500 | 11,272 | 39.7ms | 84.8ms | 235.3ms | 0% |
+| 1,000 | 12,637 | 72.8ms | 117.5ms | 337.2ms | 0% |
+
+### Recommendations
+
+1. **Implement JWT token-based auth** after initial bcrypt login to reduce API latency from ~600ms to ~30ms
+2. **Expose REST API port (8090) in the operator Service** to eliminate port-forward overhead
+3. **Increase rate limit** for performance testing environments (`CLOUDBERRY_API_RATE_LIMIT=10000`)
+
+Full test report: `.yandextank/perftest_20260519_140320/REPORT.md`
 
 ## API Endpoints Under Test
 

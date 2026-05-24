@@ -66,7 +66,7 @@ func TestClusterReconciler_ContinueUpgrade_PrimariesPhase(t *testing.T) {
 
 	result, err := r.continueUpgrade(context.Background(), cluster)
 	require.NoError(t, err)
-	_ = result
+	assert.True(t, result.Requeue || result.RequeueAfter > 0, "expected requeue after primaries phase")
 }
 
 func TestClusterReconciler_ContinueUpgrade_VerifyPhase(t *testing.T) {
@@ -109,7 +109,7 @@ func TestClusterReconciler_ContinueUpgrade_VerifyPhase(t *testing.T) {
 
 	result, err := r.continueUpgrade(context.Background(), cluster)
 	require.NoError(t, err)
-	_ = result
+	assert.True(t, result.Requeue || result.RequeueAfter > 0, "expected requeue after verify phase")
 }
 
 // ============================================================================
@@ -377,6 +377,8 @@ func TestClusterReconciler_HandleStart_RestrictedWithStandby(t *testing.T) {
 
 	result, err := r.handleStart(context.Background(), cluster, util.ActionStartRestricted)
 	require.NoError(t, err)
+	// Restricted mode should set phase to Restricted
+	assert.Equal(t, cbv1alpha1.ClusterPhaseRestricted, cluster.Status.Phase)
 	_ = result
 }
 

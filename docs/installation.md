@@ -434,9 +434,34 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 For local development, the Docker Compose test environment includes VictoriaMetrics (port 8428), Grafana (port 3000), and Tempo (ports 3200/4317/4318) pre-configured for metrics and tracing.
 
-#### Kubernetes Monitoring Charts
+#### Kubernetes Monitoring Stack (Makefile Targets)
 
-The `monitoring/` directory contains deployment configurations for vmagent (VictoriaMetrics agent) and otel-collector (OpenTelemetry Collector) that can be deployed alongside the operator in a Kubernetes cluster:
+The Makefile provides dedicated targets for deploying the monitoring stack (vmagent + OpenTelemetry Collector) to a Kubernetes cluster:
+
+```bash
+# Deploy the monitoring stack (vmagent + otel-collector)
+make monitoring-deploy
+
+# Check the status of the monitoring stack
+make monitoring-status
+
+# Remove the monitoring stack
+make monitoring-undeploy
+```
+
+**`monitoring-deploy`** installs:
+- **vmagent** (via `prometheus-community/prometheus` Helm chart) — Prometheus-compatible metrics collection agent with server, alertmanager, and exporters disabled (agent-only mode)
+- **otel-collector** (via `open-telemetry/opentelemetry-collector` Helm chart) — OpenTelemetry Collector with OTLP gRPC (port 4317) and HTTP (port 4318) receivers
+
+Both are deployed to the `cloudberry-test` namespace by default (configurable via `NAMESPACE_TEST` Make variable).
+
+**`monitoring-status`** shows the Helm release status and running pods for both components.
+
+**`monitoring-undeploy`** removes both Helm releases from the namespace.
+
+#### Manual Monitoring Deployment
+
+The `monitoring/` directory also contains raw deployment configurations for vmagent and otel-collector that can be applied directly:
 
 ```bash
 # Deploy vmagent for Prometheus-compatible metrics collection
@@ -446,7 +471,52 @@ kubectl apply -f monitoring/vmagent/
 kubectl apply -f monitoring/otel-collector/
 ```
 
-These charts are pre-configured to scrape the operator's `/metrics` endpoint and receive OTLP traces on ports 4317 (gRPC) and 4318 (HTTP).
+These configurations are pre-configured to scrape the operator's `/metrics` endpoint and receive OTLP traces on ports 4317 (gRPC) and 4318 (HTTP).
+
+#### Vault-PKI Webhook Certificate Setup
+
+For production deployments using Vault PKI for webhook certificates, follow these steps:
+
+1. **Enable the PKI secrets engine** in Vault:
+
+   ```bash
+   vault secrets enable -path=pki pki
+   vault write pki/root/generate/internal \
+     common_name="cloudberry-operator-ca" ttl=87600h
+   ```
+
+2. **Create a PKI role** that allows issuing certificates for the webhook service DNS names:
+
+   ```bash
+   vault write pki/roles/cloudberry-operator \
+     allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local" \
+     allow_subdomains=true max_ttl=8760h
+   ```
+
+3. **Deploy the operator** with Vault PKI webhook certificates:
+
+   ```bash
+   helm install cloudberry-operator deploy/helm/cloudberry-operator \
+     --namespace cloudberry-system \
+     --set webhook.enabled=true \
+     --set webhook.certSource=vault-pki \
+     --set webhook.vaultPKI.mountPath=pki \
+     --set webhook.vaultPKI.role=cloudberry-operator \
+     --set vault.enabled=true \
+     --set vault.address=http://vault:8200
+   ```
+
+4. **Verify** the webhook certificates are issued and injected:
+
+   ```bash
+   # Check the certificate Secret
+   kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
+
+   # Verify the CA bundle is injected into webhook configurations
+   kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
+   ```
+
+The operator automatically rotates certificates when 2/3 of their lifetime has elapsed. CA bundle injection into webhook configurations uses retry with exponential backoff to handle transient API server errors during operator startup. See [Webhook Certificate Configuration](#webhook-certificate-configuration) for additional options.
 
 ## Upgrading
 

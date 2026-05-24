@@ -75,7 +75,19 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCConfig, logger *slog.Logger) (
 		cfg.RoleMatchMode = "exact"
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	// maxOIDCRedirects limits the number of HTTP redirects the OIDC client
+	// will follow to prevent redirect loops and forging attacks.
+	const maxOIDCRedirects = 5
+
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= maxOIDCRedirects {
+				return fmt.Errorf("OIDC HTTP client stopped after %d redirects", maxOIDCRedirects)
+			}
+			return nil
+		},
+	}
 	oidcCtx := gooidc.ClientContext(ctx, httpClient)
 
 	provider, err := gooidc.NewProvider(oidcCtx, cfg.IssuerURL)

@@ -2491,3 +2491,234 @@ func TestPgxClient_GetAgeRecommendations_InfoSeverity(t *testing.T) {
 	require.Len(t, recs, 1)
 	assert.Equal(t, severityInfo, recs[0].Severity)
 }
+
+// ============================================================================
+// FormatIOLimits Tests
+// ============================================================================
+
+func TestFormatIOLimits(t *testing.T) {
+	tests := []struct {
+		name     string
+		limits   []IOLimitOption
+		expected string
+	}{
+		{
+			name:     "empty limits",
+			limits:   nil,
+			expected: "",
+		},
+		{
+			name:     "empty slice",
+			limits:   []IOLimitOption{},
+			expected: "",
+		},
+		{
+			name: "single tablespace",
+			limits: []IOLimitOption{
+				{Tablespace: "pg_default", ReadBytesPerSec: 1000, WriteBytesPerSec: 500, ReadIOPS: 100, WriteIOPS: 50},
+			},
+			expected: "pg_default:rbps=1000:wbps=500:riops=100:wiops=50",
+		},
+		{
+			name: "multiple tablespaces",
+			limits: []IOLimitOption{
+				{Tablespace: "pg_default", ReadBytesPerSec: 1000, WriteBytesPerSec: 500, ReadIOPS: 100, WriteIOPS: 50},
+				{Tablespace: "fast_ssd", ReadBytesPerSec: 5000, WriteBytesPerSec: 3000, ReadIOPS: 500, WriteIOPS: 300},
+			},
+			expected: "pg_default:rbps=1000:wbps=500:riops=100:wiops=50;fast_ssd:rbps=5000:wbps=3000:riops=500:wiops=300",
+		},
+		{
+			name: "zero values",
+			limits: []IOLimitOption{
+				{Tablespace: "ts1", ReadBytesPerSec: 0, WriteBytesPerSec: 0, ReadIOPS: 0, WriteIOPS: 0},
+			},
+			expected: "ts1:rbps=0:wbps=0:riops=0:wiops=0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FormatIOLimits(tt.limits)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// ============================================================================
+// ListSessionsWithResourceGroup Tests (via mock PG server)
+// ============================================================================
+
+func TestPgxClient_ListSessionsWithResourceGroup_Mock(t *testing.T) {
+	sessionFields := []fieldDesc{
+		int4Field("pid"), textField("usename"), textField("application_name"),
+		textField("client_addr"), textField("state"), textField("query"),
+		{name: "query_start", oid: 1184}, // timestamptz
+		textField("duration"),
+		textField("rsgname"),
+	}
+
+	t.Run("returns sessions with resource groups", func(t *testing.T) {
+		client, cleanup := newMockPgxClient(t, func(query string) []byte {
+			return multiRowResponseTyped(sessionFields, [][]string{
+				{"123", "admin", "psql", "10.0.0.1", "active", "SELECT 1", "2025-01-01 00:00:00+00", "00:01:30", "analytics"},
+				{"456", "etl_user", "loader", "10.0.0.2", "idle", "", "2025-01-01 00:00:00+00", "00:05:00", "etl_group"},
+			})
+		})
+		defer cleanup()
+
+		sessions, err := client.ListSessionsWithResourceGroup(context.Background())
+		assert.NoError(t, err)
+		require.Len(t, sessions, 2)
+		assert.Equal(t, int32(123), sessions[0].PID)
+		assert.Equal(t, "admin", sessions[0].Username)
+		assert.Equal(t, "analytics", sessions[0].ResourceGroup)
+		assert.Equal(t, int32(456), sessions[1].PID)
+		assert.Equal(t, "etl_group", sessions[1].ResourceGroup)
+	})
+
+	t.Run("empty result", func(t *testing.T) {
+		client, cleanup := newMockPgxClient(t, func(query string) []byte {
+			buf := mustEncode(buildRowDesc(sessionFields))
+			buf = append(buf, mustEncode(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 0")})...)
+			return buf
+		})
+		defer cleanup()
+
+		sessions, err := client.ListSessionsWithResourceGroup(context.Background())
+		assert.NoError(t, err)
+		assert.Empty(t, sessions)
+	})
+
+	t.Run("query error", func(t *testing.T) {
+		client, cleanup := newMockPgxClient(t, func(query string) []byte {
+			return errorResponseMsg("sessions query failed")
+		})
+		defer cleanup()
+
+		_, err := client.ListSessionsWithResourceGroup(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "querying sessions with resource group")
+	})
+
+	t.Run("scan error", func(t *testing.T) {
+		client, cleanup := newMockPgxClient(t, func(query string) []byte {
+			return multiRowResponse([]string{"pid"}, [][]string{
+				{"123"},
+			})
+		})
+		defer cleanup()
+
+		_, err := client.ListSessionsWithResourceGroup(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "scanning session with resource group row")
+	})
+}
+
+// ============================================================================
+// AlterResourceGroup with IO Limits Tests
+// ============================================================================
+
+func TestPgxClient_AlterResourceGroup_WithIOLimits(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return execResponse("ALTER RESOURCE GROUP")
+	})
+	defer cleanup()
+
+	err := client.AlterResourceGroup(context.Background(), ResourceGroupOptions{
+		Name:        "analytics",
+		Concurrency: 20,
+		IOLimits: []IOLimitOption{
+			{Tablespace: "pg_default", ReadBytesPerSec: 1000, WriteBytesPerSec: 500, ReadIOPS: 100, WriteIOPS: 50},
+		},
+	})
+	assert.NoError(t, err)
+}
+
+func TestPgxClient_AlterResourceGroup_IOLimitsError(t *testing.T) {
+	callCount := 0
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		callCount++
+		if strings.Contains(query, "io_limit") {
+			return errorResponseMsg("io_limit not supported")
+		}
+		return execResponse("ALTER RESOURCE GROUP")
+	})
+	defer cleanup()
+
+	err := client.AlterResourceGroup(context.Background(), ResourceGroupOptions{
+		Name: "analytics",
+		IOLimits: []IOLimitOption{
+			{Tablespace: "pg_default", ReadBytesPerSec: 1000, WriteBytesPerSec: 500, ReadIOPS: 100, WriteIOPS: 50},
+		},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "setting io_limit")
+}
+
+func TestPgxClient_AlterResourceGroup_IndividualParamError(t *testing.T) {
+	// Test error on individual ALTER statements (e.g., concurrency fails)
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "concurrency") {
+			return errorResponseMsg("concurrency alter failed")
+		}
+		return execResponse("ALTER RESOURCE GROUP")
+	})
+	defer cleanup()
+
+	err := client.AlterResourceGroup(context.Background(), ResourceGroupOptions{
+		Name:          "analytics",
+		Concurrency:   20,
+		CPUMaxPercent: 60,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "altering resource group")
+	assert.Contains(t, err.Error(), "concurrency")
+}
+
+func TestPgxClient_AlterResourceGroup_AllParams(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return execResponse("ALTER RESOURCE GROUP")
+	})
+	defer cleanup()
+
+	err := client.AlterResourceGroup(context.Background(), ResourceGroupOptions{
+		Name:          "analytics",
+		Concurrency:   20,
+		CPUMaxPercent: 60,
+		CPUWeight:     150,
+		MemoryLimit:   4096,
+		MinCost:       500,
+	})
+	assert.NoError(t, err)
+}
+
+// ============================================================================
+// IOLimitOption Construction Tests
+// ============================================================================
+
+func TestIOLimitOption_Construction(t *testing.T) {
+	opt := IOLimitOption{
+		Tablespace:       "pg_default",
+		ReadBytesPerSec:  1048576,
+		WriteBytesPerSec: 524288,
+		ReadIOPS:         1000,
+		WriteIOPS:        500,
+	}
+	assert.Equal(t, "pg_default", opt.Tablespace)
+	assert.Equal(t, int64(1048576), opt.ReadBytesPerSec)
+	assert.Equal(t, int64(524288), opt.WriteBytesPerSec)
+	assert.Equal(t, int32(1000), opt.ReadIOPS)
+	assert.Equal(t, int32(500), opt.WriteIOPS)
+}
+
+// ============================================================================
+// ResourceGroupInfo IOLimits field test
+// ============================================================================
+
+func TestResourceGroupInfo_IOLimits(t *testing.T) {
+	info := ResourceGroupInfo{
+		Name:     "analytics",
+		IOLimits: "pg_default:rbps=1000:wbps=500:riops=100:wiops=50",
+	}
+	assert.Equal(t, "pg_default:rbps=1000:wbps=500:riops=100:wiops=50", info.IOLimits)
+}

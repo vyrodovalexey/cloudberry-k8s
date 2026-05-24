@@ -174,6 +174,9 @@ func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewI
 func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
 	return nil
 }
+func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
+	return nil, nil
+}
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"postgres", "mydb"}, nil
 }

@@ -248,6 +248,8 @@ const (
 	EventReasonStorageExpanded = "StorageExpanded"
 	// EventReasonWorkloadReconciled indicates workload management has been reconciled.
 	EventReasonWorkloadReconciled = "WorkloadReconciled"
+	// EventReasonWorkloadDisabled indicates workload management has been disabled.
+	EventReasonWorkloadDisabled = "WorkloadDisabled"
 	// EventReasonQueryMonitoringReconciled indicates query monitoring has been reconciled.
 	EventReasonQueryMonitoringReconciled = "QueryMonitoringReconciled"
 	// EventReasonBackupReconciled indicates backup configuration has been reconciled.
@@ -313,12 +315,12 @@ type CloudberryClusterList struct {
 // CloudberryClusterSpec defines the desired state of CloudberryCluster.
 type CloudberryClusterSpec struct {
 	// Version is the Cloudberry DB version.
-	// +kubebuilder:default="7.7"
+	// +kubebuilder:default="2.1.0"
 	// +optional
 	Version string `json:"version,omitempty"`
 
 	// Image is the container image for Cloudberry DB.
-	// +kubebuilder:default="cloudberrydb/cloudberry:7.7"
+	// +kubebuilder:default="cloudberrydb/cloudberry:2.1.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -430,6 +432,8 @@ type CoordinatorSpec struct {
 
 	// Port is the coordinator listening port.
 	// +kubebuilder:default=5432
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 }
@@ -771,6 +775,8 @@ type MonitoringSpec struct {
 
 	// MetricsPort is the Prometheus metrics port.
 	// +kubebuilder:default=9187
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	MetricsPort int32 `json:"metricsPort,omitempty"`
 
@@ -880,6 +886,25 @@ type WorkloadSpec struct {
 	IdleRules []IdleSessionRule `json:"idleRules,omitempty"`
 }
 
+// TablespaceIOLimitSpec defines per-tablespace disk I/O limits for a resource group.
+// Applied via ALTER RESOURCE GROUP ... SET io_limit.
+type TablespaceIOLimitSpec struct {
+	// Tablespace is the target tablespace name. Use "*" for all tablespaces.
+	Tablespace string `json:"tablespace"`
+	// ReadBytesPerSec is the maximum read throughput in bytes per second.
+	// +optional
+	ReadBytesPerSec int64 `json:"readBytesPerSec,omitempty"`
+	// WriteBytesPerSec is the maximum write throughput in bytes per second.
+	// +optional
+	WriteBytesPerSec int64 `json:"writeBytesPerSec,omitempty"`
+	// ReadIOPS is the maximum read I/O operations per second.
+	// +optional
+	ReadIOPS int32 `json:"readIOPS,omitempty"`
+	// WriteIOPS is the maximum write I/O operations per second.
+	// +optional
+	WriteIOPS int32 `json:"writeIOPS,omitempty"`
+}
+
 // ResourceGroupSpec defines a resource group for workload management.
 type ResourceGroupSpec struct {
 	// Name is the resource group name.
@@ -904,6 +929,10 @@ type ResourceGroupSpec struct {
 	// MinCost is the minimum query cost to be managed.
 	// +optional
 	MinCost int32 `json:"minCost,omitempty"`
+
+	// IOLimits defines per-tablespace disk I/O limits.
+	// +optional
+	IOLimits []TablespaceIOLimitSpec `json:"ioLimits,omitempty"`
 }
 
 // WorkloadRule defines a workload management rule.
@@ -1118,6 +1147,8 @@ type StreamingServerSpec struct {
 	Host string `json:"host"`
 
 	// Port is the streaming server port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
@@ -1228,6 +1259,8 @@ type RabbitMQSourceSpec struct {
 	Host string `json:"host"`
 
 	// Port is the RabbitMQ port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 

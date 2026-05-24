@@ -27,10 +27,17 @@ This document describes the system architecture of the Cloudberry Kubernetes Ope
   - [Trusted Proxies](#trusted-proxies)
   - [HTTP Server Timeouts](#http-server-timeouts)
 - [DBClientFactory Pattern](#dbclientfactory-pattern)
+- [Idle Daemon Health Check and Reconnection](#idle-daemon-health-check-and-reconnection)
+- [Context-Aware Rebalance Goroutine Management](#context-aware-rebalance-goroutine-management)
+- [Shared DB Client in Admin Controller](#shared-db-client-in-admin-controller)
 - [Upgrade Flow](#upgrade-lifecycle)
 - [Status Update Pattern](#status-update-pattern)
 - [Webhook Certificate Manager](#webhook-certificate-manager)
   - [Vault PKI Certificate Issuance](#vault-pki-certificate-issuance)
+- [Cert Rotation Goroutine Tracking](#cert-rotation-goroutine-tracking)
+- [CLI Context Propagation for Bulk Operations](#cli-context-propagation-for-bulk-operations)
+- [OIDC Redirect Protection](#oidc-redirect-protection)
+- [Admin Password Persistence](#admin-password-persistence)
 - [Design Principles](#design-principles)
 
 ## System Overview
@@ -121,7 +128,7 @@ The operator runs two server components:
 | **DB Client** | `internal/db` | Cloudberry/PostgreSQL database operations via pgx with real SQL queries |
 | **CLI Client** | `internal/ctl` | HTTP client for `cloudberry-ctl` to communicate with the operator REST API |
 | **Vault Client** | `internal/vault` | HashiCorp Vault integration for secrets management |
-| **Metrics** | `internal/metrics` | Prometheus metrics registration and recording |
+| **Metrics** | `internal/metrics` | Prometheus metrics registration and recording. Includes `NewNoopRecorder()` for testing |
 | **Telemetry** | `internal/telemetry` | OpenTelemetry tracing setup and span helpers |
 | **Webhooks** | `internal/webhook` | Validating and mutating admission webhooks (including cross-namespace duplicate detection) |
 | **Cert Manager** | `internal/certmanager` | Webhook TLS certificate lifecycle: issuance, storage, and rotation via Vault PKI or self-signed CA |
@@ -171,7 +178,7 @@ The `CloudberryCluster` CRD (`avsoft.io/v1alpha1`) is the primary API surface. I
 ```
 CloudberryCluster
 ├── spec
-│   ├── version              # Cloudberry DB version (default: "7.7")
+│   ├── version              # Cloudberry DB version (default: "2.1.0")
 │   ├── image                # Container image
 │   ├── coordinator          # Coordinator node config
 │   │   ├── resources        # CPU/memory requests and limits
@@ -253,7 +260,7 @@ When you run `kubectl get cloudberryclusters`, the output includes:
 
 ```
 NAME              PHASE     VERSION   SEGMENTS   MIRRORING   AGE
-my-cluster        Running   7.7       4          InSync      2h
+my-cluster        Running   2.1.0     4          InSync      2h
 ```
 
 ## Controller Reconciliation Flow
@@ -614,7 +621,7 @@ The HA Controller manages fault tolerance and recovery:
 
 ### Auth Controller
 
-Manages authentication configuration:
+Manages authentication configuration. The `NewAuthReconciler()` constructor accepts a K8s client, event recorder, resource builder, metrics recorder, and optional DB client factory (the unused `*runtime.Scheme` parameter was removed). The controller requeues every `authReconcileInterval` (5 minutes).
 
 1. Renders `pg_hba.conf` rules from CRD spec into a ConfigMap
 2. Generates default HBA rules when none are specified
@@ -643,8 +650,9 @@ Manages configuration, rolling restarts, maintenance, and workload management:
    - Unknown operations emit `MaintenanceUnknown` warning event
    - Emits `MaintenanceStarted` event with job name
 7. Monitors Job completion and cleans up finished Jobs
-8. Performs a single consolidated status update per reconciliation cycle to reduce API server load
-9. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
+8. Aggregates errors from sub-reconcilers using `errors.Join()` in `reconcileSubComponents()`, ensuring all sub-reconcilers execute even when earlier ones fail
+9. Performs a single consolidated status update per reconciliation cycle to reduce API server load
+10. Uses `MergePatch` for annotation removal to avoid race conditions with concurrent updates
 10. **Workload reconciliation** (`reconcileWorkload()`): When `spec.workload.enabled` is true, reconciles resource groups, workload rules, and idle session rules:
 
 **Workload reconciliation flow:**
@@ -1239,6 +1247,106 @@ The API server starts in a background goroutine from the operator `main()` funct
 
 ## DBClientFactory Pattern
 
+## Idle Daemon Health Check and Reconnection
+
+The idle session enforcement daemon (`internal/idle`) maintains a persistent database connection for scanning and terminating idle sessions. To handle connection failures gracefully, the daemon implements a health check loop with automatic reconnection using exponential backoff.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Idle Daemon Connection Lifecycle                      │
+│                                                                   │
+│  Start()                                                          │
+│    │                                                              │
+│    ├── Launch scan loop (every ScanInterval, default 30s)         │
+│    └── Launch health check loop (every 60s)                       │
+│                                                                   │
+│  Health Check Loop:                                               │
+│    │                                                              │
+│    └── healthCheck(ctx)                                           │
+│         ├── Ping DB client                                        │
+│         │   ├── Success → consecutiveFails = 0                    │
+│         │   └── Failure → reconnect(ctx)                          │
+│         │                                                         │
+│         └── reconnect(ctx)                                        │
+│              ├── DBClientFactory == nil? → skip (graceful)        │
+│              └── For attempt = 1 to maxAttempts:                  │
+│                   ├── Check ctx.Done() → return if canceled       │
+│                   ├── factory.NewClient(ctx)                      │
+│                   │   ├── Success → swap client, reset fails      │
+│                   │   └── Failure → wait with backoff             │
+│                   └── backoff = min(backoff × 2, 60s)             │
+│                                                                   │
+│  Scan Loop:                                                       │
+│    │                                                              │
+│    └── scanAndEnforce(ctx)                                        │
+│         ├── List sessions via DB client                           │
+│         │   ├── Success → enforce rules, reset fails              │
+│         │   └── Failure → consecutiveFails++                      │
+│         │                  └── if >= 3 → reconnect(ctx)           │
+│         └── Terminate idle sessions matching rules                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+- **Separate health check interval** (60s) from scan interval (30s) to avoid excessive ping overhead
+- **Consecutive failure threshold** (3) before triggering reconnection from the scan loop, preventing reconnection on transient errors
+- **Exponential backoff** (1s → 2s → 4s → ... → 60s max) prevents overwhelming the database during outages
+- **Context-aware backoff** respects cancellation during sleep via `select` on `ctx.Done()`
+- **Graceful degradation** when `DBClientFactory` is nil — reconnection is skipped, and the daemon continues with the existing (possibly broken) client
+
+## Context-Aware Rebalance Goroutine Management
+
+The `executeRebalanceViaDB()` method in the HA Controller processes tables concurrently using a semaphore to limit parallelism. To prevent goroutine leaks when the reconciliation context is canceled (e.g., operator shutdown), the semaphore acquisition uses a `select` statement:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Context-Aware Semaphore Acquisition                   │
+│                                                                   │
+│  executeRebalanceViaDB(ctx, cluster, threshold, parallelism, ...) │
+│    │                                                              │
+│    ├── Create semaphore channel (capacity = parallelism)           │
+│    │                                                              │
+│    └── For each skewed table:                                     │
+│         │                                                         │
+│         ├── select:                                               │
+│         │   ├── case <-ctx.Done():                                │
+│         │   │   └── return ctx.Err()  (no goroutine leak)         │
+│         │   │                                                     │
+│         │   └── case sem <- struct{}{}:                            │
+│         │       └── Launch goroutine to redistribute table        │
+│         │           └── defer: release semaphore (<-sem)           │
+│         │                                                         │
+│         └── Wait for all goroutines to complete                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Without the `ctx.Done()` check, goroutines waiting to acquire the semaphore would block indefinitely if the context is canceled, causing a goroutine leak. The `select` ensures prompt cleanup.
+
+## Shared DB Client in Admin Controller
+
+The Admin Controller's `reconcileConfig()` method creates a single shared database client for all parameter operations within a reconciliation cycle:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              reconcileConfig() — Shared DB Client                  │
+│                                                                   │
+│  1. Detect config changes (hash comparison)                       │
+│  2. Create ONE DB client via DBClientFactory                      │
+│  3. defer client.Close()                                          │
+│  4. Pass sharedClient to:                                         │
+│     ├── applyCoordinatorParameters(ctx, cluster, sharedClient)    │
+│     ├── applyDatabaseParameters(ctx, cluster, sharedClient)       │
+│     └── applyRoleParameters(ctx, cluster, sharedClient)           │
+│                                                                   │
+│  Each handler: if sharedClient == nil → skip with debug log       │
+│  (no error returned, graceful degradation)                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+This consolidation reduces database connections per reconciliation from 3 to 1 and ensures consistent connection state across all parameter operations.
+
+## DBClientFactory Pattern
+
 The `DBClientFactory` interface is defined in `internal/db/factory.go` as a shared interface. Previously, duplicate interface definitions existed in both the controller and API server packages. The interface was extracted to the `internal/db` package to serve as the single source of truth, eliminating duplication and ensuring consistent signatures across consumers.
 
 Both controllers and the API server use the factory instead of creating database clients directly.
@@ -1415,6 +1523,80 @@ Server certificates include the following Subject Alternative Names:
 | `VaultPKIRole` | Vault PKI role name | `cloudberry-operator` |
 | `CertValidityDuration` | Certificate validity period | `365d` |
 
+## Cert Rotation Goroutine Tracking
+
+The operator starts a background goroutine for periodic webhook certificate rotation checks. To ensure clean shutdown, the goroutine is tracked with a `sync.WaitGroup` in `cmd/operator/main.go`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Operator Shutdown with WaitGroup                     │
+│                                                                   │
+│  main()                                                           │
+│    │                                                              │
+│    ├── var backgroundWg sync.WaitGroup                            │
+│    │                                                              │
+│    ├── backgroundWg.Add(1)                                        │
+│    ├── go startCertRotation(ctx, certManager, &backgroundWg)      │
+│    │    └── defer backgroundWg.Done()                             │
+│    │        └── Checks NeedsRotation() every 12 hours             │
+│    │            └── Calls EnsureCertificates() when needed         │
+│    │                                                              │
+│    ├── ... (start controller manager, API server, etc.)           │
+│    │                                                              │
+│    └── On shutdown signal:                                        │
+│         ├── Cancel context → goroutine exits its ticker loop      │
+│         └── backgroundWg.Wait() → blocks until goroutine returns  │
+│              └── Process exits cleanly                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters**: Without the WaitGroup, the operator process could exit while the cert rotation goroutine is still running, potentially leaving a half-written certificate Secret. The WaitGroup ensures the goroutine completes its current operation before the process terminates.
+
+## CLI Context Propagation for Bulk Operations
+
+The `cloudberry-ctl` CLI's `upsertRule` function was refactored to accept a shared `context.Context` and HTTP client instead of creating new ones per invocation. This improves performance during bulk rule imports:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Before: Per-Rule Client Creation                     │
+│                                                                   │
+│  for each rule in file:                                           │
+│    ctx := context.Background()     ← new context per rule         │
+│    client := newOperatorClient()   ← new HTTP client per rule     │
+│    upsertRule(ctx, client, rule)   ← separate connection          │
+│                                                                   │
+│              After: Shared Context and Client                     │
+│                                                                   │
+│  ctx, cancel := signal.NotifyContext(...)  ← one context          │
+│  client := newOperatorClient()             ← one HTTP client      │
+│  for each rule in file:                                           │
+│    upsertRule(ctx, client, rule)           ← reuses connection    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits**:
+- Reduces TCP connection overhead during bulk imports (connection reuse via HTTP keep-alive)
+- Respects signal-based cancellation — `SIGINT`/`SIGTERM` cancels all pending rule imports
+- Consistent timeout behavior across all rules in a batch
+
+## OIDC Redirect Protection
+
+The OIDC provider's HTTP client now includes a `CheckRedirect` function that limits redirects to 5 hops. This prevents infinite redirect loops during OIDC discovery when the identity provider misconfigures its endpoints:
+
+```go
+httpClient := &http.Client{
+    Timeout: 30 * time.Second,
+    CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+        if len(via) >= 5 {
+            return fmt.Errorf("stopped after 5 redirects")
+        }
+        return nil
+    },
+}
+```
+
+Without this protection, a misconfigured OIDC issuer URL could cause the operator to follow redirects indefinitely, consuming resources and blocking the authentication middleware.
+
 ## Admin Password Persistence
 
 The operator REST API admin password is persisted to a Kubernetes Secret (`cloudberry-operator-admin-password`) in the operator's namespace. This ensures the password survives operator pod restarts.
@@ -1426,6 +1608,53 @@ The operator REST API admin password is persisted to a Kubernetes Secret (`cloud
 3. If neither the env var nor the Secret exists, the operator auto-generates a cryptographically secure random password, persists it to the Secret, and logs a warning
 
 This eliminates the previous behavior where a new random password was generated on every restart when `CLOUDBERRY_API_ADMIN_PASSWORD` was not set, which made API access unreliable across pod restarts.
+
+## Security Hardening Patterns
+
+### SQL Injection Prevention
+
+The operator employs multiple layers of SQL injection prevention:
+
+1. **Parameterized queries**: All database operations use pgx's native config builder with parameterized queries (`$1`, `$2`, etc.) instead of string concatenation.
+
+2. **`sanitizeDistKey()` helper** (`internal/db/client.go`): Distribution keys in Cloudberry can be comma-separated column lists. The `sanitizeDistKey()` function splits the key by commas, validates each column name against a strict SQL identifier regex (`^[a-zA-Z_][a-zA-Z0-9_]*$`), and rejects any column that does not match. This prevents SQL injection through distribution key values in `CREATE TABLE ... DISTRIBUTED BY` and `ALTER TABLE ... SET DISTRIBUTED BY` statements.
+
+3. **Parameterized `updateNumsegments`**: The `updateNumsegments` query uses parameterized SQL (`$1`) instead of string interpolation for the segment count value, preventing injection through numeric parameters.
+
+4. **Path parameter validation**: All REST API path parameters are validated against a SQL identifier regex before use.
+
+### Rate Limiting for Rebalance Operations
+
+The `dispatchRebalanceTables()` method in the HA Controller introduces rate limiting for concurrent rebalance operations:
+
+- **`interTableDelay`** (100ms): A configurable pause between dispatching rebalance goroutines prevents overwhelming the database with simultaneous redistribution operations.
+- **Context-aware dispatch**: The semaphore acquisition uses `select` with `ctx.Done()` to prevent goroutine leaks on context cancellation.
+- **Bounded parallelism**: A semaphore channel limits the number of concurrent table redistributions to the configured `parallelism` value.
+
+### Context Cancellation in Database Operations
+
+The `propagateDatabasesToNewSegments()` method checks for context cancellation between database operations. This ensures that long-running segment registration operations (which iterate over multiple databases and segments) can be interrupted cleanly during operator shutdown or reconciliation timeout.
+
+### Error Aggregation with `errors.Join`
+
+The `reconcileSubComponents()` method in the Admin Controller uses `errors.Join()` to aggregate errors from multiple sub-reconcilers (config, maintenance, workload). This replaces the previous pattern of returning on the first error, ensuring all sub-reconcilers execute and all errors are reported in a single reconciliation cycle.
+
+### Webhook CA Bundle Injection with Retry
+
+The webhook certificate manager uses retry with exponential backoff when injecting the CA bundle into `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources. This handles transient API server errors during operator startup when webhook configurations may not yet be available.
+
+### Goroutine Leak Prevention in Idle Daemon
+
+The `startOrUpdateIdleDaemon()` method in the Admin Controller prevents goroutine leaks by properly stopping the existing idle daemon before starting a new one when configuration changes. The daemon's `Stop()` method cancels the internal context and waits for all goroutines to exit.
+
+## Shared Constants
+
+The `internal/util/constants.go` package centralizes operator-wide constants to eliminate duplication:
+
+- **`OperatorAdminPasswordSecretName`** (`cloudberry-operator-admin-password`): The Kubernetes Secret name for the auto-generated API admin password. Previously duplicated across `cmd/operator/main.go` and `internal/api/server.go`.
+- **`PasswordSecretKey`** (`password`): The key within admin password Secrets. Previously duplicated across multiple packages.
+
+These constants ensure consistent Secret naming across the operator, API server, and CLI.
 
 ## Design Principles
 

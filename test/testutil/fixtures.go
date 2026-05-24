@@ -161,6 +161,15 @@ func (b *ClusterBuilder) WithSSL(enabled bool, certSecretName string) *ClusterBu
 	return b
 }
 
+// WithSSLMinTLSVersion sets the minimum TLS version on the SSL spec.
+// WithSSL must be called first to initialize the SSL spec.
+func (b *ClusterBuilder) WithSSLMinTLSVersion(version string) *ClusterBuilder {
+	if b.cluster.Spec.Auth != nil && b.cluster.Spec.Auth.SSL != nil {
+		b.cluster.Spec.Auth.SSL.MinTLSVersion = version
+	}
+	return b
+}
+
 // WithConfig sets configuration parameters.
 func (b *ClusterBuilder) WithConfig(params map[string]string) *ClusterBuilder {
 	b.cluster.Spec.Config = &cbv1alpha1.ConfigSpec{

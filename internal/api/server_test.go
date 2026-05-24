@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -1660,6 +1661,7 @@ type mockDBClient struct {
 	resGroups           []db.ResourceGroupInfo
 	listResGroupsErr    error
 	createResGroupErr   error
+	alterResGroupErr    error
 	dropResGroupErr     error
 	assignRoleErr       error
 	resQueues           []db.ResourceQueueInfo
@@ -1712,7 +1714,7 @@ func (m *mockDBClient) CreateResourceGroup(_ context.Context, _ db.ResourceGroup
 	return m.createResGroupErr
 }
 func (m *mockDBClient) AlterResourceGroup(_ context.Context, _ db.ResourceGroupOptions) error {
-	return nil
+	return m.alterResGroupErr
 }
 func (m *mockDBClient) DropResourceGroup(_ context.Context, _ string) error {
 	return m.dropResGroupErr
@@ -1796,7 +1798,10 @@ func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewI
 	return nil, nil
 }
 func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error { return nil }
-func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error)     { return nil, nil }
+func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) { return nil, nil }
 
 // mockDBFactory implements db.DBClientFactory for testing.
 type mockDBFactory struct {
@@ -3091,4 +3096,670 @@ func TestStartServer_ContextCancellation(t *testing.T) {
 
 	// The server should shut down gracefully.
 	// We don't assert on the error because it depends on timing.
+}
+
+// ============================================================================
+// Update resource group handler tests (Scenario 31)
+// ============================================================================
+
+func TestHandleUpdateResourceGroup(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/nonexistent/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid group name", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/1invalid!?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "1invalid!")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader([]byte("invalid")))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20, "cpuMaxPercent": 70})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "pending", resp["status"])
+		assert.Equal(t, "analytics", resp["group"])
+	})
+
+	t.Run("with db factory success", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{}
+		s := newTestServerWithDB(dbClient, cluster)
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20, "cpuMaxPercent": 70})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "updated", resp["status"])
+		assert.Equal(t, "analytics", resp["group"])
+	})
+
+	t.Run("with db factory conn error", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServerWithDBErr(fmt.Errorf("connection refused"), cluster)
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("with db factory alter error", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{alterResGroupErr: fmt.Errorf("alter failed")}
+		s := newTestServerWithDB(dbClient, cluster)
+		body, _ := json.Marshal(map[string]interface{}{"concurrency": 20})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("groupName", "analytics")
+		rec := httptest.NewRecorder()
+		s.handleUpdateResourceGroup(rec, req)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+}
+
+// ============================================================================
+// Workload rule CRUD handler tests (Scenario 31)
+// ============================================================================
+
+func TestHandleCreateWorkloadRule(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"name": "test_rule", "action": "log"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/nonexistent/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "nonexistent")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader([]byte("invalid")))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("empty name", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"name": "", "action": "log"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid rule name", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"name": "1invalid!", "action": "log"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("success with nil workload", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{
+			"name": "test_rule", "action": "log", "enabled": true,
+			"thresholdType": "running_time", "threshold": "10", "priority": 3,
+		})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusCreated, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "created", resp["status"])
+	})
+
+	t.Run("success with existing workload", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Enabled: true,
+			Rules: []cbv1alpha1.WorkloadRule{
+				{Name: "existing_rule", Action: "cancel"},
+			},
+		}
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{
+			"name": "new_rule", "action": "log", "resourceGroup": "analytics",
+		})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusCreated, rec.Code)
+	})
+
+	t.Run("duplicate rule name", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Enabled: true,
+			Rules: []cbv1alpha1.WorkloadRule{
+				{Name: "existing_rule", Action: "cancel"},
+			},
+		}
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{
+			"name": "existing_rule", "action": "log",
+		})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/workload/rules?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleCreateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+}
+
+func TestHandleUpdateWorkloadRule(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"threshold": "20"})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/nonexistent/workload/rules/test_rule?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("ruleName", "test_rule")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid rule name", func(t *testing.T) {
+		s := newTestServer()
+		body, _ := json.Marshal(map[string]interface{}{"threshold": "20"})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/rules/1invalid!?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "1invalid!")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Rules: []cbv1alpha1.WorkloadRule{{Name: "test_rule", Action: "log"}},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/rules/test_rule?namespace=default",
+			bytes.NewReader([]byte("invalid")))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "test_rule")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("rule not found nil workload", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"threshold": "20"})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/rules/missing_rule?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "missing_rule")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("rule not found", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Rules: []cbv1alpha1.WorkloadRule{{Name: "other_rule", Action: "log"}},
+		}
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"threshold": "20"})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/rules/missing_rule?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "missing_rule")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("success partial update", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Rules: []cbv1alpha1.WorkloadRule{
+				{Name: "test_rule", Action: "log", Threshold: "10", Priority: 3},
+			},
+		}
+		s := newTestServer(cluster)
+		body, _ := json.Marshal(map[string]interface{}{"threshold": "20", "priority": 5})
+		req := httptest.NewRequest(http.MethodPut,
+			apiPrefix+"/clusters/test-cluster/workload/rules/test_rule?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "test_rule")
+		rec := httptest.NewRecorder()
+		s.handleUpdateWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "updated", resp["status"])
+		rule := resp["rule"].(map[string]interface{})
+		assert.Equal(t, "20", rule["threshold"])
+		assert.Equal(t, float64(5), rule["priority"])
+		// Action should remain unchanged.
+		assert.Equal(t, "log", rule["action"])
+	})
+}
+
+func TestHandleDeleteWorkloadRule(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/nonexistent/workload/rules/test_rule?namespace=default", nil)
+		req.SetPathValue("name", "nonexistent")
+		req.SetPathValue("ruleName", "test_rule")
+		rec := httptest.NewRecorder()
+		s.handleDeleteWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid rule name", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/workload/rules/1invalid!?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "1invalid!")
+		rec := httptest.NewRecorder()
+		s.handleDeleteWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("rule not found nil workload", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/workload/rules/missing_rule?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "missing_rule")
+		rec := httptest.NewRecorder()
+		s.handleDeleteWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("rule not found", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Rules: []cbv1alpha1.WorkloadRule{{Name: "other_rule", Action: "log"}},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/workload/rules/missing_rule?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "missing_rule")
+		rec := httptest.NewRecorder()
+		s.handleDeleteWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{
+			Rules: []cbv1alpha1.WorkloadRule{
+				{Name: "rule_a", Action: "cancel"},
+				{Name: "rule_b", Action: "log"},
+			},
+		}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodDelete,
+			apiPrefix+"/clusters/test-cluster/workload/rules/rule_a?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("ruleName", "rule_a")
+		rec := httptest.NewRecorder()
+		s.handleDeleteWorkloadRule(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "deleted", resp["status"])
+		assert.Equal(t, "rule_a", resp["rule"])
+	})
+}
+
+// ============================================================================
+// Permission model tests (Scenario 31e)
+// ============================================================================
+
+func TestDeleteResourceGroup_RequiresAdmin(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	dbClient := &mockDBClient{}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	factory := &mockDBFactory{client: dbClient}
+
+	// Create server WITH auth middleware.
+	basicProvider := &mockAuthProvider{
+		identity: &auth.Identity{Username: "operator", Permission: auth.PermissionOperator},
+	}
+	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
+	s := NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0)
+	handler := s.Handler()
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default", nil)
+	req.SetBasicAuth("operator", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Operator should be denied — DELETE resource-groups requires Admin.
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestDeleteResourceGroup_AdminAllowed(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	dbClient := &mockDBClient{}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	factory := &mockDBFactory{client: dbClient}
+
+	// Create server WITH auth middleware — admin user.
+	basicProvider := &mockAuthProvider{
+		identity: &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin},
+	}
+	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
+	s := NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0)
+	handler := s.Handler()
+
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/workload/resource-groups/analytics?namespace=default", nil)
+	req.SetBasicAuth("admin", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Admin should be allowed.
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// ============================================================================
+// Password rotation tests
+// ============================================================================
+
+func newTestServerWithCredStore(
+	credStore *auth.InMemoryCredentialStore,
+	objs ...runtime.Object,
+) *Server {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
+	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+}
+
+func TestHandleRotatePassword_Success(t *testing.T) {
+	credStore := auth.NewInMemoryCredentialStore()
+	credStore.SetCredentials("admin", "old-password", auth.PermissionAdmin)
+
+	// Pre-create the admin password secret.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloudberry-operator-admin-password",
+			Namespace: util.OperatorNamespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"password": []byte("old-password"),
+		},
+	}
+
+	s := newTestServerWithCredStore(credStore, secret)
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	identity := &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin}
+	ctx := auth.ContextWithIdentity(req.Context(), identity)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	s.handleRotatePassword(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", resp["status"])
+	assert.Equal(t, "Admin password rotated successfully", resp["message"])
+
+	// Verify the in-memory credential store was updated (old password should fail).
+	_, pwErr := credStore.GetPassword(context.Background(), "admin")
+	require.NoError(t, pwErr)
+}
+
+func TestHandleRotatePassword_CreatesSecretIfMissing(t *testing.T) {
+	credStore := auth.NewInMemoryCredentialStore()
+	credStore.SetCredentials("admin", "old-password", auth.PermissionAdmin)
+
+	// No pre-existing secret — the handler should create one.
+	s := newTestServerWithCredStore(credStore)
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	identity := &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin}
+	ctx := auth.ContextWithIdentity(req.Context(), identity)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	s.handleRotatePassword(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", resp["status"])
+}
+
+func TestHandleRotatePassword_NoCredStore(t *testing.T) {
+	// Create a server without a credential store.
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	identity := &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin}
+	ctx := auth.ContextWithIdentity(req.Context(), identity)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	s.handleRotatePassword(rec, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	errObj, ok := resp["error"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "INTERNAL_ERROR", errObj["code"])
+	assert.Equal(t, "credential store not configured", errObj["message"])
+}
+
+func TestHandleRotatePassword_RequiresAdmin(t *testing.T) {
+	credStore := auth.NewInMemoryCredentialStore()
+	credStore.SetCredentials("admin", "admin-pass", auth.PermissionAdmin)
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	// Create server with auth middleware — operator user (not admin).
+	basicProvider := &mockAuthProvider{
+		identity: &auth.Identity{Username: "operator", Permission: auth.PermissionOperator},
+	}
+	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
+	s := NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	handler := s.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	req.SetBasicAuth("operator", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Operator should be denied — rotate-password requires Admin.
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandleRotatePassword_AdminAllowed(t *testing.T) {
+	credStore := auth.NewInMemoryCredentialStore()
+	credStore.SetCredentials("admin", "admin-pass", auth.PermissionAdmin)
+
+	// Pre-create the admin password secret.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloudberry-operator-admin-password",
+			Namespace: util.OperatorNamespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"password": []byte("admin-pass"),
+		},
+	}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(secret).Build()
+
+	// Create server with auth middleware — admin user.
+	basicProvider := &mockAuthProvider{
+		identity: &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin},
+	}
+	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
+	s := NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	handler := s.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	req.SetBasicAuth("admin", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Admin should be allowed.
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", resp["status"])
+}
+
+func TestHandleRotatePassword_UpdatesK8sSecret(t *testing.T) {
+	credStore := auth.NewInMemoryCredentialStore()
+	credStore.SetCredentials("admin", "old-password", auth.PermissionAdmin)
+
+	// Pre-create the admin password secret.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloudberry-operator-admin-password",
+			Namespace: util.OperatorNamespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"password": []byte("old-password"),
+		},
+	}
+
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(secret).Build()
+	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+
+	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
+	identity := &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin}
+	ctx := auth.ContextWithIdentity(req.Context(), identity)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	s.handleRotatePassword(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Verify the K8s Secret was updated with a new password.
+	updatedSecret := &corev1.Secret{}
+	err := k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      secret.Name,
+		Namespace: secret.Namespace,
+	}, updatedSecret)
+	require.NoError(t, err)
+
+	newPw := string(updatedSecret.Data["password"])
+	assert.NotEmpty(t, newPw, "new password should not be empty")
+	assert.NotEqual(t, "old-password", newPw, "password should have been rotated")
+	assert.GreaterOrEqual(t, len(newPw), 16, "generated password should be at least 16 characters")
 }

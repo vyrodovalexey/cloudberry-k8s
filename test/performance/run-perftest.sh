@@ -335,7 +335,7 @@ create_runtime_config() {
     cp "${SCRIPT_DIR}/${config_file}" "${runtime_config}"
 
     # Apply target override
-    if [[ "$TARGET" != "localhost:8090" ]]; then
+    if [[ "$TARGET" != "localhost:8190" ]]; then
         sed -i.bak "s|address:.*|address: ${TARGET}|" "${runtime_config}"
         rm -f "${runtime_config}.bak"
     fi

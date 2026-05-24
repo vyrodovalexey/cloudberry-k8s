@@ -287,6 +287,9 @@ func (m *fullMockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]TableSkew
 func (m *fullMockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
 	return m.rebalanceTableErr
 }
+func (m *fullMockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]SessionWithGroup, error) {
+	return nil, nil
+}
 func (m *fullMockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return m.userDatabases, m.listUserDBsErr
 }

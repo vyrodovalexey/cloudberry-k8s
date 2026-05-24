@@ -1,0 +1,26 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario46-vault
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  segments:
+    count: 2
+    storage:
+      size: "5Gi"
+  vault:
+    enabled: true
+    address: http://vault:8200
+    authMethod: token
+    secretPath: secret/data/cloudberry
+  deletionPolicy: Retain

@@ -1,0 +1,56 @@
+# Scenario 37: Rule Priority Ordering
+#
+# This example shows a CloudberryCluster with workload rules intentionally
+# defined in non-priority order. The operator sorts rules by priority
+# (lowest number first) before storing them in the ConfigMap.
+#
+# Rules with the same priority preserve their CRD spec order (stable sort).
+#
+# Specification reference: Section 10 "Rule Ordering" of
+# specifications/09-workload-management-spec.md:
+#   "Rules are evaluated in priority order (lowest number first). Rules with
+#    the same priority are evaluated in the order they appear in the CRD spec."
+#
+# After reconciliation, the ConfigMap will contain rules.json with rules
+# sorted as: rule-p1 (priority 1), rule-p2 (priority 2), rule-p3 (priority 3).
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario37-priority-ordering
+spec:
+  version: "2.1.0"
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: analytics
+        concurrency: 10
+        cpuMaxPercent: 50
+        cpuWeight: 100
+      - name: etl
+        concurrency: 5
+        cpuMaxPercent: 30
+        cpuWeight: 50
+    rules:
+      # Rules intentionally in non-priority order to test sorting
+      - name: rule-p3
+        enabled: true
+        resourceGroup: analytics
+        action: cancel
+        thresholdType: running_time
+        threshold: "30"
+        priority: 3
+      - name: rule-p1
+        enabled: true
+        resourceGroup: analytics
+        action: log
+        thresholdType: running_time
+        threshold: "10"
+        priority: 1
+      - name: rule-p2
+        enabled: true
+        resourceGroup: analytics
+        action: move
+        moveTarget: etl
+        thresholdType: running_time
+        threshold: "20"
+        priority: 2

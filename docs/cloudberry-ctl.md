@@ -182,7 +182,9 @@ The following commands are fully implemented and communicate with the operator R
 - `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
 - `resource-group list`, `resource-group create`, `resource-group delete`, `resource-group assign`
 
-All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth *`, `resource-group update`, `inspect logs`, and `maintenance check-catalog/jobs`.
+- `auth login` (basic and OIDC with credentials), `auth status`, `auth logout`
+
+All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth login` (browser-based OIDC flow), `auth rotate-password`, `auth roles *`, `resource-group update`, `inspect logs`, and `maintenance check-catalog/jobs`.
 
 > **Note**: Stub commands use the `notImplemented()` helper to return a consistent error message. They exit with code `1` (general error). This behavior is intentional — it prevents silent no-ops in automation scripts.
 
@@ -222,7 +224,7 @@ cloudberry-ctl cluster status --cluster my-cluster
 
 ```
 CLUSTER      PHASE    VERSION  COORDINATOR  STANDBY  SEGMENTS  MIRRORING
-my-cluster   Running  7.7      Ready        Ready    4/4       InSync
+my-cluster   Running  2.1.0    Ready        Ready    4/4       InSync
 ```
 
 #### cluster start
@@ -834,34 +836,123 @@ kubectl get jobs -n cloudberry-test \
 
 ### auth
 
-Authentication management commands.
+Authentication management commands. The `login`, `status`, and `logout` subcommands are fully implemented (Scenario 49). They validate credentials against the operator API, display authentication state, and clear cached credentials.
 
 #### auth login
 
-Authenticate with the operator.
+Authenticate with the operator. Supports two modes: basic auth (username/password) and OIDC.
+
+**Basic auth** (`--basic` flag): Validates credentials by calling `GET /api/v1alpha1/clusters` with HTTP Basic authentication. Requires `--username` and `--password` (or the corresponding environment variables).
 
 ```bash
-# OIDC login (opens browser for auth code flow)
-cloudberry-ctl auth login --cluster my-cluster
-
 # Basic auth login
-cloudberry-ctl auth login --cluster my-cluster --basic --username admin
+cloudberry-ctl auth login --basic --username admin
+# Password is read from CLOUDBERRY_PASSWORD env var (recommended)
+# or --password flag (visible in process listings — not recommended)
+
+# With explicit password (for testing only)
+cloudberry-ctl auth login --basic --username admin --password secret
 ```
 
-#### auth logout
-
-Clear cached credentials.
+**OIDC with credentials**: When `--username` and `--password` are provided without `--basic`, the CLI simulates the OIDC resource owner password grant flow.
 
 ```bash
-cloudberry-ctl auth logout --cluster my-cluster
+# OIDC login with credentials (password grant simulation)
+cloudberry-ctl auth login --username admin --password secret \
+  --auth-method oidc --operator-url http://localhost:8090
 ```
+
+**OIDC browser flow**: When no credentials are provided, the browser-based authorization code flow with PKCE is invoked. This flow is not yet implemented and returns an error.
+
+```bash
+# OIDC login (browser flow — not yet implemented)
+cloudberry-ctl auth login --auth-method oidc
+# Error: command "auth login (browser-based OIDC flow)" is not yet implemented
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--basic` | bool | `false` | Use basic (username/password) authentication |
+
+**Output (success):**
+
+```
+Login successful (method=basic, user=admin)
+```
+
+**Exit codes:**
+
+| Scenario | Exit Code |
+|----------|-----------|
+| Login successful | 0 |
+| Invalid credentials (HTTP 401) | 3 |
+| Missing username or password | 1 |
+| OIDC browser flow (not implemented) | 1 |
 
 #### auth status
 
-Show current authentication status.
+Show current authentication status. Checks connectivity and authentication against the operator API by calling `GET /api/v1alpha1/clusters`. The command always succeeds (exit code 0) — unauthenticated state is reported in the output, not as an error.
 
 ```bash
-cloudberry-ctl auth status --cluster my-cluster
+# Check auth status
+cloudberry-ctl auth status --operator-url http://localhost:8090 \
+  --username admin --auth-method basic
+```
+
+**Output (JSON — authenticated):**
+
+```json
+{
+  "auth_method": "basic",
+  "authenticated": true,
+  "operator_url": "http://localhost:8090",
+  "username": "admin"
+}
+```
+
+**Output (JSON — unauthenticated):**
+
+```json
+{
+  "auth_method": "basic",
+  "authenticated": false,
+  "error": "API error (HTTP 401): invalid credentials",
+  "operator_url": "http://localhost:8090",
+  "username": "admin"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auth_method` | string | Current auth method (`basic` or `oidc`) |
+| `username` | string | Current username |
+| `operator_url` | string | Operator API URL |
+| `authenticated` | bool | `true` if credentials are valid |
+| `error` | string | Error message (only present when `authenticated=false`) |
+
+#### auth logout
+
+Clear cached credentials. Since `cloudberry-ctl` uses flags and environment variables for authentication (not a persistent token cache), this command is effectively a reminder to clean up your environment.
+
+```bash
+cloudberry-ctl auth logout
+```
+
+**Output:**
+
+```
+Logged out. Cached credentials have been cleared.
+Note: If you set CLOUDBERRY_USERNAME or CLOUDBERRY_PASSWORD environment variables, unset them to fully log out.
+```
+
+To fully log out, unset the environment variables:
+
+```bash
+unset CLOUDBERRY_USERNAME CLOUDBERRY_PASSWORD
 ```
 
 #### auth rotate-password
@@ -1113,7 +1204,7 @@ cloudberry-ctl cluster status --cluster my-cluster
 
 ```
 CLUSTER      PHASE    VERSION  COORDINATOR  STANDBY  SEGMENTS  MIRRORING
-my-cluster   Running  7.7      Ready        Ready    4/4       InSync
+my-cluster   Running  2.1.0    Ready        Ready    4/4       InSync
 ```
 
 ### JSON
@@ -1126,7 +1217,7 @@ cloudberry-ctl cluster status --cluster my-cluster --output json
 {
   "name": "my-cluster",
   "phase": "Running",
-  "version": "7.7",
+  "version": "2.1.0",
   "coordinator": {"ready": true},
   "standby": {"ready": true},
   "segments": {"ready": 4, "total": 4},
@@ -1143,7 +1234,7 @@ cloudberry-ctl cluster status --cluster my-cluster --output yaml
 ```yaml
 name: my-cluster
 phase: Running
-version: "7.7"
+version: "2.1.0"
 coordinator:
   ready: true
 standby:

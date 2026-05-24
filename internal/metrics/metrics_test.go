@@ -220,7 +220,8 @@ func TestBoolToFloat64(t *testing.T) {
 func TestNoopRecorder(t *testing.T) {
 	recorder := &NoopRecorder{}
 
-	// All methods should not panic
+	// All methods should not panic — this verifies the Recorder interface
+	// contract is maintained even when the no-op implementation changes.
 	recorder.RecordReconcile("c", "n", "s", time.Second)
 	recorder.UpdateClusterInfo("c", "n", "v", "p", 1)
 	recorder.SetCoordinatorUp("c", "n", true)
@@ -239,6 +240,13 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetConnectionsMax("c", "n", 0)
 	recorder.SetDiskUsageBytes("c", "n", "db", 0)
 	recorder.RecordAuthAttempt("basic", "success")
+	recorder.SetActiveQueries("c", "n", 5)
+	recorder.SetQueuedQueries("c", "n", 2)
+	recorder.SetBlockedQueries("c", "n", 1)
+	recorder.RecordWorkloadRuleAction("c", "n", "cancel-long", "cancel")
+	recorder.SetResourceGroupUsage("c", "n", "analytics", 45.5, 60.2)
+	recorder.RecordIdleSessionTermination("c", "n", "idle-30m")
+	recorder.RecordSlowQuery("c", "n")
 	recorder.RecordBackup("c", "n", "full", "success")
 	recorder.ObserveBackupDuration("c", "n", time.Second)
 	recorder.SetBackupSizeBytes("c", "n", 1024)
@@ -249,7 +257,13 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetRecommendationsTotal("c", "n", "bloat", 3)
 	recorder.ObserveRecommendationScanDuration("c", "n", time.Second)
 	recorder.SetTableBloatRatio("c", "n", "public.t", 0.1)
+	recorder.RecordScaleOperation("c", "n", "scale-out")
+	recorder.SetRedistributionProgress("c", "n", 0.75)
+	recorder.SetDataSkewCoefficient("c", "n", 0.15)
 	recorder.SetPVCSizeBytes("c", "n", "coordinator", 10737418240)
+	recorder.RecordMirroringOperation("c", "n", "enable")
+	recorder.RecordMaintenanceOperation("c", "n", "vacuum")
+	recorder.RecordPasswordRotation()
 }
 
 func TestRecordBackup(t *testing.T) {
@@ -524,6 +538,55 @@ func TestSetDataSkewCoefficient(t *testing.T) {
 
 func TestNoopRecorder_ImplementsInterface(t *testing.T) {
 	var _ Recorder = &NoopRecorder{}
+}
+
+func TestNoopRecorder_AllMethods(t *testing.T) {
+	r := NewNoopRecorder()
+	require.NotNil(t, r)
+
+	// Call every method — none should panic.
+	r.RecordReconcile("cluster", "ns", "success", time.Second)
+	r.UpdateClusterInfo("cluster", "ns", "7.7", "Running", 4)
+	r.SetCoordinatorUp("cluster", "ns", true)
+	r.SetStandbyUp("cluster", "ns", false)
+	r.SetSegmentsReady("cluster", "ns", 4)
+	r.SetSegmentsTotal("cluster", "ns", 4)
+	r.SetSegmentsFailed("cluster", "ns", 0)
+	r.SetMirroringInSync("cluster", "ns", true)
+	r.RecordFTSProbe("cluster", "ns", "success", 100*time.Millisecond)
+	r.RecordFTSFailover("cluster", "ns")
+	r.SetSegmentStatus("cluster", "ns", "seg-0", true)
+	r.SetReplicationLag("cluster", "ns", "seg-0", 1024)
+	r.SetStandbyReplicationLag("cluster", "ns", 2048)
+	r.RecordConfigReload("cluster", "ns")
+	r.SetConnectionsActive("cluster", "ns", 10)
+	r.SetConnectionsMax("cluster", "ns", 100)
+	r.SetDiskUsageBytes("cluster", "ns", "postgres", 1073741824)
+	r.RecordAuthAttempt("basic", "success")
+	r.SetActiveQueries("cluster", "ns", 5)
+	r.SetQueuedQueries("cluster", "ns", 2)
+	r.SetBlockedQueries("cluster", "ns", 1)
+	r.RecordWorkloadRuleAction("cluster", "ns", "cancel-long", "cancel")
+	r.SetResourceGroupUsage("cluster", "ns", "analytics", 45.5, 60.2)
+	r.RecordIdleSessionTermination("cluster", "ns", "idle-30m")
+	r.RecordSlowQuery("cluster", "ns")
+	r.RecordBackup("cluster", "ns", "full", "success")
+	r.ObserveBackupDuration("cluster", "ns", 30*time.Second)
+	r.SetBackupSizeBytes("cluster", "ns", 1073741824)
+	r.RecordRestore("cluster", "ns", "success")
+	r.SetDataLoadingJobsActive("cluster", "ns", 3)
+	r.RecordDataLoadingRows("cluster", "ns", "s3-loader", "s3", 1000)
+	r.SetDiskUsagePercent("cluster", "ns", 75.5)
+	r.SetRecommendationsTotal("cluster", "ns", "bloat", 5)
+	r.ObserveRecommendationScanDuration("cluster", "ns", 45*time.Second)
+	r.SetTableBloatRatio("cluster", "ns", "public.orders", 0.25)
+	r.RecordScaleOperation("cluster", "ns", "scale-out")
+	r.SetRedistributionProgress("cluster", "ns", 0.75)
+	r.SetDataSkewCoefficient("cluster", "ns", 0.15)
+	r.SetPVCSizeBytes("cluster", "ns", "coordinator", 10737418240)
+	r.RecordMirroringOperation("cluster", "ns", "enable")
+	r.RecordMaintenanceOperation("cluster", "ns", "vacuum")
+	r.RecordPasswordRotation()
 }
 
 func TestPrometheusRecorder_ImplementsInterface(t *testing.T) {

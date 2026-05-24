@@ -29,7 +29,7 @@ func TestNewAuthReconciler(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 	require.NotNil(t, r)
 }
 
@@ -40,7 +40,7 @@ func TestAuthReconciler_Reconcile_NotFound(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"},
@@ -64,7 +64,7 @@ func TestAuthReconciler_Reconcile_NotRunning(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -88,7 +88,7 @@ func TestAuthReconciler_Reconcile_Running(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -120,7 +120,7 @@ func TestAuthReconciler_Reconcile_Initializing(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -151,7 +151,7 @@ func TestAuthReconciler_Reconcile_WithOIDC(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -182,7 +182,7 @@ func TestAuthReconciler_Reconcile_WithOIDC_MissingIssuer(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	// Should still succeed (OIDC validation is a warning, not a failure).
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -213,7 +213,7 @@ func TestAuthReconciler_Reconcile_WithSSL(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -240,7 +240,7 @@ func TestAuthReconciler_Reconcile_HBAUpdate(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -283,7 +283,7 @@ func TestAuthReconciler_Reconcile_WithOIDCAndSSL(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -321,7 +321,7 @@ func TestAuthReconciler_Reconcile_HBAUpdateWithChangedRules(t *testing.T) {
 	err := k8sClient.Update(context.Background(), cluster)
 	require.NoError(t, err)
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -352,7 +352,7 @@ func TestAuthReconciler_Reconcile_WithHBARules(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -372,7 +372,7 @@ func TestAuthReconciler_Reconcile_WithHBARules(t *testing.T) {
 func TestAuthReconciler_ValidateOIDCConfig(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := NewAuthReconciler(k8sClient, scheme, record.NewFakeRecorder(10), builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
+	r := NewAuthReconciler(k8sClient, record.NewFakeRecorder(10), builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
 
 	tests := []struct {
 		name      string
@@ -455,7 +455,7 @@ func TestAuthReconciler_Reconcile_OIDCDisabled(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -486,7 +486,7 @@ func TestAuthReconciler_Reconcile_OIDCMissingClientID(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -509,7 +509,7 @@ func TestAuthReconciler_Reconcile_DeletingPhase(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -533,7 +533,7 @@ func TestAuthReconciler_ReconcileHBA_CreateThenUpdate(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	// First call creates the configmap.
 	err := r.reconcileHBA(context.Background(), cluster)
@@ -560,7 +560,7 @@ func TestAuthReconciler_Reconcile_AuthNilSpec(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -587,7 +587,7 @@ func TestAuthReconciler_Reconcile_GetError(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -618,7 +618,7 @@ func TestAuthReconciler_ReconcileHBA_CreateError(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	err := r.reconcileHBA(context.Background(), cluster)
 	require.Error(t, err)
@@ -647,7 +647,7 @@ func TestAuthReconciler_ReconcileHBA_GetError(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	err := r.reconcileHBA(context.Background(), cluster)
 	require.Error(t, err)
@@ -680,7 +680,7 @@ func TestAuthReconciler_ReconcileHBA_UpdateError(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	err := r.reconcileHBA(context.Background(), cluster)
 	require.Error(t, err)
@@ -704,7 +704,7 @@ func TestAuthReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -731,7 +731,7 @@ func TestAuthReconciler_Reconcile_ObservedGenerationMismatch(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
@@ -772,7 +772,7 @@ func TestAuthReconciler_Reconcile_HBAError_SetsCondition(t *testing.T) {
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	r := NewAuthReconciler(k8sClient, scheme, recorder, b, m, nil)
+	r := NewAuthReconciler(k8sClient, recorder, b, m, nil)
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},

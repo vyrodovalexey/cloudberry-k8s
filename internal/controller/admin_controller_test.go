@@ -2263,7 +2263,7 @@ func TestAdminReconciler_ReconcileWorkload_WithRulesCreatesConfigMap(t *testing.
 	assert.Contains(t, cm.Data["idle-rules.json"], "idle-analytics")
 
 	// Verify labels.
-	assert.Equal(t, "cloudberry-operator", cm.Labels["app.kubernetes.io/managed-by"])
+	assert.Equal(t, util.LabelManagedByValue, cm.Labels[util.LabelManagedBy])
 	assert.Equal(t, "workload-rules", cm.Labels["app.kubernetes.io/component"])
 	assert.Equal(t, "test-cluster", cm.Labels["app.kubernetes.io/instance"])
 

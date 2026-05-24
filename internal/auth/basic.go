@@ -89,7 +89,12 @@ func (p *BasicAuthProvider) Authenticate(ctx context.Context, r *http.Request) (
 		return nil, fmt.Errorf("retrieving permission level: %w", err)
 	}
 
-	p.logger.Info("basic auth succeeded", "username", username, "permission", permission.String())
+	p.logger.Info("basic auth succeeded",
+		"username", username,
+		"method", AuthMethodBasicName,
+		"source_ip", r.RemoteAddr,
+		"permission", permission.String(),
+	)
 
 	return &Identity{
 		Username:   username,

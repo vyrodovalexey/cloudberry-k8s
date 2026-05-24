@@ -259,3 +259,8 @@ func ClusterSubresourcePath(name, subresource, namespace string) string {
 	}
 	return path
 }
+
+// AuthRotatePasswordPath returns the API path for rotating the admin password.
+func AuthRotatePasswordPath() string {
+	return "/auth/rotate-password"
+}

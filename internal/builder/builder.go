@@ -26,6 +26,8 @@ const (
 	configVolumePath = "/etc/cloudberry"
 	tlsVolumeName    = "tls"
 	tlsVolumePath    = "/tls"
+	tlsSecretVolName = "tls-secret" // source Secret volume (symlinked, root-owned)
+	tlsSecretVolPath = "/tls-secret"
 
 	containerName  = "cloudberry"
 	initContainerN = "init-cloudberry"
@@ -35,6 +37,9 @@ const (
 	portName = "postgresql"
 
 	hbaTargetAll = "all"
+
+	// psqlCommandFlag is the psql flag for executing a SQL command.
+	psqlCommandFlag = "-c"
 
 	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
 	secretKeyPassword = "password"
@@ -154,13 +159,11 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						buildInitContainer(),
-					},
-					Containers:   []corev1.Container{},
-					Volumes:      buildVolumes(cluster),
-					NodeSelector: cluster.Spec.Coordinator.NodeSelector,
-					Tolerations:  convertTolerations(cluster.Spec.Coordinator.Tolerations),
+					InitContainers: buildInitContainers(cluster),
+					Containers:     []corev1.Container{},
+					Volumes:        buildVolumes(cluster),
+					NodeSelector:   cluster.Spec.Coordinator.NodeSelector,
+					Tolerations:    convertTolerations(cluster.Spec.Coordinator.Tolerations),
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
@@ -221,12 +224,10 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						buildInitContainer(),
-					},
-					Containers:   []corev1.Container{},
-					Volumes:      buildVolumes(cluster),
-					NodeSelector: cluster.Spec.Standby.NodeSelector,
+					InitContainers: buildInitContainers(cluster),
+					Containers:     []corev1.Container{},
+					Volumes:        buildVolumes(cluster),
+					NodeSelector:   cluster.Spec.Standby.NodeSelector,
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
@@ -278,14 +279,12 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						buildInitContainer(),
-					},
-					Containers:   []corev1.Container{},
-					Volumes:      buildVolumes(cluster),
-					NodeSelector: cluster.Spec.Segments.NodeSelector,
-					Tolerations:  convertTolerations(cluster.Spec.Segments.Tolerations),
-					Affinity:     buildSegmentAffinity(cluster, util.ComponentSegmentMirror),
+					InitContainers: buildInitContainers(cluster),
+					Containers:     []corev1.Container{},
+					Volumes:        buildVolumes(cluster),
+					NodeSelector:   cluster.Spec.Segments.NodeSelector,
+					Tolerations:    convertTolerations(cluster.Spec.Segments.Tolerations),
+					Affinity:       buildSegmentAffinity(cluster, util.ComponentSegmentMirror),
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
@@ -343,14 +342,12 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						buildInitContainer(),
-					},
-					Containers:   []corev1.Container{},
-					Volumes:      buildVolumes(cluster),
-					NodeSelector: cluster.Spec.Segments.NodeSelector,
-					Tolerations:  convertTolerations(cluster.Spec.Segments.Tolerations),
-					Affinity:     buildSegmentAffinity(cluster, util.ComponentSegmentPrimary),
+					InitContainers: buildInitContainers(cluster),
+					Containers:     []corev1.Container{},
+					Volumes:        buildVolumes(cluster),
+					NodeSelector:   cluster.Spec.Segments.NodeSelector,
+					Tolerations:    convertTolerations(cluster.Spec.Segments.Tolerations),
+					Affinity:       buildSegmentAffinity(cluster, util.ComponentSegmentPrimary),
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
@@ -629,7 +626,7 @@ func (b *DefaultBuilder) BuildMaintenanceJob(
 								"-h", coordinatorSvc,
 								"-U", util.DefaultAdminUser,
 								"-d", "postgres",
-								"-c", sql,
+								psqlCommandFlag, sql,
 							},
 							Env: []corev1.EnvVar{
 								{
@@ -691,6 +688,51 @@ func buildInitContainer() corev1.Container {
 			{Name: dataVolumeName, MountPath: dataVolumePath},
 		},
 	}
+}
+
+// buildTLSInitContainer creates an init container that copies TLS cert files from
+// the Secret volume (which uses symlinks with 0777 permissions) to an emptyDir
+// volume with correct ownership (gpadmin:gpadmin) and permissions (0600 for key,
+// 0644 for certs). PostgreSQL requires the private key to have restricted perms.
+func buildTLSInitContainer() corev1.Container {
+	rootUser := int64(0)
+	return corev1.Container{
+		Name:  "init-tls",
+		Image: initImage,
+		Command: []string{
+			"/bin/sh", "-c",
+			"cp " + tlsSecretVolPath + "/tls.crt " + tlsVolumePath + "/tls.crt && " +
+				"cp " + tlsSecretVolPath + "/tls.key " + tlsVolumePath + "/tls.key && " +
+				"cp " + tlsSecretVolPath + "/ca.crt " + tlsVolumePath + "/ca.crt && " +
+				"chown " + fmt.Sprintf("%d:%d", gpadminUID, gpadminUID) + " " + tlsVolumePath + "/* && " +
+				"chmod 600 " + tlsVolumePath + "/tls.key && " +
+				"chmod 644 " + tlsVolumePath + "/tls.crt " + tlsVolumePath + "/ca.crt && " +
+				"echo 'TLS certificates ready'",
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser: &rootUser,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: tlsSecretVolName, MountPath: tlsSecretVolPath, ReadOnly: true},
+			{Name: tlsVolumeName, MountPath: tlsVolumePath},
+		},
+	}
+}
+
+// sslEnabled returns true if SSL is configured with a cert secret.
+func sslEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.Auth != nil && cluster.Spec.Auth.SSL != nil &&
+		cluster.Spec.Auth.SSL.Enabled && cluster.Spec.Auth.SSL.CertSecret != nil
+}
+
+// buildInitContainers returns the init containers for a pod, including the
+// TLS init container when SSL is enabled.
+func buildInitContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container {
+	inits := []corev1.Container{buildInitContainer()}
+	if sslEnabled(cluster) {
+		inits = append(inits, buildTLSInitContainer())
+	}
+	return inits
 }
 
 // cloudberryRoleForComponent maps a component label to the CLOUDBERRY_ROLE env var value.
@@ -906,17 +948,30 @@ func buildVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume {
 		},
 	}
 
-	// Add TLS volume if SSL is enabled.
+	// Add TLS volumes if SSL is enabled.
+	// PostgreSQL requires the private key file to have permissions u=rw (0600).
+	// K8s Secret volumes use symlinks (always 0777) which PostgreSQL rejects.
+	// Solution: mount the Secret to a staging path, then use an init container
+	// to copy the files to an emptyDir with correct ownership and permissions.
 	if cluster.Spec.Auth != nil && cluster.Spec.Auth.SSL != nil &&
 		cluster.Spec.Auth.SSL.Enabled && cluster.Spec.Auth.SSL.CertSecret != nil {
-		volumes = append(volumes, corev1.Volume{
-			Name: tlsVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: cluster.Spec.Auth.SSL.CertSecret.Name,
+		// Source: Secret volume (read-only, symlinked) + Target: emptyDir with correct perms
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: tlsSecretVolName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: cluster.Spec.Auth.SSL.CertSecret.Name,
+					},
 				},
 			},
-		})
+			corev1.Volume{
+				Name: tlsVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
 	}
 
 	return volumes

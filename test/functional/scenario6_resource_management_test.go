@@ -191,6 +191,9 @@ func (m *scenario6MockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.T
 func (m *scenario6MockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error {
 	return nil
 }
+func (m *scenario6MockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
+	return nil, nil
+}
 func (m *scenario6MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return nil, nil
 }
@@ -216,8 +219,8 @@ func newScenario6Cluster() *cbv1alpha1.CloudberryCluster {
 			Namespace: scenario6Namespace,
 		},
 		Spec: cbv1alpha1.CloudberryClusterSpec{
-			Version: "7.7",
-			Image:   "cloudberrydb/cloudberry:7.7",
+			Version: "2.1.0",
+			Image:   "cloudberrydb/cloudberry:2.1.0",
 			Coordinator: cbv1alpha1.CoordinatorSpec{
 				Storage: cbv1alpha1.StorageSpec{Size: "10Gi"},
 			},

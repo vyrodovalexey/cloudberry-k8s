@@ -224,6 +224,15 @@ spec:
                             key: { type: string }
                     oidc:
                       type: object
+                      description: >
+                        OIDC/JWT authentication configuration. When both basic and OIDC are enabled,
+                        the auth middleware routes requests based on the Authorization header prefix:
+                        "Basic ..." → basic provider, "Bearer ..." → OIDC provider. The operator
+                        initializes the OIDC provider in startAPIServer() when cfg.OIDC.Enabled is
+                        true, with graceful fallback to Basic-only auth if OIDC initialization fails.
+                        Dual-mode behavior is verified by Scenario 38 against a real Keycloak instance
+                        (test/functional/scenario38_dual_auth_test.go). Note: Keycloak requires an
+                        audience mapper for the clientID and a matching frontendUrl for the issuerURL.
                       properties:
                         enabled:
                           type: boolean
@@ -269,6 +278,10 @@ spec:
                           default: true
                     hbaRules:
                       type: array
+                      description: >
+                        Host-based authentication rules for pg_hba.conf. When omitted or empty,
+                        the operator generates secure default rules (see specification 05, section 6.3).
+                        Default behavior is verified by Scenario 45 (test/functional/scenario45_hba_defaults_test.go).
                       items:
                         type: object
                         required: [type, database, user, method]
@@ -353,6 +366,13 @@ spec:
                       description: "Enable storage-layer checksums"
 
                 # --- Vault Integration ---
+                # Comprehensive Vault integration is verified by Scenario 46
+                # (test/functional/scenario46_vault_integration_test.go,
+                #  test/e2e/scenario46_vault_integration_e2e_test.go).
+                # Scenario 46 validates all 3 auth methods (token, kubernetes, approle),
+                # all 4 KV secret paths (admin-password, oidc-secret, monitoring-password, tls),
+                # secret rotation watch via hash comparison, and connection retry with
+                # exponential backoff (MaxRetries=5, InitialBackoff=1s, MaxBackoff=30s).
                 vault:
                   type: object
                   properties:

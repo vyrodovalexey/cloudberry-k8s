@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -21,7 +20,14 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
-const authControllerName = "auth-controller"
+const (
+	authControllerName = "auth-controller"
+
+	// authReconcileInterval is the requeue interval for auth reconciliation
+	// when no changes are detected. This ensures periodic re-validation of
+	// authentication configuration (e.g., OIDC endpoint availability).
+	authReconcileInterval = 5 * time.Minute
+)
 
 // AuthReconciler reconciles the authentication aspects of a CloudberryCluster.
 type AuthReconciler struct {
@@ -33,10 +39,8 @@ type AuthReconciler struct {
 }
 
 // NewAuthReconciler creates a new AuthReconciler.
-// The scheme parameter is accepted for backward compatibility but is unused.
 func NewAuthReconciler(
 	c client.Client,
-	_ *runtime.Scheme,
 	recorder record.EventRecorder,
 	b builder.ResourceBuilder,
 	m metrics.Recorder,
@@ -80,7 +84,7 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Skip full reconciliation if only status changed (ObservedGeneration matches).
 	if cluster.Status.ObservedGeneration == cluster.Generation {
 		logger.Debug("skipping auth reconciliation, generation unchanged")
-		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		return ctrl.Result{RequeueAfter: authReconcileInterval}, nil
 	}
 
 	// Reconcile pg_hba.conf.
@@ -129,7 +133,7 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("updating auth status: %w", err)
 	}
 
-	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: authReconcileInterval}, nil
 }
 
 // reconcileHBA ensures the pg_hba.conf ConfigMap is in the desired state.

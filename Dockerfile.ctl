@@ -26,11 +26,12 @@ COPY internal/ internal/
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
+ARG TARGETARCH
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
     -trimpath \
     -ldflags="-s -w \
-        -X main.appVersion=${VERSION} \
+        -X main.version=${VERSION} \
         -X main.commit=${COMMIT} \
         -X main.buildDate=${BUILD_DATE}" \
     -o /workspace/bin/cloudberry-ctl \

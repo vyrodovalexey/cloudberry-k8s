@@ -32,6 +32,11 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Restart-Required Parameters](#restart-required-parameters)
   - [Rolling Restart Behavior](#rolling-restart-behavior)
 - [Authentication Setup](#authentication-setup)
+  - [Default HBA Rules](#default-hba-rules)
+  - [OIDC Redirect Protection](#oidc-redirect-protection)
+  - [OIDC Full Flow Setup with Keycloak](#oidc-full-flow-setup-with-keycloak)
+  - [Dual-Mode Authentication (Basic + OIDC)](#dual-mode-authentication-basic--oidc)
+  - [SSL/TLS Configuration](#ssltls-configuration)
 - [Webhook Certificate Setup](#webhook-certificate-setup)
 - [High Availability](#high-availability)
   - [Automatic Segment Failover](#automatic-segment-failover)
@@ -109,6 +114,10 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Webhook Validation Errors](#webhook-validation-errors)
   - [Pod Deletion Recovery](#pod-deletion-recovery)
 - [Inspection Commands](#inspection-commands)
+- [Auditing](#auditing)
+  - [Connection Auditing](#connection-auditing)
+  - [Statement Auditing](#statement-auditing)
+  - [Operator Audit Log](#operator-audit-log)
 - [Monitoring and Observability](#monitoring-and-observability)
 
 ## Creating a CloudberryCluster
@@ -154,7 +163,7 @@ kubectl apply -f minimal-cluster.yaml
 
 The operator applies defaults for all unspecified fields:
 - **Image**: `postgres:16` (or specify your preferred PostgreSQL-compatible image)
-- **Coordinator port**: `5432` (all components, including segments, use this port)
+- **Coordinator port**: `5432` (all components, including segments, use this port). Port values are validated to be in the range 1–65535
 - **Storage class**: cluster default (no `storageClass` required)
 - **Basic auth**: enabled with `gpadmin` user
 - **Deletion policy**: `Retain`
@@ -904,6 +913,54 @@ rules:
 
 ## Authentication Setup
 
+### Default HBA Rules
+
+When you deploy a `CloudberryCluster` without specifying `auth.hbaRules`, the operator automatically generates a secure set of default `pg_hba.conf` rules:
+
+```
+local   all   gpadmin                 trust
+local   all   all                     scram-sha-256
+host    all   gpadmin   127.0.0.1/32  trust
+host    all   all       0.0.0.0/0     scram-sha-256
+host    replication  all  0.0.0.0/0   scram-sha-256
+```
+
+These defaults provide a balance of convenience and security:
+
+| Connection | User | Auth Method | Behavior |
+|------------|------|-------------|----------|
+| Local (Unix socket) | `gpadmin` | `trust` | No password required — enables operator-internal management |
+| Local (Unix socket) | All other users | `scram-sha-256` | Password required |
+| Remote (`127.0.0.1`) | `gpadmin` | `trust` | Localhost loopback trusted for admin |
+| Remote (any IP) | All users | `scram-sha-256` | Password required for all remote connections |
+| Replication (any IP) | All users | `scram-sha-256` | Password required for streaming replication |
+
+The same defaults are generated when `hbaRules` is set to an empty array (`hbaRules: []`).
+
+**Overriding defaults**: When you provide explicit `hbaRules` in the CRD spec, the defaults are replaced entirely. Only your custom rules appear in the generated `pg_hba.conf`. For example:
+
+```yaml
+spec:
+  auth:
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "10.0.0.0/8"
+        method: scram-sha-256
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: reject
+```
+
+> **Note**: The default HBA rules behavior is verified by Scenario 45 (see `test/functional/scenario45_hba_defaults_test.go` and `test/e2e/scenario45_hba_defaults_e2e_test.go`).
+
 ### Basic Authentication
 
 Basic auth is enabled by default. The operator uses **bcrypt** for password hashing, providing strong protection against brute-force attacks.
@@ -940,6 +997,10 @@ cloudberry-ctl auth rotate-password --cluster my-cluster
 ```
 
 This updates the Kubernetes Secret, database role password, and Vault secret (if enabled).
+
+### OIDC Redirect Protection
+
+The OIDC provider's HTTP client limits redirects to 5 hops during OIDC discovery and token exchange. This prevents infinite redirect loops when the identity provider misconfigures its endpoints. If you encounter `stopped after 5 redirects` errors, verify that the `issuerURL` is correct and the OIDC provider's `.well-known/openid-configuration` endpoint is accessible without excessive redirects.
 
 ### OIDC Authentication (Keycloak)
 
@@ -999,18 +1060,320 @@ cloudberry-ctl auth login --cluster my-cluster --basic --username admin
 cloudberry-ctl auth status --cluster my-cluster
 ```
 
-### SSL/TLS Configuration
+### OIDC Full Flow Setup with Keycloak
 
-1. **Create a TLS secret**:
+This section provides step-by-step instructions for setting up a complete OIDC authentication flow with Keycloak, including per-user role mapping to all 5 permission levels and service account support. This setup was verified end-to-end on a real cluster (Scenario 41).
+
+#### Step 1: Configure the Keycloak Realm
+
+Create a Keycloak realm with the required clients, roles, and users:
 
 ```bash
+# Create the realm (e.g., "test" or "cloudberry")
+# Set the Frontend URL to match the operator's issuerURL
+# Example: http://host.docker.internal:8090 (for Docker Desktop)
+```
+
+**Realm settings:**
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Realm name | `test` (or `cloudberry`) | Must match the path in `issuerURL` |
+| Frontend URL | `http://host.docker.internal:8090` | Must match the operator's `issuerURL` so the `iss` claim in tokens is correct |
+
+#### Step 2: Create the Keycloak Client
+
+Create a confidential client for the operator:
+
+| Setting | Value |
+|---------|-------|
+| Client ID | `cloudberry-operator` |
+| Client Protocol | `openid-connect` |
+| Access Type | `confidential` |
+| Service Accounts Enabled | `true` |
+| Direct Access Grants Enabled | `true` |
+
+**Critical: Add an audience mapper** to include `cloudberry-operator` in the `aud` claim of issued tokens. Without this, JWT audience validation fails with `401 Unauthorized`.
+
+1. Go to the client's **Mappers** tab
+2. Create a new mapper:
+   - Name: `audience-mapper`
+   - Mapper Type: `Audience`
+   - Included Client Audience: `cloudberry-operator`
+   - Add to ID token: `ON`
+   - Add to access token: `ON`
+
+#### Step 3: Create Realm Roles
+
+Create 5 realm roles that map to the operator's permission levels:
+
+| Realm Role | Maps To | Permission Level |
+|------------|---------|-----------------|
+| `admin` | Admin | Full access — user management, security config, cluster lifecycle |
+| `operator` | Operator | Cluster operations — start/stop, config changes, maintenance |
+| `operator-basic` | Operator Basic | Basic operations — view all sessions, view configurations |
+| `user` | Basic | View cluster state — read cluster status, view dashboards |
+| `reader` | Self Only | View own queries and sessions only |
+
+#### Step 4: Create Test Users
+
+Create users and assign one role to each:
+
+| Username | Email | Realm Role |
+|----------|-------|------------|
+| `admin-user` | `admin-user@test.local` | `admin` |
+| `operator-user` | `operator-user@test.local` | `operator` |
+| `opbasic-user` | `opbasic-user@test.local` | `operator-basic` |
+| `basic-user` | `basic-user@test.local` | `user` |
+| `reader-user` | `reader-user@test.local` | `reader` |
+
+Set a password for each user (e.g., `password`) with "Temporary" set to `OFF`.
+
+#### Step 5: Assign Roles to the Service Account
+
+For service account (client_credentials) support, assign the `admin` role to the service account:
+
+1. Go to the client's **Service Account Roles** tab
+2. Add the `admin` realm role
+
+#### Step 6: Create the Client Secret in Kubernetes
+
+```bash
+# Get the client secret from Keycloak (Client → Credentials tab)
+kubectl create secret generic oidc-client-secret \
+  -n cloudberry-test \
+  --from-literal=client-secret='<your-keycloak-client-secret>'
+```
+
+#### Step 7: Configure the Cluster CR
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: my-cluster
+  namespace: cloudberry-test
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    storage:
+      size: "5Gi"
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    oidc:
+      enabled: true
+      issuerURL: http://host.docker.internal:8090/realms/test
+      clientID: cloudberry-operator
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes: [openid, profile, email]
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        operator: Operator
+        operator-basic: "Operator Basic"
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+```
+
+#### Step 8: Verify the Setup
+
+**Obtain a token for each user** using the password grant:
+
+```bash
+# Get a token for admin-user
+TOKEN=$(curl -s -X POST \
+  "http://host.docker.internal:8090/realms/test/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password" \
+  -d "client_id=cloudberry-operator" \
+  -d "client_secret=<your-client-secret>" \
+  -d "username=admin-user" \
+  -d "password=password" \
+  | jq -r '.access_token')
+
+# Call the operator API with the OIDC token
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8090/api/v1alpha1/clusters
+```
+
+**Obtain a service account token** using client_credentials:
+
+```bash
+SA_TOKEN=$(curl -s -X POST \
+  "http://host.docker.internal:8090/realms/test/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=cloudberry-operator" \
+  -d "client_secret=<your-client-secret>" \
+  | jq -r '.access_token')
+
+curl -H "Authorization: Bearer $SA_TOKEN" \
+  http://localhost:8090/api/v1alpha1/clusters
+```
+
+**Verify Basic auth still works** alongside OIDC:
+
+```bash
+curl -u gpadmin:admin-password \
+  http://localhost:8090/api/v1alpha1/clusters
+```
+
+#### Expected Results
+
+Each user should receive the correct permission level based on their Keycloak realm role:
+
+| User | Role | Expected Permission | HTTP Status |
+|------|------|---------------------|-------------|
+| `admin-user` | `admin` | Admin | 200 |
+| `operator-user` | `operator` | Operator | 200 |
+| `opbasic-user` | `operator-basic` | Operator Basic | 200 |
+| `basic-user` | `user` | Basic | 200 |
+| `reader-user` | `reader` | Self Only | 200 (list own), 403 (admin ops) |
+| Service account | `admin` | Admin | 200 |
+| Basic auth (gpadmin) | — | Admin | 200 |
+
+**Operator log entries** confirm the authentication flow:
+
+```
+"OIDC auth succeeded" username=admin-user email=admin-user@test.local roles=[admin] permission=Admin
+"OIDC auth succeeded" username=service-account-cloudberry-operator roles=[admin] permission=Admin
+"basic auth succeeded" username=gpadmin permission=Admin
+```
+
+#### Troubleshooting
+
+| Symptom | Cause | Resolution |
+|---------|-------|------------|
+| `401 Unauthorized` on all Bearer requests | Audience mapper missing | Add `oidc-audience-mapper` to the Keycloak client that includes `cloudberry-operator` in the `aud` claim |
+| `401 Unauthorized` with "issuer mismatch" | Frontend URL mismatch | Set the Keycloak realm's Frontend URL to match the operator's `issuerURL` exactly |
+| Token accepted but wrong permission | Role not assigned | Verify the user has the correct realm role assigned in Keycloak |
+| Service account gets Self Only | Service account role missing | Assign the desired realm role to the client's service account (Service Account Roles tab) |
+| `stopped after 5 redirects` | Incorrect issuer URL | Verify the `issuerURL` is correct and the `.well-known/openid-configuration` endpoint is accessible |
+
+> **Note**: The OIDC full flow is verified by Scenario 41. See `test/functional/scenario41_oidc_full_flow_test.go` and `test/e2e/scenario41_oidc_full_flow_e2e_test.go` for the full test suite.
+
+### Dual-Mode Authentication (Basic + OIDC)
+
+The operator supports running both Basic and OIDC authentication simultaneously. When both providers are enabled, the auth middleware inspects the `Authorization` header to route each request to the correct provider:
+
+| Header Prefix | Provider | Identity.AuthMethod |
+|---------------|----------|---------------------|
+| `Basic ...` | Basic auth provider | `basic` |
+| `Bearer ...` | OIDC/JWT provider | `oidc` |
+| *(missing)* | — (rejected) | — |
+| Other (e.g., `Digest`) | — (rejected) | — |
+
+Requests without a recognized `Authorization` header receive a `401 Unauthorized` response in JSON format.
+
+**Enabling dual-mode auth**: Set both `auth.basic.enabled: true` and `auth.oidc.enabled: true` in the cluster spec:
+
+```yaml
+spec:
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+      adminPasswordSecret:
+        name: cloudberry-admin-password
+        key: password
+    oidc:
+      enabled: true
+      issuerURL: https://keycloak.auth-system/realms/cloudberry
+      clientID: cloudberry-operator
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      roleMapping:
+        admin: Admin
+        operator: Operator
+        operator-basic: "Operator Basic"
+        user: Basic
+        reader: "Self Only"
+```
+
+**How it works**:
+
+1. The middleware extracts the `Authorization` header from each incoming request
+2. If the header starts with `Basic `, the request is routed to the Basic auth provider, which validates credentials against the in-memory credential store (backed by the admin password Secret and database roles)
+3. If the header starts with `Bearer `, the request is routed to the OIDC provider, which validates the JWT signature, issuer, audience, and expiry, then maps role claims to permission levels
+4. Both providers return an `Identity` object with the authenticated user's `Username`, `AuthMethod` (`"basic"` or `"oidc"`), and `PermissionLevel`
+5. The `Identity` is stored in the request context for downstream permission enforcement
+
+**Permission levels** are resolved independently by each provider:
+
+- **Basic auth**: Permission is determined by the credential store entry (admin user gets `Admin`, database roles are mapped based on role membership)
+- **OIDC auth**: Permission is determined by mapping JWT role claims through the `roleMapping` configuration
+
+Both providers share the same permission hierarchy: `Self Only` < `Basic` < `Operator Basic` < `Operator` < `Admin`. Permission enforcement middleware works identically regardless of which provider authenticated the request.
+
+**Keycloak configuration requirements**: For OIDC to work end-to-end with a real Keycloak instance, you must configure the following:
+
+1. **Audience mapper**: Add a protocol mapper (type: `oidc-audience-mapper`) to the Keycloak realm that includes the operator's `clientID` in the `aud` claim of issued tokens. Without this, JWT audience validation fails with `401 Unauthorized`.
+2. **Frontend URL**: Set the Keycloak realm's `frontendUrl` to match the operator's configured `issuerURL`. This ensures the `iss` claim in issued tokens matches what the operator expects during JWT validation.
+3. **Role assignment**: Assign appropriate realm roles (e.g., `admin`, `operator`, `user`, `reader`) to service accounts and users. These roles must correspond to the `roleMapping` entries in the cluster CR.
+
+**Real-cluster verification results** (10/10 PASS):
+
+| # | Test | HTTP Status | Result |
+|---|------|-------------|--------|
+| 1 | Basic Auth (valid admin) → routed to Basic provider | 200 | PASS |
+| 2 | Basic Auth (invalid password) | 401 | PASS |
+| 3 | No Auth Header | 401 | PASS |
+| 4 | Bearer Auth (Keycloak service account JWT) → routed to OIDC provider | 200 | PASS |
+| 5 | Bearer Auth (Keycloak user password-grant JWT) → routed to OIDC provider | 200 | PASS |
+| 6 | Unsupported Auth Type (Digest) | 401 | PASS |
+| 7 | Health /healthz (no auth) | 200 | PASS |
+| 8 | Health /readyz (no auth) | 200 | PASS |
+| 9 | Bearer Auth (invalid token) | 401 | PASS |
+| 10 | Dual-auth cluster CR phase = Running | Running | PASS |
+
+> **Note**: Dual-mode auth behavior is verified by Scenario 38. See `test/functional/scenario38_dual_auth_test.go` and `test/e2e/scenario38_dual_auth_e2e_test.go` for the full test suite.
+
+### SSL/TLS Configuration
+
+The operator supports SSL/TLS encryption for PostgreSQL connections. When SSL is enabled, the operator configures `postgresql.conf` with SSL parameters and mounts TLS certificates into all StatefulSets (coordinator, standby, primary segments, and mirror segments).
+
+Two certificate sources are supported:
+
+| Source | Description | Use Case |
+|--------|-------------|----------|
+| **Kubernetes Secret** | TLS certificates stored in a `kubernetes.io/tls` Secret | Standard deployments, manual cert management |
+| **Vault PKI** | Certificates issued by HashiCorp Vault PKI engine | Production environments with automated cert lifecycle |
+
+#### K8s Secret Source
+
+1. **Create a TLS Secret** with the server certificate, private key, and CA certificate:
+
+```bash
+# Option A: Using kubectl create secret tls (tls.crt and tls.key only)
 kubectl create secret tls cloudberry-tls \
   -n cloudberry-test \
   --cert=server.crt \
   --key=server.key
+
+# Option B: Add the CA certificate to the Secret
+kubectl create secret generic cloudberry-tls \
+  -n cloudberry-test \
+  --from-file=tls.crt=server.crt \
+  --from-file=tls.key=server.key \
+  --from-file=ca.crt=ca.crt
 ```
 
-2. **Enable SSL in the CRD**:
+2. **Enable SSL in the CRD** with the cert Secret reference and minimum TLS version:
 
 ```yaml
 spec:
@@ -1021,6 +1384,120 @@ spec:
         name: cloudberry-tls
       minTLSVersion: "1.2"
 ```
+
+3. **Use `hostssl` HBA rules** to require SSL for remote connections:
+
+```yaml
+spec:
+  auth:
+    ssl:
+      enabled: true
+      certSecret:
+        name: cloudberry-tls
+      minTLSVersion: "1.2"
+    hbaRules:
+      - type: hostssl
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+```
+
+When SSL is enabled, the operator generates the following `postgresql.conf` settings:
+
+```
+ssl = on
+ssl_cert_file = '/tls/tls.crt'
+ssl_key_file = '/tls/tls.key'
+ssl_ca_file = '/tls/ca.crt'
+ssl_min_protocol_version = 'TLSv1.2'
+```
+
+The TLS certificates are made available at `/tls` on all StatefulSets (coordinator, standby, primary segments, and mirror segments) using a two-volume approach with an init container.
+
+**TLS key permissions handling**: PostgreSQL requires the private key file (`tls.key`) to have permissions `0600` (owner read/write only). Kubernetes Secret volumes mount files as symlinks with `0777` permissions, which PostgreSQL rejects. To solve this, the operator uses the following approach:
+
+1. The TLS Secret is mounted at `/tls-secret` (read-only)
+2. An EmptyDir volume is mounted at `/tls`
+3. An `init-tls` init container copies the certificate files from `/tls-secret` to `/tls` with correct permissions:
+   - `tls.key`: `0600` (owner read/write only)
+   - `tls.crt` and `ca.crt`: `0644` (world readable)
+   - All files owned by `gpadmin:gpadmin` (UID 1000)
+
+This is handled automatically by the operator — no manual configuration is required.
+
+**Supported `minTLSVersion` values:**
+
+| Value | PostgreSQL Setting | Description |
+|-------|-------------------|-------------|
+| `"1.2"` | `TLSv1.2` | TLS 1.2 minimum (recommended) |
+| `"1.3"` | `TLSv1.3` | TLS 1.3 minimum (strongest) |
+
+#### Vault PKI Source
+
+For production environments, use Vault's PKI secrets engine to issue and automatically rotate TLS certificates:
+
+```yaml
+spec:
+  auth:
+    ssl:
+      enabled: true
+      certSecret:
+        name: cloudberry-vault-tls
+      minTLSVersion: "1.2"
+  vault:
+    enabled: true
+    address: http://vault:8200
+    authMethod: token
+    secretPath: secret/data/cloudberry
+```
+
+Configure the webhook certificate source to use Vault PKI in your Helm values:
+
+```yaml
+webhook:
+  enabled: true
+  certSource: vault-pki
+  vaultPKI:
+    mountPath: pki
+    role: cloudberry-operator
+```
+
+Vault PKI issues certificates with the following fields:
+
+| Field | Description |
+|-------|-------------|
+| `certificate` | PEM-encoded server certificate |
+| `private_key` | PEM-encoded server private key |
+| `issuing_ca` | PEM-encoded CA certificate |
+| `serial_number` | Certificate serial number |
+
+**Certificate rotation**: Certificates are automatically rotated when 2/3 of their lifetime has elapsed. The rotation check runs every 12 hours. After rotation, the new CA bundle is injected into the webhook configurations.
+
+#### Verifying SSL Configuration
+
+```bash
+# Check the postgresql.conf ConfigMap for SSL settings
+kubectl get configmap <cluster>-postgresql-conf -n cloudberry-test \
+  -o jsonpath='{.data.postgresql\.conf}' | grep ssl
+
+# Verify the TLS volume is mounted on the coordinator StatefulSet
+kubectl get statefulset <cluster>-coordinator -n cloudberry-test \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls")]}'
+
+# Verify the TLS Secret exists
+kubectl get secret cloudberry-tls -n cloudberry-test
+
+# Check the pg_hba.conf for hostssl rules
+kubectl get configmap <cluster>-pg-hba-conf -n cloudberry-test \
+  -o jsonpath='{.data.pg_hba\.conf}' | grep hostssl
+```
+
+> **Note**: SSL/TLS configuration is verified by Scenario 47. See `test/functional/scenario47_ssl_tls_test.go` and `test/e2e/scenario47_ssl_tls_e2e_test.go` for the full test suite.
 
 ### Role Management
 
@@ -1041,13 +1518,29 @@ cloudberry-ctl auth status --cluster my-cluster
 
 ## Webhook Certificate Setup
 
-The operator's admission webhooks require TLS certificates. The operator manages these certificates automatically using one of two strategies.
+The operator's admission webhooks (validating and mutating) require TLS certificates. The operator manages these certificates automatically using one of two strategies: self-signed generation or Vault PKI issuance.
 
 ### Self-Signed Certificates (Default)
 
 No configuration is needed. The operator generates a self-signed CA and server certificate on startup, stores them in a Kubernetes Secret, and injects the CA bundle into the webhook configurations.
 
-Certificates are checked for rotation every 12 hours and automatically rotated when 2/3 of their lifetime has elapsed.
+**Certificate properties:**
+
+| Component | Algorithm | Validity | Constraints |
+|-----------|-----------|----------|-------------|
+| CA certificate | ECDSA P-256 | 10 years | CA:TRUE, pathlen:0 |
+| Server certificate | ECDSA P-256 | 1 year | CA:FALSE |
+
+The server certificate includes the following SANs:
+- `{service}.{namespace}.svc`
+- `{service}.{namespace}.svc.cluster.local`
+
+**Automatic rotation**: Certificates are checked for rotation every 12 hours and automatically rotated when 2/3 of their lifetime has elapsed. After rotation, the new CA bundle is re-injected into both validating and mutating webhook configurations.
+
+**Helm auto-generation**: When using the Helm chart, the following values are auto-generated if left empty:
+- `certSecretName`: `{release}-webhook-certs`
+- `serviceName`: `{release}-webhook`
+- `caBundle`: Left empty to trigger runtime injection by the operator
 
 ### Vault PKI Certificates
 
@@ -1067,7 +1560,121 @@ vault:
   address: http://vault:8200
 ```
 
+The operator authenticates to Vault using the configured auth method (token, kubernetes, or approle) and requests certificates from `{vaultPKI.mountPath}/issue/{vaultPKI.role}`.
+
+**Certificate request parameters:**
+
+| Parameter | Value |
+|-----------|-------|
+| Common Name | `{webhookServiceName}.{namespace}.svc` |
+| SANs | `{webhookServiceName}.{namespace}.svc`, `{webhookServiceName}.{namespace}.svc.cluster.local` |
+| Format | PEM |
+| TTL | From Vault role configuration |
+
 Ensure the Vault PKI role allows issuing certificates for the webhook service DNS names.
+
+#### Kubernetes Auth for Vault PKI (Production)
+
+For production deployments, use Kubernetes service account authentication instead of static tokens. The operator exchanges its service account JWT for a Vault token via the `auth/kubernetes/login` endpoint.
+
+**Step 1: Configure the Vault Kubernetes auth backend**
+
+```bash
+# Enable the Kubernetes auth method in Vault
+vault auth enable kubernetes
+
+# Create a dedicated service account for Vault auth
+kubectl create serviceaccount vault-auth -n cloudberry-system
+
+# Grant the service account permission to validate tokens
+kubectl create clusterrolebinding vault-auth-delegator \
+  --clusterrole=system:auth-delegator \
+  --serviceaccount=cloudberry-system:vault-auth
+
+# Get the service account token and CA cert
+SA_SECRET=$(kubectl get sa vault-auth -n cloudberry-system \
+  -o jsonpath='{.secrets[0].name}')
+SA_JWT=$(kubectl create token vault-auth -n cloudberry-system)
+K8S_CA=$(kubectl config view --raw --minify --flatten \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d)
+
+# Configure Vault with the Kubernetes API details
+vault write auth/kubernetes/config \
+  kubernetes_host="https://kubernetes.docker.internal:6443" \
+  token_reviewer_jwt="$SA_JWT" \
+  kubernetes_ca_cert="$K8S_CA" \
+  disable_iss_validation=true \
+  disable_local_ca_jwt=true
+```
+
+> **Docker Desktop hostname requirement**: You must use `kubernetes.docker.internal` as the `kubernetes_host` (not `host.docker.internal`). The Kubernetes API server certificate only includes `kubernetes.docker.internal` as a SAN. Using `host.docker.internal` causes TLS verification failures during TokenReview API calls, and the operator fails to authenticate with Vault.
+
+**Step 2: Create a Vault role for the operator**
+
+```bash
+vault write auth/kubernetes/role/cloudberry-operator \
+  bound_service_account_names=cloudberry-operator \
+  bound_service_account_namespaces=cloudberry-system \
+  policies=default,cloudberry-pki \
+  ttl=1h
+```
+
+**Step 3: Create a Vault PKI role**
+
+```bash
+vault write pki/roles/cloudberry-operator \
+  allow_any_name=true \
+  max_ttl=720h
+```
+
+**Step 4: Deploy the operator with Kubernetes auth**
+
+```yaml
+# In your Helm values
+vault:
+  enabled: true
+  address: http://vault:8200
+  authMethod: kubernetes
+  authPath: auth/kubernetes
+  role: cloudberry-operator
+
+webhook:
+  enabled: true
+  certSource: vault-pki
+  vaultPKI:
+    mountPath: pki
+    role: cloudberry-operator
+```
+
+**Verification**: After deployment, check the operator logs for successful Kubernetes auth:
+
+```bash
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.msg | test("authenticated|vault|kubernetes"))'
+
+# Expected log entries:
+# {"msg": "authenticated with vault using kubernetes method", "role": "cloudberry-operator"}
+# {"msg": "webhook certificates ensured", "certSource": "vault-pki"}
+```
+
+**Environment variables** set by the Helm chart for Kubernetes auth:
+
+| Variable | Value |
+|----------|-------|
+| `CLOUDBERRY_VAULT_AUTH_METHOD` | `kubernetes` |
+| `CLOUDBERRY_VAULT_AUTH_PATH` | `auth/kubernetes` |
+| `CLOUDBERRY_VAULT_ROLE` | `cloudberry-operator` |
+| `CLOUDBERRY_VAULT_ADDRESS` | `http://vault:8200` |
+
+**Environment variables** injected into the operator pod:
+
+| Variable | Description |
+|----------|-------------|
+| `CLOUDBERRY_WEBHOOK_CERT_SOURCE` | Certificate source (`self-signed` or `vault-pki`) |
+| `CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME` | Secret name for storing certificates |
+| `CLOUDBERRY_WEBHOOK_SERVICE_NAME` | Webhook service name for SAN generation |
+| `CLOUDBERRY_WEBHOOK_VAULT_PKI_MOUNT` | Vault PKI mount path (vault-pki only) |
+| `CLOUDBERRY_WEBHOOK_VAULT_PKI_ROLE` | Vault PKI role name (vault-pki only) |
 
 ### Verifying Webhook Certificates
 
@@ -1075,25 +1682,66 @@ Ensure the Vault PKI role allows issuing certificates for the webhook service DN
 # Check the certificate Secret
 kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
 
+# Verify the Secret contains all required keys
+kubectl get secret <release>-webhook-certs -n cloudberry-system \
+  -o jsonpath='{.data}' | jq 'keys'
+# Expected: ["ca.crt", "tls.crt", "tls.key"]
+
+# Inspect the server certificate
+kubectl get secret <release>-webhook-certs -n cloudberry-system \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+
 # Verify the webhook configuration has a CA bundle
 kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
+
+# Check the CA certificate properties
+kubectl get secret <release>-webhook-certs -n cloudberry-system \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -text -noout
 ```
 
 ### Troubleshooting Webhook Certificates
 
 If webhook calls fail with TLS errors:
 
-1. Check that the certificate Secret exists and contains valid data:
+1. **Check that the certificate Secret exists and contains valid data:**
+
    ```bash
-   kubectl get secret <release>-webhook-certs -n cloudberry-system -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+   kubectl get secret <release>-webhook-certs -n cloudberry-system \
+     -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
    ```
 
-2. Verify the CA bundle in the webhook configuration matches the CA in the Secret:
+   Verify the certificate has not expired and the SANs match the webhook service name.
+
+2. **Verify the CA bundle in the webhook configuration matches the CA in the Secret:**
+
    ```bash
-   kubectl get validatingwebhookconfiguration <release>-validating -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -text -noout
+   kubectl get validatingwebhookconfiguration <release>-validating \
+     -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -text -noout
    ```
 
-3. If using Vault PKI, ensure the Vault server is reachable and the PKI role is properly configured.
+3. **If using Vault PKI**, ensure the Vault server is reachable and the PKI role is properly configured:
+
+   ```bash
+   # Check operator logs for Vault connection errors
+   kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+     jq 'select(.msg | test("vault|cert|webhook"))'
+   ```
+
+4. **Check that environment variables are set correctly** (common issue when Vault PKI is configured):
+
+   ```bash
+   kubectl get deployment -n cloudberry-system cloudberry-operator \
+     -o jsonpath='{.spec.template.spec.containers[0].env[*]}' | jq .
+   ```
+
+   All `CLOUDBERRY_WEBHOOK_*` and `CLOUDBERRY_VAULT_*` variables must be populated. If they are empty, verify the Helm values and check that viper defaults are configured (see Bug Fix 2 below).
+
+5. **Known issues fixed in Scenario 48:**
+
+   - **Vault client nil error**: If the operator logs show "vault client is not enabled" when using `certSource=vault-pki`, ensure you are running a version that includes the vault client wiring fix in `setupWebhookCerts()`.
+   - **Empty environment variables**: If `CLOUDBERRY_VAULT_ADDRESS` or `CLOUDBERRY_VAULT_TOKEN` are empty despite being set in Helm values, ensure you are running a version that includes the missing viper defaults fix in `internal/config/config.go`.
+
+> **Note**: Webhook certificate management is verified by Scenario 48. See `test/functional/scenario48_webhook_certs_test.go` and `test/e2e/scenario48_webhook_certs_e2e_test.go` for the full test suite.
 
 ## High Availability
 
@@ -3258,6 +3906,91 @@ cloudberry-ctl inspect missing-stats --cluster my-cluster
 cloudberry-ctl inspect logs --cluster my-cluster --severity ERROR --last 1h
 ```
 
+## Auditing
+
+The operator provides comprehensive auditing across three categories: PostgreSQL connection auditing, statement auditing, and operator-level audit logging.
+
+### Connection Auditing
+
+Enable connection auditing to log client connections and disconnections in PostgreSQL:
+
+```yaml
+spec:
+  config:
+    parameters:
+      log_connections: "on"
+      log_disconnections: "on"
+```
+
+These parameters are rendered into `postgresql.conf` and take effect after a configuration reload.
+
+### Statement Auditing
+
+Enable statement auditing to log SQL statements and their durations:
+
+```yaml
+spec:
+  config:
+    parameters:
+      log_statement: "ddl"                # none, ddl, mod, all
+      log_min_duration_statement: "1000"   # log statements taking > 1000ms
+      log_duration: "on"                   # log duration of all statements
+```
+
+### Operator Audit Log
+
+The operator logs all authentication, authorization, and administrative events as structured JSON. These logs are written to the operator's standard output and can be collected by your log aggregation system.
+
+**Authentication success** -- logged when a user successfully authenticates:
+
+```json
+{"level":"INFO","msg":"basic auth succeeded","username":"admin","method":"basic","source_ip":"192.168.1.1:12345","permission":"Admin"}
+```
+
+**Authentication failure** -- logged when authentication fails:
+
+```json
+{"level":"WARN","msg":"authentication failed","method":"basic","error":"invalid credentials","remote_addr":"192.168.1.100:12345"}
+```
+
+**Permission denied** -- logged when an authenticated user attempts an operation they lack permission for:
+
+```json
+{"level":"WARN","msg":"permission denied","username":"viewer","method":"basic","source_ip":"192.168.1.1:12345","required_permission":"Admin","actual_permission":"Basic","path":"/api/v1alpha1/clusters","http_method":"POST"}
+```
+
+**Config changed** -- logged when a user updates cluster configuration:
+
+```json
+{"level":"INFO","msg":"config changed","cluster":"my-cluster","username":"admin","method":"basic","source_ip":"192.168.1.1:12345"}
+```
+
+**Role management** -- logged when a role is assigned to a resource group:
+
+```json
+{"level":"INFO","msg":"role assigned to resource group","cluster":"my-cluster","group":"analytics","role":"analyst","username":"admin","method":"basic","source_ip":"192.168.1.1:12345"}
+```
+
+**Filtering audit logs:**
+
+```bash
+# View all authentication events
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.msg == "basic auth succeeded" or .msg == "authentication failed")'
+
+# View all permission denied events
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.msg == "permission denied")'
+
+# View all config change events
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.msg == "config changed")'
+
+# View all audit events for a specific user
+kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
+  jq 'select(.username == "admin")'
+```
+
 ## Monitoring and Observability
 
 ### Prometheus Metrics
@@ -3437,15 +4170,196 @@ spec:
   vault:
     enabled: true
     address: http://vault:8200
-    authMethod: kubernetes
+    authMethod: kubernetes    # token, kubernetes, or approle
+    authPath: auth/kubernetes  # auth mount path (method-specific)
     role: cloudberry-operator
     secretPath: secret/data/cloudberry
 ```
 
-Vault stores:
-- Admin password at `secret/data/cloudberry/admin-password`
-- OIDC client secret at `secret/data/cloudberry/oidc-secret`
-- Monitoring password at `secret/data/cloudberry/monitoring-password`
-- TLS certificates at `secret/data/cloudberry/tls` (optional)
+#### Authentication Methods
 
-The operator periodically polls Vault for secret changes and automatically updates Kubernetes Secrets and reloads affected components.
+The operator supports three Vault authentication methods:
+
+| Method | Configuration | Use Case |
+|--------|--------------|----------|
+| `token` | Static Vault token passed via `VAULT_TOKEN` env var or config | Development, CI/CD |
+| `kubernetes` | Kubernetes service account JWT exchanged for Vault token via `auth/kubernetes/login` | Production (recommended) |
+| `approle` | AppRole `role_id` and `secret_id` used to obtain a client token via `auth/approle/login` | Automation, CI/CD pipelines |
+
+**Token auth** (development):
+
+```yaml
+spec:
+  vault:
+    enabled: true
+    address: http://vault:8200
+    authMethod: token
+    secretPath: secret/data/cloudberry
+```
+
+**Kubernetes auth** (production):
+
+```yaml
+spec:
+  vault:
+    enabled: true
+    address: http://vault:8200
+    authMethod: kubernetes
+    authPath: auth/kubernetes
+    role: cloudberry-operator
+    secretPath: secret/data/cloudberry
+```
+
+Kubernetes auth requires a Vault Kubernetes auth backend configured with the correct API server hostname and a dedicated service account for token review. See [Kubernetes Auth for Vault PKI](#kubernetes-auth-for-vault-pki-production) for the full setup procedure.
+
+> **Docker Desktop**: Use `kubernetes_host: https://kubernetes.docker.internal:6443` when configuring the Vault Kubernetes auth backend. The Kubernetes API server certificate only includes `kubernetes.docker.internal` as a SAN — using `host.docker.internal` causes TLS verification failures.
+
+**AppRole auth** (automation):
+
+```yaml
+spec:
+  vault:
+    enabled: true
+    address: http://vault:8200
+    authMethod: approle
+    authPath: auth/approle
+    role: cloudberry-operator
+    secretPath: secret/data/cloudberry
+```
+
+#### KV Secret Paths
+
+Vault stores cluster secrets at the following KV v2 paths under the configured `secretPath`:
+
+| Path | Contents | Description |
+|------|----------|-------------|
+| `secret/data/cloudberry/admin-password` | `username`, `password` | Admin database password |
+| `secret/data/cloudberry/oidc-secret` | `client_id`, `client_secret` | OIDC client credentials |
+| `secret/data/cloudberry/monitoring-password` | `username`, `password` | Monitoring role password |
+| `secret/data/cloudberry/tls` | `ca_cert`, `tls_cert`, `tls_key` | TLS certificates (optional, alternative to K8s TLS Secrets) |
+
+#### Secret Rotation Watch
+
+The operator includes a `SecretWatcher` that periodically polls Vault secrets and detects changes via SHA-256 hash comparison:
+
+1. On each poll interval, the watcher reads the secret from Vault
+2. Computes a SHA-256 hash of the secret data
+3. Compares the new hash against the previously stored hash
+4. If the hash differs, invokes the registered `onChange` callback
+5. The callback updates the corresponding Kubernetes Secret and reloads affected components (e.g., database password rotation, TLS certificate reload)
+
+This mechanism ensures that secrets updated directly in Vault are automatically propagated to the cluster without manual intervention.
+
+#### Connection Retry Configuration
+
+The Vault client uses exponential backoff with jitter for connection retries:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MaxRetries` | `5` | Maximum retry attempts after the initial call |
+| `InitialBackoff` | `1s` | Wait time before the first retry |
+| `MaxBackoff` | `30s` | Maximum wait time between retries |
+| `Multiplier` | `2.0` | Backoff multiplier (exponential growth) |
+| `JitterFraction` | `0.1` | Random jitter to prevent thundering herd |
+
+**Example retry timeline**:
+
+```
+Attempt 1: immediate
+Attempt 2: ~1s wait
+Attempt 3: ~2s wait
+Attempt 4: ~4s wait
+Attempt 5: ~8s wait
+→ Error if all attempts fail
+```
+
+> **Note**: Vault integration is comprehensively verified by Scenario 46. See `test/functional/scenario46_vault_integration_test.go` and `test/e2e/scenario46_vault_integration_e2e_test.go` for the full test suite covering all 3 auth methods, all 4 KV paths, secret rotation watch, and retry configuration.
+
+## Performance Tuning
+
+### Performance Characteristics
+
+Based on performance testing (2026-05-19), the operator exhibits the following characteristics:
+
+| Endpoint Type | p50 Latency | p95 Latency | p99 Latency | Peak RPS | Error Rate |
+|---------------|-------------|-------------|-------------|----------|------------|
+| Health (`/healthz`, `/readyz`) | 2.7ms | 6.5ms | 10.6ms | 12,637 | 0% |
+| API (authenticated) | 605ms | 794ms | 885ms | ~6 | 0% |
+
+**Key observations:**
+- Health endpoints are extremely fast (sub-3ms p50) and handle over 12,000 RPS
+- API endpoint latency is dominated by bcrypt password verification (~100ms per request at cost factor 10)
+- The operator maintains zero errors across 287,000+ requests under all load conditions
+- Memory remains stable at ~82MB resident with no growth observed during sustained load
+
+### Latency Breakdown (API Endpoints)
+
+| Component | Contribution | Percentage |
+|-----------|-------------|------------|
+| bcrypt auth (cost 10) | ~100ms/req | ~80% |
+| Kubernetes API call | ~20-30ms/req | ~16% |
+| HTTP/JSON overhead | ~5ms/req | ~4% |
+
+### Tuning Recommendations
+
+**Rate Limiting**: The default rate limit is 10 requests per minute per IP. For environments with high API usage, increase the limit:
+
+```bash
+# Set via environment variable on the operator
+CLOUDBERRY_API_RATE_LIMIT=1000
+```
+
+**bcrypt Cost Factor**: The default bcrypt cost factor is 10. For development environments where latency is more important than security, you can reduce it. For production, consider implementing JWT token-based authentication after initial login to amortize the bcrypt cost.
+
+**Monitoring Stack**: Deploy the monitoring stack for real-time visibility into operator performance:
+
+```bash
+# Deploy vmagent + otel-collector via Makefile
+make monitoring-deploy
+
+# Check status
+make monitoring-status
+```
+
+**Key metrics to monitor for performance:**
+
+```promql
+# Reconciliation duration (should be < 5s for healthy clusters)
+histogram_quantile(0.95, rate(cloudberry_reconcile_duration_seconds_bucket[5m]))
+
+# Reconciliation error rate (should be 0 for healthy clusters)
+rate(cloudberry_reconcile_errors_total[5m])
+
+# Active database connections
+cloudberry_connections_active
+
+# FTS probe success rate
+rate(cloudberry_fts_probe_total{result="success"}[5m])
+  / rate(cloudberry_fts_probe_total[5m])
+```
+
+### Monitoring Stack Deployment
+
+The operator integrates with VictoriaMetrics and OpenTelemetry for full observability:
+
+```bash
+# Deploy monitoring stack to Kubernetes
+make monitoring-deploy
+
+# Or deploy alongside the operator with Helm
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --set metrics.enabled=true \
+  --set serviceMonitor.enabled=true \
+  --set telemetry.enabled=true \
+  --set telemetry.otlpEndpoint=otel-collector:4317 \
+  --set telemetry.otlpInsecure=true
+
+# Check monitoring status
+make monitoring-status
+
+# Remove monitoring stack
+make monitoring-undeploy
+```
+
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory.

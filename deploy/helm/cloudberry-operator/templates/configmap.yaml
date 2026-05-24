@@ -27,6 +27,8 @@ data:
       role: {{ .Values.vault.role | quote }}
       secret-path: {{ .Values.vault.secretPath | quote }}
       {{- end }}
+    vault-pki-mount-path: {{ .Values.vault.pkiMountPath | default "" | quote }}
+    vault-pki-role: {{ .Values.vault.pkiRole | default "" | quote }}
     oidc:
       enabled: {{ .Values.oidc.enabled }}
       {{- if .Values.oidc.enabled }}
@@ -38,6 +40,7 @@ data:
       {{- if .Values.telemetry.enabled }}
       otlp-endpoint: {{ .Values.telemetry.otlpEndpoint | quote }}
       otlp-protocol: {{ .Values.telemetry.otlpProtocol | quote }}
+      otlp-insecure: {{ .Values.telemetry.otlpInsecure }}
       sampling-rate: {{ .Values.telemetry.samplingRate }}
       service-name: {{ .Values.telemetry.serviceName | quote }}
       {{- end }}

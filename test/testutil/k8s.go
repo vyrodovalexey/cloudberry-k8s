@@ -143,49 +143,50 @@ func (e *TestK8sEnv) GetSecret(ctx context.Context, name, namespace string) (*co
 
 // MockDBClient implements db.Client for testing.
 type MockDBClient struct {
-	PingFunc                      func(ctx context.Context) error
-	GetSegmentConfigurationFunc   func(ctx context.Context) ([]db.SegmentInfo, error)
-	GetClusterStateFunc           func(ctx context.Context) (*db.ClusterState, error)
-	SetParameterFunc              func(ctx context.Context, name, value string, scope db.ParameterScope) error
-	ShowParameterFunc             func(ctx context.Context, name string) (string, error)
-	ReloadConfigFunc              func(ctx context.Context) error
-	ListSessionsFunc              func(ctx context.Context) ([]db.Session, error)
-	CancelQueryFunc               func(ctx context.Context, pid int32) (bool, error)
-	TerminateSessionFunc          func(ctx context.Context, pid int32) (bool, error)
-	CreateRoleFunc                func(ctx context.Context, opts db.RoleOptions) error
-	AlterRoleFunc                 func(ctx context.Context, opts db.RoleOptions) error
-	DropRoleFunc                  func(ctx context.Context, name string) error
-	VacuumFunc                    func(ctx context.Context, opts db.VacuumOptions) error
-	AnalyzeFunc                   func(ctx context.Context, table string) error
-	ReindexFunc                   func(ctx context.Context, opts db.ReindexOptions) error
-	GetDiskUsageFunc              func(ctx context.Context, database string) ([]db.DiskUsage, error)
-	GetReplicationLagFunc         func(ctx context.Context) (int64, error)
-	PromoteStandbyFunc            func(ctx context.Context) error
-	GetActiveQueryCountFunc       func(ctx context.Context) (int32, int32, int32, error)
-	GetResourceGroupUsageFunc     func(ctx context.Context, group string) (float64, float64, error)
-	CreateResourceGroupFunc       func(ctx context.Context, opts db.ResourceGroupOptions) error
-	AlterResourceGroupFunc        func(ctx context.Context, opts db.ResourceGroupOptions) error
-	DropResourceGroupFunc         func(ctx context.Context, name string) error
-	ListResourceGroupsFunc        func(ctx context.Context) ([]db.ResourceGroupInfo, error)
-	AssignRoleResourceGroupFunc   func(ctx context.Context, role, group string) error
-	CreateResourceQueueFunc       func(ctx context.Context, opts db.ResourceQueueOptions) error
-	DropResourceQueueFunc         func(ctx context.Context, name string) error
-	ListResourceQueuesFunc        func(ctx context.Context) ([]db.ResourceQueueInfo, error)
-	InitializeMirrorsFunc         func(ctx context.Context, opts db.MirrorInitOptions) error
-	ConfigureReplicationFunc      func(ctx context.Context, opts db.ReplicationOptions) error
-	GetMirrorSyncStatusFunc       func(ctx context.Context) ([]db.MirrorSyncInfo, error)
-	TriggerFTSProbeFunc           func(ctx context.Context) error
-	TerminateAllBackendsFunc      func(ctx context.Context) (int32, error)
-	CancelAllQueriesFunc          func(ctx context.Context) (int32, error)
-	LogRotateFunc                 func(ctx context.Context) error
-	RegisterNewSegmentsFunc       func(ctx context.Context, opts db.SegmentRegistrationOptions) error
-	RedistributeDataFunc          func(ctx context.Context, opts db.RedistributionOptions) error
-	GetRedistributionProgressFunc func(ctx context.Context) (int32, error)
-	DeregisterSegmentsFunc        func(ctx context.Context, newCount int32) error
-	RedistributeBeforeScaleInFunc func(ctx context.Context, opts db.ScaleInRedistributionOptions) error
-	AnalyzeSkewFunc               func(ctx context.Context, database string) ([]db.TableSkewInfo, error)
-	RebalanceTableFunc            func(ctx context.Context, database, schema, table, distKey string) error
-	Closed                        bool
+	PingFunc                          func(ctx context.Context) error
+	GetSegmentConfigurationFunc       func(ctx context.Context) ([]db.SegmentInfo, error)
+	GetClusterStateFunc               func(ctx context.Context) (*db.ClusterState, error)
+	SetParameterFunc                  func(ctx context.Context, name, value string, scope db.ParameterScope) error
+	ShowParameterFunc                 func(ctx context.Context, name string) (string, error)
+	ReloadConfigFunc                  func(ctx context.Context) error
+	ListSessionsFunc                  func(ctx context.Context) ([]db.Session, error)
+	CancelQueryFunc                   func(ctx context.Context, pid int32) (bool, error)
+	TerminateSessionFunc              func(ctx context.Context, pid int32) (bool, error)
+	CreateRoleFunc                    func(ctx context.Context, opts db.RoleOptions) error
+	AlterRoleFunc                     func(ctx context.Context, opts db.RoleOptions) error
+	DropRoleFunc                      func(ctx context.Context, name string) error
+	VacuumFunc                        func(ctx context.Context, opts db.VacuumOptions) error
+	AnalyzeFunc                       func(ctx context.Context, table string) error
+	ReindexFunc                       func(ctx context.Context, opts db.ReindexOptions) error
+	GetDiskUsageFunc                  func(ctx context.Context, database string) ([]db.DiskUsage, error)
+	GetReplicationLagFunc             func(ctx context.Context) (int64, error)
+	PromoteStandbyFunc                func(ctx context.Context) error
+	GetActiveQueryCountFunc           func(ctx context.Context) (int32, int32, int32, error)
+	GetResourceGroupUsageFunc         func(ctx context.Context, group string) (float64, float64, error)
+	CreateResourceGroupFunc           func(ctx context.Context, opts db.ResourceGroupOptions) error
+	AlterResourceGroupFunc            func(ctx context.Context, opts db.ResourceGroupOptions) error
+	DropResourceGroupFunc             func(ctx context.Context, name string) error
+	ListResourceGroupsFunc            func(ctx context.Context) ([]db.ResourceGroupInfo, error)
+	AssignRoleResourceGroupFunc       func(ctx context.Context, role, group string) error
+	CreateResourceQueueFunc           func(ctx context.Context, opts db.ResourceQueueOptions) error
+	DropResourceQueueFunc             func(ctx context.Context, name string) error
+	ListResourceQueuesFunc            func(ctx context.Context) ([]db.ResourceQueueInfo, error)
+	InitializeMirrorsFunc             func(ctx context.Context, opts db.MirrorInitOptions) error
+	ConfigureReplicationFunc          func(ctx context.Context, opts db.ReplicationOptions) error
+	GetMirrorSyncStatusFunc           func(ctx context.Context) ([]db.MirrorSyncInfo, error)
+	TriggerFTSProbeFunc               func(ctx context.Context) error
+	TerminateAllBackendsFunc          func(ctx context.Context) (int32, error)
+	CancelAllQueriesFunc              func(ctx context.Context) (int32, error)
+	LogRotateFunc                     func(ctx context.Context) error
+	RegisterNewSegmentsFunc           func(ctx context.Context, opts db.SegmentRegistrationOptions) error
+	RedistributeDataFunc              func(ctx context.Context, opts db.RedistributionOptions) error
+	GetRedistributionProgressFunc     func(ctx context.Context) (int32, error)
+	DeregisterSegmentsFunc            func(ctx context.Context, newCount int32) error
+	RedistributeBeforeScaleInFunc     func(ctx context.Context, opts db.ScaleInRedistributionOptions) error
+	AnalyzeSkewFunc                   func(ctx context.Context, database string) ([]db.TableSkewInfo, error)
+	ListSessionsWithResourceGroupFunc func(ctx context.Context) ([]db.SessionWithGroup, error)
+	RebalanceTableFunc                func(ctx context.Context, database, schema, table, distKey string) error
+	Closed                            bool
 }
 
 // Ping implements db.Client.
@@ -216,7 +217,7 @@ func (m *MockDBClient) GetClusterState(ctx context.Context) (*db.ClusterState, e
 	}
 	return &db.ClusterState{
 		IsUp:              true,
-		Version:           "7.7",
+		Version:           "2.1.0",
 		SegmentsUp:        4,
 		SegmentsDown:      0,
 		SegmentsTotal:     4,
@@ -637,6 +638,14 @@ func (m *MockDBClient) RebalanceTable(ctx context.Context, database, schema, tab
 }
 
 // ListUserDatabases returns a list of user databases.
+// ListSessionsWithResourceGroup implements db.Client.
+func (m *MockDBClient) ListSessionsWithResourceGroup(ctx context.Context) ([]db.SessionWithGroup, error) {
+	if m.ListSessionsWithResourceGroupFunc != nil {
+		return m.ListSessionsWithResourceGroupFunc(ctx)
+	}
+	return nil, nil
+}
+
 func (m *MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"mydb"}, nil
 }

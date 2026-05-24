@@ -789,3 +789,7 @@ func (m *mockMetricsRecorder) RecordMaintenanceOperation(cluster, namespace, ope
 		"cluster": cluster, "namespace": namespace, "operation": operation,
 	})
 }
+
+func (m *mockMetricsRecorder) RecordPasswordRotation() {
+	m.record("RecordPasswordRotation", nil)
+}

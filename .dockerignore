@@ -10,6 +10,7 @@
 *.swp
 *.swo
 *~
+.playwright-mcp
 
 # Documentation
 docs/

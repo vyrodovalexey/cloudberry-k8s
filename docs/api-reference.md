@@ -63,6 +63,10 @@ curl -u admin:password http://operator:8090/api/v1alpha1/clusters
 Authorization: Bearer <JWT token>
 ```
 
+### OIDC Redirect Protection
+
+The OIDC provider's HTTP client enforces a maximum of 5 redirects during OIDC discovery and token validation. This prevents infinite redirect loops when the identity provider misconfigures its endpoints. If the redirect limit is exceeded, the authentication attempt fails with a `401 UNAUTHORIZED` response.
+
 ### Obtaining a JWT Token
 
 **Via Keycloak (password grant — for testing only):**
@@ -143,7 +147,7 @@ curl -u admin:password http://operator:8090/api/v1alpha1/clusters
       "name": "my-cluster",
       "namespace": "cloudberry-test",
       "phase": "Running",
-      "version": "7.7"
+      "version": "2.1.0"
     }
   ],
   "total": 1
@@ -170,7 +174,7 @@ curl -u admin:password \
     "segmentsReady": 4,
     "segmentsTotal": 4,
     "mirroringStatus": "InSync",
-    "clusterVersion": "7.7",
+    "clusterVersion": "2.1.0",
     "lastReconcileTime": "2026-05-11T18:00:00Z",
     "conditions": [
       {
@@ -1404,7 +1408,101 @@ curl -u admin:password -X POST \
 | `POST` | `/clusters/{name}/auth/roles` | Admin | Create role |
 | `PUT` | `/clusters/{name}/auth/roles/{role}` | Admin | Update role |
 | `DELETE` | `/clusters/{name}/auth/roles/{role}` | Admin | Delete role |
-| `POST` | `/clusters/{name}/auth/rotate-password` | Admin | Rotate admin password |
+| `POST` | `/auth/rotate-password` | Admin | Rotate admin password |
+
+#### Rotate Admin Password
+
+Generates a new cryptographically secure random password, updates the K8s Secret `cloudberry-operator-admin-password`, and refreshes the in-memory credential store immediately. No operator restart is required.
+
+The new password is **not** returned in the response for security reasons. Retrieve it from the K8s Secret after rotation:
+
+```bash
+kubectl get secret cloudberry-operator-admin-password -n cloudberry-system \
+  -o jsonpath='{.data.password}' | base64 -d
+```
+
+**Request:**
+
+```bash
+curl -u admin:current-password -X POST \
+  http://operator:8090/api/v1alpha1/auth/rotate-password
+```
+
+No request body is required.
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "rotated",
+  "message": "Admin password rotated successfully"
+}
+```
+
+**Prometheus metric**: `cloudberry_password_rotation_total` counter is incremented on each successful rotation.
+
+**CLI equivalent:**
+
+```bash
+cloudberry-ctl auth rotate-password --cluster my-cluster
+```
+
+**Error (500 Internal Server Error — credential store not configured):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "credential store not configured"
+  }
+}
+```
+
+**Error (500 Internal Server Error — password generation failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to generate new password"
+  }
+}
+```
+
+**Error (500 Internal Server Error — K8s Secret update failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to update admin password secret"
+  }
+}
+```
+
+**Error (401 Unauthorized — not authenticated):**
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Missing or invalid Authorization header"
+  }
+}
+```
+
+**Error (403 Forbidden — insufficient permissions):**
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "insufficient permissions: requires Admin"
+  }
+}
+```
+
+> **Note**: This endpoint is not cluster-scoped — it rotates the operator-level admin password used for API authentication. The path is `/api/v1alpha1/auth/rotate-password` (not under `/clusters/{name}/`).
 
 ## Request/Response Schemas
 
@@ -1727,11 +1825,11 @@ Sets defaults on `CloudberryCluster` resources:
 
 | Field | Default |
 |-------|---------|
-| `version` | `"7.7"` |
-| `image` | `"cloudberrydb/cloudberry:7.7"` |
+| `version` | `"2.1.0"` |
+| `image` | `"cloudberrydb/cloudberry:2.1.0"` |
 | `imagePullPolicy` | `IfNotPresent` |
 | `coordinator.replicas` | `1` |
-| `coordinator.port` | `5432` |
+| `coordinator.port` | `5432` (validated: 1–65535) |
 | `segments.primariesPerHost` | `2` |
 | `segments.mirroring.enabled` | `true` |
 | `segments.mirroring.layout` | `group` |

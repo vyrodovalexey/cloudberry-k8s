@@ -127,6 +127,14 @@ type OIDCConfig struct {
 	// ClientSecret is the OIDC client secret.
 	// Uses RedactedString to prevent accidental logging of the secret value.
 	ClientSecret RedactedString `mapstructure:"client-secret"`
+	// RoleClaimPath is the JSON path to extract roles from the token (e.g. "realm_access.roles").
+	RoleClaimPath string `mapstructure:"role-claim-path"`
+	// RoleClaimSource defines where to extract role claims from ("id_token" or "userinfo").
+	RoleClaimSource string `mapstructure:"role-claim-source"`
+	// RoleMatchMode defines how to match IdP roles ("exact", "suffix", "prefix", "contains").
+	RoleMatchMode string `mapstructure:"role-match-mode"`
+	// RoleMapping maps IdP roles to permission level names.
+	RoleMapping map[string]string `mapstructure:"role-mapping"`
 }
 
 // TelemetryConfig holds telemetry configuration.
@@ -217,10 +225,20 @@ func (l *viperLoader) setDefaults() {
 	l.v.SetDefault("vault-pki-role", "")
 
 	l.v.SetDefault("vault.enabled", false)
+	l.v.SetDefault("vault.address", "")
 	l.v.SetDefault("vault.auth-method", "kubernetes")
+	l.v.SetDefault("vault.auth-path", "auth/kubernetes")
+	l.v.SetDefault("vault.role", "")
+	l.v.SetDefault("vault.token", "")
 	l.v.SetDefault("vault.secret-path", "secret/data/cloudberry")
 
 	l.v.SetDefault("oidc.enabled", false)
+	l.v.SetDefault("oidc.issuer-url", "")
+	l.v.SetDefault("oidc.client-id", "")
+	l.v.SetDefault("oidc.client-secret", "")
+	l.v.SetDefault("oidc.role-claim-path", "realm_access.roles")
+	l.v.SetDefault("oidc.role-claim-source", "id_token")
+	l.v.SetDefault("oidc.role-match-mode", "exact")
 
 	l.v.SetDefault("telemetry.enabled", false)
 	l.v.SetDefault("telemetry.otlp-protocol", "grpc")

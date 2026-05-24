@@ -24,6 +24,28 @@ const (
 	severityCritical = "critical"
 )
 
+// sanitizeDistKey sanitizes a comma-separated distribution key by individually
+// quoting each column name using pgx.Identifier{}.Sanitize(). This prevents
+// SQL injection via malicious column names in distribution keys.
+func sanitizeDistKey(distKey string) (string, error) {
+	if distKey == "" {
+		return "", nil
+	}
+	cols := strings.Split(distKey, ",")
+	sanitized := make([]string, 0, len(cols))
+	for _, col := range cols {
+		col = strings.TrimSpace(col)
+		if col == "" {
+			continue
+		}
+		sanitized = append(sanitized, pgx.Identifier{col}.Sanitize())
+	}
+	if len(sanitized) == 0 {
+		return "", fmt.Errorf("distribution key contains no valid column names: %q", distKey)
+	}
+	return strings.Join(sanitized, ", "), nil
+}
+
 // Client defines the interface for Cloudberry database operations.
 type Client interface {
 	// Ping checks database connectivity.
@@ -42,6 +64,10 @@ type Client interface {
 	ReloadConfig(ctx context.Context) error
 	// ListSessions returns active database sessions.
 	ListSessions(ctx context.Context) ([]Session, error)
+	// ListSessionsWithResourceGroup returns sessions with their resource group assignment.
+	// It joins pg_stat_activity with pg_roles and pg_resgroup to determine each session's
+	// resource group. Sessions without a resource group assignment return an empty string.
+	ListSessionsWithResourceGroup(ctx context.Context) ([]SessionWithGroup, error)
 	// CancelQuery cancels a running query by PID.
 	CancelQuery(ctx context.Context, pid int32) (bool, error)
 	// TerminateSession terminates a session by PID.
@@ -210,6 +236,15 @@ type Session struct {
 	Duration      string    `json:"duration"`
 }
 
+// SessionWithGroup extends Session with resource group information.
+// It joins pg_stat_activity with pg_roles and pg_resgroup to determine
+// each session's resource group. Sessions without a resource group
+// assignment return an empty string for ResourceGroup.
+type SessionWithGroup struct {
+	Session
+	ResourceGroup string `json:"resourceGroup"`
+}
+
 // RoleOptions defines options for creating or altering a role.
 type RoleOptions struct {
 	Name       string
@@ -241,6 +276,15 @@ type DiskUsage struct {
 	SizeHuman string `json:"sizeHuman"`
 }
 
+// IOLimitOption defines I/O limits for a single tablespace.
+type IOLimitOption struct {
+	Tablespace       string
+	ReadBytesPerSec  int64
+	WriteBytesPerSec int64
+	ReadIOPS         int32
+	WriteIOPS        int32
+}
+
 // ResourceGroupOptions defines options for creating or altering a resource group.
 type ResourceGroupOptions struct {
 	Name          string
@@ -249,6 +293,8 @@ type ResourceGroupOptions struct {
 	CPUWeight     int32
 	MemoryLimit   int32
 	MinCost       int32
+	// IOLimits defines per-tablespace I/O limits (optional).
+	IOLimits []IOLimitOption
 }
 
 // ResourceQueueOptions defines options for creating or altering a resource queue.
@@ -282,6 +328,8 @@ type ResourceGroupInfo struct {
 	MinCost       int32   `json:"minCost"`
 	CPUUsage      float64 `json:"cpuUsage"`
 	MemoryUsage   float64 `json:"memoryUsage"`
+	// IOLimits is the raw io_limit string from the database (if set).
+	IOLimits string `json:"ioLimits,omitempty"`
 }
 
 // BackupOptions defines options for creating a backup.
@@ -791,6 +839,46 @@ func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
 	return sessions, nil
 }
 
+// ListSessionsWithResourceGroup returns sessions with their resource group assignment.
+func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) ([]SessionWithGroup, error) {
+	query := `SELECT s.pid, COALESCE(s.usename, ''), COALESCE(s.application_name, ''),
+		COALESCE(s.client_addr::text, ''), COALESCE(s.state, ''),
+		COALESCE(s.query, ''), COALESCE(s.query_start, now()),
+		COALESCE(now() - s.query_start, interval '0')::text,
+		COALESCE(rg.rsgname, '')
+		FROM pg_stat_activity s
+		LEFT JOIN pg_roles r ON s.usename = r.rolname
+		LEFT JOIN pg_resgroup rg ON r.rolresgroup = rg.oid
+		WHERE s.pid != pg_backend_pid()
+		AND s.usename IS NOT NULL
+		ORDER BY s.query_start DESC NULLS LAST`
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying sessions with resource group: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []SessionWithGroup
+	for rows.Next() {
+		var sg SessionWithGroup
+		if err := rows.Scan(
+			&sg.PID, &sg.Username, &sg.Application, &sg.ClientAddress,
+			&sg.State, &sg.Query, &sg.QueryStart, &sg.Duration,
+			&sg.ResourceGroup,
+		); err != nil {
+			return nil, fmt.Errorf("scanning session with resource group row: %w", err)
+		}
+		sessions = append(sessions, sg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating session with resource group rows: %w", err)
+	}
+
+	return sessions, nil
+}
+
 // CancelQuery cancels a running query by PID.
 func (c *pgxClient) CancelQuery(ctx context.Context, pid int32) (bool, error) {
 	var result bool
@@ -1016,6 +1104,21 @@ func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupO
 	return nil
 }
 
+// FormatIOLimits formats I/O limits into the Cloudberry io_limit string format.
+// Format: "tablespace:rbps=X:wbps=X:riops=X:wiops=X" joined by ";".
+func FormatIOLimits(limits []IOLimitOption) string {
+	if len(limits) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(limits))
+	for _, l := range limits {
+		part := fmt.Sprintf("%s:rbps=%d:wbps=%d:riops=%d:wiops=%d",
+			l.Tablespace, l.ReadBytesPerSec, l.WriteBytesPerSec, l.ReadIOPS, l.WriteIOPS)
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ";")
+}
+
 // AlterResourceGroup modifies an existing resource group.
 func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOptions) error {
 	alterations := []struct {
@@ -1029,16 +1132,31 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 		{"min_cost", opts.MinCost},
 	}
 
+	// Cloudberry's ALTER RESOURCE GROUP syntax uses unquoted parameter names:
+	//   ALTER RESOURCE GROUP <name> SET concurrency 20
+	// The parameter names are fixed keywords (concurrency, cpu_max_percent, etc.),
+	// not identifiers, so they must NOT be quoted with pgx.Identifier.Sanitize().
 	for _, alt := range alterations {
 		if alt.value <= 0 {
 			continue
 		}
 		query := fmt.Sprintf("ALTER RESOURCE GROUP %s SET %s %d",
 			pgx.Identifier{opts.Name}.Sanitize(),
-			pgx.Identifier{alt.param}.Sanitize(), alt.value)
+			alt.param, alt.value)
 		if _, err := c.pool.Exec(ctx, query); err != nil {
 			return fmt.Errorf("altering resource group %s param %s: %w", opts.Name, alt.param, err)
 		}
+	}
+
+	// Apply I/O limits if specified.
+	if len(opts.IOLimits) > 0 {
+		ioLimitStr := FormatIOLimits(opts.IOLimits)
+		alterSQL := fmt.Sprintf(`ALTER RESOURCE GROUP %s SET io_limit '%s'`,
+			pgx.Identifier{opts.Name}.Sanitize(), ioLimitStr)
+		if _, err := c.pool.Exec(ctx, alterSQL); err != nil {
+			return fmt.Errorf("setting io_limit for resource group %s: %w", opts.Name, err)
+		}
+		c.logger.Info("resource group io_limit set", "name", opts.Name, "ioLimit", ioLimitStr)
 	}
 
 	c.logger.Info("resource group altered", "name", opts.Name)
@@ -1783,6 +1901,10 @@ func (c *pgxClient) propagateDatabasesToNewSegments(ctx context.Context, opts Se
 
 	// For each new primary segment, create the missing databases via utility mode.
 	for i := opts.OldCount; i < opts.NewCount; i++ {
+		// Check context cancellation between segment iterations to allow graceful shutdown.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		segHost := fmt.Sprintf("%s-segment-primary-%d.%s", opts.ClusterName, i, opts.SegmentService)
 		connStr := fmt.Sprintf("host=%s port=%d dbname=postgres user=%s options='-c gp_role=utility'",
 			segHost, opts.Port, c.pool.Config().ConnConfig.User)
@@ -1975,8 +2097,14 @@ func (c *pgxClient) redistributeDatabase(ctx context.Context, dbName string, opt
 		if t.distKey == "" {
 			alterSQL = fmt.Sprintf("ALTER TABLE %s SET DISTRIBUTED RANDOMLY", qualifiedName)
 		} else {
-			// The dist_key is already a comma-separated list of column names.
-			alterSQL = fmt.Sprintf("ALTER TABLE %s SET DISTRIBUTED BY (%s)", qualifiedName, t.distKey)
+			// Sanitize each column name in the distribution key for defense-in-depth.
+			sanitizedKey, sanitizeErr := sanitizeDistKey(t.distKey)
+			if sanitizeErr != nil {
+				c.logger.Warn("failed to sanitize distribution key, skipping table",
+					"database", dbName, "table", qualifiedName, "distKey", t.distKey, "error", sanitizeErr)
+				continue
+			}
+			alterSQL = fmt.Sprintf("ALTER TABLE %s SET DISTRIBUTED BY (%s)", qualifiedName, sanitizedKey)
 		}
 
 		if _, execErr := dbPool.Exec(ctx, alterSQL); execErr != nil {
@@ -2260,9 +2388,14 @@ func (c *pgxClient) createScaleInTempTable(
 			"CREATE TABLE %s (LIKE %s INCLUDING ALL) DISTRIBUTED RANDOMLY",
 			qualifiedTmp, qualifiedName)
 	} else {
+		// Sanitize each column name in the distribution key for defense-in-depth.
+		sanitizedKey, sanitizeErr := sanitizeDistKey(distKey)
+		if sanitizeErr != nil {
+			return fmt.Errorf("sanitizing distribution key: %w", sanitizeErr)
+		}
 		createSQL = fmt.Sprintf(
 			"CREATE TABLE %s (LIKE %s INCLUDING ALL) DISTRIBUTED BY (%s)",
-			qualifiedTmp, qualifiedName, distKey)
+			qualifiedTmp, qualifiedName, sanitizedKey)
 	}
 	if _, err := dbPool.Exec(ctx, createSQL); err != nil {
 		return fmt.Errorf("creating temp table: %w", err)
@@ -2283,11 +2416,8 @@ func (c *pgxClient) updateNumsegments(
 		_ = tx.Rollback(ctx)
 		return fmt.Errorf("setting allow_system_table_mods: %w", execErr)
 	}
-	updateSQL := fmt.Sprintf(
-		"UPDATE gp_distribution_policy SET numsegments = %d "+
-			"WHERE localoid = '%s'::regclass",
-		newCount, qualifiedTmp)
-	if _, execErr := tx.Exec(ctx, updateSQL); execErr != nil {
+	updateSQL := "UPDATE gp_distribution_policy SET numsegments = $1 WHERE localoid = $2::regclass"
+	if _, execErr := tx.Exec(ctx, updateSQL, newCount, qualifiedTmp); execErr != nil {
 		_ = tx.Rollback(ctx)
 		return fmt.Errorf("updating numsegments: %w", execErr)
 	}
@@ -2441,8 +2571,13 @@ func (c *pgxClient) RebalanceTable(ctx context.Context, database, schema, table,
 		alterSQL = fmt.Sprintf(
 			"ALTER TABLE %s SET WITH (REORGANIZE=TRUE) DISTRIBUTED RANDOMLY", qualifiedName)
 	} else {
+		// Sanitize each column name in the distribution key for defense-in-depth.
+		sanitizedKey, sanitizeErr := sanitizeDistKey(distKey)
+		if sanitizeErr != nil {
+			return fmt.Errorf("sanitizing distribution key for rebalance: %w", sanitizeErr)
+		}
 		alterSQL = fmt.Sprintf(
-			"ALTER TABLE %s SET WITH (REORGANIZE=TRUE) DISTRIBUTED BY (%s)", qualifiedName, distKey)
+			"ALTER TABLE %s SET WITH (REORGANIZE=TRUE) DISTRIBUTED BY (%s)", qualifiedName, sanitizedKey)
 	}
 
 	if _, err := pool.Exec(ctx, alterSQL); err != nil {

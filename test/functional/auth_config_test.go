@@ -55,7 +55,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_CreatesHBAConfigMap() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -83,7 +83,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_CustomHBARules() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -109,7 +109,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_SkipsNonRunningCluster() 
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -132,7 +132,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_InitializingCluster() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -155,7 +155,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCValidation_Valid() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -184,7 +184,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCValidation_MissingIss
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -206,7 +206,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCValidation_MissingCli
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -228,7 +228,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_OIDCDisabled() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -251,7 +251,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_UpdatesHBAConfigMap() {
 	s.env = testutil.NewTestK8sEnv(cluster)
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 
@@ -282,7 +282,7 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_ClusterNotFound() {
 	s.env = testutil.NewTestK8sEnv()
 
 	reconciler := controller.NewAuthReconciler(
-		s.env.Client, s.env.Scheme, s.env.Recorder,
+		s.env.Client, s.env.Recorder,
 		s.env.Builder, s.env.Metrics, s.env.Logger,
 	)
 

@@ -84,8 +84,20 @@
         },
         "authPath": { "type": "string" },
         "role": { "type": "string" },
+        "token": {
+          "type": "string",
+          "description": "Vault token for token auth method"
+        },
         "secretPath": { "type": "string" },
-        "tlsSecretName": { "type": "string" }
+        "tlsSecretName": { "type": "string" },
+        "pkiMountPath": {
+          "type": "string",
+          "description": "Vault PKI mount path for webhook cert source"
+        },
+        "pkiRole": {
+          "type": "string",
+          "description": "Vault PKI role name for webhook cert source"
+        }
       }
     },
     "oidc": {
@@ -107,6 +119,10 @@
         "otlpProtocol": {
           "type": "string",
           "enum": ["grpc", "http"]
+        },
+        "otlpInsecure": {
+          "type": "boolean",
+          "description": "Use insecure (plaintext) connection for OTLP exporter"
         },
         "samplingRate": { "type": "number", "minimum": 0, "maximum": 1 },
         "serviceName": { "type": "string" }

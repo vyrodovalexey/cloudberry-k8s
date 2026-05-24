@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -23,6 +24,7 @@ import (
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/idle"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -33,6 +35,13 @@ const (
 
 	// requeueAfterShort is used when waiting for a rolling restart phase to complete.
 	requeueAfterShort = 5 * time.Second
+
+	// configMapPropagationDelay is the time to wait for Kubernetes ConfigMap volume
+	// propagation before calling pg_reload_conf(). Kubernetes ConfigMap volume
+	// propagation typically takes up to kubelet sync period + cache propagation
+	// delay (~30-60s). We use 30s to account for most environments while keeping
+	// responsiveness.
+	configMapPropagationDelay = 30 * time.Second
 
 	// Rolling restart phase constants.
 	restartPhaseMirrors     = "mirrors"
@@ -92,6 +101,10 @@ type AdminReconciler struct {
 	// configParams tracks the last known config parameters per cluster for diff-based
 	// change classification. Keyed by "namespace/name", value is map[string]string.
 	configParams sync.Map
+	// idleDaemon is the idle session enforcement daemon, started when idle rules are present.
+	idleDaemon *idle.Daemon
+	// idleDaemonMu protects idleDaemon access.
+	idleDaemonMu sync.Mutex
 }
 
 // NewAdminReconciler creates a new AdminReconciler.
@@ -186,8 +199,12 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// Reconcile all sub-components and patch status.
+	// Sub-component errors are non-fatal: they are logged individually and
+	// aggregated here for observability, but do not block the reconcile loop.
 	logger.Debug("reconciling sub-components")
-	r.reconcileSubComponents(ctx, logger, cluster)
+	if subErr := r.reconcileSubComponents(ctx, logger, cluster); subErr != nil {
+		logger.Warn("some sub-components failed to reconcile", "error", subErr)
+	}
 
 	// Re-read the current phase from the API server to avoid overwriting phase changes
 	// made by the cluster-controller (e.g., Scaling phase during scale-out).
@@ -229,27 +246,36 @@ func (r *AdminReconciler) handleConfigError(
 }
 
 // reconcileSubComponents runs all non-config sub-reconcilers.
-// Each sub-reconciler modifies cluster.Status in-place; errors are logged but non-fatal.
+// Each sub-reconciler modifies cluster.Status in-place; individual errors are
+// logged and collected. The aggregated error is returned so the caller can
+// decide how to handle partial failures (e.g., set a status condition).
 func (r *AdminReconciler) reconcileSubComponents(
 	ctx context.Context,
 	logger *slog.Logger,
 	cluster *cbv1alpha1.CloudberryCluster,
-) {
+) error {
+	var errs []error
 	if err := r.reconcileWorkload(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile workload management", "error", err)
+		errs = append(errs, err)
 	}
 	if err := r.reconcileQueryMonitoring(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile query monitoring", "error", err)
+		errs = append(errs, err)
 	}
 	if err := r.reconcileBackup(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile backup", "error", err)
+		errs = append(errs, err)
 	}
 	if err := r.reconcileDataLoading(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile data loading", "error", err)
+		errs = append(errs, err)
 	}
 	if err := r.reconcileStorage(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile storage management", "error", err)
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
 }
 
 // reconcileWorkload reconciles workload management configuration.
@@ -263,7 +289,7 @@ func (r *AdminReconciler) reconcileWorkload(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
 	if cluster.Spec.Workload == nil || !cluster.Spec.Workload.Enabled {
-		return nil
+		return r.cleanupWorkload(ctx, cluster)
 	}
 
 	logger := util.LoggerFromContext(ctx)
@@ -316,6 +342,11 @@ func (r *AdminReconciler) reconcileWorkload(
 	// 3. Apply idle session rules to ConfigMap.
 	if err := r.applyIdleSessionRules(ctx, cluster); err != nil {
 		logger.Error("failed to apply idle session rules", "error", err)
+	}
+
+	// 3.5. Start/update idle session daemon if idle rules are present.
+	if r.dbFactory != nil {
+		r.startOrUpdateIdleDaemon(ctx, cluster)
 	}
 
 	// 4. Update resource group usage metrics from DB.
@@ -422,6 +453,19 @@ func (r *AdminReconciler) ensureDesiredResourceGroups(
 			MemoryLimit:   rg.MemoryLimit,
 			MinCost:       rg.MinCost,
 		}
+		// Map IOLimits from CRD spec to DB options.
+		if len(rg.IOLimits) > 0 {
+			opts.IOLimits = make([]db.IOLimitOption, len(rg.IOLimits))
+			for i, iol := range rg.IOLimits {
+				opts.IOLimits[i] = db.IOLimitOption{
+					Tablespace:       iol.Tablespace,
+					ReadBytesPerSec:  iol.ReadBytesPerSec,
+					WriteBytesPerSec: iol.WriteBytesPerSec,
+					ReadIOPS:         iol.ReadIOPS,
+					WriteIOPS:        iol.WriteIOPS,
+				}
+			}
+		}
 
 		if actual, exists := existingMap[rg.Name]; exists {
 			if needsAlter(rg, actual) {
@@ -478,7 +522,16 @@ func needsAlter(desired cbv1alpha1.ResourceGroupSpec, actual db.ResourceGroupInf
 	if desired.MemoryLimit != actual.MemoryLimit {
 		return true
 	}
-	return desired.MinCost != actual.MinCost
+	if desired.MinCost != actual.MinCost {
+		return true
+	}
+	// Compare IOLimits: if desired has IOLimits, always trigger ALTER
+	// (we can't easily read back io_limit from the DB in a structured way).
+	// This is safe because ALTER RESOURCE GROUP ... SET io_limit is idempotent.
+	if len(desired.IOLimits) > 0 {
+		return true
+	}
+	return false
 }
 
 // applyWorkloadRules serializes workload rules to JSON and stores them in a
@@ -494,7 +547,14 @@ func (r *AdminReconciler) applyWorkloadRules(
 
 	logger := util.LoggerFromContext(ctx)
 
-	rulesJSON, err := json.Marshal(cluster.Spec.Workload.Rules)
+	// Sort rules by priority (lowest number first), preserving CRD spec order
+	// for rules with the same priority (stable sort).
+	sortedRules := make([]cbv1alpha1.WorkloadRule, len(cluster.Spec.Workload.Rules))
+	copy(sortedRules, cluster.Spec.Workload.Rules)
+	sort.SliceStable(sortedRules, func(i, j int) bool {
+		return sortedRules[i].Priority < sortedRules[j].Priority
+	})
+	rulesJSON, err := json.Marshal(sortedRules)
 	if err != nil {
 		return fmt.Errorf("marshal workload rules: %w", err)
 	}
@@ -597,9 +657,9 @@ func (r *AdminReconciler) buildWorkloadRulesConfigMap(
 			Name:      cmName.Name,
 			Namespace: cmName.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "cloudberry-operator",
-				"app.kubernetes.io/component":  "workload-rules",
-				"app.kubernetes.io/instance":   cluster.Name,
+				util.LabelManagedBy:           util.LabelManagedByValue,
+				"app.kubernetes.io/component": "workload-rules",
+				"app.kubernetes.io/instance":  cluster.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(cluster, cbv1alpha1.GroupVersion.WithKind("CloudberryCluster")),
@@ -607,6 +667,208 @@ func (r *AdminReconciler) buildWorkloadRulesConfigMap(
 		},
 		Data: make(map[string]string),
 	}
+}
+
+// cleanupWorkload handles the transition to workload-disabled state.
+// It drops user-created resource groups from the database, deletes the
+// workload-rules ConfigMap, stops the idle daemon, zeros out metrics,
+// and updates the WorkloadConfigured condition to False.
+func (r *AdminReconciler) cleanupWorkload(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("cleaning up workload management (disabled)")
+
+	// 1. Drop user-created resource groups from DB (best-effort).
+	if r.dbFactory != nil {
+		dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+		if err == nil {
+			defer dbClient.Close()
+			r.dropAllUserResourceGroups(ctx, cluster, dbClient, logger)
+		} else {
+			logger.Warn("cannot connect to DB for resource group cleanup", "error", err)
+		}
+	}
+
+	// 2. Delete workload-rules ConfigMap.
+	r.deleteWorkloadRulesConfigMap(ctx, cluster, logger)
+
+	// 3. Stop idle daemon if running.
+	r.stopIdleDaemon()
+
+	// 4. Update condition.
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionWorkloadConfigured),
+		metav1.ConditionFalse,
+		"WorkloadDisabled",
+		"Workload management is disabled",
+	)
+
+	// 5. Emit event.
+	r.recorder.Event(cluster, corev1.EventTypeNormal,
+		cbv1alpha1.EventReasonWorkloadDisabled,
+		"Workload management disabled: resource groups dropped, rules cleared")
+
+	return nil
+}
+
+// dropAllUserResourceGroups drops all user-created resource groups from the database.
+// System groups (default_group, admin_group, system_group) are excluded by ListResourceGroups.
+// Errors are logged but do not fail the cleanup.
+func (r *AdminReconciler) dropAllUserResourceGroups(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+	logger *slog.Logger,
+) {
+	groups, err := dbClient.ListResourceGroups(ctx)
+	if err != nil {
+		logger.Warn("failed to list resource groups for cleanup", "error", err)
+		return
+	}
+
+	for _, g := range groups {
+		if dropErr := dbClient.DropResourceGroup(ctx, g.Name); dropErr != nil {
+			logger.Warn("failed to drop resource group during cleanup",
+				"group", g.Name, "error", dropErr)
+		} else {
+			logger.Info("dropped resource group during workload cleanup", "group", g.Name)
+			// Zero out metrics for this specific group.
+			r.metrics.SetResourceGroupUsage(cluster.Name, cluster.Namespace, g.Name, 0, 0)
+		}
+	}
+}
+
+// deleteWorkloadRulesConfigMap deletes the workload-rules ConfigMap for the cluster.
+// If the ConfigMap does not exist, this is a no-op.
+func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) {
+	cm := &corev1.ConfigMap{}
+	cmName := types.NamespacedName{
+		Name:      cluster.Name + "-workload-rules",
+		Namespace: cluster.Namespace,
+	}
+
+	if err := r.client.Get(ctx, cmName, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return // Already gone — no-op.
+		}
+		logger.Warn("failed to get workload-rules ConfigMap for deletion", "error", err)
+		return
+	}
+
+	if err := r.client.Delete(ctx, cm); err != nil {
+		logger.Warn("failed to delete workload-rules ConfigMap", "error", err)
+	} else {
+		logger.Info("deleted workload-rules ConfigMap", "name", cmName.Name)
+	}
+}
+
+// stopIdleDaemon stops the idle session daemon if it is running.
+func (r *AdminReconciler) stopIdleDaemon() {
+	r.idleDaemonMu.Lock()
+	defer r.idleDaemonMu.Unlock()
+
+	if r.idleDaemon != nil {
+		r.idleDaemon.Stop()
+		r.idleDaemon = nil
+	}
+}
+
+// startOrUpdateIdleDaemon starts the idle daemon if idle rules are present,
+// or updates the rules if the daemon is already running.
+func (r *AdminReconciler) startOrUpdateIdleDaemon(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	if len(cluster.Spec.Workload.IdleRules) == 0 {
+		r.stopIdleDaemon()
+		return
+	}
+
+	rules, err := idle.ParseIdleRules(cluster.Spec.Workload.IdleRules)
+	if err != nil {
+		r.logger.Error("failed to parse idle rules", "error", err)
+		return
+	}
+
+	// Check if any rule is enabled.
+	hasEnabled := false
+	for i := range rules {
+		if rules[i].Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		r.stopIdleDaemon()
+		return
+	}
+
+	r.idleDaemonMu.Lock()
+	defer r.idleDaemonMu.Unlock()
+
+	if r.idleDaemon != nil {
+		// Daemon already running — just update rules.
+		r.idleDaemon.UpdateRules(rules)
+		return
+	}
+
+	// Create and start a new daemon.
+	// The daemon needs its own DB client that won't be closed by the reconciler.
+	daemonDBClient, dbErr := r.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		r.logger.Error("failed to create DB client for idle daemon", "error", dbErr)
+		return
+	}
+
+	// Create a factory adapter so the daemon can reconnect on connection failures.
+	daemonFactory := &idleDaemonDBClientFactory{
+		dbFactory: r.dbFactory,
+		cluster:   cluster.DeepCopy(),
+	}
+
+	d := idle.New(idle.Config{
+		ClusterName:     cluster.Name,
+		Namespace:       cluster.Namespace,
+		ScanInterval:    idle.DefaultScanInterval,
+		DBClient:        daemonDBClient,
+		DBClientFactory: daemonFactory,
+		Metrics:         r.metrics,
+		Logger:          r.logger,
+	})
+	d.UpdateRules(rules)
+
+	// Ensure the DB client is closed if daemon start fails or panics,
+	// preventing resource leaks.
+	started := false
+	defer func() {
+		if !started {
+			daemonDBClient.Close()
+			r.logger.Warn("closed DB client after idle daemon failed to start")
+		}
+	}()
+
+	d.Start(ctx)
+	started = true
+	r.idleDaemon = d
+}
+
+// idleDaemonDBClientFactory adapts db.DBClientFactory to idle.DBClientFactory
+// so the idle daemon can reconnect to the database on connection failures.
+type idleDaemonDBClientFactory struct {
+	dbFactory db.DBClientFactory
+	cluster   *cbv1alpha1.CloudberryCluster
+}
+
+// NewClient creates a new database client using the stored cluster reference.
+func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (db.Client, error) {
+	return f.dbFactory.NewClient(ctx, f.cluster)
 }
 
 // reconcileQueryMonitoring reconciles query monitoring status.
@@ -941,11 +1203,6 @@ func (r *AdminReconciler) completePendingReload(
 	}
 
 	// Parse the timestamp and check if enough time has passed.
-	// Kubernetes ConfigMap volume propagation typically takes up to
-	// kubelet sync period + cache propagation delay (~30-60s).
-	// We use 30s to account for most environments while keeping responsiveness.
-	const configMapPropagationDelay = 30 * time.Second
-
 	parsedTime, err := time.Parse(time.RFC3339, pendingTime)
 	if err != nil {
 		r.logger.Error("failed to parse pending-reload timestamp, executing reload now", "error", err)
@@ -1045,20 +1302,34 @@ func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alph
 		return err
 	}
 
+	// Create a single DB client for all parameter operations to avoid
+	// creating separate connections for coordinator, database, and role parameters.
+	var configDBClient db.Client
+	if r.dbFactory != nil {
+		var dbErr error
+		configDBClient, dbErr = r.dbFactory.NewClient(ctx, cluster)
+		if dbErr != nil {
+			logger.Error("failed to create DB client for config parameters", "error", dbErr)
+			// Continue without DB client — individual methods will skip DB operations.
+		} else {
+			defer configDBClient.Close()
+		}
+	}
+
 	// Apply coordinator-only parameters via the database client.
-	if err := r.applyCoordinatorParameters(ctx, cluster); err != nil {
+	if err := r.applyCoordinatorParameters(ctx, cluster, configDBClient); err != nil {
 		logger.Error("failed to apply coordinator parameters", "error", err)
 		// Non-fatal: continue with other config layers.
 	}
 
 	// Apply database-specific parameters via ALTER DATABASE SET.
-	if err := r.applyDatabaseParameters(ctx, cluster); err != nil {
+	if err := r.applyDatabaseParameters(ctx, cluster, configDBClient); err != nil {
 		logger.Error("failed to apply database parameters", "error", err)
 		// Non-fatal: continue with other config layers.
 	}
 
 	// Apply role-specific parameters via ALTER ROLE SET.
-	if err := r.applyRoleParameters(ctx, cluster); err != nil {
+	if err := r.applyRoleParameters(ctx, cluster, configDBClient); err != nil {
 		logger.Error("failed to apply role parameters", "error", err)
 		// Non-fatal: continue with other config layers.
 	}
@@ -1107,9 +1378,11 @@ func (r *AdminReconciler) computeFullConfigHash(config *cbv1alpha1.ConfigSpec) s
 
 // applyCoordinatorParameters applies coordinator-only parameters via ALTER SYSTEM SET
 // on the coordinator. These parameters are only applied to the coordinator node.
+// If sharedClient is non-nil, it is used instead of creating a new DB client.
 func (r *AdminReconciler) applyCoordinatorParameters(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
+	sharedClient db.Client,
 ) error {
 	if len(cluster.Spec.Config.CoordinatorParameters) == 0 {
 		return nil
@@ -1119,16 +1392,11 @@ func (r *AdminReconciler) applyCoordinatorParameters(
 	logger.Debug("applying coordinator-only parameters",
 		"count", len(cluster.Spec.Config.CoordinatorParameters))
 
-	if r.dbFactory == nil {
-		logger.Debug("database client factory not available, skipping coordinator parameters")
+	dbClient := sharedClient
+	if dbClient == nil {
+		logger.Debug("no shared DB client available, skipping coordinator parameters")
 		return nil
 	}
-
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("creating database client for coordinator parameters: %w", err)
-	}
-	defer dbClient.Close()
 
 	for name, value := range cluster.Spec.Config.CoordinatorParameters {
 		if setErr := dbClient.SetParameter(ctx, name, value, db.ParameterScope{Level: "cluster"}); setErr != nil {
@@ -1152,9 +1420,13 @@ func (r *AdminReconciler) applyCoordinatorParameters(
 }
 
 // applyDatabaseParameters applies per-database parameters via ALTER DATABASE SET.
+// If sharedClient is non-nil, it is used instead of creating a new DB client.
+//
+//nolint:unparam // error return used when sharedClient encounters DB errors
 func (r *AdminReconciler) applyDatabaseParameters(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
+	sharedClient db.Client,
 ) error {
 	if len(cluster.Spec.Config.DatabaseParameters) == 0 {
 		return nil
@@ -1164,16 +1436,11 @@ func (r *AdminReconciler) applyDatabaseParameters(
 	logger.Debug("applying database-specific parameters",
 		"databases", len(cluster.Spec.Config.DatabaseParameters))
 
-	if r.dbFactory == nil {
-		logger.Debug("database client factory not available, skipping database parameters")
+	dbClient := sharedClient
+	if dbClient == nil {
+		logger.Debug("no shared DB client available, skipping database parameters")
 		return nil
 	}
-
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("creating database client for database parameters: %w", err)
-	}
-	defer dbClient.Close()
 
 	for dbName, params := range cluster.Spec.Config.DatabaseParameters {
 		for name, value := range params {
@@ -1196,9 +1463,13 @@ func (r *AdminReconciler) applyDatabaseParameters(
 }
 
 // applyRoleParameters applies per-role parameters via ALTER ROLE SET.
+// If sharedClient is non-nil, it is used instead of creating a new DB client.
+//
+//nolint:unparam // error return used when sharedClient encounters DB errors
 func (r *AdminReconciler) applyRoleParameters(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
+	sharedClient db.Client,
 ) error {
 	if len(cluster.Spec.Config.RoleParameters) == 0 {
 		return nil
@@ -1208,16 +1479,11 @@ func (r *AdminReconciler) applyRoleParameters(
 	logger.Debug("applying role-specific parameters",
 		"roles", len(cluster.Spec.Config.RoleParameters))
 
-	if r.dbFactory == nil {
-		logger.Debug("database client factory not available, skipping role parameters")
+	dbClient := sharedClient
+	if dbClient == nil {
+		logger.Debug("no shared DB client available, skipping role parameters")
 		return nil
 	}
-
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("creating database client for role parameters: %w", err)
-	}
-	defer dbClient.Close()
 
 	for roleName, params := range cluster.Spec.Config.RoleParameters {
 		for name, value := range params {

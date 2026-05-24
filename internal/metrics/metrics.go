@@ -107,6 +107,8 @@ type Recorder interface {
 	RecordMirroringOperation(cluster, namespace, operation string)
 	// RecordMaintenanceOperation records a maintenance operation event.
 	RecordMaintenanceOperation(cluster, namespace, operation string)
+	// RecordPasswordRotation records a password rotation event.
+	RecordPasswordRotation()
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -165,6 +167,7 @@ type PrometheusRecorder struct {
 	pvcSizeBytes               *prometheus.GaugeVec
 	mirroringOperationsTotal   *prometheus.CounterVec
 	maintenanceOperationsTotal *prometheus.CounterVec
+	passwordRotationTotal      prometheus.Counter
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -225,6 +228,11 @@ func (r *PrometheusRecorder) initCoreMetrics() {
 		Name:      "auth_attempts_total",
 		Help:      "Total number of authentication attempts.",
 	}, []string{"method", labelResult})
+	r.passwordRotationTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "password_rotation_total",
+		Help:      "Total number of admin password rotations.",
+	})
 }
 
 // initHAMetrics initializes high availability and replication metrics.
@@ -458,6 +466,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.scaleOperationsTotal, r.redistributionProgressVec,
 		r.dataSkewCoefficient, r.pvcSizeBytes,
 		r.mirroringOperationsTotal, r.maintenanceOperationsTotal,
+		r.passwordRotationTotal,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -687,6 +696,11 @@ func (r *PrometheusRecorder) RecordMaintenanceOperation(cluster, namespace, oper
 	r.maintenanceOperationsTotal.WithLabelValues(cluster, namespace, operation).Inc()
 }
 
+// RecordPasswordRotation records a password rotation event.
+func (r *PrometheusRecorder) RecordPasswordRotation() {
+	r.passwordRotationTotal.Inc()
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -699,6 +713,11 @@ func boolToFloat64(b bool) float64 {
 // All methods intentionally do nothing as this recorder is used in
 // unit tests where metric recording is not needed.
 type NoopRecorder struct{}
+
+// NewNoopRecorder creates a new NoopRecorder instance.
+func NewNoopRecorder() *NoopRecorder {
+	return &NoopRecorder{}
+}
 
 // RecordReconcile is a no-op implementation for testing.
 func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration) {}
@@ -822,3 +841,6 @@ func (n *NoopRecorder) RecordMirroringOperation(_, _, _ string) {}
 
 // RecordMaintenanceOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordMaintenanceOperation(_, _, _ string) {}
+
+// RecordPasswordRotation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPasswordRotation() {}

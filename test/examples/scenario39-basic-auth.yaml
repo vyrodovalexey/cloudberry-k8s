@@ -1,0 +1,23 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario39-basic-auth
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    storage:
+      size: "5Gi"
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+      adminPasswordSecret:
+        name: cloudberry-admin-password
+        key: password
+  deletionPolicy: Retain

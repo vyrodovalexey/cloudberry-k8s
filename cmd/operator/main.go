@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/webhook"
 )
 
@@ -47,13 +49,6 @@ const (
 	// shutdownTimeout is the maximum time to wait for graceful shutdown of
 	// background components (tracer, API server, etc.).
 	shutdownTimeout = 5 * time.Second
-
-	// operatorAdminPasswordSecretName is the name of the Kubernetes Secret
-	// used to persist the auto-generated API admin password across pod restarts.
-	operatorAdminPasswordSecretName = "cloudberry-operator-admin-password"
-
-	// passwordSecretKey is the key within the admin password Secret.
-	passwordSecretKey = "password"
 )
 
 var scheme = runtime.NewScheme()
@@ -139,9 +134,13 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	// backgroundWg tracks background goroutines (e.g. cert rotation) to ensure
+	// they complete before the process exits.
+	var backgroundWg sync.WaitGroup
+
 	// Register admission webhooks when enabled.
 	if cfg.WebhookEnabled {
-		if err := setupWebhookCerts(ctx, mgr, cfg, logger); err != nil {
+		if err := setupWebhookCerts(ctx, mgr, cfg, logger, &backgroundWg); err != nil {
 			return fmt.Errorf("setting up webhook certificates: %w", err)
 		}
 		if err := registerWebhooks(mgr, logger); err != nil {
@@ -169,6 +168,10 @@ func run(ctx context.Context) error {
 	if err := mgr.Start(ctx); err != nil {
 		return err
 	}
+
+	// Wait for background goroutines (e.g. cert rotation) to finish before
+	// returning, so they are not leaked on shutdown.
+	backgroundWg.Wait()
 
 	// Check if the API server returned an error before the manager stopped.
 	select {
@@ -231,7 +234,6 @@ func registerControllers(
 	// Register auth controller.
 	authReconciler := controller.NewAuthReconciler(
 		mgr.GetClient(),
-		mgr.GetScheme(),
 		eventRecorder,
 		resourceBuilder,
 		metricsRecorder,
@@ -276,6 +278,15 @@ func startAPIServer(
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 ) error {
+	// Wait for the manager's cache to sync before using the cached client.
+	// The API server goroutine is launched before mgr.Start(), so the cache
+	// may not be ready yet. Without this wait, the cached client returns
+	// ErrCacheNotStarted and the API server silently fails to start.
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		return fmt.Errorf("timed out waiting for manager cache to sync")
+	}
+	logger.Info("manager cache synced, initializing API server")
+
 	// Create an in-memory credential store with an admin user.
 	credStore := auth.NewInMemoryCredentialStore()
 	adminPassword, err := resolveAdminPassword(ctx, mgr.GetClient(), logger)
@@ -284,15 +295,55 @@ func startAPIServer(
 	}
 	credStore.SetCredentials("admin", adminPassword, auth.PermissionAdmin)
 
-	// Create the basic auth provider and middleware.
+	// Create the basic auth provider.
 	basicProvider := auth.NewBasicAuthProvider(credStore, logger)
-	authMW := auth.NewAuthMiddleware(basicProvider, nil, logger, metricsRecorder)
+
+	// Create the OIDC provider when enabled.
+	var oidcProvider auth.Provider
+	if cfg.OIDC.Enabled {
+		roleMapping := cfg.OIDC.RoleMapping
+		if len(roleMapping) == 0 {
+			roleMapping = map[string]string{
+				"admin":          "Admin",
+				"operator":       "Operator",
+				"operator-basic": "Operator Basic",
+				"user":           "Basic",
+				"reader":         "Self Only",
+			}
+		}
+		oidcCfg := auth.OIDCConfig{
+			IssuerURL:       cfg.OIDC.IssuerURL,
+			ClientID:        cfg.OIDC.ClientID,
+			ClientSecret:    cfg.OIDC.ClientSecret.Value(),
+			RoleClaimPath:   cfg.OIDC.RoleClaimPath,
+			RoleClaimSource: cfg.OIDC.RoleClaimSource,
+			RoleMatchMode:   cfg.OIDC.RoleMatchMode,
+			RoleMapping:     roleMapping,
+		}
+		provider, oidcErr := auth.NewOIDCProvider(ctx, oidcCfg, logger)
+		if oidcErr != nil {
+			logger.Warn("failed to initialize OIDC provider, Bearer token auth will be unavailable",
+				"error", oidcErr,
+				"issuerURL", cfg.OIDC.IssuerURL,
+				"clientID", cfg.OIDC.ClientID,
+			)
+		} else {
+			oidcProvider = provider
+			logger.Info("OIDC authentication enabled",
+				"issuerURL", cfg.OIDC.IssuerURL,
+				"clientID", cfg.OIDC.ClientID,
+			)
+		}
+	}
+
+	// Create the auth middleware with both providers.
+	authMW := auth.NewAuthMiddleware(basicProvider, oidcProvider, logger, metricsRecorder)
 
 	// Create database client factory for session operations.
 	dbFactory := db.NewClientFactory(mgr.GetClient(), logger)
 
 	// Create and start the API server.
-	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger, cfg.APIRateLimit)
+	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger, cfg.APIRateLimit, credStore)
 	defer apiServer.Close()
 
 	logger.Info("starting REST API server", "address", cfg.APIAddress, "rateLimit", cfg.APIRateLimit)
@@ -319,20 +370,20 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 	// 2. Check if a persisted Secret already exists.
 	existing := &corev1.Secret{}
 	err := k8sClient.Get(ctx, types.NamespacedName{
-		Name:      operatorAdminPasswordSecretName,
+		Name:      util.OperatorAdminPasswordSecretName,
 		Namespace: operatorNS,
 	}, existing)
 
 	if err == nil {
 		// Secret exists — use the stored password.
-		if pw, ok := existing.Data[passwordSecretKey]; ok && len(pw) > 0 {
+		if pw, ok := existing.Data[util.PasswordSecretKey]; ok && len(pw) > 0 {
 			logger.Info("using admin password from existing Secret",
-				"secret", operatorAdminPasswordSecretName, "namespace", operatorNS)
+				"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS)
 			return string(pw), nil
 		}
 		// Secret exists but has no password key — fall through to generate.
 		logger.Warn("admin password Secret exists but is empty, generating new password",
-			"secret", operatorAdminPasswordSecretName)
+			"secret", util.OperatorAdminPasswordSecretName)
 	} else if !apierrors.IsNotFound(err) {
 		return "", fmt.Errorf("checking admin password secret: %w", err)
 	}
@@ -345,7 +396,7 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      operatorAdminPasswordSecretName,
+			Name:      util.OperatorAdminPasswordSecretName,
 			Namespace: operatorNS,
 			Labels: map[string]string{
 				util.LabelManagedBy: util.LabelManagedByValue,
@@ -353,7 +404,7 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			passwordSecretKey: []byte(generated),
+			util.PasswordSecretKey: []byte(generated),
 		},
 	}
 
@@ -361,12 +412,12 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 		if apierrors.IsAlreadyExists(createErr) {
 			// Race condition: another replica created it first — re-read.
 			if getErr := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      operatorAdminPasswordSecretName,
+				Name:      util.OperatorAdminPasswordSecretName,
 				Namespace: operatorNS,
 			}, existing); getErr != nil {
 				return "", fmt.Errorf("re-reading admin password secret after conflict: %w", getErr)
 			}
-			if pw, ok := existing.Data[passwordSecretKey]; ok && len(pw) > 0 {
+			if pw, ok := existing.Data[util.PasswordSecretKey]; ok && len(pw) > 0 {
 				return string(pw), nil
 			}
 		}
@@ -374,7 +425,7 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 	}
 
 	logger.Warn("CLOUDBERRY_API_ADMIN_PASSWORD not set, generated and persisted password to Secret",
-		"secret", operatorAdminPasswordSecretName, "namespace", operatorNS,
+		"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS,
 		"hint", "set CLOUDBERRY_API_ADMIN_PASSWORD environment variable for production use")
 
 	return generated, nil
@@ -386,6 +437,7 @@ func setupWebhookCerts(
 	mgr ctrl.Manager,
 	cfg *config.OperatorConfig,
 	logger *slog.Logger,
+	wg *sync.WaitGroup,
 ) error {
 	// Determine the operator namespace from the POD_NAMESPACE env var (set by
 	// the Helm deployment via the downward API), falling back to the configured
@@ -415,7 +467,31 @@ func setupWebhookCerts(
 		return fmt.Errorf("creating direct API client for cert management: %w", err)
 	}
 
-	cm := certmanager.New(directClient, nil, certCfg, logger)
+	// Create a vault client when the cert source is vault-pki so that the
+	// certmanager can issue certificates via the Vault PKI engine.
+	var vaultClient vault.Client
+	if cfg.WebhookCertSource == certmanager.CertSourceVaultPKI {
+		vaultCfg := vault.Config{
+			Enabled:    true,
+			Address:    cfg.Vault.Address,
+			AuthMethod: cfg.Vault.AuthMethod,
+			AuthPath:   cfg.Vault.AuthPath,
+			Role:       cfg.Vault.Role,
+			Token:      cfg.Vault.Token.Value(),
+			SecretPath: cfg.Vault.SecretPath,
+		}
+		vc, vaultErr := vault.NewClient(ctx, vaultCfg, logger)
+		if vaultErr != nil {
+			return fmt.Errorf("creating vault client for webhook cert management: %w", vaultErr)
+		}
+		vaultClient = vc
+		logger.Info("vault client created for webhook PKI certificate management",
+			"address", cfg.Vault.Address,
+			"authMethod", cfg.Vault.AuthMethod,
+		)
+	}
+
+	cm := certmanager.New(directClient, vaultClient, certCfg, logger)
 
 	caBundle, err := cm.EnsureCertificates(ctx)
 	if err != nil {
@@ -429,12 +505,27 @@ func setupWebhookCerts(
 
 	// Inject the CA bundle into webhook configurations so the API server
 	// can verify the self-signed certificate used by the webhook server.
-	if err := injectCABundle(ctx, directClient, caBundle, logger); err != nil {
+	// Retry with exponential backoff to handle transient API server errors
+	// during startup or network instability.
+	retryOpts := util.RetryOptions{
+		MaxRetries:     5,
+		InitialBackoff: time.Second,
+		MaxBackoff:     30 * time.Second,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+	}
+	if err := util.RetryWithBackoff(ctx, retryOpts, func(retryCtx context.Context) error {
+		return injectCABundle(retryCtx, directClient, caBundle, logger)
+	}); err != nil {
 		return fmt.Errorf("injecting CA bundle into webhook configurations: %w", err)
 	}
 
 	// Start background goroutine for certificate rotation.
-	go runCertRotation(ctx, cm, logger)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runCertRotation(ctx, cm, logger)
+	}()
 
 	return nil
 }
@@ -445,7 +536,7 @@ func injectCABundle(ctx context.Context, k8sClient client.Client, caBundle []byt
 	// Patch validating webhook configurations.
 	vwcList := &admissionregistrationv1.ValidatingWebhookConfigurationList{}
 	if err := k8sClient.List(ctx, vwcList, client.MatchingLabels{
-		"app.kubernetes.io/part-of": "cloudberry-operator",
+		util.LabelPartOf: util.LabelPartOfValue,
 	}); err != nil {
 		return fmt.Errorf("listing validating webhook configurations: %w", err)
 	}
@@ -468,7 +559,7 @@ func injectCABundle(ctx context.Context, k8sClient client.Client, caBundle []byt
 	// Patch mutating webhook configurations.
 	mwcList := &admissionregistrationv1.MutatingWebhookConfigurationList{}
 	if err := k8sClient.List(ctx, mwcList, client.MatchingLabels{
-		"app.kubernetes.io/part-of": "cloudberry-operator",
+		util.LabelPartOf: util.LabelPartOfValue,
 	}); err != nil {
 		return fmt.Errorf("listing mutating webhook configurations: %w", err)
 	}

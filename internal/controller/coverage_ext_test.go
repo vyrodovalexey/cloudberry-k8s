@@ -1698,7 +1698,8 @@ func TestAdminReconciler_ApplyCoordinatorParameters(t *testing.T) {
 	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
 
-	err := r.applyCoordinatorParameters(context.Background(), cluster)
+	mockClient := &mockDBClient{}
+	err := r.applyCoordinatorParameters(context.Background(), cluster, mockClient)
 	require.NoError(t, err)
 }
 
@@ -1720,11 +1721,11 @@ func TestAdminReconciler_ApplyCoordinatorParameters_Empty(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyCoordinatorParameters(context.Background(), cluster)
+	err := r.applyCoordinatorParameters(context.Background(), cluster, nil)
 	require.NoError(t, err)
 }
 
-func TestAdminReconciler_ApplyCoordinatorParameters_NilDBFactory(t *testing.T) {
+func TestAdminReconciler_ApplyCoordinatorParameters_NilDBClient(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
@@ -1742,8 +1743,8 @@ func TestAdminReconciler_ApplyCoordinatorParameters_NilDBFactory(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyCoordinatorParameters(context.Background(), cluster)
-	require.NoError(t, err) // Should return nil when no DB factory
+	err := r.applyCoordinatorParameters(context.Background(), cluster, nil)
+	require.NoError(t, err) // Should return nil when no shared DB client
 }
 
 func TestAdminReconciler_ApplyDatabaseParameters(t *testing.T) {
@@ -1767,7 +1768,8 @@ func TestAdminReconciler_ApplyDatabaseParameters(t *testing.T) {
 	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
 
-	err := r.applyDatabaseParameters(context.Background(), cluster)
+	mockClient := &mockDBClient{}
+	err := r.applyDatabaseParameters(context.Background(), cluster, mockClient)
 	require.NoError(t, err)
 }
 
@@ -1789,11 +1791,11 @@ func TestAdminReconciler_ApplyDatabaseParameters_Empty(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyDatabaseParameters(context.Background(), cluster)
+	err := r.applyDatabaseParameters(context.Background(), cluster, nil)
 	require.NoError(t, err)
 }
 
-func TestAdminReconciler_ApplyDatabaseParameters_NilDBFactory(t *testing.T) {
+func TestAdminReconciler_ApplyDatabaseParameters_NilDBClient(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
@@ -1813,7 +1815,7 @@ func TestAdminReconciler_ApplyDatabaseParameters_NilDBFactory(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyDatabaseParameters(context.Background(), cluster)
+	err := r.applyDatabaseParameters(context.Background(), cluster, nil)
 	require.NoError(t, err)
 }
 
@@ -1838,7 +1840,8 @@ func TestAdminReconciler_ApplyRoleParameters(t *testing.T) {
 	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
 
-	err := r.applyRoleParameters(context.Background(), cluster)
+	mockClient := &mockDBClient{}
+	err := r.applyRoleParameters(context.Background(), cluster, mockClient)
 	require.NoError(t, err)
 }
 
@@ -1860,11 +1863,11 @@ func TestAdminReconciler_ApplyRoleParameters_Empty(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyRoleParameters(context.Background(), cluster)
+	err := r.applyRoleParameters(context.Background(), cluster, nil)
 	require.NoError(t, err)
 }
 
-func TestAdminReconciler_ApplyRoleParameters_NilDBFactory(t *testing.T) {
+func TestAdminReconciler_ApplyRoleParameters_NilDBClient(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
@@ -1884,11 +1887,12 @@ func TestAdminReconciler_ApplyRoleParameters_NilDBFactory(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyRoleParameters(context.Background(), cluster)
+	err := r.applyRoleParameters(context.Background(), cluster, nil)
 	require.NoError(t, err)
 }
 
-func TestAdminReconciler_ApplyCoordinatorParameters_DBClientError(t *testing.T) {
+func TestAdminReconciler_ApplyCoordinatorParameters_NilSharedClient(t *testing.T) {
+	// When sharedClient is nil but parameters exist, should return nil (skip).
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Spec.Config = &cbv1alpha1.ConfigSpec{
@@ -1904,12 +1908,10 @@ func TestAdminReconciler_ApplyCoordinatorParameters_DBClientError(t *testing.T) 
 	b := builder.NewBuilder()
 	m := &metrics.NoopRecorder{}
 
-	dbFactory := &mockDBClientFactory{err: fmt.Errorf("connection refused")}
-	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	err := r.applyCoordinatorParameters(context.Background(), cluster)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "creating database client")
+	err := r.applyCoordinatorParameters(context.Background(), cluster, nil)
+	require.NoError(t, err)
 }
 
 // ============================================================================

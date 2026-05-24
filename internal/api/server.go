@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -55,11 +58,21 @@ const (
 
 	statusDeleted = "deleted"
 	statusPending = "pending"
+	statusUpdated = "updated"
+	statusCreated = "created"
+	statusRotated = "rotated"
 
 	responseKeyMemoryLimit = "memoryLimit"
+	responseKeyConcurrency = "concurrency"
+	responseKeyCPUMaxPct   = "cpuMaxPercent"
+	responseKeyCPUWeight   = "cpuWeight"
+	responseKeyRule        = "rule"
 
 	// errCodeClusterNotFound is the error code for cluster-not-found responses.
 	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
+
+	// adminUsername is the default admin username for the credential store.
+	adminUsername = "admin"
 )
 
 // dns1123SubdomainRegex validates DNS-1123 subdomain names used for cluster and namespace names.
@@ -104,6 +117,7 @@ type Server struct {
 	authMW      *auth.AuthMiddleware
 	rateLimiter *RateLimiter
 	dbFactory   db.DBClientFactory
+	credStore   *auth.InMemoryCredentialStore
 	metrics     metrics.Recorder
 	logger      *slog.Logger
 	mux         *http.ServeMux
@@ -112,6 +126,7 @@ type Server struct {
 // NewServer creates a new API server.
 // rateLimit controls the per-IP request rate limit (requests per minute).
 // Use 0 to disable rate limiting (useful for performance testing).
+// credStore is optional; when provided, the server can rotate admin passwords in-memory.
 func NewServer(
 	k8sClient client.Client,
 	authMW *auth.AuthMiddleware,
@@ -119,6 +134,7 @@ func NewServer(
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 	rateLimit int,
+	credStore ...*auth.InMemoryCredentialStore,
 ) *Server {
 	if logger == nil {
 		logger = slog.Default()
@@ -136,6 +152,10 @@ func NewServer(
 		metrics:     metricsRecorder,
 		logger:      logger.With("component", "api-server"),
 		mux:         http.NewServeMux(),
+	}
+
+	if len(credStore) > 0 && credStore[0] != nil {
+		s.credStore = credStore[0]
 	}
 
 	s.registerRoutes()
@@ -160,6 +180,10 @@ func (s *Server) registerRoutes() {
 	// Health endpoints (no auth required).
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// Auth management.
+	s.mux.Handle("POST "+apiPrefix+"/auth/rotate-password",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleRotatePassword)))
 
 	// Cluster management.
 	s.mux.Handle("GET "+apiPrefix+"/clusters",
@@ -229,29 +253,8 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/rebalance/status",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetRebalanceStatus)))
 
-	// Workload management.
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetWorkload)))
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-groups",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceGroups)))
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/rules",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListWorkloadRules)))
-
-	// Resource group management.
-	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups",
-		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceGroup)))
-	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}",
-		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceGroup)))
-	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}/assign",
-		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleAssignResourceGroup)))
-
-	// Resource queue management.
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-queues",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceQueues)))
-	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-queues",
-		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceQueue)))
-	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-queues/{queueName}",
-		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceQueue)))
+	// Workload, resource group, rule, and queue management.
+	s.registerWorkloadRoutes()
 
 	// Query monitoring.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
@@ -306,6 +309,43 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStopDataLoadingJob)))
 }
 
+// registerWorkloadRoutes registers workload, resource group, rule, and queue routes.
+func (s *Server) registerWorkloadRoutes() {
+	// Workload management.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetWorkload)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-groups",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceGroups)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/rules",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListWorkloadRules)))
+
+	// Resource group management.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceGroup)))
+	s.mux.Handle("PUT "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleUpdateResourceGroup)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteResourceGroup)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-groups/{groupName}/assign",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleAssignResourceGroup)))
+
+	// Workload rule management.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/rules",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateWorkloadRule)))
+	s.mux.Handle("PUT "+apiPrefix+"/clusters/{name}/workload/rules/{ruleName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleUpdateWorkloadRule)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/rules/{ruleName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteWorkloadRule)))
+
+	// Resource queue management.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/workload/resource-queues",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListResourceQueues)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/workload/resource-queues",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateResourceQueue)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/workload/resource-queues/{queueName}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceQueue)))
+}
+
 // withAuth wraps a handler with rate limiting and authentication middleware.
 // Rate limiting is applied before authentication to protect against brute-force attacks.
 func (s *Server) withAuth(handler http.Handler) http.Handler {
@@ -318,7 +358,7 @@ func (s *Server) withAuth(handler http.Handler) http.Handler {
 
 // withPermission wraps a handler function with permission checking.
 func (s *Server) withPermission(level auth.PermissionLevel, fn http.HandlerFunc) http.Handler {
-	return auth.RequirePermission(level)(fn)
+	return auth.RequirePermission(level, s.logger)(fn)
 }
 
 // handleHealthz handles the health check endpoint.
@@ -329,6 +369,94 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // handleReadyz handles the readiness check endpoint.
 func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{responseKeyStatus: "ready"})
+}
+
+// handleRotatePassword rotates the operator admin password.
+// It generates a new random password, updates the K8s Secret, and refreshes
+// the in-memory credential store so the new password takes effect immediately
+// without requiring a pod restart.
+func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Verify the credential store is available for in-memory rotation.
+	if s.credStore == nil {
+		s.logger.Error("password rotation requested but credential store not available")
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"credential store not configured")
+		return
+	}
+
+	// Generate a new cryptographically secure random password.
+	newPassword, err := util.GenerateRandomPassword()
+	if err != nil {
+		s.logger.Error("failed to generate new password", "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to generate new password")
+		return
+	}
+
+	// Determine the operator namespace.
+	operatorNS := os.Getenv("POD_NAMESPACE")
+	if operatorNS == "" {
+		operatorNS = util.OperatorNamespace
+	}
+
+	// Read the existing K8s Secret.
+	secretKey := types.NamespacedName{
+		Name:      util.OperatorAdminPasswordSecretName,
+		Namespace: operatorNS,
+	}
+	existing := &corev1.Secret{}
+	if err := s.k8sClient.Get(ctx, secretKey, existing); err != nil {
+		// Secret does not exist — create it.
+		s.logger.Info("admin password secret not found, creating new secret",
+			"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS)
+		newSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.OperatorAdminPasswordSecretName,
+				Namespace: operatorNS,
+				Labels: map[string]string{
+					util.LabelManagedBy: util.LabelManagedByValue,
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				util.PasswordSecretKey: []byte(newPassword),
+			},
+		}
+		if createErr := s.k8sClient.Create(ctx, newSecret); createErr != nil {
+			s.logger.Error("failed to create admin password secret",
+				"error", createErr)
+			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+				"failed to create admin password secret")
+			return
+		}
+	} else {
+		// Secret exists — update it with the new password.
+		existing.Data[util.PasswordSecretKey] = []byte(newPassword)
+		if updateErr := s.k8sClient.Update(ctx, existing); updateErr != nil {
+			s.logger.Error("failed to update admin password secret",
+				"error", updateErr)
+			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+				"failed to update admin password secret")
+			return
+		}
+	}
+
+	// Update the in-memory credential store so the new password works immediately.
+	s.credStore.SetCredentials(adminUsername, newPassword, auth.PermissionAdmin)
+
+	s.logger.Info("admin password rotated successfully",
+		"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS)
+
+	if s.metrics != nil {
+		s.metrics.RecordPasswordRotation()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		responseKeyStatus:  statusRotated,
+		responseKeyMessage: "Admin password rotated successfully",
+	})
 }
 
 // handleListClusters lists all CloudberryCluster resources.
@@ -524,7 +652,17 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{responseKeyStatus: "updated"})
+	// Audit log: config change
+	if identity := auth.IdentityFromContext(r.Context()); identity != nil {
+		s.logger.Info("config changed",
+			"cluster", name,
+			"username", identity.Username,
+			"method", identity.AuthMethod,
+			"source_ip", r.RemoteAddr,
+		)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{responseKeyStatus: statusUpdated})
 }
 
 // handleListSegments lists cluster segments.
@@ -926,7 +1064,9 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 		Name          string `json:"name"`
 		Concurrency   int32  `json:"concurrency"`
 		CPUMaxPercent int32  `json:"cpuMaxPercent"`
+		CPUWeight     int32  `json:"cpuWeight"`
 		MemoryLimit   int32  `json:"memoryLimit"`
+		MinCost       int32  `json:"minCost"`
 	}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
@@ -949,8 +1089,9 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 			"cluster", cluster.Name, "group", req.Name)
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
 			responseKeyName:        req.Name,
-			"concurrency":          req.Concurrency,
-			"cpuMaxPercent":        req.CPUMaxPercent,
+			responseKeyConcurrency: req.Concurrency,
+			responseKeyCPUMaxPct:   req.CPUMaxPercent,
+			responseKeyCPUWeight:   req.CPUWeight,
 			responseKeyMemoryLimit: req.MemoryLimit,
 			responseKeyMessage:     "resource group creation pending; database connection not available",
 		})
@@ -971,7 +1112,9 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 		Name:          req.Name,
 		Concurrency:   req.Concurrency,
 		CPUMaxPercent: req.CPUMaxPercent,
+		CPUWeight:     req.CPUWeight,
 		MemoryLimit:   req.MemoryLimit,
+		MinCost:       req.MinCost,
 	}
 	if createErr := dbClient.CreateResourceGroup(r.Context(), opts); createErr != nil {
 		s.logger.Error("failed to create resource group",
@@ -985,10 +1128,10 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 		"cluster", cluster.Name, "group", req.Name)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		responseKeyName:        req.Name,
-		"concurrency":          req.Concurrency,
-		"cpuMaxPercent":        req.CPUMaxPercent,
+		responseKeyConcurrency: req.Concurrency,
+		responseKeyCPUMaxPct:   req.CPUMaxPercent,
 		responseKeyMemoryLimit: req.MemoryLimit,
-		responseKeyStatus:      "created",
+		responseKeyStatus:      statusCreated,
 	})
 }
 
@@ -1043,6 +1186,89 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		responseKeyGroup:  groupName,
 		responseKeyStatus: statusDeleted,
+	})
+}
+
+// handleUpdateResourceGroup updates an existing resource group's parameters.
+func (s *Server) handleUpdateResourceGroup(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	groupName := r.PathValue("groupName")
+
+	if !isValidIdentifier(groupName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid resource group name: must be a valid SQL identifier")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	var req struct {
+		Concurrency   int32 `json:"concurrency"`
+		CPUMaxPercent int32 `json:"cpuMaxPercent"`
+		CPUWeight     int32 `json:"cpuWeight"`
+		MemoryLimit   int32 `json:"memoryLimit"`
+		MinCost       int32 `json:"minCost"`
+	}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("update resource group requested but database factory not available",
+			"cluster", cluster.Name, responseKeyGroup, groupName)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyGroup:       groupName,
+			responseKeyConcurrency: req.Concurrency,
+			responseKeyCPUMaxPct:   req.CPUMaxPercent,
+			responseKeyCPUWeight:   req.CPUWeight,
+			responseKeyStatus:      statusPending,
+			responseKeyMessage:     msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for resource group update",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	opts := db.ResourceGroupOptions{
+		Name:          groupName,
+		Concurrency:   req.Concurrency,
+		CPUMaxPercent: req.CPUMaxPercent,
+		CPUWeight:     req.CPUWeight,
+		MemoryLimit:   req.MemoryLimit,
+		MinCost:       req.MinCost,
+	}
+	if alterErr := dbClient.AlterResourceGroup(r.Context(), opts); alterErr != nil {
+		s.logger.Error("failed to alter resource group",
+			"cluster", cluster.Name, responseKeyGroup, groupName, "error", alterErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to alter resource group")
+		return
+	}
+
+	s.logger.Info("resource group updated",
+		"cluster", cluster.Name, responseKeyGroup, groupName)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyGroup:       groupName,
+		responseKeyConcurrency: req.Concurrency,
+		responseKeyCPUMaxPct:   req.CPUMaxPercent,
+		responseKeyCPUWeight:   req.CPUWeight,
+		responseKeyStatus:      statusUpdated,
 	})
 }
 
@@ -1115,8 +1341,22 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Audit log: role management
+	identity := auth.IdentityFromContext(r.Context())
+	userName := ""
+	authMethod := ""
+	if identity != nil {
+		userName = identity.Username
+		authMethod = identity.AuthMethod
+	}
 	s.logger.Info("role assigned to resource group",
-		"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role)
+		"cluster", cluster.Name,
+		responseKeyGroup, groupName,
+		"role", req.Role,
+		"username", userName,
+		"method", authMethod,
+		"source_ip", r.RemoteAddr,
+	)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		responseKeyGroup:  groupName,
 		"role":            req.Role,
@@ -1251,7 +1491,7 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 		"activeStatements":     req.ActiveStatements,
 		responseKeyMemoryLimit: req.MemoryLimit,
 		"priority":             req.Priority,
-		responseKeyStatus:      "created",
+		responseKeyStatus:      statusCreated,
 	})
 }
 
@@ -1328,6 +1568,217 @@ func (s *Server) handleListWorkloadRules(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"rules":          rules,
 		responseKeyTotal: len(rules),
+	})
+}
+
+// handleCreateWorkloadRule creates a new workload rule by patching the cluster CRD.
+func (s *Server) handleCreateWorkloadRule(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	var rule cbv1alpha1.WorkloadRule
+	if decodeErr := json.NewDecoder(r.Body).Decode(&rule); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if rule.Name == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "rule name is required")
+		return
+	}
+
+	if !isValidIdentifier(rule.Name) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid rule name: must be a valid SQL identifier")
+		return
+	}
+
+	// Initialize workload spec if nil.
+	if cluster.Spec.Workload == nil {
+		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{}
+	}
+
+	// Check for duplicate rule name.
+	for i := range cluster.Spec.Workload.Rules {
+		if cluster.Spec.Workload.Rules[i].Name == rule.Name {
+			writeErrorJSON(w, http.StatusBadRequest, "DUPLICATE_RULE",
+				fmt.Sprintf("workload rule %q already exists", rule.Name))
+			return
+		}
+	}
+
+	cluster.Spec.Workload.Rules = append(cluster.Spec.Workload.Rules, rule)
+	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+		s.logger.Error("failed to create workload rule",
+			"cluster", name, "rule", rule.Name, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to create workload rule")
+		return
+	}
+
+	s.logger.Info("workload rule created", "cluster", name, responseKeyRule, rule.Name)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		responseKeyRule:   rule,
+		responseKeyStatus: statusCreated,
+	})
+}
+
+// applyWorkloadRuleUpdates applies partial updates from a JSON map to a WorkloadRule.
+func applyWorkloadRuleUpdates(rule *cbv1alpha1.WorkloadRule, updates map[string]interface{}) {
+	if v, ok := updates["enabled"]; ok {
+		if b, isBool := v.(bool); isBool {
+			rule.Enabled = b
+		}
+	}
+	applyStringField(updates, "resourceGroup", &rule.ResourceGroup)
+	applyStringField(updates, "action", &rule.Action)
+	applyStringField(updates, "threshold", &rule.Threshold)
+	applyStringField(updates, "thresholdType", &rule.ThresholdType)
+	applyStringField(updates, "moveTarget", &rule.MoveTarget)
+	applyStringField(updates, "queryTag", &rule.QueryTag)
+	if v, ok := updates["priority"]; ok {
+		if f, isFloat := v.(float64); isFloat {
+			rule.Priority = int32(f)
+		}
+	}
+}
+
+// applyStringField applies a string field update from a JSON map.
+func applyStringField(updates map[string]interface{}, key string, target *string) {
+	if v, ok := updates[key]; ok {
+		if s, isStr := v.(string); isStr {
+			*target = s
+		}
+	}
+}
+
+// handleUpdateWorkloadRule updates an existing workload rule by patching the cluster CRD.
+func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	ruleName := r.PathValue("ruleName")
+
+	if !isValidIdentifier(ruleName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid rule name: must be a valid SQL identifier")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	var updates map[string]interface{}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&updates); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if cluster.Spec.Workload == nil {
+		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
+			fmt.Sprintf("workload rule %q not found", ruleName))
+		return
+	}
+
+	ruleIdx := -1
+	for i := range cluster.Spec.Workload.Rules {
+		if cluster.Spec.Workload.Rules[i].Name == ruleName {
+			ruleIdx = i
+			break
+		}
+	}
+
+	if ruleIdx < 0 {
+		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
+			fmt.Sprintf("workload rule %q not found", ruleName))
+		return
+	}
+
+	// Apply partial updates to the existing rule.
+	rule := &cluster.Spec.Workload.Rules[ruleIdx]
+	applyWorkloadRuleUpdates(rule, updates)
+
+	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+		s.logger.Error("failed to update workload rule",
+			"cluster", name, "rule", ruleName, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to update workload rule")
+		return
+	}
+
+	s.logger.Info("workload rule updated", "cluster", name, responseKeyRule, ruleName)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyRule:   *rule,
+		responseKeyStatus: statusUpdated,
+	})
+}
+
+// handleDeleteWorkloadRule deletes a workload rule by patching the cluster CRD.
+func (s *Server) handleDeleteWorkloadRule(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ruleName := r.PathValue("ruleName")
+
+	if !isValidIdentifier(ruleName) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"invalid rule name: must be a valid SQL identifier")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	if cluster.Spec.Workload == nil {
+		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
+			fmt.Sprintf("workload rule %q not found", ruleName))
+		return
+	}
+
+	ruleIdx := -1
+	for i := range cluster.Spec.Workload.Rules {
+		if cluster.Spec.Workload.Rules[i].Name == ruleName {
+			ruleIdx = i
+			break
+		}
+	}
+
+	if ruleIdx < 0 {
+		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
+			fmt.Sprintf("workload rule %q not found", ruleName))
+		return
+	}
+
+	// Remove the rule from the slice.
+	cluster.Spec.Workload.Rules = append(
+		cluster.Spec.Workload.Rules[:ruleIdx],
+		cluster.Spec.Workload.Rules[ruleIdx+1:]...,
+	)
+
+	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+		s.logger.Error("failed to delete workload rule",
+			"cluster", name, "rule", ruleName, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to delete workload rule")
+		return
+	}
+
+	s.logger.Info("workload rule deleted", "cluster", name, responseKeyRule, ruleName)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyRule:   ruleName,
+		responseKeyStatus: statusDeleted,
 	})
 }
 
@@ -1526,7 +1977,7 @@ func (s *Server) handleUpdateDataLoadingJob(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: "updated",
+		responseKeyStatus: statusUpdated,
 		responseKeyJob:    jobName,
 	})
 }

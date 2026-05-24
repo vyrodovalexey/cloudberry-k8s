@@ -111,7 +111,11 @@ func (m *AuthMiddleware) recordFailure(method string, err error, remoteAddr stri
 }
 
 // RequirePermission creates a middleware that enforces a minimum permission level.
-func RequirePermission(level PermissionLevel) Middleware {
+func RequirePermission(level PermissionLevel, loggers ...*slog.Logger) Middleware {
+	var logger *slog.Logger
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			identity := IdentityFromContext(r.Context())
@@ -121,6 +125,17 @@ func RequirePermission(level PermissionLevel) Middleware {
 			}
 
 			if identity.Permission < level {
+				if logger != nil {
+					logger.Warn("permission denied",
+						"username", identity.Username,
+						"method", identity.AuthMethod,
+						"source_ip", r.RemoteAddr,
+						"required_permission", level.String(),
+						"actual_permission", identity.Permission.String(),
+						"path", r.URL.Path,
+						"http_method", r.Method,
+					)
+				}
 				writeErrorResponse(
 					w, http.StatusForbidden, "FORBIDDEN",
 					"insufficient permissions: requires "+level.String(),

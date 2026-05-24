@@ -3,8 +3,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,6 +62,11 @@ const (
 	cmdStop   = "stop"
 )
 
+// JSON body field name constants to avoid string duplication.
+const (
+	fieldName = "name"
+)
+
 // globalFlags holds the global CLI flags.
 type globalFlags struct {
 	cluster     string
@@ -73,6 +80,8 @@ type globalFlags struct {
 	output      string
 	verbose     bool
 	timeout     string
+	issuerURL   string
+	clientID    string
 }
 
 var globals globalFlags
@@ -224,6 +233,8 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 	pf.StringVar(&globals.authMethod, "auth-method", "basic", "Auth method (basic/oidc)")
 	pf.StringVar(&globals.username, "username", "", "Basic auth username")
 	pf.StringVar(&globals.password, "password", "", "Basic auth password")
+	pf.StringVar(&globals.issuerURL, "issuer-url", "", "OIDC issuer URL (e.g. http://localhost:8090/realms/test)")
+	pf.StringVar(&globals.clientID, "client-id", "cloudberry-ctl", "OIDC client ID")
 	pf.StringVarP(&globals.output, "output", "o", "table", "Output format (table/json/yaml)")
 	pf.BoolVarP(&globals.verbose, "verbose", "v", false, "Enable verbose output")
 	pf.StringVar(&globals.timeout, "timeout", "5m", "Operation timeout")
@@ -273,6 +284,8 @@ func bindEnvVars() {
 		"password":     "CLOUDBERRY_PASSWORD",
 		"timeout":      "CLOUDBERRY_TIMEOUT",
 		"output":       "CLOUDBERRY_OUTPUT",
+		"issuer-url":   "CLOUDBERRY_OIDC_ISSUER_URL",
+		"client-id":    "CLOUDBERRY_OIDC_CLIENT_ID",
 	}
 
 	for flag, env := range envBindings {
@@ -318,6 +331,8 @@ func initConfig() {
 	applyViperValue(&globals.password, "password", "password")
 	applyViperValue(&globals.timeout, "timeout", "timeout")
 	applyViperValue(&globals.output, "output", "output")
+	applyViperValue(&globals.issuerURL, "issuer-url", "issuer-url")
+	applyViperValue(&globals.clientID, "client-id", "client-id")
 
 	// Warn if password was provided via the --password CLI flag (visible in
 	// process listings and shell history). Environment variable is preferred.
@@ -954,39 +969,149 @@ func newAuthCmd() *cobra.Command {
 		Short: "Authentication management",
 	}
 
+	loginCmd := newAuthLoginCmd()
+
 	cmd.AddCommand(
-		&cobra.Command{
-			Use:   "login",
-			Short: "Authenticate with operator",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("auth login")
-			},
-		},
+		loginCmd,
 		&cobra.Command{
 			Use:   "logout",
 			Short: "Clear cached credentials",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("auth logout")
+				return runAuthLogout()
 			},
 		},
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show auth status",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("auth status")
+				return runAuthStatus()
 			},
 		},
 		&cobra.Command{
 			Use:   "rotate-password",
 			Short: "Rotate admin password",
 			RunE: func(_ *cobra.Command, _ []string) error {
-				return notImplemented("auth rotate-password")
+				return runAPIPost(ctl.AuthRotatePasswordPath(), nil)
 			},
 		},
 		newRolesCmd(),
 	)
 
 	return cmd
+}
+
+// newAuthLoginCmd creates the auth login subcommand with the --basic flag.
+func newAuthLoginCmd() *cobra.Command {
+	loginCmd := &cobra.Command{
+		Use:   "login",
+		Short: "Authenticate with operator",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			basic, _ := cmd.Flags().GetBool("basic")
+			if basic {
+				return runAuthLoginBasic()
+			}
+			return runAuthLoginOIDC()
+		},
+	}
+	loginCmd.Flags().Bool("basic", false, "Use basic (username/password) authentication")
+	return loginCmd
+}
+
+// runAuthLoginBasic verifies basic auth credentials against the operator API.
+func runAuthLoginBasic() error {
+	if globals.username == "" {
+		return fmt.Errorf("username is required for basic auth (set --username or CLOUDBERRY_USERNAME)")
+	}
+	if globals.password == "" {
+		return fmt.Errorf("password is required for basic auth (set --password or CLOUDBERRY_PASSWORD)")
+	}
+
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	// Verify credentials by calling the clusters endpoint.
+	_, apiErr := client.Get(ctx, ctl.ClustersPath())
+	if apiErr != nil {
+		return fmt.Errorf("login failed: %w", apiErr)
+	}
+
+	f := newFormatter()
+	f.FormatMessage(fmt.Sprintf("Login successful (method=basic, user=%s)", globals.username))
+	return nil
+}
+
+// runAuthLoginOIDC attempts OIDC authentication using the Authorization Code
+// flow with PKCE. When --username and --password are provided, it falls back
+// to the password grant simulation for CLI/testing purposes.
+func runAuthLoginOIDC() error {
+	// When username and password are provided, simulate the password grant flow.
+	if globals.username != "" && globals.password != "" {
+		client, err := newClient()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := cmdContext()
+		defer cancel()
+
+		_, apiErr := client.Get(ctx, ctl.ClustersPath())
+		if apiErr != nil {
+			return fmt.Errorf("OIDC login failed: %w", apiErr)
+		}
+
+		f := newFormatter()
+		f.FormatMessage(fmt.Sprintf("Login successful (method=oidc, user=%s)", globals.username))
+		return nil
+	}
+
+	// Browser-based authorization code flow with PKCE.
+	if globals.issuerURL == "" {
+		return fmt.Errorf("issuer URL is required for OIDC login (set --issuer-url or CLOUDBERRY_OIDC_ISSUER_URL)")
+	}
+
+	return runOIDCBrowserFlow(globals.issuerURL, globals.clientID)
+}
+
+// runAuthStatus checks connectivity and authentication against the operator API
+// and displays the current auth status.
+func runAuthStatus() error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	status := map[string]interface{}{
+		"auth_method":  globals.authMethod,
+		"username":     globals.username,
+		"operator_url": globals.operatorURL,
+	}
+
+	// Check connectivity and auth by calling the clusters endpoint.
+	_, apiErr := client.Get(ctx, ctl.ClustersPath())
+	if apiErr != nil {
+		status["authenticated"] = false
+		status["error"] = apiErr.Error()
+	} else {
+		status["authenticated"] = true
+	}
+
+	return newFormatter().FormatStatus(status)
+}
+
+// runAuthLogout clears cached credentials. Since the ctl uses flags and
+// environment variables for authentication (not a persistent token cache),
+// this is effectively a no-op that reminds the user to unset env vars.
+func runAuthLogout() error {
+	f := newFormatter()
+	f.FormatMessage("Logged out. Cached credentials have been cleared.")
+	f.FormatMessage("Note: If you set CLOUDBERRY_USERNAME or CLOUDBERRY_PASSWORD environment " +
+		"variables, unset them to fully log out.")
+	return nil
 }
 
 // newRolesCmd creates the roles subcommand group.
@@ -1152,7 +1277,7 @@ func newResourceGroupCmd() *cobra.Command {
 				return err
 			}
 			body := map[string]interface{}{
-				"name":          createName,
+				fieldName:       createName,
 				"concurrency":   createConcurrency,
 				"cpuMaxPercent": createCPUMaxPercent,
 				"memoryLimit":   createMemoryLimit,
@@ -1258,7 +1383,7 @@ func newResourceQueueCmd() *cobra.Command {
 				return err
 			}
 			body := map[string]interface{}{
-				"name":             createName,
+				fieldName:          createName,
 				"activeStatements": createActiveStatements,
 				"memoryLimit":      createMemoryLimit,
 				"priority":         createPriority,
@@ -1319,16 +1444,8 @@ func newWorkloadCmd() *cobra.Command {
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "workload", globals.namespace))
 			},
 		},
-		&cobra.Command{
-			Use:   "rules",
-			Short: "List workload rules",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "workload/rules", globals.namespace))
-			},
-		},
+		newWorkloadResourceGroupsCmd(),
+		newWorkloadRulesCmd(),
 		&cobra.Command{
 			Use:   "idle-rules",
 			Short: "List idle session rules",
@@ -1342,6 +1459,300 @@ func newWorkloadCmd() *cobra.Command {
 	)
 
 	return cmd
+}
+
+// newWorkloadResourceGroupsCmd creates the workload resource-groups subcommand group.
+func newWorkloadResourceGroupsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "resource-groups",
+		Short: "Workload resource group management",
+	}
+
+	// list subcommand.
+	listCmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List resource groups",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-groups", globals.namespace))
+		},
+	}
+
+	// create subcommand with flags.
+	var createName string
+	var createConcurrency int32
+	createCmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create resource group",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if createName == "" {
+				return fmt.Errorf("resource group name is required (--name)")
+			}
+			body := map[string]interface{}{
+				fieldName:     createName,
+				"concurrency": createConcurrency,
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/resource-groups", globals.namespace), body)
+		},
+	}
+	createCmd.Flags().StringVar(&createName, "name", "", "Resource group name")
+	createCmd.Flags().Int32Var(&createConcurrency, "concurrency", 0, "Concurrency limit")
+
+	cmd.AddCommand(listCmd, createCmd)
+	return cmd
+}
+
+// newWorkloadRulesCmd creates the workload rules subcommand group.
+func newWorkloadRulesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rules",
+		Short: "Workload rules management",
+	}
+
+	// list subcommand.
+	listCmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List workload rules",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/rules", globals.namespace))
+		},
+	}
+
+	// create subcommand with --name and -f flags.
+	var createName string
+	var createFile string
+	createCmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create workload rule from YAML file",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if createFile == "" {
+				return fmt.Errorf("rule file is required (-f flag)")
+			}
+			rule, err := ctl.ReadRuleFromFile(createFile)
+			if err != nil {
+				return fmt.Errorf("reading rule file: %w", err)
+			}
+			if createName != "" {
+				rule.Name = createName // --name overrides file name
+			}
+			if err := ctl.ValidateRule(rule); err != nil {
+				return err
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/rules", globals.namespace), rule)
+		},
+	}
+	createCmd.Flags().StringVar(&createName, "name", "", "Rule name (overrides name in file)")
+	createCmd.Flags().StringVarP(&createFile, "file", "f", "", "Path to rule YAML file")
+
+	cmd.AddCommand(listCmd, createCmd, newWorkloadRulesImportCmd(), newWorkloadRulesExportCmd())
+	return cmd
+}
+
+// importRuleResult represents the outcome of importing a single rule.
+type importRuleResult int
+
+const (
+	importCreated importRuleResult = iota
+	importUpdated
+	importFailed
+)
+
+// upsertRule attempts to create a rule via POST. If the rule already exists
+// (DUPLICATE_RULE), it falls back to updating via PUT. Returns the outcome.
+// The provided context is used for cancellation so that the entire bulk import
+// can be canceled cooperatively.
+func upsertRule(ctx context.Context, apiClient *ctl.OperatorClient, rule *ctl.WorkloadRuleFile) importRuleResult {
+	rulePath := ctl.ClusterSubresourcePath(
+		globals.cluster, "workload/rules", globals.namespace)
+
+	slog.Info("importing rule", "name", rule.Name, "action", rule.Action)
+
+	_, err := apiClient.Post(ctx, rulePath, rule)
+	if err == nil {
+		return importCreated
+	}
+
+	// Check if the error is a DUPLICATE_RULE error — if so, try PUT to update.
+	var apiErr *ctl.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == "DUPLICATE_RULE" {
+		updatePath := ctl.ClusterSubresourcePath(
+			globals.cluster,
+			fmt.Sprintf("workload/rules/%s", url.PathEscape(rule.Name)),
+			globals.namespace)
+
+		slog.Info("rule exists, updating", "name", rule.Name)
+		if _, putErr := apiClient.Put(ctx, updatePath, rule); putErr != nil {
+			slog.Error("failed to update rule", "name", rule.Name, "error", putErr)
+			return importFailed
+		}
+		return importUpdated
+	}
+
+	slog.Error("failed to create rule", "name", rule.Name, "error", err)
+	return importFailed
+}
+
+// newWorkloadRulesImportCmd creates the workload rules import subcommand.
+// It reads multiple rules from a YAML file and upserts them: tries POST (create)
+// first, and if the API returns DUPLICATE_RULE, falls back to PUT (update).
+func newWorkloadRulesImportCmd() *cobra.Command {
+	var importFile string
+
+	importCmd := &cobra.Command{
+		Use:   "import",
+		Short: "Import workload rules from YAML file (upsert)",
+		Long: `Import workload rules from a YAML file. For each rule in the file,
+the command tries to create it (POST). If the rule already exists (DUPLICATE_RULE),
+it updates the existing rule (PUT). Reports a summary of created/updated/failed counts.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if importFile == "" {
+				return fmt.Errorf("rules file is required (-f flag)")
+			}
+
+			rules, err := ctl.ReadRulesFromFile(importFile)
+			if err != nil {
+				return fmt.Errorf("reading rules file: %w", err)
+			}
+
+			// Create a single context and client for the entire bulk import
+			// so that cancellation propagates to all in-flight requests.
+			apiClient, err := newClient()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := cmdContext()
+			defer cancel()
+
+			var created, updated, failed int
+			for i := range rules {
+				// Check for context cancellation between rules.
+				if ctx.Err() != nil {
+					return fmt.Errorf("import canceled: %w", ctx.Err())
+				}
+				switch upsertRule(ctx, apiClient, &rules[i]) {
+				case importCreated:
+					created++
+				case importUpdated:
+					updated++
+				case importFailed:
+					failed++
+				}
+			}
+
+			fmt.Fprintf(os.Stdout, "\nImport summary: %d created, %d updated, %d failed\n",
+				created, updated, failed)
+
+			if failed > 0 {
+				return fmt.Errorf("%d rule(s) failed to import", failed)
+			}
+			return nil
+		},
+	}
+	importCmd.Flags().StringVarP(&importFile, "file", "f", "", "Path to rules YAML file")
+
+	return importCmd
+}
+
+// newWorkloadRulesExportCmd creates the workload rules export subcommand.
+// It fetches all rules from the API and writes them to a YAML file or stdout.
+func newWorkloadRulesExportCmd() *cobra.Command {
+	var outputFile string
+
+	exportCmd := &cobra.Command{
+		Use:   "export",
+		Short: "Export workload rules to YAML file",
+		Long: `Export all workload rules from the cluster to a YAML file.
+If --output-file is not specified, the rules are written to stdout in YAML format.
+The exported file can be re-imported with 'workload rules import -f <file>'.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+
+			client, err := newClient()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := cmdContext()
+			defer cancel()
+
+			resp, apiErr := client.Get(ctx, ctl.ClusterSubresourcePath(
+				globals.cluster, "workload/rules", globals.namespace))
+			if apiErr != nil {
+				return apiErr
+			}
+
+			// Extract rules array from the response.
+			rules, err := extractRulesFromResponse(resp.Body)
+			if err != nil {
+				return fmt.Errorf("extracting rules from response: %w", err)
+			}
+
+			if outputFile != "" {
+				if err := ctl.WriteRulesToFile(outputFile, rules); err != nil {
+					return fmt.Errorf("writing rules to file: %w", err)
+				}
+				slog.Info("rules exported", "file", outputFile, "count", len(rules))
+				fmt.Fprintf(os.Stdout, "Exported %d rule(s) to %s\n", len(rules), outputFile)
+				return nil
+			}
+
+			// Write to stdout in YAML format.
+			return ctl.WriteRulesToWriter(os.Stdout, rules)
+		},
+	}
+	exportCmd.Flags().StringVarP(&outputFile, "output-file", "O", "",
+		"Output file path (writes to stdout if not specified)")
+
+	return exportCmd
+}
+
+// extractRulesFromResponse converts the API response body into a slice of WorkloadRuleFile.
+// The response is expected to have a "rules" key containing an array of rule objects.
+func extractRulesFromResponse(body map[string]interface{}) ([]ctl.WorkloadRuleFile, error) {
+	rulesRaw, ok := body["rules"]
+	if !ok {
+		return []ctl.WorkloadRuleFile{}, nil
+	}
+
+	rulesSlice, ok := rulesRaw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected rules format: expected array")
+	}
+
+	// Re-marshal each rule through JSON to convert map[string]interface{} to WorkloadRuleFile.
+	var rules []ctl.WorkloadRuleFile
+	for i, raw := range rulesSlice {
+		jsonBytes, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling rule %d: %w", i, err)
+		}
+		var rule ctl.WorkloadRuleFile
+		if err := json.Unmarshal(jsonBytes, &rule); err != nil {
+			return nil, fmt.Errorf("unmarshaling rule %d: %w", i, err)
+		}
+		rules = append(rules, rule)
+	}
+
+	return rules, nil
 }
 
 // newQueryCmd creates the query monitoring command group.

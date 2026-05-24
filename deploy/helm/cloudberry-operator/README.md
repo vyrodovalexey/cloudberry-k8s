@@ -166,9 +166,10 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 ```
 
 **Behavior:**
-- If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it as the admin password for the REST API
-- If not set, the operator auto-generates a cryptographically secure random password (including special characters) and logs a warning
-- The auto-generated password changes on every operator restart — always set this variable in production
+- If `CLOUDBERRY_API_ADMIN_PASSWORD` is set, the operator uses it and persists it to a Kubernetes Secret (`cloudberry-operator-admin-password`)
+- If not set but the Secret exists (from a previous run), the operator reads the password from the Secret — this ensures the password survives pod restarts
+- If neither the env var nor the Secret exists, the operator auto-generates a cryptographically secure random password (including special characters), persists it to the Secret, and logs a warning
+- The auto-generated password is stable across restarts (persisted to Secret). For explicit control, set `CLOUDBERRY_API_ADMIN_PASSWORD` in production
 
 ### Webhook Certificate Management
 
@@ -353,6 +354,162 @@ kubectl patch cloudberrycluster my-cluster --type merge \
 **Mirroring status values:** `NotConfigured` → `Initializing` → `Syncing` → `InSync`
 
 See the [User Guide](../../docs/user-guide.md#enable-mirroring-on-existing-cluster) for detailed instructions.
+
+## Webhook Configuration
+
+### Certificate Sources
+
+The operator supports three certificate management strategies for admission webhooks:
+
+| Strategy | Configuration | Description |
+|----------|--------------|-------------|
+| **Self-signed** (default) | `webhook.certSource=self-signed` | Operator generates ECDSA P-256 CA + server certificate. No external dependencies. Auto-rotates when 2/3 of lifetime elapsed |
+| **Vault PKI** | `webhook.certSource=vault-pki` | Issues certificates from Vault's PKI secrets engine. Recommended for production |
+| **External** | `webhook.certSecretName=<name>` | Use a pre-existing TLS Secret. Set `webhook.caBundle` for static CA injection |
+
+### Vault PKI Integration
+
+To use Vault PKI for webhook certificates:
+
+1. **Prerequisites**: Enable the PKI secrets engine and create a role in Vault:
+
+   ```bash
+   vault secrets enable -path=pki pki
+   vault write pki/root/generate/internal \
+     common_name="cloudberry-operator-ca" ttl=87600h
+   vault write pki/roles/cloudberry-operator \
+     allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local" \
+     allow_subdomains=true max_ttl=8760h
+   ```
+
+2. **Deploy** with Vault PKI:
+
+   ```bash
+   helm install cloudberry-operator deploy/helm/cloudberry-operator \
+     --namespace cloudberry-system \
+     --create-namespace \
+     --set webhook.enabled=true \
+     --set webhook.certSource=vault-pki \
+     --set webhook.vaultPKI.mountPath=pki \
+     --set webhook.vaultPKI.role=cloudberry-operator \
+     --set vault.enabled=true \
+     --set vault.address=http://vault:8200
+   ```
+
+3. **Verify** certificates are issued:
+
+   ```bash
+   kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
+   kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
+   ```
+
+### Webhook Configuration Values
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `webhook.enabled` | Enable admission webhooks | `true` |
+| `webhook.port` | Webhook service port | `443` |
+| `webhook.targetPort` | Target port on the operator | `9443` |
+| `webhook.failurePolicy` | Failure policy (`Fail` or `Ignore`) | `Fail` |
+| `webhook.certSource` | Certificate source (`self-signed` or `vault-pki`) | `self-signed` |
+| `webhook.certSecretName` | TLS certificate secret name (auto-generated if empty) | `""` |
+| `webhook.serviceName` | Webhook service name (defaults to `{release}-webhook`) | `""` |
+| `webhook.caBundle` | Static CA bundle (base64-encoded) | `""` |
+| `webhook.vaultPKI.mountPath` | Vault PKI engine mount path | `pki` |
+| `webhook.vaultPKI.role` | Vault PKI role name | `cloudberry-operator` |
+
+### Webhook Runtime Behavior
+
+The deployment template automatically:
+- Sets `CLOUDBERRY_WEBHOOK_CERT_SOURCE`, `CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME`, and `CLOUDBERRY_WEBHOOK_SERVICE_NAME` environment variables
+- Mounts the certificate Secret at `/tmp/k8s-webhook-server/serving-certs`
+- Exposes the webhook port (default `9443`)
+- Creates a dedicated webhook Service
+- Injects the CA bundle into `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` at runtime
+
+## Monitoring Integration
+
+The operator integrates with Prometheus-compatible metrics collectors and OpenTelemetry for distributed tracing.
+
+### Deploying the Monitoring Stack
+
+Use the Makefile targets to deploy the monitoring stack alongside the operator:
+
+```bash
+# Deploy vmagent + otel-collector
+make monitoring-deploy
+
+# Check status
+make monitoring-status
+
+# Remove
+make monitoring-undeploy
+```
+
+### Metrics Collection (vmagent / Prometheus)
+
+Deploy with a ServiceMonitor for automatic metrics scraping:
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --create-namespace \
+  --set metrics.enabled=true \
+  --set serviceMonitor.enabled=true \
+  --set serviceMonitor.interval=30s
+```
+
+The operator exposes metrics at `/metrics` on port 8080, including:
+- Cluster health (`cloudberry_cluster_info`, `cloudberry_coordinator_up`)
+- Reconciliation performance (`cloudberry_reconcile_duration_seconds`)
+- FTS probing (`cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`)
+- Scale operations (`cloudberry_scale_operations_total`)
+- PVC sizes (`cloudberry_pvc_size_bytes`)
+
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory.
+
+### Distributed Tracing (OpenTelemetry)
+
+Deploy with OTLP tracing:
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --create-namespace \
+  --set telemetry.enabled=true \
+  --set telemetry.otlpEndpoint=otel-collector:4317 \
+  --set telemetry.otlpProtocol=grpc \
+  --set telemetry.otlpInsecure=true
+```
+
+The operator emits spans for reconciliation loops, API request handling, database operations, and Vault interactions.
+
+### Monitoring Configuration Values
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metrics.enabled` | Enable metrics endpoint | `true` |
+| `metrics.port` | Metrics service port | `8080` |
+| `serviceMonitor.enabled` | Create Prometheus ServiceMonitor | `false` |
+| `serviceMonitor.interval` | Scrape interval | `30s` |
+| `serviceMonitor.scrapeTimeout` | Scrape timeout | `10s` |
+| `telemetry.enabled` | Enable OTLP telemetry | `false` |
+| `telemetry.otlpEndpoint` | OTLP collector endpoint | `""` |
+| `telemetry.otlpProtocol` | OTLP protocol (`grpc` or `http`) | `grpc` |
+| `telemetry.samplingRate` | Trace sampling rate (0.0–1.0) | `1.0` |
+| `telemetry.otlpInsecure` | Disable TLS for OTLP exporter | `false` |
+
+## Security
+
+The operator includes the following security hardening measures:
+
+- **SQL injection prevention**: All database queries use parameterized queries via pgx. Distribution key handling uses the `sanitizeDistKey()` helper for additional validation
+- **Dependency security**: `golang.org/x/net` upgraded to fix GO-2026-5026 vulnerability
+- **Port validation**: CRD types validate port values are in the range 1–65535
+- **Rate limiting**: Per-IP token bucket rate limiting on API endpoints, plus inter-table delay for rebalance operations
+- **Context cancellation**: Database propagation operations check for context cancellation between operations
+- **Webhook CA bundle retry**: CA bundle injection uses exponential backoff for transient API server errors
+- **Error aggregation**: Sub-component reconciliation uses `errors.Join` to report all errors
 
 ## CRDs
 

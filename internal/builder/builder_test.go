@@ -497,8 +497,14 @@ func TestBuildVolumes_WithSSL(t *testing.T) {
 	}
 
 	volumes := buildVolumes(cluster)
-	require.Len(t, volumes, 2) // config + tls
-	assert.Equal(t, "tls", volumes[1].Name)
+	require.Len(t, volumes, 3) // config + tls-secret + tls (emptyDir)
+	assert.Equal(t, "tls-secret", volumes[1].Name)
+	assert.Equal(t, "tls", volumes[2].Name)
+	// Verify tls-secret is a Secret volume
+	assert.NotNil(t, volumes[1].Secret)
+	assert.Equal(t, "tls-secret", volumes[1].Secret.SecretName)
+	// Verify tls is an EmptyDir volume
+	assert.NotNil(t, volumes[2].EmptyDir)
 }
 
 func TestBuildVolumes_WithoutSSL(t *testing.T) {
@@ -1343,4 +1349,143 @@ func TestFormatHBARule_AllTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ============================================================================
+// BuildMaintenanceJob Tests
+// ============================================================================
+
+func TestBuildMaintenanceJob(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+
+	tests := []struct {
+		name      string
+		operation string
+		wantSQL   string
+	}{
+		{
+			name:      "vacuum operation",
+			operation: util.MaintenanceVacuum,
+			wantSQL:   "VACUUM",
+		},
+		{
+			name:      "vacuum analyze operation",
+			operation: util.MaintenanceVacuumAnalyze,
+			wantSQL:   "VACUUM ANALYZE",
+		},
+		{
+			name:      "vacuum full operation",
+			operation: util.MaintenanceVacuumFull,
+			wantSQL:   "VACUUM FULL",
+		},
+		{
+			name:      "analyze operation",
+			operation: util.MaintenanceAnalyze,
+			wantSQL:   "ANALYZE",
+		},
+		{
+			name:      "reindex operation",
+			operation: util.MaintenanceReindex,
+			wantSQL:   "REINDEX DATABASE postgres",
+		},
+		{
+			name:      "log-rotate operation",
+			operation: util.MaintenanceLogRotate,
+			wantSQL:   "SELECT pg_rotate_logfile()",
+		},
+		{
+			name:      "redistribute operation",
+			operation: util.MaintenanceRedistribute,
+			wantSQL:   "SELECT gp_expand.status()",
+		},
+		{
+			name:      "rebalance operation",
+			operation: util.MaintenanceRebalance,
+			wantSQL:   "SELECT gp_expand.status()",
+		},
+		{
+			name:      "backup-on-delete operation",
+			operation: util.MaintenanceBackupOnDelete,
+			wantSQL:   "SELECT 1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timestamp := "20260524-120000"
+			job := b.BuildMaintenanceJob(cluster, tt.operation, timestamp)
+			require.NotNil(t, job)
+
+			// Verify job name.
+			expectedName := util.MaintenanceJobName(cluster.Name, tt.operation, timestamp)
+			assert.Equal(t, expectedName, job.Name)
+			assert.Equal(t, cluster.Namespace, job.Namespace)
+
+			// Verify labels.
+			assert.Equal(t, util.LabelManagedByValue, job.Labels[util.LabelManagedBy])
+			assert.Equal(t, cluster.Name, job.Labels[util.LabelCluster])
+			assert.Equal(t, util.ComponentCoordinator, job.Labels[util.LabelComponent])
+			assert.Equal(t, tt.operation, job.Labels[util.LabelOperation])
+
+			// Verify owner reference.
+			require.Len(t, job.OwnerReferences, 1)
+			assert.Equal(t, cluster.Name, job.OwnerReferences[0].Name)
+			assert.True(t, *job.OwnerReferences[0].Controller)
+
+			// Verify job spec.
+			assert.NotNil(t, job.Spec.BackoffLimit)
+			assert.Equal(t, int32(1), *job.Spec.BackoffLimit)
+			assert.NotNil(t, job.Spec.TTLSecondsAfterFinished)
+			assert.Equal(t, int32(3600), *job.Spec.TTLSecondsAfterFinished)
+
+			// Verify pod template.
+			podSpec := job.Spec.Template.Spec
+			assert.Equal(t, corev1.RestartPolicyNever, podSpec.RestartPolicy)
+			require.Len(t, podSpec.Containers, 1)
+
+			container := podSpec.Containers[0]
+			assert.Equal(t, "maintenance", container.Name)
+			assert.Equal(t, cluster.Spec.Image, container.Image)
+
+			// Verify command contains psql with the expected SQL.
+			assert.Contains(t, container.Command, "psql")
+			assert.Contains(t, container.Command, "-c")
+			assert.Contains(t, container.Command, tt.wantSQL)
+			assert.Contains(t, container.Command, "-h")
+			assert.Contains(t, container.Command, util.CoordinatorServiceName(cluster.Name))
+			assert.Contains(t, container.Command, "-U")
+			assert.Contains(t, container.Command, util.DefaultAdminUser)
+
+			// Verify PGPASSWORD env var.
+			require.Len(t, container.Env, 1)
+			assert.Equal(t, "PGPASSWORD", container.Env[0].Name)
+			assert.NotNil(t, container.Env[0].ValueFrom)
+			assert.NotNil(t, container.Env[0].ValueFrom.SecretKeyRef)
+			assert.Equal(t, util.AdminPasswordSecretName(cluster.Name), container.Env[0].ValueFrom.SecretKeyRef.Name)
+		})
+	}
+}
+
+func TestBuildMaintenanceJob_UnknownOperation(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+
+	job := b.BuildMaintenanceJob(cluster, "unknown-operation", "20260524-120000")
+	assert.Nil(t, job, "unknown operation should return nil")
+}
+
+func TestBuildMaintenanceJob_PodTemplateLabels(t *testing.T) {
+	b := NewBuilder()
+	cluster := newTestCluster()
+
+	job := b.BuildMaintenanceJob(cluster, util.MaintenanceVacuum, "20260524-120000")
+	require.NotNil(t, job)
+
+	// Pod template should have the same labels as the job.
+	podLabels := job.Spec.Template.Labels
+	assert.Equal(t, util.LabelManagedByValue, podLabels[util.LabelManagedBy])
+	assert.Equal(t, cluster.Name, podLabels[util.LabelCluster])
+	assert.Equal(t, util.ComponentCoordinator, podLabels[util.LabelComponent])
+	assert.Equal(t, util.MaintenanceVacuum, podLabels[util.LabelOperation])
 }

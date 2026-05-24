@@ -14,6 +14,10 @@ const (
 	LabelManagedBy = "app.kubernetes.io/managed-by"
 	// LabelManagedByValue is the value for the managed-by label.
 	LabelManagedByValue = "cloudberry-operator"
+	// LabelPartOf is the standard part-of label key.
+	LabelPartOf = "app.kubernetes.io/part-of"
+	// LabelPartOfValue is the value for the part-of label.
+	LabelPartOfValue = "cloudberry-operator"
 	// LabelCluster is the label key for the cluster name.
 	LabelCluster = "avsoft.io/cluster"
 	// LabelComponent is the label key for the component type.
@@ -111,12 +115,19 @@ const (
 	// DefaultMetricsPort is the default Prometheus metrics port.
 	DefaultMetricsPort = 9187
 	// DefaultVersion is the default Cloudberry DB version.
-	DefaultVersion = "7.7"
+	DefaultVersion = "2.1.0"
 	// DefaultImage is the default Cloudberry DB container image.
-	DefaultImage = "cloudberrydb/cloudberry:7.7"
+	DefaultImage = "cloudberrydb/cloudberry:2.1.0"
 
 	// OperatorNamespace is the default operator namespace.
 	OperatorNamespace = "cloudberry-system"
 	// TestNamespace is the default test namespace.
 	TestNamespace = "cloudberry-test"
+
+	// OperatorAdminPasswordSecretName is the name of the Kubernetes Secret
+	// used to persist the auto-generated API admin password across pod restarts.
+	OperatorAdminPasswordSecretName = "cloudberry-operator-admin-password"
+
+	// PasswordSecretKey is the key within the admin password Secret.
+	PasswordSecretKey = "password"
 )

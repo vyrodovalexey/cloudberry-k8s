@@ -241,6 +241,49 @@ ifndef CONTROLLER_GEN
 endif
 
 # =============================================================================
+# Monitoring Stack targets
+# =============================================================================
+
+.PHONY: monitoring-deploy
+monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector) to cloudberry-test namespace
+	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
+	$(HELM) repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
+	$(HELM) repo update
+	$(HELM) upgrade --install vmagent prometheus-community/prometheus \
+		--namespace $(NAMESPACE_TEST) \
+		--set server.enabled=false \
+		--set alertmanager.enabled=false \
+		--set kube-state-metrics.enabled=false \
+		--set prometheus-node-exporter.enabled=false \
+		--set prometheus-pushgateway.enabled=false \
+		--wait --timeout 5m
+	$(HELM) upgrade --install otel-collector open-telemetry/opentelemetry-collector \
+		--namespace $(NAMESPACE_TEST) \
+		--set mode=deployment \
+		--set config.receivers.otlp.protocols.grpc.endpoint="0.0.0.0:4317" \
+		--set config.receivers.otlp.protocols.http.endpoint="0.0.0.0:4318" \
+		--wait --timeout 5m
+	@echo "Monitoring stack deployed to namespace $(NAMESPACE_TEST)"
+
+.PHONY: monitoring-undeploy
+monitoring-undeploy: ## Remove monitoring stack from cloudberry-test namespace
+	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
+	$(HELM) uninstall vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || true
+	@echo "Monitoring stack removed from namespace $(NAMESPACE_TEST)"
+
+.PHONY: monitoring-status
+monitoring-status: ## Check monitoring stack status in cloudberry-test namespace
+	@echo "=== VictoriaMetrics Agent ==="
+	$(HELM) status vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "vmagent: not installed"
+	@echo ""
+	@echo "=== OpenTelemetry Collector ==="
+	$(HELM) status otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "otel-collector: not installed"
+	@echo ""
+	@echo "=== Pods ==="
+	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (prometheus,opentelemetry-collector)' 2>/dev/null || echo "No monitoring pods found"
+
+# =============================================================================
 # Test Environment targets
 # =============================================================================
 

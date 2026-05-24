@@ -82,10 +82,16 @@ vault:
   authPath: auth/kubernetes
   # -- Vault role name
   role: cloudberry-operator
+  # -- Vault token (for token auth method only; use existingSecret in production)
+  token: ""
   # -- Vault secret path
   secretPath: secret/data/cloudberry
   # -- Vault TLS secret name
   tlsSecretName: ""
+  # -- Vault PKI mount path (used for vault-pki webhook cert source)
+  pkiMountPath: "pki"
+  # -- Vault PKI role name (used for vault-pki webhook cert source)
+  pkiRole: "cloudberry-operator"
 
 # =============================================================================
 # OIDC Configuration
@@ -114,6 +120,8 @@ telemetry:
   otlpEndpoint: ""
   # -- OTLP protocol (grpc, http)
   otlpProtocol: grpc
+  # -- Use insecure (plaintext) connection for OTLP exporter
+  otlpInsecure: false
   # -- Trace sampling rate (0.0 to 1.0)
   samplingRate: 1.0
   # -- Service name for traces

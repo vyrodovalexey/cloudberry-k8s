@@ -111,6 +111,17 @@ cloudberry-ctl
 │   ├── update                    # Update resource group
 │   ├── delete                    # Delete resource group
 │   └── assign                    # Assign role to group
+├── workload                      # Workload management
+│   ├── status                    # Show workload status
+│   ├── resource-groups           # Resource group management
+│   │   ├── list                  # List resource groups
+│   │   └── create                # Create resource group
+│   ├── rules                     # Workload rule management
+│   │   ├── list                  # List workload rules
+│   │   ├── create                # Create rule from file
+│   │   ├── import                # Import rules from YAML
+│   │   └── export                # Export rules to YAML
+│   └── idle-rules                # List idle session rules
 └── version                       # Show version info
 ```
 
@@ -284,6 +295,33 @@ cloudberry-ctl inspect missing-stats --cluster my-cluster
 cloudberry-ctl inspect logs --cluster my-cluster --severity ERROR --last 1h
 ```
 
+### 5.8 Workload Management
+
+```bash
+# Show workload status
+cloudberry-ctl workload status --cluster my-cluster
+
+# List resource groups
+cloudberry-ctl workload resource-groups list --cluster my-cluster
+
+# Create resource group
+cloudberry-ctl workload resource-groups create --cluster my-cluster \
+  --name analytics --concurrency 10
+
+# List workload rules
+cloudberry-ctl workload rules list --cluster my-cluster
+
+# Create rule from YAML file
+cloudberry-ctl workload rules create --cluster my-cluster \
+  --name cancel-long -f rule.yaml
+
+# Import rules from YAML (upsert semantics)
+cloudberry-ctl workload rules import --cluster my-cluster -f rules.yaml
+
+# Export rules to YAML file
+cloudberry-ctl workload rules export --cluster my-cluster -O rules.yaml
+```
+
 ## 6. Output Formats
 
 ### 6.1 Table (default)
@@ -372,7 +410,90 @@ ENV variables take priority over config file values, which take priority over fl
 | 6 | Operation timeout |
 | 7 | Connection error |
 
-## 10. Shell Completion
+## 10. Scenario 49 — cloudberry-ctl Authentication
+
+Scenario 49 implements and verifies the `auth login`, `auth status`, and `auth logout` commands in `cloudberry-ctl`.
+
+### 10.1 Implemented Commands
+
+#### auth login --basic
+
+Validates basic auth credentials against the operator API by calling `GET /api/v1alpha1/clusters` with the configured username and password. On success, prints `Login successful (method=basic, user=<username>)`. On failure (HTTP 401), exits with code 3 (authentication failure).
+
+**Flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--basic` | bool | Use basic (username/password) authentication |
+
+**Requirements:**
+- `--username` (or `CLOUDBERRY_USERNAME`) is required
+- `--password` (or `CLOUDBERRY_PASSWORD`) is required
+
+#### auth login (OIDC)
+
+When `--username` and `--password` are provided (without `--basic`), simulates the OIDC resource owner password grant by calling `GET /api/v1alpha1/clusters` with the configured credentials. On success, prints `Login successful (method=oidc, user=<username>)`.
+
+When no credentials are provided, the browser-based authorization code flow with PKCE returns a `"not yet implemented"` error.
+
+#### auth status
+
+Checks connectivity and authentication against the operator API and displays the current auth status as a JSON/table/YAML response containing:
+
+| Field | Description |
+|-------|-------------|
+| `auth_method` | Current auth method (`basic` or `oidc`) |
+| `username` | Current username |
+| `operator_url` | Operator API URL |
+| `authenticated` | `true` if credentials are valid, `false` otherwise |
+| `error` | Error message (only when `authenticated=false`) |
+
+The command always succeeds (exit code 0) — unauthenticated state is reported in the output, not as an error.
+
+#### auth logout
+
+Clears cached credentials and prints:
+1. `Logged out. Cached credentials have been cleared.`
+2. A reminder to unset `CLOUDBERRY_USERNAME` and `CLOUDBERRY_PASSWORD` environment variables.
+
+Since `cloudberry-ctl` uses flags and environment variables for authentication (not a persistent token cache), logout is effectively a no-op that reminds the user to clean up their environment.
+
+### 10.2 Real-Cluster Verification Results
+
+Test environment: Vault, VictoriaMetrics, MinIO, Keycloak, Kafka, RabbitMQ — all running.
+
+| # | Test | Result |
+|---|------|--------|
+| 49b | Basic login with correct password | `Login successful (method=basic, user=admin)` |
+| 49b | Basic login with wrong password | Rejected (exit code 3) |
+| 49c | Auth status (authenticated) | Shows `authenticated: true` |
+| 49c | Auth status (unauthenticated) | Shows `authenticated: false` with error |
+| 49d | Logout | `Logged out. Cached credentials have been cleared.` |
+| 49a | OIDC login (with credentials) | `Login successful (method=oidc, user=admin)` |
+| — | Cluster status after auth | Shows Running cluster |
+| — | Data ops | 50 rows in mydb |
+
+### 10.3 Test Files
+
+| File | Description |
+|------|-------------|
+| `cmd/cloudberry-ctl/main.go` | `newAuthLoginCmd()`, `runAuthLoginBasic()`, `runAuthLoginOIDC()`, `runAuthStatus()`, `runAuthLogout()` |
+| `test/examples/scenario49-ctl-auth.yaml` | Example cluster CR with basic auth config |
+| `test/cases/test_cases.go` | `CTLAuthCase` type and `CTLAuthCases()` (6 test cases) |
+| `test/functional/scenario49_ctl_auth_test.go` | 7 functional tests (mock HTTP server) |
+| `test/e2e/scenario49_ctl_auth_e2e_test.go` | 8 E2E tests (mock HTTP server + cluster CR) |
+
+### 10.4 Exit Codes
+
+| Scenario | Exit Code |
+|----------|-----------|
+| Login successful | 0 |
+| Login failed (wrong credentials) | 3 (authentication failure) |
+| Auth status (always) | 0 |
+| Logout (always) | 0 |
+| OIDC browser flow (not implemented) | 1 (general error) |
+
+## 11. Shell Completion
 
 ```bash
 # Bash

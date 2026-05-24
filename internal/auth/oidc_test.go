@@ -2,10 +2,18 @@ package auth
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -421,6 +429,366 @@ func TestNewOIDCProvider_DefaultValues(t *testing.T) {
 	assert.Equal(t, "id_token", provider.config.RoleClaimSource)
 	assert.Equal(t, "exact", provider.config.RoleMatchMode)
 	assert.Len(t, provider.config.Scopes, 3) // openid, profile, email
+}
+
+// signJWT creates a minimal RS256-signed JWT for testing.
+func signJWT(t *testing.T, key *rsa.PrivateKey, claims map[string]interface{}) string {
+	t.Helper()
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+
+	claimsJSON, err := json.Marshal(claims)
+	require.NoError(t, err)
+	payload := base64.RawURLEncoding.EncodeToString(claimsJSON)
+
+	signingInput := header + "." + payload
+	hash := crypto.SHA256.New()
+	hash.Write([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash.Sum(nil))
+	require.NoError(t, err)
+
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// setupOIDCTestServer creates a mock OIDC server with a real RSA key for JWT verification.
+func setupOIDCTestServer(t *testing.T, key *rsa.PrivateKey) *httptest.Server {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	var serverURL string
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"issuer": "%s",
+			"authorization_endpoint": "%s/auth",
+			"token_endpoint": "%s/token",
+			"jwks_uri": "%s/keys"
+		}`, serverURL, serverURL, serverURL, serverURL)))
+	})
+
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
+		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes())
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"keys":[{"kty":"RSA","alg":"RS256","use":"sig","n":"%s","e":"%s","kid":"test-key"}]}`, n, e)))
+	})
+
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestOIDCProvider_Authenticate_ValidToken(t *testing.T) {
+	// Generate RSA key for signing.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	server := setupOIDCTestServer(t, key)
+
+	cfg := OIDCConfig{
+		IssuerURL:     server.URL,
+		ClientID:      "test-client",
+		RoleClaimPath: "realm_access.roles",
+		RoleMapping:   map[string]string{"admin": "Admin", "viewer": "Basic"},
+		RoleMatchMode: "exact",
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+
+	tests := []struct {
+		name           string
+		claims         map[string]interface{}
+		wantUsername   string
+		wantEmail      string
+		wantPermission PermissionLevel
+	}{
+		{
+			name: "token with sub and email",
+			claims: map[string]interface{}{
+				"iss":   server.URL,
+				"sub":   "user-123",
+				"aud":   "test-client",
+				"email": "user@example.com",
+				"exp":   float64(time.Now().Add(time.Hour).Unix()),
+				"iat":   float64(time.Now().Unix()),
+			},
+			wantUsername:   "user-123",
+			wantEmail:      "user@example.com",
+			wantPermission: PermissionSelfOnly,
+		},
+		{
+			name: "token with preferred_username overrides sub",
+			claims: map[string]interface{}{
+				"iss":                server.URL,
+				"sub":                "user-123",
+				"aud":                "test-client",
+				"preferred_username": "jdoe",
+				"email":              "jdoe@example.com",
+				"exp":                float64(time.Now().Add(time.Hour).Unix()),
+				"iat":                float64(time.Now().Unix()),
+			},
+			wantUsername:   "jdoe",
+			wantEmail:      "jdoe@example.com",
+			wantPermission: PermissionSelfOnly,
+		},
+		{
+			name: "token with admin role",
+			claims: map[string]interface{}{
+				"iss": server.URL,
+				"sub": "admin-user",
+				"aud": "test-client",
+				"exp": float64(time.Now().Add(time.Hour).Unix()),
+				"iat": float64(time.Now().Unix()),
+				"realm_access": map[string]interface{}{
+					"roles": []interface{}{"admin"},
+				},
+			},
+			wantUsername:   "admin-user",
+			wantPermission: PermissionAdmin,
+		},
+		{
+			name: "token with viewer role",
+			claims: map[string]interface{}{
+				"iss": server.URL,
+				"sub": "viewer-user",
+				"aud": "test-client",
+				"exp": float64(time.Now().Add(time.Hour).Unix()),
+				"iat": float64(time.Now().Unix()),
+				"realm_access": map[string]interface{}{
+					"roles": []interface{}{"viewer"},
+				},
+			},
+			wantUsername:   "viewer-user",
+			wantPermission: PermissionBasic,
+		},
+		{
+			name: "token with multiple roles - highest wins",
+			claims: map[string]interface{}{
+				"iss": server.URL,
+				"sub": "multi-role-user",
+				"aud": "test-client",
+				"exp": float64(time.Now().Add(time.Hour).Unix()),
+				"iat": float64(time.Now().Unix()),
+				"realm_access": map[string]interface{}{
+					"roles": []interface{}{"viewer", "admin"},
+				},
+			},
+			wantUsername:   "multi-role-user",
+			wantPermission: PermissionAdmin,
+		},
+		{
+			name: "token with no roles",
+			claims: map[string]interface{}{
+				"iss": server.URL,
+				"sub": "no-role-user",
+				"aud": "test-client",
+				"exp": float64(time.Now().Add(time.Hour).Unix()),
+				"iat": float64(time.Now().Unix()),
+			},
+			wantUsername:   "no-role-user",
+			wantPermission: PermissionSelfOnly,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			token := signJWT(t, key, tt.claims)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			identity, authErr := provider.Authenticate(context.Background(), req)
+			require.NoError(t, authErr)
+			require.NotNil(t, identity)
+
+			assert.Equal(t, tt.wantUsername, identity.Username)
+			if tt.wantEmail != "" {
+				assert.Equal(t, tt.wantEmail, identity.Email)
+			}
+			assert.Equal(t, tt.wantPermission, identity.Permission)
+			assert.Equal(t, AuthMethodOIDCName, identity.AuthMethod)
+		})
+	}
+}
+
+func TestOIDCProvider_Authenticate_ExpiredToken(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	server := setupOIDCTestServer(t, key)
+
+	cfg := OIDCConfig{
+		IssuerURL: server.URL,
+		ClientID:  "test-client",
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	// Create an expired token.
+	claims := map[string]interface{}{
+		"iss": server.URL,
+		"sub": "user-123",
+		"aud": "test-client",
+		"exp": float64(time.Now().Add(-time.Hour).Unix()),
+		"iat": float64(time.Now().Add(-2 * time.Hour).Unix()),
+	}
+	token := signJWT(t, key, claims)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	identity, authErr := provider.Authenticate(context.Background(), req)
+	assert.Error(t, authErr)
+	assert.Nil(t, identity)
+	assert.Contains(t, authErr.Error(), "token verification failed")
+}
+
+func TestOIDCProvider_Authenticate_WrongAudience(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	server := setupOIDCTestServer(t, key)
+
+	cfg := OIDCConfig{
+		IssuerURL: server.URL,
+		ClientID:  "test-client",
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+
+	// Create a token with wrong audience.
+	claims := map[string]interface{}{
+		"iss": server.URL,
+		"sub": "user-123",
+		"aud": "wrong-client",
+		"exp": float64(time.Now().Add(time.Hour).Unix()),
+		"iat": float64(time.Now().Unix()),
+	}
+	token := signJWT(t, key, claims)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	identity, authErr := provider.Authenticate(context.Background(), req)
+	assert.Error(t, authErr)
+	assert.Nil(t, identity)
+	assert.Contains(t, authErr.Error(), "token verification failed")
+}
+
+func TestExtractBearerToken_BearerWithOnlySpaces(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer    ")
+	result := extractBearerToken(req)
+	assert.Equal(t, "   ", result) // Trims only the "Bearer " prefix.
+}
+
+func TestInterfaceToStringSlice_InvalidJSONString(t *testing.T) {
+	result := interfaceToStringSlice("not-json")
+	assert.Equal(t, []string{"not-json"}, result)
+}
+
+func TestInterfaceToStringSlice_EmptyString(t *testing.T) {
+	result := interfaceToStringSlice("")
+	assert.Equal(t, []string{""}, result)
+}
+
+func TestOIDCProvider_ExtractRoles_DeepNestedPath(t *testing.T) {
+	provider := &OIDCProvider{
+		config: OIDCConfig{
+			RoleClaimPath: "a.b.c",
+		},
+	}
+	claims := map[string]interface{}{
+		"a": map[string]interface{}{
+			"b": map[string]interface{}{
+				"c": []interface{}{"role1", "role2"},
+			},
+		},
+	}
+	result := provider.extractRoles(claims)
+	assert.Equal(t, []string{"role1", "role2"}, result)
+}
+
+func TestNewOIDCProvider_CustomScopes(t *testing.T) {
+	mux := http.NewServeMux()
+	var serverURL string
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"issuer": "%s",
+			"authorization_endpoint": "%s/auth",
+			"token_endpoint": "%s/token",
+			"jwks_uri": "%s/keys"
+		}`, serverURL, serverURL, serverURL, serverURL)))
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	})
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	defer server.Close()
+
+	cfg := OIDCConfig{
+		IssuerURL:     server.URL,
+		ClientID:      "test-client",
+		Scopes:        []string{"openid", "custom-scope"},
+		RoleClaimPath: "custom.roles",
+		RoleMatchMode: "prefix",
+	}
+
+	provider, err := NewOIDCProvider(context.Background(), cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+
+	assert.Equal(t, "custom.roles", provider.config.RoleClaimPath)
+	assert.Equal(t, "prefix", provider.config.RoleMatchMode)
+	assert.Equal(t, []string{"openid", "custom-scope"}, provider.config.Scopes)
+}
+
+func TestOIDCProvider_MatchRole_EmptyStrings(t *testing.T) {
+	provider := &OIDCProvider{
+		config: OIDCConfig{RoleMatchMode: "exact"},
+	}
+	assert.True(t, provider.matchRole("", ""))
+	assert.False(t, provider.matchRole("admin", ""))
+
+	provider.config.RoleMatchMode = "prefix"
+	assert.True(t, provider.matchRole("admin", ""))
+
+	provider.config.RoleMatchMode = "suffix"
+	assert.True(t, provider.matchRole("admin", ""))
+
+	provider.config.RoleMatchMode = "contains"
+	assert.True(t, provider.matchRole("admin", ""))
+}
+
+// Verify that the redirect limit works.
+func TestNewOIDCProvider_RedirectLimit(t *testing.T) {
+	redirectCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectCount++
+		if strings.Contains(r.URL.Path, "openid-configuration") {
+			http.Redirect(w, r, r.URL.String()+"?r="+fmt.Sprint(redirectCount), http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := OIDCConfig{
+		IssuerURL: server.URL,
+		ClientID:  "test-client",
+	}
+
+	_, err := NewOIDCProvider(context.Background(), cfg, nil)
+	assert.Error(t, err)
 }
 
 func TestOIDCProvider_ResolvePermission(t *testing.T) {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -303,4 +305,52 @@ func TestValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBindFlags(t *testing.T) {
+	v := viper.New()
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+
+	// Define flags that match config keys.
+	flags.String("log-level", "info", "log level")
+	flags.String("log-format", "json", "log format")
+	flags.Int("webhook-port", 9443, "webhook port")
+	flags.Bool("leader-election", true, "leader election")
+	flags.String("namespace", "", "namespace")
+
+	// Set flag values via parsing.
+	err := flags.Parse([]string{
+		"--log-level=debug",
+		"--log-format=text",
+		"--webhook-port=9444",
+		"--leader-election=false",
+		"--namespace=test-ns",
+	})
+	require.NoError(t, err)
+
+	// Bind flags to viper.
+	BindFlags(v, flags)
+
+	// Verify viper picks up the flag values.
+	assert.Equal(t, "debug", v.GetString("log-level"))
+	assert.Equal(t, "text", v.GetString("log-format"))
+	assert.Equal(t, 9444, v.GetInt("webhook-port"))
+	assert.False(t, v.GetBool("leader-election"))
+	assert.Equal(t, "test-ns", v.GetString("namespace"))
+}
+
+func TestBindFlags_DefaultValues(t *testing.T) {
+	v := viper.New()
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+
+	// Define flags with defaults (no parsing, so defaults apply).
+	flags.String("log-level", "info", "log level")
+	flags.Int("webhook-port", 9443, "webhook port")
+
+	// Bind flags to viper.
+	BindFlags(v, flags)
+
+	// Viper should pick up the default values from flags.
+	assert.Equal(t, "info", v.GetString("log-level"))
+	assert.Equal(t, 9443, v.GetInt("webhook-port"))
 }
