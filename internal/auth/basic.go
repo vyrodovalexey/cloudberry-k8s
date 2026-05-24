@@ -113,6 +113,7 @@ type InMemoryCredentialStore struct {
 	mu          sync.RWMutex
 	credentials map[string]string
 	permissions map[string]PermissionLevel
+	cost        int // bcrypt cost; defaults to bcrypt.DefaultCost
 }
 
 // NewInMemoryCredentialStore creates a new InMemoryCredentialStore.
@@ -120,12 +121,26 @@ func NewInMemoryCredentialStore() *InMemoryCredentialStore {
 	return &InMemoryCredentialStore{
 		credentials: make(map[string]string),
 		permissions: make(map[string]PermissionLevel),
+		cost:        bcrypt.DefaultCost,
+	}
+}
+
+// NewInMemoryCredentialStoreWithCost creates a new InMemoryCredentialStore with a custom bcrypt cost.
+// Use bcrypt.MinCost in tests to speed up password hashing.
+func NewInMemoryCredentialStoreWithCost(cost int) *InMemoryCredentialStore {
+	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		cost = bcrypt.DefaultCost
+	}
+	return &InMemoryCredentialStore{
+		credentials: make(map[string]string),
+		permissions: make(map[string]PermissionLevel),
+		cost:        cost,
 	}
 }
 
 // SetCredentials hashes the password with bcrypt and stores the hash and permission level for a user.
 func (s *InMemoryCredentialStore) SetCredentials(username, password string, permission PermissionLevel) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), s.cost)
 	if err != nil {
 		// bcrypt only fails if password exceeds 72 bytes or cost is invalid;
 		// log and store empty to prevent silent authentication bypass.

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/api"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
@@ -82,7 +83,8 @@ func (s *Scenario43PermissionMatrixSuite) SetupTest() {
 	s.users = scenario43Users()
 
 	// Create credential store with all five users.
-	s.store = auth.NewInMemoryCredentialStore()
+	// Use bcrypt.MinCost to speed up password hashing in tests.
+	s.store = auth.NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 	for _, u := range s.users {
 		s.store.SetCredentials(u.username, u.password, u.permission)
 	}
