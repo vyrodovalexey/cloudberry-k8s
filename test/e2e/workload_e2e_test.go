@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1302,6 +1303,42 @@ func (w *nonClosingClientWrapper) ListSessionsWithResourceGroup(ctx context.Cont
 
 func (w *nonClosingClientWrapper) ListUserDatabases(ctx context.Context) ([]string, error) {
 	return w.delegate.ListUserDatabases(ctx)
+}
+
+func (w *nonClosingClientWrapper) SetupExporterRole(ctx context.Context, password string) error {
+	return w.delegate.SetupExporterRole(ctx, password)
+}
+
+func (w *nonClosingClientWrapper) GetQueryDetail(ctx context.Context, pid int32) (*db.QueryDetail, error) {
+	return w.delegate.GetQueryDetail(ctx, pid)
+}
+
+func (w *nonClosingClientWrapper) EnsureQueryHistoryTable(ctx context.Context) error {
+	return w.delegate.EnsureQueryHistoryTable(ctx)
+}
+
+func (w *nonClosingClientWrapper) InsertQueryHistory(ctx context.Context, entry *db.QueryHistoryEntry) error {
+	return w.delegate.InsertQueryHistory(ctx, entry)
+}
+
+func (w *nonClosingClientWrapper) GetQueryHistory(ctx context.Context, filter db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error) {
+	return w.delegate.GetQueryHistory(ctx, filter)
+}
+
+func (w *nonClosingClientWrapper) GetQueryHistoryDetail(ctx context.Context, queryID string) (*db.QueryHistoryEntry, error) {
+	return w.delegate.GetQueryHistoryDetail(ctx, queryID)
+}
+
+func (w *nonClosingClientWrapper) ExportQueryHistoryCSV(ctx context.Context, filter db.QueryHistoryFilter, wr io.Writer) error {
+	return w.delegate.ExportQueryHistoryCSV(ctx, filter, wr)
+}
+
+func (w *nonClosingClientWrapper) CleanupQueryHistory(ctx context.Context, retention time.Duration) (int64, error) {
+	return w.delegate.CleanupQueryHistory(ctx, retention)
+}
+
+func (w *nonClosingClientWrapper) MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error {
+	return w.delegate.MoveQueryToResourceGroup(ctx, pid, targetGroup)
 }
 
 // ============================================================================

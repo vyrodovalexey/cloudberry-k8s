@@ -15,6 +15,10 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
   - [Scale Status](#scale-status)
   - [High Availability](#high-availability)
   - [Sessions](#sessions)
+  - [Query History](#query-history)
+  - [Plan Analysis](#plan-analysis)
+  - [Query Operations](#query-operations)
+  - [Exporter Health](#exporter-health)
   - [Resource Groups](#resource-groups)
   - [Maintenance](#maintenance)
   - [Authentication Management](#authentication-management)
@@ -44,6 +48,8 @@ Default port: `8090` (configurable via `APIAddress` / `CLOUDBERRY_API_ADDRESS`)
 ## Authentication
 
 All API endpoints (except health checks) require authentication. The API supports two authentication methods simultaneously.
+
+> **Guest Access**: When `guestAccess: true` is set in the cluster's `queryMonitoring` spec, certain read-only GET endpoints allow unauthenticated access with a guest identity (`Basic` permission). See [Guest Access](#guest-access) for details.
 
 ### Basic Authentication
 
@@ -1102,6 +1108,945 @@ The `terminated` field reflects the return value of `pg_terminate_backend()`. A 
 
 > **Note**: The PID must be a positive integer. Zero, negative, and non-numeric values are rejected with a `400 Bad Request` response.
 
+### Query History
+
+Query history endpoints provide access to completed queries stored in the `cloudberry_query_history` table. The `cloudberry-query-exporter` sidecar automatically collects completed queries and inserts them into this table. These endpoints query the coordinator database via the `DBClientFactory`.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/queries/history` | Operator Basic | Search query history with filters and pagination |
+| `GET` | `/clusters/{name}/queries/history/{qid}` | Operator Basic | Get historical query details (including EXPLAIN plan) |
+| `POST` | `/clusters/{name}/queries/history/export` | Operator Basic | Export query history to CSV |
+
+#### List Query History
+
+Returns paginated query history with optional filters. All filters are AND-combined.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/history?namespace=default&limit=20&user=analyst"
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | No | Cluster namespace |
+| `pattern` | string | No | Search pattern for query text |
+| `patternType` | string | No | `regex` (default) or `wildcard` |
+| `user` | string | No | Filter by username |
+| `database` | string | No | Filter by database name |
+| `resourceGroup` | string | No | Filter by resource group |
+| `state` | string | No | Filter by state (`completed`, `cancelled`, `error`) |
+| `minDuration` | float | No | Minimum duration in milliseconds |
+| `since` | string | No | Start time — RFC 3339 timestamp or Go duration (e.g., `24h`, `30m`) |
+| `until` | string | No | End time — RFC 3339 timestamp |
+| `limit` | int | No | Page size (default: 50, max: 100) |
+| `offset` | int | No | Pagination offset (default: 0) |
+
+**Response (200 OK):**
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "queryId": "q-1234-1716984000000000000",
+      "pid": 1234,
+      "username": "analyst",
+      "databaseName": "warehouse",
+      "queryText": "SELECT * FROM orders WHERE created_at > '2026-01-01'",
+      "queryStart": "2026-05-29T10:00:00Z",
+      "queryEnd": "2026-05-29T10:00:02.5Z",
+      "durationMs": 2500.00,
+      "state": "completed",
+      "rowsAffected": 15000,
+      "cpuTimeMs": 1800.50,
+      "memoryBytes": 67108864,
+      "spillBytes": 0,
+      "diskReadBytes": 134217728,
+      "diskWriteBytes": 0,
+      "waitEvents": "",
+      "resourceGroup": "default_group",
+      "createdAt": "2026-05-29T10:00:02.5Z"
+    }
+  ],
+  "total": 156,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `items` | array | List of query history entries |
+| `items[].id` | int | Auto-incremented row ID |
+| `items[].queryId` | string | Unique query identifier (format: `q-{pid}-{query_start_unix_nano}`) |
+| `items[].pid` | int | PostgreSQL backend process ID |
+| `items[].username` | string | Database user who ran the query |
+| `items[].databaseName` | string | Database the query was executed against |
+| `items[].queryText` | string | Full SQL text |
+| `items[].queryStart` | string | ISO 8601 timestamp when the query started |
+| `items[].queryEnd` | string | ISO 8601 timestamp when the query completed |
+| `items[].durationMs` | float | Execution duration in milliseconds |
+| `items[].state` | string | Final state (`completed`, `cancelled`, `error`) |
+| `items[].rowsAffected` | int | Rows affected or returned |
+| `items[].cpuTimeMs` | float | CPU time in milliseconds |
+| `items[].memoryBytes` | int | Peak memory usage in bytes |
+| `items[].spillBytes` | int | Data spilled to disk in bytes |
+| `items[].diskReadBytes` | int | Bytes read from disk |
+| `items[].diskWriteBytes` | int | Bytes written to disk |
+| `items[].waitEvents` | string | Wait events encountered |
+| `items[].resourceGroup` | string | Resource group the query ran in |
+| `items[].createdAt` | string | ISO 8601 timestamp when the entry was recorded |
+| `total` | int | Total number of matching entries |
+| `limit` | int | Page size used |
+| `offset` | int | Pagination offset used |
+
+**Graceful degradation (200 OK — no DB factory):**
+
+```json
+{
+  "items": [],
+  "total": 0,
+  "limit": 50,
+  "offset": 0,
+  "message": "database connection not available"
+}
+```
+
+**Error (400 Bad Request — invalid regex pattern):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "invalid regex pattern \"[invalid\": error parsing regexp: missing closing ]: `[invalid`"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+**Error (500 Internal Server Error — query failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to get query history"
+  }
+}
+```
+
+#### Get Query History Detail
+
+Returns detailed information for a specific historical query, including the EXPLAIN execution plan if collected.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/history/q-1234-1716984000000000000?namespace=default"
+```
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Cluster name |
+| `qid` | string | Query ID (e.g., `q-1234-1716984000000000000`) |
+
+**Response (200 OK):**
+
+```json
+{
+  "id": 42,
+  "queryId": "q-1234-1716984000000000000",
+  "pid": 1234,
+  "username": "analyst",
+  "databaseName": "warehouse",
+  "queryText": "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.total > 1000",
+  "queryStart": "2026-05-29T10:00:00Z",
+  "queryEnd": "2026-05-29T10:00:05.2Z",
+  "durationMs": 5200.00,
+  "state": "completed",
+  "rowsAffected": 3200,
+  "cpuTimeMs": 4100.25,
+  "memoryBytes": 134217728,
+  "spillBytes": 268435456,
+  "diskReadBytes": 536870912,
+  "diskWriteBytes": 134217728,
+  "waitEvents": "IO",
+  "resourceGroup": "analytics_group",
+  "explainPlan": "Gather Motion 4:1  (slice1; segments: 4)\n  ->  Hash Join\n        Hash Cond: (o.customer_id = c.id)\n        ->  Seq Scan on orders o\n              Filter: (total > 1000)\n        ->  Hash\n              ->  Broadcast Motion 4:4  (slice2; segments: 4)\n                    ->  Seq Scan on customers c",
+  "errorMessage": "",
+  "createdAt": "2026-05-29T10:00:05.2Z"
+}
+```
+
+The response includes all fields from the list endpoint, plus:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `explainPlan` | string | EXPLAIN execution plan (present when plan collection is enabled) |
+| `errorMessage` | string | Error message (present when state is `error`) |
+
+**Error (400 Bad Request — missing query ID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "query ID is required"
+  }
+}
+```
+
+**Error (404 Not Found — query not found):**
+
+```json
+{
+  "error": {
+    "code": "QUERY_NOT_FOUND",
+    "message": "historical query \"q-nonexistent\" not found"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database not available):**
+
+```json
+{
+  "error": {
+    "code": "DB_NOT_AVAILABLE",
+    "message": "database connection not configured"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_CONNECTION_FAILED",
+    "message": "failed to connect to database"
+  }
+}
+```
+
+#### Export Query History to CSV
+
+Exports query history as a CSV file. Accepts an optional JSON body to filter the exported data. All matching rows are exported (no pagination limits). The response streams rows directly from the database to avoid buffering the entire result set in memory.
+
+```bash
+# Export all history
+curl -u admin:password -X POST \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/history/export?namespace=default" \
+  -o query-history.csv
+
+# Export with filters
+curl -u admin:password -X POST \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/history/export?namespace=default" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pattern": "SELECT.*FROM orders",
+    "patternType": "regex",
+    "user": "analyst",
+    "database": "warehouse",
+    "since": "24h"
+  }' \
+  -o filtered-history.csv
+```
+
+**Request Body** (optional, `Content-Type: application/json`):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `pattern` | string | No | Search pattern for query text |
+| `patternType` | string | No | `regex` (default) or `wildcard` |
+| `user` | string | No | Filter by username |
+| `database` | string | No | Filter by database name |
+| `resourceGroup` | string | No | Filter by resource group |
+| `state` | string | No | Filter by state |
+| `since` | string | No | Start time — RFC 3339 or Go duration |
+| `until` | string | No | End time — RFC 3339 |
+
+**Response (200 OK):**
+
+```
+Content-Type: text/csv
+Content-Disposition: attachment; filename="query-history.csv"
+
+query_id,username,database,query_text,start_time,end_time,duration_ms,rows_affected,cpu_time_ms,memory_bytes,spill_bytes,state
+q-1234-1716984000000000000,analyst,warehouse,"SELECT * FROM orders WHERE created_at > '2026-01-01'",2026-05-29T10:00:00Z,2026-05-29T10:00:02.5Z,2500.00,15000,1800.50,67108864,0,completed
+```
+
+**CSV columns:**
+
+| Column | Description |
+|--------|-------------|
+| `query_id` | Unique query identifier |
+| `username` | Database user |
+| `database` | Database name |
+| `query_text` | Full SQL text |
+| `start_time` | Query start time (RFC 3339) |
+| `end_time` | Query end time (RFC 3339) |
+| `duration_ms` | Duration in milliseconds |
+| `rows_affected` | Rows affected or returned |
+| `cpu_time_ms` | CPU time in milliseconds |
+| `memory_bytes` | Peak memory usage |
+| `spill_bytes` | Data spilled to disk |
+| `state` | Final query state |
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database not available):**
+
+```json
+{
+  "error": {
+    "code": "DB_NOT_AVAILABLE",
+    "message": "database connection not configured"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_CONNECTION_FAILED",
+    "message": "failed to connect to database"
+  }
+}
+```
+
+> **Note**: Once CSV streaming begins (HTTP 200 headers sent), errors during row iteration cannot be communicated via HTTP status codes. Partial CSV output may result if the database connection drops mid-export.
+
+### Plan Analysis
+
+The plan analysis endpoint provides static analysis of PostgreSQL/Cloudberry `EXPLAIN ANALYZE` output. No database connection is required — the analysis is purely text-based.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `POST` | `/clusters/{name}/queries/plan-check` | Basic | Run static plan checker on EXPLAIN ANALYZE output |
+
+#### Run Plan Check
+
+Analyzes an EXPLAIN ANALYZE plan text and returns identified performance issues with actionable recommendations.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/plan-check \
+  -H "Content-Type: application/json" \
+  -d '{
+    "planText": "Seq Scan on orders  (cost=0.00..5000.00 rows=100 width=36) (actual time=0.010..10.000 rows=50000 loops=1)\n  Filter: (status = '\''pending'\'')\n  Rows Removed by Filter: 950000\nExecution Time: 10.500 ms"
+  }'
+```
+
+**Request Body** (`Content-Type: application/json`):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `planText` | string | Yes | Raw EXPLAIN ANALYZE text output |
+
+**Response (200 OK):**
+
+```json
+{
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "sequential_scan",
+      "nodeType": "Seq Scan",
+      "relation": "orders",
+      "description": "Sequential scan on orders returned 50000 rows",
+      "recommendation": "Consider creating an index on orders for filter condition (status = 'pending')",
+      "details": {
+        "actualRows": 50000,
+        "filter": "(status = 'pending')",
+        "totalCost": 5000.00
+      }
+    },
+    {
+      "severity": "warning",
+      "category": "row_estimate_mismatch",
+      "nodeType": "Seq Scan",
+      "relation": "orders",
+      "description": "Row estimate mismatch on orders: estimated 100 rows, actual 50000 rows (499x off)",
+      "recommendation": "Run ANALYZE on the tables involved to update statistics",
+      "details": {
+        "planRows": 100,
+        "actualRows": 50000,
+        "ratio": 499.0
+      }
+    },
+    {
+      "severity": "warning",
+      "category": "excessive_filter_rows",
+      "nodeType": "Seq Scan",
+      "relation": "orders",
+      "description": "Filter removed 19x more rows than returned (950000 removed vs 50000 returned)",
+      "recommendation": "Filter removed 19x more rows than returned; consider adding index on filter column",
+      "details": {
+        "rowsRemoved": 950000,
+        "actualRows": 50000,
+        "ratio": 19,
+        "filter": "(status = 'pending')"
+      }
+    }
+  ],
+  "summary": "Found 3 performance issues: 3 warning(s)",
+  "totalNodes": 1,
+  "executionTime": 10.5
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `issues` | array | List of identified performance issues |
+| `issues[].severity` | string | Issue severity: `"warning"` (actionable) or `"info"` (optimization opportunity) |
+| `issues[].category` | string | Issue category: `sequential_scan`, `row_estimate_mismatch`, `sort_spill`, `nested_loop_high_rows`, `excessive_filter_rows`, `high_cost_node` |
+| `issues[].nodeType` | string | Plan node type where the issue was found |
+| `issues[].relation` | string | Table name (if applicable) |
+| `issues[].description` | string | Human-readable description |
+| `issues[].recommendation` | string | Actionable recommendation |
+| `issues[].details` | object | Additional details (varies by category) |
+| `summary` | string | Human-readable summary of all issues found |
+| `totalNodes` | int | Total number of plan nodes parsed |
+| `executionTime` | float | Total execution time from the plan footer (ms), 0 if not present |
+
+**Error (400 Bad Request — empty plan text):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "planText is required"
+  }
+}
+```
+
+**Error (400 Bad Request — parse failure):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "failed to parse plan: empty plan text"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+### Monitor Pause/Resume
+
+Monitor pause/resume endpoints allow operators to freeze query monitoring data at a point in time. While paused, query monitoring endpoints return cached snapshot data with a stale indicator.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `POST` | `/clusters/{name}/queries/monitor/pause` | Operator | Pause the query monitor |
+| `POST` | `/clusters/{name}/queries/monitor/resume` | Operator | Resume the query monitor |
+| `GET` | `/clusters/{name}/queries/monitor/state` | Basic | Get current monitor state |
+
+#### Pause Monitor
+
+Pauses the query monitor for a cluster. Takes a snapshot of the current query data and stores it in memory. Subsequent requests to query monitoring endpoints return the cached snapshot with a `stale` flag.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/monitor/pause?namespace=default
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "paused",
+  "pausedAt": "2026-05-30T10:00:00Z",
+  "message": "Query monitor paused"
+}
+```
+
+**Response (200 OK — already paused):**
+
+```json
+{
+  "status": "paused",
+  "pausedAt": "2026-05-30T10:00:00Z",
+  "message": "Query monitor is already paused"
+}
+```
+
+**Prometheus metric**: `cloudberry_monitor_pause_total` counter is incremented on each pause request.
+
+#### Resume Monitor
+
+Resumes the query monitor for a cluster. Removes the cached snapshot so subsequent requests return fresh data.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/monitor/resume?namespace=default
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "resumed",
+  "message": "Query monitor resumed"
+}
+```
+
+Resuming when not paused succeeds idempotently.
+
+**Prometheus metric**: `cloudberry_monitor_resume_total` counter is incremented on each resume request.
+
+#### Get Monitor State
+
+Returns the current pause/resume state of the query monitor.
+
+```bash
+curl -u admin:password \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/monitor/state?namespace=default
+```
+
+**Response (200 OK — not paused):**
+
+```json
+{
+  "paused": false,
+  "stale": false
+}
+```
+
+**Response (200 OK — paused):**
+
+```json
+{
+  "paused": true,
+  "stale": true,
+  "pausedAt": "2026-05-30T10:00:00Z"
+}
+```
+
+### Query Operations
+
+Query operation endpoints provide active query management capabilities including cancellation, resource group reassignment, and CSV export. Operations execute on the coordinator database via the `DBClientFactory`.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `POST` | `/clusters/{name}/queries/{pid}/cancel` | Operator | Cancel a running query |
+| `POST` | `/clusters/{name}/queries/{pid}/move` | Operator | Move query to resource group |
+| `POST` | `/clusters/{name}/queries/export` | Operator Basic | Export active queries to CSV |
+
+#### Cancel Running Query
+
+Cancels a running query by PID. Executes `pg_cancel_backend()` on the coordinator. The session remains connected but the current query is interrupted.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/1234/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Query running too long"}'
+```
+
+**Request Body** (optional, `Content-Type: application/json`):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `reason` | string | No | Human-readable reason for cancellation (logged for audit) |
+
+**Response (200 OK):**
+
+```json
+{
+  "pid": 1234,
+  "canceled": true,
+  "reason": "Query running too long"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pid` | int | The backend process ID that was targeted |
+| `canceled` | bool | `true` if `pg_cancel_backend()` returned true; `false` if PID not found or query already completed |
+| `reason` | string | The cancellation reason (echoed back when provided) |
+
+**Prometheus metric**: `cloudberry_query_cancel_total` counter is incremented on each cancel request.
+
+**Error (400 Bad Request — invalid PID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "PID must be a positive integer"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+**Error (500 Internal Server Error — cancel failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to cancel query"
+  }
+}
+```
+
+#### Move Query to Resource Group
+
+Moves a running query to a different resource group by reassigning the user's resource group via `ALTER ROLE <user> RESOURCE GROUP <target_group>`.
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/1234/move \
+  -H "Content-Type: application/json" \
+  -d '{"targetGroup": "etl"}'
+```
+
+**Request Body** (`Content-Type: application/json`):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `targetGroup` | string | Yes | Name of the target resource group |
+
+**Response (200 OK):**
+
+```json
+{
+  "pid": 1234,
+  "moved": true,
+  "targetGroup": "etl",
+  "previousGroup": "default_group"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pid` | int | The backend process ID that was targeted |
+| `moved` | bool | `true` if the resource group reassignment succeeded |
+| `targetGroup` | string | The target resource group name |
+| `previousGroup` | string | The resource group the query was previously in |
+
+**Prometheus metric**: `cloudberry_query_move_total` counter is incremented on each move request.
+
+**Error (400 Bad Request — missing target group):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "targetGroup is required"
+  }
+}
+```
+
+**Error (400 Bad Request — invalid PID):**
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "PID must be a positive integer"
+  }
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (404 Not Found — resource group not found):**
+
+```json
+{
+  "error": {
+    "code": "RESOURCE_GROUP_NOT_FOUND",
+    "message": "resource group \"etl\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database connection failed):**
+
+```json
+{
+  "error": {
+    "code": "DB_UNAVAILABLE",
+    "message": "cannot connect to database"
+  }
+}
+```
+
+#### Export Active Queries to CSV
+
+Exports all active queries from `pg_stat_activity` as a CSV file. The response streams rows directly from the database.
+
+```bash
+curl -u admin:password -X POST \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/export?namespace=default" \
+  -o active-queries.csv
+```
+
+**Response (200 OK):**
+
+```
+Content-Type: text/csv
+Content-Disposition: attachment; filename="active-queries.csv"
+
+pid,username,database,state,query,duration,wait_event_type,resource_group
+1234,gpadmin,testdb,active,SELECT * FROM orders,,default_group
+5678,analyst,mydb,idle,,,analytics
+```
+
+**CSV columns:**
+
+| Column | Description |
+|--------|-------------|
+| `pid` | PostgreSQL backend process ID |
+| `username` | Database user |
+| `database` | Database name |
+| `state` | Session state |
+| `query` | Current or last query |
+| `duration` | Query duration |
+| `wait_event_type` | Wait event type (if any) |
+| `resource_group` | Resource group name |
+
+**Prometheus metric**: `cloudberry_active_query_export_total` counter is incremented on each export.
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (503 Service Unavailable — database not available):**
+
+```json
+{
+  "error": {
+    "code": "DB_NOT_AVAILABLE",
+    "message": "database connection not configured"
+  }
+}
+```
+
+### Exporter Health
+
+The exporter health endpoint provides a unified view of all Prometheus exporter sidecars deployed for a cluster.
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/metrics/exporters` | Basic | List exporter health status |
+
+#### List Exporter Health
+
+Returns the health status of all Prometheus exporters deployed for the cluster, including their availability, last scrape time, and metric count.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/metrics/exporters"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "exporters": [
+    {
+      "name": "postgres-exporter",
+      "type": "postgres_exporter",
+      "port": 9187,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 142,
+      "errorMessage": ""
+    },
+    {
+      "name": "cloudberry-query-exporter",
+      "type": "cloudberry_query_exporter",
+      "port": 9188,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 87,
+      "errorMessage": ""
+    },
+    {
+      "name": "node-exporter",
+      "type": "node_exporter",
+      "port": 9100,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 256,
+      "errorMessage": ""
+    }
+  ],
+  "total": 3,
+  "healthyCount": 3
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exporters` | array | List of exporter health entries |
+| `exporters[].name` | string | Exporter container name |
+| `exporters[].type` | string | Exporter type identifier (`postgres_exporter`, `cloudberry_query_exporter`, `node_exporter`) |
+| `exporters[].port` | int | Metrics port number |
+| `exporters[].healthy` | bool | `true` if the exporter's `/metrics` endpoint is reachable and returns valid data |
+| `exporters[].lastScrape` | string | ISO 8601 timestamp of the last successful scrape |
+| `exporters[].scrapeInterval` | string | Configured scrape interval |
+| `exporters[].metricsCount` | int | Number of metric families exposed |
+| `exporters[].errorMessage` | string | Error message if the exporter is unhealthy (empty when healthy) |
+| `total` | int | Total number of exporters |
+| `healthyCount` | int | Number of healthy exporters |
+
+**Prometheus metric**: `cloudberry_exporter_health_check_total` counter is incremented on each health check request.
+
+**Response (200 OK — exporter unhealthy):**
+
+```json
+{
+  "exporters": [
+    {
+      "name": "postgres-exporter",
+      "type": "postgres_exporter",
+      "port": 9187,
+      "healthy": false,
+      "lastScrape": "2026-05-30T09:55:00Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 0,
+      "errorMessage": "connection refused: dial tcp 127.0.0.1:9187: connect: connection refused"
+    }
+  ],
+  "total": 1,
+  "healthyCount": 0
+}
+```
+
+**Error (404 Not Found — cluster not found):**
+
+```json
+{
+  "error": {
+    "code": "CLUSTER_NOT_FOUND",
+    "message": "cluster \"my-cluster\" not found"
+  }
+}
+```
+
+**Error (500 Internal Server Error — health check failed):**
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "failed to check exporter health"
+  }
+}
+```
+
 ### Resource Groups
 
 Resource group endpoints manage Cloudberry resource groups for workload isolation. Operations execute SQL commands on the coordinator via the `DBClientFactory`.
@@ -1550,12 +2495,15 @@ All errors follow a consistent JSON format:
 | 403 | `FORBIDDEN` | Insufficient permissions for the requested operation |
 | 404 | `CLUSTER_NOT_FOUND` | Cluster does not exist |
 | 404 | `SEGMENT_NOT_FOUND` | Segment does not exist |
+| 404 | `QUERY_NOT_FOUND` | Historical query does not exist (query history detail) |
 | 409 | `CONFLICT` | Operation conflicts with current cluster state |
 | 422 | `VALIDATION_ERROR` | Request validation failed |
 | 429 | `RATE_LIMITED` | Rate limit exceeded |
 | 500 | `INTERNAL_ERROR` | Unexpected server error |
 | 503 | `SERVICE_UNAVAILABLE` | Operator not ready |
 | 503 | `DB_UNAVAILABLE` | Cannot connect to the cluster's database (session operations) |
+| 503 | `DB_NOT_AVAILABLE` | Database connection not configured (query history) |
+| 503 | `DB_CONNECTION_FAILED` | Failed to connect to coordinator database (query history) |
 
 ### Error Examples
 
@@ -1615,6 +2563,56 @@ GET /clusters/{name}/sessions?limit=50&offset=0
   "offset": 0
 }
 ```
+
+## Monitoring Disabled Response
+
+When `spec.queryMonitoring.enabled` is `false` (or the `queryMonitoring` section is omitted), all monitoring-specific endpoints return HTTP 200 with the following response body:
+
+```json
+{
+  "monitoringEnabled": false,
+  "message": "query monitoring is not enabled for this cluster"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `monitoringEnabled` | bool | Always `false` when monitoring is disabled |
+| `message` | string | Human-readable explanation |
+
+**Affected endpoints**: `GET /queries`, `GET /queries/active`, `GET /queries/history`, `GET /queries/history/{qid}`, `POST /queries/history/export`, `GET /queries/monitor/state`, `POST /queries/monitor/pause`, `GET /metrics/exporters`.
+
+**Unaffected endpoints**: `GET /sessions`, `POST /queries/plan-check`, `POST /queries/{pid}/cancel`, `POST /queries/{pid}/move`, `GET /queries/{pid}` continue to function normally regardless of the monitoring enabled state.
+
+The operator records a `cloudberry_monitoring_disabled_access_total` Prometheus counter metric (labeled by `cluster` and `namespace`) each time a monitoring endpoint is accessed while monitoring is disabled.
+
+## Guest Access
+
+When `guestAccess: true` is set in a cluster's `queryMonitoring` spec, certain read-only endpoints allow unauthenticated access. Guest users receive a `Basic` permission level identity.
+
+### Guest-Enabled Endpoints
+
+| Endpoint | Permission | Guest Result |
+|----------|-----------|-------------|
+| `GET /clusters/{name}/queries/active` | Basic | 200 OK |
+| `GET /clusters/{name}/metrics/exporters` | Basic | 200 OK |
+| `GET /clusters/{name}/queries` | Operator Basic | 403 Forbidden (guest has Basic) |
+
+### Guest Access Rules
+
+1. **GET/HEAD/OPTIONS only**: POST, PUT, and DELETE requests always return `401 Unauthorized` for unauthenticated users
+2. **Per-cluster**: Guest access is checked against the cluster's `spec.queryMonitoring.guestAccess` field
+3. **Auth header priority**: If an `Authorization` header is present, normal authentication is used
+4. **Permission enforcement**: Guest identity has `Basic` permission — endpoints requiring higher permissions return `403 Forbidden`
+
+### Permission Levels Per Endpoint
+
+| Permission Level | Endpoints |
+|-----------------|-----------|
+| **Basic** | `GET /clusters`, `GET /clusters/{name}`, `GET /clusters/{name}/status`, `GET /clusters/{name}/queries/active`, `GET /clusters/{name}/metrics/exporters`, `GET /clusters/{name}/segments`, `GET /clusters/{name}/backups`, `GET /clusters/{name}/storage/*` |
+| **Operator Basic** | `GET /clusters/{name}/config`, `GET /clusters/{name}/sessions`, `GET /clusters/{name}/queries`, `GET /clusters/{name}/queries/{pid}`, `GET /clusters/{name}/queries/history` |
+| **Operator** | `POST /clusters/{name}/start`, `POST /clusters/{name}/stop`, `POST /clusters/{name}/queries/{pid}/cancel`, `POST /clusters/{name}/queries/{pid}/move`, `POST /clusters/{name}/maintenance/*` |
+| **Admin** | `POST /clusters`, `DELETE /clusters/{name}`, `POST /clusters/{name}/standby/activate`, `POST /auth/rotate-password` |
 
 ## Rate Limiting
 
@@ -1880,6 +2878,32 @@ rate(cloudberry_fts_probe_total{result="failure"}[5m])
 
 # Currently failed segments
 cloudberry_segments_failed{cluster="my-cluster"}
+```
+
+### Security, Admission, and Lifecycle Metrics
+
+The operator exposes additional Prometheus metrics covering webhook/certificate rotation, Vault operations, admission decisions, and cluster lifecycle workflows (upgrades, rolling restarts, and recovery):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_cert_rotation_total` | Counter | `component`, `source`, `result` | Webhook/cert TLS rotation events. `source` is `vault-pki` or `self-signed`; `result` is `success` or `error` |
+| `cloudberry_cert_expiry_seconds` | Gauge | `component` | Seconds until the certificate expires per component |
+| `cloudberry_vault_operations_total` | Counter | `operation`, `result` | Vault auth/read/write operations. `operation` is `auth`, `read`, or `write`; `result` is `success` or `error` |
+| `cloudberry_vault_operation_duration_seconds` | Histogram | `operation` | Duration of Vault operations in seconds |
+| `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error` |
+| `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
+| `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
+| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; `result` is `started`, `completed`, or `failed` |
+
+```promql
+# Certificates expiring within the next 7 days
+cloudberry_cert_expiry_seconds < 604800
+
+# Webhook denials over the last hour
+increase(cloudberry_webhook_admission_total{result="denied"}[1h])
+
+# Upgrade rollbacks per cluster (last 24 hours)
+increase(cloudberry_upgrade_operations_total{result="rollback"}[24h])
 ```
 
 ### OpenAPI Specification

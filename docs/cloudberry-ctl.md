@@ -18,6 +18,8 @@ All commands communicate with the operator via HTTP calls to the REST API server
   - [segments](#segments)
   - [ha](#ha)
   - [sessions](#sessions)
+  - [queries](#queries) (including [list](#queries-list), [detail](#queries-detail), [cancel](#queries-cancel), [move](#queries-move), [export](#queries-export), [history](#queries-history), [plan-check](#queries-plan-check))
+  - [metrics](#metrics) (including [exporters](#metrics-exporters))
   - [maintenance](#maintenance)
   - [auth](#auth)
   - [inspect](#inspect)
@@ -178,6 +180,9 @@ The following commands are fully implemented and communicate with the operator R
 - `segments list`, `segments status`, `segments inspect`
 - `ha mirroring status`, `ha recovery start`, `ha recovery status`, `ha rebalance` (with `--status` and `--tables` flags), `ha standby status`, `ha standby activate`
 - `sessions list`, `sessions cancel-query`, `sessions terminate`
+- `queries list`, `queries detail`, `queries cancel`, `queries move`, `queries export`
+- `queries history list`, `queries history detail`, `queries history export`, `queries history --export csv`
+- `metrics exporters`
 - `maintenance vacuum`, `maintenance analyze`, `maintenance reindex`
 - `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
 - `resource-group list`, `resource-group create`, `resource-group delete`, `resource-group assign`
@@ -757,6 +762,499 @@ A `terminated: false` result means the PID was not found or the session had alre
 
 ---
 
+### queries
+
+Query monitoring and history commands. The `queries` command group provides access to active query monitoring and historical query analysis.
+
+#### queries list
+
+List active queries by querying the sessions endpoint with optional status filtering.
+
+```bash
+# List all active queries
+cloudberry-ctl queries list --cluster my-cluster
+
+# Filter by status
+cloudberry-ctl queries list --cluster my-cluster --status running
+cloudberry-ctl queries list --cluster my-cluster --status idle
+cloudberry-ctl queries list --cluster my-cluster --status blocked
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--status` | string | | Filter by status (`running`, `queued`, `blocked`, `idle`) |
+
+**Output (JSON):**
+
+```json
+{
+  "sessions": [
+    {
+      "pid": 1234,
+      "username": "gpadmin",
+      "database": "testdb",
+      "state": "active",
+      "query": "SELECT * FROM orders",
+      "queryStart": "2026-05-30T10:00:00Z",
+      "resourceGroup": "default_group"
+    }
+  ],
+  "total": 1
+}
+```
+
+This command calls `GET /clusters/{name}/sessions` on the operator REST API.
+
+#### queries detail
+
+Show detailed execution information for a specific running query, including execution metrics, lock information, and tables accessed.
+
+```bash
+cloudberry-ctl queries detail --cluster my-cluster --query-id 12345
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--query-id` | int | Yes | Backend process ID (PID) of the query |
+
+**Output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "username": "analyst",
+  "database": "mydb",
+  "state": "active",
+  "query": "SELECT * FROM large_table JOIN dim_table ON ...",
+  "queryStart": "2026-05-27T12:00:00Z",
+  "duration": "00:00:30",
+  "waitEventType": "",
+  "waitEvent": "",
+  "backendType": "client backend",
+  "locks": [
+    {"lockType": "relation", "mode": "AccessShareLock", "granted": true, "relation": "large_table"},
+    {"lockType": "relation", "mode": "AccessShareLock", "granted": true, "relation": "dim_table"}
+  ],
+  "tablesAccessed": ["public.large_table", "public.dim_table"]
+}
+```
+
+This command calls `GET /clusters/{name}/queries/{pid}` on the operator REST API.
+
+#### queries cancel
+
+Cancel a running query by PID. The session remains connected but the current query is interrupted. An optional reason can be provided for audit logging.
+
+```bash
+# Cancel a query
+cloudberry-ctl queries cancel --cluster my-cluster --query-id 12345
+
+# Cancel with a reason
+cloudberry-ctl queries cancel --cluster my-cluster --query-id 12345 --reason "Too long"
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--query-id` | int | Yes | Backend process ID (PID) of the query to cancel |
+| `--reason` | string | No | Human-readable reason for cancellation (logged for audit) |
+
+**Output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "canceled": true,
+  "reason": "Too long"
+}
+```
+
+A `canceled: false` result means the PID was not found or the query had already completed.
+
+This command calls `POST /clusters/{name}/queries/{pid}/cancel` on the operator REST API.
+
+#### queries move
+
+Move a running query to a different resource group. This reassigns the user's resource group, affecting the running query's resource allocation.
+
+```bash
+cloudberry-ctl queries move --cluster my-cluster --query-id 12345 --target-group etl
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--query-id` | int | Yes | Backend process ID (PID) of the query to move |
+| `--target-group` | string | Yes | Name of the target resource group |
+
+**Output (JSON):**
+
+```json
+{
+  "pid": 12345,
+  "moved": true,
+  "targetGroup": "etl",
+  "previousGroup": "default_group"
+}
+```
+
+A `moved: false` result means the PID was not found or the resource group reassignment failed.
+
+This command calls `POST /clusters/{name}/queries/{pid}/move` on the operator REST API.
+
+#### queries export
+
+Export active queries as CSV. Queries the coordinator's `pg_stat_activity` and writes the results as CSV.
+
+```bash
+# Export to stdout
+cloudberry-ctl queries export --cluster my-cluster --format csv
+
+# Export to a file
+cloudberry-ctl queries export --cluster my-cluster --format csv -O active-queries.csv
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--format` | string | `csv` | Export format (currently only `csv` is supported) |
+| `-O`, `--output-file` | string | | Output file path (stdout if omitted) |
+
+**Output (CSV):**
+
+```csv
+pid,username,database,state,query,duration,wait_event_type,resource_group
+1234,gpadmin,testdb,active,SELECT * FROM orders,,default_group
+5678,analyst,mydb,idle,,,analytics
+```
+
+**Response headers:**
+
+```
+Content-Type: text/csv
+Content-Disposition: attachment; filename="active-queries.csv"
+```
+
+This command calls `POST /clusters/{name}/queries/export` on the operator REST API.
+
+#### queries history list
+
+List query history with optional filters and pagination.
+
+```bash
+# List recent query history
+cloudberry-ctl queries history list --cluster my-cluster
+
+# Filter by time range
+cloudberry-ctl queries history list --cluster my-cluster --last 24h
+
+# Filter by user and database
+cloudberry-ctl queries history list --cluster my-cluster --user analyst --database warehouse
+
+# Search with regex pattern
+cloudberry-ctl queries history list --cluster my-cluster \
+  --pattern "SELECT.*FROM orders" --pattern-type regex
+
+# Search with wildcard pattern
+cloudberry-ctl queries history list --cluster my-cluster \
+  --pattern "INSERT*" --pattern-type wildcard
+
+# Filter by resource group
+cloudberry-ctl queries history list --cluster my-cluster --resource-group analytics_group
+
+# Paginate results
+cloudberry-ctl queries history list --cluster my-cluster --limit 20 --offset 40
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--last` | string | | Show history from the last duration (e.g., `24h`, `7d`) |
+| `--user` | string | | Filter by username |
+| `--database` | string | | Filter by database name |
+| `--pattern` | string | | Search pattern (regex or wildcard) |
+| `--pattern-type` | string | | Pattern type: `regex` (default) or `wildcard` |
+| `--resource-group` | string | | Filter by resource group |
+| `--export` | string | | Export format (`csv`) — calls the export endpoint instead of listing |
+| `--limit` | int | 50 | Maximum number of results (max: 100) |
+| `--offset` | int | 0 | Pagination offset |
+
+When `--export csv` is specified, the command calls `POST /clusters/{name}/queries/history/export` instead of the list endpoint, streaming CSV output directly.
+
+**Output (JSON):**
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "queryId": "q-1234-1716984000000000000",
+      "pid": 1234,
+      "username": "analyst",
+      "databaseName": "warehouse",
+      "queryText": "SELECT * FROM orders WHERE created_at > '2026-01-01'",
+      "queryStart": "2026-05-29T10:00:00Z",
+      "queryEnd": "2026-05-29T10:00:02.5Z",
+      "durationMs": 2500.00,
+      "state": "completed",
+      "rowsAffected": 15000,
+      "cpuTimeMs": 1800.50,
+      "memoryBytes": 67108864,
+      "spillBytes": 0,
+      "resourceGroup": "default_group"
+    }
+  ],
+  "total": 156,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+This command calls `GET /clusters/{name}/queries/history` on the operator REST API.
+
+#### queries history detail
+
+Show detailed information for a specific historical query, including the EXPLAIN execution plan.
+
+```bash
+cloudberry-ctl queries history detail --cluster my-cluster \
+  --query-id q-1234-1716984000000000000
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--query-id` | string | Yes | Query ID to show details for |
+
+**Output (JSON):**
+
+```json
+{
+  "id": 42,
+  "queryId": "q-1234-1716984000000000000",
+  "pid": 1234,
+  "username": "analyst",
+  "databaseName": "warehouse",
+  "queryText": "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id",
+  "queryStart": "2026-05-29T10:00:00Z",
+  "queryEnd": "2026-05-29T10:00:05.2Z",
+  "durationMs": 5200.00,
+  "state": "completed",
+  "rowsAffected": 3200,
+  "cpuTimeMs": 4100.25,
+  "memoryBytes": 134217728,
+  "spillBytes": 268435456,
+  "explainPlan": "Gather Motion 4:1  (slice1; segments: 4)\n  ->  Hash Join\n        ...",
+  "resourceGroup": "analytics_group"
+}
+```
+
+This command calls `GET /clusters/{name}/queries/history/{qid}` on the operator REST API.
+
+#### queries history export
+
+Export query history to CSV. Supports the same filters as `queries history list`.
+
+```bash
+# Export all history to a file
+cloudberry-ctl queries history export --cluster my-cluster \
+  --output-file queries.csv
+
+# Export with filters
+cloudberry-ctl queries history export --cluster my-cluster \
+  --last 24h --user analyst --output-file filtered.csv
+
+# Export with pattern filter
+cloudberry-ctl queries history export --cluster my-cluster \
+  --pattern "SELECT.*FROM orders" --pattern-type regex \
+  --output-file orders-queries.csv
+
+# Export to stdout (for piping)
+cloudberry-ctl queries history export --cluster my-cluster | head -20
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-O`, `--output-file` | string | | Output file path (stdout if omitted) |
+| `--last` | string | | Export history from the last duration (e.g., `24h`) |
+| `--user` | string | | Filter by username |
+| `--database` | string | | Filter by database name |
+| `--pattern` | string | | Search pattern |
+| `--pattern-type` | string | | Pattern type: `regex` or `wildcard` |
+
+**Output (CSV):**
+
+```csv
+query_id,username,database,query_text,start_time,end_time,duration_ms,rows_affected,cpu_time_ms,memory_bytes,spill_bytes,state
+q-1234-1716984000000000000,analyst,warehouse,"SELECT * FROM orders",2026-05-29T10:00:00Z,2026-05-29T10:00:02.5Z,2500.00,15000,1800.50,67108864,0,completed
+```
+
+This command calls `POST /clusters/{name}/queries/history/export` on the operator REST API.
+
+#### queries monitor pause
+
+Pause the query monitor for a cluster. Takes a snapshot of the current query data and freezes it. While paused, all query monitoring endpoints return the cached snapshot with a `stale` indicator.
+
+```bash
+# Pause the query monitor
+cloudberry-ctl queries monitor pause --cluster my-cluster
+
+# Pause with namespace
+cloudberry-ctl queries monitor pause --cluster my-cluster --namespace production
+```
+
+**Output:**
+
+```
+Query monitor paused for cluster my-cluster
+Paused at: 2026-05-30T10:00:00Z
+```
+
+This command calls `POST /clusters/{name}/queries/monitor/pause` on the operator REST API. Requires **Operator** permission.
+
+#### queries monitor resume
+
+Resume the query monitor for a cluster. Removes the cached snapshot so subsequent requests return fresh data.
+
+```bash
+# Resume the query monitor
+cloudberry-ctl queries monitor resume --cluster my-cluster
+```
+
+**Output:**
+
+```
+Query monitor resumed for cluster my-cluster
+```
+
+This command calls `POST /clusters/{name}/queries/monitor/resume` on the operator REST API. Requires **Operator** permission.
+
+#### queries monitor state
+
+Get the current pause/resume state of the query monitor.
+
+```bash
+# Check monitor state
+cloudberry-ctl queries monitor state --cluster my-cluster
+
+# JSON output
+cloudberry-ctl queries monitor state --cluster my-cluster -o json
+```
+
+**Output (table):**
+
+```
+CLUSTER      PAUSED  STALE  PAUSED AT
+my-cluster   false   false  -
+```
+
+**Output (paused):**
+
+```
+CLUSTER      PAUSED  STALE  PAUSED AT
+my-cluster   true    true   2026-05-30T10:00:00Z
+```
+
+**Output (JSON):**
+
+```json
+{
+  "paused": true,
+  "stale": true,
+  "pausedAt": "2026-05-30T10:00:00Z"
+}
+```
+
+This command calls `GET /clusters/{name}/queries/monitor/state` on the operator REST API. Requires **Basic** permission.
+
+#### queries plan-check
+
+Run the static plan checker on EXPLAIN ANALYZE output. Parses the plan text, identifies performance issues, and returns actionable recommendations. No database connection is required — the analysis is purely text-based.
+
+```bash
+# Analyze a plan from a file
+cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt
+
+# Analyze a plan from stdin
+cat explain.txt | cloudberry-ctl queries plan-check --cluster my-cluster -f -
+
+# JSON output
+cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt -o json
+
+# YAML output
+cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt -o yaml
+```
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `-f`, `--file` | string | Yes | Path to EXPLAIN ANALYZE output file (use `-` for stdin) |
+
+**Output (table):**
+
+```
+SEVERITY  CATEGORY               NODE TYPE     RELATION  DESCRIPTION
+warning   sequential_scan        Seq Scan      orders    Sequential scan on orders returned 50000 rows
+warning   row_estimate_mismatch  Seq Scan      orders    Row estimate mismatch on orders: estimated 100 rows, actual 50000 rows (499x off)
+warning   sort_spill             Sort                    Sort spilled to disk using 8192kB
+info      high_cost_node         Nested Loop             High-cost node Nested Loop (cost=12000.00)
+
+Summary: Found 4 performance issues: 3 warning(s), 1 info
+Total nodes: 5 | Execution time: 150.000 ms
+```
+
+**Output (JSON):**
+
+```json
+{
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "sequential_scan",
+      "nodeType": "Seq Scan",
+      "relation": "orders",
+      "description": "Sequential scan on orders returned 50000 rows",
+      "recommendation": "Consider creating an index on orders for filter condition (status = 'pending')",
+      "details": {
+        "actualRows": 50000,
+        "filter": "(status = 'pending')",
+        "totalCost": 5000.00
+      }
+    }
+  ],
+  "summary": "Found 1 performance issue: 1 warning(s)",
+  "totalNodes": 1,
+  "executionTime": 10.5
+}
+```
+
+**Detection rules applied:**
+
+| Category | Trigger | Severity |
+|----------|---------|----------|
+| `sequential_scan` | Seq Scan with `actualRows > 10,000` | warning |
+| `row_estimate_mismatch` | Estimated vs actual rows differ by `> 10x` | warning |
+| `sort_spill` | Sort using disk instead of memory | warning |
+| `nested_loop_high_rows` | Nested loop with `rows * loops > 100,000` | warning |
+| `excessive_filter_rows` | Filter removes `> 10x` more rows than returned (min 1,000) | warning |
+| `high_cost_node` | Node with `TotalCost > 10,000` | info |
+
+This command calls `POST /clusters/{name}/queries/plan-check` on the operator REST API.
+
+---
+
 ### maintenance
 
 Maintenance operation commands. Each maintenance command triggers the creation of a Kubernetes `batchv1.Job` that runs the requested operation against the coordinator. Jobs are automatically cleaned up after 1 hour (`TTLSecondsAfterFinished=3600`).
@@ -1191,6 +1689,86 @@ cloudberry-ctl resource-group update --cluster my-cluster \
 ```
 
 > **Note**: This command is a stub and returns a `"command \"resource-group update\" is not yet implemented"` error.
+
+### metrics
+
+Metrics and exporter management commands.
+
+#### metrics exporters
+
+List the health status of all Prometheus exporters deployed for a cluster. Shows each exporter's availability, last scrape time, and metric count.
+
+```bash
+cloudberry-ctl metrics exporters --cluster my-cluster
+```
+
+**Output (table):**
+
+```
+NAME                         TYPE                        PORT  HEALTHY  LAST SCRAPE           METRICS
+postgres-exporter            postgres_exporter           9187  true     2026-05-30T10:00:15Z  142
+cloudberry-query-exporter    cloudberry_query_exporter   9188  true     2026-05-30T10:00:15Z  87
+node-exporter                node_exporter               9100  true     2026-05-30T10:00:15Z  256
+```
+
+**Output (JSON):**
+
+```json
+{
+  "exporters": [
+    {
+      "name": "postgres-exporter",
+      "type": "postgres_exporter",
+      "port": 9187,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 142,
+      "errorMessage": ""
+    },
+    {
+      "name": "cloudberry-query-exporter",
+      "type": "cloudberry_query_exporter",
+      "port": 9188,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 87,
+      "errorMessage": ""
+    },
+    {
+      "name": "node-exporter",
+      "type": "node_exporter",
+      "port": 9100,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 256,
+      "errorMessage": ""
+    }
+  ],
+  "total": 3,
+  "healthyCount": 3
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exporters[].name` | string | Exporter container name |
+| `exporters[].type` | string | Exporter type (`postgres_exporter`, `cloudberry_query_exporter`, `node_exporter`) |
+| `exporters[].port` | int | Metrics port number |
+| `exporters[].healthy` | bool | `true` if the exporter's `/metrics` endpoint is reachable |
+| `exporters[].lastScrape` | string | ISO 8601 timestamp of the last successful scrape |
+| `exporters[].metricsCount` | int | Number of metric families exposed |
+| `exporters[].errorMessage` | string | Error message if unhealthy (empty when healthy) |
+| `total` | int | Total number of exporters |
+| `healthyCount` | int | Number of healthy exporters |
+
+This command calls `GET /clusters/{name}/metrics/exporters` on the operator REST API.
+
+---
 
 ## Output Formats
 

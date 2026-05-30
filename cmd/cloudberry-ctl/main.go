@@ -60,6 +60,7 @@ const (
 	cmdDelete = "delete"
 	cmdStart  = "start"
 	cmdStop   = "stop"
+	cmdExport = "export"
 )
 
 // JSON body field name constants to avoid string duplication.
@@ -264,6 +265,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newDataLoadingCmd(),
 		newStorageCmd(),
 		newCompletionCmd(),
+		newMetricsCmd(),
 	)
 
 	return cmd
@@ -1677,7 +1679,7 @@ func newWorkloadRulesExportCmd() *cobra.Command {
 	var outputFile string
 
 	exportCmd := &cobra.Command{
-		Use:   "export",
+		Use:   cmdExport,
 		Short: "Export workload rules to YAML file",
 		Long: `Export all workload rules from the cluster to a YAML file.
 If --output-file is not specified, the rules are written to stdout in YAML format.
@@ -1755,6 +1757,90 @@ func extractRulesFromResponse(body map[string]interface{}) ([]ctl.WorkloadRuleFi
 	return rules, nil
 }
 
+// newQueryDetailCmd creates the queries detail subcommand.
+func newQueryDetailCmd() *cobra.Command {
+	var detailPID string
+	detailCmd := &cobra.Command{
+		Use:   "detail",
+		Short: "Show query execution details",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if detailPID == "" {
+				return fmt.Errorf("query ID is required (--query-id)")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(detailPID)),
+				globals.namespace)
+			return runAPIGet(path)
+		},
+	}
+	detailCmd.Flags().StringVar(&detailPID, "query-id", "", "Query PID to show details for")
+	return detailCmd
+}
+
+// newQueryCancelCmd creates the queries cancel subcommand.
+func newQueryCancelCmd() *cobra.Command {
+	var cancelPID string
+	var cancelReason string
+	cancelCmd := &cobra.Command{
+		Use:   "cancel",
+		Short: "Cancel a running query",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if cancelPID == "" {
+				return fmt.Errorf("query ID is required (--query-id)")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/%s/cancel",
+					url.PathEscape(globals.cluster), url.PathEscape(cancelPID)),
+				globals.namespace)
+			var body interface{}
+			if cancelReason != "" {
+				body = map[string]string{"reason": cancelReason}
+			}
+			return runAPIPost(path, body)
+		},
+	}
+	cancelCmd.Flags().StringVar(&cancelPID, "query-id", "", "Query PID to cancel")
+	cancelCmd.Flags().StringVar(&cancelReason, "reason", "", "Cancellation reason")
+	return cancelCmd
+}
+
+// newQueryMoveCmd creates the queries move subcommand.
+func newQueryMoveCmd() *cobra.Command {
+	var movePID string
+	var moveTargetGroup string
+	moveCmd := &cobra.Command{
+		Use:   "move",
+		Short: "Move query to resource group",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if movePID == "" {
+				return fmt.Errorf("query ID is required (--query-id)")
+			}
+			if moveTargetGroup == "" {
+				return fmt.Errorf("target group is required (--target-group)")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/%s/move",
+					url.PathEscape(globals.cluster), url.PathEscape(movePID)),
+				globals.namespace)
+			body := map[string]string{"targetGroup": moveTargetGroup}
+			return runAPIPost(path, body)
+		},
+	}
+	moveCmd.Flags().StringVar(&movePID, "query-id", "", "Query PID to move")
+	moveCmd.Flags().StringVar(&moveTargetGroup, "target-group", "", "Target resource group name")
+	return moveCmd
+}
+
 // newQueryCmd creates the query monitoring command group.
 func newQueryCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -1763,6 +1849,7 @@ func newQueryCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(
+		newQueryListCmd(),
 		&cobra.Command{
 			Use:   "active",
 			Short: "Show active queries",
@@ -1783,16 +1870,13 @@ func newQueryCmd() *cobra.Command {
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries", globals.namespace))
 			},
 		},
-		&cobra.Command{
-			Use:   "history",
-			Short: "Show query history",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "queries", globals.namespace))
-			},
-		},
+		newQueryHistoryCmd(),
+		newPlanCheckCmd(),
+		newQueryDetailCmd(),
+		newQueryCancelCmd(),
+		newQueryMoveCmd(),
+		newQueryExportCmd(),
+		newQueryMonitorCmd(),
 		&cobra.Command{
 			Use:   cmdStatus,
 			Short: "Show query monitoring status",
@@ -1805,6 +1889,422 @@ func newQueryCmd() *cobra.Command {
 		},
 	)
 
+	return cmd
+}
+
+// newQueryListCmd creates the queries list subcommand.
+// It lists active queries by calling the sessions endpoint with optional status filtering.
+func newQueryListCmd() *cobra.Command {
+	var status string
+	cmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List active queries",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			params := url.Values{}
+			if globals.namespace != "" {
+				params.Set("namespace", globals.namespace)
+			}
+			if status != "" {
+				params.Set("status", status)
+			}
+			path := fmt.Sprintf("/clusters/%s/sessions", url.PathEscape(globals.cluster))
+			if len(params) > 0 {
+				path += "?" + params.Encode()
+			}
+			return runAPIGet(path)
+		},
+	}
+	cmd.Flags().StringVar(&status, "status", "", "Filter by status (running, queued, blocked, idle)")
+	return cmd
+}
+
+// newQueryExportCmd creates the queries export subcommand.
+// It exports active queries as CSV by calling the queries export API endpoint.
+func newQueryExportCmd() *cobra.Command {
+	var exportFormat string
+	var outputFile string
+
+	exportCmd := &cobra.Command{
+		Use:   cmdExport,
+		Short: "Export active queries",
+		Long: `Export active queries from the cluster. When --format csv is specified,
+the output is written as CSV to stdout or to a file specified by --output-file.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+
+			if exportFormat != "" && exportFormat != "csv" {
+				return fmt.Errorf("unsupported export format %q; supported: csv", exportFormat)
+			}
+
+			client, err := newClient()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := cmdContext()
+			defer cancel()
+
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/export",
+					url.PathEscape(globals.cluster)),
+				globals.namespace)
+
+			resp, apiErr := client.Post(ctx, path, nil)
+			if apiErr != nil {
+				return apiErr
+			}
+
+			// Write output to file or stdout.
+			// The export endpoint returns CSV text, so use RawBody.
+			if outputFile != "" {
+				if writeErr := os.WriteFile(outputFile, resp.RawBody, 0o600); writeErr != nil {
+					return fmt.Errorf("writing to file: %w", writeErr)
+				}
+				fmt.Fprintf(os.Stdout, "Active queries exported to %s\n", outputFile)
+				return nil
+			}
+
+			// Write raw CSV to stdout.
+			_, _ = os.Stdout.Write(resp.RawBody)
+			return nil
+		},
+	}
+	exportCmd.Flags().StringVar(&exportFormat, "format", "csv", "Export format (csv)")
+	exportCmd.Flags().StringVarP(&outputFile, "output-file", "O", "",
+		"Output file path (writes to stdout if not specified)")
+	return exportCmd
+}
+
+// newPlanCheckCmd creates the plan-check subcommand for analyzing EXPLAIN ANALYZE output.
+func newPlanCheckCmd() *cobra.Command {
+	var planFile string
+	var planText string
+
+	planCheckCmd := &cobra.Command{
+		Use:   "plan-check",
+		Short: "Analyze EXPLAIN ANALYZE output for performance issues",
+		Long: `Analyze PostgreSQL/Cloudberry EXPLAIN ANALYZE output for performance issues.
+Reads plan text from a file (-f) or inline (--plan) and returns identified issues
+with actionable recommendations.
+
+Examples:
+  cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt
+  cloudberry-ctl queries plan-check --cluster my-cluster --plan "Seq Scan on orders..."`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+
+			var text string
+			switch {
+			case planFile != "":
+				//nolint:gosec // user-provided file path is intentional for CLI
+				data, readErr := os.ReadFile(planFile)
+				if readErr != nil {
+					return fmt.Errorf("reading plan file %q: %w", planFile, readErr)
+				}
+				text = string(data)
+			case planText != "":
+				text = planText
+			default:
+				return fmt.Errorf("either --file (-f) or --plan must be provided")
+			}
+
+			if strings.TrimSpace(text) == "" {
+				return fmt.Errorf("plan text is empty")
+			}
+
+			body := map[string]interface{}{
+				"planText": text,
+			}
+
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/plan-check",
+					url.PathEscape(globals.cluster)),
+				globals.namespace)
+
+			return runAPIPost(path, body)
+		},
+	}
+
+	planCheckCmd.Flags().StringVarP(&planFile, "file", "f", "", "Path to EXPLAIN ANALYZE output file")
+	planCheckCmd.Flags().StringVar(&planText, "plan", "", "Inline EXPLAIN ANALYZE text")
+
+	return planCheckCmd
+}
+
+// newQueryMonitorCmd creates the queries monitor subcommand group.
+// It provides pause, resume, and state subcommands for controlling the query monitor.
+func newQueryMonitorCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "monitor",
+		Short: "Query monitor pause/resume management",
+	}
+
+	pauseCmd := &cobra.Command{
+		Use:   "pause",
+		Short: "Pause the query monitor",
+		Long: `Pause the query monitor for a cluster. While paused, query monitoring
+endpoints return cached (stale) data from the time of pausing. New queries
+running in the database will not appear in the monitor output until resumed.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/monitor/pause",
+					url.PathEscape(globals.cluster)),
+				globals.namespace)
+			return runAPIPost(path, nil)
+		},
+	}
+
+	resumeCmd := &cobra.Command{
+		Use:   "resume",
+		Short: "Resume the query monitor",
+		Long: `Resume the query monitor for a cluster. After resuming, query monitoring
+endpoints return fresh data from the database again.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/monitor/resume",
+					url.PathEscape(globals.cluster)),
+				globals.namespace)
+			return runAPIPost(path, nil)
+		},
+	}
+
+	stateCmd := &cobra.Command{
+		Use:   "state",
+		Short: "Show monitor state",
+		Long:  `Show the current pause/resume state of the query monitor for a cluster.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/monitor/state",
+					url.PathEscape(globals.cluster)),
+				globals.namespace)
+			return runAPIGet(path)
+		},
+	}
+
+	cmd.AddCommand(pauseCmd, resumeCmd, stateCmd)
+	return cmd
+}
+
+// runQueryHistoryList executes the query history list logic with the given filter parameters.
+// It is shared between the history parent command and the history list subcommand.
+func runQueryHistoryList(histLast, histUser, histDatabase, histPattern, histPatternType,
+	histResourceGroup, histExport string, histLimit, histOffset int,
+) error {
+	if err := requireCluster(); err != nil {
+		return err
+	}
+
+	// Handle --export csv: call the export endpoint instead.
+	if histExport == "csv" {
+		return runQueryHistoryExportCSV(histLast, histUser, histDatabase, histPattern, histPatternType, "")
+	}
+
+	params := url.Values{}
+	if histLast != "" {
+		params.Set("since", histLast)
+	}
+	if histUser != "" {
+		params.Set("user", histUser)
+	}
+	if histDatabase != "" {
+		params.Set("database", histDatabase)
+	}
+	if histPattern != "" {
+		params.Set("pattern", histPattern)
+	}
+	if histPatternType != "" {
+		params.Set("patternType", histPatternType)
+	}
+	if histResourceGroup != "" {
+		params.Set("resourceGroup", histResourceGroup)
+	}
+	if histLimit > 0 {
+		params.Set("limit", fmt.Sprintf("%d", histLimit))
+	}
+	if histOffset > 0 {
+		params.Set("offset", fmt.Sprintf("%d", histOffset))
+	}
+	path := fmt.Sprintf("/clusters/%s/queries/history",
+		url.PathEscape(globals.cluster))
+	if ns := globals.namespace; ns != "" {
+		params.Set("namespace", ns)
+	}
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	return runAPIGet(path)
+}
+
+// runQueryHistoryExportCSV calls the query history export endpoint and writes CSV output.
+func runQueryHistoryExportCSV(last, user, database, pattern, patternType, outputFile string) error {
+	body := map[string]interface{}{}
+	if last != "" {
+		body["since"] = last
+	}
+	if user != "" {
+		body["user"] = user
+	}
+	if database != "" {
+		body["database"] = database
+	}
+	if pattern != "" {
+		body["pattern"] = pattern
+	}
+	if patternType != "" {
+		body["patternType"] = patternType
+	}
+
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	path := appendNamespaceQuery(
+		fmt.Sprintf("/clusters/%s/queries/history/export",
+			url.PathEscape(globals.cluster)),
+		globals.namespace)
+
+	resp, apiErr := client.Post(ctx, path, body)
+	if apiErr != nil {
+		return apiErr
+	}
+
+	// Write CSV to file or stdout.
+	// The export endpoint returns CSV text, so use RawBody.
+	if outputFile != "" {
+		if writeErr := os.WriteFile(outputFile, resp.RawBody, 0o600); writeErr != nil {
+			return fmt.Errorf("writing to file: %w", writeErr)
+		}
+		fmt.Fprintf(os.Stdout, "Query history exported to %s\n", outputFile)
+		return nil
+	}
+
+	// Write raw CSV to stdout.
+	_, _ = os.Stdout.Write(resp.RawBody)
+	return nil
+}
+
+// newQueryHistoryCmd creates the query history subcommand group.
+// The parent command is directly runnable and behaves like "queries history list"
+// when called without a subcommand.
+func newQueryHistoryCmd() *cobra.Command {
+	// Shared filter flags for both the parent command and the list subcommand.
+	var histLast string
+	var histUser string
+	var histDatabase string
+	var histPattern string
+	var histPatternType string
+	var histResourceGroup string
+	var histExport string
+	var histLimit int
+	var histOffset int
+
+	cmd := &cobra.Command{
+		Use:   "history",
+		Short: "Query history management",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runQueryHistoryList(histLast, histUser, histDatabase, histPattern,
+				histPatternType, histResourceGroup, histExport, histLimit, histOffset)
+		},
+	}
+
+	// Register filter flags on the parent command so they work on both
+	// "queries history" and "queries history list".
+	cmd.Flags().StringVar(&histLast, "last", "", "Show history from the last duration (e.g., 24h)")
+	cmd.Flags().StringVar(&histUser, "user", "", "Filter by username")
+	cmd.Flags().StringVar(&histDatabase, "database", "", "Filter by database name")
+	cmd.Flags().StringVar(&histPattern, "pattern", "", "Search pattern (regex or wildcard)")
+	cmd.Flags().StringVar(&histPatternType, "pattern-type", "", "Pattern type: regex or wildcard")
+	cmd.Flags().StringVar(&histResourceGroup, "resource-group", "", "Filter by resource group")
+	cmd.Flags().StringVar(&histExport, "export", "", "Export format (csv)")
+	cmd.Flags().IntVar(&histLimit, "limit", 0, "Maximum number of results")
+	cmd.Flags().IntVar(&histOffset, "offset", 0, "Pagination offset")
+
+	// list subcommand — uses the same shared filter flags via closures.
+	listCmd := &cobra.Command{
+		Use:   cmdList,
+		Short: "List query history",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runQueryHistoryList(histLast, histUser, histDatabase, histPattern,
+				histPatternType, histResourceGroup, histExport, histLimit, histOffset)
+		},
+	}
+	// Register the same flags on the list subcommand for discoverability.
+	listCmd.Flags().StringVar(&histLast, "last", "", "Show history from the last duration (e.g., 24h)")
+	listCmd.Flags().StringVar(&histUser, "user", "", "Filter by username")
+	listCmd.Flags().StringVar(&histDatabase, "database", "", "Filter by database name")
+	listCmd.Flags().StringVar(&histPattern, "pattern", "", "Search pattern (regex or wildcard)")
+	listCmd.Flags().StringVar(&histPatternType, "pattern-type", "", "Pattern type: regex or wildcard")
+	listCmd.Flags().StringVar(&histResourceGroup, "resource-group", "", "Filter by resource group")
+	listCmd.Flags().StringVar(&histExport, "export", "", "Export format (csv)")
+	listCmd.Flags().IntVar(&histLimit, "limit", 0, "Maximum number of results")
+	listCmd.Flags().IntVar(&histOffset, "offset", 0, "Pagination offset")
+
+	// detail subcommand.
+	var detailQueryID string
+	detailCmd := &cobra.Command{
+		Use:   "detail",
+		Short: "Show historical query details",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if detailQueryID == "" {
+				return fmt.Errorf("query ID is required (--query-id)")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/queries/history/%s",
+					url.PathEscape(globals.cluster),
+					url.PathEscape(detailQueryID)),
+				globals.namespace)
+			return runAPIGet(path)
+		},
+	}
+	detailCmd.Flags().StringVar(&detailQueryID, "query-id", "", "Query ID to show details for")
+
+	// export subcommand.
+	var exportOutputFile string
+	var exportLast string
+	var exportUser string
+	var exportDatabase string
+	var exportPattern string
+	var exportPatternType string
+	exportCmd := &cobra.Command{
+		Use:   cmdExport,
+		Short: "Export query history to CSV",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runQueryHistoryExportCSV(exportLast, exportUser, exportDatabase,
+				exportPattern, exportPatternType, exportOutputFile)
+		},
+	}
+	exportCmd.Flags().StringVarP(&exportOutputFile, "output-file", "O", "", "Output file path")
+	exportCmd.Flags().StringVar(&exportLast, "last", "", "Export history from the last duration (e.g., 24h)")
+	exportCmd.Flags().StringVar(&exportUser, "user", "", "Filter by username")
+	exportCmd.Flags().StringVar(&exportDatabase, "database", "", "Filter by database name")
+	exportCmd.Flags().StringVar(&exportPattern, "pattern", "", "Search pattern")
+	exportCmd.Flags().StringVar(&exportPatternType, "pattern-type", "", "Pattern type: regex or wildcard")
+
+	cmd.AddCommand(listCmd, detailCmd, exportCmd)
 	return cmd
 }
 
@@ -2089,6 +2589,29 @@ func newDataLoadingCmd() *cobra.Command {
 					return err
 				}
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "data-loading/jobs", globals.namespace))
+			},
+		},
+	)
+
+	return cmd
+}
+
+// newMetricsCmd creates the metrics command group.
+func newMetricsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "metrics",
+		Short: "Metrics and monitoring",
+	}
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "exporters",
+			Short: "Show exporter health status",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "metrics/exporters", globals.namespace))
 			},
 		},
 	)

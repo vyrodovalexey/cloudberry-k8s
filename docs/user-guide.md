@@ -67,6 +67,29 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Terminating a Session](#terminating-a-session)
   - [Graceful Degradation](#graceful-degradation)
   - [Error Handling](#error-handling)
+- [Query History](#query-history)
+  - [Browsing Query History](#browsing-query-history)
+  - [Searching with Patterns](#searching-with-patterns)
+  - [Viewing Historical Query Details](#viewing-historical-query-details)
+  - [Exporting to CSV](#exporting-to-csv)
+  - [CLI Commands for Query History](#cli-commands-for-query-history)
+  - [Query History Metrics](#query-history-metrics)
+- [Plan Analysis](#plan-analysis)
+  - [What is Plan Analysis?](#what-is-plan-analysis)
+  - [Using Plan Check via CLI](#using-plan-check-via-cli)
+  - [Interpreting Results](#interpreting-results)
+  - [Detection Rules Reference](#detection-rules-reference)
+  - [Plan Analysis Metrics](#plan-analysis-metrics)
+- [Query Cancellation](#query-cancellation)
+  - [Canceling a Running Query](#canceling-a-running-query)
+  - [Query Cancel Metrics](#query-cancel-metrics)
+- [Query Move (Resource Group Reassignment)](#query-move-resource-group-reassignment)
+  - [Moving a Query to a Different Resource Group](#moving-a-query-to-a-different-resource-group)
+  - [Query Move Metrics](#query-move-metrics)
+- [Exporter Health Monitoring](#exporter-health-monitoring)
+  - [Checking Exporter Health](#checking-exporter-health)
+  - [Exporter Types](#exporter-types)
+  - [Exporter Health Metrics](#exporter-health-metrics)
 - [Resource Group Management](#resource-group-management)
   - [Creating a Resource Group](#creating-a-resource-group)
   - [Listing Resource Groups](#listing-resource-groups)
@@ -1516,6 +1539,112 @@ cloudberry-ctl auth status --cluster my-cluster
 > cloudberry-ctl auth login --cluster my-cluster --basic --username admin
 > ```
 
+## Guest Access
+
+Guest access allows unauthenticated users to view basic cluster monitoring data without credentials. This is useful for public dashboards, status pages, and monitoring integrations that need read-only access.
+
+### Enabling Guest Access
+
+Set `guestAccess: true` in the `queryMonitoring` section of your cluster CR:
+
+```yaml
+spec:
+  queryMonitoring:
+    enabled: true
+    guestAccess: true
+```
+
+### How Guest Access Works
+
+When guest access is enabled for a cluster:
+
+1. **Unauthenticated GET requests** to guest-enabled endpoints receive a guest identity with `Basic` permission level
+2. **POST/PUT/DELETE requests** always require authentication, regardless of the `guestAccess` setting
+3. **Authenticated requests** work normally — the `Authorization` header takes priority over guest access
+4. Guest access is evaluated **per-cluster** by checking the `CloudberryCluster` CR
+
+### Guest-Enabled Endpoints
+
+| Endpoint | Method | Guest Access | Notes |
+|----------|--------|-------------|-------|
+| `/clusters/{name}/queries/active` | GET | Allowed | Returns active/queued/blocked query counts |
+| `/clusters/{name}/metrics/exporters` | GET | Allowed | Returns exporter health status |
+| `/clusters/{name}/queries` | GET | Denied (403) | Requires Operator Basic permission |
+
+All other endpoints return `401 Unauthorized` for unauthenticated requests.
+
+### Disabling Guest Access
+
+Guest access is disabled by default. To explicitly disable it:
+
+```yaml
+spec:
+  queryMonitoring:
+    guestAccess: false
+```
+
+When disabled, all endpoints require authentication.
+
+> **Note**: Guest access behavior is verified by Scenario 65. See `test/functional/scenario65_access_control_test.go` and `test/e2e/scenario65_access_control_e2e_test.go`.
+
+## Permission Levels
+
+The operator uses a hierarchical permission model to control access to API endpoints. Each authenticated user is assigned a permission level, and each endpoint requires a minimum permission level.
+
+### Permission Hierarchy
+
+| Level | Name | Description |
+|-------|------|-------------|
+| 0 | Self Only | View own queries and sessions only |
+| 1 | Basic | View cluster state, active queries, exporter health, backups, storage |
+| 2 | Operator Basic | View all sessions, configurations, query history, query details |
+| 3 | Operator | Cancel/move queries, start/stop clusters, maintenance operations |
+| 4 | Admin | Create/delete clusters, activate standby, delete backups, rotate passwords |
+
+A user with a higher permission level can access all endpoints that require a lower level. For example, an `Operator` user can access `Basic` and `Operator Basic` endpoints.
+
+### Endpoint Permission Matrix
+
+**Basic (read-only cluster state):**
+- `GET /clusters`, `GET /clusters/{name}`, `GET /clusters/{name}/status`
+- `GET /clusters/{name}/queries/active`, `GET /clusters/{name}/metrics/exporters`
+- `GET /clusters/{name}/segments`, `GET /clusters/{name}/mirroring`
+- `GET /clusters/{name}/backups`, `GET /clusters/{name}/storage/*`
+
+**Operator Basic (config + sessions viewing):**
+- `GET /clusters/{name}/config`, `GET /clusters/{name}/sessions`
+- `GET /clusters/{name}/queries`, `GET /clusters/{name}/queries/{pid}`
+- `GET /clusters/{name}/queries/history`, `GET /clusters/{name}/queries/history/{qid}`
+
+**Operator (cluster operations, mutations):**
+- `POST /clusters/{name}/start`, `POST /clusters/{name}/stop`, `POST /clusters/{name}/restart`
+- `POST /clusters/{name}/queries/{pid}/cancel`, `POST /clusters/{name}/queries/{pid}/move`
+- `POST /clusters/{name}/maintenance/*`, `POST /clusters/{name}/recovery`
+
+**Admin (destructive / high-impact operations):**
+- `POST /clusters`, `DELETE /clusters/{name}`
+- `POST /clusters/{name}/standby/activate`
+- `DELETE /clusters/{name}/backups/{id}`, `POST /clusters/{name}/backups/{id}/restore`
+- `POST /auth/rotate-password`
+
+### Assigning Permission Levels
+
+**Basic auth**: Permission is determined by the credential store entry. The admin user gets `Admin` permission.
+
+**OIDC auth**: Permission is determined by mapping JWT role claims through the `roleMapping` configuration:
+
+```yaml
+spec:
+  auth:
+    oidc:
+      roleMapping:
+        admin: Admin
+        operator: Operator
+        operator-basic: "Operator Basic"
+        user: Basic
+        reader: "Self Only"
+```
+
 ## Webhook Certificate Setup
 
 The operator's admission webhooks (validating and mutating) require TLS certificates. The operator manages these certificates automatically using one of two strategies: self-signed generation or Vault PKI issuance.
@@ -2527,6 +2656,598 @@ When the database connection is not available (e.g., the `DBClientFactory` is no
 | Query execution failed | 500 | `INTERNAL_ERROR` | The database query or operation failed |
 
 > **PID validation**: The PID argument must be a positive integer. The API rejects PIDs that are zero, negative, or non-numeric with a `400 Bad Request` error (`INVALID_REQUEST: PID must be a positive integer`).
+
+## Listing Active Queries
+
+The `queries list` command lists active queries by querying the sessions endpoint with optional status filtering:
+
+```bash
+# List all active queries
+cloudberry-ctl queries list --cluster my-cluster
+
+# Filter by status (running, queued, blocked, idle)
+cloudberry-ctl queries list --cluster my-cluster --status running
+```
+
+This command calls `GET /clusters/{name}/sessions` on the operator REST API with the optional `status` query parameter.
+
+## Exporting Active Queries to CSV
+
+The `queries export` command exports all active queries as a CSV file:
+
+```bash
+# Export to stdout
+cloudberry-ctl queries export --cluster my-cluster --format csv
+
+# Export to a file
+cloudberry-ctl queries export --cluster my-cluster --format csv -O active-queries.csv
+```
+
+**CSV columns**: `pid`, `username`, `database`, `state`, `query`, `duration`, `wait_event_type`, `resource_group`.
+
+This command calls `POST /clusters/{name}/queries/export` on the operator REST API.
+
+## Query History
+
+The operator maintains a persistent query history by recording completed queries in a `cloudberry_query_history` table on the coordinator database. The `cloudberry-query-exporter` sidecar automatically collects completed queries from `pg_stat_activity` and inserts them into this table. You can browse, search, inspect, and export historical queries through the REST API and CLI.
+
+Query history is retained for the duration configured in `spec.queryMonitoring.historyRetention` (default: 30 days). Entries older than the retention period are automatically cleaned up.
+
+### Browsing Query History
+
+List completed queries with pagination:
+
+```bash
+# List recent query history (default: last 50 entries)
+cloudberry-ctl queries history list --cluster my-cluster
+
+# Paginate through results
+cloudberry-ctl queries history list --cluster my-cluster --limit 20 --offset 40
+
+# Filter by time range
+cloudberry-ctl queries history list --cluster my-cluster --last 24h
+
+# Filter by username
+cloudberry-ctl queries history list --cluster my-cluster --user analyst
+
+# Filter by database
+cloudberry-ctl queries history list --cluster my-cluster --database warehouse
+```
+
+**Example output (JSON):**
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "queryId": "q-1234-1716984000000000000",
+      "pid": 1234,
+      "username": "analyst",
+      "databaseName": "warehouse",
+      "queryText": "SELECT * FROM orders WHERE created_at > '2026-01-01'",
+      "queryStart": "2026-05-29T10:00:00Z",
+      "queryEnd": "2026-05-29T10:00:02.5Z",
+      "durationMs": 2500.00,
+      "state": "completed",
+      "rowsAffected": 15000,
+      "cpuTimeMs": 1800.50,
+      "memoryBytes": 67108864,
+      "spillBytes": 0,
+      "diskReadBytes": 134217728,
+      "diskWriteBytes": 0,
+      "waitEvents": "",
+      "resourceGroup": "default_group",
+      "createdAt": "2026-05-29T10:00:02.5Z"
+    }
+  ],
+  "total": 156,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Query history entry fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Auto-incremented row ID |
+| `queryId` | string | Unique query identifier (format: `q-{pid}-{query_start_unix_nano}`) |
+| `pid` | int | PostgreSQL backend process ID that executed the query |
+| `username` | string | Database user who ran the query |
+| `databaseName` | string | Database the query was executed against |
+| `queryText` | string | Full SQL text of the query |
+| `queryStart` | string | ISO 8601 timestamp when the query started |
+| `queryEnd` | string | ISO 8601 timestamp when the query completed |
+| `durationMs` | float | Query execution duration in milliseconds |
+| `state` | string | Final state (`completed`, `cancelled`, `error`) |
+| `rowsAffected` | int | Number of rows affected or returned |
+| `cpuTimeMs` | float | CPU time consumed in milliseconds |
+| `memoryBytes` | int | Peak memory usage in bytes |
+| `spillBytes` | int | Data spilled to disk in bytes |
+| `diskReadBytes` | int | Bytes read from disk |
+| `diskWriteBytes` | int | Bytes written to disk |
+| `waitEvents` | string | Wait events encountered during execution |
+| `resourceGroup` | string | Resource group the query ran in |
+| `explainPlan` | string | EXPLAIN plan (present in detail view when plan collection is enabled) |
+| `errorMessage` | string | Error message (present when state is `error`) |
+| `createdAt` | string | ISO 8601 timestamp when the entry was recorded |
+
+### Searching with Patterns
+
+Search query history using regex or wildcard patterns:
+
+```bash
+# Regex search — find all SELECT queries on the orders table
+cloudberry-ctl queries history list --cluster my-cluster \
+  --pattern "SELECT.*FROM orders" --pattern-type regex
+
+# Wildcard search — find all queries containing "INSERT"
+cloudberry-ctl queries history list --cluster my-cluster \
+  --pattern "INSERT*" --pattern-type wildcard
+
+# Combine pattern with other filters
+cloudberry-ctl queries history list --cluster my-cluster \
+  --pattern "SELECT.*FROM orders" --pattern-type regex \
+  --user analyst --database warehouse
+
+# Filter by resource group
+cloudberry-ctl queries history list --cluster my-cluster \
+  --resource-group analytics_group
+```
+
+**Pattern types:**
+
+| Type | Syntax | Description |
+|------|--------|-------------|
+| `regex` (default) | PostgreSQL `~` operator | Full regex syntax (e.g., `SELECT.*FROM orders`) |
+| `wildcard` | `*` = any chars, `?` = single char | Converted to SQL `LIKE` (e.g., `SELECT * FROM users*`) |
+
+> **Note**: Invalid regex patterns are rejected with a `400 Bad Request` error before being sent to the database. This prevents ReDoS (Regular Expression Denial of Service) attacks.
+
+### Viewing Historical Query Details
+
+Retrieve detailed information for a specific historical query, including the EXPLAIN execution plan (when plan collection is enabled):
+
+```bash
+cloudberry-ctl queries history detail --cluster my-cluster \
+  --query-id q-1234-1716984000000000000
+```
+
+**Example output (JSON):**
+
+```json
+{
+  "id": 42,
+  "queryId": "q-1234-1716984000000000000",
+  "pid": 1234,
+  "username": "analyst",
+  "databaseName": "warehouse",
+  "queryText": "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.total > 1000",
+  "queryStart": "2026-05-29T10:00:00Z",
+  "queryEnd": "2026-05-29T10:00:05.2Z",
+  "durationMs": 5200.00,
+  "state": "completed",
+  "rowsAffected": 3200,
+  "cpuTimeMs": 4100.25,
+  "memoryBytes": 134217728,
+  "spillBytes": 268435456,
+  "diskReadBytes": 536870912,
+  "diskWriteBytes": 134217728,
+  "waitEvents": "IO",
+  "resourceGroup": "analytics_group",
+  "explainPlan": "Gather Motion 4:1  (slice1; segments: 4)\n  ->  Hash Join\n        Hash Cond: (o.customer_id = c.id)\n        ->  Seq Scan on orders o\n              Filter: (total > 1000)\n        ->  Hash\n              ->  Broadcast Motion 4:4  (slice2; segments: 4)\n                    ->  Seq Scan on customers c",
+  "errorMessage": "",
+  "createdAt": "2026-05-29T10:00:05.2Z"
+}
+```
+
+The `explainPlan` field contains the query execution plan collected by the `cloudberry-query-exporter`. This is available when `spec.queryMonitoring.planCollection` is enabled (default: `true`). Use this to analyze query performance, identify sequential scans, and optimize join strategies.
+
+### Exporting to CSV
+
+Export query history to a CSV file for offline analysis, reporting, or integration with external tools:
+
+```bash
+# Export all query history to a file
+cloudberry-ctl queries history export --cluster my-cluster \
+  --output-file queries.csv
+
+# Export with filters
+cloudberry-ctl queries history export --cluster my-cluster \
+  --last 24h --user analyst --output-file filtered.csv
+
+# Export with pattern filter
+cloudberry-ctl queries history export --cluster my-cluster \
+  --pattern "SELECT.*FROM orders" --pattern-type regex \
+  --output-file orders-queries.csv
+
+# Export to stdout (for piping)
+cloudberry-ctl queries history export --cluster my-cluster
+
+# Shorthand: use --export csv flag on the history command directly
+cloudberry-ctl queries history --cluster my-cluster --last 24h --export csv
+```
+
+The CSV export includes the following columns:
+
+| Column | Description |
+|--------|-------------|
+| `query_id` | Unique query identifier |
+| `username` | Database user |
+| `database` | Database name |
+| `query_text` | Full SQL text |
+| `start_time` | Query start time (RFC 3339) |
+| `end_time` | Query end time (RFC 3339) |
+| `duration_ms` | Duration in milliseconds |
+| `rows_affected` | Rows affected or returned |
+| `cpu_time_ms` | CPU time in milliseconds |
+| `memory_bytes` | Peak memory usage |
+| `spill_bytes` | Data spilled to disk |
+| `state` | Final query state |
+
+> **Note**: The CSV export streams rows directly from the database to the HTTP response without buffering the entire result set in memory. No pagination limits are applied — all matching rows are included. This makes it suitable for exporting large history datasets.
+
+### CLI Commands for Query History
+
+All query history commands are under the `queries history` command group:
+
+| Command | Description |
+|---------|-------------|
+| `queries history list` | List query history with optional filters |
+| `queries history detail` | Show detailed information for a specific query |
+| `queries history export` | Export query history to CSV |
+
+**`queries history list` flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--last` | string | Show history from the last duration (e.g., `24h`, `7d`) |
+| `--user` | string | Filter by username |
+| `--database` | string | Filter by database name |
+| `--pattern` | string | Search pattern (regex or wildcard) |
+| `--pattern-type` | string | Pattern type: `regex` (default) or `wildcard` |
+| `--resource-group` | string | Filter by resource group |
+| `--limit` | int | Maximum number of results (default: 50, max: 100) |
+| `--offset` | int | Pagination offset |
+
+**`queries history detail` flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--query-id` | string | Yes | Query ID to show details for |
+
+**`queries history export` flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `-O`, `--output-file` | string | Output file path (stdout if omitted) |
+| `--last` | string | Export history from the last duration |
+| `--user` | string | Filter by username |
+| `--database` | string | Filter by database name |
+| `--pattern` | string | Search pattern |
+| `--pattern-type` | string | Pattern type: `regex` or `wildcard` |
+
+### Query History Metrics
+
+The operator exposes Prometheus metrics for monitoring the query history subsystem:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_query_history_total` | Counter | Total queries recorded in the history table |
+| `cloudberry_query_history_search_duration_seconds` | Histogram | Duration of history search operations |
+| `cloudberry_query_history_export_total` | Counter | Total history export operations |
+| `cloudberry_query_history_retention_deleted_total` | Counter | Total entries deleted by retention cleanup |
+| `cloudberry_query_history_size_bytes` | Gauge | Estimated size of the query history table |
+
+```promql
+# Search latency (95th percentile)
+histogram_quantile(0.95, rate(cloudberry_query_history_search_duration_seconds_bucket[5m]))
+
+# Export rate
+rate(cloudberry_query_history_export_total[1h])
+
+# Retention cleanup activity
+increase(cloudberry_query_history_retention_deleted_total[24h])
+```
+
+> **Note**: Query history is verified by Scenario 61. See `test/functional/scenario61_query_history_test.go` and `test/e2e/scenario61_query_history_e2e_test.go` for the full test suite.
+
+## Plan Analysis
+
+The plan analysis feature provides a static checker for PostgreSQL/Cloudberry `EXPLAIN ANALYZE` output. It identifies performance issues in query execution plans and provides actionable recommendations — all without requiring a database connection.
+
+### What is Plan Analysis?
+
+When you run `EXPLAIN ANALYZE` on a query, the database produces a detailed execution plan showing how the query was executed, including actual row counts, timing, and resource usage. The plan checker parses this output and applies six detection rules to identify common performance problems such as:
+
+- Sequential scans on large tables (missing indexes)
+- Row estimate mismatches (stale statistics)
+- Sort operations spilling to disk (insufficient `work_mem`)
+- Nested loops processing excessive rows (suboptimal join strategy)
+- Filters removing disproportionate rows (missing indexes on filter columns)
+- High-cost nodes (general optimization opportunities)
+
+### Using Plan Check via CLI
+
+**Step 1**: Obtain an EXPLAIN ANALYZE plan from your database:
+
+```sql
+EXPLAIN ANALYZE SELECT o.*, c.name
+FROM orders o JOIN customers c ON o.customer_id = c.id
+WHERE o.total > 1000;
+```
+
+Save the output to a file (e.g., `explain.txt`).
+
+**Step 2**: Run the plan checker:
+
+```bash
+# Analyze a plan from a file
+cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt
+
+# Analyze a plan from stdin
+cat explain.txt | cloudberry-ctl queries plan-check --cluster my-cluster -f -
+
+# Get JSON output for programmatic use
+cloudberry-ctl queries plan-check --cluster my-cluster -f explain.txt -o json
+```
+
+**Example output (table format)**:
+
+```
+SEVERITY  CATEGORY               NODE TYPE     RELATION  DESCRIPTION
+warning   sequential_scan        Seq Scan      orders    Sequential scan on orders returned 50000 rows
+warning   row_estimate_mismatch  Seq Scan      orders    Row estimate mismatch on orders: estimated 100 rows, actual 50000 rows (499x off)
+warning   excessive_filter_rows  Seq Scan      orders    Filter removed 19x more rows than returned (950000 removed vs 50000 returned)
+warning   sort_spill             Sort                    Sort spilled to disk using 8192kB
+
+Summary: Found 4 performance issues: 4 warning(s)
+Total nodes: 5 | Execution time: 150.000 ms
+```
+
+### Interpreting Results
+
+Each issue includes:
+
+| Field | Description |
+|-------|-------------|
+| **Severity** | `warning` (actionable problem) or `info` (optimization opportunity) |
+| **Category** | Machine-readable category for filtering and automation |
+| **Node Type** | The plan node where the issue was found (e.g., `Seq Scan`, `Sort`, `Nested Loop`) |
+| **Relation** | The table name involved (if applicable) |
+| **Description** | Human-readable explanation of the issue |
+| **Recommendation** | Specific action to resolve the issue |
+
+**Common actions based on results**:
+
+| Issue Category | Recommended Action |
+|----------------|-------------------|
+| `sequential_scan` | Create an index on the table, targeting the filter condition |
+| `row_estimate_mismatch` | Run `ANALYZE` on the affected tables to update planner statistics |
+| `sort_spill` | Increase `work_mem` to allow in-memory sorting |
+| `nested_loop_high_rows` | Consider rewriting the query to use Hash Join or Merge Join |
+| `excessive_filter_rows` | Add an index on the column used in the filter condition |
+| `high_cost_node` | Review the node for general optimization (partitioning, materialized views, etc.) |
+
+### Detection Rules Reference
+
+| Rule | Trigger | Threshold |
+|------|---------|-----------|
+| Sequential Scan | `Seq Scan` node with high actual rows | `actualRows > 10,000` |
+| Row Estimate Mismatch | Large difference between estimated and actual rows | Ratio `> 10x` |
+| Sort Spill | Sort operation using disk instead of memory | `SortSpaceType == "Disk"` |
+| Nested Loop High Rows | Nested loop processing excessive total rows | `actualRows * loops > 100,000` |
+| Excessive Filter Rows | Filter removing far more rows than returned | `RowsRemoved > 10 * ActualRows` AND `RowsRemoved > 1,000` |
+| High-Cost Node | Any node with very high estimated cost | `TotalCost > 10,000` |
+
+### Plan Analysis Metrics
+
+The following Prometheus metrics track plan check usage:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_plan_check_total` | Counter | Total plan check operations performed |
+| `cloudberry_plan_check_duration_seconds` | Histogram | Duration of plan check operations |
+| `cloudberry_plan_check_issues_total` | Counter | Issues detected, by category and severity |
+
+```promql
+# Plan check rate
+rate(cloudberry_plan_check_total[5m])
+
+# Plan check latency (95th percentile)
+histogram_quantile(0.95, rate(cloudberry_plan_check_duration_seconds_bucket[5m]))
+
+# Most common issue categories
+topk(5, sum by (category) (rate(cloudberry_plan_check_issues_total[1h])))
+```
+
+> **Note**: Plan analysis is verified by Scenario 62. See `test/functional/scenario62_plan_analysis_test.go` and `test/e2e/scenario62_plan_analysis_e2e_test.go` for the full test suite.
+
+## Query Cancellation
+
+The operator allows you to cancel a running query by its backend process ID (PID). This calls `pg_cancel_backend()` on the coordinator database, which interrupts the current query but keeps the session connected. An optional reason can be provided for audit logging.
+
+### Canceling a Running Query
+
+```bash
+# Cancel a query by PID
+cloudberry-ctl queries cancel --cluster my-cluster --query-id 12345
+
+# Cancel with a reason (logged for audit)
+cloudberry-ctl queries cancel --cluster my-cluster --query-id 12345 --reason "Too long"
+```
+
+Or via the REST API:
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/12345/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Query running too long"}'
+```
+
+**Response:**
+
+```json
+{
+  "pid": 12345,
+  "canceled": true,
+  "reason": "Query running too long"
+}
+```
+
+The `canceled` field indicates whether `pg_cancel_backend()` returned `true`. A value of `false` means the PID was not found or the query had already completed.
+
+### Query Cancel Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_query_cancel_total` | Counter | Total query cancel operations performed |
+
+```promql
+# Cancel rate over time
+rate(cloudberry_query_cancel_total[5m])
+```
+
+> **Note**: Query cancellation requires `Operator` permission level. The PID must be a positive integer.
+
+## Query Move (Resource Group Reassignment)
+
+The operator supports moving a running query to a different resource group. This is useful when a query is consuming too many resources in its current group and needs to be throttled or given more resources by reassigning it to a different group.
+
+### Moving a Query to a Different Resource Group
+
+```bash
+# Move a query to the "etl" resource group
+cloudberry-ctl queries move --cluster my-cluster --query-id 12345 --target-group etl
+```
+
+Or via the REST API:
+
+```bash
+curl -u admin:password -X POST \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/queries/12345/move \
+  -H "Content-Type: application/json" \
+  -d '{"targetGroup": "etl"}'
+```
+
+**Response:**
+
+```json
+{
+  "pid": 12345,
+  "moved": true,
+  "targetGroup": "etl",
+  "previousGroup": "default_group"
+}
+```
+
+The move operation reassigns the user's resource group via `ALTER ROLE`, which affects the running query's resource allocation.
+
+### Query Move Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_query_move_total` | Counter | Total query move operations performed |
+
+```promql
+# Move rate over time
+rate(cloudberry_query_move_total[5m])
+```
+
+> **Note**: Query move requires `Operator` permission level. The target resource group must exist in the cluster.
+
+## Exporter Health Monitoring
+
+The operator provides a unified health check endpoint for all Prometheus exporters deployed with a cluster. This allows operators to quickly verify that metric collection is functioning correctly without manually checking individual exporter pods.
+
+### Checking Exporter Health
+
+```bash
+# List exporter health status
+cloudberry-ctl metrics exporters --cluster my-cluster
+```
+
+**Output (table):**
+
+```
+NAME                         TYPE                        PORT  HEALTHY  LAST SCRAPE           METRICS
+postgres-exporter            postgres_exporter           9187  true     2026-05-30T10:00:15Z  142
+cloudberry-query-exporter    cloudberry_query_exporter   9188  true     2026-05-30T10:00:15Z  87
+node-exporter                node_exporter               9100  true     2026-05-30T10:00:15Z  256
+```
+
+Or via the REST API:
+
+```bash
+curl -u admin:password \
+  http://operator:8090/api/v1alpha1/clusters/my-cluster/metrics/exporters
+```
+
+**Response:**
+
+```json
+{
+  "exporters": [
+    {
+      "name": "postgres-exporter",
+      "type": "postgres_exporter",
+      "port": 9187,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 142,
+      "errorMessage": ""
+    },
+    {
+      "name": "cloudberry-query-exporter",
+      "type": "cloudberry_query_exporter",
+      "port": 9188,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 87,
+      "errorMessage": ""
+    },
+    {
+      "name": "node-exporter",
+      "type": "node_exporter",
+      "port": 9100,
+      "healthy": true,
+      "lastScrape": "2026-05-30T10:00:15Z",
+      "scrapeInterval": "15s",
+      "metricsCount": 256,
+      "errorMessage": ""
+    }
+  ],
+  "total": 3,
+  "healthyCount": 3
+}
+```
+
+### Exporter Types
+
+| Exporter | Container | Port | Description |
+|----------|-----------|------|-------------|
+| `postgres_exporter` | `postgres-exporter` | 9187 | Coordinator sidecar — collects PostgreSQL metrics via custom queries |
+| `cloudberry_query_exporter` | `cloudberry-query-exporter` | 9188 | Coordinator sidecar — collects Cloudberry-specific metrics |
+| `node_exporter` | `node-exporter` | 9100 | Segment host DaemonSet — collects OS-level metrics |
+
+### Exporter Health Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cloudberry_exporter_health_check_total` | Counter | Total exporter health check operations performed |
+
+```promql
+# Health check rate
+rate(cloudberry_exporter_health_check_total[5m])
+```
+
+> **Note**: Exporter health check requires `Basic` permission level (read-only). The health check performs an HTTP GET to each exporter's `/metrics` endpoint with a 5-second timeout.
+
+> **Note**: Query operations (cancel, move) and exporter health monitoring are verified by Scenario 63. See `test/functional/scenario63_all_rest_api_test.go` and `test/e2e/scenario63_all_rest_api_e2e_test.go` for the full test suite.
 
 ## Resource Group Management
 
@@ -4022,6 +4743,39 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_pvc_size_bytes` | Gauge | PVC size in bytes (labels: `cluster`, `namespace`, `component`) |
 | `cloudberry_resource_group_cpu_usage` | Gauge | CPU usage per resource group (labels: `cluster`, `namespace`, `group`) |
 | `cloudberry_resource_group_memory_usage` | Gauge | Memory usage per resource group (labels: `cluster`, `namespace`, `group`) |
+| `cloudberry_slow_queries_total` | Counter | Slow queries detected (labels: `cluster`, `namespace`) |
+| `cloudberry_workload_rule_actions_total` | Counter | Workload rule actions applied (labels: `cluster`, `namespace`, `rule`, `action`) |
+
+### Security and Lifecycle Metrics
+
+The operator records dedicated metrics for webhook/certificate rotation, Vault operations, admission decisions, and cluster lifecycle workflows (upgrades, rolling restarts, and recovery).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_cert_rotation_total` | Counter | `component`, `source`, `result` | Webhook/cert TLS rotation events. `source` is `vault-pki` or `self-signed`; `result` is `success` or `error` |
+| `cloudberry_cert_expiry_seconds` | Gauge | `component` | Seconds until the certificate expires per component |
+| `cloudberry_vault_operations_total` | Counter | `operation`, `result` | Vault auth/read/write operations. `operation` is `auth`, `read`, or `write`; `result` is `success` or `error` |
+| `cloudberry_vault_operation_duration_seconds` | Histogram | `operation` | Duration of Vault operations in seconds |
+| `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error` |
+| `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
+| `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
+| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; `result` is `started`, `completed`, or `failed` |
+
+**Useful PromQL queries:**
+
+```promql
+# Certificates expiring within the next 7 days
+cloudberry_cert_expiry_seconds < 604800
+
+# Vault operation error rate (last 5 minutes)
+sum(rate(cloudberry_vault_operations_total{result="error"}[5m])) by (operation)
+
+# Denied admission decisions over the last hour
+increase(cloudberry_webhook_admission_total{result="denied"}[1h])
+
+# Upgrade rollbacks per cluster (last 24 hours)
+increase(cloudberry_upgrade_operations_total{result="rollback"}[24h])
+```
 
 ### ServiceMonitor
 
@@ -4049,6 +4803,165 @@ spec:
 ```
 
 Traces include spans for reconciliation loops, API requests, database operations, and Vault interactions.
+
+### Query Monitoring
+
+Enable query monitoring with exporters, ServiceMonitor, and PrometheusRule in the CRD:
+
+```yaml
+spec:
+  queryMonitoring:
+    enabled: true
+    historyRetention: "30d"
+    samplingInterval: 5
+    guestAccess: false
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:0.16.0"
+        port: 9187
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+      nodeExporter:
+        enabled: true
+        image: "prom/node-exporter:1.8.2"
+        port: 9100
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+      serviceMonitor:
+        enabled: true
+        interval: "15s"
+        scrapeTimeout: "10s"
+        labels:
+          team: "platform"
+      prometheusRule:
+        enabled: true
+        labels:
+          team: "platform"
+```
+
+**Configuration fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable query monitoring |
+| `historyRetention` | string | `""` | How long to retain query history (e.g. `"30d"`, `"90d"`) |
+| `samplingInterval` | int32 | `0` | Sampling interval in seconds |
+| `guestAccess` | bool | `false` | Allow guest access to query monitoring |
+| `planCollection` | bool | `false` | Enable query plan collection |
+| `slowQueryThreshold` | string | `""` | Threshold for slow query detection (e.g. `"1000ms"`) |
+
+**Exporter types:**
+
+| Exporter | Purpose | Default Port |
+|----------|---------|-------------|
+| `postgresExporter` | Exposes PostgreSQL metrics via `postgres_exporter` | 9187 |
+| `nodeExporter` | Exposes host-level metrics via `node_exporter` | 9100 |
+| `cloudberryQueryExporter` | Exposes Cloudberry-specific query metrics | 9188 |
+
+Each exporter supports `enabled`, `image`, `port`, and optional `resources` (requests/limits for CPU and memory).
+
+**ServiceMonitor** creates a Prometheus Operator `ServiceMonitor` resource for automatic scrape target discovery. Set `namespace` to override the target namespace (defaults to the cluster namespace). Use `labels` to add custom labels for Prometheus selector matching.
+
+**PrometheusRule** creates a Prometheus Operator `PrometheusRule` resource for alerting rules. Set `namespace` and `labels` similarly to ServiceMonitor.
+
+### Pause/Resume Monitor
+
+The query monitor can be paused to freeze data at a point in time. While paused, all query monitoring endpoints return cached snapshot data with a `stale` indicator, allowing operators to inspect a consistent view without live data changing.
+
+**Pause the monitor:**
+
+```bash
+cloudberry-ctl queries monitor pause --cluster my-cluster
+```
+
+**Check monitor state:**
+
+```bash
+cloudberry-ctl queries monitor state --cluster my-cluster
+```
+
+**Resume the monitor:**
+
+```bash
+cloudberry-ctl queries monitor resume --cluster my-cluster
+```
+
+**Behavior while paused:**
+
+- `GET /queries/active` returns the snapshot with `stale: true` and `pausedAt` timestamp
+- `GET /queries` returns the snapshot with `stale: true` and `pausedAt` timestamp
+- `GET /queries/monitor/state` returns `paused: true`, `stale: true`, and `pausedAt`
+- New query data is not fetched until the monitor is resumed
+
+**Permission requirements:**
+
+- Pause/Resume: Operator permission
+- Get state: Basic permission
+
+### Disabling Query Monitoring
+
+To disable query monitoring entirely, set `enabled: false` in the `queryMonitoring` section:
+
+```yaml
+spec:
+  queryMonitoring:
+    enabled: false
+```
+
+When monitoring is disabled, all monitoring-specific API endpoints return HTTP 200 with:
+
+```json
+{
+  "monitoringEnabled": false,
+  "message": "query monitoring is not enabled for this cluster"
+}
+```
+
+**Affected endpoints**: `/queries`, `/queries/active`, `/queries/history`, `/queries/history/{qid}`, `/queries/history/export`, `/queries/monitor/state`, `/queries/monitor/pause`, `/metrics/exporters`.
+
+**Unaffected endpoints**: `/sessions`, `/queries/plan-check`, `/queries/{pid}/cancel`, `/queries/{pid}/move`, `/queries/{pid}` continue to work normally.
+
+To re-enable monitoring, set `enabled: true` and the endpoints will immediately return live data again.
+
+### Plan Collection Configuration
+
+The `planCollection` field controls whether the `cloudberry-query-exporter` captures EXPLAIN plans for slow queries:
+
+```yaml
+spec:
+  queryMonitoring:
+    enabled: true
+    planCollection: false    # Disable plan collection
+    slowQueryThreshold: "1000ms"
+```
+
+When `planCollection: false`:
+- The `--plan-collection` flag is omitted from the exporter container args
+- Query history entries will have an empty `explainPlan` field
+- All other monitoring (active queries, history, slow query detection) continues normally
+- Useful when running EXPLAIN on production queries is undesirable
+
+When `planCollection: true` (default when monitoring is enabled):
+- The exporter captures `EXPLAIN (FORMAT TEXT)` output for queries exceeding `slowQueryThreshold`
+- Plans are stored in the `explainPlan` field of query history entries
+- A 2-second timeout prevents EXPLAIN from blocking
 
 ### Structured Logging
 
@@ -4362,4 +5275,30 @@ make monitoring-status
 make monitoring-undeploy
 ```
 
-Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory.
+### Grafana Dashboards
+
+Three pre-built Grafana dashboards are available in the `monitoring/grafana/` directory:
+
+| Dashboard | UID | Description |
+|-----------|-----|-------------|
+| Cloudberry Operator | `cloudberry-operator` | Cluster overview, reconciliation metrics, query activity |
+| Cloudberry Exporters | `cloudberry-exporters` | postgres-exporter and query-exporter health and scrape metrics |
+| Cloudberry Node Metrics | `cloudberry-node-metrics` | Host-level CPU, memory, disk, and network metrics |
+
+All dashboards use VictoriaMetrics as the datasource and are tagged with `cloudberry`.
+
+```bash
+# Publish dashboards to Grafana (creates datasources + imports dashboards)
+make grafana-publish
+
+# Open Grafana in browser
+make grafana-open
+
+# Full test environment setup (includes dashboard publishing)
+make test-env-setup
+```
+
+Dashboard URLs (default Grafana at `http://127.0.0.1:3000`, credentials `admin/admin`):
+- Operator: `http://127.0.0.1:3000/d/cloudberry-operator`
+- Exporters: `http://127.0.0.1:3000/d/cloudberry-exporters`
+- Node Metrics: `http://127.0.0.1:3000/d/cloudberry-node-metrics`

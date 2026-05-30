@@ -10,6 +10,7 @@ import (
 
 	vaultapi "github.com/hashicorp/vault/api"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -17,6 +18,17 @@ const (
 	authMethodToken      = "token"
 	authMethodKubernetes = "kubernetes"
 	authMethodAppRole    = "approle"
+
+	// vaultOpAuth, vaultOpRead, and vaultOpWrite are the operation label values
+	// used for Vault operation metrics.
+	vaultOpAuth  = "auth"
+	vaultOpRead  = "read"
+	vaultOpWrite = "write"
+
+	// metricResultSuccess and metricResultError are the result label values used
+	// for Vault operation metrics.
+	metricResultSuccess = "success"
+	metricResultError   = "error"
 )
 
 // kubeTokenPath is the path to the Kubernetes service account token file.
@@ -67,11 +79,41 @@ type vaultClient struct {
 	config    Config
 	retryOpts util.RetryOptions
 	logger    *slog.Logger
+	// recorder records Vault operation metrics. It is optional and may be nil;
+	// all metric recording is guarded with a nil check.
+	recorder metrics.Recorder
+}
+
+// SetRecorder sets an optional metrics recorder for Vault operations.
+// It is safe to leave the recorder unset (nil); metric recording is then a no-op.
+func (v *vaultClient) SetRecorder(recorder metrics.Recorder) {
+	v.recorder = recorder
+}
+
+// recordVaultOp records a Vault operation metric and its duration when a recorder
+// is configured. It is nil-safe.
+func (v *vaultClient) recordVaultOp(operation string, start time.Time, err error) {
+	if v.recorder == nil {
+		return
+	}
+	result := metricResultSuccess
+	if err != nil {
+		result = metricResultError
+	}
+	v.recorder.RecordVaultOperation(operation, result)
+	v.recorder.ObserveVaultOperationDuration(operation, time.Since(start))
 }
 
 // NewClient creates a new Vault client.
 // If Vault is not enabled, returns a no-op client.
-func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, error) {
+// An optional metrics recorder may be supplied to record Vault operation metrics;
+// when omitted (or nil), metric recording is a no-op.
+func NewClient(
+	ctx context.Context,
+	cfg Config,
+	logger *slog.Logger,
+	recorder ...metrics.Recorder,
+) (Client, error) {
 	if !cfg.Enabled {
 		return &noopClient{}, nil
 	}
@@ -110,6 +152,9 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 		retryOpts: retryOpts,
 		logger:    logger,
 	}
+	if len(recorder) > 0 {
+		vc.recorder = recorder[0]
+	}
 
 	if err := vc.authenticate(ctx); err != nil {
 		return nil, fmt.Errorf("authenticating with vault: %w", err)
@@ -120,7 +165,8 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 
 // authenticate performs Vault authentication based on the configured method.
 func (v *vaultClient) authenticate(ctx context.Context) error {
-	return util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
+	start := time.Now()
+	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		switch v.config.AuthMethod {
 		case authMethodToken:
 			return v.authenticateToken()
@@ -132,6 +178,8 @@ func (v *vaultClient) authenticate(ctx context.Context) error {
 			return fmt.Errorf("unsupported vault auth method: %s", v.config.AuthMethod)
 		}
 	})
+	v.recordVaultOp(vaultOpAuth, start, err)
+	return err
 }
 
 // authenticateToken sets the Vault token directly.
@@ -209,6 +257,7 @@ func (v *vaultClient) authenticateAppRole(ctx context.Context) error {
 func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]interface{}, error) {
 	var result map[string]interface{}
 
+	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		secret, readErr := v.client.Logical().ReadWithContext(ctx, path)
 		if readErr != nil {
@@ -227,6 +276,7 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 		}
 		return nil
 	})
+	v.recordVaultOp(vaultOpRead, start, err)
 
 	if err != nil {
 		return nil, err
@@ -238,6 +288,7 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 
 // WriteSecret writes a secret to Vault KV v2.
 func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[string]interface{}) error {
+	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		// KV v2 expects data wrapped in a "data" key.
 		wrappedData := map[string]interface{}{
@@ -249,6 +300,7 @@ func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[str
 		}
 		return nil
 	})
+	v.recordVaultOp(vaultOpWrite, start, err)
 
 	if err != nil {
 		return err
@@ -266,6 +318,7 @@ func (v *vaultClient) WriteSecretWithResponse(
 ) (map[string]interface{}, error) {
 	var result map[string]interface{}
 
+	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		secret, writeErr := v.client.Logical().WriteWithContext(ctx, path, data)
 		if writeErr != nil {
@@ -277,6 +330,7 @@ func (v *vaultClient) WriteSecretWithResponse(
 		result = secret.Data
 		return nil
 	})
+	v.recordVaultOp(vaultOpWrite, start, err)
 
 	if err != nil {
 		return nil, err

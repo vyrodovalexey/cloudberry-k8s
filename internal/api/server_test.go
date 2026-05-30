@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,6 +61,9 @@ func newTestCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
 			Segments: cbv1alpha1.SegmentsSpec{
 				Count:   4,
 				Storage: cbv1alpha1.StorageSpec{Size: "20Gi"},
+			},
+			QueryMonitoring: &cbv1alpha1.QueryMonitoringSpec{
+				Enabled: true,
 			},
 		},
 		Status: cbv1alpha1.CloudberryClusterStatus{
@@ -1361,6 +1367,305 @@ func TestHandleGetActiveQueries_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// Monitor pause/resume endpoint tests.
+
+func TestHandlePauseMonitor(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 5
+	cluster.Status.QueuedQueries = 2
+	cluster.Status.BlockedQueries = 1
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handlePauseMonitor(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "paused", resp["status"])
+	assert.NotEmpty(t, resp["pausedAt"])
+	assert.Equal(t, "Query monitor paused", resp["message"])
+}
+
+func TestHandlePauseMonitor_AlreadyPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 5
+	s := newTestServer(cluster)
+
+	// Pause first time.
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handlePauseMonitor(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Pause again — should return already paused.
+	req2 := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	req2.SetPathValue("name", "test-cluster")
+	rec2 := httptest.NewRecorder()
+	s.handlePauseMonitor(rec2, req2)
+	assert.Equal(t, http.StatusOK, rec2.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec2.Body).Decode(&resp))
+	assert.Equal(t, "paused", resp["status"])
+	assert.Contains(t, resp["message"], "already paused")
+}
+
+func TestHandlePauseMonitor_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/nonexistent/queries/monitor/pause?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handlePauseMonitor(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleResumeMonitor(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	// Pause first.
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handlePauseMonitor(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Resume.
+	req2 := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/resume?namespace=default", nil)
+	req2.SetPathValue("name", "test-cluster")
+	rec2 := httptest.NewRecorder()
+	s.handleResumeMonitor(rec2, req2)
+	assert.Equal(t, http.StatusOK, rec2.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec2.Body).Decode(&resp))
+	assert.Equal(t, "resumed", resp["status"])
+	assert.Equal(t, "Query monitor resumed", resp["message"])
+}
+
+func TestHandleResumeMonitor_NotPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	// Resume without pausing first — should still succeed.
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/resume?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleResumeMonitor(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "resumed", resp["status"])
+}
+
+func TestHandleResumeMonitor_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/nonexistent/queries/monitor/resume?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleResumeMonitor(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetMonitorState_NotPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/state?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetMonitorState(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, false, resp["paused"])
+	assert.Equal(t, false, resp["stale"])
+	assert.Nil(t, resp["pausedAt"])
+}
+
+func TestHandleGetMonitorState_Paused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	// Pause first.
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handlePauseMonitor(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Check state.
+	req2 := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/state?namespace=default", nil)
+	req2.SetPathValue("name", "test-cluster")
+	rec2 := httptest.NewRecorder()
+	s.handleGetMonitorState(rec2, req2)
+	assert.Equal(t, http.StatusOK, rec2.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec2.Body).Decode(&resp))
+	assert.Equal(t, true, resp["paused"])
+	assert.Equal(t, true, resp["stale"])
+	assert.NotNil(t, resp["pausedAt"])
+}
+
+func TestHandleGetMonitorState_NotFound(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/queries/monitor/state?namespace=default", nil)
+	req.SetPathValue("name", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleGetMonitorState(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestHandleGetQueryMonitoring_WhenPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 5
+	cluster.Status.QueuedQueries = 2
+	cluster.Status.BlockedQueries = 1
+	s := newTestServer(cluster)
+
+	// Pause the monitor.
+	pauseReq := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	pauseReq.SetPathValue("name", "test-cluster")
+	pauseRec := httptest.NewRecorder()
+	s.handlePauseMonitor(pauseRec, pauseReq)
+	assert.Equal(t, http.StatusOK, pauseRec.Code)
+
+	// Now query monitoring should return stale data.
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetQueryMonitoring(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, true, resp["stale"])
+	assert.NotNil(t, resp["pausedAt"])
+	assert.Equal(t, float64(5), resp["activeQueries"])
+	assert.Equal(t, float64(2), resp["queuedQueries"])
+	assert.Equal(t, float64(1), resp["blockedQueries"])
+}
+
+func TestHandleGetActiveQueries_WhenPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 10
+	cluster.Status.QueuedQueries = 3
+	cluster.Status.BlockedQueries = 0
+	s := newTestServer(cluster)
+
+	// Pause the monitor.
+	pauseReq := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	pauseReq.SetPathValue("name", "test-cluster")
+	pauseRec := httptest.NewRecorder()
+	s.handlePauseMonitor(pauseRec, pauseReq)
+	assert.Equal(t, http.StatusOK, pauseRec.Code)
+
+	// Now active queries should return stale data.
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries/active?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetActiveQueries(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, true, resp["stale"])
+	assert.NotNil(t, resp["pausedAt"])
+	assert.Equal(t, float64(10), resp["activeQueries"])
+	assert.Equal(t, float64(3), resp["queuedQueries"])
+}
+
+func TestHandleGetQueryMonitoring_AfterResume(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.ActiveQueries = 5
+	s := newTestServer(cluster)
+
+	// Pause.
+	pauseReq := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/pause?namespace=default", nil)
+	pauseReq.SetPathValue("name", "test-cluster")
+	pauseRec := httptest.NewRecorder()
+	s.handlePauseMonitor(pauseRec, pauseReq)
+	assert.Equal(t, http.StatusOK, pauseRec.Code)
+
+	// Resume.
+	resumeReq := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/queries/monitor/resume?namespace=default", nil)
+	resumeReq.SetPathValue("name", "test-cluster")
+	resumeRec := httptest.NewRecorder()
+	s.handleResumeMonitor(resumeRec, resumeReq)
+	assert.Equal(t, http.StatusOK, resumeRec.Code)
+
+	// Query monitoring should return fresh data (no stale flag).
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleGetQueryMonitoring(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Nil(t, resp["stale"])
+	assert.Nil(t, resp["pausedAt"])
+	assert.Equal(t, float64(5), resp["activeQueries"])
+}
+
+func TestMonitorStateKey(t *testing.T) {
+	assert.Equal(t, "default/test-cluster", monitorStateKey("default", "test-cluster"))
+	assert.Equal(t, "prod/my-db", monitorStateKey("prod", "my-db"))
+}
+
+func TestIsMonitorPaused_NotPaused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	state, paused := s.isMonitorPaused("default", "test-cluster")
+	assert.False(t, paused)
+	assert.Nil(t, state)
+}
+
+func TestIsMonitorPaused_Paused(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+
+	// Manually set paused state.
+	now := time.Now().UTC()
+	s.monitorStates["default/test-cluster"] = &monitorState{
+		Paused:   true,
+		PausedAt: &now,
+		Snapshot: map[string]interface{}{"activeQueries": 5},
+	}
+
+	state, paused := s.isMonitorPaused("default", "test-cluster")
+	assert.True(t, paused)
+	assert.NotNil(t, state)
+	assert.Equal(t, true, state.Paused)
+}
+
 // Storage endpoint tests.
 
 func TestHandleGetDiskUsage(t *testing.T) {
@@ -1652,23 +1957,25 @@ func (m *mockAuthProvider) Type() string {
 
 // mockDBClient implements db.Client for testing.
 type mockDBClient struct {
-	sessions            []db.Session
-	listSessionsErr     error
-	cancelResult        bool
-	cancelQueryErr      error
-	terminateResult     bool
-	terminateSessionErr error
-	resGroups           []db.ResourceGroupInfo
-	listResGroupsErr    error
-	createResGroupErr   error
-	alterResGroupErr    error
-	dropResGroupErr     error
-	assignRoleErr       error
-	resQueues           []db.ResourceQueueInfo
-	listResQueuesErr    error
-	createResQueueErr   error
-	dropResQueueErr     error
-	closeCalls          int
+	sessions                 []db.Session
+	listSessionsErr          error
+	sessionsWithGroup        []db.SessionWithGroup
+	listSessionsWithGroupErr error
+	cancelResult             bool
+	cancelQueryErr           error
+	terminateResult          bool
+	terminateSessionErr      error
+	resGroups                []db.ResourceGroupInfo
+	listResGroupsErr         error
+	createResGroupErr        error
+	alterResGroupErr         error
+	dropResGroupErr          error
+	assignRoleErr            error
+	resQueues                []db.ResourceQueueInfo
+	listResQueuesErr         error
+	createResQueueErr        error
+	dropResQueueErr          error
+	closeCalls               int
 }
 
 func (m *mockDBClient) Ping(_ context.Context) error { return nil }
@@ -1799,9 +2106,32 @@ func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewI
 }
 func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error { return nil }
 func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
-	return nil, nil
+	return m.sessionsWithGroup, m.listSessionsWithGroupErr
 }
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) { return nil, nil }
+func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error   { return nil }
+func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
+	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+func (m *mockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
+func (m *mockDBClient) InsertQueryHistory(_ context.Context, _ *db.QueryHistoryEntry) error {
+	return nil
+}
+func (m *mockDBClient) GetQueryHistory(_ context.Context, _ db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error) {
+	return []db.QueryHistoryEntry{}, 0, nil
+}
+func (m *mockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*db.QueryHistoryEntry, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *mockDBClient) ExportQueryHistoryCSV(_ context.Context, _ db.QueryHistoryFilter, _ io.Writer) error {
+	return nil
+}
+func (m *mockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (m *mockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
+	return nil
+}
 
 // mockDBFactory implements db.DBClientFactory for testing.
 type mockDBFactory struct {
@@ -2044,9 +2374,9 @@ func TestHandleStartRecovery_AllValidTypes(t *testing.T) {
 func TestHandleListSessions_WithDBFactory_Success(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 	dbClient := &mockDBClient{
-		sessions: []db.Session{
-			{PID: 100, Username: "admin", State: "active", Query: "SELECT 1"},
-			{PID: 200, Username: "user1", State: "idle"},
+		sessionsWithGroup: []db.SessionWithGroup{
+			{Session: db.Session{PID: 100, Username: "admin", Database: "postgres", State: "active", Query: "SELECT 1"}, ResourceGroup: "admin_group"},
+			{Session: db.Session{PID: 200, Username: "user1", Database: "mydb", State: "idle"}, ResourceGroup: "default_group"},
 		},
 	}
 	s := newTestServerWithDB(dbClient, cluster)
@@ -2079,7 +2409,7 @@ func TestHandleListSessions_WithDBFactory_ConnError(t *testing.T) {
 func TestHandleListSessions_WithDBFactory_ListError(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 	dbClient := &mockDBClient{
-		listSessionsErr: fmt.Errorf("query failed"),
+		listSessionsWithGroupErr: fmt.Errorf("query failed"),
 	}
 	s := newTestServerWithDB(dbClient, cluster)
 
@@ -3762,4 +4092,384 @@ func TestHandleRotatePassword_UpdatesK8sSecret(t *testing.T) {
 	assert.NotEmpty(t, newPw, "new password should not be empty")
 	assert.NotEqual(t, "old-password", newPw, "password should have been rotated")
 	assert.GreaterOrEqual(t, len(newPw), 16, "generated password should be at least 16 characters")
+}
+
+// ============================================================================
+// Session filtering tests (Scenario 59)
+// ============================================================================
+
+func TestFilterSessions(t *testing.T) {
+	now := time.Now()
+	sessions := []db.SessionWithGroup{
+		{
+			Session: db.Session{
+				PID: 100, Username: "admin", Database: "postgres",
+				State: "active", WaitEventType: "", QueryStart: now.Add(-2 * time.Minute),
+			},
+			ResourceGroup: "admin_group",
+		},
+		{
+			Session: db.Session{
+				PID: 200, Username: "analyst", Database: "analytics",
+				State: "idle in transaction", WaitEventType: "", QueryStart: now.Add(-10 * time.Minute),
+			},
+			ResourceGroup: "analytics",
+		},
+		{
+			Session: db.Session{
+				PID: 300, Username: "etl_user", Database: "warehouse",
+				State: "active", WaitEventType: "Lock", QueryStart: now.Add(-30 * time.Minute),
+			},
+			ResourceGroup: "etl",
+		},
+		{
+			Session: db.Session{
+				PID: 400, Username: "analyst", Database: "analytics",
+				State: "idle", WaitEventType: "", QueryStart: now.Add(-1 * time.Hour),
+			},
+			ResourceGroup: "analytics",
+		},
+	}
+
+	t.Run("no filters returns all", func(t *testing.T) {
+		params := make(url.Values)
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 4)
+	})
+
+	t.Run("filter by status running", func(t *testing.T) {
+		params := url.Values{"status": []string{"running"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 2)
+		for _, s := range result {
+			assert.Equal(t, "active", s.State)
+		}
+	})
+
+	t.Run("filter by status queued", func(t *testing.T) {
+		params := url.Values{"status": []string{"queued"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(200), result[0].PID)
+	})
+
+	t.Run("filter by status blocked", func(t *testing.T) {
+		params := url.Values{"status": []string{"blocked"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(300), result[0].PID)
+	})
+
+	t.Run("filter by status idle", func(t *testing.T) {
+		params := url.Values{"status": []string{"idle"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(400), result[0].PID)
+	})
+
+	t.Run("filter by database", func(t *testing.T) {
+		params := url.Values{"database": []string{"analytics"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 2)
+		for _, s := range result {
+			assert.Equal(t, "analytics", s.Database)
+		}
+	})
+
+	t.Run("filter by user", func(t *testing.T) {
+		params := url.Values{"user": []string{"analyst"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 2)
+		for _, s := range result {
+			assert.Equal(t, "analyst", s.Username)
+		}
+	})
+
+	t.Run("filter by resource_group", func(t *testing.T) {
+		params := url.Values{"resource_group": []string{"etl"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(300), result[0].PID)
+	})
+
+	t.Run("filter by since", func(t *testing.T) {
+		params := url.Values{"since": []string{"5m"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(100), result[0].PID)
+	})
+
+	t.Run("filter by since 15m", func(t *testing.T) {
+		params := url.Values{"since": []string{"15m"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 2)
+	})
+
+	t.Run("combined filters", func(t *testing.T) {
+		params := url.Values{
+			"user":     []string{"analyst"},
+			"database": []string{"analytics"},
+			"status":   []string{"idle"},
+		}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(400), result[0].PID)
+	})
+
+	t.Run("no matches returns empty slice", func(t *testing.T) {
+		params := url.Values{"database": []string{"nonexistent"}}
+		result := filterSessions(sessions, params)
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+
+	t.Run("unknown status matches all", func(t *testing.T) {
+		params := url.Values{"status": []string{"unknown"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 4)
+	})
+
+	t.Run("invalid since duration matches all", func(t *testing.T) {
+		params := url.Values{"since": []string{"invalid"}}
+		result := filterSessions(sessions, params)
+		assert.Len(t, result, 4)
+	})
+
+	t.Run("empty sessions returns empty slice", func(t *testing.T) {
+		params := url.Values{"status": []string{"running"}}
+		result := filterSessions(nil, params)
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+}
+
+func TestHandleListSessions_WithFilters(t *testing.T) {
+	now := time.Now()
+	cluster := newTestCluster("test-cluster", "default")
+	dbClient := &mockDBClient{
+		sessionsWithGroup: []db.SessionWithGroup{
+			{
+				Session:       db.Session{PID: 100, Username: "admin", Database: "postgres", State: "active", QueryStart: now},
+				ResourceGroup: "admin_group",
+			},
+			{
+				Session:       db.Session{PID: 200, Username: "analyst", Database: "analytics", State: "idle", QueryStart: now},
+				ResourceGroup: "analytics",
+			},
+			{
+				Session:       db.Session{PID: 300, Username: "etl_user", Database: "warehouse", State: "active", WaitEventType: "Lock", QueryStart: now},
+				ResourceGroup: "etl",
+			},
+		},
+	}
+	s := newTestServerWithDB(dbClient, cluster)
+
+	t.Run("filter by status", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default&status=running", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(2), resp["total"])
+	})
+
+	t.Run("filter by database", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default&database=analytics", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(1), resp["total"])
+	})
+
+	t.Run("filter by user", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default&user=admin", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(1), resp["total"])
+	})
+
+	t.Run("filter by resource_group", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default&resource_group=etl", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(1), resp["total"])
+	})
+
+	t.Run("filter by blocked status", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default&status=blocked", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(1), resp["total"])
+	})
+
+	t.Run("no filters returns all", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/sessions?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListSessions(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(3), resp["total"])
+	})
+}
+
+// ============================================================================
+// Cancel query with reason tests (Scenario 59b)
+// ============================================================================
+
+func TestHandleCancelQuery_WithReason(t *testing.T) {
+	t.Run("with reason", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+
+		body, _ := json.Marshal(map[string]string{"reason": "query taking too long"})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "123")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["canceled"])
+		assert.Equal(t, "query taking too long", resp["reason"])
+	})
+
+	t.Run("without reason", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "123")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["canceled"])
+		_, hasReason := resp["reason"]
+		assert.False(t, hasReason, "reason should not be present when not provided")
+	})
+
+	t.Run("with empty reason", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+
+		body, _ := json.Marshal(map[string]string{"reason": ""})
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+			bytes.NewReader(body))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "123")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["canceled"])
+		_, hasReason := resp["reason"]
+		assert.False(t, hasReason, "reason should not be present when empty")
+	})
+
+	t.Run("with invalid json body still works", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+			bytes.NewReader([]byte("not-json")))
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "123")
+		rec := httptest.NewRecorder()
+		s.handleCancelQuery(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["canceled"])
+	})
+}
+
+func TestMatchStatus(t *testing.T) {
+	session := db.SessionWithGroup{
+		Session: db.Session{State: "active", WaitEventType: "Lock"},
+	}
+
+	assert.True(t, matchStatus(session, "running"))
+	assert.False(t, matchStatus(session, "idle"))
+	assert.False(t, matchStatus(session, "queued"))
+	assert.True(t, matchStatus(session, "blocked"))
+	assert.True(t, matchStatus(session, "unknown"))
+
+	idleSession := db.SessionWithGroup{
+		Session: db.Session{State: "idle"},
+	}
+	assert.True(t, matchStatus(idleSession, "idle"))
+	assert.False(t, matchStatus(idleSession, "running"))
+
+	queuedSession := db.SessionWithGroup{
+		Session: db.Session{State: "idle in transaction"},
+	}
+	assert.True(t, matchStatus(queuedSession, "queued"))
+	assert.False(t, matchStatus(queuedSession, "running"))
+}
+
+func TestMatchSince(t *testing.T) {
+	now := time.Now()
+
+	recentSession := db.SessionWithGroup{
+		Session: db.Session{QueryStart: now.Add(-2 * time.Minute)},
+	}
+	oldSession := db.SessionWithGroup{
+		Session: db.Session{QueryStart: now.Add(-1 * time.Hour)},
+	}
+
+	assert.True(t, matchSince(recentSession, "5m"))
+	assert.False(t, matchSince(oldSession, "5m"))
+	assert.True(t, matchSince(oldSession, "2h"))
+
+	// Invalid duration returns true (no filtering).
+	assert.True(t, matchSince(oldSession, "invalid"))
+	assert.True(t, matchSince(recentSession, ""))
 }

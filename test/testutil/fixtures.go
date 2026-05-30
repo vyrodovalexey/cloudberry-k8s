@@ -353,6 +353,31 @@ func (b *ClusterBuilder) WithCondition(
 	return b
 }
 
+// WithQueryMonitoringExporters sets the full query monitoring exporters configuration.
+// Configuring exporters implies query monitoring is enabled, so this also sets
+// Spec.QueryMonitoring.Enabled = true (the API now gates monitoring endpoints on
+// this flag via isMonitoringEnabled). Tests that need monitoring explicitly
+// disabled should set Spec.QueryMonitoring.Enabled = false directly.
+func (b *ClusterBuilder) WithQueryMonitoringExporters(exporters *cbv1alpha1.QueryMonitoringExportersSpec) *ClusterBuilder {
+	if b.cluster.Spec.QueryMonitoring == nil {
+		b.cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{}
+	}
+	b.cluster.Spec.QueryMonitoring.Enabled = true
+	b.cluster.Spec.QueryMonitoring.Exporters = exporters
+	return b
+}
+
+// WithQueryMonitoringEnabled enables query monitoring on the cluster without
+// requiring a full exporters configuration. The API gates monitoring endpoints
+// (queries, history, exporter health, etc.) on Spec.QueryMonitoring.Enabled.
+func (b *ClusterBuilder) WithQueryMonitoringEnabled(enabled bool) *ClusterBuilder {
+	if b.cluster.Spec.QueryMonitoring == nil {
+		b.cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{}
+	}
+	b.cluster.Spec.QueryMonitoring.Enabled = enabled
+	return b
+}
+
 // Build returns the constructed CloudberryCluster.
 func (b *ClusterBuilder) Build() *cbv1alpha1.CloudberryCluster {
 	return b.cluster.DeepCopy()

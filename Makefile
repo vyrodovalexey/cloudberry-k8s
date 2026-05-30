@@ -21,9 +21,10 @@ GOARCH           ?= $(shell $(GO) env GOARCH)
 LDFLAGS          := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
 # --- Docker settings ---------------------------------------------------------
-IMG_OPERATOR     ?= cloudberry-operator:latest
-IMG_CTL          ?= cloudberry-ctl:latest
-IMG_CLOUDBERRY   ?= cloudberrydb/cloudberry:2.1.0
+IMG_OPERATOR         ?= cloudberry-operator:latest
+IMG_CTL              ?= cloudberry-ctl:latest
+IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
+IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
@@ -34,7 +35,7 @@ HELM_RELEASE       ?= cloudberry-operator
 HELM_CHART         := deploy/helm/cloudberry-operator
 
 # --- Tool versions -----------------------------------------------------------
-GOLANGCI_LINT_VERSION ?= v1.64.8
+GOLANGCI_LINT_VERSION ?= v2.12.2
 CONTROLLER_GEN_VERSION ?= v0.17.3
 
 # --- Tool binaries -----------------------------------------------------------
@@ -112,7 +113,7 @@ test-all: test test-functional test-integration test-e2e ## Run all tests
 lint: ## Run golangci-lint
 ifndef GOLANGCI_LINT
 	@echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."
-	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 endif
 	golangci-lint run ./...
 
@@ -144,7 +145,7 @@ endif
 docker-build: docker-build-operator docker-build-ctl ## Build Docker images for operator and ctl
 
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-cloudberry ## Build all Docker images (operator, ctl, cloudberry)
+docker-build-all: docker-build docker-build-cloudberry docker-build-query-exporter ## Build all Docker images (operator, ctl, cloudberry, query-exporter)
 
 .PHONY: docker-push
 docker-push: ## Push Docker images
@@ -168,6 +169,13 @@ docker-build-ctl: ## Build cloudberry-ctl Docker image
 		$(DOCKER_BUILD_ARGS) \
 		-t $(IMG_CTL) \
 		-f Dockerfile.ctl .
+
+.PHONY: docker-build-query-exporter
+docker-build-query-exporter: ## Build cloudberry-query-exporter Docker image
+	$(DOCKER) build \
+		$(DOCKER_BUILD_ARGS) \
+		-t $(IMG_QUERY_EXPORTER) \
+		-f Dockerfile.cloudberry-query-exporter .
 
 .PHONY: docker-build-cloudberry
 docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles from source)
@@ -245,22 +253,20 @@ endif
 # =============================================================================
 
 .PHONY: monitoring-deploy
-monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector) to cloudberry-test namespace
+monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + node-exporter) to cloudberry-test namespace
 	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
-	$(HELM) repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+	$(HELM) upgrade --install vmagent test/monitoring/vmagent \
+		--namespace $(NAMESPACE_TEST) \
+		--wait --timeout 2m
+	$(HELM) upgrade --install node-exporter test/monitoring/node-exporter \
+		--namespace $(NAMESPACE_TEST) \
+		--wait --timeout 2m
 	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
 	$(HELM) repo update
-	$(HELM) upgrade --install vmagent prometheus-community/prometheus \
-		--namespace $(NAMESPACE_TEST) \
-		--set server.enabled=false \
-		--set alertmanager.enabled=false \
-		--set kube-state-metrics.enabled=false \
-		--set prometheus-node-exporter.enabled=false \
-		--set prometheus-pushgateway.enabled=false \
-		--wait --timeout 5m
 	$(HELM) upgrade --install otel-collector open-telemetry/opentelemetry-collector \
 		--namespace $(NAMESPACE_TEST) \
 		--set mode=deployment \
+		--set image.repository=otel/opentelemetry-collector-contrib \
 		--set config.receivers.otlp.protocols.grpc.endpoint="0.0.0.0:4317" \
 		--set config.receivers.otlp.protocols.http.endpoint="0.0.0.0:4318" \
 		--wait --timeout 5m
@@ -269,6 +275,7 @@ monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector) to clou
 .PHONY: monitoring-undeploy
 monitoring-undeploy: ## Remove monitoring stack from cloudberry-test namespace
 	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
+	$(HELM) uninstall node-exporter --namespace $(NAMESPACE_TEST) 2>/dev/null || true
 	$(HELM) uninstall vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || true
 	@echo "Monitoring stack removed from namespace $(NAMESPACE_TEST)"
 
@@ -277,11 +284,36 @@ monitoring-status: ## Check monitoring stack status in cloudberry-test namespace
 	@echo "=== VictoriaMetrics Agent ==="
 	$(HELM) status vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "vmagent: not installed"
 	@echo ""
+	@echo "=== Node Exporter ==="
+	$(HELM) status node-exporter --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "node-exporter: not installed"
+	@echo ""
 	@echo "=== OpenTelemetry Collector ==="
 	$(HELM) status otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "otel-collector: not installed"
 	@echo ""
 	@echo "=== Pods ==="
-	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (prometheus,opentelemetry-collector)' 2>/dev/null || echo "No monitoring pods found"
+	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (vmagent,node-exporter,opentelemetry-collector)' 2>/dev/null || echo "No monitoring pods found"
+	@echo ""
+	@echo "=== Grafana Dashboards ==="
+	@curl -sf -u admin:admin http://127.0.0.1:3000/api/search?tag=cloudberry 2>/dev/null | \
+		python3 -c "import json,sys; [print(f'  {d[\"title\"]}: http://127.0.0.1:3000{d[\"url\"]}') for d in json.load(sys.stdin)]" 2>/dev/null || \
+		echo "  Grafana not available (run: make test-env-up)"
+
+# =============================================================================
+# Grafana Dashboard targets
+# =============================================================================
+
+.PHONY: grafana-publish
+grafana-publish: ## Publish Grafana dashboards to test environment
+	bash test/monitoring/scripts/publish-dashboards.sh
+
+.PHONY: grafana-open
+grafana-open: ## Open Grafana in browser (macOS)
+	@echo "Grafana: http://127.0.0.1:3000 (admin/admin)"
+	@echo "Dashboards:"
+	@echo "  Operator:  http://127.0.0.1:3000/d/cloudberry-operator"
+	@echo "  Exporters: http://127.0.0.1:3000/d/cloudberry-exporters"
+	@echo "  Nodes:     http://127.0.0.1:3000/d/cloudberry-node-metrics"
+	@open http://127.0.0.1:3000/d/cloudberry-operator 2>/dev/null || true
 
 # =============================================================================
 # Test Environment targets
@@ -296,11 +328,15 @@ test-env-down: ## Stop test environment
 	$(DOCKER) compose -f test/docker-compose/docker-compose.yml down -v
 
 .PHONY: test-env-setup
-test-env-setup: ## Run Vault and Keycloak setup scripts
+test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka, RabbitMQ) and publish dashboards
 	@echo "Waiting for services to be ready..."
 	@sleep 10
 	bash test/docker-compose/scripts/setup-vault.sh
 	bash test/docker-compose/scripts/setup-keycloak.sh
+	bash test/docker-compose/scripts/setup-minio.sh
+	bash test/docker-compose/scripts/setup-kafka.sh
+	bash test/docker-compose/scripts/setup-rabbitmq.sh
+	bash test/monitoring/scripts/publish-dashboards.sh
 
 # =============================================================================
 # Clean targets

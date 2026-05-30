@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -54,6 +55,9 @@ const (
 	patchKeyMetadata = "metadata"
 	// patchKeyAnnotations is the JSON key for annotations in MergePatch payloads.
 	patchKeyAnnotations = "annotations"
+
+	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
+	secretKeyPassword = "password"
 )
 
 // restartRequiredParams lists PostgreSQL parameters that require a server
@@ -157,39 +161,9 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"generation", cluster.Generation,
 		"observedGeneration", cluster.Status.ObservedGeneration)
 
-	// Check for in-progress rolling restart (must continue regardless of generation).
-	if _, hasRestart := cluster.Annotations[util.AnnotationRollingRestart]; hasRestart {
-		logger.Debug("continuing in-progress rolling restart")
-		return r.continueRollingRestart(ctx, cluster)
-	}
-
-	// Check for pending config reload. If the generation changed (new config applied),
-	// skip the pending reload and let reconcileConfig handle the new change.
-	if cluster.Status.ObservedGeneration == cluster.Generation {
-		if result, handled := r.completePendingReload(ctx, cluster); handled {
-			return result, nil
-		}
-	}
-
-	// Skip if cluster is not running.
-	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
-		logger.Debug("cluster not running, deferring admin reconciliation",
-			"phase", cluster.Status.Phase)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
-	}
-
-	// Skip full reconciliation if only status changed (ObservedGeneration matches)
-	// and there are no maintenance annotations pending.
-	if cluster.Status.ObservedGeneration == cluster.Generation &&
-		cluster.Annotations[util.AnnotationMaintenance] == "" {
-		logger.Debug("skipping admin reconciliation, generation unchanged")
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
-	}
-
-	// Handle maintenance annotations.
-	if maintenance, ok := cluster.Annotations[util.AnnotationMaintenance]; ok {
-		logger.Debug("handling maintenance annotation", "operation", maintenance)
-		return r.handleMaintenance(ctx, cluster, maintenance)
+	// Handle early-return cases: rolling restart, pending reload, not-running, unchanged generation.
+	if result, handled, err := r.handleAdminEarlyReturns(ctx, cluster); handled {
+		return result, err
 	}
 
 	// Reconcile configuration parameters.
@@ -221,7 +195,72 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	logger.Debug("admin reconciliation completed successfully")
+
+	// If the exporter role isn't ready yet, requeue sooner to retry.
+	if !isExporterRoleReady(cluster) {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// isExporterRoleReady returns true if the exporter role is already set up
+// or query monitoring is disabled (i.e., no exporter role setup is needed).
+func isExporterRoleReady(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Annotations[util.AnnotationExporterRoleReady] == "true" ||
+		cluster.Spec.QueryMonitoring == nil || !cluster.Spec.QueryMonitoring.Enabled
+}
+
+// handleAdminEarlyReturns checks for conditions that should short-circuit the
+// admin reconciliation: in-progress rolling restart, pending config reload,
+// cluster not running, unchanged generation, and maintenance annotations.
+// Returns (result, true, err) if the reconciliation should stop, or (_, false, nil) to continue.
+func (r *AdminReconciler) handleAdminEarlyReturns(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (result ctrl.Result, handled bool, err error) {
+	logger := util.LoggerFromContext(ctx)
+
+	// Check for in-progress rolling restart (must continue regardless of generation).
+	if _, hasRestart := cluster.Annotations[util.AnnotationRollingRestart]; hasRestart {
+		logger.Debug("continuing in-progress rolling restart")
+		result, err := r.continueRollingRestart(ctx, cluster)
+		return result, true, err
+	}
+
+	// Check for pending config reload. If the generation changed (new config applied),
+	// skip the pending reload and let reconcileConfig handle the new change.
+	if cluster.Status.ObservedGeneration == cluster.Generation {
+		if result, handled := r.completePendingReload(ctx, cluster); handled {
+			return result, true, nil
+		}
+	}
+
+	// Skip if cluster is not running.
+	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
+		logger.Debug("cluster not running, deferring admin reconciliation",
+			"phase", cluster.Status.Phase)
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true, nil
+	}
+
+	// Skip full reconciliation if only status changed (ObservedGeneration matches),
+	// there are no maintenance annotations pending, and the exporter role is set up
+	// (or query monitoring is disabled).
+	if cluster.Status.ObservedGeneration == cluster.Generation &&
+		cluster.Annotations[util.AnnotationMaintenance] == "" &&
+		isExporterRoleReady(cluster) {
+		logger.Debug("skipping admin reconciliation, generation unchanged")
+		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true, nil
+	}
+
+	// Handle maintenance annotations.
+	if maintenance, ok := cluster.Annotations[util.AnnotationMaintenance]; ok {
+		logger.Debug("handling maintenance annotation", "operation", maintenance)
+		result, err := r.handleMaintenance(ctx, cluster, maintenance)
+		return result, true, err
+	}
+
+	return ctrl.Result{}, false, nil
 }
 
 // handleConfigError handles a config reconciliation error by setting the condition and returning.
@@ -255,12 +294,15 @@ func (r *AdminReconciler) reconcileSubComponents(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
 	var errs []error
-	if err := r.reconcileWorkload(ctx, cluster); err != nil {
-		logger.Error("failed to reconcile workload management", "error", err)
-		errs = append(errs, err)
-	}
+	// Query monitoring runs first because it creates K8s resources (Secret,
+	// ConfigMap, DaemonSet, Service) that don't require a DB connection.
+	// Workload reconciliation may block on DB connection attempts.
 	if err := r.reconcileQueryMonitoring(ctx, cluster); err != nil {
 		logger.Error("failed to reconcile query monitoring", "error", err)
+		errs = append(errs, err)
+	}
+	if err := r.reconcileWorkload(ctx, cluster); err != nil {
+		logger.Error("failed to reconcile workload management", "error", err)
 		errs = append(errs, err)
 	}
 	if err := r.reconcileBackup(ctx, cluster); err != nil {
@@ -554,6 +596,15 @@ func (r *AdminReconciler) applyWorkloadRules(
 	sort.SliceStable(sortedRules, func(i, j int) bool {
 		return sortedRules[i].Priority < sortedRules[j].Priority
 	})
+
+	// Record a metric for each workload rule/action being applied.
+	for i := range sortedRules {
+		rule := &sortedRules[i]
+		r.metrics.RecordWorkloadRuleAction(
+			cluster.Name, cluster.Namespace, rule.Name, rule.Action,
+		)
+	}
+
 	rulesJSON, err := json.Marshal(sortedRules)
 	if err != nil {
 		return fmt.Errorf("marshal workload rules: %w", err)
@@ -680,19 +731,23 @@ func (r *AdminReconciler) cleanupWorkload(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("cleaning up workload management (disabled)")
 
-	// 1. Drop user-created resource groups from DB (best-effort).
+	// 1. Drop user-created resource groups from DB (best-effort, with timeout).
 	if r.dbFactory != nil {
-		dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+		dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+		dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
 		if err == nil {
-			defer dbClient.Close()
-			r.dropAllUserResourceGroups(ctx, cluster, dbClient, logger)
+			r.dropAllUserResourceGroups(dbCtx, cluster, dbClient, logger)
+			dbClient.Close()
 		} else {
-			logger.Warn("cannot connect to DB for resource group cleanup", "error", err)
+			logger.Warn("cannot connect to DB for resource group cleanup (will retry)", "error", err)
 		}
+		dbCancel()
 	}
 
 	// 2. Delete workload-rules ConfigMap.
-	r.deleteWorkloadRulesConfigMap(ctx, cluster, logger)
+	if err := r.deleteWorkloadRulesConfigMap(ctx, cluster); err != nil {
+		return fmt.Errorf("deleting workload-rules ConfigMap: %w", err)
+	}
 
 	// 3. Stop idle daemon if running.
 	r.stopIdleDaemon()
@@ -746,8 +801,9 @@ func (r *AdminReconciler) dropAllUserResourceGroups(
 func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-	logger *slog.Logger,
-) {
+) error {
+	logger := util.LoggerFromContext(ctx)
+
 	cm := &corev1.ConfigMap{}
 	cmName := types.NamespacedName{
 		Name:      cluster.Name + "-workload-rules",
@@ -756,17 +812,17 @@ func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
 
 	if err := r.client.Get(ctx, cmName, cm); err != nil {
 		if apierrors.IsNotFound(err) {
-			return // Already gone — no-op.
+			return nil // Already gone — no-op.
 		}
-		logger.Warn("failed to get workload-rules ConfigMap for deletion", "error", err)
-		return
+		return fmt.Errorf("getting workload-rules ConfigMap: %w", err)
 	}
 
 	if err := r.client.Delete(ctx, cm); err != nil {
-		logger.Warn("failed to delete workload-rules ConfigMap", "error", err)
-	} else {
-		logger.Info("deleted workload-rules ConfigMap", "name", cmName.Name)
+		return fmt.Errorf("deleting workload-rules ConfigMap %s: %w", cmName.Name, err)
 	}
+
+	logger.Info("deleted workload-rules ConfigMap", "name", cmName.Name)
+	return nil
 }
 
 // stopIdleDaemon stops the idle session daemon if it is running.
@@ -871,9 +927,11 @@ func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (db.Client, e
 	return f.dbFactory.NewClient(ctx, f.cluster)
 }
 
-// reconcileQueryMonitoring reconciles query monitoring status.
-//
-//nolint:unparam // error return reserved for future DB operations
+// reconcileQueryMonitoring reconciles query monitoring configuration by creating
+// and updating the required Kubernetes resources: exporter credentials Secret,
+// exporter queries ConfigMap, node exporter DaemonSet, exporter Service,
+// ServiceMonitor, and PrometheusRule. It also sets up the database exporter role
+// when a DB client factory is available.
 func (r *AdminReconciler) reconcileQueryMonitoring(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -883,10 +941,54 @@ func (r *AdminReconciler) reconcileQueryMonitoring(
 	}
 
 	logger := util.LoggerFromContext(ctx)
+	qm := cluster.Spec.QueryMonitoring
+
 	logger.Info("reconciling query monitoring",
-		"historyRetention", cluster.Spec.QueryMonitoring.HistoryRetention,
-		"samplingInterval", cluster.Spec.QueryMonitoring.SamplingInterval,
+		"historyRetention", qm.HistoryRetention,
+		"samplingInterval", qm.SamplingInterval,
+		"guestAccess", qm.GuestAccess,
+		"planCollection", qm.PlanCollection,
+		"slowQueryThreshold", qm.SlowQueryThreshold,
 	)
+
+	r.logQueryMonitoringExporters(logger, cluster)
+
+	// Retrieve or generate the exporter password.
+	password, err := r.resolveExporterPassword(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("resolving exporter password: %w", err)
+	}
+
+	// Construct the DSN for postgres_exporter.
+	port := resolveExporterDSNPort(cluster)
+	dsn := fmt.Sprintf("postgresql://cloudberry_exporter:%s@localhost:%d/postgres?sslmode=disable",
+		url.QueryEscape(password), port)
+
+	// Create/update core exporter resources.
+	if err := r.ensureExporterCoreResources(ctx, cluster, password, dsn, logger); err != nil {
+		return err
+	}
+
+	// Setup DB exporter role if DB client factory is available.
+	if r.dbFactory != nil {
+		r.setupExporterRole(ctx, cluster, password, logger)
+	}
+
+	// Create/update optional exporter resources (DaemonSet).
+	if isNodeExporterEnabled(qm) {
+		if err := r.ensureNodeExporterDaemonSet(ctx, cluster, logger); err != nil {
+			logger.Warn("failed to create node exporter DaemonSet", "error", err)
+		}
+	}
+
+	// Fetch live query counts from the database and patch status explicitly
+	// (MergePatch with omitempty would skip zero values, leaving stale counts).
+	if r.dbFactory != nil {
+		r.updateQueryStatusFromDB(ctx, cluster, logger)
+		if patchErr := r.patchQueryStatus(ctx, cluster); patchErr != nil {
+			logger.Warn("failed to patch query status", "error", patchErr)
+		}
+	}
 
 	// Update query monitoring metrics.
 	r.metrics.SetActiveQueries(cluster.Name, cluster.Namespace, float64(cluster.Status.ActiveQueries))
@@ -897,6 +999,406 @@ func (r *AdminReconciler) reconcileQueryMonitoring(
 		"Query monitoring configuration reconciled")
 
 	return nil
+}
+
+// logQueryMonitoringExporters logs the exporter configuration details for
+// query monitoring, including ServiceMonitor and PrometheusRule settings.
+func (r *AdminReconciler) logQueryMonitoringExporters(
+	logger *slog.Logger,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	qm := cluster.Spec.QueryMonitoring
+	if qm.Exporters == nil {
+		return
+	}
+
+	r.logExporterConfig(logger, "postgresExporter", qm.Exporters.PostgresExporter)
+	r.logExporterConfig(logger, "nodeExporter", qm.Exporters.NodeExporter)
+	r.logExporterConfig(logger, "cloudberryQueryExporter", qm.Exporters.CloudberryQueryExporter)
+
+	r.logServiceMonitorConfig(logger, qm.Exporters.ServiceMonitor, cluster.Namespace)
+	r.logPrometheusRuleConfig(logger, qm.Exporters.PrometheusRule, cluster.Namespace)
+}
+
+// logServiceMonitorConfig logs the ServiceMonitor configuration if present.
+func (r *AdminReconciler) logServiceMonitorConfig(
+	logger *slog.Logger,
+	sm *cbv1alpha1.QueryServiceMonitorSpec,
+	defaultNamespace string,
+) {
+	if sm == nil {
+		return
+	}
+	ns := sm.Namespace
+	if ns == "" {
+		ns = defaultNamespace
+	}
+	logger.Info("query monitoring ServiceMonitor config",
+		"enabled", sm.Enabled,
+		"namespace", ns,
+		"interval", sm.Interval,
+		"scrapeTimeout", sm.ScrapeTimeout,
+		"labels", sm.Labels,
+	)
+}
+
+// logPrometheusRuleConfig logs the PrometheusRule configuration if present.
+func (r *AdminReconciler) logPrometheusRuleConfig(
+	logger *slog.Logger,
+	pr *cbv1alpha1.QueryPrometheusRuleSpec,
+	defaultNamespace string,
+) {
+	if pr == nil {
+		return
+	}
+	ns := pr.Namespace
+	if ns == "" {
+		ns = defaultNamespace
+	}
+	logger.Info("query monitoring PrometheusRule config",
+		"enabled", pr.Enabled,
+		"namespace", ns,
+		"labels", pr.Labels,
+	)
+}
+
+// ensureExporterCoreResources creates or updates the core exporter resources:
+// credentials Secret, queries ConfigMap, and exporter Service.
+func (r *AdminReconciler) ensureExporterCoreResources(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	password, dsn string,
+	logger *slog.Logger,
+) error {
+	if err := r.ensureExporterCredentialsSecret(ctx, cluster, password, dsn, logger); err != nil {
+		return err
+	}
+	if err := r.ensureExporterQueriesConfigMap(ctx, cluster, logger); err != nil {
+		return err
+	}
+	return r.ensureExporterService(ctx, cluster, logger)
+}
+
+// isNodeExporterEnabled returns true if the node exporter is configured and enabled.
+func isNodeExporterEnabled(qm *cbv1alpha1.QueryMonitoringSpec) bool {
+	return qm.Exporters != nil && qm.Exporters.NodeExporter != nil && qm.Exporters.NodeExporter.Enabled
+}
+
+// resolveExporterPassword retrieves the exporter password from an existing Secret,
+// or generates a new one if the Secret does not exist yet.
+func (r *AdminReconciler) resolveExporterPassword(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (string, error) {
+	secretName := util.ExporterCredentialsSecretName(cluster.Name)
+	existing := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}
+
+	err := r.client.Get(ctx, key, existing)
+	if err == nil {
+		// Secret exists — reuse the stored password.
+		if pw, ok := existing.Data[secretKeyPassword]; ok && len(pw) > 0 {
+			return string(pw), nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("getting exporter credentials secret: %w", err)
+	}
+
+	// Secret does not exist or has no password — generate a new one.
+	password, genErr := util.GenerateRandomPassword()
+	if genErr != nil {
+		return "", fmt.Errorf("generating exporter password: %w", genErr)
+	}
+	return password, nil
+}
+
+// resolveExporterDSNPort returns the coordinator port for the exporter DSN.
+func resolveExporterDSNPort(cluster *cbv1alpha1.CloudberryCluster) int32 {
+	if cluster.Spec.Coordinator.Port != 0 {
+		return cluster.Spec.Coordinator.Port
+	}
+	return int32(util.DefaultCoordinatorPort)
+}
+
+// ensureExporterCredentialsSecret creates or updates the exporter credentials Secret.
+func (r *AdminReconciler) ensureExporterCredentialsSecret(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	password, dsn string,
+	logger *slog.Logger,
+) error {
+	secretName := util.ExporterCredentialsSecretName(cluster.Name)
+	existing := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}
+
+	err := r.client.Get(ctx, key, existing)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		desired := r.builder.BuildExporterCredentialsSecret(cluster, password, dsn)
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating exporter credentials secret: %w", createErr)
+		}
+		logger.Info("created exporter credentials secret", "name", secretName)
+	case err != nil:
+		return fmt.Errorf("getting exporter credentials secret: %w", err)
+	default:
+		desired := r.builder.BuildExporterCredentialsSecret(cluster, password, dsn)
+		existing.Data = desired.Data
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating exporter credentials secret: %w", updateErr)
+		}
+		logger.Info("updated exporter credentials secret", "name", secretName)
+	}
+
+	return nil
+}
+
+// ensureExporterQueriesConfigMap creates or updates the exporter queries ConfigMap.
+func (r *AdminReconciler) ensureExporterQueriesConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) error {
+	cmName := util.ExporterQueriesConfigMapName(cluster.Name)
+	existing := &corev1.ConfigMap{}
+	key := types.NamespacedName{Name: cmName, Namespace: cluster.Namespace}
+
+	err := r.client.Get(ctx, key, existing)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		desired := r.builder.BuildExporterQueriesConfigMap(cluster)
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating exporter queries configmap: %w", createErr)
+		}
+		logger.Info("created exporter queries configmap", "name", cmName)
+	case err != nil:
+		return fmt.Errorf("getting exporter queries configmap: %w", err)
+	default:
+		desired := r.builder.BuildExporterQueriesConfigMap(cluster)
+		existing.Data = desired.Data
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating exporter queries configmap: %w", updateErr)
+		}
+		logger.Info("updated exporter queries configmap", "name", cmName)
+	}
+
+	return nil
+}
+
+// setupExporterRole creates the database exporter role using the DB client.
+// Uses a short timeout to avoid blocking the reconciliation loop.
+// On success, sets the AnnotationExporterRoleReady annotation so the
+// admin-controller stops retrying. On failure, the annotation stays absent
+// and the controller will retry on the next reconcile cycle.
+func (r *AdminReconciler) setupExporterRole(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	password string,
+	logger *slog.Logger,
+) {
+	// Use a short timeout so DB connection issues don't block the entire reconcile.
+	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	if err != nil {
+		logger.Warn("failed to create DB client for exporter role setup (will retry)", "error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	if setupErr := dbClient.SetupExporterRole(dbCtx, password); setupErr != nil {
+		logger.Warn("failed to setup exporter role (will retry)", "error", setupErr)
+		return
+	}
+
+	logger.Info("exporter role configured successfully")
+
+	// Mark the role as ready so the admin-controller stops retrying.
+	if setErr := setAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationExporterRoleReady, "true"); setErr != nil {
+		logger.Warn("failed to set exporter-role-ready annotation", "error", setErr)
+	}
+}
+
+// updateQueryStatusFromDB queries pg_stat_activity for live query counts
+// and updates the cluster status fields. Errors are logged but non-fatal.
+func (r *AdminReconciler) updateQueryStatusFromDB(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) {
+	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	if err != nil {
+		logger.Debug("skipping query status update, DB not available", "error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	active, queued, blocked, err := dbClient.GetActiveQueryCount(dbCtx)
+	if err != nil {
+		logger.Warn("failed to get active query counts", "error", err)
+		return
+	}
+
+	cluster.Status.ActiveQueries = active
+	cluster.Status.QueuedQueries = queued
+	cluster.Status.BlockedQueries = blocked
+
+	logger.Info("updated query status from database",
+		"activeQueries", active,
+		"queuedQueries", queued,
+		"blockedQueries", blocked,
+	)
+
+	// Record the number of active database connections (sessions) from real data
+	// and detect any currently running slow queries.
+	if sessions, sessErr := dbClient.ListSessions(dbCtx); sessErr != nil {
+		logger.Debug("failed to list sessions for connection metrics", "error", sessErr)
+	} else {
+		r.metrics.SetConnectionsActive(cluster.Name, cluster.Namespace, float64(len(sessions)))
+		r.recordSlowQueries(cluster, sessions)
+	}
+}
+
+// recordSlowQueries inspects active sessions and records a slow-query metric for
+// each running query whose elapsed time exceeds the configured SlowQueryThreshold.
+func (r *AdminReconciler) recordSlowQueries(
+	cluster *cbv1alpha1.CloudberryCluster,
+	sessions []db.Session,
+) {
+	qm := cluster.Spec.QueryMonitoring
+	if qm == nil || qm.SlowQueryThreshold == "" {
+		return
+	}
+	threshold, err := time.ParseDuration(qm.SlowQueryThreshold)
+	if err != nil || threshold <= 0 {
+		return
+	}
+	now := time.Now()
+	for i := range sessions {
+		s := &sessions[i]
+		if s.State != "active" || s.QueryStart.IsZero() {
+			continue
+		}
+		if now.Sub(s.QueryStart) >= threshold {
+			r.metrics.RecordSlowQuery(cluster.Name, cluster.Namespace)
+		}
+	}
+}
+
+// patchQueryStatus explicitly patches the query count status fields.
+// This is needed because the standard patchStatus uses json.Marshal with
+// omitempty, which omits zero values and leaves stale counts in the CR.
+func (r *AdminReconciler) patchQueryStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		patchKeyStatus: map[string]interface{}{
+			"activeQueries":  cluster.Status.ActiveQueries,
+			"queuedQueries":  cluster.Status.QueuedQueries,
+			"blockedQueries": cluster.Status.BlockedQueries,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling query status patch: %w", err)
+	}
+	return r.client.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patch))
+}
+
+// ensureNodeExporterDaemonSet creates or updates the node exporter DaemonSet.
+func (r *AdminReconciler) ensureNodeExporterDaemonSet(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) error {
+	dsName := util.NodeExporterDaemonSetName(cluster.Name)
+	existing := &appsv1.DaemonSet{}
+	key := types.NamespacedName{Name: dsName, Namespace: cluster.Namespace}
+
+	err := r.client.Get(ctx, key, existing)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		desired := r.builder.BuildNodeExporterDaemonSet(cluster)
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating node exporter daemonset: %w", createErr)
+		}
+		logger.Info("created node exporter daemonset", "name", dsName)
+	case err != nil:
+		return fmt.Errorf("getting node exporter daemonset: %w", err)
+	default:
+		desired := r.builder.BuildNodeExporterDaemonSet(cluster)
+		existing.Spec = desired.Spec
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating node exporter daemonset: %w", updateErr)
+		}
+		logger.Info("updated node exporter daemonset", "name", dsName)
+	}
+
+	return nil
+}
+
+// ensureExporterService creates or updates the exporter metrics Service.
+func (r *AdminReconciler) ensureExporterService(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) error {
+	svcName := util.ExporterMetricsServiceName(cluster.Name)
+	existing := &corev1.Service{}
+	key := types.NamespacedName{Name: svcName, Namespace: cluster.Namespace}
+
+	err := r.client.Get(ctx, key, existing)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		desired := r.builder.BuildExporterService(cluster)
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating exporter service: %w", createErr)
+		}
+		logger.Info("created exporter service", "name", svcName)
+	case err != nil:
+		return fmt.Errorf("getting exporter service: %w", err)
+	default:
+		desired := r.builder.BuildExporterService(cluster)
+		existing.Spec.Ports = desired.Spec.Ports
+		existing.Spec.Selector = desired.Spec.Selector
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating exporter service: %w", updateErr)
+		}
+		logger.Info("updated exporter service", "name", svcName)
+	}
+
+	return nil
+}
+
+// logExporterConfig logs the configuration of a monitoring exporter.
+func (r *AdminReconciler) logExporterConfig(logger *slog.Logger, name string, spec *cbv1alpha1.ExporterSpec) {
+	if spec == nil {
+		return
+	}
+	logger.Info("query monitoring exporter config",
+		"exporter", name,
+		"enabled", spec.Enabled,
+		"image", spec.Image,
+		"port", spec.Port,
+	)
+	if spec.Resources != nil {
+		logger.Info("query monitoring exporter resources",
+			"exporter", name,
+			"requestsCPU", spec.Resources.Requests.CPU,
+			"requestsMemory", spec.Resources.Requests.Memory,
+			"limitsCPU", spec.Resources.Limits.CPU,
+			"limitsMemory", spec.Resources.Limits.Memory,
+		)
+	}
 }
 
 // reconcileBackup reconciles backup configuration and status.
@@ -1552,6 +2054,7 @@ func (r *AdminReconciler) triggerRollingRestart(
 		util.AnnotationRollingRestart, string(stateJSON)); patchErr != nil {
 		return fmt.Errorf("setting rolling restart annotation: %w", patchErr)
 	}
+	r.metrics.RecordRollingRestart(cluster.Name, cluster.Namespace, "started")
 
 	// Restart the first StatefulSet to kick off the rolling restart.
 	stsName := r.statefulSetNameForPhase(cluster, startPhase)
@@ -1634,6 +2137,7 @@ func (r *AdminReconciler) continueRollingRestart(
 	if nextSTS != "" {
 		if restartErr := r.restartStatefulSet(ctx, cluster.Namespace, nextSTS); restartErr != nil {
 			logger.Error("failed to restart statefulset", "phase", nextPhase, "sts", nextSTS, "error", restartErr)
+			r.metrics.RecordRollingRestart(cluster.Name, cluster.Namespace, "failed")
 			return ctrl.Result{RequeueAfter: requeueAfterShort}, restartErr
 		}
 		logger.Info("restarted statefulset for phase", "phase", nextPhase, "sts", nextSTS)
@@ -1681,6 +2185,7 @@ func (r *AdminReconciler) completeRollingRestart(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRollingRestartCompleted,
 		fmt.Sprintf("Rolling restart completed for parameters: %s", strings.Join(state.RestartParams, ", ")))
+	r.metrics.RecordRollingRestart(cluster.Name, cluster.Namespace, "completed")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }

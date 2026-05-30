@@ -350,6 +350,8 @@ spec:
                     default: 5432
                     description: Port is the coordinator listening port.
                     format: int32
+                    maximum: 65535
+                    minimum: 1
                     type: integer
                   replicas:
                     default: 1
@@ -505,6 +507,8 @@ spec:
                             port:
                               description: Port is the RabbitMQ port.
                               format: int32
+                              maximum: 65535
+                              minimum: 1
                               type: integer
                             queue:
                               description: Queue is the RabbitMQ queue name.
@@ -601,6 +605,8 @@ spec:
                       port:
                         description: Port is the streaming server port.
                         format: int32
+                        maximum: 65535
+                        minimum: 1
                         type: integer
                       tlsMode:
                         default: none
@@ -646,7 +652,7 @@ spec:
                     type: integer
                 type: object
               image:
-                default: cloudberrydb/cloudberry:7.7
+                default: cloudberrydb/cloudberry:2.1.0
                 description: Image is the container image for Cloudberry DB.
                 type: string
               imagePullPolicy:
@@ -682,6 +688,8 @@ spec:
                     default: 9187
                     description: MetricsPort is the Prometheus metrics port.
                     format: int32
+                    maximum: 65535
+                    minimum: 1
                     type: integer
                   serviceMonitor:
                     default: false
@@ -697,6 +705,183 @@ spec:
                     default: false
                     description: Enabled controls whether query monitoring is active.
                     type: boolean
+                  exporters:
+                    description: Exporters defines the monitoring exporters configuration.
+                    properties:
+                      cloudberryQueryExporter:
+                        description: CloudberryQueryExporter configures the Cloudberry
+                          query exporter sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                        type: object
+                      nodeExporter:
+                        description: NodeExporter configures the Prometheus node_exporter
+                          sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                        type: object
+                      postgresExporter:
+                        description: PostgresExporter configures the Prometheus postgres_exporter
+                          sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                        type: object
+                      prometheusRule:
+                        description: PrometheusRule configures the Prometheus PrometheusRule
+                          resource.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether a PrometheusRule
+                              resource is created.
+                            type: boolean
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels are additional labels to add to the
+                              PrometheusRule.
+                            type: object
+                          namespace:
+                            description: Namespace is the namespace for the PrometheusRule.
+                              Defaults to the cluster namespace.
+                            type: string
+                        type: object
+                      serviceMonitor:
+                        description: ServiceMonitor configures the Prometheus ServiceMonitor
+                          resource.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether a ServiceMonitor
+                              resource is created.
+                            type: boolean
+                          interval:
+                            description: Interval is the Prometheus scrape interval.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels are additional labels to add to the
+                              ServiceMonitor.
+                            type: object
+                          namespace:
+                            description: Namespace is the namespace for the ServiceMonitor.
+                              Defaults to the cluster namespace.
+                            type: string
+                          scrapeTimeout:
+                            description: ScrapeTimeout is the Prometheus scrape timeout.
+                            type: string
+                        type: object
+                    type: object
                   guestAccess:
                     default: false
                     description: GuestAccess allows guest access to query monitoring
@@ -1016,7 +1201,7 @@ spec:
                     type: object
                 type: object
               version:
-                default: "7.7"
+                default: 2.1.0
                 description: Version is the Cloudberry DB version.
                 type: string
               workload:
@@ -1081,6 +1266,41 @@ spec:
                           description: CPUWeight is the CPU scheduling weight.
                           format: int32
                           type: integer
+                        ioLimits:
+                          description: IOLimits defines per-tablespace disk I/O limits.
+                          items:
+                            description: |-
+                              TablespaceIOLimitSpec defines per-tablespace disk I/O limits for a resource group.
+                              Applied via ALTER RESOURCE GROUP ... SET io_limit.
+                            properties:
+                              readBytesPerSec:
+                                description: ReadBytesPerSec is the maximum read throughput
+                                  in bytes per second.
+                                format: int64
+                                type: integer
+                              readIOPS:
+                                description: ReadIOPS is the maximum read I/O operations
+                                  per second.
+                                format: int32
+                                type: integer
+                              tablespace:
+                                description: Tablespace is the target tablespace name.
+                                  Use "*" for all tablespaces.
+                                type: string
+                              writeBytesPerSec:
+                                description: WriteBytesPerSec is the maximum write
+                                  throughput in bytes per second.
+                                format: int64
+                                type: integer
+                              writeIOPS:
+                                description: WriteIOPS is the maximum write I/O operations
+                                  per second.
+                                format: int32
+                                type: integer
+                            required:
+                            - tablespace
+                            type: object
+                          type: array
                         memoryLimit:
                           description: MemoryLimit is the memory limit in MB.
                           format: int32

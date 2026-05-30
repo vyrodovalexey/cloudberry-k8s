@@ -319,7 +319,7 @@ func (s *Scenario43PermissionMatrixSuite) TestFunctional_Scenario43d_Basic_Allow
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/segments"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/mirroring"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/standby"},
-		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/queries"},
+		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/queries/active"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/backups"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/storage/pvcs"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/workload"},
@@ -343,6 +343,7 @@ func (s *Scenario43PermissionMatrixSuite) TestFunctional_Scenario43d_Basic_Allow
 	}{
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/config"},
 		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/sessions"},
+		{http.MethodGet, "/api/v1alpha1/clusters/test-cluster/queries"},
 		{http.MethodPost, "/api/v1alpha1/clusters/test-cluster/start"},
 		{http.MethodPost, "/api/v1alpha1/clusters/test-cluster/stop"},
 		{http.MethodPost, "/api/v1alpha1/clusters"},

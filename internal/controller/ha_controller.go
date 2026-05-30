@@ -490,15 +490,32 @@ func (r *HAReconciler) handleRecovery(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling recovery", "type", recoveryType)
 
+	rt := normalizeRecoveryType(recoveryType)
+	r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, "started")
+
 	// Remove the recovery annotation using MergePatch to avoid conflicts with stale objects.
 	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationRecovery); err != nil {
+		r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, "failed")
 		return ctrl.Result{}, fmt.Errorf("removing recovery annotation: %w", err)
 	}
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "RecoveryStarted",
 		fmt.Sprintf("Recovery type %s initiated", recoveryType))
+	r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, "completed")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// normalizeRecoveryType maps an arbitrary recovery type string to one of the
+// supported metric label values (incremental, full, differential), defaulting
+// to "full" for unknown values.
+func normalizeRecoveryType(recoveryType string) string {
+	switch recoveryType {
+	case "incremental", "full", "differential":
+		return recoveryType
+	default:
+		return "full"
+	}
 }
 
 // defaultSkewThreshold is the default percentage skew threshold for rebalance.

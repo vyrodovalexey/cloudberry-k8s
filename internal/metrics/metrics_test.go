@@ -262,8 +262,14 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetDataSkewCoefficient("c", "n", 0.15)
 	recorder.SetPVCSizeBytes("c", "n", "coordinator", 10737418240)
 	recorder.RecordMirroringOperation("c", "n", "enable")
+	recorder.RecordMirroringOperation("c", "n", "disable")
 	recorder.RecordMaintenanceOperation("c", "n", "vacuum")
 	recorder.RecordPasswordRotation()
+	recorder.RecordQueryHistoryInsert("c", "n")
+	recorder.ObserveQueryHistorySearchDuration("c", "n", time.Second)
+	recorder.RecordQueryHistoryExport("c", "n", "csv")
+	recorder.RecordQueryHistoryRetentionCleanup("c", "n", 10)
+	recorder.SetQueryHistorySizeBytes("c", "n", 1024)
 }
 
 func TestRecordBackup(t *testing.T) {
@@ -587,6 +593,9 @@ func TestNoopRecorder_AllMethods(t *testing.T) {
 	r.RecordMirroringOperation("cluster", "ns", "enable")
 	r.RecordMaintenanceOperation("cluster", "ns", "vacuum")
 	r.RecordPasswordRotation()
+	r.RecordActiveQueryExport()
+	r.RecordMonitorPause("cluster", "ns")
+	r.RecordMonitorResume("cluster", "ns")
 }
 
 func TestPrometheusRecorder_ImplementsInterface(t *testing.T) {
@@ -661,4 +670,535 @@ func TestRecordMirroringOperation_MultipleIncrements(t *testing.T) {
 		}
 	}
 	assert.True(t, found)
+}
+
+// ============================================================================
+// Query History Metrics Tests
+// ============================================================================
+
+func TestQueryHistoryMetrics_Registration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	// Record all query history metrics to ensure they are registered.
+	recorder.RecordQueryHistoryInsert("test", "default")
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 100*time.Millisecond)
+	recorder.RecordQueryHistoryExport("test", "default", "csv")
+	recorder.RecordQueryHistoryRetentionCleanup("test", "default", 50)
+	recorder.SetQueryHistorySizeBytes("test", "default", 1073741824)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	expectedMetrics := []string{
+		"cloudberry_query_history_total",
+		"cloudberry_query_history_search_duration_seconds",
+		"cloudberry_query_history_export_total",
+		"cloudberry_query_history_retention_deleted_total",
+		"cloudberry_query_history_size_bytes",
+	}
+
+	for _, metricName := range expectedMetrics {
+		found := false
+		for _, f := range families {
+			if f.GetName() == metricName {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "metric %s should be registered", metricName)
+	}
+}
+
+func TestRecordQueryHistoryInsert(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordQueryHistoryInsert("test", "default")
+	recorder.RecordQueryHistoryInsert("test", "default")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 2.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_query_history_total metric should be registered")
+}
+
+func TestObserveQueryHistorySearchDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 250*time.Millisecond)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_search_duration_seconds" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.Equal(t, uint64(1), f.GetMetric()[0].GetHistogram().GetSampleCount())
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_query_history_search_duration_seconds metric should be registered")
+}
+
+func TestRecordQueryHistoryExport(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordQueryHistoryExport("test", "default", "csv")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_export_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 1.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_query_history_export_total metric should be registered")
+}
+
+func TestRecordQueryHistoryRetentionCleanup(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordQueryHistoryRetentionCleanup("test", "default", 100)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_retention_deleted_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 100.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_query_history_retention_deleted_total metric should be registered")
+}
+
+func TestSetQueryHistorySizeBytes(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetQueryHistorySizeBytes("test", "default", 5368709120)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_size_bytes" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 5368709120.0, f.GetMetric()[0].GetGauge().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_query_history_size_bytes metric should be registered")
+}
+
+func TestNoopRecorder_QueryHistoryMethods(t *testing.T) {
+	recorder := &NoopRecorder{}
+
+	// All query history methods should not panic.
+	recorder.RecordQueryHistoryInsert("c", "n")
+	recorder.ObserveQueryHistorySearchDuration("c", "n", time.Second)
+	recorder.RecordQueryHistoryExport("c", "n", "csv")
+	recorder.RecordQueryHistoryRetentionCleanup("c", "n", 50)
+	recorder.SetQueryHistorySizeBytes("c", "n", 1024)
+}
+
+func TestQueryHistorySearchDuration_Buckets(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	// Record multiple observations at different durations.
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 10*time.Millisecond)
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 100*time.Millisecond)
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 1*time.Second)
+	recorder.ObserveQueryHistorySearchDuration("test", "default", 5*time.Second)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_search_duration_seconds" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.Equal(t, uint64(4), f.GetMetric()[0].GetHistogram().GetSampleCount())
+			break
+		}
+	}
+	assert.True(t, found)
+}
+
+func TestQueryHistoryExport_MultipleFormats(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordQueryHistoryExport("test", "default", "csv")
+	recorder.RecordQueryHistoryExport("test", "default", "csv")
+	recorder.RecordQueryHistoryExport("test", "default", "json")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_query_history_export_total" {
+			found = true
+			// Should have 2 metric series (csv and json).
+			assert.Len(t, f.GetMetric(), 2)
+			break
+		}
+	}
+	assert.True(t, found)
+}
+
+// ============================================================================
+// Monitor Pause/Resume Metrics Tests
+// ============================================================================
+
+func TestRecordMonitorPause(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordMonitorPause("test", "default")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_monitor_pause_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 1.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_monitor_pause_total metric should be registered")
+}
+
+func TestRecordMonitorResume(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordMonitorResume("test", "default")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_monitor_resume_total" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.InDelta(t, 1.0, f.GetMetric()[0].GetCounter().GetValue(), 0.001)
+			break
+		}
+	}
+	assert.True(t, found, "cloudberry_monitor_resume_total metric should be registered")
+}
+
+func TestNoopRecorder_MonitorPauseResume(t *testing.T) {
+	recorder := &NoopRecorder{}
+	// Should not panic.
+	recorder.RecordMonitorPause("c", "n")
+	recorder.RecordMonitorResume("c", "n")
+}
+
+// counterValue returns the value of the first metric series in the named family.
+func counterValue(t *testing.T, reg *prometheus.Registry, name string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() == name {
+			require.NotEmpty(t, f.GetMetric())
+			return f.GetMetric()[0].GetCounter().GetValue(), true
+		}
+	}
+	return 0, false
+}
+
+// gaugeValue returns the value of the first metric series in the named family.
+func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() == name {
+			require.NotEmpty(t, f.GetMetric())
+			return f.GetMetric()[0].GetGauge().GetValue(), true
+		}
+	}
+	return 0, false
+}
+
+// histogramSampleCount returns the sample count of the first metric series in the named family.
+func histogramSampleCount(t *testing.T, reg *prometheus.Registry, name string) (uint64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() == name {
+			require.NotEmpty(t, f.GetMetric())
+			return f.GetMetric()[0].GetHistogram().GetSampleCount(), true
+		}
+	}
+	return 0, false
+}
+
+// ============================================================================
+// Security Metrics Tests (cert rotation, vault operations)
+// ============================================================================
+
+func TestRecordCertRotation(t *testing.T) {
+	tests := []struct {
+		name      string
+		component string
+		source    string
+		result    string
+	}{
+		{"vault success", "webhook", "vault-pki", "success"},
+		{"vault error", "webhook", "vault-pki", "error"},
+		{"self-signed success", "webhook", "self-signed", "success"},
+		{"self-signed error", "webhook", "self-signed", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordCertRotation(tt.component, tt.source, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_cert_rotation_total")
+			assert.True(t, found, "cloudberry_cert_rotation_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordCertRotation_MultipleIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordCertRotation("webhook", "self-signed", "success")
+	recorder.RecordCertRotation("webhook", "self-signed", "success")
+
+	v, found := counterValue(t, reg, "cloudberry_cert_rotation_total")
+	require.True(t, found)
+	assert.InDelta(t, 2.0, v, 0.001)
+}
+
+func TestSetCertExpirySeconds(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetCertExpirySeconds("webhook", 86400)
+
+	v, found := gaugeValue(t, reg, "cloudberry_cert_expiry_seconds")
+	assert.True(t, found, "cloudberry_cert_expiry_seconds should be registered")
+	assert.InDelta(t, 86400.0, v, 0.001)
+}
+
+func TestRecordVaultOperation(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		result    string
+	}{
+		{"auth success", "auth", "success"},
+		{"auth error", "auth", "error"},
+		{"read success", "read", "success"},
+		{"write error", "write", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordVaultOperation(tt.operation, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_vault_operations_total")
+			assert.True(t, found, "cloudberry_vault_operations_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestObserveVaultOperationDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveVaultOperationDuration("read", 250*time.Millisecond)
+	recorder.ObserveVaultOperationDuration("read", 500*time.Millisecond)
+
+	count, found := histogramSampleCount(t, reg, "cloudberry_vault_operation_duration_seconds")
+	assert.True(t, found, "cloudberry_vault_operation_duration_seconds should be registered")
+	assert.Equal(t, uint64(2), count)
+}
+
+// ============================================================================
+// Webhook Admission Metrics Tests
+// ============================================================================
+
+func TestRecordWebhookAdmission(t *testing.T) {
+	tests := []struct {
+		name      string
+		webhook   string
+		operation string
+		result    string
+	}{
+		{"validating allowed", "validating", "create", "allowed"},
+		{"validating denied", "validating", "update", "denied"},
+		{"validating error", "validating", "delete", "error"},
+		{"mutating allowed", "mutating", "create", "allowed"},
+		{"mutating denied", "mutating", "update", "denied"},
+		{"mutating error", "mutating", "create", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordWebhookAdmission(tt.webhook, tt.operation, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_webhook_admission_total")
+			assert.True(t, found, "cloudberry_webhook_admission_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+// ============================================================================
+// Lifecycle Metrics Tests (upgrade, rolling restart, recovery)
+// ============================================================================
+
+func TestRecordUpgradeOperation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"started", "started"},
+		{"completed", "completed"},
+		{"rollback", "rollback"},
+		{"failed", "failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordUpgradeOperation("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_upgrade_operations_total")
+			assert.True(t, found, "cloudberry_upgrade_operations_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordRollingRestart(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"started", "started"},
+		{"completed", "completed"},
+		{"failed", "failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordRollingRestart("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_rolling_restart_total")
+			assert.True(t, found, "cloudberry_rolling_restart_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordRecoveryOperation(t *testing.T) {
+	tests := []struct {
+		name         string
+		recoveryType string
+		result       string
+	}{
+		{"incremental started", "incremental", "started"},
+		{"full completed", "full", "completed"},
+		{"differential failed", "differential", "failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordRecoveryOperation("test", "default", tt.recoveryType, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_recovery_operations_total")
+			assert.True(t, found, "cloudberry_recovery_operations_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+// TestNewMetricsRegistration verifies all new collectors are registered.
+func TestNewMetricsRegistration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	recorder.RecordCertRotation("webhook", "self-signed", "success")
+	recorder.SetCertExpirySeconds("webhook", 3600)
+	recorder.RecordVaultOperation("read", "success")
+	recorder.ObserveVaultOperationDuration("read", time.Second)
+	recorder.RecordWebhookAdmission("validating", "create", "allowed")
+	recorder.RecordUpgradeOperation("test", "default", "started")
+	recorder.RecordRollingRestart("test", "default", "started")
+	recorder.RecordRecoveryOperation("test", "default", "full", "started")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	expectedMetrics := []string{
+		"cloudberry_cert_rotation_total",
+		"cloudberry_cert_expiry_seconds",
+		"cloudberry_vault_operations_total",
+		"cloudberry_vault_operation_duration_seconds",
+		"cloudberry_webhook_admission_total",
+		"cloudberry_upgrade_operations_total",
+		"cloudberry_rolling_restart_total",
+		"cloudberry_recovery_operations_total",
+	}
+
+	for _, metricName := range expectedMetrics {
+		found := false
+		for _, f := range families {
+			if f.GetName() == metricName {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "metric %s should be registered", metricName)
+	}
+}
+
+// TestNoopRecorder_NewMethods exercises all newly added NoopRecorder methods.
+func TestNoopRecorder_NewMethods(t *testing.T) {
+	r := NewNoopRecorder()
+	require.NotNil(t, r)
+
+	// None of these should panic; they are intentional no-ops.
+	r.RecordCertRotation("webhook", "self-signed", "success")
+	r.SetCertExpirySeconds("webhook", 3600)
+	r.RecordVaultOperation("read", "success")
+	r.ObserveVaultOperationDuration("read", time.Second)
+	r.RecordWebhookAdmission("validating", "create", "allowed")
+	r.RecordUpgradeOperation("c", "n", "started")
+	r.RecordRollingRestart("c", "n", "started")
+	r.RecordRecoveryOperation("c", "n", "full", "started")
 }

@@ -3,11 +3,8 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"time"
-
 	"encoding/json"
+	"fmt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -18,9 +15,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"log/slog"
+	"net/url"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"time"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
@@ -38,6 +38,9 @@ const (
 	scaleTimeout           = 10 * time.Minute
 	upgradePhaseTimeout    = 10 * time.Minute
 	mirroringEnableTimeout = 30 * time.Minute
+
+	// patchKeyStatus is the JSON key used in MergePatch payloads for status subresource.
+	patchKeyStatus = "status"
 
 	// annotationValueTrue is the canonical string value for boolean-true annotations.
 	annotationValueTrue = "true"
@@ -289,19 +292,10 @@ func (r *ClusterReconciler) reconcileCluster(
 		return r.updatePhase(ctx, cluster, cbv1alpha1.ClusterPhasePending)
 	}
 
-	// Reconcile admin password Secret (must exist before StatefulSets reference it).
-	if err := r.reconcileAdminSecret(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling admin secret: %w", err)
-	}
-
-	// Reconcile ConfigMaps.
-	if err := r.reconcileConfigMaps(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling configmaps: %w", err)
-	}
-
-	// Reconcile Services.
-	if err := r.reconcileServices(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling services: %w", err)
+	// Reconcile core resources: admin Secret, ConfigMaps, Services, and
+	// exporter prerequisites (must exist before StatefulSets reference them).
+	if err := r.reconcileCoreResources(ctx, cluster); err != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
 	// Check for in-progress or needed upgrade before reconciling StatefulSets.
@@ -321,26 +315,9 @@ func (r *ClusterReconciler) reconcileCluster(
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
-	// Reconcile coordinator StatefulSet.
-	if err := r.reconcileCoordinator(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling coordinator: %w", err)
-	}
-
-	// Reconcile standby if enabled.
-	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
-		if err := r.reconcileStandby(ctx, cluster); err != nil {
-			return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling standby: %w", err)
-		}
-	}
-
-	// Reconcile segments.
-	if err := r.reconcileSegments(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling segments: %w", err)
-	}
-
-	// Reconcile storage expansion (PVC resizing).
-	if err := r.reconcileStorageExpansion(ctx, cluster); err != nil {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("reconciling storage expansion: %w", err)
+	// Reconcile StatefulSets and storage.
+	if err := r.reconcileStatefulSets(ctx, cluster); err != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
 	// Update status.
@@ -350,6 +327,70 @@ func (r *ClusterReconciler) reconcileCluster(
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+}
+
+// reconcileCoreResources reconciles the core Kubernetes resources that must exist
+// before StatefulSets are created: admin password Secret, ConfigMaps, Services,
+// and exporter prerequisites (when query monitoring is enabled).
+func (r *ClusterReconciler) reconcileCoreResources(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	// Reconcile admin password Secret (must exist before StatefulSets reference it).
+	if err := r.reconcileAdminSecret(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling admin secret: %w", err)
+	}
+
+	// Reconcile ConfigMaps.
+	if err := r.reconcileConfigMaps(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling configmaps: %w", err)
+	}
+
+	// Reconcile Services.
+	if err := r.reconcileServices(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling services: %w", err)
+	}
+
+	// Ensure exporter resources exist before the coordinator StatefulSet
+	// references them (Secret for DATA_SOURCE_NAME, ConfigMap for queries).
+	if needsExporterPrerequisites(cluster) {
+		if err := r.ensureExporterPrerequisites(ctx, cluster); err != nil {
+			util.LoggerFromContext(ctx).Warn("failed to create exporter prerequisites", "error", err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileStatefulSets reconciles all StatefulSets (coordinator, standby,
+// segments) and storage expansion.
+func (r *ClusterReconciler) reconcileStatefulSets(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	// Reconcile coordinator StatefulSet.
+	if err := r.reconcileCoordinator(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling coordinator: %w", err)
+	}
+
+	// Reconcile standby if enabled.
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
+		if err := r.reconcileStandby(ctx, cluster); err != nil {
+			return fmt.Errorf("reconciling standby: %w", err)
+		}
+	}
+
+	// Reconcile segments.
+	if err := r.reconcileSegments(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling segments: %w", err)
+	}
+
+	// Reconcile storage expansion (PVC resizing).
+	if err := r.reconcileStorageExpansion(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling storage expansion: %w", err)
+	}
+
+	return nil
 }
 
 // reconcileConfigMaps ensures ConfigMaps are in the desired state.
@@ -2151,6 +2192,7 @@ func (r *ClusterReconciler) handleScaleFailure(
 	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonScaleOutFailed,
 		fmt.Sprintf("Scale-out failed: %d segments not ready after timeout",
 			len(failedSegments)))
+	r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "scale-out-failed")
 
 	// Remove scale-started annotation (after status update to avoid
 	// re-fetch overwriting in-memory status changes).
@@ -3228,6 +3270,7 @@ func (r *ClusterReconciler) handleUpgrade(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonUpgradeStarted,
 		fmt.Sprintf("Upgrade from %s to %s initiated", state.PreviousVersion, cluster.Spec.Version))
+	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "started")
 
 	return r.continueUpgrade(ctx, cluster)
 }
@@ -3419,6 +3462,7 @@ func (r *ClusterReconciler) completeUpgrade(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonUpgradeCompleted,
 		fmt.Sprintf("Upgrade from %s to %s completed", state.PreviousVersion, cluster.Spec.Version))
+	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "completed")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }
@@ -3461,6 +3505,10 @@ func (r *ClusterReconciler) rollbackUpgrade(
 
 	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonUpgradeRollback,
 		fmt.Sprintf("Upgrade rolled back: %s", reason))
+	// A rollback represents a failed upgrade that is being reverted; record both
+	// the failure and the rollback outcome.
+	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "failed")
+	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "rollback")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }
@@ -3648,7 +3696,7 @@ func patchStatus(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
 	statusPatch, err := json.Marshal(map[string]interface{}{
-		"status": cluster.Status,
+		patchKeyStatus: cluster.Status,
 	})
 	if err != nil {
 		return fmt.Errorf("marshaling status patch: %w", err)
@@ -3680,11 +3728,135 @@ func patchFTSStatus(
 	}
 
 	statusPatch, err := json.Marshal(map[string]interface{}{
-		"status": statusMap,
+		patchKeyStatus: statusMap,
 	})
 	if err != nil {
 		return fmt.Errorf("marshaling FTS status patch: %w", err)
 	}
 
 	return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
+}
+
+// needsExporterPrerequisites returns true if the cluster has query monitoring
+// enabled with exporters configured, meaning exporter prerequisite resources
+// (Secret, ConfigMap) must exist before the coordinator StatefulSet is created.
+func needsExporterPrerequisites(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.QueryMonitoring != nil &&
+		cluster.Spec.QueryMonitoring.Enabled &&
+		cluster.Spec.QueryMonitoring.Exporters != nil
+}
+
+// ensureExporterPrerequisites creates the exporter credentials Secret and
+// queries ConfigMap before the coordinator StatefulSet is created, so the
+// sidecar containers can reference them via env vars and volume mounts.
+func (r *ClusterReconciler) ensureExporterPrerequisites(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	// Resolve or generate the exporter password.
+	password, secretMissing, err := r.resolveExporterPrereqPassword(ctx, cluster)
+	if err != nil {
+		return err
+	}
+
+	// Build DSN.
+	dsn := r.buildExporterDSN(cluster, password)
+
+	// Create the Secret if it does not exist yet.
+	if secretMissing {
+		if err := r.createExporterPrereqSecret(ctx, cluster, password, dsn); err != nil {
+			return err
+		}
+	}
+
+	// Create the queries ConfigMap if it does not exist yet.
+	return r.createExporterPrereqConfigMap(ctx, cluster)
+}
+
+// resolveExporterPrereqPassword retrieves the exporter password from an existing
+// Secret, or generates a new one. Returns the password, whether the Secret was
+// missing (needs creation), and any error.
+func (r *ClusterReconciler) resolveExporterPrereqPassword(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (password string, secretMissing bool, err error) {
+	secretName := util.ExporterCredentialsSecretName(cluster.Name)
+	existing := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}
+
+	getErr := r.client.Get(ctx, key, existing)
+	if getErr == nil && len(existing.Data["password"]) > 0 {
+		return string(existing.Data["password"]), false, nil
+	}
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return "", false, fmt.Errorf("getting exporter credentials secret: %w", getErr)
+	}
+
+	// Secret does not exist or has no password — generate a new one.
+	pw, genErr := util.GenerateRandomPassword()
+	if genErr != nil {
+		return "", false, fmt.Errorf("generating exporter password: %w", genErr)
+	}
+	return pw, apierrors.IsNotFound(getErr), nil
+}
+
+// buildExporterDSN constructs the PostgreSQL DSN for the exporter sidecar.
+func (r *ClusterReconciler) buildExporterDSN(
+	cluster *cbv1alpha1.CloudberryCluster,
+	password string,
+) string {
+	port := int32(util.DefaultCoordinatorPort)
+	if cluster.Spec.Coordinator.Port > 0 {
+		port = cluster.Spec.Coordinator.Port
+	}
+	return fmt.Sprintf("postgresql://cloudberry_exporter:%s@localhost:%d/postgres?sslmode=disable",
+		url.QueryEscape(password), port)
+}
+
+// createExporterPrereqSecret creates the exporter credentials Secret.
+// If the Secret already exists (race condition), the error is ignored.
+func (r *ClusterReconciler) createExporterPrereqSecret(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	password, dsn string,
+) error {
+	logger := util.LoggerFromContext(ctx)
+	secretName := util.ExporterCredentialsSecretName(cluster.Name)
+	desired := r.builder.BuildExporterCredentialsSecret(cluster, password, dsn)
+
+	if createErr := r.client.Create(ctx, desired); createErr != nil {
+		if !apierrors.IsAlreadyExists(createErr) {
+			return fmt.Errorf("creating exporter credentials secret: %w", createErr)
+		}
+	} else {
+		logger.Info("created exporter credentials secret (prerequisite)", "name", secretName)
+	}
+	return nil
+}
+
+// createExporterPrereqConfigMap creates the exporter queries ConfigMap if it
+// does not exist. If the ConfigMap already exists, this is a no-op.
+func (r *ClusterReconciler) createExporterPrereqConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+	cmName := util.ExporterQueriesConfigMapName(cluster.Name)
+	existingCM := &corev1.ConfigMap{}
+	cmKey := types.NamespacedName{Name: cmName, Namespace: cluster.Namespace}
+
+	cmErr := r.client.Get(ctx, cmKey, existingCM)
+	if !apierrors.IsNotFound(cmErr) {
+		return nil // Already exists or transient error — skip creation.
+	}
+
+	desiredCM := r.builder.BuildExporterQueriesConfigMap(cluster)
+	if createErr := r.client.Create(ctx, desiredCM); createErr != nil {
+		if !apierrors.IsAlreadyExists(createErr) {
+			return fmt.Errorf("creating exporter queries configmap: %w", createErr)
+		}
+	} else {
+		logger.Info("created exporter queries configmap (prerequisite)", "name", cmName)
+	}
+	return nil
 }

@@ -21,6 +21,8 @@ const (
 	labelType       = "type"
 	labelJob        = "job"
 	labelSourceType = "source_type"
+	labelSource     = "source"
+	labelWebhook    = "webhook"
 )
 
 // Recorder defines the interface for recording metrics.
@@ -109,6 +111,63 @@ type Recorder interface {
 	RecordMaintenanceOperation(cluster, namespace, operation string)
 	// RecordPasswordRotation records a password rotation event.
 	RecordPasswordRotation()
+	// RecordQueryHistoryInsert records a query history insert event.
+	RecordQueryHistoryInsert(cluster, namespace string)
+	// ObserveQueryHistorySearchDuration records the duration of a history search operation.
+	ObserveQueryHistorySearchDuration(cluster, namespace string, duration time.Duration)
+	// RecordQueryHistoryExport records a query history export event.
+	RecordQueryHistoryExport(cluster, namespace, format string)
+	// RecordQueryHistoryRetentionCleanup records the number of entries deleted by retention cleanup.
+	RecordQueryHistoryRetentionCleanup(cluster, namespace string, deleted int64)
+	// SetQueryHistorySizeBytes sets the current size of the query history table.
+	SetQueryHistorySizeBytes(cluster, namespace string, bytes float64)
+	// RecordPlanCheck records a plan check operation.
+	RecordPlanCheck(cluster, namespace string)
+	// RecordPlanCheckIssue records a plan check issue by severity and category.
+	RecordPlanCheckIssue(cluster, namespace, severity, category string)
+	// ObservePlanCheckDuration records the duration of a plan check operation.
+	ObservePlanCheckDuration(cluster, namespace string, duration time.Duration)
+	// RecordQueryCancel records a query cancellation via the queries API.
+	RecordQueryCancel(cluster, namespace string)
+	// RecordQueryMove records a query resource group move.
+	RecordQueryMove(cluster, namespace string)
+	// RecordExporterHealthCheck records an exporter health check.
+	RecordExporterHealthCheck(cluster, namespace string)
+	// RecordActiveQueryExport records an active query export operation.
+	RecordActiveQueryExport()
+	// RecordGuestAccess records a guest access attempt with the result (allowed/denied).
+	RecordGuestAccess(cluster, namespace string, allowed bool)
+	// RecordMonitorPause records a query monitor pause event.
+	RecordMonitorPause(cluster, namespace string)
+	// RecordMonitorResume records a query monitor resume event.
+	RecordMonitorResume(cluster, namespace string)
+	// RecordMonitoringDisabledAccess records an access attempt to a monitoring endpoint
+	// when query monitoring is disabled for the cluster.
+	RecordMonitoringDisabledAccess(cluster, namespace string)
+	// RecordCertRotation records a webhook certificate rotation event.
+	// source is "vault-pki" or "self-signed"; result is "success" or "error".
+	RecordCertRotation(component, source, result string)
+	// SetCertExpirySeconds sets the seconds until the certificate expires for a component.
+	SetCertExpirySeconds(component string, seconds float64)
+	// RecordVaultOperation records a Vault operation event.
+	// operation is "auth", "read", or "write"; result is "success" or "error".
+	RecordVaultOperation(operation, result string)
+	// ObserveVaultOperationDuration records the duration of a Vault operation.
+	ObserveVaultOperationDuration(operation string, d time.Duration)
+	// RecordWebhookAdmission records an admission webhook decision.
+	// webhook is "validating" or "mutating"; operation is "create", "update", or "delete";
+	// result is "allowed", "denied", or "error".
+	RecordWebhookAdmission(webhook, operation, result string)
+	// RecordUpgradeOperation records a cluster upgrade operation event.
+	// result is "started", "completed", "rollback", or "failed".
+	RecordUpgradeOperation(cluster, namespace, result string)
+	// RecordRollingRestart records a rolling restart operation event.
+	// result is "started", "completed", or "failed".
+	RecordRollingRestart(cluster, namespace, result string)
+	// RecordRecoveryOperation records a recovery operation event.
+	// recoveryType is "incremental", "full", or "differential";
+	// result is "started", "completed", or "failed".
+	RecordRecoveryOperation(cluster, namespace, recoveryType, result string)
 }
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
@@ -168,6 +227,34 @@ type PrometheusRecorder struct {
 	mirroringOperationsTotal   *prometheus.CounterVec
 	maintenanceOperationsTotal *prometheus.CounterVec
 	passwordRotationTotal      prometheus.Counter
+
+	queryHistoryTotal          *prometheus.CounterVec
+	queryHistorySearchDuration *prometheus.HistogramVec
+	queryHistoryExportTotal    *prometheus.CounterVec
+	queryHistoryRetentionTotal *prometheus.CounterVec
+	queryHistorySizeBytes      *prometheus.GaugeVec
+
+	planCheckTotal       *prometheus.CounterVec
+	planCheckIssuesTotal *prometheus.CounterVec
+	planCheckDuration    *prometheus.HistogramVec
+
+	queryCancelTotal              *prometheus.CounterVec
+	queryMoveTotal                *prometheus.CounterVec
+	exporterHealthCheckTotal      *prometheus.CounterVec
+	activeQueryExportTotal        prometheus.Counter
+	guestAccessTotal              *prometheus.CounterVec
+	monitorPauseTotal             *prometheus.CounterVec
+	monitorResumeTotal            *prometheus.CounterVec
+	monitoringDisabledAccessTotal *prometheus.CounterVec
+
+	certRotationTotal       *prometheus.CounterVec
+	certExpirySeconds       *prometheus.GaugeVec
+	vaultOperationsTotal    *prometheus.CounterVec
+	vaultOperationDuration  *prometheus.HistogramVec
+	webhookAdmissionTotal   *prometheus.CounterVec
+	upgradeOperationsTotal  *prometheus.CounterVec
+	rollingRestartTotal     *prometheus.CounterVec
+	recoveryOperationsTotal *prometheus.CounterVec
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -433,6 +520,153 @@ func (r *PrometheusRecorder) initStorageMetrics() {
 	}, []string{labelCluster, labelNamespace, labelOperation})
 }
 
+// initQueryHistoryMetrics initializes query history metrics.
+func (r *PrometheusRecorder) initQueryHistoryMetrics() {
+	r.queryHistoryTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_history_total",
+		Help:      "Total queries recorded in history.",
+	}, []string{labelCluster, labelNamespace})
+	r.queryHistorySearchDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_history_search_duration_seconds",
+		Help:      "Duration of history search operations in seconds.",
+		Buckets:   []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	}, []string{labelCluster, labelNamespace})
+	r.queryHistoryExportTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_history_export_total",
+		Help:      "Total history exports.",
+	}, []string{labelCluster, labelNamespace, "format"})
+	r.queryHistoryRetentionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_history_retention_deleted_total",
+		Help:      "Queries deleted by retention policy.",
+	}, []string{labelCluster, labelNamespace})
+	r.queryHistorySizeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_history_size_bytes",
+		Help:      "Current size of query history table.",
+	}, []string{labelCluster, labelNamespace})
+}
+
+// initPlanCheckMetrics initializes plan check metrics.
+func (r *PrometheusRecorder) initPlanCheckMetrics() {
+	r.planCheckTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "plan_check_total",
+		Help:      "Total plan checks performed.",
+	}, []string{labelCluster, labelNamespace})
+	r.planCheckIssuesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "plan_check_issues_total",
+		Help:      "Plan check issues found by severity and category.",
+	}, []string{labelCluster, labelNamespace, "severity", "category"})
+	r.planCheckDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "plan_check_duration_seconds",
+		Help:      "Duration of plan check operations in seconds.",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+	}, []string{labelCluster, labelNamespace})
+}
+
+// initQueryOperationMetrics initializes query operation metrics (cancel, move, exporter health).
+func (r *PrometheusRecorder) initQueryOperationMetrics() {
+	r.queryCancelTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_cancel_total",
+		Help:      "Total number of query cancellations via the queries API.",
+	}, []string{labelCluster, labelNamespace})
+	r.queryMoveTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "query_move_total",
+		Help:      "Total number of query resource group moves.",
+	}, []string{labelCluster, labelNamespace})
+	r.exporterHealthCheckTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "exporter_health_check_total",
+		Help:      "Total number of exporter health checks.",
+	}, []string{labelCluster, labelNamespace})
+	r.activeQueryExportTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "active_query_export_total",
+		Help:      "Total number of active query exports.",
+	})
+	r.guestAccessTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "guest_access_total",
+		Help:      "Total number of guest access attempts.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.monitorPauseTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "monitor_pause_total",
+		Help:      "Total number of query monitor pause operations.",
+	}, []string{labelCluster, labelNamespace})
+	r.monitorResumeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "monitor_resume_total",
+		Help:      "Total number of query monitor resume operations.",
+	}, []string{labelCluster, labelNamespace})
+	r.monitoringDisabledAccessTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "monitoring_disabled_access_total",
+		Help:      "Total number of access attempts to monitoring endpoints when monitoring is disabled.",
+	}, []string{labelCluster, labelNamespace})
+}
+
+// initSecurityMetrics initializes certificate and vault security metrics.
+func (r *PrometheusRecorder) initSecurityMetrics() {
+	r.certRotationTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "cert_rotation_total",
+		Help:      "Total number of webhook certificate rotations.",
+	}, []string{labelComponent, labelSource, labelResult})
+	r.certExpirySeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "cert_expiry_seconds",
+		Help:      "Seconds until the certificate expires per component.",
+	}, []string{labelComponent})
+	r.vaultOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "vault_operations_total",
+		Help:      "Total number of Vault operations.",
+	}, []string{labelOperation, labelResult})
+	r.vaultOperationDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "vault_operation_duration_seconds",
+		Help:      "Duration of Vault operations in seconds.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{labelOperation})
+}
+
+// initAdmissionMetrics initializes webhook admission metrics.
+func (r *PrometheusRecorder) initAdmissionMetrics() {
+	r.webhookAdmissionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "webhook_admission_total",
+		Help:      "Total number of admission webhook decisions.",
+	}, []string{labelWebhook, labelOperation, labelResult})
+}
+
+// initLifecycleMetrics initializes upgrade, rolling restart, and recovery metrics.
+func (r *PrometheusRecorder) initLifecycleMetrics() {
+	r.upgradeOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "upgrade_operations_total",
+		Help:      "Total number of cluster upgrade operations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.rollingRestartTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "rolling_restart_total",
+		Help:      "Total number of rolling restart operations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.recoveryOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "recovery_operations_total",
+		Help:      "Total number of recovery operations.",
+	}, []string{labelCluster, labelNamespace, labelType, labelResult})
+}
+
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
 func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 	r := &PrometheusRecorder{}
@@ -442,6 +676,12 @@ func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 	r.initWorkloadMetrics()
 	r.initBackupMetrics()
 	r.initStorageMetrics()
+	r.initQueryHistoryMetrics()
+	r.initPlanCheckMetrics()
+	r.initQueryOperationMetrics()
+	r.initSecurityMetrics()
+	r.initAdmissionMetrics()
+	r.initLifecycleMetrics()
 	r.register(reg)
 	return r
 }
@@ -467,6 +707,19 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.dataSkewCoefficient, r.pvcSizeBytes,
 		r.mirroringOperationsTotal, r.maintenanceOperationsTotal,
 		r.passwordRotationTotal,
+		r.queryHistoryTotal, r.queryHistorySearchDuration,
+		r.queryHistoryExportTotal, r.queryHistoryRetentionTotal,
+		r.queryHistorySizeBytes,
+		r.planCheckTotal, r.planCheckIssuesTotal, r.planCheckDuration,
+		r.queryCancelTotal, r.queryMoveTotal, r.exporterHealthCheckTotal,
+		r.activeQueryExportTotal, r.guestAccessTotal,
+		r.monitorPauseTotal, r.monitorResumeTotal,
+		r.monitoringDisabledAccessTotal,
+		r.certRotationTotal, r.certExpirySeconds,
+		r.vaultOperationsTotal, r.vaultOperationDuration,
+		r.webhookAdmissionTotal,
+		r.upgradeOperationsTotal, r.rollingRestartTotal,
+		r.recoveryOperationsTotal,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -701,6 +954,131 @@ func (r *PrometheusRecorder) RecordPasswordRotation() {
 	r.passwordRotationTotal.Inc()
 }
 
+// RecordQueryHistoryInsert records a query history insert event.
+func (r *PrometheusRecorder) RecordQueryHistoryInsert(cluster, namespace string) {
+	r.queryHistoryTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// ObserveQueryHistorySearchDuration records the duration of a history search operation.
+func (r *PrometheusRecorder) ObserveQueryHistorySearchDuration(cluster, namespace string, duration time.Duration) {
+	r.queryHistorySearchDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// RecordQueryHistoryExport records a query history export event.
+func (r *PrometheusRecorder) RecordQueryHistoryExport(cluster, namespace, format string) {
+	r.queryHistoryExportTotal.WithLabelValues(cluster, namespace, format).Inc()
+}
+
+// RecordQueryHistoryRetentionCleanup records the number of entries deleted by retention cleanup.
+func (r *PrometheusRecorder) RecordQueryHistoryRetentionCleanup(cluster, namespace string, deleted int64) {
+	r.queryHistoryRetentionTotal.WithLabelValues(cluster, namespace).Add(float64(deleted))
+}
+
+// SetQueryHistorySizeBytes sets the current size of the query history table.
+func (r *PrometheusRecorder) SetQueryHistorySizeBytes(cluster, namespace string, bytes float64) {
+	r.queryHistorySizeBytes.WithLabelValues(cluster, namespace).Set(bytes)
+}
+
+// RecordPlanCheck records a plan check operation.
+func (r *PrometheusRecorder) RecordPlanCheck(cluster, namespace string) {
+	r.planCheckTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordPlanCheckIssue records a plan check issue by severity and category.
+func (r *PrometheusRecorder) RecordPlanCheckIssue(cluster, namespace, severity, category string) {
+	r.planCheckIssuesTotal.WithLabelValues(cluster, namespace, severity, category).Inc()
+}
+
+// ObservePlanCheckDuration records the duration of a plan check operation.
+func (r *PrometheusRecorder) ObservePlanCheckDuration(cluster, namespace string, duration time.Duration) {
+	r.planCheckDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// RecordQueryCancel records a query cancellation via the queries API.
+func (r *PrometheusRecorder) RecordQueryCancel(cluster, namespace string) {
+	r.queryCancelTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordQueryMove records a query resource group move.
+func (r *PrometheusRecorder) RecordQueryMove(cluster, namespace string) {
+	r.queryMoveTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordExporterHealthCheck records an exporter health check.
+func (r *PrometheusRecorder) RecordExporterHealthCheck(cluster, namespace string) {
+	r.exporterHealthCheckTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordActiveQueryExport records an active query export operation.
+func (r *PrometheusRecorder) RecordActiveQueryExport() {
+	r.activeQueryExportTotal.Inc()
+}
+
+// RecordGuestAccess records a guest access attempt with the result (allowed/denied).
+func (r *PrometheusRecorder) RecordGuestAccess(cluster, namespace string, allowed bool) {
+	result := "denied"
+	if allowed {
+		result = "allowed"
+	}
+	r.guestAccessTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordMonitorPause records a query monitor pause event.
+func (r *PrometheusRecorder) RecordMonitorPause(cluster, namespace string) {
+	r.monitorPauseTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordMonitorResume records a query monitor resume event.
+func (r *PrometheusRecorder) RecordMonitorResume(cluster, namespace string) {
+	r.monitorResumeTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordMonitoringDisabledAccess records an access attempt to a monitoring endpoint
+// when query monitoring is disabled for the cluster.
+func (r *PrometheusRecorder) RecordMonitoringDisabledAccess(cluster, namespace string) {
+	r.monitoringDisabledAccessTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordCertRotation records a webhook certificate rotation event.
+func (r *PrometheusRecorder) RecordCertRotation(component, source, result string) {
+	r.certRotationTotal.WithLabelValues(component, source, result).Inc()
+}
+
+// SetCertExpirySeconds sets the seconds until the certificate expires for a component.
+func (r *PrometheusRecorder) SetCertExpirySeconds(component string, seconds float64) {
+	r.certExpirySeconds.WithLabelValues(component).Set(seconds)
+}
+
+// RecordVaultOperation records a Vault operation event.
+func (r *PrometheusRecorder) RecordVaultOperation(operation, result string) {
+	r.vaultOperationsTotal.WithLabelValues(operation, result).Inc()
+}
+
+// ObserveVaultOperationDuration records the duration of a Vault operation.
+func (r *PrometheusRecorder) ObserveVaultOperationDuration(operation string, d time.Duration) {
+	r.vaultOperationDuration.WithLabelValues(operation).Observe(d.Seconds())
+}
+
+// RecordWebhookAdmission records an admission webhook decision.
+func (r *PrometheusRecorder) RecordWebhookAdmission(webhook, operation, result string) {
+	r.webhookAdmissionTotal.WithLabelValues(webhook, operation, result).Inc()
+}
+
+// RecordUpgradeOperation records a cluster upgrade operation event.
+func (r *PrometheusRecorder) RecordUpgradeOperation(cluster, namespace, result string) {
+	r.upgradeOperationsTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordRollingRestart records a rolling restart operation event.
+func (r *PrometheusRecorder) RecordRollingRestart(cluster, namespace, result string) {
+	r.rollingRestartTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordRecoveryOperation records a recovery operation event.
+func (r *PrometheusRecorder) RecordRecoveryOperation(cluster, namespace, recoveryType, result string) {
+	r.recoveryOperationsTotal.WithLabelValues(cluster, namespace, recoveryType, result).Inc()
+}
+
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
 func boolToFloat64(b bool) float64 {
 	if b {
@@ -844,3 +1222,75 @@ func (n *NoopRecorder) RecordMaintenanceOperation(_, _, _ string) {}
 
 // RecordPasswordRotation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordPasswordRotation() {}
+
+// RecordQueryHistoryInsert is a no-op implementation for testing.
+func (n *NoopRecorder) RecordQueryHistoryInsert(_, _ string) {}
+
+// ObserveQueryHistorySearchDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveQueryHistorySearchDuration(_, _ string, _ time.Duration) {}
+
+// RecordQueryHistoryExport is a no-op implementation for testing.
+func (n *NoopRecorder) RecordQueryHistoryExport(_, _, _ string) {}
+
+// RecordQueryHistoryRetentionCleanup is a no-op implementation for testing.
+func (n *NoopRecorder) RecordQueryHistoryRetentionCleanup(_, _ string, _ int64) {}
+
+// SetQueryHistorySizeBytes is a no-op implementation for testing.
+func (n *NoopRecorder) SetQueryHistorySizeBytes(_, _ string, _ float64) {}
+
+// RecordPlanCheck is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPlanCheck(_, _ string) {}
+
+// RecordPlanCheckIssue is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPlanCheckIssue(_, _, _, _ string) {}
+
+// ObservePlanCheckDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObservePlanCheckDuration(_, _ string, _ time.Duration) {}
+
+// RecordQueryCancel is a no-op implementation for testing.
+func (n *NoopRecorder) RecordQueryCancel(_, _ string) {}
+
+// RecordQueryMove is a no-op implementation for testing.
+func (n *NoopRecorder) RecordQueryMove(_, _ string) {}
+
+// RecordExporterHealthCheck is a no-op implementation for testing.
+func (n *NoopRecorder) RecordExporterHealthCheck(_, _ string) {}
+
+// RecordActiveQueryExport is a no-op implementation for testing.
+func (n *NoopRecorder) RecordActiveQueryExport() {}
+
+// RecordGuestAccess is a no-op implementation for testing.
+func (n *NoopRecorder) RecordGuestAccess(_, _ string, _ bool) {}
+
+// RecordMonitorPause is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMonitorPause(_, _ string) {}
+
+// RecordMonitorResume is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMonitorResume(_, _ string) {}
+
+// RecordMonitoringDisabledAccess is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMonitoringDisabledAccess(_, _ string) {}
+
+// RecordCertRotation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordCertRotation(_, _, _ string) {}
+
+// SetCertExpirySeconds is a no-op implementation for testing.
+func (n *NoopRecorder) SetCertExpirySeconds(_ string, _ float64) {}
+
+// RecordVaultOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordVaultOperation(_, _ string) {}
+
+// ObserveVaultOperationDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {}
+
+// RecordWebhookAdmission is a no-op implementation for testing.
+func (n *NoopRecorder) RecordWebhookAdmission(_, _, _ string) {}
+
+// RecordUpgradeOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordUpgradeOperation(_, _, _ string) {}
+
+// RecordRollingRestart is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRollingRestart(_, _, _ string) {}
+
+// RecordRecoveryOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRecoveryOperation(_, _, _, _ string) {}

@@ -2113,7 +2113,7 @@ func TestQueryCommands_WithMockServer(t *testing.T) {
 	globals.authMethod = "basic"
 	globals.output = "json"
 
-	subcmds := []string{"active", "slow", "history", "status"}
+	subcmds := []string{"active", "slow", "status"}
 	for _, name := range subcmds {
 		t.Run(name, func(t *testing.T) {
 			cmd := newQueryCmd()
@@ -2123,6 +2123,17 @@ func TestQueryCommands_WithMockServer(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+
+	// "history" is a command group — test its "list" subcommand.
+	t.Run("history/list", func(t *testing.T) {
+		cmd := newQueryCmd()
+		historySub := findSubcommand(cmd, "history")
+		require.NotNil(t, historySub)
+		listSub := findSubcommand(historySub, "list")
+		require.NotNil(t, listSub)
+		err := listSub.RunE(listSub, nil)
+		require.NoError(t, err)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -2906,7 +2917,7 @@ func TestAdditionalClusterRequiredCommands(t *testing.T) {
 		{"inspect logs", newInspectCmd, "logs"},
 		{"queries active", newQueryCmd, "active"},
 		{"queries slow", newQueryCmd, "slow"},
-		{"queries history", newQueryCmd, "history"},
+		// "history" is a command group — skip it here; tested separately below.
 		{"queries status", newQueryCmd, "status"},
 		{"backup create", newBackupCmd, "create"},
 		{"backup list", newBackupCmd, "list"},
@@ -2930,6 +2941,21 @@ func TestAdditionalClusterRequiredCommands(t *testing.T) {
 			sub := findSubcommand(cmd, tt.subcmd)
 			require.NotNil(t, sub, "should have %q subcommand", tt.subcmd)
 
+			err := sub.RunE(sub, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cluster name is required")
+		})
+	}
+
+	// Test "queries history" subcommands (history is a command group).
+	historySubcmds := []string{"list", "detail", "export"}
+	for _, name := range historySubcmds {
+		t.Run("queries history/"+name, func(t *testing.T) {
+			cmd := newQueryCmd()
+			historySub := findSubcommand(cmd, "history")
+			require.NotNil(t, historySub, "should have history subcommand")
+			sub := findSubcommand(historySub, name)
+			require.NotNil(t, sub, "should have %q subcommand under history", name)
 			err := sub.RunE(sub, nil)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "cluster name is required")

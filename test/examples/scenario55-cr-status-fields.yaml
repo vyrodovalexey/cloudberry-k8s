@@ -1,0 +1,45 @@
+# Scenario 55: CR Status Fields Verification
+# Cluster with query monitoring enabled to verify status field updates.
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario55-status
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "10Gi"
+  segments:
+    count: 2
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+  auth:
+    basic:
+      enabled: true
+      adminUser: "gpadmin"
+  queryMonitoring:
+    enabled: true
+    historyRetention: "30d"
+    samplingInterval: 5
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187

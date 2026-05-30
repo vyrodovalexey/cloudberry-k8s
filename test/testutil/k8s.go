@@ -3,6 +3,7 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -186,6 +187,15 @@ type MockDBClient struct {
 	AnalyzeSkewFunc                   func(ctx context.Context, database string) ([]db.TableSkewInfo, error)
 	ListSessionsWithResourceGroupFunc func(ctx context.Context) ([]db.SessionWithGroup, error)
 	RebalanceTableFunc                func(ctx context.Context, database, schema, table, distKey string) error
+	SetupExporterRoleFunc             func(ctx context.Context, password string) error
+	GetQueryDetailFunc                func(ctx context.Context, pid int32) (*db.QueryDetail, error)
+	EnsureQueryHistoryTableFunc       func(ctx context.Context) error
+	InsertQueryHistoryFunc            func(ctx context.Context, entry *db.QueryHistoryEntry) error
+	GetQueryHistoryFunc               func(ctx context.Context, filter db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error)
+	GetQueryHistoryDetailFunc         func(ctx context.Context, queryID string) (*db.QueryHistoryEntry, error)
+	ExportQueryHistoryCSVFunc         func(ctx context.Context, filter db.QueryHistoryFilter, w io.Writer) error
+	CleanupQueryHistoryFunc           func(ctx context.Context, retention time.Duration) (int64, error)
+	MoveQueryToResourceGroupFunc      func(ctx context.Context, pid int32, targetGroup string) error
 	Closed                            bool
 }
 
@@ -648,6 +658,78 @@ func (m *MockDBClient) ListSessionsWithResourceGroup(ctx context.Context) ([]db.
 
 func (m *MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"mydb"}, nil
+}
+
+// SetupExporterRole implements db.Client.
+func (m *MockDBClient) SetupExporterRole(ctx context.Context, password string) error {
+	if m.SetupExporterRoleFunc != nil {
+		return m.SetupExporterRoleFunc(ctx, password)
+	}
+	return nil
+}
+
+// GetQueryDetail implements db.Client.
+func (m *MockDBClient) GetQueryDetail(ctx context.Context, pid int32) (*db.QueryDetail, error) {
+	if m.GetQueryDetailFunc != nil {
+		return m.GetQueryDetailFunc(ctx, pid)
+	}
+	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+
+// EnsureQueryHistoryTable implements db.Client.
+func (m *MockDBClient) EnsureQueryHistoryTable(ctx context.Context) error {
+	if m.EnsureQueryHistoryTableFunc != nil {
+		return m.EnsureQueryHistoryTableFunc(ctx)
+	}
+	return nil
+}
+
+// InsertQueryHistory implements db.Client.
+func (m *MockDBClient) InsertQueryHistory(ctx context.Context, entry *db.QueryHistoryEntry) error {
+	if m.InsertQueryHistoryFunc != nil {
+		return m.InsertQueryHistoryFunc(ctx, entry)
+	}
+	return nil
+}
+
+// GetQueryHistory implements db.Client.
+func (m *MockDBClient) GetQueryHistory(ctx context.Context, filter db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error) {
+	if m.GetQueryHistoryFunc != nil {
+		return m.GetQueryHistoryFunc(ctx, filter)
+	}
+	return []db.QueryHistoryEntry{}, 0, nil
+}
+
+// GetQueryHistoryDetail implements db.Client.
+func (m *MockDBClient) GetQueryHistoryDetail(ctx context.Context, queryID string) (*db.QueryHistoryEntry, error) {
+	if m.GetQueryHistoryDetailFunc != nil {
+		return m.GetQueryHistoryDetailFunc(ctx, queryID)
+	}
+	return nil, fmt.Errorf("query %s not found", queryID)
+}
+
+// ExportQueryHistoryCSV implements db.Client.
+func (m *MockDBClient) ExportQueryHistoryCSV(ctx context.Context, filter db.QueryHistoryFilter, w io.Writer) error {
+	if m.ExportQueryHistoryCSVFunc != nil {
+		return m.ExportQueryHistoryCSVFunc(ctx, filter, w)
+	}
+	return nil
+}
+
+// CleanupQueryHistory implements db.Client.
+func (m *MockDBClient) CleanupQueryHistory(ctx context.Context, retention time.Duration) (int64, error) {
+	if m.CleanupQueryHistoryFunc != nil {
+		return m.CleanupQueryHistoryFunc(ctx, retention)
+	}
+	return 0, nil
+}
+
+// MoveQueryToResourceGroup implements db.Client.
+func (m *MockDBClient) MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error {
+	if m.MoveQueryToResourceGroupFunc != nil {
+		return m.MoveQueryToResourceGroupFunc(ctx, pid, targetGroup)
+	}
+	return nil
 }
 
 // MockDBClientFactory implements db.DBClientFactory for testing.

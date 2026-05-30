@@ -518,6 +518,111 @@ For production deployments using Vault PKI for webhook certificates, follow thes
 
 The operator automatically rotates certificates when 2/3 of their lifetime has elapsed. CA bundle injection into webhook configurations uses retry with exponential backoff to handle transient API server errors during operator startup. See [Webhook Certificate Configuration](#webhook-certificate-configuration) for additional options.
 
+#### Vault PKI with Kubernetes Auth (End-to-End)
+
+This walkthrough deploys the operator with `webhook.certSource=vault-pki` and `vault.authMethod=kubernetes`. With Kubernetes auth, the operator authenticates to Vault using its own ServiceAccount token — no static Vault token is required. Vault then issues short-lived webhook certificates from the PKI engine on each rotation.
+
+The flow is:
+
+1. The operator presents its ServiceAccount JWT to Vault's Kubernetes auth backend.
+2. Vault validates the JWT against the Kubernetes API (`TokenReview`) and maps the ServiceAccount to a Vault role and policy.
+3. The policy grants `pki/issue/<role>`, allowing the operator to request webhook certificates for the webhook service SANs.
+
+**Prerequisites:** a reachable Vault server, the Vault CLI (or API) configured with an admin token, and `kubectl` access to the target cluster.
+
+1. **Enable the PKI secrets engine and configure a CA** (skip if already done):
+
+   ```bash
+   vault secrets enable -path=pki pki
+   vault secrets tune -max-lease-ttl=87600h pki
+   vault write pki/root/generate/internal \
+     common_name="cloudberry-operator-ca" ttl=87600h
+   ```
+
+2. **Create a PKI role** for the webhook Subject Alternative Names (SANs):
+
+   ```bash
+   vault write pki/roles/cloudberry-operator \
+     allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local" \
+     allow_subdomains=true \
+     max_ttl=8760h
+   ```
+
+3. **Create a Vault policy** that grants the operator permission to issue certificates from the PKI role:
+
+   ```bash
+   vault policy write cloudberry-operator - <<'EOF'
+   path "pki/issue/cloudberry-operator" {
+     capabilities = ["create", "update"]
+   }
+   EOF
+   ```
+
+4. **Enable the Kubernetes auth method** and configure it so Vault can validate ServiceAccount tokens against the Kubernetes API:
+
+   ```bash
+   vault auth enable kubernetes
+
+   # Token used by Vault to call the Kubernetes TokenReview API.
+   TOKEN_REVIEWER_JWT="$(kubectl create token vault-auth -n vault-system)"
+
+   # Kubernetes CA certificate (PEM) that signed the API server certificate.
+   kubectl config view --raw --minify --flatten \
+     -o jsonpath='{.clusters[].cluster.certificate-authority-data}' \
+     | base64 -d > /tmp/k8s-ca.crt
+
+   vault write auth/kubernetes/config \
+     token_reviewer_jwt="${TOKEN_REVIEWER_JWT}" \
+     kubernetes_host="https://kubernetes.default.svc:443" \
+     kubernetes_ca_cert=@/tmp/k8s-ca.crt
+   ```
+
+   > **docker-desktop note**: On Docker Desktop, `kubernetes_host` must use a hostname that is present in the API server certificate SANs. Use `https://kubernetes.docker.internal:6443` — **not** `https://host.docker.internal:6443`. Pointing Vault at `host.docker.internal` causes TLS verification to fail because that name is not in the API server certificate SANs.
+
+5. **Bind the operator ServiceAccount** to the Vault role and policy:
+
+   ```bash
+   vault write auth/kubernetes/role/cloudberry-operator \
+     bound_service_account_names=cloudberry-operator \
+     bound_service_account_namespaces=cloudberry-system \
+     policies=cloudberry-operator \
+     ttl=1h
+   ```
+
+6. **Deploy the operator** with Vault PKI webhook certificates and Kubernetes auth:
+
+   ```bash
+   helm install cloudberry-operator deploy/helm/cloudberry-operator \
+     --namespace cloudberry-system --create-namespace \
+     --set webhook.enabled=true \
+     --set webhook.certSource=vault-pki \
+     --set webhook.vaultPKI.mountPath=pki \
+     --set webhook.vaultPKI.role=cloudberry-operator \
+     --set vault.enabled=true \
+     --set vault.address=http://vault.vault-system:8200 \
+     --set vault.authMethod=kubernetes \
+     --set vault.authPath=auth/kubernetes
+   ```
+
+7. **Verify** authentication and certificate issuance:
+
+   ```bash
+   # Operator should report a successful Vault login and a healthy webhook cert
+   kubectl logs -n cloudberry-system deployment/cloudberry-operator | grep -i vault
+
+   # Confirm the webhook certificate Secret exists
+   kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
+
+   # Confirm the CA bundle was injected into the webhook configurations
+   kubectl get validatingwebhookconfigurations \
+     -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
+
+   # Inspect the Vault auth role binding
+   vault read auth/kubernetes/role/cloudberry-operator
+   ```
+
+The operator authenticates to Vault on startup and on each certificate rotation, recording `cloudberry_vault_operations_total` and `cloudberry_cert_rotation_total` metrics for observability. See [Monitoring and Observability](user-guide.md#monitoring-and-observability) for the metric reference.
+
 ## Upgrading
 
 ### Helm Upgrade

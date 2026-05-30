@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +24,7 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/planchecker"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -48,6 +52,7 @@ const (
 	responseKeyCluster = "cluster"
 	responseKeyPID     = "pid"
 	responseKeyMessage = "message"
+	responseKeyItems   = "items"
 
 	// msgDBNotAvailable is the message returned when the database factory is not configured.
 	msgDBNotAvailable = "database connection not available"
@@ -55,18 +60,28 @@ const (
 	responseKeyGroup     = "group"
 	responseKeyName      = "name"
 	responseKeyNamespace = "namespace"
+	responseKeyCanceled  = "canceled"
 
-	statusDeleted = "deleted"
-	statusPending = "pending"
-	statusUpdated = "updated"
-	statusCreated = "created"
-	statusRotated = "rotated"
+	statusDeleted  = "deleted"
+	statusPending  = "pending"
+	statusUpdated  = "updated"
+	statusCreated  = "created"
+	statusRotated  = "rotated"
+	statusCanceled = "canceled"
+	statusMoved    = "moved"
 
 	responseKeyMemoryLimit = "memoryLimit"
 	responseKeyConcurrency = "concurrency"
 	responseKeyCPUMaxPct   = "cpuMaxPercent"
 	responseKeyCPUWeight   = "cpuWeight"
 	responseKeyRule        = "rule"
+
+	responseKeyActiveQueries  = "activeQueries"
+	responseKeyQueuedQueries  = "queuedQueries"
+	responseKeyBlockedQueries = "blockedQueries"
+
+	statusPaused  = "paused"
+	statusResumed = "resumed"
 
 	// errCodeClusterNotFound is the error code for cluster-not-found responses.
 	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
@@ -111,16 +126,25 @@ func limitBody(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 }
 
+// monitorState tracks the pause/resume state for a cluster's query monitor.
+type monitorState struct {
+	Paused   bool                   `json:"paused"`
+	PausedAt *time.Time             `json:"pausedAt,omitempty"`
+	Snapshot map[string]interface{} `json:"snapshot,omitempty"`
+}
+
 // Server is the REST API server for the cloudberry operator.
 type Server struct {
-	k8sClient   client.Client
-	authMW      *auth.AuthMiddleware
-	rateLimiter *RateLimiter
-	dbFactory   db.DBClientFactory
-	credStore   *auth.InMemoryCredentialStore
-	metrics     metrics.Recorder
-	logger      *slog.Logger
-	mux         *http.ServeMux
+	k8sClient     client.Client
+	authMW        *auth.AuthMiddleware
+	rateLimiter   *RateLimiter
+	dbFactory     db.DBClientFactory
+	credStore     *auth.InMemoryCredentialStore
+	metrics       metrics.Recorder
+	logger        *slog.Logger
+	mux           *http.ServeMux
+	monitorStates map[string]*monitorState // key: "namespace/cluster"
+	monitorMu     sync.RWMutex
 }
 
 // NewServer creates a new API server.
@@ -145,13 +169,14 @@ func NewServer(
 	}
 
 	s := &Server{
-		k8sClient:   k8sClient,
-		authMW:      authMW,
-		rateLimiter: NewRateLimiter(rateLimit, defaultRateInterval, logger),
-		dbFactory:   dbFactory,
-		metrics:     metricsRecorder,
-		logger:      logger.With("component", "api-server"),
-		mux:         http.NewServeMux(),
+		k8sClient:     k8sClient,
+		authMW:        authMW,
+		rateLimiter:   NewRateLimiter(rateLimit, defaultRateInterval, logger),
+		dbFactory:     dbFactory,
+		metrics:       metricsRecorder,
+		logger:        logger.With("component", "api-server"),
+		mux:           http.NewServeMux(),
+		monitorStates: make(map[string]*monitorState),
 	}
 
 	if len(credStore) > 0 && credStore[0] != nil {
@@ -256,11 +281,12 @@ func (s *Server) registerRoutes() {
 	// Workload, resource group, rule, and queue management.
 	s.registerWorkloadRoutes()
 
-	// Query monitoring.
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetQueryMonitoring)))
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/active",
-		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetActiveQueries)))
+	// Query monitoring, pause/resume, history, plan-check, cancel, move, export.
+	s.registerQueryRoutes()
+
+	// Exporter health — read endpoint supports guest access.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/metrics/exporters",
+		s.withGuestAuth(s.withPermission(auth.PermissionBasic, s.handleGetExporterHealth)))
 
 	// Backup and restore.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups",
@@ -346,6 +372,49 @@ func (s *Server) registerWorkloadRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleDeleteResourceQueue)))
 }
 
+// registerQueryRoutes registers query monitoring, pause/resume, history,
+// plan-check, cancel, move, and export routes.
+func (s *Server) registerQueryRoutes() {
+	// Query monitoring — read endpoints support guest access.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries",
+		s.withGuestAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleGetQueryMonitoring)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/active",
+		s.withGuestAuth(s.withPermission(auth.PermissionBasic, s.handleGetActiveQueries)))
+
+	// Monitor pause/resume.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/monitor/pause",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handlePauseMonitor)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/monitor/resume",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleResumeMonitor)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/monitor/state",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetMonitorState)))
+
+	// Query history — MUST be registered before queries/{pid} to avoid path conflicts.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/history",
+		s.withAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleGetQueryHistory)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/history/{qid}",
+		s.withAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleGetQueryHistoryDetail)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/history/export",
+		s.withAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleExportQueryHistory)))
+
+	// Active query export.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/export",
+		s.withAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleExportActiveQueries)))
+
+	// Plan analysis — MUST be registered before queries/{pid} to avoid path conflicts.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/plan-check",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handlePlanCheck)))
+
+	// Query cancel and move — POST routes with {pid} sub-path, no conflict with GET queries/{pid}.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/{pid}/cancel",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCancelQueryByPID)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/queries/{pid}/move",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleMoveQuery)))
+
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/queries/{pid}",
+		s.withAuth(s.withPermission(auth.PermissionOperatorBasic, s.handleGetQueryDetail)))
+}
+
 // withAuth wraps a handler with rate limiting and authentication middleware.
 // Rate limiting is applied before authentication to protect against brute-force attacks.
 func (s *Server) withAuth(handler http.Handler) http.Handler {
@@ -359,6 +428,64 @@ func (s *Server) withAuth(handler http.Handler) http.Handler {
 // withPermission wraps a handler function with permission checking.
 func (s *Server) withPermission(level auth.PermissionLevel, fn http.HandlerFunc) http.Handler {
 	return auth.RequirePermission(level, s.logger)(fn)
+}
+
+// isGuestAccessEnabled checks if guestAccess is enabled for the cluster in the request.
+// It looks up the cluster by name and namespace from the request path and query parameters.
+// Returns false if the cluster cannot be found or guestAccess is not enabled.
+func (s *Server) isGuestAccessEnabled(r *http.Request) bool {
+	clusterName := r.PathValue("name")
+	namespace := r.URL.Query().Get("namespace")
+	if clusterName == "" {
+		return false
+	}
+
+	// When namespace is empty, search across all namespaces.
+	if namespace == "" {
+		clusterList := &cbv1alpha1.CloudberryClusterList{}
+		if err := s.k8sClient.List(r.Context(), clusterList); err != nil {
+			s.logger.Debug("guest access check: failed to list clusters", "error", err)
+			return false
+		}
+		for i := range clusterList.Items {
+			if clusterList.Items[i].Name == clusterName {
+				enabled := clusterList.Items[i].Spec.QueryMonitoring != nil &&
+					clusterList.Items[i].Spec.QueryMonitoring.GuestAccess
+				if s.metrics != nil {
+					s.metrics.RecordGuestAccess(clusterName, clusterList.Items[i].Namespace, enabled)
+				}
+				return enabled
+			}
+		}
+		s.logger.Debug("guest access check: cluster not found", "cluster", clusterName)
+		return false
+	}
+
+	cluster := &cbv1alpha1.CloudberryCluster{}
+	key := types.NamespacedName{Name: clusterName, Namespace: namespace}
+	if err := s.k8sClient.Get(r.Context(), key, cluster); err != nil {
+		s.logger.Debug("guest access check: failed to get cluster",
+			"cluster", clusterName, "namespace", namespace, "error", err)
+		return false
+	}
+
+	enabled := cluster.Spec.QueryMonitoring != nil && cluster.Spec.QueryMonitoring.GuestAccess
+	if s.metrics != nil {
+		s.metrics.RecordGuestAccess(clusterName, namespace, enabled)
+	}
+	return enabled
+}
+
+// withGuestAuth wraps a handler with guest-aware authentication.
+// When guestAccess is enabled for the cluster, unauthenticated GET requests are allowed
+// with a guest identity that has PermissionBasic.
+func (s *Server) withGuestAuth(handler http.Handler) http.Handler {
+	if s.authMW == nil {
+		return handler
+	}
+	return s.rateLimiter.Middleware(
+		s.authMW.GuestHandler(s.isGuestAccessEnabled)(handler),
+	)
 }
 
 // handleHealthz handles the health check endpoint.
@@ -486,7 +613,7 @@ func (s *Server) handleListClusters(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"items":          items,
+		responseKeyItems: items,
 		responseKeyTotal: len(items),
 	})
 }
@@ -697,6 +824,13 @@ func (s *Server) handleGetMirroring(w http.ResponseWriter, r *http.Request) {
 
 // handleListSessions lists active sessions by querying pg_stat_activity
 // through a short-lived database connection created via the DBClientFactory.
+//
+// Supports optional query parameter filters:
+//   - status: filter by session state ("running", "queued", "blocked", "idle")
+//   - database: filter by database name (datname)
+//   - user: filter by username (usename)
+//   - resource_group: filter by resource group name
+//   - since: filter by query_start within the last N minutes (e.g. "5m", "30m")
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -726,7 +860,8 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer dbClient.Close()
 
-	sessions, err := dbClient.ListSessions(r.Context())
+	// Use ListSessionsWithResourceGroup for richer data including resource group info.
+	sessions, err := dbClient.ListSessionsWithResourceGroup(r.Context())
 	if err != nil {
 		s.logger.Error("failed to list sessions",
 			"cluster", cluster.Name, "error", err)
@@ -735,14 +870,84 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply filters from query parameters.
+	filtered := filterSessions(sessions, r.URL.Query())
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"sessions":       sessions,
-		responseKeyTotal: len(sessions),
+		"sessions":       filtered,
+		responseKeyTotal: len(filtered),
 	})
+}
+
+// filterSessions applies query parameter filters to a list of sessions.
+// All filters are ANDed together. An empty filter value means no filtering on that field.
+func filterSessions(sessions []db.SessionWithGroup, params url.Values) []db.SessionWithGroup {
+	status := params.Get("status")
+	database := params.Get("database")
+	user := params.Get("user")
+	resGroup := params.Get("resource_group")
+	since := params.Get("since")
+
+	var result []db.SessionWithGroup
+	for _, sess := range sessions {
+		if status != "" && !matchStatus(sess, status) {
+			continue
+		}
+		if database != "" && sess.Database != database {
+			continue
+		}
+		if user != "" && sess.Username != user {
+			continue
+		}
+		if resGroup != "" && sess.ResourceGroup != resGroup {
+			continue
+		}
+		if since != "" && !matchSince(sess, since) {
+			continue
+		}
+		result = append(result, sess)
+	}
+	if result == nil {
+		result = []db.SessionWithGroup{}
+	}
+	return result
+}
+
+// matchStatus checks whether a session matches the given status filter.
+// Supported values: "running" (active), "queued" (idle in transaction),
+// "blocked" (wait_event_type=Lock), "idle".
+// Unknown status values are ignored (match all).
+func matchStatus(s db.SessionWithGroup, status string) bool {
+	switch status {
+	case "running":
+		return s.State == "active"
+	case "queued":
+		return s.State == "idle in transaction"
+	case "blocked":
+		return s.WaitEventType == "Lock"
+	case "idle":
+		return s.State == "idle"
+	default:
+		return true
+	}
+}
+
+// matchSince checks whether a session's query started within the given duration.
+// The since parameter should be a Go duration string (e.g. "5m", "30m", "1h").
+// Returns true if the since value is invalid (no filtering on parse error).
+func matchSince(s db.SessionWithGroup, since string) bool {
+	d, err := time.ParseDuration(since)
+	if err != nil {
+		// Invalid duration format — do not filter.
+		return true
+	}
+	cutoff := time.Now().Add(-d)
+	return s.QueryStart.After(cutoff)
 }
 
 // handleCancelQuery cancels a running query by calling pg_cancel_backend
 // through a short-lived database connection created via the DBClientFactory.
+// Accepts an optional JSON body with a "reason" field for audit logging.
 func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	pidStr := r.PathValue("pid")
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
@@ -753,6 +958,15 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	if pid <= 0 {
 		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
 		return
+	}
+
+	// Parse optional reason from request body.
+	var cancelReq struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		// Ignore decode errors — reason is optional.
+		_ = json.NewDecoder(r.Body).Decode(&cancelReq)
 	}
 
 	name := r.PathValue("name")
@@ -766,9 +980,9 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("cancel query requested but database factory not available",
 			"cluster", cluster.Name, responseKeyPID, pid)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			responseKeyPID:     pid,
-			"canceled":         false,
-			responseKeyMessage: msgDBNotAvailable,
+			responseKeyPID:      pid,
+			responseKeyCanceled: false,
+			responseKeyMessage:  msgDBNotAvailable,
 		})
 		return
 	}
@@ -792,12 +1006,22 @@ func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("query cancel requested",
-		"cluster", cluster.Name, responseKeyPID, pid, "canceled", result)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		responseKeyPID: pid,
-		"canceled":     result,
-	})
+	response := map[string]interface{}{
+		responseKeyPID:      pid,
+		responseKeyCanceled: result,
+	}
+
+	if cancelReq.Reason != "" {
+		response["reason"] = cancelReq.Reason
+		s.logger.Info("query canceled with reason",
+			"cluster", cluster.Name, responseKeyPID, pid,
+			responseKeyCanceled, result, "reason", cancelReq.Reason)
+	} else {
+		s.logger.Info("query cancel requested",
+			"cluster", cluster.Name, responseKeyPID, pid, responseKeyCanceled, result)
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleTerminateSession terminates a session by calling pg_terminate_backend
@@ -1782,7 +2006,32 @@ func (s *Server) handleDeleteWorkloadRule(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// monitoringDisabledResponse is the standard message returned when query monitoring
+// is not enabled for a cluster.
+const monitoringDisabledMessage = "query monitoring is not enabled for this cluster"
+
+// isMonitoringEnabled checks if query monitoring is enabled for the given cluster.
+// Returns true if monitoring is enabled, false otherwise.
+func isMonitoringEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.QueryMonitoring != nil && cluster.Spec.QueryMonitoring.Enabled
+}
+
+// writeMonitoringDisabled writes a standard HTTP 200 response indicating that
+// query monitoring is disabled for the cluster, and records the access metric.
+func (s *Server) writeMonitoringDisabled(w http.ResponseWriter, cluster *cbv1alpha1.CloudberryCluster) {
+	if s.metrics != nil {
+		s.metrics.RecordMonitoringDisabledAccess(cluster.Name, cluster.Namespace)
+	}
+	s.logger.Debug("monitoring disabled access attempt",
+		"cluster", cluster.Name, "namespace", cluster.Namespace)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"monitoringEnabled": false,
+		responseKeyMessage:  monitoringDisabledMessage,
+	})
+}
+
 // handleGetQueryMonitoring gets the query monitoring configuration and status.
+// When the monitor is paused, returns the cached snapshot with stale flag.
 func (s *Server) handleGetQueryMonitoring(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -1791,10 +2040,30 @@ func (s *Server) handleGetQueryMonitoring(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	// Check if monitor is paused — return cached snapshot if so.
+	if state, paused := s.isMonitorPaused(cluster.Namespace, cluster.Name); paused {
+		response := make(map[string]interface{})
+		for k, v := range state.Snapshot {
+			response[k] = v
+		}
+		response["stale"] = true
+		if state.PausedAt != nil {
+			response["pausedAt"] = state.PausedAt.Format(time.RFC3339)
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
 	response := map[string]interface{}{
-		"activeQueries":  cluster.Status.ActiveQueries,
-		"queuedQueries":  cluster.Status.QueuedQueries,
-		"blockedQueries": cluster.Status.BlockedQueries,
+		responseKeyActiveQueries:  cluster.Status.ActiveQueries,
+		responseKeyQueuedQueries:  cluster.Status.QueuedQueries,
+		responseKeyBlockedQueries: cluster.Status.BlockedQueries,
 	}
 
 	if cluster.Spec.QueryMonitoring != nil {
@@ -1805,6 +2074,7 @@ func (s *Server) handleGetQueryMonitoring(w http.ResponseWriter, r *http.Request
 }
 
 // handleGetActiveQueries gets the active query counts.
+// When the monitor is paused, returns the cached snapshot with stale flag.
 func (s *Server) handleGetActiveQueries(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -1813,11 +2083,1024 @@ func (s *Server) handleGetActiveQueries(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	// Check if monitor is paused — return cached snapshot if so.
+	if state, paused := s.isMonitorPaused(cluster.Namespace, cluster.Name); paused {
+		response := map[string]interface{}{
+			responseKeyActiveQueries:  state.Snapshot[responseKeyActiveQueries],
+			responseKeyQueuedQueries:  state.Snapshot[responseKeyQueuedQueries],
+			responseKeyBlockedQueries: state.Snapshot[responseKeyBlockedQueries],
+			"stale":                   true,
+		}
+		if state.PausedAt != nil {
+			response["pausedAt"] = state.PausedAt.Format(time.RFC3339)
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"activeQueries":  cluster.Status.ActiveQueries,
-		"queuedQueries":  cluster.Status.QueuedQueries,
-		"blockedQueries": cluster.Status.BlockedQueries,
+		responseKeyActiveQueries:  cluster.Status.ActiveQueries,
+		responseKeyQueuedQueries:  cluster.Status.QueuedQueries,
+		responseKeyBlockedQueries: cluster.Status.BlockedQueries,
 	})
+}
+
+// monitorStateKey builds the map key for monitor state lookups.
+func monitorStateKey(namespace, cluster string) string {
+	return namespace + "/" + cluster
+}
+
+// isMonitorPaused checks whether the query monitor is paused for the given cluster.
+// Returns the monitor state and true if paused, nil and false otherwise.
+func (s *Server) isMonitorPaused(namespace, cluster string) (*monitorState, bool) {
+	s.monitorMu.RLock()
+	defer s.monitorMu.RUnlock()
+	key := monitorStateKey(namespace, cluster)
+	state, ok := s.monitorStates[key]
+	return state, ok && state.Paused
+}
+
+// handlePauseMonitor pauses the query monitor for a cluster.
+// It takes a snapshot of the current query data and stores it in memory.
+// Subsequent requests to the query monitoring endpoints will return the
+// cached snapshot with a stale flag until the monitor is resumed.
+func (s *Server) handlePauseMonitor(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	key := monitorStateKey(cluster.Namespace, cluster.Name)
+
+	// Check if already paused.
+	s.monitorMu.RLock()
+	if existing, ok := s.monitorStates[key]; ok && existing.Paused {
+		s.monitorMu.RUnlock()
+		s.logger.Info("monitor already paused",
+			"cluster", cluster.Name, "namespace", cluster.Namespace)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyStatus:  statusPaused,
+			"pausedAt":         existing.PausedAt,
+			responseKeyMessage: "Query monitor is already paused",
+		})
+		return
+	}
+	s.monitorMu.RUnlock()
+
+	// Take a snapshot of the current query data.
+	snapshot := map[string]interface{}{
+		responseKeyActiveQueries:  cluster.Status.ActiveQueries,
+		responseKeyQueuedQueries:  cluster.Status.QueuedQueries,
+		responseKeyBlockedQueries: cluster.Status.BlockedQueries,
+	}
+	if cluster.Spec.QueryMonitoring != nil {
+		snapshot["config"] = cluster.Spec.QueryMonitoring
+	}
+
+	now := time.Now().UTC()
+	s.monitorMu.Lock()
+	s.monitorStates[key] = &monitorState{
+		Paused:   true,
+		PausedAt: &now,
+		Snapshot: snapshot,
+	}
+	s.monitorMu.Unlock()
+
+	// Record metric.
+	if s.metrics != nil {
+		s.metrics.RecordMonitorPause(cluster.Name, cluster.Namespace)
+	}
+
+	// Audit log.
+	if identity := auth.IdentityFromContext(r.Context()); identity != nil {
+		s.logger.Info("query monitor paused",
+			"cluster", cluster.Name, "namespace", cluster.Namespace,
+			"username", identity.Username, "source_ip", r.RemoteAddr)
+	} else {
+		s.logger.Info("query monitor paused",
+			"cluster", cluster.Name, "namespace", cluster.Namespace)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyStatus:  statusPaused,
+		"pausedAt":         now.Format(time.RFC3339),
+		responseKeyMessage: "Query monitor paused",
+	})
+}
+
+// handleResumeMonitor resumes the query monitor for a cluster.
+// It removes the cached snapshot so subsequent requests return fresh data.
+func (s *Server) handleResumeMonitor(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	key := monitorStateKey(cluster.Namespace, cluster.Name)
+
+	s.monitorMu.Lock()
+	_, wasPaused := s.monitorStates[key]
+	delete(s.monitorStates, key)
+	s.monitorMu.Unlock()
+
+	// Record metric only if it was actually paused.
+	if wasPaused {
+		if s.metrics != nil {
+			s.metrics.RecordMonitorResume(cluster.Name, cluster.Namespace)
+		}
+	}
+
+	// Audit log.
+	if identity := auth.IdentityFromContext(r.Context()); identity != nil {
+		s.logger.Info("query monitor resumed",
+			"cluster", cluster.Name, "namespace", cluster.Namespace,
+			"username", identity.Username, "source_ip", r.RemoteAddr)
+	} else {
+		s.logger.Info("query monitor resumed",
+			"cluster", cluster.Name, "namespace", cluster.Namespace)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyStatus:  statusResumed,
+		responseKeyMessage: "Query monitor resumed",
+	})
+}
+
+// handleGetMonitorState returns the current pause/resume state of the query monitor.
+func (s *Server) handleGetMonitorState(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	state, paused := s.isMonitorPaused(cluster.Namespace, cluster.Name)
+	response := map[string]interface{}{
+		"paused": paused,
+		"stale":  paused,
+	}
+	if paused && state != nil && state.PausedAt != nil {
+		response["pausedAt"] = state.PausedAt.Format(time.RFC3339)
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleGetQueryDetail returns detailed execution information for a specific query by PID.
+// It queries pg_stat_activity, pg_locks, and pg_stat_user_tables through a short-lived
+// database connection created via the DBClientFactory.
+func (s *Server) handleGetQueryDetail(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	pidStr := r.PathValue("pid")
+
+	pid, err := strconv.ParseInt(pidStr, 10, 32)
+	if err != nil || pid <= 0 {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	if s.dbFactory == nil {
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_NOT_AVAILABLE",
+			"database connection not configured")
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for query detail",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_CONNECTION_FAILED",
+			"failed to connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	detail, detailErr := dbClient.GetQueryDetail(r.Context(), int32(pid))
+	if detailErr != nil {
+		s.logger.Warn("query detail not found",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", detailErr)
+		writeErrorJSON(w, http.StatusNotFound, "QUERY_NOT_FOUND",
+			fmt.Sprintf("query with PID %d not found", pid))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// handleCancelQueryByPID cancels a running query by PID via the queries API.
+// This is the query-monitoring-specific cancel endpoint (POST /queries/{pid}/cancel)
+// that records query cancel metrics, distinct from the session cancel endpoint.
+func (s *Server) handleCancelQueryByPID(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.PathValue("pid")
+	pid, err := strconv.ParseInt(pidStr, 10, 32)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		return
+	}
+	if pid <= 0 {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
+		return
+	}
+
+	// Parse optional reason from request body.
+	var cancelReq struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		// Ignore decode errors — reason is optional.
+		_ = json.NewDecoder(r.Body).Decode(&cancelReq)
+	}
+
+	name := r.PathValue("name")
+	cluster, clusterErr := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if clusterErr != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("cancel query by PID requested but database factory not available",
+			"cluster", cluster.Name, responseKeyPID, pid)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyPID:     pid,
+			"canceled":         false,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for cancel query by PID",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	result, cancelErr := dbClient.CancelQuery(r.Context(), int32(pid))
+	if cancelErr != nil {
+		s.logger.Error("failed to cancel query by PID",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", cancelErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to cancel query")
+		return
+	}
+
+	// Record query cancel metric.
+	if s.metrics != nil {
+		s.metrics.RecordQueryCancel(cluster.Name, cluster.Namespace)
+	}
+
+	response := map[string]interface{}{
+		responseKeyPID:      pid,
+		responseKeyCanceled: result,
+		responseKeyStatus:   statusCanceled,
+	}
+
+	if cancelReq.Reason != "" {
+		response["reason"] = cancelReq.Reason
+		s.logger.Info("query canceled by PID with reason",
+			"cluster", cluster.Name, responseKeyPID, pid,
+			responseKeyCanceled, result, "reason", cancelReq.Reason)
+	} else {
+		s.logger.Info("query cancel by PID requested",
+			"cluster", cluster.Name, responseKeyPID, pid, responseKeyCanceled, result)
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleMoveQuery moves a running query to a different resource group.
+// It parses the target group from the request body and calls MoveQueryToResourceGroup.
+func (s *Server) handleMoveQuery(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.PathValue("pid")
+	pid, err := strconv.ParseInt(pidStr, 10, 32)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		return
+	}
+	if pid <= 0 {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
+		return
+	}
+
+	// Parse request body for targetGroup.
+	var moveReq struct {
+		TargetGroup string `json:"targetGroup"`
+	}
+	if r.Body == nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "request body is required")
+		return
+	}
+	if decErr := json.NewDecoder(r.Body).Decode(&moveReq); decErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+	if moveReq.TargetGroup == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "targetGroup is required")
+		return
+	}
+	if !isValidIdentifier(moveReq.TargetGroup) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			"targetGroup must be a valid SQL identifier (alphanumeric and underscores, max 63 chars)")
+		return
+	}
+
+	name := r.PathValue("name")
+	cluster, clusterErr := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if clusterErr != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("move query requested but database factory not available",
+			"cluster", cluster.Name, responseKeyPID, pid)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyPID:     pid,
+			responseKeyStatus:  statusPending,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for move query",
+			"cluster", cluster.Name, responseKeyPID, pid, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	if moveErr := dbClient.MoveQueryToResourceGroup(r.Context(), int32(pid), moveReq.TargetGroup); moveErr != nil {
+		s.logger.Error("failed to move query to resource group",
+			"cluster", cluster.Name, responseKeyPID, pid,
+			"targetGroup", moveReq.TargetGroup, "error", moveErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			fmt.Sprintf("failed to move query: %s", moveErr.Error()))
+		return
+	}
+
+	// Record query move metric.
+	if s.metrics != nil {
+		s.metrics.RecordQueryMove(cluster.Name, cluster.Namespace)
+	}
+
+	s.logger.Info("query moved to resource group",
+		"cluster", cluster.Name, responseKeyPID, pid,
+		"targetGroup", moveReq.TargetGroup)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyPID:    pid,
+		"targetGroup":     moveReq.TargetGroup,
+		responseKeyStatus: statusMoved,
+	})
+}
+
+// ExporterStatus represents the health status of a monitoring exporter.
+type ExporterStatus struct {
+	Name           string `json:"name"`
+	Port           int32  `json:"port"`
+	Status         string `json:"status"` // "up", "down", "unknown"
+	ContainerReady bool   `json:"containerReady"`
+	Endpoint       string `json:"endpoint"`
+	LastCheck      string `json:"lastCheck"`
+}
+
+// handleGetExporterHealth returns the health status of configured monitoring exporters.
+// It inspects the coordinator pod's container statuses via the K8s API.
+func (s *Server) handleGetExporterHealth(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	// Record exporter health check metric.
+	if s.metrics != nil {
+		s.metrics.RecordExporterHealthCheck(cluster.Name, cluster.Namespace)
+	}
+
+	// Check if query monitoring is configured with exporters.
+	if cluster.Spec.QueryMonitoring == nil || cluster.Spec.QueryMonitoring.Exporters == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"exporters":        []ExporterStatus{},
+			responseKeyTotal:   0,
+			responseKeyMessage: "query monitoring exporters not configured",
+		})
+		return
+	}
+
+	exporters := cluster.Spec.QueryMonitoring.Exporters
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// List coordinator pods.
+	podList := &corev1.PodList{}
+	if listErr := s.k8sClient.List(r.Context(), podList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{
+			util.LabelCluster:   cluster.Name,
+			util.LabelComponent: "coordinator",
+		},
+	); listErr != nil {
+		s.logger.Error("failed to list coordinator pods for exporter health",
+			"cluster", name, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to list coordinator pods")
+		return
+	}
+
+	// Build a map of container name -> ready status from coordinator pods.
+	containerReady := make(map[string]bool)
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		for j := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[j]
+			containerReady[cs.Name] = cs.Ready
+		}
+	}
+
+	hasPods := len(podList.Items) > 0
+	statuses := buildExporterStatuses(exporters, containerReady, hasPods, now)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"exporters":      statuses,
+		responseKeyTotal: len(statuses),
+	})
+}
+
+// exporterEntry defines a candidate exporter to check.
+type exporterEntry struct {
+	name          string
+	containerName string
+	defaultPort   int32
+	spec          *cbv1alpha1.ExporterSpec
+}
+
+// buildExporterStatuses builds the list of ExporterStatus from the CRD exporter config
+// and the container readiness map from coordinator pods.
+func buildExporterStatuses(
+	exporters *cbv1alpha1.QueryMonitoringExportersSpec,
+	containerReady map[string]bool,
+	hasPods bool,
+	now string,
+) []ExporterStatus {
+	candidates := []exporterEntry{
+		{"postgres-exporter", "postgres-exporter", 9187,
+			exporterSpecOrNil(exporters.PostgresExporter)},
+		{"cloudberry-query-exporter", "cloudberry-query-exporter", 9188,
+			exporterSpecOrNil(exporters.CloudberryQueryExporter)},
+		{"node-exporter", "node-exporter", 9100,
+			exporterSpecOrNil(exporters.NodeExporter)},
+	}
+
+	var statuses []ExporterStatus
+	for _, c := range candidates {
+		if c.spec == nil || !c.spec.Enabled {
+			continue
+		}
+		port := c.spec.Port
+		if port == 0 {
+			port = c.defaultPort
+		}
+		ready := containerReady[c.containerName]
+		statuses = append(statuses, ExporterStatus{
+			Name:           c.name,
+			Port:           port,
+			Status:         exporterStatusFromReady(ready, hasPods),
+			ContainerReady: ready,
+			Endpoint:       fmt.Sprintf(":%d/metrics", port),
+			LastCheck:      now,
+		})
+	}
+	return statuses
+}
+
+// exporterSpecOrNil returns the ExporterSpec pointer or nil if it's nil.
+// This avoids nil pointer dereference when building exporter entries.
+func exporterSpecOrNil(spec *cbv1alpha1.ExporterSpec) *cbv1alpha1.ExporterSpec {
+	return spec
+}
+
+// exporterStatusFromReady derives the exporter status string from container readiness.
+// Returns "up" if the container is ready, "down" if the pod exists but container is not ready,
+// or "unknown" if no coordinator pod was found.
+func exporterStatusFromReady(ready, podExists bool) string {
+	if !podExists {
+		return "unknown"
+	}
+	if ready {
+		return "up"
+	}
+	return "down"
+}
+
+// handleGetQueryHistory returns paginated query history with optional filters.
+func (s *Server) handleGetQueryHistory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	if s.dbFactory == nil {
+		s.logger.Warn("query history requested but database factory not available",
+			"cluster", cluster.Name)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			responseKeyItems:   []interface{}{},
+			responseKeyTotal:   0,
+			"limit":            defaultPageSize,
+			"offset":           0,
+			responseKeyMessage: msgDBNotAvailable,
+		})
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for query history",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
+			"cannot connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	// Parse query parameters into filter.
+	filter, parseErr := parseQueryHistoryFilter(r)
+	if parseErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", parseErr.Error())
+		return
+	}
+
+	start := time.Now()
+	entries, total, queryErr := dbClient.GetQueryHistory(r.Context(), filter)
+	if queryErr != nil {
+		s.logger.Error("failed to get query history",
+			"cluster", cluster.Name, "error", queryErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to get query history")
+		return
+	}
+
+	// Record search duration metric.
+	if s.metrics != nil {
+		s.metrics.ObserveQueryHistorySearchDuration(cluster.Name, cluster.Namespace, time.Since(start))
+	}
+
+	// Normalize limit/offset for response.
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultPageSize
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	if entries == nil {
+		entries = []db.QueryHistoryEntry{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyItems: entries,
+		responseKeyTotal: total,
+		"limit":          limit,
+		"offset":         offset,
+	})
+}
+
+// handleGetQueryHistoryDetail returns detailed information for a specific historical query.
+func (s *Server) handleGetQueryHistoryDetail(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	qid := r.PathValue("qid")
+
+	if qid == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "query ID is required")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	if s.dbFactory == nil {
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_NOT_AVAILABLE",
+			"database connection not configured")
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for query history detail",
+			"cluster", cluster.Name, "queryId", qid, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_CONNECTION_FAILED",
+			"failed to connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	entry, detailErr := dbClient.GetQueryHistoryDetail(r.Context(), qid)
+	if detailErr != nil {
+		s.logger.Warn("query history detail not found",
+			"cluster", cluster.Name, "queryId", qid, "error", detailErr)
+		writeErrorJSON(w, http.StatusNotFound, "QUERY_NOT_FOUND",
+			fmt.Sprintf("historical query %q not found", qid))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// handleExportQueryHistory exports query history as CSV.
+func (s *Server) handleExportQueryHistory(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Check if monitoring is disabled for this cluster.
+	if !isMonitoringEnabled(cluster) {
+		s.writeMonitoringDisabled(w, cluster)
+		return
+	}
+
+	if s.dbFactory == nil {
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_NOT_AVAILABLE",
+			"database connection not configured")
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for query history export",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_CONNECTION_FAILED",
+			"failed to connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	// Parse filter from request body (optional JSON).
+	filter := parseQueryHistoryExportFilter(r)
+
+	// Set CSV response headers.
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="query-history.csv"`)
+	w.WriteHeader(http.StatusOK)
+
+	if exportErr := dbClient.ExportQueryHistoryCSV(r.Context(), filter, w); exportErr != nil {
+		s.logger.Error("failed to export query history CSV",
+			"cluster", cluster.Name, "error", exportErr)
+		// Headers already sent, cannot write error JSON.
+		return
+	}
+
+	// Record export metric.
+	if s.metrics != nil {
+		s.metrics.RecordQueryHistoryExport(cluster.Name, cluster.Namespace, "csv")
+	}
+
+	s.logger.Info("query history CSV exported", "cluster", cluster.Name)
+}
+
+// parseQueryHistoryExportFilter parses an optional JSON filter from the request
+// body for query history CSV export. A missing or invalid body yields a
+// zero-value filter (export all).
+func parseQueryHistoryExportFilter(r *http.Request) db.QueryHistoryFilter {
+	filter := db.QueryHistoryFilter{}
+	if r.ContentLength <= 0 {
+		return filter
+	}
+
+	var req struct {
+		Pattern       string `json:"pattern"`
+		PatternType   string `json:"patternType"`
+		User          string `json:"user"`
+		Database      string `json:"database"`
+		ResourceGroup string `json:"resourceGroup"`
+		State         string `json:"state"`
+		Since         string `json:"since"`
+		Until         string `json:"until"`
+	}
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		return filter
+	}
+
+	filter.Pattern = req.Pattern
+	filter.PatternType = req.PatternType
+	filter.Username = req.User
+	filter.Database = req.Database
+	filter.ResourceGroup = req.ResourceGroup
+	filter.State = req.State
+	if req.Since != "" {
+		filter.Since = parseSinceTime(req.Since)
+	}
+	if req.Until != "" {
+		if t, parseErr := time.Parse(time.RFC3339, req.Until); parseErr == nil {
+			filter.Until = t
+		}
+	}
+
+	return filter
+}
+
+// handleExportActiveQueries exports active queries as CSV.
+// It queries pg_stat_activity through a short-lived database connection
+// and writes the results as CSV with headers: pid, username, database,
+// state, query, duration, wait_event_type, resource_group.
+func (s *Server) handleExportActiveQueries(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	if s.dbFactory == nil {
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_NOT_AVAILABLE",
+			"database connection not configured")
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for active query export",
+			"cluster", cluster.Name, "error", dbErr)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_CONNECTION_FAILED",
+			"failed to connect to database")
+		return
+	}
+	defer dbClient.Close()
+
+	sessions, listErr := dbClient.ListSessionsWithResourceGroup(r.Context())
+	if listErr != nil {
+		s.logger.Error("failed to list sessions for active query export",
+			"cluster", cluster.Name, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"failed to list sessions")
+		return
+	}
+
+	// Set CSV response headers.
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="active-queries.csv"`)
+	w.WriteHeader(http.StatusOK)
+
+	// Write CSV header.
+	csvHeader := "pid,username,database,state,query,duration,wait_event_type,resource_group\n"
+	if _, writeErr := w.Write([]byte(csvHeader)); writeErr != nil {
+		s.logger.Error("failed to write CSV header for active query export",
+			"cluster", cluster.Name, "error", writeErr)
+		return
+	}
+
+	// Write CSV rows.
+	for _, sess := range sessions {
+		row := fmt.Sprintf("%d,%s,%s,%s,%s,%s,%s,%s\n",
+			sess.PID,
+			csvEscape(sess.Username),
+			csvEscape(sess.Database),
+			csvEscape(sess.State),
+			csvEscape(sess.Query),
+			csvEscape(sess.Duration),
+			csvEscape(sess.WaitEventType),
+			csvEscape(sess.ResourceGroup),
+		)
+		if _, writeErr := w.Write([]byte(row)); writeErr != nil {
+			s.logger.Error("failed to write CSV row for active query export",
+				"cluster", cluster.Name, "error", writeErr)
+			return
+		}
+	}
+
+	// Record export metric.
+	if s.metrics != nil {
+		s.metrics.RecordActiveQueryExport()
+	}
+
+	s.logger.Info("active queries CSV exported",
+		"cluster", cluster.Name, "count", len(sessions))
+}
+
+// csvEscape escapes a string for safe inclusion in a CSV field.
+// It wraps the value in double quotes if it contains commas, double quotes,
+// or newlines, and doubles any internal double quotes per RFC 4180.
+func csvEscape(s string) string {
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
+}
+
+// handlePlanCheck analyzes EXPLAIN ANALYZE output for performance issues.
+// It accepts a JSON body with planText, runs the plan checker, records metrics,
+// and returns the analysis result.
+func (s *Server) handlePlanCheck(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	var req planchecker.PlanCheckRequest
+	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.PlanText) == "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "planText is required and must not be empty")
+		return
+	}
+
+	start := time.Now()
+	result, checkErr := planchecker.CheckPlan(req.PlanText)
+	duration := time.Since(start)
+
+	if checkErr != nil {
+		s.logger.Error("plan check failed",
+			"cluster", cluster.Name, "error", checkErr)
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("failed to analyze plan: %v", checkErr))
+		return
+	}
+
+	// Record metrics.
+	if s.metrics != nil {
+		s.metrics.RecordPlanCheck(cluster.Name, cluster.Namespace)
+		s.metrics.ObservePlanCheckDuration(cluster.Name, cluster.Namespace, duration)
+		for _, issue := range result.Issues {
+			s.metrics.RecordPlanCheckIssue(cluster.Name, cluster.Namespace, issue.Severity, issue.Category)
+		}
+	}
+
+	s.logger.Info("plan check completed",
+		"cluster", cluster.Name,
+		"issues", len(result.Issues),
+		"totalNodes", result.TotalNodes,
+		"duration", duration)
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// parseQueryHistoryFilter parses query parameters into a QueryHistoryFilter.
+func parseQueryHistoryFilter(r *http.Request) (db.QueryHistoryFilter, error) {
+	params := r.URL.Query()
+	filter := db.QueryHistoryFilter{
+		Pattern:       params.Get("pattern"),
+		PatternType:   params.Get("patternType"),
+		Username:      params.Get("user"),
+		Database:      params.Get("database"),
+		ResourceGroup: params.Get("resourceGroup"),
+		State:         params.Get("state"),
+	}
+
+	if err := applyQueryHistoryPaging(&filter, params); err != nil {
+		return filter, err
+	}
+
+	if err := applyQueryHistoryTimeRange(&filter, params); err != nil {
+		return filter, err
+	}
+
+	// Validate regex pattern if provided.
+	if filter.Pattern != "" && (filter.PatternType == "" || filter.PatternType == "regex") {
+		if _, err := regexp.Compile(filter.Pattern); err != nil {
+			return filter, fmt.Errorf("invalid regex pattern: %w", err)
+		}
+	}
+
+	return filter, nil
+}
+
+// applyQueryHistoryPaging parses limit, offset and minDuration parameters.
+func applyQueryHistoryPaging(filter *db.QueryHistoryFilter, params url.Values) error {
+	if limitStr := params.Get("limit"); limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit < 0 {
+			return fmt.Errorf("invalid limit parameter: %q", limitStr)
+		}
+		filter.Limit = limit
+	}
+
+	if offsetStr := params.Get("offset"); offsetStr != "" {
+		offset, err := strconv.Atoi(offsetStr)
+		if err != nil || offset < 0 {
+			return fmt.Errorf("invalid offset parameter: %q", offsetStr)
+		}
+		filter.Offset = offset
+	}
+
+	if minDurStr := params.Get("minDuration"); minDurStr != "" {
+		minDur, err := strconv.ParseFloat(minDurStr, 64)
+		if err != nil || minDur < 0 {
+			return fmt.Errorf("invalid minDuration parameter: %q", minDurStr)
+		}
+		filter.MinDuration = minDur
+	}
+
+	return nil
+}
+
+// applyQueryHistoryTimeRange parses the since and until parameters.
+func applyQueryHistoryTimeRange(filter *db.QueryHistoryFilter, params url.Values) error {
+	// Parse since (supports both RFC3339 and Go duration like "24h").
+	if sinceStr := params.Get("since"); sinceStr != "" {
+		filter.Since = parseSinceTime(sinceStr)
+	}
+
+	// Parse until (RFC3339 only).
+	if untilStr := params.Get("until"); untilStr != "" {
+		t, err := time.Parse(time.RFC3339, untilStr)
+		if err != nil {
+			return fmt.Errorf("invalid until parameter: %q (expected RFC3339 format)", untilStr)
+		}
+		filter.Until = t
+	}
+
+	return nil
+}
+
+// parseSinceTime parses a "since" parameter that can be either an RFC3339 timestamp
+// or a Go duration string (e.g., "24h", "30m").
+func parseSinceTime(s string) time.Time {
+	// Try RFC3339 first.
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	// Try Go duration (relative to now).
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d)
+	}
+	return time.Time{}
 }
 
 // handleListBackups lists backups for a cluster.

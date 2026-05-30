@@ -140,10 +140,10 @@ func run(ctx context.Context) error {
 
 	// Register admission webhooks when enabled.
 	if cfg.WebhookEnabled {
-		if err := setupWebhookCerts(ctx, mgr, cfg, logger, &backgroundWg); err != nil {
+		if err := setupWebhookCerts(ctx, mgr, cfg, logger, &backgroundWg, metricsRecorder); err != nil {
 			return fmt.Errorf("setting up webhook certificates: %w", err)
 		}
-		if err := registerWebhooks(mgr, logger); err != nil {
+		if err := registerWebhooks(mgr, logger, metricsRecorder); err != nil {
 			return fmt.Errorf("registering webhooks: %w", err)
 		}
 	} else {
@@ -196,8 +196,9 @@ func registerControllers(
 	// Create resource builder.
 	resourceBuilder := builder.NewBuilder()
 
-	// Create database client factory.
-	dbFactory := db.NewClientFactory(mgr.GetClient(), logger)
+	// Create database client factory with the metrics recorder so query-history
+	// metrics are recorded by created clients.
+	dbFactory := db.NewClientFactory(mgr.GetClient(), logger, metricsRecorder)
 
 	// Create event recorder.
 	//nolint:staticcheck // v1 events API needed for record.EventRecorder
@@ -295,6 +296,12 @@ func startAPIServer(
 	}
 	credStore.SetCredentials("admin", adminPassword, auth.PermissionAdmin)
 
+	// Register additional test users for different permission levels.
+	// These are useful for testing access control scenarios.
+	credStore.SetCredentials("basic_user", "basic_pass", auth.PermissionBasic)
+	credStore.SetCredentials("opbasic_user", "opbasic_pass", auth.PermissionOperatorBasic)
+	credStore.SetCredentials("operator_user", "operator_pass", auth.PermissionOperator)
+
 	// Create the basic auth provider.
 	basicProvider := auth.NewBasicAuthProvider(credStore, logger)
 
@@ -339,8 +346,9 @@ func startAPIServer(
 	// Create the auth middleware with both providers.
 	authMW := auth.NewAuthMiddleware(basicProvider, oidcProvider, logger, metricsRecorder)
 
-	// Create database client factory for session operations.
-	dbFactory := db.NewClientFactory(mgr.GetClient(), logger)
+	// Create database client factory for session operations, propagating the
+	// metrics recorder so query-history metrics are recorded.
+	dbFactory := db.NewClientFactory(mgr.GetClient(), logger, metricsRecorder)
 
 	// Create and start the API server.
 	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger, cfg.APIRateLimit, credStore)
@@ -438,6 +446,7 @@ func setupWebhookCerts(
 	cfg *config.OperatorConfig,
 	logger *slog.Logger,
 	wg *sync.WaitGroup,
+	metricsRecorder metrics.Recorder,
 ) error {
 	// Determine the operator namespace from the POD_NAMESPACE env var (set by
 	// the Helm deployment via the downward API), falling back to the configured
@@ -480,7 +489,7 @@ func setupWebhookCerts(
 			Token:      cfg.Vault.Token.Value(),
 			SecretPath: cfg.Vault.SecretPath,
 		}
-		vc, vaultErr := vault.NewClient(ctx, vaultCfg, logger)
+		vc, vaultErr := vault.NewClient(ctx, vaultCfg, logger, metricsRecorder)
 		if vaultErr != nil {
 			return fmt.Errorf("creating vault client for webhook cert management: %w", vaultErr)
 		}
@@ -491,7 +500,7 @@ func setupWebhookCerts(
 		)
 	}
 
-	cm := certmanager.New(directClient, vaultClient, certCfg, logger)
+	cm := certmanager.New(directClient, vaultClient, certCfg, logger, metricsRecorder)
 
 	caBundle, err := cm.EnsureCertificates(ctx)
 	if err != nil {
@@ -611,10 +620,10 @@ func runCertRotation(ctx context.Context, cm certmanager.CertManager, logger *sl
 
 // registerWebhooks registers the validating and mutating admission webhooks
 // for CloudberryCluster resources with the controller manager.
-func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger) error {
+func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger, metricsRecorder metrics.Recorder) error {
 	// Register the validating webhook.
 	if err := ctrl.NewWebhookManagedBy(mgr, &cbv1alpha1.CloudberryCluster{}).
-		WithValidator(webhook.NewCloudberryClusterValidator(mgr.GetClient())).
+		WithValidator(webhook.NewCloudberryClusterValidator(mgr.GetClient(), metricsRecorder)).
 		Complete(); err != nil {
 		return fmt.Errorf("creating validating webhook: %w", err)
 	}
@@ -622,7 +631,7 @@ func registerWebhooks(mgr ctrl.Manager, logger *slog.Logger) error {
 
 	// Register the mutating webhook.
 	if err := ctrl.NewWebhookManagedBy(mgr, &cbv1alpha1.CloudberryCluster{}).
-		WithDefaulter(webhook.NewCloudberryClusterDefaulter()).
+		WithDefaulter(webhook.NewCloudberryClusterDefaulter(metricsRecorder)).
 		Complete(); err != nil {
 		return fmt.Errorf("creating mutating webhook: %w", err)
 	}

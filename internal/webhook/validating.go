@@ -9,20 +9,76 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+)
+
+// Webhook admission metric label values.
+const (
+	// webhookValidating and webhookMutating are the webhook label values.
+	webhookValidating = "validating"
+	webhookMutating   = "mutating"
+
+	// admissionOpCreate, admissionOpUpdate, and admissionOpDelete are the
+	// operation label values for admission metrics.
+	admissionOpCreate = "create"
+	admissionOpUpdate = "update"
+	admissionOpDelete = "delete"
+
+	// admissionAllowed, admissionDenied, and admissionError are the result
+	// label values for admission metrics.
+	admissionAllowed = "allowed"
+	admissionDenied  = "denied"
+	admissionError   = "error"
 )
 
 // CloudberryClusterValidator validates CloudberryCluster resources.
 type CloudberryClusterValidator struct {
 	reader client.Reader
+	// recorder records admission metrics. It is optional and may be nil;
+	// all metric recording is guarded with a nil check.
+	recorder metrics.Recorder
 }
 
 // NewCloudberryClusterValidator creates a new CloudberryClusterValidator.
-func NewCloudberryClusterValidator(reader client.Reader) *CloudberryClusterValidator {
-	return &CloudberryClusterValidator{reader: reader}
+// An optional metrics recorder may be supplied to record admission metrics;
+// when omitted (or nil), metric recording is a no-op.
+func NewCloudberryClusterValidator(
+	reader client.Reader,
+	recorder ...metrics.Recorder,
+) *CloudberryClusterValidator {
+	v := &CloudberryClusterValidator{reader: reader}
+	if len(recorder) > 0 {
+		v.recorder = recorder[0]
+	}
+	return v
+}
+
+// recordAdmission records a validating-webhook admission decision when a
+// recorder is configured. It is nil-safe and derives the result from the error
+// and warnings returned by the validation.
+func (v *CloudberryClusterValidator) recordAdmission(operation string, err error) {
+	if v.recorder == nil {
+		return
+	}
+	result := admissionAllowed
+	if err != nil {
+		result = admissionDenied
+	}
+	v.recorder.RecordWebhookAdmission(webhookValidating, operation, result)
 }
 
 // ValidateCreate validates a CloudberryCluster on creation.
 func (v *CloudberryClusterValidator) ValidateCreate(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (admission.Warnings, error) {
+	warnings, err := v.validateCreate(ctx, cluster)
+	v.recordAdmission(admissionOpCreate, err)
+	return warnings, err
+}
+
+// validateCreate performs the create-time validation logic.
+func (v *CloudberryClusterValidator) validateCreate(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
@@ -65,6 +121,15 @@ func (v *CloudberryClusterValidator) ValidateUpdate(
 	oldCluster *cbv1alpha1.CloudberryCluster,
 	newCluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	warnings, err := validateUpdate(oldCluster, newCluster)
+	v.recordAdmission(admissionOpUpdate, err)
+	return warnings, err
+}
+
+// validateUpdate performs the update-time validation logic.
+func validateUpdate(
+	oldCluster, newCluster *cbv1alpha1.CloudberryCluster,
+) (admission.Warnings, error) {
 	warnings, err := validateCluster(newCluster)
 	if err != nil {
 		return warnings, err
@@ -84,6 +149,7 @@ func (v *CloudberryClusterValidator) ValidateDelete(
 	_ *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
 	// No validation needed on delete.
+	v.recordAdmission(admissionOpDelete, nil)
 	return nil, nil
 }
 

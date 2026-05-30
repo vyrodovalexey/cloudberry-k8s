@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -196,6 +198,36 @@ func (m *scenario6MockDBClient) ListSessionsWithResourceGroup(_ context.Context)
 }
 func (m *scenario6MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return nil, nil
+}
+
+// SetupExporterRole implements db.Client.
+func (m *scenario6MockDBClient) SetupExporterRole(_ context.Context, _ string) error {
+	return nil
+}
+
+// GetQueryDetail implements db.Client.
+func (m *scenario6MockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
+	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+
+func (m *scenario6MockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
+func (m *scenario6MockDBClient) InsertQueryHistory(_ context.Context, _ *db.QueryHistoryEntry) error {
+	return nil
+}
+func (m *scenario6MockDBClient) GetQueryHistory(_ context.Context, _ db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error) {
+	return []db.QueryHistoryEntry{}, 0, nil
+}
+func (m *scenario6MockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*db.QueryHistoryEntry, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *scenario6MockDBClient) ExportQueryHistoryCSV(_ context.Context, _ db.QueryHistoryFilter, _ io.Writer) error {
+	return nil
+}
+func (m *scenario6MockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (m *scenario6MockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
+	return nil
 }
 
 // scenario6MockDBFactory implements db.DBClientFactory for testing.

@@ -33,6 +33,10 @@ const (
 	ComponentSegmentPrimary = "segment-primary"
 	// ComponentSegmentMirror is the component label value for mirror segments.
 	ComponentSegmentMirror = "segment-mirror"
+	// ComponentExporter is the component label value for monitoring exporters.
+	ComponentExporter = "exporter"
+	// ComponentNodeExporter is the component label value for node exporters.
+	ComponentNodeExporter = "node-exporter"
 
 	// AnnotationAction is the annotation key for cluster actions.
 	AnnotationAction = "avsoft.io/action"
@@ -62,6 +66,9 @@ const (
 	// The value is the RFC3339 timestamp when the ConfigMap was updated.
 	// The operator waits for ConfigMap volume propagation before calling reload.
 	AnnotationPendingReload = "avsoft.io/pending-reload"
+	// AnnotationExporterRoleReady indicates the exporter DB role has been created.
+	// When absent or not "true", the admin-controller will retry role setup on each cycle.
+	AnnotationExporterRoleReady = "avsoft.io/exporter-role-ready"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"

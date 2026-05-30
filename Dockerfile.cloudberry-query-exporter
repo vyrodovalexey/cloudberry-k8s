@@ -1,0 +1,48 @@
+# =============================================================================
+# Stage 1: Build the query exporter binary
+# =============================================================================
+FROM golang:1.26-alpine AS builder
+
+# Install build dependencies (sorted alphanumerically)
+RUN apk add --no-cache \
+    ca-certificates \
+    git
+
+WORKDIR /workspace
+
+# Cache Go modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY cmd/cloudberry-query-exporter/ cmd/cloudberry-query-exporter/
+COPY internal/ internal/
+COPY api/ api/
+
+# Build the query exporter binary with optimizations
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+    -trimpath -ldflags="-s -w" \
+    -o /workspace/bin/cloudberry-query-exporter \
+    ./cmd/cloudberry-query-exporter/
+
+# =============================================================================
+# Stage 2: Runtime image
+# =============================================================================
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-query-exporter" \
+      org.opencontainers.image.description="Prometheus metrics exporter for Cloudberry Database query activity" \
+      org.opencontainers.image.vendor="Cloudberry Contributors" \
+      org.opencontainers.image.source="https://github.com/cloudberry-contrib/cloudberry-k8s" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=builder /workspace/bin/cloudberry-query-exporter /cloudberry-query-exporter
+
+# Use non-root user (65532 is the nonroot user in distroless)
+USER 65532:65532
+
+EXPOSE 9188
+
+ENTRYPOINT ["/cloudberry-query-exporter"]

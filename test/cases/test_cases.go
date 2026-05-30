@@ -1215,8 +1215,8 @@ func PermissionMatrixCases() []PermissionMatrixCase {
 			Name:          "get_query_monitoring",
 			Method:        "GET",
 			Path:          "/api/v1alpha1/clusters/test-cluster/queries",
-			RequiredLevel: "Basic",
-			Description:   "Get query monitoring requires Basic permission",
+			RequiredLevel: "OperatorBasic",
+			Description:   "Get query monitoring requires Operator Basic permission",
 		},
 		{
 			Name:          "get_active_queries",
@@ -2089,6 +2089,1500 @@ func NegativeEdgeCaseCases() []NegativeEdgeCaseCase {
 			Category:       "auth",
 			ExpectedStatus: 401,
 			Description:    "Missing admin password secret should cause Basic auth to fail with 401",
+		},
+	}
+}
+
+// QueryHistoryCase represents a test case for query history operations (Scenario 61).
+type QueryHistoryCase struct {
+	Name           string
+	SubScenario    string // "61a", "61b", "61c", "61d"
+	Category       string // "browse", "search", "export", "detail", "error", "auth"
+	Description    string
+	Pattern        string // search pattern (regex or wildcard)
+	PatternType    string // "regex" or "wildcard"
+	User           string // filter by username
+	Database       string // filter by database name
+	ResourceGroup  string // filter by resource group
+	Limit          int    // pagination limit
+	Offset         int    // pagination offset
+	QueryID        string // for detail lookups
+	ExpectedCount  int    // expected number of results
+	ExpectedStatus int    // expected HTTP status code
+	ExpectError    bool   // whether an error is expected
+}
+
+// QueryHistoryCases returns the test cases for query history (Scenario 61).
+func QueryHistoryCases() []QueryHistoryCase {
+	return []QueryHistoryCase{
+		// --- 61a: Browse History with Charts ---
+		{
+			Name:           "61a_browse_all_history",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Browse all history with default pagination returns up to 50 entries",
+			ExpectedCount:  3,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61a_browse_empty_history",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Browse empty history returns empty array with total=0",
+			ExpectedCount:  0,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61a_browse_paginate_page1",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Paginate page 1 with limit=2, offset=0",
+			Limit:          2,
+			Offset:         0,
+			ExpectedCount:  2,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61a_browse_paginate_page2",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Paginate page 2 with limit=2, offset=2",
+			Limit:          2,
+			Offset:         2,
+			ExpectedCount:  1,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61a_browse_duration_metrics_present",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Each entry has durationMs field populated",
+			ExpectedCount:  3,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61a_browse_resource_usage_present",
+			SubScenario:    "61a",
+			Category:       "browse",
+			Description:    "Each entry has cpuTimeMs, memoryBytes, spillBytes fields",
+			ExpectedCount:  3,
+			ExpectedStatus: 200,
+		},
+
+		// --- 61b: Advanced Search ---
+		{
+			Name:           "61b_regex_search_match",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Regex search with SELECT.*FROM orders returns matching queries",
+			Pattern:        "SELECT.*FROM orders",
+			PatternType:    "regex",
+			ExpectedCount:  1,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_wildcard_search_match",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Wildcard search with SELECT * returns matching queries",
+			Pattern:        "SELECT *",
+			PatternType:    "wildcard",
+			ExpectedCount:  2,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_filter_by_user",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Filter by username returns only that user's queries",
+			User:           "analyst",
+			ExpectedCount:  2,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_filter_by_database",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Filter by database returns only that database's queries",
+			Database:       "mydb",
+			ExpectedCount:  1,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_filter_by_resource_group",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Filter by resource group returns only that group's queries",
+			ResourceGroup:  "analytics",
+			ExpectedCount:  1,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_combined_filters",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Combined user + database filters are AND-combined",
+			User:           "analyst",
+			Database:       "mydb",
+			ExpectedCount:  1,
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61b_invalid_regex",
+			SubScenario:    "61b",
+			Category:       "search",
+			Description:    "Invalid regex pattern returns 400 error",
+			Pattern:        "[invalid",
+			PatternType:    "regex",
+			ExpectedStatus: 400,
+			ExpectError:    true,
+		},
+
+		// --- 61c: Export to CSV ---
+		{
+			Name:           "61c_export_basic_csv",
+			SubScenario:    "61c",
+			Category:       "export",
+			Description:    "Export generates valid CSV with header and data rows",
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61c_export_csv_headers",
+			SubScenario:    "61c",
+			Category:       "export",
+			Description:    "CSV has correct column headers matching specification",
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61c_export_csv_content_type",
+			SubScenario:    "61c",
+			Category:       "export",
+			Description:    "Response Content-Type is text/csv",
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61c_export_csv_with_filters",
+			SubScenario:    "61c",
+			Category:       "export",
+			Description:    "Export with filter criteria applies filters",
+			User:           "analyst",
+			ExpectedStatus: 200,
+		},
+
+		// --- 61d: Historical Query Details ---
+		{
+			Name:           "61d_detail_with_metrics",
+			SubScenario:    "61d",
+			Category:       "detail",
+			Description:    "Get historical query with all execution metrics",
+			QueryID:        "q-1234-5678",
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61d_detail_with_plan",
+			SubScenario:    "61d",
+			Category:       "detail",
+			Description:    "Detail includes saved EXPLAIN plan",
+			QueryID:        "q-1234-5678",
+			ExpectedStatus: 200,
+		},
+		{
+			Name:           "61d_detail_not_found",
+			SubScenario:    "61d",
+			Category:       "detail",
+			Description:    "Returns 404 for unknown query ID",
+			QueryID:        "q-nonexistent",
+			ExpectedStatus: 404,
+			ExpectError:    true,
+		},
+
+		// --- Cross-cutting ---
+		{
+			Name:           "61_unauthenticated",
+			SubScenario:    "all",
+			Category:       "auth",
+			Description:    "Unauthenticated requests rejected with 401",
+			ExpectedStatus: 401,
+			ExpectError:    true,
+		},
+	}
+}
+
+// PlanCheckCase represents a plan analysis test case (Scenario 62).
+type PlanCheckCase struct {
+	Name               string
+	PlanText           string
+	ExpectError        bool
+	ExpectedIssueCount int      // minimum expected issue count (-1 means don't check)
+	ExpectedCategories []string // e.g., ["sequential_scan", "sort_spill"]
+	Description        string
+}
+
+// Sample EXPLAIN ANALYZE plan text constants for plan check test cases.
+const (
+	// sampleSeqScanPlan contains a sequential scan on a large table.
+	sampleSeqScanPlan = `Seq Scan on large_orders  (cost=0.00..5000.00 rows=100000 width=100) (actual time=0.020..120.000 rows=100000 loops=1)
+  Filter: (region = 'US')
+  Rows Removed by Filter: 400000
+Planning Time: 0.200 ms
+Execution Time: 120.500 ms`
+
+	// sampleRowMismatchPlan contains a nested loop with row estimate mismatch.
+	sampleRowMismatchPlan = `Nested Loop  (cost=0.00..500.00 rows=10 width=72) (actual time=0.050..2500.000 rows=200000 loops=1)
+  ->  Seq Scan on dim_products p  (cost=0.00..1.10 rows=10 width=36) (actual time=0.010..0.020 rows=10 loops=1)
+  ->  Index Scan using idx_sales_product on sales s  (cost=0.29..49.90 rows=1 width=36) (actual time=0.001..200.000 rows=20000 loops=10)
+        Index Cond: (s.product_id = p.id)
+Planning Time: 0.300 ms
+Execution Time: 2500.500 ms`
+
+	// sampleSortSpillPlan contains a sort that spills to disk.
+	sampleSortSpillPlan = `Sort  (cost=8000.00..8025.00 rows=10000 width=150) (actual time=200.000..350.000 rows=10000 loops=1)
+  Sort Key: event_timestamp DESC
+  Sort Method: external merge  Disk: 8192kB
+  ->  Seq Scan on events  (cost=0.00..500.00 rows=10000 width=150) (actual time=0.010..20.000 rows=10000 loops=1)
+Planning Time: 0.150 ms
+Execution Time: 350.500 ms`
+
+	// sampleFullPlan contains all 3 issue types: seq scan, row mismatch, sort spill.
+	sampleFullPlan = `Sort  (cost=15000.00..15025.00 rows=10000 width=200) (actual time=850.123..1200.456 rows=10000 loops=1)
+  Sort Key: o.created_at DESC
+  Sort Method: external merge  Disk: 16384kB
+  ->  Nested Loop  (cost=0.00..12000.00 rows=100 width=200) (actual time=0.500..800.000 rows=500000 loops=1)
+        ->  Seq Scan on orders o  (cost=0.00..2500.00 rows=50000 width=100) (actual time=0.020..45.000 rows=50000 loops=1)
+              Filter: (status = 'active')
+              Rows Removed by Filter: 150000
+        ->  Index Scan using idx_items_order_id on order_items i  (cost=0.29..0.50 rows=1 width=100) (actual time=0.001..0.010 rows=10 loops=50000)
+              Index Cond: (i.order_id = o.id)
+Planning Time: 2.345 ms
+Execution Time: 1234.567 ms`
+
+	// sampleCleanPlan contains an optimized plan with no issues.
+	sampleCleanPlan = `Index Scan using idx_orders_id on orders  (cost=0.29..8.31 rows=1 width=100) (actual time=0.020..0.025 rows=1 loops=1)
+  Index Cond: (id = 42)
+Planning Time: 0.100 ms
+Execution Time: 0.050 ms`
+)
+
+// PlanCheckCases returns the test cases for plan analysis (Scenario 62).
+func PlanCheckCases() []PlanCheckCase {
+	return []PlanCheckCase{
+		{
+			Name:               "62a_sequential_scan_detected",
+			PlanText:           sampleSeqScanPlan,
+			ExpectedIssueCount: 1,
+			ExpectedCategories: []string{"sequential_scan"},
+			Description:        "Sequential scan on large table should be flagged",
+		},
+		{
+			Name:               "62b_row_estimate_mismatch",
+			PlanText:           sampleRowMismatchPlan,
+			ExpectedIssueCount: 1,
+			ExpectedCategories: []string{"row_estimate_mismatch"},
+			Description:        "Row estimate mismatch should be flagged with ANALYZE recommendation",
+		},
+		{
+			Name:               "62c_sort_spill_to_disk",
+			PlanText:           sampleSortSpillPlan,
+			ExpectedIssueCount: 1,
+			ExpectedCategories: []string{"sort_spill"},
+			Description:        "Sort spill to disk should be flagged with work_mem recommendation",
+		},
+		{
+			Name:               "62d_all_issues_combined",
+			PlanText:           sampleFullPlan,
+			ExpectedIssueCount: 3,
+			ExpectedCategories: []string{"sequential_scan", "row_estimate_mismatch", "sort_spill"},
+			Description:        "Plan with all issue types should flag all of them",
+		},
+		{
+			Name:               "62e_clean_plan_no_issues",
+			PlanText:           sampleCleanPlan,
+			ExpectedIssueCount: 0,
+			ExpectedCategories: nil,
+			Description:        "Optimized plan should have no issues",
+		},
+		{
+			Name:        "62f_empty_plan",
+			PlanText:    "",
+			ExpectError: true,
+			Description: "Empty plan text should return error",
+		},
+	}
+}
+
+// SamplePlanText returns a named sample plan text for use in tests.
+// Valid names: "seq_scan", "row_mismatch", "sort_spill", "full", "clean".
+func SamplePlanText(name string) string {
+	switch name {
+	case "seq_scan":
+		return sampleSeqScanPlan
+	case "row_mismatch":
+		return sampleRowMismatchPlan
+	case "sort_spill":
+		return sampleSortSpillPlan
+	case "full":
+		return sampleFullPlan
+	case "clean":
+		return sampleCleanPlan
+	default:
+		return ""
+	}
+}
+
+// APIEndpointCase represents a test case for an individual REST API endpoint (Scenario 63).
+type APIEndpointCase struct {
+	Name           string
+	SubScenario    string   // "63a" through "63m"
+	Method         string   // HTTP method
+	Path           string   // relative path (without cluster prefix)
+	Body           string   // JSON request body (empty for GET/DELETE)
+	ExpectedStatus int      // expected HTTP status code
+	ExpectedKeys   []string // expected top-level JSON keys in response
+	ContentType    string   // expected Content-Type (default "application/json")
+	Permission     string   // required permission level: "Basic", "OperatorBasic", "Operator"
+	NeedsDB        bool     // whether the endpoint requires a DB connection
+	Description    string
+}
+
+// APIEndpointCases returns the test cases for all 13 REST API endpoints (Scenario 63).
+func APIEndpointCases() []APIEndpointCase {
+	return []APIEndpointCase{
+		// --- 63a: GET /queries — Query Monitoring Overview ---
+		{
+			Name:           "63a_list_queries_ok",
+			SubScenario:    "63a",
+			Method:         "GET",
+			Path:           "/queries",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"activeQueries", "queuedQueries", "blockedQueries"},
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /queries returns monitoring config and query counts",
+		},
+		{
+			Name:           "63a_list_queries_cluster_not_found",
+			SubScenario:    "63a",
+			Method:         "GET",
+			Path:           "/queries",
+			ExpectedStatus: 404,
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /queries for non-existent cluster returns 404",
+		},
+
+		// --- 63b: GET /queries/active — Active Query Counts ---
+		{
+			Name:           "63b_active_queries_ok",
+			SubScenario:    "63b",
+			Method:         "GET",
+			Path:           "/queries/active",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"activeQueries", "queuedQueries", "blockedQueries"},
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /queries/active returns integer counts",
+		},
+		{
+			Name:           "63b_active_queries_cluster_not_found",
+			SubScenario:    "63b",
+			Method:         "GET",
+			Path:           "/queries/active",
+			ExpectedStatus: 404,
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /queries/active for non-existent cluster returns 404",
+		},
+
+		// --- 63c: GET /queries/{pid} — Query Detail ---
+		{
+			Name:           "63c_query_detail_ok",
+			SubScenario:    "63c",
+			Method:         "GET",
+			Path:           "/queries/1234",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "state", "query"},
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /queries/{pid} returns detail fields",
+		},
+		{
+			Name:           "63c_query_detail_invalid_pid",
+			SubScenario:    "63c",
+			Method:         "GET",
+			Path:           "/queries/abc",
+			ExpectedStatus: 400,
+			Permission:     "OperatorBasic",
+			NeedsDB:        false,
+			Description:    "GET /queries/{pid} with non-numeric PID returns 400",
+		},
+		{
+			Name:           "63c_query_detail_negative_pid",
+			SubScenario:    "63c",
+			Method:         "GET",
+			Path:           "/queries/-1",
+			ExpectedStatus: 400,
+			Permission:     "OperatorBasic",
+			NeedsDB:        false,
+			Description:    "GET /queries/{pid} with negative PID returns 400",
+		},
+
+		// --- 63d: POST /queries/{pid}/cancel — Cancel Query ---
+		{
+			Name:           "63d_cancel_query_ok",
+			SubScenario:    "63d",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "canceled", "status"},
+			Permission:     "Operator",
+			NeedsDB:        true,
+			Description:    "POST /queries/{pid}/cancel returns cancellation response",
+		},
+		{
+			Name:           "63d_cancel_query_with_reason",
+			SubScenario:    "63d",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{"reason":"too slow"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "canceled", "reason"},
+			Permission:     "Operator",
+			NeedsDB:        true,
+			Description:    "POST /queries/{pid}/cancel with reason includes reason in response",
+		},
+		{
+			Name:           "63d_cancel_query_invalid_pid",
+			SubScenario:    "63d",
+			Method:         "POST",
+			Path:           "/queries/abc/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "POST /queries/{pid}/cancel with invalid PID returns 400",
+		},
+
+		// --- 63e: POST /queries/{pid}/move — Move Query ---
+		{
+			Name:           "63e_move_query_ok",
+			SubScenario:    "63e",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{"targetGroup":"etl_group"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "targetGroup", "status"},
+			Permission:     "Operator",
+			NeedsDB:        true,
+			Description:    "POST /queries/{pid}/move returns move response with targetGroup",
+		},
+		{
+			Name:           "63e_move_query_missing_target",
+			SubScenario:    "63e",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{}`,
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "POST /queries/{pid}/move without targetGroup returns 400",
+		},
+		{
+			Name:           "63e_move_query_invalid_target",
+			SubScenario:    "63e",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{"targetGroup":"DROP TABLE;--"}`,
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "POST /queries/{pid}/move with SQL injection targetGroup returns 400",
+		},
+		{
+			Name:           "63e_move_query_invalid_pid",
+			SubScenario:    "63e",
+			Method:         "POST",
+			Path:           "/queries/abc/move",
+			Body:           `{"targetGroup":"etl_group"}`,
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "POST /queries/{pid}/move with invalid PID returns 400",
+		},
+
+		// --- 63f: GET /queries/history — Query History ---
+		{
+			Name:           "63f_query_history_ok",
+			SubScenario:    "63f",
+			Method:         "GET",
+			Path:           "/queries/history",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"items", "total", "limit", "offset"},
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /queries/history returns list with pagination",
+		},
+		{
+			Name:           "63f_query_history_invalid_limit",
+			SubScenario:    "63f",
+			Method:         "GET",
+			Path:           "/queries/history?limit=-1",
+			ExpectedStatus: 400,
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /queries/history with invalid limit returns 400",
+		},
+
+		// --- 63g: GET /queries/history/{qid} — Query History Detail ---
+		{
+			Name:           "63g_query_history_detail_ok",
+			SubScenario:    "63g",
+			Method:         "GET",
+			Path:           "/queries/history/q-1234-5678",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"queryId"},
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /queries/history/{qid} returns detail with plan",
+		},
+		{
+			Name:           "63g_query_history_detail_not_found",
+			SubScenario:    "63g",
+			Method:         "GET",
+			Path:           "/queries/history/q-nonexistent",
+			ExpectedStatus: 404,
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /queries/history/{qid} for unknown ID returns 404",
+		},
+
+		// --- 63h: POST /queries/history/export — Export Query History ---
+		{
+			Name:           "63h_export_history_ok",
+			SubScenario:    "63h",
+			Method:         "POST",
+			Path:           "/queries/history/export",
+			Body:           `{}`,
+			ExpectedStatus: 200,
+			ContentType:    "text/csv",
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "POST /queries/history/export returns CSV content",
+		},
+
+		// --- 63i: POST /queries/plan-check — Plan Analysis ---
+		{
+			Name:           "63i_plan_check_ok",
+			SubScenario:    "63i",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			Body:           `{"planText":"Seq Scan on large_orders  (cost=0.00..5000.00 rows=100000 width=100) (actual time=0.020..120.000 rows=100000 loops=1)\n  Filter: (region = 'US')\n  Rows Removed by Filter: 400000\nPlanning Time: 0.200 ms\nExecution Time: 120.500 ms"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"issues", "summary", "totalNodes"},
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "POST /queries/plan-check returns issues detected",
+		},
+		{
+			Name:           "63i_plan_check_empty",
+			SubScenario:    "63i",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			Body:           `{"planText":""}`,
+			ExpectedStatus: 400,
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "POST /queries/plan-check with empty plan returns 400",
+		},
+
+		// --- 63j: GET /metrics/exporters — Exporter Health ---
+		{
+			Name:           "63j_exporter_health_ok",
+			SubScenario:    "63j",
+			Method:         "GET",
+			Path:           "/metrics/exporters",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"exporters", "total"},
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /metrics/exporters returns exporter list with status",
+		},
+		{
+			Name:           "63j_exporter_health_no_config",
+			SubScenario:    "63j",
+			Method:         "GET",
+			Path:           "/metrics/exporters",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"exporters", "total", "message"},
+			Permission:     "Basic",
+			NeedsDB:        false,
+			Description:    "GET /metrics/exporters without config returns empty list with message",
+		},
+
+		// --- 63k: GET /sessions — List Sessions ---
+		{
+			Name:           "63k_list_sessions_ok",
+			SubScenario:    "63k",
+			Method:         "GET",
+			Path:           "/sessions",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"sessions", "total"},
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /sessions returns session list",
+		},
+		{
+			Name:           "63k_list_sessions_with_filter",
+			SubScenario:    "63k",
+			Method:         "GET",
+			Path:           "/sessions?status=running",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"sessions", "total"},
+			Permission:     "OperatorBasic",
+			NeedsDB:        true,
+			Description:    "GET /sessions with status filter returns filtered sessions",
+		},
+
+		// --- 63l: POST /sessions/{pid}/cancel — Cancel Session Query ---
+		{
+			Name:           "63l_cancel_session_ok",
+			SubScenario:    "63l",
+			Method:         "POST",
+			Path:           "/sessions/1234/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "canceled"},
+			Permission:     "Operator",
+			NeedsDB:        true,
+			Description:    "POST /sessions/{pid}/cancel returns cancellation result",
+		},
+		{
+			Name:           "63l_cancel_session_invalid_pid",
+			SubScenario:    "63l",
+			Method:         "POST",
+			Path:           "/sessions/abc/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "POST /sessions/{pid}/cancel with invalid PID returns 400",
+		},
+
+		// --- 63m: DELETE /sessions/{pid} — Terminate Session ---
+		{
+			Name:           "63m_terminate_session_ok",
+			SubScenario:    "63m",
+			Method:         "DELETE",
+			Path:           "/sessions/1234",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "terminated"},
+			Permission:     "Operator",
+			NeedsDB:        true,
+			Description:    "DELETE /sessions/{pid} returns termination result",
+		},
+		{
+			Name:           "63m_terminate_session_invalid_pid",
+			SubScenario:    "63m",
+			Method:         "DELETE",
+			Path:           "/sessions/-1",
+			ExpectedStatus: 400,
+			Permission:     "Operator",
+			NeedsDB:        false,
+			Description:    "DELETE /sessions/{pid} with negative PID returns 400",
+		},
+	}
+}
+
+// CLICommandCase represents a test case for a CLI command API endpoint (Scenario 64).
+type CLICommandCase struct {
+	Name                  string
+	SubScenario           string   // "64a" through "64i"
+	Method                string   // HTTP method
+	Path                  string   // relative path (without cluster prefix)
+	Body                  string   // JSON request body (empty for GET/DELETE)
+	ExpectedStatus        int      // expected HTTP status code
+	ExpectedKeys          []string // expected top-level JSON keys in response
+	ContentType           string   // expected Content-Type (default "application/json")
+	UseNonExistentCluster bool     // whether to use a non-existent cluster path
+	Description           string
+}
+
+// CLICommandCases returns the test cases for all CLI command API endpoints (Scenario 64).
+func CLICommandCases() []CLICommandCase {
+	return []CLICommandCase{
+		// --- 64a: queries list — GET /sessions ---
+		{
+			Name:           "64a_queries_list_ok",
+			SubScenario:    "64a",
+			Method:         "GET",
+			Path:           "/sessions",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"sessions", "total"},
+			Description:    "queries list returns session list with total",
+		},
+		{
+			Name:                  "64a_queries_list_cluster_not_found",
+			SubScenario:           "64a",
+			Method:                "GET",
+			Path:                  "/sessions",
+			ExpectedStatus:        404,
+			UseNonExistentCluster: true,
+			Description:           "queries list for non-existent cluster returns 404",
+		},
+
+		// --- 64b: queries detail — GET /queries/{pid} ---
+		{
+			Name:           "64b_queries_detail_ok",
+			SubScenario:    "64b",
+			Method:         "GET",
+			Path:           "/queries/1234",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "state", "query"},
+			Description:    "queries detail returns query info with locks and tables",
+		},
+		{
+			Name:           "64b_queries_detail_invalid_pid",
+			SubScenario:    "64b",
+			Method:         "GET",
+			Path:           "/queries/abc",
+			ExpectedStatus: 400,
+			Description:    "queries detail with non-numeric PID returns 400",
+		},
+
+		// --- 64c: queries cancel — POST /queries/{pid}/cancel ---
+		{
+			Name:           "64c_queries_cancel_ok",
+			SubScenario:    "64c",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "canceled", "status"},
+			Description:    "queries cancel returns cancellation response",
+		},
+		{
+			Name:           "64c_queries_cancel_with_reason",
+			SubScenario:    "64c",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{"reason":"too slow"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "canceled", "reason"},
+			Description:    "queries cancel with reason includes reason in response",
+		},
+		{
+			Name:           "64c_queries_cancel_invalid_pid",
+			SubScenario:    "64c",
+			Method:         "POST",
+			Path:           "/queries/abc/cancel",
+			Body:           `{}`,
+			ExpectedStatus: 400,
+			Description:    "queries cancel with invalid PID returns 400",
+		},
+
+		// --- 64d: queries move — POST /queries/{pid}/move ---
+		{
+			Name:           "64d_queries_move_ok",
+			SubScenario:    "64d",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{"targetGroup":"etl_group"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"pid", "targetGroup", "status"},
+			Description:    "queries move returns move response with targetGroup",
+		},
+		{
+			Name:           "64d_queries_move_missing_target",
+			SubScenario:    "64d",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{}`,
+			ExpectedStatus: 400,
+			Description:    "queries move without targetGroup returns 400",
+		},
+		{
+			Name:           "64d_queries_move_invalid_target",
+			SubScenario:    "64d",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{"targetGroup":"DROP TABLE;--"}`,
+			ExpectedStatus: 400,
+			Description:    "queries move with SQL injection targetGroup returns 400",
+		},
+
+		// --- 64e: queries history --last 24h — GET /queries/history?since=24h ---
+		{
+			Name:           "64e_queries_history_last_24h",
+			SubScenario:    "64e",
+			Method:         "GET",
+			Path:           "/queries/history",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"items", "total", "limit", "offset"},
+			Description:    "queries history with since filter returns paginated results",
+		},
+
+		// --- 64f: queries history --user --database ---
+		{
+			Name:           "64f_queries_history_user_filter",
+			SubScenario:    "64f",
+			Method:         "GET",
+			Path:           "/queries/history",
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"items", "total"},
+			Description:    "queries history with user filter returns filtered results",
+		},
+
+		// --- 64g: queries plan-check — POST /queries/plan-check ---
+		{
+			Name:           "64g_plan_check_ok",
+			SubScenario:    "64g",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			Body:           `{"planText":"Seq Scan on large_orders  (cost=0.00..5000.00 rows=100000 width=100) (actual time=0.020..120.000 rows=100000 loops=1)\n  Filter: (region = 'US')\n  Rows Removed by Filter: 400000\nPlanning Time: 0.200 ms\nExecution Time: 120.500 ms"}`,
+			ExpectedStatus: 200,
+			ExpectedKeys:   []string{"issues", "summary", "totalNodes"},
+			Description:    "plan-check returns issues detected in plan",
+		},
+		{
+			Name:           "64g_plan_check_empty",
+			SubScenario:    "64g",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			Body:           `{"planText":""}`,
+			ExpectedStatus: 400,
+			Description:    "plan-check with empty plan returns 400",
+		},
+
+		// --- 64h: queries export — POST /queries/export ---
+		{
+			Name:           "64h_queries_export_csv",
+			SubScenario:    "64h",
+			Method:         "POST",
+			Path:           "/queries/export",
+			ExpectedStatus: 200,
+			ContentType:    "text/csv",
+			Description:    "queries export returns CSV content",
+		},
+		{
+			Name:                  "64h_queries_export_cluster_not_found",
+			SubScenario:           "64h",
+			Method:                "POST",
+			Path:                  "/queries/export",
+			ExpectedStatus:        404,
+			UseNonExistentCluster: true,
+			Description:           "queries export for non-existent cluster returns 404",
+		},
+
+		// --- 64i: queries history export — POST /queries/history/export ---
+		{
+			Name:           "64i_history_export_csv",
+			SubScenario:    "64i",
+			Method:         "POST",
+			Path:           "/queries/history/export",
+			Body:           `{}`,
+			ExpectedStatus: 200,
+			ContentType:    "text/csv",
+			Description:    "history export returns CSV content",
+		},
+		{
+			Name:                  "64i_history_export_cluster_not_found",
+			SubScenario:           "64i",
+			Method:                "POST",
+			Path:                  "/queries/history/export",
+			Body:                  `{}`,
+			ExpectedStatus:        404,
+			UseNonExistentCluster: true,
+			Description:           "history export for non-existent cluster returns 404",
+		},
+	}
+}
+
+// QueryMonitoringCase represents a test case for query monitoring configuration.
+type QueryMonitoringCase struct {
+	Name               string
+	Enabled            bool
+	HistoryRetention   string
+	SamplingInterval   int32
+	GuestAccess        bool
+	PlanCollection     bool
+	SlowQueryThreshold string
+	HasExporters       bool
+	Description        string
+}
+
+// QueryMonitoringCases returns the test cases for query monitoring configuration.
+func QueryMonitoringCases() []QueryMonitoringCase {
+	return []QueryMonitoringCase{
+		{
+			Name:               "full_config",
+			Enabled:            true,
+			HistoryRetention:   "30d",
+			SamplingInterval:   5,
+			GuestAccess:        false,
+			PlanCollection:     true,
+			SlowQueryThreshold: "1000ms",
+			HasExporters:       true,
+			Description:        "Full query monitoring configuration with all exporters",
+		},
+		{
+			Name:               "minimal_config",
+			Enabled:            true,
+			HistoryRetention:   "7d",
+			SamplingInterval:   10,
+			GuestAccess:        false,
+			PlanCollection:     false,
+			SlowQueryThreshold: "500ms",
+			HasExporters:       false,
+			Description:        "Minimal query monitoring without exporters",
+		},
+		{
+			Name:               "disabled",
+			Enabled:            false,
+			HistoryRetention:   "",
+			SamplingInterval:   0,
+			GuestAccess:        false,
+			PlanCollection:     false,
+			SlowQueryThreshold: "",
+			HasExporters:       false,
+			Description:        "Query monitoring disabled",
+		},
+		{
+			Name:               "guest_access_enabled",
+			Enabled:            true,
+			HistoryRetention:   "30d",
+			SamplingInterval:   5,
+			GuestAccess:        true,
+			PlanCollection:     true,
+			SlowQueryThreshold: "2000ms",
+			HasExporters:       true,
+			Description:        "Query monitoring with guest access enabled",
+		},
+	}
+}
+
+// PauseResumeCase represents a test case for pause/resume monitor verification (Scenario 66).
+type PauseResumeCase struct {
+	Name           string
+	SubScenario    string // "66a"
+	Step           string // step description
+	Method         string // HTTP method
+	Path           string // relative path (without cluster prefix)
+	AuthUser       string // username for authenticated requests (empty = unauthenticated)
+	AuthPass       string // password for authenticated requests
+	ExpectedStatus int    // expected HTTP status code
+	ExpectStale    bool   // whether stale=true is expected in response
+	ExpectPausedAt bool   // whether pausedAt is expected in response
+	Permission     string // permission level of the user
+	Description    string
+}
+
+// PauseResumeCases returns the test cases for pause/resume monitor (Scenario 66).
+func PauseResumeCases() []PauseResumeCase {
+	return []PauseResumeCase{
+		// --- 66a: Pause and Resume lifecycle ---
+		{
+			Name:           "66a_initial_state_not_paused",
+			SubScenario:    "66a",
+			Step:           "initial_state",
+			Method:         "GET",
+			Path:           "/queries/monitor/state",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    false,
+			ExpectPausedAt: false,
+			Permission:     "Basic",
+			Description:    "Initial monitor state should be paused=false, stale=false",
+		},
+		{
+			Name:           "66a_pause_monitor",
+			SubScenario:    "66a",
+			Step:           "pause",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectPausedAt: true,
+			Permission:     "Operator",
+			Description:    "POST pause should return status=paused with pausedAt timestamp",
+		},
+		{
+			Name:           "66a_verify_paused_state",
+			SubScenario:    "66a",
+			Step:           "verify_paused",
+			Method:         "GET",
+			Path:           "/queries/monitor/state",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    true,
+			ExpectPausedAt: true,
+			Permission:     "Basic",
+			Description:    "After pause, state should show paused=true, stale=true, pausedAt set",
+		},
+		{
+			Name:           "66a_stale_active_queries",
+			SubScenario:    "66a",
+			Step:           "stale_active",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    true,
+			ExpectPausedAt: true,
+			Permission:     "Basic",
+			Description:    "GET /queries/active while paused returns stale=true with pausedAt",
+		},
+		{
+			Name:           "66a_stale_queries",
+			SubScenario:    "66a",
+			Step:           "stale_queries",
+			Method:         "GET",
+			Path:           "/queries",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    true,
+			ExpectPausedAt: true,
+			Permission:     "OperatorBasic",
+			Description:    "GET /queries while paused returns stale=true with pausedAt",
+		},
+		{
+			Name:           "66a_resume_monitor",
+			SubScenario:    "66a",
+			Step:           "resume",
+			Method:         "POST",
+			Path:           "/queries/monitor/resume",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			Permission:     "Operator",
+			Description:    "POST resume should return status=resumed",
+		},
+		{
+			Name:           "66a_verify_resumed_state",
+			SubScenario:    "66a",
+			Step:           "verify_resumed",
+			Method:         "GET",
+			Path:           "/queries/monitor/state",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    false,
+			ExpectPausedAt: false,
+			Permission:     "Basic",
+			Description:    "After resume, state should show paused=false, stale=false",
+		},
+		{
+			Name:           "66a_fresh_active_queries",
+			SubScenario:    "66a",
+			Step:           "fresh_active",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectStale:    false,
+			ExpectPausedAt: false,
+			Permission:     "Basic",
+			Description:    "GET /queries/active after resume returns fresh data (no stale flag)",
+		},
+		{
+			Name:           "66a_idempotent_pause",
+			SubScenario:    "66a",
+			Step:           "idempotent_pause",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			Permission:     "Operator",
+			Description:    "Pausing twice should succeed (idempotent)",
+		},
+		{
+			Name:           "66a_resume_without_pause",
+			SubScenario:    "66a",
+			Step:           "resume_no_pause",
+			Method:         "POST",
+			Path:           "/queries/monitor/resume",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			Permission:     "Operator",
+			Description:    "Resuming when not paused should succeed",
+		},
+		{
+			Name:           "66a_unauthenticated_pause",
+			SubScenario:    "66a",
+			Step:           "unauth_pause",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			ExpectedStatus: 401,
+			Description:    "POST pause without auth should return 401",
+		},
+		{
+			Name:           "66a_basic_user_pause_forbidden",
+			SubScenario:    "66a",
+			Step:           "basic_pause",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			AuthUser:       "basic-user",
+			AuthPass:       "basic-pass",
+			ExpectedStatus: 403,
+			Permission:     "Basic",
+			Description:    "Basic user POST pause should return 403 (needs Operator)",
+		},
+		{
+			Name:           "66a_cluster_not_found",
+			SubScenario:    "66a",
+			Step:           "not_found",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 404,
+			Permission:     "Operator",
+			Description:    "POST pause for non-existent cluster should return 404",
+		},
+	}
+}
+
+// AccessControlCase represents a test case for access control and guest access verification (Scenario 65).
+type AccessControlCase struct {
+	Name           string
+	SubScenario    string // "65a", "65b", "65c"
+	Method         string // HTTP method
+	Path           string // relative path (without cluster prefix)
+	Body           string // JSON request body (empty for GET)
+	AuthUser       string // username for authenticated requests (empty = unauthenticated)
+	AuthPass       string // password for authenticated requests
+	ExpectedStatus int    // expected HTTP status code
+	Permission     string // permission level of the user (for 65c)
+	Description    string
+}
+
+// AccessControlCases returns the test cases for access control and guest access (Scenario 65).
+func AccessControlCases() []AccessControlCase {
+	return []AccessControlCase{
+		// --- 65a: guestAccess=false (default) — all unauthenticated → 401 ---
+		{
+			Name:           "65a_unauthenticated_active_queries",
+			SubScenario:    "65a",
+			Method:         "GET",
+			Path:           "/queries/active",
+			ExpectedStatus: 401,
+			Description:    "Unauthenticated GET /queries/active returns 401 when guestAccess=false",
+		},
+		{
+			Name:           "65a_unauthenticated_exporter_health",
+			SubScenario:    "65a",
+			Method:         "GET",
+			Path:           "/metrics/exporters",
+			ExpectedStatus: 401,
+			Description:    "Unauthenticated GET /metrics/exporters returns 401 when guestAccess=false",
+		},
+		{
+			Name:           "65a_unauthenticated_cancel_query",
+			SubScenario:    "65a",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			ExpectedStatus: 401,
+			Description:    "Unauthenticated POST /queries/{pid}/cancel returns 401",
+		},
+		{
+			Name:           "65a_unauthenticated_list_queries",
+			SubScenario:    "65a",
+			Method:         "GET",
+			Path:           "/queries",
+			ExpectedStatus: 401,
+			Description:    "Unauthenticated GET /queries returns 401 when guestAccess=false",
+		},
+
+		// --- 65b: guestAccess=true — guest identity with PermissionBasic ---
+		{
+			Name:           "65b_guest_active_queries_200",
+			SubScenario:    "65b",
+			Method:         "GET",
+			Path:           "/queries/active",
+			ExpectedStatus: 200,
+			Description:    "Guest GET /queries/active returns 200 (guest has Basic permission)",
+		},
+		{
+			Name:           "65b_guest_exporter_health_200",
+			SubScenario:    "65b",
+			Method:         "GET",
+			Path:           "/metrics/exporters",
+			ExpectedStatus: 200,
+			Description:    "Guest GET /metrics/exporters returns 200 (guest has Basic permission)",
+		},
+		{
+			Name:           "65b_guest_queries_403",
+			SubScenario:    "65b",
+			Method:         "GET",
+			Path:           "/queries",
+			ExpectedStatus: 403,
+			Description:    "Guest GET /queries returns 403 (guest has Basic, needs OperatorBasic)",
+		},
+		{
+			Name:           "65b_guest_cancel_401",
+			SubScenario:    "65b",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			ExpectedStatus: 401,
+			Description:    "Guest POST /queries/{pid}/cancel returns 401 (write ops always require auth)",
+		},
+		{
+			Name:           "65b_guest_plan_check_401",
+			SubScenario:    "65b",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			ExpectedStatus: 401,
+			Description:    "Guest POST /queries/plan-check returns 401 (POST always requires auth)",
+		},
+		{
+			Name:           "65b_authenticated_active_queries_200",
+			SubScenario:    "65b",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "admin",
+			AuthPass:       "admin-pass",
+			ExpectedStatus: 200,
+			Description:    "Authenticated GET /queries/active returns 200 when guestAccess=true",
+		},
+
+		// --- 65c: Permission enforcement — different permission levels ---
+		{
+			Name:           "65c_basic_active_queries_200",
+			SubScenario:    "65c",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "basic-user",
+			AuthPass:       "basic-pass",
+			ExpectedStatus: 200,
+			Permission:     "Basic",
+			Description:    "Basic user GET /queries/active returns 200",
+		},
+		{
+			Name:           "65c_basic_queries_403",
+			SubScenario:    "65c",
+			Method:         "GET",
+			Path:           "/queries",
+			AuthUser:       "basic-user",
+			AuthPass:       "basic-pass",
+			ExpectedStatus: 403,
+			Permission:     "Basic",
+			Description:    "Basic user GET /queries returns 403 (requires OperatorBasic)",
+		},
+		{
+			Name:           "65c_opbasic_queries_200",
+			SubScenario:    "65c",
+			Method:         "GET",
+			Path:           "/queries",
+			AuthUser:       "opbasic-user",
+			AuthPass:       "opbasic-pass",
+			ExpectedStatus: 200,
+			Permission:     "OperatorBasic",
+			Description:    "OperatorBasic user GET /queries returns 200",
+		},
+		{
+			Name:           "65c_opbasic_active_queries_200",
+			SubScenario:    "65c",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "opbasic-user",
+			AuthPass:       "opbasic-pass",
+			ExpectedStatus: 200,
+			Permission:     "OperatorBasic",
+			Description:    "OperatorBasic user GET /queries/active returns 200",
+		},
+		{
+			Name:           "65c_opbasic_cancel_403",
+			SubScenario:    "65c",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{}`,
+			AuthUser:       "opbasic-user",
+			AuthPass:       "opbasic-pass",
+			ExpectedStatus: 403,
+			Permission:     "OperatorBasic",
+			Description:    "OperatorBasic user POST /queries/{pid}/cancel returns 403 (requires Operator)",
+		},
+		{
+			Name:           "65c_operator_cancel_200",
+			SubScenario:    "65c",
+			Method:         "POST",
+			Path:           "/queries/1234/cancel",
+			Body:           `{}`,
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			Permission:     "Operator",
+			Description:    "Operator user POST /queries/{pid}/cancel returns 200",
+		},
+		{
+			Name:           "65c_operator_move_200",
+			SubScenario:    "65c",
+			Method:         "POST",
+			Path:           "/queries/1234/move",
+			Body:           `{"targetGroup":"etl_group"}`,
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			Permission:     "Operator",
+			Description:    "Operator user POST /queries/{pid}/move returns 200",
+		},
+	}
+}
+
+// MonitoringDisabledCase represents a test case for monitoring disabled and planCollection disabled
+// verification (Scenario 67).
+type MonitoringDisabledCase struct {
+	Name           string
+	SubScenario    string // "67a" (monitoring disabled), "67b" (planCollection disabled)
+	Step           string // step description
+	Method         string // HTTP method
+	Path           string // relative path (without cluster prefix)
+	AuthUser       string // username for authenticated requests (empty = unauthenticated)
+	AuthPass       string // password for authenticated requests
+	ExpectedStatus int    // expected HTTP status code
+	ExpectMonOff   bool   // whether monitoringEnabled=false is expected in response
+	ExpectPlanArg  bool   // whether --plan-collection arg is expected in exporter args
+	Permission     string // permission level of the user
+	Description    string
+}
+
+// MonitoringDisabledCases returns the test cases for monitoring disabled and planCollection disabled
+// (Scenario 67).
+func MonitoringDisabledCases() []MonitoringDisabledCase {
+	return []MonitoringDisabledCase{
+		// --- 67a: queryMonitoring.enabled=false ---
+		{
+			Name:           "67a_queries_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "queries_disabled",
+			Method:         "GET",
+			Path:           "/queries",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "OperatorBasic",
+			Description:    "GET /queries with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_active_queries_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "active_disabled",
+			Method:         "GET",
+			Path:           "/queries/active",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "Basic",
+			Description:    "GET /queries/active with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_query_history_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "history_disabled",
+			Method:         "GET",
+			Path:           "/queries/history",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "OperatorBasic",
+			Description:    "GET /queries/history with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_exporter_health_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "exporters_disabled",
+			Method:         "GET",
+			Path:           "/metrics/exporters",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "Basic",
+			Description:    "GET /metrics/exporters with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_monitor_state_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "state_disabled",
+			Method:         "GET",
+			Path:           "/queries/monitor/state",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "Basic",
+			Description:    "GET /queries/monitor/state with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_pause_returns_monitoring_disabled",
+			SubScenario:    "67a",
+			Step:           "pause_disabled",
+			Method:         "POST",
+			Path:           "/queries/monitor/pause",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   true,
+			Permission:     "Operator",
+			Description:    "POST /queries/monitor/pause with monitoring disabled returns monitoringEnabled=false",
+		},
+		{
+			Name:           "67a_sessions_still_works",
+			SubScenario:    "67a",
+			Step:           "sessions_ok",
+			Method:         "GET",
+			Path:           "/sessions",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   false,
+			Permission:     "OperatorBasic",
+			Description:    "GET /sessions still works when monitoring is disabled",
+		},
+		{
+			Name:           "67a_plan_check_still_works",
+			SubScenario:    "67a",
+			Step:           "plan_check_ok",
+			Method:         "POST",
+			Path:           "/queries/plan-check",
+			AuthUser:       "operator-user",
+			AuthPass:       "operator-pass",
+			ExpectedStatus: 200,
+			ExpectMonOff:   false,
+			Permission:     "Basic",
+			Description:    "POST /queries/plan-check still works when monitoring is disabled",
+		},
+
+		// --- 67b: planCollection=false ---
+		{
+			Name:          "67b_plan_collection_enabled_has_arg",
+			SubScenario:   "67b",
+			Step:          "plan_enabled",
+			ExpectPlanArg: true,
+			Description:   "With planCollection=true, exporter args include --plan-collection",
+		},
+		{
+			Name:          "67b_plan_collection_disabled_no_arg",
+			SubScenario:   "67b",
+			Step:          "plan_disabled",
+			ExpectPlanArg: false,
+			Description:   "With planCollection=false, exporter args do NOT include --plan-collection",
+		},
+		{
+			Name:        "67b_history_retention_arg_present",
+			SubScenario: "67b",
+			Step:        "retention_arg",
+			Description: "With historyRetention set, exporter args include --history-retention",
 		},
 	}
 }

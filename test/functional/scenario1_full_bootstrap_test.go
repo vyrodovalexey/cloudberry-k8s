@@ -793,3 +793,30 @@ func (m *mockMetricsRecorder) RecordMaintenanceOperation(cluster, namespace, ope
 func (m *mockMetricsRecorder) RecordPasswordRotation() {
 	m.record("RecordPasswordRotation", nil)
 }
+
+func (m *mockMetricsRecorder) RecordQueryHistoryInsert(_, _ string) {}
+func (m *mockMetricsRecorder) ObserveQueryHistorySearchDuration(_, _ string, _ time.Duration) {
+}
+func (m *mockMetricsRecorder) RecordQueryHistoryExport(_, _, _ string)                 {}
+func (m *mockMetricsRecorder) RecordQueryHistoryRetentionCleanup(_, _ string, _ int64) {}
+func (m *mockMetricsRecorder) SetQueryHistorySizeBytes(_, _ string, _ float64)         {}
+func (m *mockMetricsRecorder) RecordPlanCheck(_, _ string)                             {}
+func (m *mockMetricsRecorder) RecordPlanCheckIssue(_, _, _, _ string)                  {}
+func (m *mockMetricsRecorder) ObservePlanCheckDuration(_, _ string, _ time.Duration) {
+}
+func (m *mockMetricsRecorder) RecordQueryCancel(_, _ string)                           {}
+func (m *mockMetricsRecorder) RecordQueryMove(_, _ string)                             {}
+func (m *mockMetricsRecorder) RecordExporterHealthCheck(_, _ string)                   {}
+func (m *mockMetricsRecorder) RecordActiveQueryExport()                                {}
+func (m *mockMetricsRecorder) RecordGuestAccess(_, _ string, _ bool)                   {}
+func (m *mockMetricsRecorder) RecordMonitorPause(_, _ string)                          {}
+func (m *mockMetricsRecorder) RecordMonitorResume(_, _ string)                         {}
+func (m *mockMetricsRecorder) RecordMonitoringDisabledAccess(_, _ string)              {}
+func (m *mockMetricsRecorder) RecordCertRotation(_, _, _ string)                       {}
+func (m *mockMetricsRecorder) SetCertExpirySeconds(_ string, _ float64)                {}
+func (m *mockMetricsRecorder) RecordVaultOperation(_, _ string)                        {}
+func (m *mockMetricsRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {}
+func (m *mockMetricsRecorder) RecordWebhookAdmission(_, _, _ string)                   {}
+func (m *mockMetricsRecorder) RecordUpgradeOperation(_, _, _ string)                   {}
+func (m *mockMetricsRecorder) RecordRollingRestart(_, _, _ string)                     {}
+func (m *mockMetricsRecorder) RecordRecoveryOperation(_, _, _, _ string)               {}

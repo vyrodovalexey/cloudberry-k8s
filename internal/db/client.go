@@ -4,6 +4,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -187,6 +189,26 @@ type Client interface {
 	RebalanceTable(ctx context.Context, database, schema, table, distKey string) error
 	// ListUserDatabases returns all non-template, non-system databases.
 	ListUserDatabases(ctx context.Context) ([]string, error)
+	// SetupExporterRole creates the cloudberry_exporter database role with LOGIN privilege,
+	// grants pg_monitor membership, and grants SELECT on monitoring views.
+	SetupExporterRole(ctx context.Context, password string) error
+	// GetQueryDetail returns detailed execution information for a specific query by PID.
+	GetQueryDetail(ctx context.Context, pid int32) (*QueryDetail, error)
+	// EnsureQueryHistoryTable creates the query history table and indexes if they don't exist.
+	EnsureQueryHistoryTable(ctx context.Context) error
+	// InsertQueryHistory inserts a single query history entry into the table.
+	InsertQueryHistory(ctx context.Context, entry *QueryHistoryEntry) error
+	// GetQueryHistory searches query history with filters and pagination.
+	GetQueryHistory(ctx context.Context, filter QueryHistoryFilter) ([]QueryHistoryEntry, int, error)
+	// GetQueryHistoryDetail returns detailed information for a specific historical query.
+	GetQueryHistoryDetail(ctx context.Context, queryID string) (*QueryHistoryEntry, error)
+	// ExportQueryHistoryCSV writes query history matching the filter as CSV to the writer.
+	ExportQueryHistoryCSV(ctx context.Context, filter QueryHistoryFilter, w io.Writer) error
+	// CleanupQueryHistory deletes query history entries older than the retention period.
+	CleanupQueryHistory(ctx context.Context, retention time.Duration) (int64, error)
+	// MoveQueryToResourceGroup moves a running query's session to a different resource group.
+	// It looks up the session's role from pg_stat_activity and reassigns it via ALTER ROLE.
+	MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error
 }
 
 // ParameterScope defines the scope for parameter changes.
@@ -228,9 +250,11 @@ type ClusterState struct {
 type Session struct {
 	PID           int32     `json:"pid"`
 	Username      string    `json:"username"`
+	Database      string    `json:"database"`
 	Application   string    `json:"application"`
 	ClientAddress string    `json:"clientAddress"`
 	State         string    `json:"state"`
+	WaitEventType string    `json:"waitEventType"`
 	Query         string    `json:"query"`
 	QueryStart    time.Time `json:"queryStart"`
 	Duration      string    `json:"duration"`
@@ -243,6 +267,31 @@ type Session struct {
 type SessionWithGroup struct {
 	Session
 	ResourceGroup string `json:"resourceGroup"`
+}
+
+// QueryDetail contains detailed execution information for a running query.
+type QueryDetail struct {
+	PID            int32      `json:"pid"`
+	Username       string     `json:"username"`
+	Database       string     `json:"database"`
+	State          string     `json:"state"`
+	Query          string     `json:"query"`
+	QueryStart     time.Time  `json:"queryStart"`
+	Duration       string     `json:"duration"`
+	WaitEventType  string     `json:"waitEventType,omitempty"`
+	WaitEvent      string     `json:"waitEvent,omitempty"`
+	BackendType    string     `json:"backendType,omitempty"`
+	Locks          []LockInfo `json:"locks,omitempty"`
+	TablesAccessed []string   `json:"tablesAccessed,omitempty"`
+	ExplainPlan    string     `json:"explainPlan,omitempty"`
+}
+
+// LockInfo describes a lock held or awaited by a query.
+type LockInfo struct {
+	LockType string `json:"lockType"`
+	Mode     string `json:"mode"`
+	Granted  bool   `json:"granted"`
+	Relation string `json:"relation,omitempty"`
 }
 
 // RoleOptions defines options for creating or altering a role.
@@ -535,6 +584,22 @@ type pgxClient struct {
 	config    Config
 	retryOpts util.RetryOptions
 	logger    *slog.Logger
+	// recorder records query-history metrics. It is optional and may be nil;
+	// all metric recording is guarded with a nil check.
+	recorder metrics.Recorder
+	// metricsCluster and metricsNamespace are the label values used when
+	// recording query-history metrics. They are empty unless SetRecorder is used.
+	metricsCluster   string
+	metricsNamespace string
+}
+
+// SetRecorder configures an optional metrics recorder and the cluster/namespace
+// labels used when recording query-history metrics. It is safe to leave the
+// recorder unset (nil); metric recording is then a no-op.
+func (c *pgxClient) SetRecorder(recorder metrics.Recorder, cluster, namespace string) {
+	c.recorder = recorder
+	c.metricsCluster = cluster
+	c.metricsNamespace = namespace
 }
 
 // NewClient creates a new database client with connection pooling.
@@ -805,8 +870,10 @@ func (c *pgxClient) ReloadConfig(ctx context.Context) error {
 
 // ListSessions returns active database sessions.
 func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
-	query := `SELECT pid, COALESCE(usename, ''), COALESCE(application_name, ''), 
-		COALESCE(client_addr::text, ''), COALESCE(state, ''), 
+	query := `SELECT pid, COALESCE(usename, ''), COALESCE(datname, ''),
+		COALESCE(application_name, ''),
+		COALESCE(client_addr::text, ''), COALESCE(state, ''),
+		COALESCE(wait_event_type, ''),
 		COALESCE(query, ''), COALESCE(query_start, now()),
 		COALESCE(now() - query_start, interval '0')::text
 		FROM pg_stat_activity 
@@ -824,8 +891,8 @@ func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
 	for rows.Next() {
 		var s Session
 		if err := rows.Scan(
-			&s.PID, &s.Username, &s.Application, &s.ClientAddress,
-			&s.State, &s.Query, &s.QueryStart, &s.Duration,
+			&s.PID, &s.Username, &s.Database, &s.Application, &s.ClientAddress,
+			&s.State, &s.WaitEventType, &s.Query, &s.QueryStart, &s.Duration,
 		); err != nil {
 			return nil, fmt.Errorf("scanning session row: %w", err)
 		}
@@ -841,8 +908,10 @@ func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
 
 // ListSessionsWithResourceGroup returns sessions with their resource group assignment.
 func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) ([]SessionWithGroup, error) {
-	query := `SELECT s.pid, COALESCE(s.usename, ''), COALESCE(s.application_name, ''),
+	query := `SELECT s.pid, COALESCE(s.usename, ''), COALESCE(s.datname, ''),
+		COALESCE(s.application_name, ''),
 		COALESCE(s.client_addr::text, ''), COALESCE(s.state, ''),
+		COALESCE(s.wait_event_type, ''),
 		COALESCE(s.query, ''), COALESCE(s.query_start, now()),
 		COALESCE(now() - s.query_start, interval '0')::text,
 		COALESCE(rg.rsgname, '')
@@ -863,8 +932,8 @@ func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) ([]Sessio
 	for rows.Next() {
 		var sg SessionWithGroup
 		if err := rows.Scan(
-			&sg.PID, &sg.Username, &sg.Application, &sg.ClientAddress,
-			&sg.State, &sg.Query, &sg.QueryStart, &sg.Duration,
+			&sg.PID, &sg.Username, &sg.Database, &sg.Application, &sg.ClientAddress,
+			&sg.State, &sg.WaitEventType, &sg.Query, &sg.QueryStart, &sg.Duration,
 			&sg.ResourceGroup,
 		); err != nil {
 			return nil, fmt.Errorf("scanning session with resource group row: %w", err)
@@ -2589,6 +2658,129 @@ func (c *pgxClient) RebalanceTable(ctx context.Context, database, schema, table,
 	return nil
 }
 
+// SetupExporterRole creates the cloudberry_exporter database role with LOGIN privilege,
+// grants pg_monitor membership, and grants SELECT on monitoring views.
+// The operation is idempotent: if the role already exists, its password is updated.
+func (c *pgxClient) SetupExporterRole(ctx context.Context, password string) error {
+	roleName := "cloudberry_exporter"
+
+	// Check if role exists.
+	var exists bool
+	err := c.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", roleName).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("checking exporter role existence: %w", err)
+	}
+
+	sanitizedRole := pgx.Identifier{roleName}.Sanitize()
+
+	if !exists {
+		// Create role with LOGIN.
+		createSQL := fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD %s",
+			sanitizedRole,
+			quoteLiteral(password))
+		if _, err := c.pool.Exec(ctx, createSQL); err != nil {
+			return fmt.Errorf("creating exporter role: %w", err)
+		}
+		c.logger.Info("exporter role created", "role", roleName)
+	} else {
+		// Update password if role already exists.
+		alterSQL := fmt.Sprintf("ALTER ROLE %s PASSWORD %s",
+			sanitizedRole,
+			quoteLiteral(password))
+		if _, err := c.pool.Exec(ctx, alterSQL); err != nil {
+			return fmt.Errorf("updating exporter role password: %w", err)
+		}
+		c.logger.Info("exporter role password updated", "role", roleName)
+	}
+
+	// Grant pg_monitor membership.
+	grantSQL := fmt.Sprintf("GRANT pg_monitor TO %s", sanitizedRole)
+	if _, err := c.pool.Exec(ctx, grantSQL); err != nil {
+		return fmt.Errorf("granting pg_monitor to exporter role: %w", err)
+	}
+
+	// Grant SELECT on monitoring views.
+	monitoringViews := []string{
+		"gp_segment_configuration",
+		"gp_toolkit.gp_resgroup_status",
+		"gp_toolkit.gp_resgroup_status_per_host",
+		"gp_toolkit.gp_resgroup_iostats_per_host",
+		"gp_toolkit.gp_resgroup_config",
+		"gp_toolkit.gp_workfile_usage_per_query",
+		"gp_toolkit.gp_workfile_usage_per_segment",
+		"gp_toolkit.gp_skew_coefficients",
+	}
+
+	for _, view := range monitoringViews {
+		grantViewSQL := fmt.Sprintf("GRANT SELECT ON %s TO %s", view, sanitizedRole)
+		if _, err := c.pool.Exec(ctx, grantViewSQL); err != nil {
+			// Log warning but don't fail — some views may not exist in all versions.
+			c.logger.Warn("failed to grant SELECT on view", "view", view, "error", err)
+		}
+	}
+
+	c.logger.Info("exporter role setup completed", "role", roleName)
+	return nil
+}
+
+// GetQueryDetail returns detailed execution information for a specific query by PID.
+// It queries pg_stat_activity for session info, pg_locks for lock information,
+// and pg_stat_user_tables for recently accessed tables.
+func (c *pgxClient) GetQueryDetail(ctx context.Context, pid int32) (*QueryDetail, error) {
+	// 1. Get session info from pg_stat_activity.
+	detail := &QueryDetail{}
+	sessionQuery := `SELECT pid, COALESCE(usename, ''), COALESCE(datname, ''),
+		COALESCE(state, ''), COALESCE(query, ''),
+		COALESCE(query_start, now()),
+		COALESCE(now() - query_start, interval '0')::text,
+		COALESCE(wait_event_type, ''), COALESCE(wait_event, ''),
+		COALESCE(backend_type, '')
+		FROM pg_stat_activity WHERE pid = $1`
+
+	err := c.pool.QueryRow(ctx, sessionQuery, pid).Scan(
+		&detail.PID, &detail.Username, &detail.Database,
+		&detail.State, &detail.Query, &detail.QueryStart,
+		&detail.Duration, &detail.WaitEventType, &detail.WaitEvent,
+		&detail.BackendType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query not found or not accessible: %w", err)
+	}
+
+	// 2. Get locks for this PID.
+	lockQuery := `SELECT locktype, mode, granted, COALESCE(relation::regclass::text, '')
+		FROM pg_locks WHERE pid = $1`
+	lockRows, lockErr := c.pool.Query(ctx, lockQuery, pid)
+	if lockErr == nil {
+		defer lockRows.Close()
+		for lockRows.Next() {
+			var lock LockInfo
+			if scanErr := lockRows.Scan(&lock.LockType, &lock.Mode, &lock.Granted, &lock.Relation); scanErr == nil {
+				detail.Locks = append(detail.Locks, lock)
+			}
+		}
+	}
+
+	// 3. Get tables accessed (tables with recent activity in the query's database).
+	// This is an approximation — we list tables that have been accessed recently.
+	tableQuery := `SELECT schemaname || '.' || relname FROM pg_stat_user_tables
+		WHERE (seq_scan + COALESCE(idx_scan, 0)) > 0
+		ORDER BY (seq_scan + COALESCE(idx_scan, 0)) DESC LIMIT 20`
+	tableRows, tableErr := c.pool.Query(ctx, tableQuery)
+	if tableErr == nil {
+		defer tableRows.Close()
+		for tableRows.Next() {
+			var table string
+			if scanErr := tableRows.Scan(&table); scanErr == nil {
+				detail.TablesAccessed = append(detail.TablesAccessed, table)
+			}
+		}
+	}
+
+	c.logger.Info("query detail retrieved", "pid", pid, "state", detail.State)
+	return detail, nil
+}
+
 // buildRoleOptions constructs the SQL options clause for role operations.
 func buildRoleOptions(opts RoleOptions) string {
 	var parts []string
@@ -2639,6 +2831,33 @@ func escapeQuotes(s string) string {
 		}
 	}
 	return string(result)
+}
+
+// MoveQueryToResourceGroup moves a running query's session to a different resource group.
+// It looks up the session's role from pg_stat_activity by PID, then executes
+// ALTER ROLE <role> RESOURCE GROUP <group> to reassign the role's resource group.
+// Both role and group names are sanitized via pgx.Identifier to prevent SQL injection.
+func (c *pgxClient) MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error {
+	// Look up the username for the given PID from pg_stat_activity.
+	var username string
+	lookupQuery := `SELECT COALESCE(usename, '') FROM pg_stat_activity WHERE pid = $1`
+	if err := c.pool.QueryRow(ctx, lookupQuery, pid).Scan(&username); err != nil {
+		return fmt.Errorf("looking up session for PID %d: %w", pid, err)
+	}
+	if username == "" {
+		return fmt.Errorf("session with PID %d not found or has no associated role", pid)
+	}
+
+	// Execute ALTER ROLE to reassign the resource group.
+	alterSQL := fmt.Sprintf("ALTER ROLE %s RESOURCE GROUP %s",
+		pgx.Identifier{username}.Sanitize(), pgx.Identifier{targetGroup}.Sanitize())
+	if _, err := c.pool.Exec(ctx, alterSQL); err != nil {
+		return fmt.Errorf("moving PID %d (role %s) to resource group %s: %w", pid, username, targetGroup, err)
+	}
+
+	c.logger.Info("query moved to resource group",
+		"pid", pid, "role", username, "targetGroup", targetGroup)
+	return nil
 }
 
 // classifySeverity returns a severity level based on a value and thresholds.

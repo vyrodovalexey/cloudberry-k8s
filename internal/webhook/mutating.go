@@ -4,6 +4,7 @@ import (
 	"context"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -44,16 +45,31 @@ const (
 )
 
 // CloudberryClusterDefaulter sets defaults on CloudberryCluster resources.
-type CloudberryClusterDefaulter struct{}
+type CloudberryClusterDefaulter struct {
+	// recorder records admission metrics. It is optional and may be nil;
+	// all metric recording is guarded with a nil check.
+	recorder metrics.Recorder
+}
 
 // NewCloudberryClusterDefaulter creates a new CloudberryClusterDefaulter.
-func NewCloudberryClusterDefaulter() *CloudberryClusterDefaulter {
-	return &CloudberryClusterDefaulter{}
+// An optional metrics recorder may be supplied to record admission metrics;
+// when omitted (or nil), metric recording is a no-op.
+func NewCloudberryClusterDefaulter(recorder ...metrics.Recorder) *CloudberryClusterDefaulter {
+	d := &CloudberryClusterDefaulter{}
+	if len(recorder) > 0 {
+		d.recorder = recorder[0]
+	}
+	return d
 }
 
 // Default sets defaults on a CloudberryCluster.
 func (d *CloudberryClusterDefaulter) Default(_ context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
 	setClusterDefaults(cluster)
+	// The mutating webhook applies defaults on both create and update; record it
+	// as a create admission for consistency. Defaulting never denies admission.
+	if d.recorder != nil {
+		d.recorder.RecordWebhookAdmission(webhookMutating, admissionOpCreate, admissionAllowed)
+	}
 	return nil
 }
 

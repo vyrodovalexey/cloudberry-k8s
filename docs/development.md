@@ -3264,6 +3264,17 @@ This is implemented in `internal/webhook/validating.go` via `checkDuplicateName(
 5. Add unit tests
 6. Update the metrics table in `docs/user-guide.md`
 
+### cloudberry-query-exporter Retention Durations
+
+The `cloudberry-query-exporter` sidecar accepts a `--history-retention` flag controlling how long query-history entries are kept. The flag is parsed by `parseRetention()` in `cmd/cloudberry-query-exporter/main.go`, which accepts:
+
+- Standard Go durations handled by `time.ParseDuration` (for example, `720h`, `1000ms`)
+- CRD-friendly day and week suffixes: `d` (days) and `w` (weeks), for example `30d` → `720h`, `90d` → `2160h`, `2w` → `336h`
+
+An empty value falls back to the default retention period, and negative or otherwise invalid values are rejected with a clear error.
+
+> **Fixed**: Previously, passing a day- or week-based value such as `--history-retention=30d` crashed the exporter because `time.ParseDuration` does not understand the `d`/`w` units. `parseRetention()` now normalizes these suffixes to hours before parsing, so values like `30d`, `90d`, and `2w` work alongside standard Go durations.
+
 ## Debugging
 
 ### Running the Operator Locally

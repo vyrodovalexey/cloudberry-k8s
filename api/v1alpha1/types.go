@@ -1032,6 +1032,94 @@ type QueryMonitoringSpec struct {
 	// SlowQueryThreshold is the threshold for slow query detection (e.g. "1000ms").
 	// +optional
 	SlowQueryThreshold string `json:"slowQueryThreshold,omitempty"`
+
+	// Exporters defines the monitoring exporters configuration.
+	// +optional
+	Exporters *QueryMonitoringExportersSpec `json:"exporters,omitempty"`
+}
+
+// QueryMonitoringExportersSpec defines the monitoring exporters for query monitoring.
+type QueryMonitoringExportersSpec struct {
+	// PostgresExporter configures the Prometheus postgres_exporter sidecar.
+	// +optional
+	PostgresExporter *ExporterSpec `json:"postgresExporter,omitempty"`
+
+	// NodeExporter configures the Prometheus node_exporter sidecar.
+	// +optional
+	NodeExporter *ExporterSpec `json:"nodeExporter,omitempty"`
+
+	// CloudberryQueryExporter configures the Cloudberry query exporter sidecar.
+	// +optional
+	CloudberryQueryExporter *ExporterSpec `json:"cloudberryQueryExporter,omitempty"`
+
+	// ServiceMonitor configures the Prometheus ServiceMonitor resource.
+	// +optional
+	ServiceMonitor *QueryServiceMonitorSpec `json:"serviceMonitor,omitempty"`
+
+	// PrometheusRule configures the Prometheus PrometheusRule resource.
+	// +optional
+	PrometheusRule *QueryPrometheusRuleSpec `json:"prometheusRule,omitempty"`
+}
+
+// ExporterSpec defines the configuration for a monitoring exporter sidecar.
+type ExporterSpec struct {
+	// Enabled controls whether this exporter is deployed.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Image is the container image for the exporter.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the metrics port exposed by the exporter.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
+
+	// Resources defines the compute resource requirements for the exporter.
+	// +optional
+	Resources *ResourceRequirements `json:"resources,omitempty"`
+}
+
+// QueryServiceMonitorSpec defines the Prometheus ServiceMonitor configuration
+// for query monitoring exporters.
+type QueryServiceMonitorSpec struct {
+	// Enabled controls whether a ServiceMonitor resource is created.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Namespace is the namespace for the ServiceMonitor. Defaults to the cluster namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Interval is the Prometheus scrape interval.
+	// +optional
+	Interval string `json:"interval,omitempty"`
+
+	// ScrapeTimeout is the Prometheus scrape timeout.
+	// +optional
+	ScrapeTimeout string `json:"scrapeTimeout,omitempty"`
+
+	// Labels are additional labels to add to the ServiceMonitor.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// QueryPrometheusRuleSpec defines the Prometheus PrometheusRule configuration
+// for query monitoring alerts.
+type QueryPrometheusRuleSpec struct {
+	// Enabled controls whether a PrometheusRule resource is created.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Namespace is the namespace for the PrometheusRule. Defaults to the cluster namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Labels are additional labels to add to the PrometheusRule.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // BackupSpec defines backup and restore configuration.

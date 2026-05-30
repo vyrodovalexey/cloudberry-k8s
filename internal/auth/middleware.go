@@ -110,6 +110,58 @@ func (m *AuthMiddleware) recordFailure(method string, err error, remoteAddr stri
 	)
 }
 
+// authMethodGuest is the authentication method name for guest access.
+const authMethodGuest = "guest"
+
+// guestUsername is the username assigned to guest identities.
+const guestUsername = "guest"
+
+// GuestHandler returns middleware that allows unauthenticated access with a guest identity.
+// When guestAccessEnabled returns true and no Authorization header is present,
+// a guest identity with PermissionBasic is created for read-only methods (GET, HEAD, OPTIONS).
+// When guestAccessEnabled returns false, missing auth returns 401.
+// POST/PUT/DELETE methods always require authentication regardless of guestAccess.
+func (m *AuthMiddleware) GuestHandler(guestAccessEnabled func(r *http.Request) bool) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If Authorization header is present, use normal auth flow.
+			if r.Header.Get(headerAuthorization) != "" {
+				m.Handler()(next).ServeHTTP(w, r)
+				return
+			}
+
+			// No auth header — check if guest access is allowed.
+			if !guestAccessEnabled(r) {
+				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing Authorization header")
+				return
+			}
+
+			// Guest access only for read-only methods (GET, HEAD, OPTIONS).
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED",
+					"authentication required for write operations")
+				return
+			}
+
+			// Create guest identity with Basic permission.
+			guestIdentity := &Identity{
+				Username:   guestUsername,
+				Permission: PermissionBasic,
+				AuthMethod: authMethodGuest,
+			}
+
+			m.logger.Info("guest access granted",
+				"remote_addr", r.RemoteAddr,
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
+
+			ctx := ContextWithIdentity(r.Context(), guestIdentity)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
 // RequirePermission creates a middleware that enforces a minimum permission level.
 func RequirePermission(level PermissionLevel, loggers ...*slog.Logger) Middleware {
 	var logger *slog.Logger

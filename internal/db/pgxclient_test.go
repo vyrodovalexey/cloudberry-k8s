@@ -856,14 +856,17 @@ func TestPgxClient_GetDiskUsage_Error(t *testing.T) {
 
 func TestPgxClient_ListSessions_Mock(t *testing.T) {
 	sessionFields := []fieldDesc{
-		int4Field("pid"), textField("usename"), textField("application_name"),
-		textField("client_addr"), textField("state"), textField("query"),
+		int4Field("pid"), textField("usename"), textField("datname"),
+		textField("application_name"),
+		textField("client_addr"), textField("state"),
+		textField("wait_event_type"),
+		textField("query"),
 		{name: "query_start", oid: 1184}, // timestamptz
 		textField("duration"),
 	}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(sessionFields, [][]string{
-			{"123", "admin", "psql", "10.0.0.1", "active", "SELECT 1", "2025-01-01 00:00:00+00", "00:01:30"},
+			{"123", "admin", "postgres", "psql", "10.0.0.1", "active", "", "SELECT 1", "2025-01-01 00:00:00+00", "00:01:30"},
 		})
 	})
 	defer cleanup()
@@ -873,6 +876,7 @@ func TestPgxClient_ListSessions_Mock(t *testing.T) {
 	require.Len(t, sessions, 1)
 	assert.Equal(t, int32(123), sessions[0].PID)
 	assert.Equal(t, "admin", sessions[0].Username)
+	assert.Equal(t, "postgres", sessions[0].Database)
 	assert.Equal(t, "active", sessions[0].State)
 }
 
@@ -2550,8 +2554,11 @@ func TestFormatIOLimits(t *testing.T) {
 
 func TestPgxClient_ListSessionsWithResourceGroup_Mock(t *testing.T) {
 	sessionFields := []fieldDesc{
-		int4Field("pid"), textField("usename"), textField("application_name"),
-		textField("client_addr"), textField("state"), textField("query"),
+		int4Field("pid"), textField("usename"), textField("datname"),
+		textField("application_name"),
+		textField("client_addr"), textField("state"),
+		textField("wait_event_type"),
+		textField("query"),
 		{name: "query_start", oid: 1184}, // timestamptz
 		textField("duration"),
 		textField("rsgname"),
@@ -2560,8 +2567,8 @@ func TestPgxClient_ListSessionsWithResourceGroup_Mock(t *testing.T) {
 	t.Run("returns sessions with resource groups", func(t *testing.T) {
 		client, cleanup := newMockPgxClient(t, func(query string) []byte {
 			return multiRowResponseTyped(sessionFields, [][]string{
-				{"123", "admin", "psql", "10.0.0.1", "active", "SELECT 1", "2025-01-01 00:00:00+00", "00:01:30", "analytics"},
-				{"456", "etl_user", "loader", "10.0.0.2", "idle", "", "2025-01-01 00:00:00+00", "00:05:00", "etl_group"},
+				{"123", "admin", "postgres", "psql", "10.0.0.1", "active", "", "SELECT 1", "2025-01-01 00:00:00+00", "00:01:30", "analytics"},
+				{"456", "etl_user", "warehouse", "loader", "10.0.0.2", "idle", "Lock", "", "2025-01-01 00:00:00+00", "00:05:00", "etl_group"},
 			})
 		})
 		defer cleanup()
@@ -2571,8 +2578,11 @@ func TestPgxClient_ListSessionsWithResourceGroup_Mock(t *testing.T) {
 		require.Len(t, sessions, 2)
 		assert.Equal(t, int32(123), sessions[0].PID)
 		assert.Equal(t, "admin", sessions[0].Username)
+		assert.Equal(t, "postgres", sessions[0].Database)
 		assert.Equal(t, "analytics", sessions[0].ResourceGroup)
 		assert.Equal(t, int32(456), sessions[1].PID)
+		assert.Equal(t, "warehouse", sessions[1].Database)
+		assert.Equal(t, "Lock", sessions[1].WaitEventType)
 		assert.Equal(t, "etl_group", sessions[1].ResourceGroup)
 	})
 

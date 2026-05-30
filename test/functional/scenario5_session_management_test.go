@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -182,10 +183,47 @@ func (m *scenario5MockDBClient) RebalanceTable(_ context.Context, _, _, _, _ str
 	return nil
 }
 func (m *scenario5MockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
-	return nil, nil
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	result := make([]db.SessionWithGroup, 0, len(m.sessions))
+	for _, sess := range m.sessions {
+		result = append(result, db.SessionWithGroup{Session: sess})
+	}
+	return result, nil
 }
 func (m *scenario5MockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return nil, nil
+}
+
+// SetupExporterRole implements db.Client.
+func (m *scenario5MockDBClient) SetupExporterRole(_ context.Context, _ string) error {
+	return nil
+}
+
+// GetQueryDetail implements db.Client.
+func (m *scenario5MockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
+	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+
+func (m *scenario5MockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
+func (m *scenario5MockDBClient) InsertQueryHistory(_ context.Context, _ *db.QueryHistoryEntry) error {
+	return nil
+}
+func (m *scenario5MockDBClient) GetQueryHistory(_ context.Context, _ db.QueryHistoryFilter) ([]db.QueryHistoryEntry, int, error) {
+	return []db.QueryHistoryEntry{}, 0, nil
+}
+func (m *scenario5MockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*db.QueryHistoryEntry, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *scenario5MockDBClient) ExportQueryHistoryCSV(_ context.Context, _ db.QueryHistoryFilter, _ io.Writer) error {
+	return nil
+}
+func (m *scenario5MockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (m *scenario5MockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
+	return nil
 }
 
 // scenario5MockDBFactory implements db.DBClientFactory for testing.

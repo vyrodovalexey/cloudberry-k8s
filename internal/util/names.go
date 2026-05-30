@@ -69,6 +69,36 @@ func MaintenanceJobName(cluster, operation, timestamp string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-%s-%s", cluster, operation, timestamp))
 }
 
+// ExporterCredentialsSecretName returns the exporter credentials secret name.
+func ExporterCredentialsSecretName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-exporter-credentials", cluster))
+}
+
+// ExporterQueriesConfigMapName returns the exporter queries ConfigMap name.
+func ExporterQueriesConfigMapName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-exporter-queries", cluster))
+}
+
+// ExporterMetricsServiceName returns the exporter metrics service name.
+func ExporterMetricsServiceName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-exporter-metrics", cluster))
+}
+
+// NodeExporterDaemonSetName returns the node exporter DaemonSet name.
+func NodeExporterDaemonSetName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-node-exporter", cluster))
+}
+
+// QueryMetricsServiceMonitorName returns the query metrics ServiceMonitor name.
+func QueryMetricsServiceMonitorName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-query-metrics", cluster))
+}
+
+// QueryAlertsPrometheusRuleName returns the query alerts PrometheusRule name.
+func QueryAlertsPrometheusRuleName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-query-alerts", cluster))
+}
+
 // CommonLabels returns the standard labels for a cluster resource.
 func CommonLabels(cluster, component string) map[string]string {
 	return map[string]string{

@@ -138,6 +138,9 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 **Observability**
 - Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, mirroring operations, and PVC sizes
 - Reconciliation metrics: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` with cluster/namespace/result labels
+- Security metrics: `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`, `cloudberry_vault_operations_total`, `cloudberry_vault_operation_duration_seconds`
+- Admission and lifecycle metrics: `cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`, `cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`
+- Workload and query-history metrics wired through: slow queries, workload rule actions, active connections, and query-history insert/retention/size
 - OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters
 - Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
 - Structured logging (slog) with JSON output including cluster, namespace, controller, and reconcileID fields
@@ -622,7 +625,7 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set telemetry.otlpInsecure=true
 ```
 
-Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory.
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory. The `monitoring/grafana/cloudberry-operator.json` dashboard visualizes all operator metrics, including a **Security & Lifecycle** section covering certificate rotation and expiry, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery.
 
 ## Deployment Status
 

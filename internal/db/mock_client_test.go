@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -292,6 +293,29 @@ func (m *fullMockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]S
 }
 func (m *fullMockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return m.userDatabases, m.listUserDBsErr
+}
+func (m *fullMockDBClient) SetupExporterRole(_ context.Context, _ string) error { return nil }
+func (m *fullMockDBClient) GetQueryDetail(_ context.Context, pid int32) (*QueryDetail, error) {
+	return &QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+func (m *fullMockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
+func (m *fullMockDBClient) InsertQueryHistory(_ context.Context, _ *QueryHistoryEntry) error {
+	return nil
+}
+func (m *fullMockDBClient) GetQueryHistory(_ context.Context, _ QueryHistoryFilter) ([]QueryHistoryEntry, int, error) {
+	return []QueryHistoryEntry{}, 0, nil
+}
+func (m *fullMockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*QueryHistoryEntry, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *fullMockDBClient) ExportQueryHistoryCSV(_ context.Context, _ QueryHistoryFilter, _ io.Writer) error {
+	return nil
+}
+func (m *fullMockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (m *fullMockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
+	return nil
 }
 
 // TestFullMockDBClient_ImplementsInterface verifies the mock implements Client.

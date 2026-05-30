@@ -1013,7 +1013,11 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
 - **Scale metrics**: `cloudberry_scale_operations_total`, `cloudberry_redistribution_progress`
 - **Mirroring metrics**: `cloudberry_mirroring_operations_total`, `cloudberry_replication_lag_bytes`
-- **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`
+- **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`, `cloudberry_slow_queries_total`, `cloudberry_workload_rule_actions_total`
+- **Query history metrics**: `cloudberry_query_history_total`, `cloudberry_query_history_retention_deleted_total`, `cloudberry_query_history_size_bytes`
+- **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`)
+- **Admission metrics**: `cloudberry_webhook_admission_total` (labels `webhook`, `operation`, `result`)
+- **Lifecycle metrics**: `cloudberry_upgrade_operations_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `rollback`, `failed`}), `cloudberry_rolling_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `failed`}), `cloudberry_recovery_operations_total` (labels `cluster`, `namespace`, `type`, `result`)
 
 ### Tracing (OpenTelemetry)
 

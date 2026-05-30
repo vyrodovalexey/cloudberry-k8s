@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 )
 
@@ -38,6 +39,12 @@ const (
 	// rotationThresholdFraction is the fraction of certificate lifetime at which rotation is triggered.
 	// Certificates are rotated when 2/3 of their lifetime has elapsed.
 	rotationThresholdFraction = 2.0 / 3.0
+
+	// certComponent is the component label value used for certificate metrics.
+	certComponent = "webhook"
+	// resultSuccess and resultError are the result label values for cert metrics.
+	resultSuccess = "success"
+	resultError   = "error"
 )
 
 // CertManager manages webhook TLS certificates.
@@ -75,24 +82,69 @@ type certManager struct {
 	vaultClient vault.Client
 	config      Config
 	logger      *slog.Logger
+	// recorder records certificate metrics. It is optional and may be nil;
+	// all metric recording is guarded with a nil check.
+	recorder metrics.Recorder
 }
 
 // New creates a new CertManager based on the provided configuration.
+// An optional metrics recorder may be supplied to record certificate metrics;
+// when omitted (or nil), metric recording is a no-op.
 func New(
 	k8sClient client.Client,
 	vaultClient vault.Client,
 	cfg Config,
 	logger *slog.Logger,
+	recorder ...metrics.Recorder,
 ) CertManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &certManager{
+	cm := &certManager{
 		client:      k8sClient,
 		vaultClient: vaultClient,
 		config:      cfg,
 		logger:      logger.With("component", "certmanager"),
 	}
+	if len(recorder) > 0 {
+		cm.recorder = recorder[0]
+	}
+	return cm
+}
+
+// certSource returns the configured certificate source label value,
+// defaulting to self-signed when unset.
+func (m *certManager) certSource() string {
+	if m.config.CertSource == CertSourceVaultPKI {
+		return CertSourceVaultPKI
+	}
+	return CertSourceSelfSigned
+}
+
+// recordCertRotation records a certificate rotation metric when a recorder is
+// configured. It is nil-safe.
+func (m *certManager) recordCertRotation(result string) {
+	if m.recorder == nil {
+		return
+	}
+	m.recorder.RecordCertRotation(certComponent, m.certSource(), result)
+}
+
+// setCertExpiry parses the TLS certificate from the secret data and records the
+// seconds until it expires. It is nil-safe and silently ignores parse errors.
+func (m *certManager) setCertExpiry(certPEM []byte) {
+	if m.recorder == nil || len(certPEM) == 0 {
+		return
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return
+	}
+	m.recorder.SetCertExpirySeconds(certComponent, time.Until(cert.NotAfter).Seconds())
 }
 
 // EnsureCertificates ensures webhook TLS certificates exist and are valid.
@@ -117,6 +169,8 @@ func (m *certManager) EnsureCertificates(ctx context.Context) ([]byte, error) {
 			m.logger.Warn("failed to check certificate validity, regenerating", "error", rotErr)
 		} else if !needsRotation {
 			m.logger.Info("existing certificates are valid, no rotation needed")
+			// Refresh the expiry gauge from the currently loaded certificate.
+			m.setCertExpiry(existing.Data[secretKeyTLSCert])
 			return existing.Data[secretKeyCACert], nil
 		}
 		m.logger.Info("certificates need rotation, regenerating")
@@ -127,6 +181,7 @@ func (m *certManager) EnsureCertificates(ctx context.Context) ([]byte, error) {
 	// Generate or issue new certificates.
 	caBundle, err := m.generateCertificates(ctx, existing, apierrors.IsNotFound(err))
 	if err != nil {
+		m.recordCertRotation(resultError)
 		return nil, fmt.Errorf("generating certificates: %w", err)
 	}
 
@@ -209,6 +264,10 @@ func (m *certManager) generateCertificates(
 		}
 		m.logger.Info("updated webhook certificate secret", "name", m.config.SecretName)
 	}
+
+	// Record successful (re)generation and refresh the expiry gauge.
+	m.recordCertRotation(resultSuccess)
+	m.setCertExpiry(tlsCert)
 
 	return caCert, nil
 }

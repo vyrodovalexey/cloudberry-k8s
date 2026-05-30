@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -117,6 +118,22 @@ type ResourceBuilder interface {
 	BuildAdminPasswordSecret(cluster *cbv1alpha1.CloudberryCluster, password string) *corev1.Secret
 	// BuildMaintenanceJob builds a Kubernetes Job for a maintenance operation.
 	BuildMaintenanceJob(cluster *cbv1alpha1.CloudberryCluster, operation, timestamp string) *batchv1.Job
+	// BuildExporterCredentialsSecret builds the exporter credentials Secret.
+	BuildExporterCredentialsSecret(cluster *cbv1alpha1.CloudberryCluster, password, dsn string) *corev1.Secret
+	// BuildExporterQueriesConfigMap builds the exporter queries ConfigMap.
+	BuildExporterQueriesConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
+	// BuildExporterSidecarContainers returns the exporter sidecar containers.
+	BuildExporterSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildExporterSidecarVolumes returns the volumes for exporter sidecars.
+	BuildExporterSidecarVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume
+	// BuildNodeExporterDaemonSet builds the node exporter DaemonSet.
+	BuildNodeExporterDaemonSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.DaemonSet
+	// BuildExporterService builds the exporter metrics Service.
+	BuildExporterService(cluster *cbv1alpha1.CloudberryCluster) *corev1.Service
+	// BuildQueryMetricsServiceMonitor builds the ServiceMonitor for Prometheus Operator.
+	BuildQueryMetricsServiceMonitor(cluster *cbv1alpha1.CloudberryCluster) *unstructured.Unstructured
+	// BuildQueryAlertsPrometheusRule builds the PrometheusRule for alerting.
+	BuildQueryAlertsPrometheusRule(cluster *cbv1alpha1.CloudberryCluster) *unstructured.Unstructured
 }
 
 // DefaultBuilder implements ResourceBuilder.
@@ -177,6 +194,22 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 		return nil, fmt.Errorf("building coordinator main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	// Inject exporter sidecar containers if query monitoring exporters are enabled.
+	if cluster.Spec.QueryMonitoring != nil && cluster.Spec.QueryMonitoring.Enabled &&
+		cluster.Spec.QueryMonitoring.Exporters != nil {
+		sidecars := b.BuildExporterSidecarContainers(cluster)
+		sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, sidecars...)
+		sidecarVolumes := b.BuildExporterSidecarVolumes(cluster)
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, sidecarVolumes...)
+		// Add Prometheus scrape annotations so vmagent/Prometheus discovers the exporter metrics.
+		if sts.Spec.Template.Annotations == nil {
+			sts.Spec.Template.Annotations = make(map[string]string)
+		}
+		sts.Spec.Template.Annotations["prometheus.io/scrape"] = promScrapeTrue
+		sts.Spec.Template.Annotations["prometheus.io/port"] = fmt.Sprintf("%d", pgExporterPort)
+		sts.Spec.Template.Annotations["prometheus.io/path"] = "/metrics"
+	}
 
 	pvc, err := buildPVC(cluster.Spec.Coordinator.Storage, labels)
 	if err != nil {

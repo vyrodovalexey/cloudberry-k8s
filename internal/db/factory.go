@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -32,17 +33,30 @@ type DBClientFactory interface {
 type ClientFactory struct {
 	k8sClient client.Client
 	logger    *slog.Logger
+	// recorder is an optional metrics recorder propagated to created clients so
+	// that query-history metrics can be recorded. It may be nil (nil-safe).
+	recorder metrics.Recorder
 }
 
 // NewClientFactory creates a new ClientFactory.
-func NewClientFactory(k8sClient client.Client, logger *slog.Logger) *ClientFactory {
+// An optional metrics recorder may be supplied; it is propagated to every client
+// created by the factory so that query-history metrics can be recorded.
+func NewClientFactory(
+	k8sClient client.Client,
+	logger *slog.Logger,
+	recorder ...metrics.Recorder,
+) *ClientFactory {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ClientFactory{
+	f := &ClientFactory{
 		k8sClient: k8sClient,
 		logger:    logger.With("component", "db-client-factory"),
 	}
+	if len(recorder) > 0 {
+		f.recorder = recorder[0]
+	}
+	return f
 }
 
 // NewClient creates a new database client for the given cluster.
@@ -114,7 +128,20 @@ func (f *ClientFactory) NewClient(ctx context.Context, cluster *cbv1alpha1.Cloud
 		"username", username,
 	)
 
-	return NewClient(ctx, cfg, f.logger)
+	dbClient, err := NewClient(ctx, cfg, f.logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// Propagate the optional metrics recorder (with cluster/namespace labels) so
+	// that query-history metrics are recorded by the created client.
+	if f.recorder != nil {
+		if pc, ok := dbClient.(*pgxClient); ok {
+			pc.SetRecorder(f.recorder, cluster.Name, cluster.Namespace)
+		}
+	}
+
+	return dbClient, nil
 }
 
 // readAdminPassword reads the admin password from the cluster's admin password Secret.

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"testing"
 	"time"
@@ -374,6 +375,29 @@ func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]Sessi
 }
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"postgres"}, nil
+}
+func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*QueryDetail, error) {
+	return &QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
+}
+func (m *mockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
+func (m *mockDBClient) InsertQueryHistory(_ context.Context, _ *QueryHistoryEntry) error {
+	return nil
+}
+func (m *mockDBClient) GetQueryHistory(_ context.Context, _ QueryHistoryFilter) ([]QueryHistoryEntry, int, error) {
+	return []QueryHistoryEntry{}, 0, nil
+}
+func (m *mockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*QueryHistoryEntry, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *mockDBClient) ExportQueryHistoryCSV(_ context.Context, _ QueryHistoryFilter, _ io.Writer) error {
+	return nil
+}
+func (m *mockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (m *mockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
+	return nil
 }
 
 func TestMockDBClient_ImplementsInterface(t *testing.T) {

@@ -343,7 +343,10 @@ func TestAdminReconciler_DeleteWorkloadRulesConfigMap_NotFound(t *testing.T) {
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
 	// ConfigMap doesn't exist — should be a no-op.
-	r.deleteWorkloadRulesConfigMap(context.Background(), cluster, r.logger)
+	err := r.deleteWorkloadRulesConfigMap(context.Background(), cluster)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestAdminReconciler_DeleteWorkloadRulesConfigMap_GetError(t *testing.T) {
@@ -369,8 +372,11 @@ func TestAdminReconciler_DeleteWorkloadRulesConfigMap_GetError(t *testing.T) {
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	// Should log warning, not panic.
-	r.deleteWorkloadRulesConfigMap(context.Background(), cluster, r.logger)
+	// Should return an error.
+	err := r.deleteWorkloadRulesConfigMap(context.Background(), cluster)
+	if err == nil {
+		t.Fatal("expected error from deleteWorkloadRulesConfigMap, got nil")
+	}
 }
 
 func TestAdminReconciler_DeleteWorkloadRulesConfigMap_DeleteError(t *testing.T) {
@@ -403,8 +409,11 @@ func TestAdminReconciler_DeleteWorkloadRulesConfigMap_DeleteError(t *testing.T) 
 
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
 
-	// Should log warning, not panic.
-	r.deleteWorkloadRulesConfigMap(context.Background(), cluster, r.logger)
+	// Should return an error.
+	err := r.deleteWorkloadRulesConfigMap(context.Background(), cluster)
+	if err == nil {
+		t.Fatal("expected error from deleteWorkloadRulesConfigMap, got nil")
+	}
 }
 
 // ============================================================================
