@@ -45,7 +45,7 @@ WORKDIR /build
 # NOTE: The download URL follows the Apache Incubator release layout.
 # Override CB_BACKUP_REPO_URL if the mirror or release structure changes.
 ARG CB_BACKUP_VERSION=2.1.0-incubating
-ARG CB_BACKUP_REPO_URL=https://www.apache.org/dyn/closer.lua/incubator/cloudberry-backup/${CB_BACKUP_VERSION}/apache-cloudberry-backup-${CB_BACKUP_VERSION}-src.tar.gz?action=download
+ARG CB_BACKUP_REPO_URL=https://github.com/apache/cloudberry-backup/archive/refs/tags/${CB_BACKUP_VERSION}.tar.gz
 
 RUN curl -fSL -o /tmp/cloudberry-backup-src.tar.gz "${CB_BACKUP_REPO_URL}" && \
     tar -xzf /tmp/cloudberry-backup-src.tar.gz -C /build --strip-components=1 && \
