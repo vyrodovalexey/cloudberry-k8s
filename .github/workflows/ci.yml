@@ -389,6 +389,7 @@ jobs:
           mkdir -p bin
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-operator ./cmd/operator/
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-ctl ./cmd/cloudberry-ctl/
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-query-exporter ./cmd/cloudberry-query-exporter/
           ls -la ./bin/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -417,9 +418,10 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
-          # NOTE: cloudberry (Dockerfile.cloudberry) is excluded from PR builds
-          # because it compiles Apache Cloudberry from source and is very slow.
-          # It is only built on tag/release via the docker-build-push job.
+          # cloudberry compiles Apache Cloudberry from source (slow); built on PRs and releases.
+          - name: cloudberry
+            dockerfile: Dockerfile.cloudberry
+            image_env: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_env: DOCKER_IMAGE_QUERY_EXPORTER
@@ -452,7 +454,6 @@ jobs:
     name: Helm Chart Test (PR)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [lint, govulncheck, unit-tests]
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -559,8 +560,11 @@ jobs:
           SHA=${{ github.sha }}
           for PAIR in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             OS=${PAIR%/*}; ARCH=${PAIR#*/}
-            for CMD in operator cloudberry-ctl; do
-              BIN=cloudberry-${CMD}; [ "$CMD" = "operator" ] && BIN=cloudberry-operator
+            for CMD in operator cloudberry-ctl cloudberry-query-exporter; do
+              case "$CMD" in
+                operator) BIN=cloudberry-operator ;;
+                *)        BIN=$CMD ;;
+              esac
               echo "Building ${BIN} ${OS}/${ARCH}"
               CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -trimpath \
                 -ldflags="-s -w -X main.version=${VER} -X main.buildTime=${BT} -X main.gitCommit=${SHA}" \
