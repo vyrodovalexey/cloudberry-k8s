@@ -15,13 +15,16 @@ import (
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/planchecker"
@@ -141,6 +144,7 @@ type Server struct {
 	dbFactory     db.DBClientFactory
 	credStore     *auth.InMemoryCredentialStore
 	metrics       metrics.Recorder
+	builder       *builder.DefaultBuilder
 	logger        *slog.Logger
 	mux           *http.ServeMux
 	monitorStates map[string]*monitorState // key: "namespace/cluster"
@@ -174,6 +178,7 @@ func NewServer(
 		rateLimiter:   NewRateLimiter(rateLimit, defaultRateInterval, logger),
 		dbFactory:     dbFactory,
 		metrics:       metricsRecorder,
+		builder:       builder.NewBuilder(),
 		logger:        logger.With("component", "api-server"),
 		mux:           http.NewServeMux(),
 		monitorStates: make(map[string]*monitorState),
@@ -293,12 +298,22 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListBackups)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups",
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateBackup)))
-	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/{id}",
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/jobs",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListBackupJobs)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/schedule",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetBackupSchedule)))
+	s.mux.Handle("PATCH "+apiPrefix+"/clusters/{name}/backups/schedule",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleUpdateBackupSchedule)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/{timestamp}",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetBackup)))
-	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/backups/{id}",
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/backups/{timestamp}",
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeleteBackup)))
-	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups/{id}/restore",
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/backups/{timestamp}/restore",
 		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleRestoreBackup)))
+
+	// Cross-cluster migration.
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/migrate",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleMigrate)))
 
 	// PVC listing.
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/pvcs",
@@ -3103,7 +3118,7 @@ func parseSinceTime(s string) time.Time {
 	return time.Time{}
 }
 
-// handleListBackups lists backups for a cluster.
+// handleListBackups lists backups for a cluster from its status backup history.
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -3112,17 +3127,25 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	history := cluster.Status.BackupHistory
+	backups := make([]cbv1alpha1.BackupHistoryEntry, 0, len(history))
+	backups = append(backups, history...)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		responseKeyCluster: cluster.Name,
-		"backups":          []interface{}{},
-		responseKeyTotal:   0,
-		"lastBackupTime":   cluster.Status.LastBackupTime,
-		"lastBackupStatus": cluster.Status.LastBackupStatus,
+		responseKeyCluster:    cluster.Name,
+		"backups":             backups,
+		responseKeyTotal:      len(backups),
+		"lastBackupTime":      cluster.Status.LastBackupTime,
+		"lastBackupTimestamp": cluster.Status.LastBackupTimestamp,
+		"lastBackupStatus":    cluster.Status.LastBackupStatus,
 	})
 }
 
-// handleCreateBackup creates a new backup for a cluster.
+// handleCreateBackup creates a new on-demand backup Job for a cluster.
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
@@ -3136,44 +3159,107 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus:  "backup initiated",
-		responseKeyCluster: cluster.Name,
+	var req CreateBackupRequest
+	if decErr := decodeOptionalJSON(r, &req); decErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+	if !validateBackupDatabases(w, req.Databases) {
+		return
+	}
+
+	backupType := backupTypeOrDefault(req.Type)
+	if backupType != util.BackupTypeFull && backupType != util.BackupTypeIncremental {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid backup type %q; valid types: full, incremental", backupType))
+		return
+	}
+
+	timestamp := time.Now().UTC().Format(backupTimestampLayout)
+	opts := buildBackupJobOptions(cluster, &req, backupType, timestamp)
+
+	job := s.builder.BuildBackupJob(cluster, opts)
+	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
+		s.logger.Error("failed to create backup job", "cluster", name, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create backup job")
+		return
+	}
+
+	if s.metrics != nil {
+		s.metrics.RecordBackup(cluster.Name, cluster.Namespace, backupType, "started")
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		responseKeyStatus:    "backup started",
+		responseKeyCluster:   cluster.Name,
+		responseKeyJob:       job.Name,
+		responseKeyTimestamp: timestamp,
+		"type":               backupType,
 	})
 }
 
-// handleGetBackup gets a specific backup.
+// handleGetBackup gets a specific backup by gpbackup timestamp from status history.
 func (s *Server) handleGetBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	backupID := r.PathValue("id")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	timestamp := r.PathValue("timestamp")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
 		writeClusterNotFound(w, name)
 		return
+	}
+	if !isValidBackupTimestamp(timestamp) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid backup timestamp %q", timestamp))
+		return
+	}
+
+	for i := range cluster.Status.BackupHistory {
+		if cluster.Status.BackupHistory[i].Timestamp == timestamp {
+			writeJSON(w, http.StatusOK, cluster.Status.BackupHistory[i])
+			return
+		}
 	}
 
 	writeErrorJSON(w, http.StatusNotFound, "BACKUP_NOT_FOUND",
-		fmt.Sprintf("backup %q not found", backupID))
+		fmt.Sprintf("backup %q not found", timestamp))
 }
 
-// handleDeleteBackup deletes a backup.
+// handleDeleteBackup deletes a backup by creating a retention/cleanup Job.
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	backupID := r.PathValue("id")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	timestamp := r.PathValue("timestamp")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
+	if !isValidBackupTimestamp(timestamp) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid backup timestamp %q", timestamp))
+		return
+	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: statusDeleted,
-		"backupID":        backupID,
+	job := s.builder.BuildRetentionCleanupJob(cluster, timestamp)
+	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
+		s.logger.Error("failed to create cleanup job", "cluster", name, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create cleanup job")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		responseKeyStatus:    statusDeleted,
+		responseKeyCluster:   cluster.Name,
+		responseKeyJob:       job.Name,
+		responseKeyTimestamp: timestamp,
 	})
 }
 
-// handleRestoreBackup restores from a backup.
+// handleRestoreBackup restores from a backup by creating a gprestore Job.
 func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
 	name := r.PathValue("name")
-	backupID := r.PathValue("id")
 	namespace := r.URL.Query().Get("namespace")
 	cluster, err := s.getCluster(r.Context(), name, namespace)
 	if err != nil {
@@ -3184,14 +3270,211 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.metrics != nil {
-		s.metrics.RecordRestore(cluster.Name, cluster.Namespace, "initiated")
+	var req RestoreRequest
+	if decErr := decodeOptionalJSON(r, &req); decErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus: "restore initiated",
-		"backupID":        backupID,
+	// Prefer the path timestamp; fall back to the body timestamp.
+	timestamp := r.PathValue("timestamp")
+	if timestamp == "" {
+		timestamp = req.Timestamp
+	}
+	if !isValidBackupTimestamp(timestamp) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid backup timestamp %q", timestamp))
+		return
+	}
+	if !validateBackupDatabases(w, req.Databases) {
+		return
+	}
+	if msg := restoreOptionsConflict(req.GprestoreOptions); msg != "" {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", msg)
+		return
+	}
+
+	opts := buildRestoreJobOptions(cluster, &req, timestamp)
+	job := s.builder.BuildRestoreJob(cluster, opts)
+	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
+		s.logger.Error("failed to create restore job", "cluster", name, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create restore job")
+		return
+	}
+
+	if s.metrics != nil {
+		s.metrics.RecordRestore(cluster.Name, cluster.Namespace, "started")
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		responseKeyStatus:    "restore started",
+		responseKeyCluster:   cluster.Name,
+		responseKeyJob:       job.Name,
+		responseKeyTimestamp: timestamp,
 	})
+}
+
+// handleListBackupJobs lists backup/restore/cleanup Job statuses for a cluster.
+func (s *Server) handleListBackupJobs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	jobList := &batchv1.JobList{}
+	if listErr := s.k8sClient.List(r.Context(), jobList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{util.LabelCluster: cluster.Name},
+	); listErr != nil {
+		s.logger.Error("failed to list backup jobs", "cluster", name, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list backup jobs")
+		return
+	}
+
+	jobs := make([]backupJobInfo, 0, len(jobList.Items))
+	for i := range jobList.Items {
+		job := &jobList.Items[i]
+		operation := job.Labels[util.LabelBackupOperation]
+		if !isBackupOperation(operation) {
+			continue
+		}
+		jobs = append(jobs, newBackupJobInfo(job, operation))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		responseKeyCluster: cluster.Name,
+		"jobs":             jobs,
+		responseKeyTotal:   len(jobs),
+	})
+}
+
+// handleGetBackupSchedule returns the backup CronJob status and next run time.
+func (s *Server) handleGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	cronJob := &batchv1.CronJob{}
+	key := client.ObjectKey{Name: util.BackupCronJobName(cluster.Name), Namespace: cluster.Namespace}
+	if getErr := s.k8sClient.Get(r.Context(), key, cronJob); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				responseKeyCluster: cluster.Name,
+				"scheduled":        false,
+			})
+			return
+		}
+		s.logger.Error("failed to get backup schedule", "cluster", name, "error", getErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get backup schedule")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, backupScheduleResponse(cluster.Name, cronJob))
+}
+
+// handleUpdateBackupSchedule sets the backup schedule and/or suspends/resumes the
+// backup CronJob. A non-nil `schedule` updates spec.backup.schedule (which the
+// operator reconciles into the CronJob); a non-nil `suspend` patches the existing
+// CronJob's .spec.suspend in place for an immediate effect.
+func (s *Server) handleUpdateBackupSchedule(w http.ResponseWriter, r *http.Request) {
+	limitBody(w, r)
+	defer r.Body.Close()
+
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	var req UpdateBackupScheduleRequest
+	if decErr := json.NewDecoder(r.Body).Decode(&req); decErr != nil {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+	if req.Schedule != nil && *req.Schedule != "" && !isValidCronSchedule(*req.Schedule) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid cron schedule %q", *req.Schedule))
+		return
+	}
+
+	result := map[string]interface{}{
+		responseKeyStatus:  statusUpdated,
+		responseKeyCluster: cluster.Name,
+	}
+	if !s.applyScheduleUpdate(w, r, cluster, &req, result) {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// applyScheduleUpdate performs the schedule and suspend updates, writing an error
+// response and returning false on failure.
+func (s *Server) applyScheduleUpdate(
+	w http.ResponseWriter,
+	r *http.Request,
+	cluster *cbv1alpha1.CloudberryCluster,
+	req *UpdateBackupScheduleRequest,
+	result map[string]interface{},
+) bool {
+	if req.Schedule != nil {
+		if cluster.Spec.Backup == nil {
+			writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
+				"backup is not configured for this cluster")
+			return false
+		}
+		cluster.Spec.Backup.Schedule = *req.Schedule
+		if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+			s.logger.Error("failed to update backup schedule", "cluster", cluster.Name, "error", updateErr)
+			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update backup schedule")
+			return false
+		}
+		result["schedule"] = *req.Schedule
+	}
+
+	if req.Suspend != nil {
+		if !s.patchCronJobSuspend(w, r, cluster, *req.Suspend) {
+			return false
+		}
+		result["suspend"] = *req.Suspend
+	}
+	return true
+}
+
+// patchCronJobSuspend sets the backup CronJob's .spec.suspend field in place.
+func (s *Server) patchCronJobSuspend(
+	w http.ResponseWriter,
+	r *http.Request,
+	cluster *cbv1alpha1.CloudberryCluster,
+	suspend bool,
+) bool {
+	cronJob := &batchv1.CronJob{}
+	key := client.ObjectKey{Name: util.BackupCronJobName(cluster.Name), Namespace: cluster.Namespace}
+	if getErr := s.k8sClient.Get(r.Context(), key, cronJob); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			writeErrorJSON(w, http.StatusNotFound, "SCHEDULE_NOT_FOUND",
+				"backup schedule does not exist for this cluster")
+			return false
+		}
+		s.logger.Error("failed to get backup schedule", "cluster", cluster.Name, "error", getErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get backup schedule")
+		return false
+	}
+
+	suspendCopy := suspend
+	cronJob.Spec.Suspend = &suspendCopy
+	if updateErr := s.k8sClient.Update(r.Context(), cronJob); updateErr != nil {
+		s.logger.Error("failed to update backup schedule suspend", "cluster", cluster.Name, "error", updateErr)
+		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update backup schedule")
+		return false
+	}
+	return true
 }
 
 // handleListDataLoadingJobs lists data loading jobs for a cluster.

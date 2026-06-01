@@ -100,7 +100,9 @@ type ScalingCase struct {
 	ExpectError     bool
 }
 
-// BackupRestoreCase represents a backup/restore test case.
+// BackupRestoreCase represents a backup/restore test case backed by the
+// gpbackup/gprestore toolchain (spec 11). Capability flags describe which part
+// of the backup feature the case exercises so suites can select subsets.
 type BackupRestoreCase struct {
 	Name        string
 	BackupType  string
@@ -108,6 +110,12 @@ type BackupRestoreCase struct {
 	Compression int32
 	Parallelism int32
 	Incremental bool
+	// Capability is the spec-11 capability under test, one of:
+	// "scheduled", "on-demand", "restore", "retention", "migrate",
+	// "pre-backup-check", "post-restore-validation".
+	Capability string
+	// Scheduled indicates the case exercises the backup CronJob.
+	Scheduled   bool
 	ExpectError bool
 }
 
@@ -426,17 +434,64 @@ func BackupRestoreCases() []BackupRestoreCase {
 			Destination: "s3",
 			Compression: 6,
 			Parallelism: 4,
+			Capability:  "on-demand",
 		},
 		{
 			Name:        "incremental_backup_s3",
 			BackupType:  "incremental",
 			Destination: "s3",
 			Incremental: true,
+			Capability:  "on-demand",
 		},
 		{
 			Name:        "full_backup_local",
 			BackupType:  "full",
 			Destination: "local",
+			Capability:  "on-demand",
+		},
+		{
+			Name:        "scheduled_backup_cronjob_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "scheduled",
+			Scheduled:   true,
+		},
+		{
+			Name:        "restore_from_timestamp_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "restore",
+		},
+		{
+			Name:        "retention_cleanup_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "retention",
+		},
+		{
+			Name:        "migrate_between_clusters_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "migrate",
+		},
+		{
+			Name:        "pre_backup_health_check_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "pre-backup-check",
+		},
+		{
+			Name:        "post_restore_validation_s3",
+			BackupType:  "full",
+			Destination: "s3",
+			Capability:  "post-restore-validation",
+		},
+		{
+			Name:        "incremental_backup_from_full_s3",
+			BackupType:  "incremental",
+			Destination: "s3",
+			Incremental: true,
+			Capability:  "on-demand",
 		},
 	}
 }

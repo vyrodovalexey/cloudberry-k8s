@@ -8,12 +8,15 @@ import (
 	"log/slog"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,6 +57,17 @@ const (
 	// Backup type label values used for backup/recovery metrics.
 	backupTypeFull        = "full"
 	backupTypeIncremental = "incremental"
+
+	// Backup Job status codes for the cloudberry_backup_job_status gauge.
+	backupJobStatusPending   = 0.0
+	backupJobStatusRunning   = 1.0
+	backupJobStatusSucceeded = 2.0
+	backupJobStatusFailed    = 3.0
+
+	// Backup last-status codes for the cloudberry_backup_last_status gauge.
+	backupLastStatusSuccess    = 0.0
+	backupLastStatusFailed     = 1.0
+	backupLastStatusInProgress = 2.0
 
 	// patchKeyMetadata is the JSON key for metadata in MergePatch payloads.
 	patchKeyMetadata = "metadata"
@@ -1405,9 +1419,13 @@ func (r *AdminReconciler) logExporterConfig(logger *slog.Logger, name string, sp
 	}
 }
 
-// reconcileBackup reconciles backup configuration and status.
-//
-//nolint:unparam // error return reserved for future DB operations
+// backupHistoryLimit is the maximum number of entries retained in status.backupHistory.
+const backupHistoryLimit = 10
+
+// reconcileBackup reconciles backup configuration and status. When backup is
+// enabled, it ensures the gpbackup_s3_plugin ConfigMap, the scheduled-backup
+// CronJob (when a schedule is set) and refreshes the backup status from the most
+// recent backup/restore Jobs owned by the cluster.
 func (r *AdminReconciler) reconcileBackup(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -1419,11 +1437,25 @@ func (r *AdminReconciler) reconcileBackup(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("reconciling backup configuration",
 		"schedule", cluster.Spec.Backup.Schedule,
-		"incremental", cluster.Spec.Backup.Incremental,
 		"destination", cluster.Spec.Backup.Destination.Type,
 	)
 
-	// Set backup-related status conditions (persisted by the caller).
+	if err := r.ensureBackupS3ConfigMap(ctx, cluster); err != nil {
+		return err
+	}
+
+	if err := r.ensureBackupCronJob(ctx, cluster); err != nil {
+		return err
+	}
+
+	if err := r.refreshBackupStatus(ctx, cluster); err != nil {
+		return err
+	}
+
+	if err := r.ensurePostRestoreValidation(ctx, cluster); err != nil {
+		return err
+	}
+
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionBackupConfigured),
@@ -1436,17 +1468,425 @@ func (r *AdminReconciler) reconcileBackup(
 		fmt.Sprintf("Backup configuration reconciled: schedule=%s, destination=%s",
 			cluster.Spec.Backup.Schedule, cluster.Spec.Backup.Destination.Type))
 
-	// Record that a backup schedule has been (re)established. Backup duration
-	// and size are produced by the backup Job at runtime and are not observable
-	// at this configuration-reconcile layer, so only the started event is
-	// recorded here.
-	backupType := backupTypeFull
-	if cluster.Spec.Backup.Incremental {
-		backupType = backupTypeIncremental
-	}
-	r.metrics.RecordBackup(cluster.Name, cluster.Namespace, backupType, "started")
-
 	return nil
+}
+
+// ensureBackupS3ConfigMap creates or updates the S3 plugin ConfigMap for S3 destinations.
+func (r *AdminReconciler) ensureBackupS3ConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	desired := r.builder.BuildBackupS3ConfigMap(cluster)
+	if desired == nil {
+		// Non-S3 destination: nothing to ensure.
+		return nil
+	}
+
+	existing := &corev1.ConfigMap{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating backup s3 configmap %s: %w", desired.Name, createErr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting backup s3 configmap %s: %w", desired.Name, err)
+	}
+
+	if !equality.Semantic.DeepEqual(existing.Data, desired.Data) {
+		existing.Data = desired.Data
+		existing.Labels = desired.Labels
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating backup s3 configmap %s: %w", desired.Name, updateErr)
+		}
+	}
+	return nil
+}
+
+// ensureBackupCronJob creates/updates the scheduled backup CronJob when a
+// schedule is set, or deletes it when the schedule has been cleared.
+func (r *AdminReconciler) ensureBackupCronJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	cronName := util.BackupCronJobName(cluster.Name)
+	desired := r.builder.BuildBackupCronJob(cluster)
+
+	if desired == nil {
+		// No schedule configured: delete the CronJob if it exists.
+		existing := &batchv1.CronJob{}
+		err := r.client.Get(ctx, types.NamespacedName{Name: cronName, Namespace: cluster.Namespace}, existing)
+		if apierrors.IsNotFound(err) {
+			cluster.Status.CronJobName = ""
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("getting backup cronjob %s: %w", cronName, err)
+		}
+		if delErr := r.client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("deleting backup cronjob %s: %w", cronName, delErr)
+		}
+		cluster.Status.CronJobName = ""
+		return nil
+	}
+
+	existing := &batchv1.CronJob{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating backup cronjob %s: %w", desired.Name, createErr)
+		}
+		cluster.Status.CronJobName = desired.Name
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting backup cronjob %s: %w", desired.Name, err)
+	}
+
+	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		existing.Spec = desired.Spec
+		existing.Labels = desired.Labels
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating backup cronjob %s: %w", desired.Name, updateErr)
+		}
+	}
+	cluster.Status.CronJobName = desired.Name
+	return nil
+}
+
+// refreshBackupStatus inspects backup/restore Jobs owned by the cluster and
+// updates the backup-related status fields and history from the latest Job.
+func (r *AdminReconciler) refreshBackupStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	jobs := &batchv1.JobList{}
+	if err := r.client.List(ctx, jobs,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{util.LabelCluster: cluster.Name},
+	); err != nil {
+		return fmt.Errorf("listing backup jobs: %w", err)
+	}
+
+	// Emit per-Job status metrics for every observed backup/restore/cleanup Job
+	// and record terminal metrics (restore duration, retention deletions) as Jobs
+	// reach a terminal state.
+	r.recordBackupJobMetrics(cluster, jobs.Items)
+
+	latest := latestBackupJob(jobs.Items)
+	if latest == nil {
+		return nil
+	}
+
+	status := backupJobStatus(latest)
+	r.applyBackupJobToStatus(cluster, latest, status)
+	return nil
+}
+
+// ensurePostRestoreValidation creates a post-restore validation Job for each
+// successfully completed restore Job that does not yet have one (spec 11
+// §Post-Restore Validation). It is idempotent: the validation Job is named
+// deterministically from the restore timestamp and skipped when it already
+// exists. Each created Job is owner-ref'd to the cluster and emits an Event.
+func (r *AdminReconciler) ensurePostRestoreValidation(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	jobs := &batchv1.JobList{}
+	if err := r.client.List(ctx, jobs,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{util.LabelCluster: cluster.Name},
+	); err != nil {
+		return fmt.Errorf("listing restore jobs for validation: %w", err)
+	}
+
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if job.Labels[util.LabelBackupOperation] != util.BackupOperationRestore {
+			continue
+		}
+		if job.Status.Succeeded == 0 {
+			continue
+		}
+		timestamp := strings.TrimPrefix(job.Name, util.RestoreJobName(cluster.Name, ""))
+		timestamp = strings.TrimPrefix(timestamp, "-")
+		if timestamp == "" {
+			continue
+		}
+		if err := r.createValidationJob(ctx, cluster, timestamp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createValidationJob creates a single post-restore validation Job when one does
+// not already exist for the given restore timestamp.
+func (r *AdminReconciler) createValidationJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	timestamp string,
+) error {
+	name := util.PostRestoreValidationJobName(cluster.Name, timestamp)
+	existing := &batchv1.Job{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, existing)
+	if err == nil {
+		// Validation Job already exists: idempotent no-op.
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting validation job %s: %w", name, err)
+	}
+
+	job := r.builder.BuildPostRestoreValidationJob(cluster, &builder.ValidationJobOptions{
+		Timestamp: timestamp,
+	})
+	if createErr := r.client.Create(ctx, job); createErr != nil {
+		if apierrors.IsAlreadyExists(createErr) {
+			return nil
+		}
+		return fmt.Errorf("creating validation job %s: %w", name, createErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonBackupReconciled,
+		fmt.Sprintf("Post-restore validation Job created for timestamp %s", timestamp))
+	return nil
+}
+
+// backupJobStatusCode maps a Job's status to the spec-11 numeric code used by
+// the cloudberry_backup_job_status gauge (0=pending, 1=running, 2=succeeded,
+// 3=failed).
+func backupJobStatusCode(job *batchv1.Job) float64 {
+	switch {
+	case job.Status.Succeeded > 0:
+		return backupJobStatusSucceeded
+	case job.Status.Failed > 0:
+		return backupJobStatusFailed
+	case job.Status.Active > 0 || job.Status.StartTime != nil:
+		return backupJobStatusRunning
+	default:
+		return backupJobStatusPending
+	}
+}
+
+// recordBackupJobMetrics emits the per-Job status gauge for all backup, restore
+// and cleanup Jobs, plus terminal metrics for succeeded restore and cleanup Jobs.
+func (r *AdminReconciler) recordBackupJobMetrics(
+	cluster *cbv1alpha1.CloudberryCluster,
+	jobs []batchv1.Job,
+) {
+	for i := range jobs {
+		job := &jobs[i]
+		operation := job.Labels[util.LabelBackupOperation]
+		switch operation {
+		case util.BackupOperationBackup, util.BackupOperationRestore, util.BackupOperationCleanup:
+		default:
+			continue
+		}
+
+		code := backupJobStatusCode(job)
+		r.metrics.SetBackupJobStatus(cluster.Name, cluster.Namespace, job.Name, operation, code)
+
+		if code != backupJobStatusSucceeded {
+			continue
+		}
+		switch operation {
+		case util.BackupOperationRestore:
+			if d := backupJobDurationValue(job); d > 0 {
+				r.metrics.ObserveRestoreDuration(cluster.Name, cluster.Namespace, d)
+			}
+		case util.BackupOperationCleanup:
+			if n := backupRetentionDeletedCount(job); n > 0 {
+				r.metrics.RecordBackupRetentionDeleted(cluster.Name, cluster.Namespace, n)
+			}
+		}
+	}
+}
+
+// backupRetentionDeletedCount extracts the number of backups deleted by a cleanup
+// Job from its annotations, returning 0 when the count is unknown.
+func backupRetentionDeletedCount(job *batchv1.Job) int {
+	raw, ok := job.Annotations[util.AnnotationBackupRetentionDeleted]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// latestBackupJob returns the most recently created backup operation Job, or nil.
+func latestBackupJob(jobs []batchv1.Job) *batchv1.Job {
+	var latest *batchv1.Job
+	for i := range jobs {
+		op := jobs[i].Labels[util.LabelBackupOperation]
+		if op != util.BackupOperationBackup && op != util.BackupOperationRestore {
+			continue
+		}
+		if latest == nil || jobs[i].CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = &jobs[i]
+		}
+	}
+	return latest
+}
+
+// backupJobStatus derives a human-readable status from a Job's status.
+func backupJobStatus(job *batchv1.Job) string {
+	switch {
+	case job.Status.Succeeded > 0:
+		return "Success"
+	case job.Status.Failed > 0:
+		return "Failed"
+	default:
+		return "InProgress"
+	}
+}
+
+// applyBackupJobToStatus updates cluster.Status backup fields, appends a history
+// entry and records metrics for the given Job.
+func (r *AdminReconciler) applyBackupJobToStatus(
+	cluster *cbv1alpha1.CloudberryCluster,
+	job *batchv1.Job,
+	status string,
+) {
+	timestamp := backupTimestampFromJob(cluster, job)
+	backupType := backupTypeFromLabels(cluster)
+	duration := backupJobDuration(job)
+
+	cluster.Status.LastBackupStatus = status
+	cluster.Status.LastBackupJobName = job.Name
+	cluster.Status.LastBackupTimestamp = timestamp
+	cluster.Status.LastBackupType = backupType
+	if job.Status.CompletionTime != nil {
+		cluster.Status.LastBackupTime = job.Status.CompletionTime
+	} else if job.Status.StartTime != nil {
+		cluster.Status.LastBackupTime = job.Status.StartTime
+	}
+
+	cluster.Status.BackupHistory = appendBackupHistory(cluster.Status.BackupHistory, cbv1alpha1.BackupHistoryEntry{
+		Timestamp: timestamp,
+		Type:      backupType,
+		Status:    status,
+		Duration:  duration,
+	})
+
+	operation := job.Labels[util.LabelBackupOperation]
+	if operation == util.BackupOperationRestore {
+		r.metrics.RecordRestore(cluster.Name, cluster.Namespace, strings.ToLower(status))
+		return
+	}
+
+	r.recordLatestBackupMetrics(cluster, job, backupType, timestamp, status)
+}
+
+// recordLatestBackupMetrics wires the spec-11 backup metrics for the latest
+// backup Job: the aggregate backup counter, the last-status gauge, and (on
+// success) the last-success timestamp, typed duration histogram and size gauge.
+func (r *AdminReconciler) recordLatestBackupMetrics(
+	cluster *cbv1alpha1.CloudberryCluster,
+	job *batchv1.Job,
+	backupType, timestamp, status string,
+) {
+	name, namespace := cluster.Name, cluster.Namespace
+	r.metrics.RecordBackup(name, namespace, backupType, strings.ToLower(status))
+
+	switch status {
+	case "Success":
+		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusSuccess)
+		if job.Status.CompletionTime != nil {
+			r.metrics.SetBackupLastSuccessTimestamp(
+				name, namespace, float64(job.Status.CompletionTime.Unix()),
+			)
+		}
+		if d := backupJobDurationValue(job); d > 0 {
+			r.metrics.ObserveBackupDuration(name, namespace, backupType, d)
+		}
+		if size := backupJobSizeBytes(job); size > 0 && timestamp != "" {
+			r.metrics.SetBackupSizeBytes(name, namespace, timestamp, size)
+		}
+	case "Failed":
+		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusFailed)
+	default:
+		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusInProgress)
+	}
+}
+
+// backupJobSizeBytes extracts the backup size in bytes from a Job's annotations,
+// returning 0 when the size is unknown.
+func backupJobSizeBytes(job *batchv1.Job) float64 {
+	raw, ok := job.Annotations[util.AnnotationBackupSizeBytes]
+	if !ok {
+		return 0
+	}
+	size, err := strconv.ParseFloat(raw, 64)
+	if err != nil || size < 0 {
+		return 0
+	}
+	return size
+}
+
+// backupTimestampFromJob extracts a gpbackup-style timestamp from the Job name,
+// falling back to the last status timestamp.
+func backupTimestampFromJob(cluster *cbv1alpha1.CloudberryCluster, job *batchv1.Job) string {
+	prefixes := []string{
+		util.BackupJobName(cluster.Name, ""),
+		util.RestoreJobName(cluster.Name, ""),
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(job.Name, prefix) {
+			return strings.TrimPrefix(job.Name, prefix)
+		}
+	}
+	return cluster.Status.LastBackupTimestamp
+}
+
+// backupTypeFromLabels resolves the backup type from the cluster's gpbackup spec.
+func backupTypeFromLabels(cluster *cbv1alpha1.CloudberryCluster) string {
+	if cluster.Spec.Backup != nil && cluster.Spec.Backup.Gpbackup != nil &&
+		cluster.Spec.Backup.Gpbackup.Incremental {
+		return backupTypeIncremental
+	}
+	return backupTypeFull
+}
+
+// backupJobDuration returns a human-readable duration for the Job, or "".
+func backupJobDuration(job *batchv1.Job) string {
+	d := backupJobDurationValue(job)
+	if d <= 0 {
+		return ""
+	}
+	return d.Round(time.Second).String()
+}
+
+// backupJobDurationValue returns the elapsed time between Job start and completion.
+func backupJobDurationValue(job *batchv1.Job) time.Duration {
+	if job.Status.StartTime == nil || job.Status.CompletionTime == nil {
+		return 0
+	}
+	return job.Status.CompletionTime.Sub(job.Status.StartTime.Time)
+}
+
+// appendBackupHistory prepends a new entry and trims to backupHistoryLimit,
+// replacing any existing entry with the same timestamp.
+func appendBackupHistory(
+	history []cbv1alpha1.BackupHistoryEntry,
+	entry cbv1alpha1.BackupHistoryEntry,
+) []cbv1alpha1.BackupHistoryEntry {
+	filtered := make([]cbv1alpha1.BackupHistoryEntry, 0, len(history)+1)
+	filtered = append(filtered, entry)
+	for _, e := range history {
+		if e.Timestamp != "" && e.Timestamp == entry.Timestamp {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	if len(filtered) > backupHistoryLimit {
+		filtered = filtered[:backupHistoryLimit]
+	}
+	return filtered
 }
 
 // reconcileDataLoading reconciles data loading configuration and status.
@@ -2428,9 +2868,14 @@ func (r *AdminReconciler) executeLogRotate(ctx context.Context, dbClient db.Clie
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=create;delete;get;list;watch;update;patch
 func (r *AdminReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cbv1alpha1.CloudberryCluster{}).
+		Owns(&batchv1.Job{}).
+		Owns(&batchv1.CronJob{}).
 		Named(adminControllerName).
 		Complete(r)
 }

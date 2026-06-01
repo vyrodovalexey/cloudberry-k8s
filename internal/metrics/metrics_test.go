@@ -5,9 +5,71 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// valueWithLabels gathers the value of a metric family from the registry,
+// matching on the metric name and the provided label key/value pairs. It fails
+// the test when the metric is not found.
+func valueWithLabels(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	v, ok := findMetricValue(t, reg, name, labels)
+	require.True(t, ok, "metric %s with labels %v not found", name, labels)
+	return v
+}
+
+// metricExists reports whether at least one sample for the named metric family
+// with the given labels exists in the registry.
+func metricExists(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) bool {
+	t.Helper()
+	_, ok := findMetricValue(t, reg, name, labels)
+	return ok
+}
+
+// findMetricValue returns the scalar value of the first matching sample for the
+// metric family, supporting gauges, counters and histograms (sample count).
+func findMetricValue(
+	t *testing.T, reg *prometheus.Registry, name string, labels map[string]string,
+) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if !labelsMatch(m.GetLabel(), labels) {
+				continue
+			}
+			switch {
+			case m.GetGauge() != nil:
+				return m.GetGauge().GetValue(), true
+			case m.GetCounter() != nil:
+				return m.GetCounter().GetValue(), true
+			case m.GetHistogram() != nil:
+				return float64(m.GetHistogram().GetSampleCount()), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// labelsMatch reports whether the gathered label pairs contain all wanted pairs.
+func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
+	got := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		got[p.GetName()] = p.GetValue()
+	}
+	for k, v := range want {
+		if got[k] != v {
+			return false
+		}
+	}
+	return true
+}
 
 func TestNewPrometheusRecorder(t *testing.T) {
 	reg := prometheus.NewRegistry()
@@ -248,8 +310,13 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.RecordIdleSessionTermination("c", "n", "idle-30m")
 	recorder.RecordSlowQuery("c", "n")
 	recorder.RecordBackup("c", "n", "full", "success")
-	recorder.ObserveBackupDuration("c", "n", time.Second)
-	recorder.SetBackupSizeBytes("c", "n", 1024)
+	recorder.ObserveBackupDuration("c", "n", "full", time.Second)
+	recorder.SetBackupSizeBytes("c", "n", "20260519020000", 1024)
+	recorder.SetBackupLastSuccessTimestamp("c", "n", 1700000000)
+	recorder.SetBackupLastStatus("c", "n", 0)
+	recorder.ObserveRestoreDuration("c", "n", time.Second)
+	recorder.RecordBackupRetentionDeleted("c", "n", 2)
+	recorder.SetBackupJobStatus("c", "n", "job1", "backup", 2)
 	recorder.RecordRestore("c", "n", "success")
 	recorder.SetDataLoadingJobsActive("c", "n", 1)
 	recorder.RecordDataLoadingRows("c", "n", "job1", "s3", 100)
@@ -282,13 +349,71 @@ func TestRecordBackup(t *testing.T) {
 func TestObserveBackupDuration(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
-	recorder.ObserveBackupDuration("test", "default", 30*time.Second)
+	recorder.ObserveBackupDuration("test", "default", "full", 30*time.Second)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_duration_seconds",
+		map[string]string{"cluster": "test", "namespace": "default", "type": "full"})
+	assert.InDelta(t, 1.0, got, 0.001)
 }
 
 func TestSetBackupSizeBytes(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
-	recorder.SetBackupSizeBytes("test", "default", 1073741824)
+	recorder.SetBackupSizeBytes("test", "default", "20260519020000", 1073741824)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_size_bytes",
+		map[string]string{"cluster": "test", "namespace": "default", "timestamp": "20260519020000"})
+	assert.InDelta(t, 1073741824.0, got, 0.5)
+}
+
+func TestSetBackupLastSuccessTimestamp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetBackupLastSuccessTimestamp("test", "default", 1700000000)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_last_success_timestamp",
+		map[string]string{"cluster": "test", "namespace": "default"})
+	assert.InDelta(t, 1700000000.0, got, 0.5)
+}
+
+func TestSetBackupLastStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetBackupLastStatus("test", "default", 1)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_last_status",
+		map[string]string{"cluster": "test", "namespace": "default"})
+	assert.InDelta(t, 1.0, got, 0.001)
+}
+
+func TestObserveRestoreDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveRestoreDuration("test", "default", 30*time.Second)
+
+	assert.True(t, metricExists(t, reg, "cloudberry_restore_duration_seconds",
+		map[string]string{"cluster": "test", "namespace": "default"}))
+}
+
+func TestRecordBackupRetentionDeleted(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordBackupRetentionDeleted("test", "default", 3)
+	recorder.RecordBackupRetentionDeleted("test", "default", 2)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_retention_deleted_total",
+		map[string]string{"cluster": "test", "namespace": "default"})
+	assert.InDelta(t, 5.0, got, 0.001)
+}
+
+func TestSetBackupJobStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetBackupJobStatus("test", "default", "job1", "backup", 2)
+
+	got := valueWithLabels(t, reg, "cloudberry_backup_job_status",
+		map[string]string{"cluster": "test", "namespace": "default", "job": "job1", "operation": "backup"})
+	assert.InDelta(t, 2.0, got, 0.001)
 }
 
 func TestRecordRestore(t *testing.T) {
@@ -577,8 +702,13 @@ func TestNoopRecorder_AllMethods(t *testing.T) {
 	r.RecordIdleSessionTermination("cluster", "ns", "idle-30m")
 	r.RecordSlowQuery("cluster", "ns")
 	r.RecordBackup("cluster", "ns", "full", "success")
-	r.ObserveBackupDuration("cluster", "ns", 30*time.Second)
-	r.SetBackupSizeBytes("cluster", "ns", 1073741824)
+	r.ObserveBackupDuration("cluster", "ns", "full", 30*time.Second)
+	r.SetBackupSizeBytes("cluster", "ns", "20260519020000", 1073741824)
+	r.SetBackupLastSuccessTimestamp("cluster", "ns", 1700000000)
+	r.SetBackupLastStatus("cluster", "ns", 0)
+	r.ObserveRestoreDuration("cluster", "ns", 30*time.Second)
+	r.RecordBackupRetentionDeleted("cluster", "ns", 2)
+	r.SetBackupJobStatus("cluster", "ns", "job1", "backup", 2)
 	r.RecordRestore("cluster", "ns", "success")
 	r.SetDataLoadingJobsActive("cluster", "ns", 3)
 	r.RecordDataLoadingRows("cluster", "ns", "s3-loader", "s3", 1000)

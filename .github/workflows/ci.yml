@@ -22,6 +22,7 @@ env:
   DOCKER_IMAGE_CTL: ghcr.io/${{ github.repository }}-ctl
   DOCKER_IMAGE_CLOUDBERRY: ghcr.io/${{ github.repository }}-cloudberry
   DOCKER_IMAGE_QUERY_EXPORTER: ghcr.io/${{ github.repository }}-query-exporter
+  DOCKER_IMAGE_BACKUP: ghcr.io/${{ github.repository }}-backup
   HELM_CHART_PATH: deploy/helm/cloudberry-operator
 
 jobs:
@@ -425,6 +426,10 @@ jobs:
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_env: DOCKER_IMAGE_QUERY_EXPORTER
+          # backup compiles apache/cloudberry-backup from source (slow); built on PRs and releases.
+          - name: backup
+            dockerfile: Dockerfile.cloudberry-backup
+            image_env: DOCKER_IMAGE_BACKUP
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -616,6 +621,9 @@ jobs:
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
+          - name: backup
+            dockerfile: Dockerfile.cloudberry-backup
+            image_key: DOCKER_IMAGE_BACKUP
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -679,6 +687,8 @@ jobs:
             image_key: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
+          - name: backup
+            image_key: DOCKER_IMAGE_BACKUP
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

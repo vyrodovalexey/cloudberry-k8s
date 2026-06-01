@@ -1310,24 +1310,28 @@ func TestBackupCmd_Subcommands(t *testing.T) {
 	assert.Equal(t, "backup", cmd.Use)
 
 	names := subcommandNames(cmd)
-	expected := []string{"create", "list", "delete", "restore", "status", "schedule"}
+	expected := []string{"create", "list", "delete", "restore", "status", "schedule", "jobs"}
 	for _, e := range expected {
 		assert.Contains(t, names, e, "backup should have %q subcommand", e)
 	}
 }
 
-func TestBackupCmd_ScheduleNotImplemented(t *testing.T) {
-	saved := globals
-	defer func() { globals = saved }()
-	globals.cluster = "test-cluster"
-
+func TestBackupCmd_ScheduleSubcommands(t *testing.T) {
 	cmd := newBackupCmd()
 	scheduleCmd := findSubcommand(cmd, "schedule")
 	require.NotNil(t, scheduleCmd)
 
-	err := scheduleCmd.RunE(scheduleCmd, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not yet implemented")
+	names := subcommandNames(scheduleCmd)
+	for _, e := range []string{"set", "suspend", "resume"} {
+		assert.Contains(t, names, e, "schedule should have %q subcommand", e)
+	}
+}
+
+func TestBackupCmd_JobsSubcommands(t *testing.T) {
+	cmd := newBackupCmd()
+	jobsCmd := findSubcommand(cmd, "jobs")
+	require.NotNil(t, jobsCmd)
+	assert.Contains(t, subcommandNames(jobsCmd), "logs")
 }
 
 // ---------------------------------------------------------------------------
@@ -1875,7 +1879,8 @@ func TestBackupCommands_WithMockServer(t *testing.T) {
 		cmd := newBackupCmd()
 		sub := findSubcommand(cmd, "delete")
 		require.NotNil(t, sub)
-		err := sub.RunE(sub, []string{"backup-123"})
+		require.NoError(t, sub.Flags().Set("timestamp", "20260519020000"))
+		err := sub.RunE(sub, nil)
 		require.NoError(t, err)
 	})
 
@@ -1883,9 +1888,214 @@ func TestBackupCommands_WithMockServer(t *testing.T) {
 		cmd := newBackupCmd()
 		sub := findSubcommand(cmd, "restore")
 		require.NotNil(t, sub)
-		err := sub.RunE(sub, []string{"backup-123"})
+		require.NoError(t, sub.Flags().Set("timestamp", "20260519020000"))
+		err := sub.RunE(sub, nil)
 		require.NoError(t, err)
 	})
+
+	t.Run("schedule", func(t *testing.T) {
+		cmd := newBackupCmd()
+		sub := findSubcommand(cmd, "schedule")
+		require.NotNil(t, sub)
+		require.NoError(t, sub.RunE(sub, nil))
+	})
+
+	t.Run("schedule set", func(t *testing.T) {
+		cmd := newBackupCmd()
+		scheduleCmd := findSubcommand(cmd, "schedule")
+		setCmd := findSubcommand(scheduleCmd, "set")
+		require.NotNil(t, setCmd)
+		require.NoError(t, setCmd.Flags().Set("cron", "0 3 * * *"))
+		require.NoError(t, setCmd.RunE(setCmd, nil))
+	})
+
+	t.Run("schedule suspend", func(t *testing.T) {
+		cmd := newBackupCmd()
+		scheduleCmd := findSubcommand(cmd, "schedule")
+		suspendCmd := findSubcommand(scheduleCmd, "suspend")
+		require.NotNil(t, suspendCmd)
+		require.NoError(t, suspendCmd.RunE(suspendCmd, nil))
+	})
+
+	t.Run("schedule resume", func(t *testing.T) {
+		cmd := newBackupCmd()
+		scheduleCmd := findSubcommand(cmd, "schedule")
+		resumeCmd := findSubcommand(scheduleCmd, "resume")
+		require.NotNil(t, resumeCmd)
+		require.NoError(t, resumeCmd.RunE(resumeCmd, nil))
+	})
+
+	t.Run("jobs", func(t *testing.T) {
+		cmd := newBackupCmd()
+		sub := findSubcommand(cmd, "jobs")
+		require.NotNil(t, sub)
+		require.NoError(t, sub.RunE(sub, nil))
+	})
+}
+
+func TestBackupCreateCmd_RequestBody(t *testing.T) {
+	var captured map[string]interface{}
+	server := setupMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+	globals.operatorURL = server.URL
+	globals.timeout = "5s"
+	globals.output = "json"
+
+	cmd := newBackupCmd()
+	sub := findSubcommand(cmd, "create")
+	require.NoError(t, sub.Flags().Set("type", "incremental"))
+	require.NoError(t, sub.Flags().Set("database", "mydb"))
+	require.NoError(t, sub.Flags().Set("jobs", "4"))
+	require.NoError(t, sub.Flags().Set("with-stats", "true"))
+	require.NoError(t, sub.RunE(sub, nil))
+
+	require.Equal(t, "incremental", captured["type"])
+	gp, ok := captured["gpbackupOptions"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, float64(4), gp["jobs"])
+	assert.Equal(t, true, gp["withStats"])
+}
+
+func TestMigrateCmd_Subcommand(t *testing.T) {
+	cmd := newMigrateCmd()
+	require.NotNil(t, cmd)
+	assert.Equal(t, "migrate", cmd.Use)
+	for _, f := range []string{
+		"source-cluster", "target-cluster", "database", "tables",
+		"truncate", "redirect-db", "redirect-schema", "jobs",
+	} {
+		assert.NotNil(t, cmd.Flags().Lookup(f), "migrate should have --%s flag", f)
+	}
+}
+
+func TestMigrateCmd_RequestBody(t *testing.T) {
+	var captured map[string]interface{}
+	var gotPath string
+	server := setupMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	saved := globals
+	defer func() { globals = saved }()
+	globals.namespace = ""
+	globals.operatorURL = server.URL
+	globals.timeout = "5s"
+	globals.output = "json"
+
+	cmd := newMigrateCmd()
+	require.NoError(t, cmd.Flags().Set("source-cluster", "src"))
+	require.NoError(t, cmd.Flags().Set("target-cluster", "dst"))
+	require.NoError(t, cmd.Flags().Set("database", "mydb"))
+	require.NoError(t, cmd.Flags().Set("tables", "public.users,public.orders"))
+	require.NoError(t, cmd.Flags().Set("truncate", "true"))
+	require.NoError(t, cmd.RunE(cmd, nil))
+
+	assert.Contains(t, gotPath, "/clusters/src/migrate")
+	assert.Equal(t, "src", captured["sourceCluster"])
+	assert.Equal(t, "dst", captured["targetCluster"])
+	assert.Equal(t, "mydb", captured["database"])
+	assert.Equal(t, true, captured["truncate"])
+	tables, ok := captured[fieldTables].([]interface{})
+	require.True(t, ok)
+	assert.Len(t, tables, 2)
+}
+
+func TestMigrateCmd_MissingFlags(t *testing.T) {
+	saved := globals
+	defer func() { globals = saved }()
+
+	cmd := newMigrateCmd()
+	err := cmd.RunE(cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--source-cluster is required")
+
+	require.NoError(t, cmd.Flags().Set("source-cluster", "src"))
+	err = cmd.RunE(cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--target-cluster is required")
+}
+
+func TestBackupStatusCmd_WithTimestamp(t *testing.T) {
+	var gotPath string
+	server := setupMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+	globals.namespace = ""
+	globals.operatorURL = server.URL
+	globals.timeout = "5s"
+	globals.output = "json"
+
+	cmd := newBackupCmd()
+	sub := findSubcommand(cmd, "status")
+	require.NoError(t, sub.Flags().Set("timestamp", "20260519020000"))
+	require.NoError(t, sub.RunE(sub, nil))
+	assert.Contains(t, gotPath, "/backups/20260519020000")
+}
+
+func TestBackupCmd_MissingTimestampErrors(t *testing.T) {
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+
+	cmd := newBackupCmd()
+	for _, name := range []string{"delete", "restore"} {
+		sub := findSubcommand(cmd, name)
+		require.NotNil(t, sub)
+		err := sub.RunE(sub, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--timestamp is required")
+	}
+}
+
+func TestBackupScheduleSetCmd_MissingCron(t *testing.T) {
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+
+	cmd := newBackupCmd()
+	scheduleCmd := findSubcommand(cmd, "schedule")
+	setCmd := findSubcommand(scheduleCmd, "set")
+	err := setCmd.RunE(setCmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--cron is required")
+}
+
+func TestBackupJobsLogsCmd(t *testing.T) {
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+	globals.namespace = "test-ns"
+
+	cmd := newBackupCmd()
+	jobsCmd := findSubcommand(cmd, "jobs")
+	logsCmd := findSubcommand(jobsCmd, "logs")
+	require.NotNil(t, logsCmd)
+
+	var buf bytes.Buffer
+	logsCmd.SetOut(&buf)
+
+	// Missing --job is an error.
+	require.Error(t, logsCmd.RunE(logsCmd, nil))
+
+	require.NoError(t, logsCmd.Flags().Set("job", "test-cluster-backup-1"))
+	require.NoError(t, logsCmd.RunE(logsCmd, nil))
+	assert.Contains(t, buf.String(), "kubectl logs")
 }
 
 // ---------------------------------------------------------------------------

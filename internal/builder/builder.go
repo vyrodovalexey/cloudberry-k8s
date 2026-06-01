@@ -141,6 +141,21 @@ type ResourceBuilder interface {
 	BuildQueryMetricsServiceMonitor(cluster *cbv1alpha1.CloudberryCluster) *unstructured.Unstructured
 	// BuildQueryAlertsPrometheusRule builds the PrometheusRule for alerting.
 	BuildQueryAlertsPrometheusRule(cluster *cbv1alpha1.CloudberryCluster) *unstructured.Unstructured
+	// BuildBackupS3ConfigMap builds the gpbackup_s3_plugin config ConfigMap.
+	// Returns nil when the destination is not S3.
+	BuildBackupS3ConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
+	// BuildBackupCronJob builds the scheduled backup CronJob.
+	// Returns nil when no schedule is configured.
+	BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluster) *batchv1.CronJob
+	// BuildBackupJob builds an on-demand gpbackup Job.
+	BuildBackupJob(cluster *cbv1alpha1.CloudberryCluster, opts *BackupJobOptions) *batchv1.Job
+	// BuildRestoreJob builds a gprestore Job.
+	BuildRestoreJob(cluster *cbv1alpha1.CloudberryCluster, opts *RestoreJobOptions) *batchv1.Job
+	// BuildRetentionCleanupJob builds a gpbackman retention cleanup Job.
+	BuildRetentionCleanupJob(cluster *cbv1alpha1.CloudberryCluster, timestamp string) *batchv1.Job
+	// BuildPostRestoreValidationJob builds a post-restore validation Job.
+	BuildPostRestoreValidationJob(
+		cluster *cbv1alpha1.CloudberryCluster, opts *ValidationJobOptions) *batchv1.Job
 }
 
 // DefaultBuilder implements ResourceBuilder.

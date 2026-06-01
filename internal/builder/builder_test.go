@@ -828,12 +828,12 @@ func TestBuildCoordinatorStatefulSet_WithBackupConfig(t *testing.T) {
 	b := NewBuilder()
 	cluster := newTestCluster()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
-		Enabled:     true,
-		Schedule:    "0 2 * * *",
-		Compression: 6,
+		Enabled:  true,
+		Schedule: "0 2 * * *",
+		Gpbackup: &cbv1alpha1.GpbackupOptions{CompressionLevel: 6},
 		Destination: cbv1alpha1.BackupDestination{
-			Type:   "s3",
-			Bucket: "cloudberry-backups",
+			Type: "s3",
+			S3:   &cbv1alpha1.S3Destination{Bucket: "cloudberry-backups"},
 		},
 	}
 

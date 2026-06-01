@@ -305,6 +305,36 @@ func TestValidateSegments_SpreadWarning(t *testing.T) {
 	assert.Contains(t, warnings[0], "spread mirroring")
 }
 
+// backupCluster returns a valid cluster with a backup spec mutated by the
+// provided functions.
+func backupCluster(mutators ...func(*cbv1alpha1.BackupSpec)) *cbv1alpha1.CloudberryCluster {
+	c := newValidCluster()
+	b := &cbv1alpha1.BackupSpec{Enabled: true}
+	for _, m := range mutators {
+		m(b)
+	}
+	c.Spec.Backup = b
+	return c
+}
+
+// validS3Backup returns a mutator chain producing a fully valid s3 backup spec,
+// optionally further mutated by the supplied functions.
+func validS3Backup(extra ...func(*cbv1alpha1.BackupSpec)) func(*cbv1alpha1.BackupSpec) {
+	return func(b *cbv1alpha1.BackupSpec) {
+		b.Image = "cloudberry-backup:2.1.0"
+		b.Destination = cbv1alpha1.BackupDestination{
+			Type: "s3",
+			S3: &cbv1alpha1.S3Destination{
+				Bucket:           "my-bucket",
+				CredentialSecret: &cbv1alpha1.S3CredentialSecret{Name: "backup-s3-credentials"},
+			},
+		}
+		for _, m := range extra {
+			m(b)
+		}
+	}
+}
+
 func TestValidateBackup(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -318,99 +348,146 @@ func TestValidateBackup(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "backup enabled with valid s3 destination",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled:     true,
-					Compression: 6,
-					Destination: cbv1alpha1.BackupDestination{
-						Type:   "s3",
-						Bucket: "my-bucket",
-					},
-				}
-				return c
-			}(),
+			name:      "backup enabled with valid s3 destination",
+			cluster:   backupCluster(validS3Backup()),
 			expectErr: false,
 		},
 		{
 			name: "backup enabled missing destination type",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled: true,
-					Destination: cbv1alpha1.BackupDestination{
-						Type: "",
-					},
-				}
-				return c
-			}(),
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{Type: ""}
+			}),
+			expectErr:   true,
+			errContains: "backup.destination.type",
+		},
+		{
+			name: "backup invalid destination type",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{Type: "gcs"}
+			}),
 			expectErr:   true,
 			errContains: "backup.destination.type",
 		},
 		{
 			name: "backup s3 missing bucket",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled:     true,
-					Compression: 6,
-					Destination: cbv1alpha1.BackupDestination{
-						Type: "s3",
-					},
-				}
-				return c
-			}(),
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{Type: "s3"}
+			}),
 			expectErr:   true,
-			errContains: "backup.destination.bucket",
+			errContains: "backup.destination.s3.bucket",
+		},
+		{
+			name: "backup s3 missing credential secret",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type: "s3",
+					S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
+				}
+			}),
+			expectErr:   true,
+			errContains: "backup.destination.s3.credentialSecret.name",
 		},
 		{
 			name: "backup invalid compression too high",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled:     true,
-					Compression: 10,
-					Destination: cbv1alpha1.BackupDestination{
-						Type:   "s3",
-						Bucket: "my-bucket",
-					},
-				}
-				return c
-			}(),
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 10}
+			})),
 			expectErr:   true,
-			errContains: "backup.compression",
+			errContains: "backup.gpbackup.compressionLevel",
 		},
 		{
-			name: "backup invalid compression negative",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled:     true,
-					Compression: -1,
-					Destination: cbv1alpha1.BackupDestination{
-						Type:   "s3",
-						Bucket: "my-bucket",
-					},
-				}
-				return c
-			}(),
+			name: "backup invalid compression type",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionType: "lz4"}
+			})),
 			expectErr:   true,
-			errContains: "backup.compression",
+			errContains: "backup.gpbackup.compressionType",
+		},
+		{
+			name: "backup copyQueueSize without singleDataFile",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CopyQueueSize: 4}
+			})),
+			expectErr:   true,
+			errContains: "copyQueueSize",
+		},
+		{
+			name: "backup jobs combined with singleDataFile",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Jobs: 4, SingleDataFile: true}
+			})),
+			expectErr:   true,
+			errContains: "jobs cannot be combined",
+		},
+		{
+			name: "backup incremental without leafPartitionData",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Incremental: true}
+			})),
+			expectErr:   true,
+			errContains: "leafPartitionData",
+		},
+		{
+			name: "backup incremental with leafPartitionData valid",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Incremental: true, LeafPartitionData: true}
+			})),
+			expectErr: false,
+		},
+		{
+			name: "backup invalid schedule",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Schedule = "not a cron"
+			})),
+			expectErr:   true,
+			errContains: "schedule",
+		},
+		{
+			name: "backup valid schedule",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Schedule = "0 2 * * *"
+			})),
+			expectErr: false,
+		},
+		{
+			name: "backup missing image",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type:  "local",
+					Local: &cbv1alpha1.LocalDestination{Path: "/backups"},
+				}
+			}),
+			expectErr:   true,
+			errContains: "backup.image",
 		},
 		{
 			name: "backup local destination valid",
-			cluster: func() *cbv1alpha1.CloudberryCluster {
-				c := newValidCluster()
-				c.Spec.Backup = &cbv1alpha1.BackupSpec{
-					Enabled: true,
-					Destination: cbv1alpha1.BackupDestination{
-						Type: "local",
-						Path: "/backups",
-					},
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type:  "local",
+					Local: &cbv1alpha1.LocalDestination{Path: "/backups"},
 				}
-				return c
-			}(),
+			}),
+			expectErr: false,
+		},
+		{
+			name: "backup gprestore data-only and metadata-only conflict",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gprestore = &cbv1alpha1.GprestoreOptions{DataOnly: true, MetadataOnly: true}
+			})),
+			expectErr:   true,
+			errContains: "dataOnly and backup.gprestore.metadataOnly",
+		},
+		{
+			name: "backup gprestore data-only only valid",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gprestore = &cbv1alpha1.GprestoreOptions{DataOnly: true}
+			})),
 			expectErr: false,
 		},
 	}

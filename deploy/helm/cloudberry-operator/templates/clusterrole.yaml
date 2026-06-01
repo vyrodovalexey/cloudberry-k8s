@@ -126,12 +126,16 @@ rules:
       - batch
     resources:
       - jobs
+      - cronjobs
+      - cronjobs/status
     verbs:
       - create
       - delete
       - get
       - list
       - watch
+      - update
+      - patch
   # Networking resources
   - apiGroups:
       - networking.k8s.io

@@ -26,12 +26,22 @@ const (
 	defaultCPUWeight = 100
 	// defaultSamplingInterval is the default query monitoring sampling interval in seconds.
 	defaultSamplingInterval = 15
-	// defaultBackupCompression is the default backup compression level (0-9).
-	defaultBackupCompression = 6
-	// defaultBackupParallelism is the default backup parallelism.
-	defaultBackupParallelism = 1
+	// defaultBackupCompressionLevel is the default gpbackup compression level (1-9).
+	defaultBackupCompressionLevel = 1
+	// defaultBackupJobs is the default number of parallel gpbackup workers.
+	defaultBackupJobs = 1
 	// defaultBackupRetentionFullCount is the default number of full backups to retain.
 	defaultBackupRetentionFullCount = 3
+	// defaultBackupCompressionType is the default gpbackup compression algorithm.
+	defaultBackupCompressionType = "gzip"
+	// defaultBackupRetentionMaxAge is the default maximum backup age.
+	defaultBackupRetentionMaxAge = "30d"
+	// defaultBackupJobBackoffLimit is the default Job backoffLimit for backup/restore Jobs.
+	defaultBackupJobBackoffLimit = int32(2)
+	// defaultBackupJobActiveDeadlineSeconds is the default Job timeout (2 hours).
+	defaultBackupJobActiveDeadlineSeconds = int64(7200)
+	// defaultBackupJobTTLSecondsAfterFinished cleans up finished Jobs after 24 hours.
+	defaultBackupJobTTLSecondsAfterFinished = int32(86400)
 	// defaultStreamingServerPort is the default streaming server port.
 	defaultStreamingServerPort = 5432
 	// defaultBloatThreshold is the default table bloat threshold percentage.
@@ -244,24 +254,81 @@ func setQueryMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	}
 }
 
-// setBackupDefaults sets backup defaults.
+// setBackupDefaults sets backup defaults per spec 11 §Webhook Defaults.
+// All 12 defaults are applied only when backup is enabled and the corresponding
+// field is unset/zero, taking care not to overwrite explicit user values.
 func setBackupDefaults(cluster *cbv1alpha1.CloudberryCluster) {
-	if cluster.Spec.Backup == nil {
-		// Backup is optional; no defaults needed when not specified.
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		// Backup is optional; no defaults needed when not specified or disabled.
 		return
 	}
+	setGpbackupDefaults(cluster.Spec.Backup)
+	setGprestoreDefaults(cluster.Spec.Backup)
+	setBackupRetentionDefaults(cluster.Spec.Backup)
+	setBackupJobTemplateDefaults(cluster.Spec.Backup)
+}
 
-	if cluster.Spec.Backup.Compression == 0 {
-		cluster.Spec.Backup.Compression = defaultBackupCompression
+// setGpbackupDefaults applies gpbackup option defaults.
+func setGpbackupDefaults(backup *cbv1alpha1.BackupSpec) {
+	if backup.Gpbackup == nil {
+		backup.Gpbackup = &cbv1alpha1.GpbackupOptions{}
 	}
-	if cluster.Spec.Backup.Parallelism == 0 {
-		cluster.Spec.Backup.Parallelism = defaultBackupParallelism
+	gp := backup.Gpbackup
+	if gp.CompressionLevel == 0 {
+		gp.CompressionLevel = defaultBackupCompressionLevel
 	}
-	if cluster.Spec.Backup.Retention.FullCount == 0 {
-		cluster.Spec.Backup.Retention.FullCount = defaultBackupRetentionFullCount
+	if gp.CompressionType == "" {
+		gp.CompressionType = defaultBackupCompressionType
 	}
-	if cluster.Spec.Backup.Retention.MaxAge == "" {
-		cluster.Spec.Backup.Retention.MaxAge = "30d"
+	if gp.Jobs == 0 {
+		gp.Jobs = defaultBackupJobs
+	}
+	// gp.SingleDataFile defaults to false; the zero value already matches the
+	// spec default, so no explicit assignment is required here.
+	if !gp.WithStats {
+		gp.WithStats = true
+	}
+}
+
+// setGprestoreDefaults applies gprestore option defaults.
+func setGprestoreDefaults(backup *cbv1alpha1.BackupSpec) {
+	if backup.Gprestore == nil {
+		backup.Gprestore = &cbv1alpha1.GprestoreOptions{}
+	}
+	gr := backup.Gprestore
+	if gr.Jobs == 0 {
+		gr.Jobs = defaultBackupJobs
+	}
+	if !gr.WithStats {
+		gr.WithStats = true
+	}
+}
+
+// setBackupRetentionDefaults applies retention defaults.
+func setBackupRetentionDefaults(backup *cbv1alpha1.BackupSpec) {
+	if backup.Retention.FullCount == 0 {
+		backup.Retention.FullCount = defaultBackupRetentionFullCount
+	}
+	if backup.Retention.MaxAge == "" {
+		backup.Retention.MaxAge = defaultBackupRetentionMaxAge
+	}
+}
+
+// setBackupJobTemplateDefaults applies Job template defaults, allocating the
+// JobTemplate and its pointer fields when needed.
+func setBackupJobTemplateDefaults(backup *cbv1alpha1.BackupSpec) {
+	if backup.JobTemplate == nil {
+		backup.JobTemplate = &cbv1alpha1.BackupJobTemplate{}
+	}
+	jt := backup.JobTemplate
+	if jt.BackoffLimit == nil {
+		jt.BackoffLimit = util.Ptr(defaultBackupJobBackoffLimit)
+	}
+	if jt.ActiveDeadlineSeconds == nil {
+		jt.ActiveDeadlineSeconds = util.Ptr(defaultBackupJobActiveDeadlineSeconds)
+	}
+	if jt.TTLSecondsAfterFinished == nil {
+		jt.TTLSecondsAfterFinished = util.Ptr(defaultBackupJobTTLSecondsAfterFinished)
 	}
 }
 

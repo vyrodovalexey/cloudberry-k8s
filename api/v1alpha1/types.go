@@ -1137,14 +1137,15 @@ type QueryPrometheusRuleSpec struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-// BackupSpec defines backup and restore configuration.
+// BackupSpec defines backup and restore configuration backed by the
+// apache/cloudberry-backup toolchain (gpbackup, gprestore, gpbackup_s3_plugin).
 type BackupSpec struct {
 	// Enabled controls whether backup is active.
 	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Schedule is the cron expression for scheduled backups.
+	// Schedule is the cron expression for scheduled backups. Empty disables the CronJob.
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 
@@ -1155,20 +1156,44 @@ type BackupSpec struct {
 	// Destination defines where backups are stored.
 	Destination BackupDestination `json:"destination"`
 
-	// Compression is the compression level (0-9).
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=9
+	// Gpbackup defines default gpbackup options applied to backup Jobs.
 	// +optional
-	Compression int32 `json:"compression,omitempty"`
+	Gpbackup *GpbackupOptions `json:"gpbackup,omitempty"`
 
-	// Parallelism is the number of parallel backup workers.
+	// Gprestore defines default gprestore options applied to restore Jobs.
 	// +optional
-	Parallelism int32 `json:"parallelism,omitempty"`
+	Gprestore *GprestoreOptions `json:"gprestore,omitempty"`
 
-	// Incremental enables incremental backups.
-	// +kubebuilder:default=false
+	// JobTemplate defines pod template overrides for all backup/restore Jobs.
 	// +optional
-	Incremental bool `json:"incremental,omitempty"`
+	JobTemplate *BackupJobTemplate `json:"jobTemplate,omitempty"`
+
+	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+	// +optional
+	Image string `json:"image,omitempty"`
+}
+
+// BackupHistoryEntry describes a single backup recorded in cluster status.
+type BackupHistoryEntry struct {
+	// Timestamp is the gpbackup YYYYMMDDHHMMSS timestamp.
+	// +optional
+	Timestamp string `json:"timestamp,omitempty"`
+
+	// Type is the backup type (full | incremental).
+	// +optional
+	Type string `json:"type,omitempty"`
+
+	// Status is the backup result (Success | Failed | InProgress).
+	// +optional
+	Status string `json:"status,omitempty"`
+
+	// Size is the human-readable backup size (e.g. "2.4Gi").
+	// +optional
+	Size string `json:"size,omitempty"`
+
+	// Duration is the human-readable backup duration (e.g. "5m32s").
+	// +optional
+	Duration string `json:"duration,omitempty"`
 }
 
 // BackupRetention defines backup retention policy.
@@ -1192,11 +1217,22 @@ type BackupDestination struct {
 	// +kubebuilder:validation:Enum=s3;local
 	Type string `json:"type"`
 
+	// S3 defines the S3-compatible destination configuration.
+	// +optional
+	S3 *S3Destination `json:"s3,omitempty"`
+
+	// Local defines the local (PVC-backed) destination configuration.
+	// +optional
+	Local *LocalDestination `json:"local,omitempty"`
+}
+
+// S3Destination defines an S3-compatible backup destination used by gpbackup_s3_plugin.
+type S3Destination struct {
 	// Bucket is the S3 bucket name.
 	// +optional
 	Bucket string `json:"bucket,omitempty"`
 
-	// Endpoint is the S3-compatible endpoint (for MinIO).
+	// Endpoint is the S3-compatible endpoint (for MinIO); omit for AWS.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
@@ -1204,18 +1240,206 @@ type BackupDestination struct {
 	// +optional
 	Region string `json:"region,omitempty"`
 
-	// Path is the storage path prefix.
+	// Folder is the S3 folder prefix (maps to gpbackup_s3_plugin folder).
 	// +optional
-	Path string `json:"path,omitempty"`
+	Folder string `json:"folder,omitempty"`
 
-	// CredentialSecret references the secret containing storage credentials.
+	// Encryption controls S3 plugin SSL encryption (on|off).
+	// +kubebuilder:validation:Enum=on;off
 	// +optional
-	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+	Encryption string `json:"encryption,omitempty"`
 
-	// ForcePathStyle enables path-style addressing for S3-compatible storage.
+	// ForcePathStyle enables path-style addressing (required for MinIO).
 	// +kubebuilder:default=false
 	// +optional
 	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+
+	// CredentialSecret references the Secret containing S3 credentials.
+	// +optional
+	CredentialSecret *S3CredentialSecret `json:"credentialSecret,omitempty"`
+
+	// Multipart defines S3 multipart transfer tuning options.
+	// +optional
+	Multipart *S3Multipart `json:"multipart,omitempty"`
+}
+
+// S3CredentialSecret references a Secret holding S3 access credentials.
+type S3CredentialSecret struct {
+	// Name is the name of the Secret.
+	Name string `json:"name"`
+
+	// AccessKeyField is the Secret key holding the access key id.
+	// +optional
+	AccessKeyField string `json:"accessKeyField,omitempty"`
+
+	// SecretKeyField is the Secret key holding the secret access key.
+	// +optional
+	SecretKeyField string `json:"secretKeyField,omitempty"`
+}
+
+// S3Multipart defines S3 multipart transfer tuning options.
+type S3Multipart struct {
+	// BackupMaxConcurrentRequests maps to backup_max_concurrent_requests.
+	// +optional
+	BackupMaxConcurrentRequests int32 `json:"backupMaxConcurrentRequests,omitempty"`
+
+	// BackupMultipartChunksize maps to backup_multipart_chunksize (e.g. "10MB").
+	// +optional
+	BackupMultipartChunksize string `json:"backupMultipartChunksize,omitempty"`
+
+	// RestoreMaxConcurrentRequests maps to restore_max_concurrent_requests.
+	// +optional
+	RestoreMaxConcurrentRequests int32 `json:"restoreMaxConcurrentRequests,omitempty"`
+
+	// RestoreMultipartChunksize maps to restore_multipart_chunksize (e.g. "10MB").
+	// +optional
+	RestoreMultipartChunksize string `json:"restoreMultipartChunksize,omitempty"`
+}
+
+// LocalDestination defines a local (PVC-backed) backup destination.
+type LocalDestination struct {
+	// Path maps to gpbackup --backup-dir.
+	// +optional
+	Path string `json:"path,omitempty"`
+
+	// PersistentVolumeClaim is the PVC mounted into the Job pod.
+	// +optional
+	PersistentVolumeClaim string `json:"persistentVolumeClaim,omitempty"`
+}
+
+// GpbackupOptions defines gpbackup command-line options.
+type GpbackupOptions struct {
+	// CompressionLevel maps to --compression-level (1-9).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9
+	// +optional
+	CompressionLevel int32 `json:"compressionLevel,omitempty"`
+
+	// CompressionType maps to --compression-type (gzip|zstd).
+	// +kubebuilder:validation:Enum=gzip;zstd
+	// +optional
+	CompressionType string `json:"compressionType,omitempty"`
+
+	// SingleDataFile maps to --single-data-file.
+	// +kubebuilder:default=false
+	// +optional
+	SingleDataFile bool `json:"singleDataFile,omitempty"`
+
+	// CopyQueueSize maps to --copy-queue-size (requires SingleDataFile).
+	// +optional
+	CopyQueueSize int32 `json:"copyQueueSize,omitempty"`
+
+	// Jobs maps to --jobs (parallel backup workers).
+	// +optional
+	Jobs int32 `json:"jobs,omitempty"`
+
+	// Incremental maps to --incremental.
+	// +kubebuilder:default=false
+	// +optional
+	Incremental bool `json:"incremental,omitempty"`
+
+	// LeafPartitionData maps to --leaf-partition-data.
+	// +kubebuilder:default=false
+	// +optional
+	LeafPartitionData bool `json:"leafPartitionData,omitempty"`
+
+	// WithStats maps to --with-stats.
+	// +optional
+	WithStats bool `json:"withStats,omitempty"`
+
+	// WithoutGlobals maps to --without-globals.
+	// +kubebuilder:default=false
+	// +optional
+	WithoutGlobals bool `json:"withoutGlobals,omitempty"`
+
+	// NoCompression maps to --no-compression (overrides compressionLevel).
+	// +kubebuilder:default=false
+	// +optional
+	NoCompression bool `json:"noCompression,omitempty"`
+}
+
+// GprestoreOptions defines gprestore command-line options.
+type GprestoreOptions struct {
+	// Jobs maps to --jobs (parallel restore workers).
+	// +optional
+	Jobs int32 `json:"jobs,omitempty"`
+
+	// CreateDb maps to --create-db.
+	// +kubebuilder:default=false
+	// +optional
+	CreateDb bool `json:"createDb,omitempty"`
+
+	// WithGlobals maps to --with-globals.
+	// +kubebuilder:default=false
+	// +optional
+	WithGlobals bool `json:"withGlobals,omitempty"`
+
+	// WithStats maps to --with-stats.
+	// +optional
+	WithStats bool `json:"withStats,omitempty"`
+
+	// RunAnalyze maps to --run-analyze.
+	// +kubebuilder:default=false
+	// +optional
+	RunAnalyze bool `json:"runAnalyze,omitempty"`
+
+	// OnErrorContinue maps to --on-error-continue.
+	// +kubebuilder:default=false
+	// +optional
+	OnErrorContinue bool `json:"onErrorContinue,omitempty"`
+
+	// TruncateTable maps to --truncate-table.
+	// +kubebuilder:default=false
+	// +optional
+	TruncateTable bool `json:"truncateTable,omitempty"`
+
+	// DataOnly maps to --data-only (restore data without recreating objects).
+	// Mutually exclusive with MetadataOnly.
+	// +kubebuilder:default=false
+	// +optional
+	DataOnly bool `json:"dataOnly,omitempty"`
+
+	// MetadataOnly maps to --metadata-only (restore object definitions only).
+	// Mutually exclusive with DataOnly.
+	// +kubebuilder:default=false
+	// +optional
+	MetadataOnly bool `json:"metadataOnly,omitempty"`
+
+	// ResizeCluster maps to --resize-cluster (restore into a differently sized cluster).
+	// +kubebuilder:default=false
+	// +optional
+	ResizeCluster bool `json:"resizeCluster,omitempty"`
+}
+
+// BackupJobTemplate defines pod template overrides for backup/restore Jobs.
+type BackupJobTemplate struct {
+	// Resources defines compute resource requirements for the Job pod.
+	// +optional
+	Resources *ResourceRequirements `json:"resources,omitempty"`
+
+	// NodeSelector constrains the Job pod to matching nodes.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations allow the Job pod to schedule onto tainted nodes.
+	// +optional
+	Tolerations []Toleration `json:"tolerations,omitempty"`
+
+	// ServiceAccountName is the ServiceAccount used by the Job pod.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// BackoffLimit is the number of retries before the Job is marked failed.
+	// +optional
+	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
+
+	// ActiveDeadlineSeconds is the Job timeout in seconds.
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+
+	// TTLSecondsAfterFinished cleans up finished Jobs after the given seconds.
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 }
 
 // SecretReference references a Kubernetes secret.
@@ -1502,6 +1726,26 @@ type CloudberryClusterStatus struct {
 	// LastBackupStatus is the status of the last backup (Success, Failed, InProgress).
 	// +optional
 	LastBackupStatus string `json:"lastBackupStatus,omitempty"`
+
+	// LastBackupTimestamp is the gpbackup YYYYMMDDHHMMSS timestamp of the last backup.
+	// +optional
+	LastBackupTimestamp string `json:"lastBackupTimestamp,omitempty"`
+
+	// LastBackupType is the type of the last backup (full | incremental).
+	// +optional
+	LastBackupType string `json:"lastBackupType,omitempty"`
+
+	// LastBackupJobName is the name of the Job that produced the last backup.
+	// +optional
+	LastBackupJobName string `json:"lastBackupJobName,omitempty"`
+
+	// CronJobName is the name of the scheduled backup CronJob, when present.
+	// +optional
+	CronJobName string `json:"cronJobName,omitempty"`
+
+	// BackupHistory contains the most recent backup entries.
+	// +optional
+	BackupHistory []BackupHistoryEntry `json:"backupHistory,omitempty"`
 
 	// DataLoadingJobs is the number of active data loading jobs.
 	// +optional

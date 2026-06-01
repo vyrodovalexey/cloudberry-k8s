@@ -302,25 +302,105 @@ func validateQueryMonitoring(cluster *cbv1alpha1.CloudberryCluster) error {
 	return nil
 }
 
-// validateBackup validates backup configuration.
+// backupDestinationTypeS3 is the s3 destination type discriminator.
+const backupDestinationTypeS3 = "s3"
+
+// backupDestinationTypeLocal is the local destination type discriminator.
+const backupDestinationTypeLocal = "local"
+
+// validateBackup validates backup configuration per spec 11 §Webhook Validation.
+// It enforces the full rule set when backup is enabled.
 func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
-	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+	backup := cluster.Spec.Backup
+	if backup == nil || !backup.Enabled {
 		return nil
 	}
 
-	if cluster.Spec.Backup.Destination.Type == "" {
+	if err := validateBackupDestination(&backup.Destination); err != nil {
+		return err
+	}
+	if err := validateBackupGpbackup(backup.Gpbackup); err != nil {
+		return err
+	}
+	if err := validateBackupGprestore(backup.Gprestore); err != nil {
+		return err
+	}
+	if backup.Schedule != "" {
+		if err := validateCron(backup.Schedule); err != nil {
+			return fmt.Errorf("backup.schedule is not a valid cron expression: %w", err)
+		}
+	}
+	if backup.Image == "" {
+		return fmt.Errorf("backup.image is required when backup is enabled")
+	}
+	return nil
+}
+
+// validateBackupDestination validates the destination type and, for s3, the
+// required bucket and credential secret fields (rules 1-3).
+func validateBackupDestination(dest *cbv1alpha1.BackupDestination) error {
+	switch dest.Type {
+	case "":
 		return fmt.Errorf("backup.destination.type is required when backup is enabled")
+	case backupDestinationTypeS3, backupDestinationTypeLocal:
+		// Valid types.
+	default:
+		return fmt.Errorf("backup.destination.type must be %q or %q, got %q",
+			backupDestinationTypeS3, backupDestinationTypeLocal, dest.Type)
 	}
 
-	if cluster.Spec.Backup.Destination.Type == "s3" && cluster.Spec.Backup.Destination.Bucket == "" {
-		return fmt.Errorf("backup.destination.bucket is required for S3 destinations")
+	if dest.Type != backupDestinationTypeS3 {
+		return nil
 	}
-
-	if cluster.Spec.Backup.Compression < 0 || cluster.Spec.Backup.Compression > 9 {
-		return fmt.Errorf("backup.compression must be between 0 and 9, got %d",
-			cluster.Spec.Backup.Compression)
+	s3 := dest.S3
+	if s3 == nil || s3.Bucket == "" {
+		return fmt.Errorf("backup.destination.s3.bucket is required for S3 destinations")
 	}
+	if s3.CredentialSecret == nil || s3.CredentialSecret.Name == "" {
+		return fmt.Errorf(
+			"backup.destination.s3.credentialSecret.name is required for S3 destinations")
+	}
+	return nil
+}
 
+// validateBackupGpbackup validates gpbackup option constraints (rules 4-8).
+func validateBackupGpbackup(gp *cbv1alpha1.GpbackupOptions) error {
+	if gp == nil {
+		return nil
+	}
+	if gp.CompressionLevel != 0 && (gp.CompressionLevel < 1 || gp.CompressionLevel > 9) {
+		return fmt.Errorf("backup.gpbackup.compressionLevel must be between 1 and 9, got %d",
+			gp.CompressionLevel)
+	}
+	if gp.CompressionType != "" && gp.CompressionType != "gzip" && gp.CompressionType != "zstd" {
+		return fmt.Errorf("backup.gpbackup.compressionType must be gzip or zstd, got %q",
+			gp.CompressionType)
+	}
+	if gp.CopyQueueSize > 0 && !gp.SingleDataFile {
+		return fmt.Errorf(
+			"backup.gpbackup.copyQueueSize requires backup.gpbackup.singleDataFile to be true")
+	}
+	if gp.Jobs > 1 && gp.SingleDataFile {
+		return fmt.Errorf(
+			"backup.gpbackup.jobs cannot be combined with backup.gpbackup.singleDataFile")
+	}
+	if gp.Incremental && !gp.LeafPartitionData {
+		return fmt.Errorf(
+			"backup.gpbackup.incremental requires backup.gpbackup.leafPartitionData to be true")
+	}
+	return nil
+}
+
+// validateBackupGprestore validates gprestore option constraints. gprestore
+// --data-only and --metadata-only are mutually exclusive and cannot both be set.
+func validateBackupGprestore(gr *cbv1alpha1.GprestoreOptions) error {
+	if gr == nil {
+		return nil
+	}
+	if gr.DataOnly && gr.MetadataOnly {
+		return fmt.Errorf(
+			"backup.gprestore.dataOnly and backup.gprestore.metadataOnly cannot both be true")
+	}
 	return nil
 }
 

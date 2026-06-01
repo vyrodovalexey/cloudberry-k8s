@@ -23,6 +23,7 @@ const (
 	labelSourceType = "source_type"
 	labelSource     = "source"
 	labelWebhook    = "webhook"
+	labelTimestamp  = "timestamp"
 )
 
 // Recorder defines the interface for recording metrics.
@@ -80,9 +81,20 @@ type Recorder interface {
 	// RecordBackup records a backup event by type and status.
 	RecordBackup(cluster, namespace, backupType, status string)
 	// ObserveBackupDuration records the duration of a backup operation.
-	ObserveBackupDuration(cluster, namespace string, duration time.Duration)
-	// SetBackupSizeBytes sets the size of the last backup.
-	SetBackupSizeBytes(cluster, namespace string, bytes float64)
+	ObserveBackupDuration(cluster, namespace, backupType string, duration time.Duration)
+	// SetBackupSizeBytes sets the size of a backup identified by its timestamp.
+	SetBackupSizeBytes(cluster, namespace, timestamp string, bytes float64)
+	// SetBackupLastSuccessTimestamp sets the Unix timestamp of the last successful backup.
+	SetBackupLastSuccessTimestamp(cluster, namespace string, ts float64)
+	// SetBackupLastStatus sets the last backup status (0=success, 1=failed, 2=in-progress).
+	SetBackupLastStatus(cluster, namespace string, status float64)
+	// ObserveRestoreDuration records the duration of a restore operation.
+	ObserveRestoreDuration(cluster, namespace string, duration time.Duration)
+	// RecordBackupRetentionDeleted records the number of backups deleted by retention policy.
+	RecordBackupRetentionDeleted(cluster, namespace string, n int)
+	// SetBackupJobStatus sets a Kubernetes backup Job status
+	// (0=pending, 1=running, 2=succeeded, 3=failed).
+	SetBackupJobStatus(cluster, namespace, job, operation string, status float64)
 	// RecordRestore records a restore event.
 	RecordRestore(cluster, namespace, status string)
 	// SetDataLoadingJobsActive sets the number of active data loading jobs.
@@ -209,12 +221,17 @@ type PrometheusRecorder struct {
 	idleSessionTermination *prometheus.CounterVec
 	slowQueries            *prometheus.CounterVec
 
-	backupTotal          *prometheus.CounterVec
-	backupDuration       *prometheus.HistogramVec
-	backupSizeBytes      *prometheus.GaugeVec
-	restoreTotal         *prometheus.CounterVec
-	dataLoadingJobsGauge *prometheus.GaugeVec
-	dataLoadingRows      *prometheus.CounterVec
+	backupTotal                *prometheus.CounterVec
+	backupDuration             *prometheus.HistogramVec
+	backupSizeBytes            *prometheus.GaugeVec
+	backupLastSuccessTimestamp *prometheus.GaugeVec
+	backupLastStatus           *prometheus.GaugeVec
+	restoreDuration            *prometheus.HistogramVec
+	backupRetentionDeleted     *prometheus.CounterVec
+	backupJobStatus            *prometheus.GaugeVec
+	restoreTotal               *prometheus.CounterVec
+	dataLoadingJobsGauge       *prometheus.GaugeVec
+	dataLoadingRows            *prometheus.CounterVec
 
 	diskUsagePercent      *prometheus.GaugeVec
 	recommendationsTotal  *prometheus.GaugeVec
@@ -443,12 +460,38 @@ func (r *PrometheusRecorder) initBackupMetrics() {
 		Name:      "backup_duration_seconds",
 		Help:      "Duration of backup operations in seconds.",
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
-	}, []string{labelCluster, labelNamespace})
+	}, []string{labelCluster, labelNamespace, labelType})
 	r.backupSizeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Name:      "backup_size_bytes",
-		Help:      "Size of the last backup in bytes.",
+		Help:      "Size of a backup in bytes per timestamp.",
+	}, []string{labelCluster, labelNamespace, labelTimestamp})
+	r.backupLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_last_success_timestamp",
+		Help:      "Unix timestamp of the last successful backup.",
 	}, []string{labelCluster, labelNamespace})
+	r.backupLastStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_last_status",
+		Help:      "Last backup status (0=success, 1=failed, 2=in-progress).",
+	}, []string{labelCluster, labelNamespace})
+	r.restoreDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "restore_duration_seconds",
+		Help:      "Duration of restore operations in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+	}, []string{labelCluster, labelNamespace})
+	r.backupRetentionDeleted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_retention_deleted_total",
+		Help:      "Total number of backups deleted by retention policy.",
+	}, []string{labelCluster, labelNamespace})
+	r.backupJobStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_job_status",
+		Help:      "Kubernetes backup Job status (0=pending, 1=running, 2=succeeded, 3=failed).",
+	}, []string{labelCluster, labelNamespace, labelJob, labelOperation})
 	r.restoreTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "restore_total",
@@ -701,6 +744,8 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.workloadRuleActions, r.resourceGroupCPU, r.resourceGroupMemory,
 		r.idleSessionTermination, r.slowQueries,
 		r.backupTotal, r.backupDuration, r.backupSizeBytes,
+		r.backupLastSuccessTimestamp, r.backupLastStatus, r.restoreDuration,
+		r.backupRetentionDeleted, r.backupJobStatus,
 		r.restoreTotal, r.dataLoadingJobsGauge, r.dataLoadingRows,
 		r.diskUsagePercent, r.recommendationsTotal,
 		r.recommendationScanDur, r.tableBloatRatio,
@@ -867,13 +912,39 @@ func (r *PrometheusRecorder) RecordBackup(cluster, namespace, backupType, status
 }
 
 // ObserveBackupDuration records the duration of a backup operation.
-func (r *PrometheusRecorder) ObserveBackupDuration(cluster, namespace string, duration time.Duration) {
-	r.backupDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+func (r *PrometheusRecorder) ObserveBackupDuration(cluster, namespace, backupType string, duration time.Duration) {
+	r.backupDuration.WithLabelValues(cluster, namespace, backupType).Observe(duration.Seconds())
 }
 
-// SetBackupSizeBytes sets the size of the last backup.
-func (r *PrometheusRecorder) SetBackupSizeBytes(cluster, namespace string, bytes float64) {
-	r.backupSizeBytes.WithLabelValues(cluster, namespace).Set(bytes)
+// SetBackupSizeBytes sets the size of a backup identified by its timestamp.
+func (r *PrometheusRecorder) SetBackupSizeBytes(cluster, namespace, timestamp string, bytes float64) {
+	r.backupSizeBytes.WithLabelValues(cluster, namespace, timestamp).Set(bytes)
+}
+
+// SetBackupLastSuccessTimestamp sets the Unix timestamp of the last successful backup.
+func (r *PrometheusRecorder) SetBackupLastSuccessTimestamp(cluster, namespace string, ts float64) {
+	r.backupLastSuccessTimestamp.WithLabelValues(cluster, namespace).Set(ts)
+}
+
+// SetBackupLastStatus sets the last backup status (0=success, 1=failed, 2=in-progress).
+func (r *PrometheusRecorder) SetBackupLastStatus(cluster, namespace string, status float64) {
+	r.backupLastStatus.WithLabelValues(cluster, namespace).Set(status)
+}
+
+// ObserveRestoreDuration records the duration of a restore operation.
+func (r *PrometheusRecorder) ObserveRestoreDuration(cluster, namespace string, duration time.Duration) {
+	r.restoreDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// RecordBackupRetentionDeleted records the number of backups deleted by retention policy.
+func (r *PrometheusRecorder) RecordBackupRetentionDeleted(cluster, namespace string, n int) {
+	r.backupRetentionDeleted.WithLabelValues(cluster, namespace).Add(float64(n))
+}
+
+// SetBackupJobStatus sets a Kubernetes backup Job status
+// (0=pending, 1=running, 2=succeeded, 3=failed).
+func (r *PrometheusRecorder) SetBackupJobStatus(cluster, namespace, job, operation string, status float64) {
+	r.backupJobStatus.WithLabelValues(cluster, namespace, job, operation).Set(status)
 }
 
 // RecordRestore records a restore event.
@@ -1177,10 +1248,25 @@ func (n *NoopRecorder) RecordSlowQuery(_, _ string) {}
 func (n *NoopRecorder) RecordBackup(_, _, _, _ string) {}
 
 // ObserveBackupDuration is a no-op implementation for testing.
-func (n *NoopRecorder) ObserveBackupDuration(_, _ string, _ time.Duration) {}
+func (n *NoopRecorder) ObserveBackupDuration(_, _, _ string, _ time.Duration) {}
 
 // SetBackupSizeBytes is a no-op implementation for testing.
-func (n *NoopRecorder) SetBackupSizeBytes(_, _ string, _ float64) {}
+func (n *NoopRecorder) SetBackupSizeBytes(_, _, _ string, _ float64) {}
+
+// SetBackupLastSuccessTimestamp is a no-op implementation for testing.
+func (n *NoopRecorder) SetBackupLastSuccessTimestamp(_, _ string, _ float64) {}
+
+// SetBackupLastStatus is a no-op implementation for testing.
+func (n *NoopRecorder) SetBackupLastStatus(_, _ string, _ float64) {}
+
+// ObserveRestoreDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveRestoreDuration(_, _ string, _ time.Duration) {}
+
+// RecordBackupRetentionDeleted is a no-op implementation for testing.
+func (n *NoopRecorder) RecordBackupRetentionDeleted(_, _ string, _ int) {}
+
+// SetBackupJobStatus is a no-op implementation for testing.
+func (n *NoopRecorder) SetBackupJobStatus(_, _, _, _ string, _ float64) {}
 
 // RecordRestore is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRestore(_, _, _ string) {}

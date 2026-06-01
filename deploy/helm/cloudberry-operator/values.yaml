@@ -46,6 +46,22 @@ rbac:
   create: true
 
 # =============================================================================
+# Backup RBAC
+# =============================================================================
+# Backup/restore Jobs run under the dedicated `cloudberry-backup-sa`
+# ServiceAccount (see internal/util/names.go BackupServiceAccountName). The
+# chart creates the ServiceAccount, Role and RoleBinding in the chart release
+# namespace. Note: backup Jobs run in the CLUSTER's namespace; for clusters
+# deployed in a namespace other than the chart release namespace, the
+# `cloudberry-backup-sa` ServiceAccount, Role and RoleBinding must also be
+# created in that namespace.
+backup:
+  rbac:
+    # -- Create the cloudberry-backup-sa ServiceAccount, Role and RoleBinding
+    # for backup/restore Jobs in the release namespace.
+    create: true
+
+# =============================================================================
 # Operator Configuration
 # =============================================================================
 operator:

@@ -215,7 +215,7 @@ func TestAdminReconciler_ReconcileSubComponents_BackupEnabled(t *testing.T) {
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:     true,
-		Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "test-bucket"},
+		Destination: cbv1alpha1.BackupDestination{Type: "s3", S3: &cbv1alpha1.S3Destination{Bucket: "test-bucket"}},
 	}
 
 	k8sClient := fake.NewClientBuilder().
@@ -302,7 +302,7 @@ func TestAdminReconciler_ReconcileSubComponents_ErrorsJoinMultiple(t *testing.T)
 	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:     true,
-		Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "b"},
+		Destination: cbv1alpha1.BackupDestination{Type: "s3", S3: &cbv1alpha1.S3Destination{Bucket: "b"}},
 	}
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
 	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{

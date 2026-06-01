@@ -301,39 +301,74 @@ func TestSetBackupDefaults(t *testing.T) {
 		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 			Enabled: true,
 			Destination: cbv1alpha1.BackupDestination{
-				Type:   "s3",
-				Bucket: "my-bucket",
+				Type: "s3",
+				S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
 			},
 		}
 		setBackupDefaults(cluster)
 
-		assert.Equal(t, int32(6), cluster.Spec.Backup.Compression)
-		assert.Equal(t, int32(1), cluster.Spec.Backup.Parallelism)
+		gp := cluster.Spec.Backup.Gpbackup
+		require.NotNil(t, gp)
+		assert.Equal(t, int32(1), gp.CompressionLevel)
+		assert.Equal(t, "gzip", gp.CompressionType)
+		assert.Equal(t, int32(1), gp.Jobs)
+		assert.False(t, gp.SingleDataFile)
+		assert.True(t, gp.WithStats)
+
+		gr := cluster.Spec.Backup.Gprestore
+		require.NotNil(t, gr)
+		assert.Equal(t, int32(1), gr.Jobs)
+		assert.True(t, gr.WithStats)
+
 		assert.Equal(t, int32(3), cluster.Spec.Backup.Retention.FullCount)
 		assert.Equal(t, "30d", cluster.Spec.Backup.Retention.MaxAge)
+
+		jt := cluster.Spec.Backup.JobTemplate
+		require.NotNil(t, jt)
+		require.NotNil(t, jt.BackoffLimit)
+		assert.Equal(t, int32(2), *jt.BackoffLimit)
+		require.NotNil(t, jt.ActiveDeadlineSeconds)
+		assert.Equal(t, int64(7200), *jt.ActiveDeadlineSeconds)
+		require.NotNil(t, jt.TTLSecondsAfterFinished)
+		assert.Equal(t, int32(86400), *jt.TTLSecondsAfterFinished)
+	})
+
+	t.Run("disabled backup gets no defaults", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{Enabled: false}
+		setBackupDefaults(cluster)
+		assert.Nil(t, cluster.Spec.Backup.Gpbackup)
+		assert.Nil(t, cluster.Spec.Backup.JobTemplate)
 	})
 
 	t.Run("existing backup values preserved", func(t *testing.T) {
 		cluster := newMinimalCluster()
 		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
-			Enabled:     true,
-			Compression: 9,
-			Parallelism: 4,
+			Enabled:  true,
+			Gpbackup: &cbv1alpha1.GpbackupOptions{CompressionLevel: 9, Jobs: 4},
 			Retention: cbv1alpha1.BackupRetention{
 				FullCount: 5,
 				MaxAge:    "90d",
 			},
+			JobTemplate: &cbv1alpha1.BackupJobTemplate{
+				BackoffLimit: util.Ptr(int32(7)),
+			},
 			Destination: cbv1alpha1.BackupDestination{
-				Type:   "s3",
-				Bucket: "my-bucket",
+				Type: "s3",
+				S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
 			},
 		}
 		setBackupDefaults(cluster)
 
-		assert.Equal(t, int32(9), cluster.Spec.Backup.Compression)
-		assert.Equal(t, int32(4), cluster.Spec.Backup.Parallelism)
+		assert.Equal(t, int32(9), cluster.Spec.Backup.Gpbackup.CompressionLevel)
+		assert.Equal(t, int32(4), cluster.Spec.Backup.Gpbackup.Jobs)
 		assert.Equal(t, int32(5), cluster.Spec.Backup.Retention.FullCount)
 		assert.Equal(t, "90d", cluster.Spec.Backup.Retention.MaxAge)
+		// User-provided JobTemplate pointer fields are preserved; unset ones default.
+		require.NotNil(t, cluster.Spec.Backup.JobTemplate.BackoffLimit)
+		assert.Equal(t, int32(7), *cluster.Spec.Backup.JobTemplate.BackoffLimit)
+		require.NotNil(t, cluster.Spec.Backup.JobTemplate.ActiveDeadlineSeconds)
+		assert.Equal(t, int64(7200), *cluster.Spec.Backup.JobTemplate.ActiveDeadlineSeconds)
 	})
 }
 

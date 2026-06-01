@@ -222,45 +222,91 @@ spec:
               backup:
                 description: Backup defines backup and restore configuration.
                 properties:
-                  compression:
-                    description: Compression is the compression level (0-9).
-                    format: int32
-                    maximum: 9
-                    minimum: 0
-                    type: integer
                   destination:
                     description: Destination defines where backups are stored.
                     properties:
-                      bucket:
-                        description: Bucket is the S3 bucket name.
-                        type: string
-                      credentialSecret:
-                        description: CredentialSecret references the secret containing
-                          storage credentials.
+                      local:
+                        description: Local defines the local (PVC-backed) destination
+                          configuration.
                         properties:
-                          key:
-                            description: Key is the key within the secret.
+                          path:
+                            description: Path maps to gpbackup --backup-dir.
                             type: string
-                          name:
-                            description: Name is the name of the secret.
+                          persistentVolumeClaim:
+                            description: PersistentVolumeClaim is the PVC mounted
+                              into the Job pod.
                             type: string
-                        required:
-                        - name
                         type: object
-                      endpoint:
-                        description: Endpoint is the S3-compatible endpoint (for MinIO).
-                        type: string
-                      forcePathStyle:
-                        default: false
-                        description: ForcePathStyle enables path-style addressing
-                          for S3-compatible storage.
-                        type: boolean
-                      path:
-                        description: Path is the storage path prefix.
-                        type: string
-                      region:
-                        description: Region is the S3 region.
-                        type: string
+                      s3:
+                        description: S3 defines the S3-compatible destination configuration.
+                        properties:
+                          bucket:
+                            description: Bucket is the S3 bucket name.
+                            type: string
+                          credentialSecret:
+                            description: CredentialSecret references the Secret containing
+                              S3 credentials.
+                            properties:
+                              accessKeyField:
+                                description: AccessKeyField is the Secret key holding
+                                  the access key id.
+                                type: string
+                              name:
+                                description: Name is the name of the Secret.
+                                type: string
+                              secretKeyField:
+                                description: SecretKeyField is the Secret key holding
+                                  the secret access key.
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          encryption:
+                            description: Encryption controls S3 plugin SSL encryption
+                              (on|off).
+                            enum:
+                            - "on"
+                            - "off"
+                            type: string
+                          endpoint:
+                            description: Endpoint is the S3-compatible endpoint (for
+                              MinIO); omit for AWS.
+                            type: string
+                          folder:
+                            description: Folder is the S3 folder prefix (maps to gpbackup_s3_plugin
+                              folder).
+                            type: string
+                          forcePathStyle:
+                            default: false
+                            description: ForcePathStyle enables path-style addressing
+                              (required for MinIO).
+                            type: boolean
+                          multipart:
+                            description: Multipart defines S3 multipart transfer tuning
+                              options.
+                            properties:
+                              backupMaxConcurrentRequests:
+                                description: BackupMaxConcurrentRequests maps to backup_max_concurrent_requests.
+                                format: int32
+                                type: integer
+                              backupMultipartChunksize:
+                                description: BackupMultipartChunksize maps to backup_multipart_chunksize
+                                  (e.g. "10MB").
+                                type: string
+                              restoreMaxConcurrentRequests:
+                                description: RestoreMaxConcurrentRequests maps to
+                                  restore_max_concurrent_requests.
+                                format: int32
+                                type: integer
+                              restoreMultipartChunksize:
+                                description: RestoreMultipartChunksize maps to restore_multipart_chunksize
+                                  (e.g. "10MB").
+                                type: string
+                            type: object
+                          region:
+                            description: Region is the S3 region.
+                            type: string
+                        type: object
                       type:
                         description: Type is the destination type (s3, local).
                         enum:
@@ -274,14 +320,188 @@ spec:
                     default: false
                     description: Enabled controls whether backup is active.
                     type: boolean
-                  incremental:
-                    default: false
-                    description: Incremental enables incremental backups.
-                    type: boolean
-                  parallelism:
-                    description: Parallelism is the number of parallel backup workers.
-                    format: int32
-                    type: integer
+                  gpbackup:
+                    description: Gpbackup defines default gpbackup options applied
+                      to backup Jobs.
+                    properties:
+                      compressionLevel:
+                        description: CompressionLevel maps to --compression-level
+                          (1-9).
+                        format: int32
+                        maximum: 9
+                        minimum: 1
+                        type: integer
+                      compressionType:
+                        description: CompressionType maps to --compression-type (gzip|zstd).
+                        enum:
+                        - gzip
+                        - zstd
+                        type: string
+                      copyQueueSize:
+                        description: CopyQueueSize maps to --copy-queue-size (requires
+                          SingleDataFile).
+                        format: int32
+                        type: integer
+                      incremental:
+                        default: false
+                        description: Incremental maps to --incremental.
+                        type: boolean
+                      jobs:
+                        description: Jobs maps to --jobs (parallel backup workers).
+                        format: int32
+                        type: integer
+                      leafPartitionData:
+                        default: false
+                        description: LeafPartitionData maps to --leaf-partition-data.
+                        type: boolean
+                      noCompression:
+                        default: false
+                        description: NoCompression maps to --no-compression (overrides
+                          compressionLevel).
+                        type: boolean
+                      singleDataFile:
+                        default: false
+                        description: SingleDataFile maps to --single-data-file.
+                        type: boolean
+                      withStats:
+                        description: WithStats maps to --with-stats.
+                        type: boolean
+                      withoutGlobals:
+                        default: false
+                        description: WithoutGlobals maps to --without-globals.
+                        type: boolean
+                    type: object
+                  gprestore:
+                    description: Gprestore defines default gprestore options applied
+                      to restore Jobs.
+                    properties:
+                      createDb:
+                        default: false
+                        description: CreateDb maps to --create-db.
+                        type: boolean
+                      dataOnly:
+                        default: false
+                        description: |-
+                          DataOnly maps to --data-only (restore data without recreating objects).
+                          Mutually exclusive with MetadataOnly.
+                        type: boolean
+                      jobs:
+                        description: Jobs maps to --jobs (parallel restore workers).
+                        format: int32
+                        type: integer
+                      metadataOnly:
+                        default: false
+                        description: |-
+                          MetadataOnly maps to --metadata-only (restore object definitions only).
+                          Mutually exclusive with DataOnly.
+                        type: boolean
+                      onErrorContinue:
+                        default: false
+                        description: OnErrorContinue maps to --on-error-continue.
+                        type: boolean
+                      resizeCluster:
+                        default: false
+                        description: ResizeCluster maps to --resize-cluster (restore
+                          into a differently sized cluster).
+                        type: boolean
+                      runAnalyze:
+                        default: false
+                        description: RunAnalyze maps to --run-analyze.
+                        type: boolean
+                      truncateTable:
+                        default: false
+                        description: TruncateTable maps to --truncate-table.
+                        type: boolean
+                      withGlobals:
+                        default: false
+                        description: WithGlobals maps to --with-globals.
+                        type: boolean
+                      withStats:
+                        description: WithStats maps to --with-stats.
+                        type: boolean
+                    type: object
+                  image:
+                    description: Image is the backup toolchain container image (e.g.
+                      cloudberry-backup:2.1.0).
+                    type: string
+                  jobTemplate:
+                    description: JobTemplate defines pod template overrides for all
+                      backup/restore Jobs.
+                    properties:
+                      activeDeadlineSeconds:
+                        description: ActiveDeadlineSeconds is the Job timeout in seconds.
+                        format: int64
+                        type: integer
+                      backoffLimit:
+                        description: BackoffLimit is the number of retries before
+                          the Job is marked failed.
+                        format: int32
+                        type: integer
+                      nodeSelector:
+                        additionalProperties:
+                          type: string
+                        description: NodeSelector constrains the Job pod to matching
+                          nodes.
+                        type: object
+                      resources:
+                        description: Resources defines compute resource requirements
+                          for the Job pod.
+                        properties:
+                          limits:
+                            description: Limits defines maximum resource limits.
+                            properties:
+                              cpu:
+                                description: CPU is the CPU resource quantity.
+                                type: string
+                              memory:
+                                description: Memory is the memory resource quantity.
+                                type: string
+                            type: object
+                          requests:
+                            description: Requests defines minimum resource requirements.
+                            properties:
+                              cpu:
+                                description: CPU is the CPU resource quantity.
+                                type: string
+                              memory:
+                                description: Memory is the memory resource quantity.
+                                type: string
+                            type: object
+                        type: object
+                      serviceAccountName:
+                        description: ServiceAccountName is the ServiceAccount used
+                          by the Job pod.
+                        type: string
+                      tolerations:
+                        description: Tolerations allow the Job pod to schedule onto
+                          tainted nodes.
+                        items:
+                          description: Toleration defines a Kubernetes toleration.
+                          properties:
+                            effect:
+                              description: Effect is the taint effect.
+                              type: string
+                            key:
+                              description: Key is the taint key.
+                              type: string
+                            operator:
+                              description: Operator is the toleration operator.
+                              type: string
+                            tolerationSeconds:
+                              description: TolerationSeconds is the toleration duration.
+                              format: int64
+                              type: integer
+                            value:
+                              description: Value is the taint value.
+                              type: string
+                          type: object
+                        type: array
+                      ttlSecondsAfterFinished:
+                        description: TTLSecondsAfterFinished cleans up finished Jobs
+                          after the given seconds.
+                        format: int32
+                        type: integer
+                    type: object
                   retention:
                     description: Retention defines backup retention policy.
                     properties:
@@ -301,6 +521,7 @@ spec:
                     type: object
                   schedule:
                     description: Schedule is the cron expression for scheduled backups.
+                      Empty disables the CronJob.
                     type: string
                 required:
                 - destination
@@ -1422,6 +1643,31 @@ spec:
                 description: ActiveQueries is the number of currently active queries.
                 format: int32
                 type: integer
+              backupHistory:
+                description: BackupHistory contains the most recent backup entries.
+                items:
+                  description: BackupHistoryEntry describes a single backup recorded
+                    in cluster status.
+                  properties:
+                    duration:
+                      description: Duration is the human-readable backup duration
+                        (e.g. "5m32s").
+                      type: string
+                    size:
+                      description: Size is the human-readable backup size (e.g. "2.4Gi").
+                      type: string
+                    status:
+                      description: Status is the backup result (Success | Failed |
+                        InProgress).
+                      type: string
+                    timestamp:
+                      description: Timestamp is the gpbackup YYYYMMDDHHMMSS timestamp.
+                      type: string
+                    type:
+                      description: Type is the backup type (full | incremental).
+                      type: string
+                  type: object
+                type: array
               blockedQueries:
                 description: BlockedQueries is the number of currently blocked queries.
                 format: int32
@@ -1491,6 +1737,10 @@ spec:
                 description: CoordinatorReady indicates whether the coordinator is
                   ready.
                 type: boolean
+              cronJobName:
+                description: CronJobName is the name of the scheduled backup CronJob,
+                  when present.
+                type: string
               dataLoadingJobs:
                 description: DataLoadingJobs is the number of active data loading
                   jobs.
@@ -1527,6 +1777,10 @@ spec:
                   - status
                   type: object
                 type: array
+              lastBackupJobName:
+                description: LastBackupJobName is the name of the Job that produced
+                  the last backup.
+                type: string
               lastBackupStatus:
                 description: LastBackupStatus is the status of the last backup (Success,
                   Failed, InProgress).
@@ -1534,6 +1788,14 @@ spec:
               lastBackupTime:
                 description: LastBackupTime is the timestamp of the last backup.
                 format: date-time
+                type: string
+              lastBackupTimestamp:
+                description: LastBackupTimestamp is the gpbackup YYYYMMDDHHMMSS timestamp
+                  of the last backup.
+                type: string
+              lastBackupType:
+                description: LastBackupType is the type of the last backup (full |
+                  incremental).
                 type: string
               lastConfigChangeTime:
                 description: LastConfigChangeTime is the timestamp of the last configuration

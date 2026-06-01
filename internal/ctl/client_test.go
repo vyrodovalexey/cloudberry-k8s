@@ -157,6 +157,25 @@ func TestOperatorClient_Put(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+func TestOperatorClient_Patch(t *testing.T) {
+	var body map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPatch, r.Method)
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+	}))
+	defer server.Close()
+
+	client := NewOperatorClient(ClientConfig{BaseURL: server.URL})
+	resp, err := client.Patch(context.Background(),
+		"/clusters/test/backups/schedule", map[string]string{"schedule": "0 3 * * *"})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "0 3 * * *", body["schedule"])
+}
+
 func TestOperatorClient_Delete(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodDelete, r.Method)

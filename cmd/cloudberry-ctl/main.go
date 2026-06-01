@@ -61,11 +61,14 @@ const (
 	cmdStart  = "start"
 	cmdStop   = "stop"
 	cmdExport = "export"
+	cmdJobs   = "jobs"
 )
 
 // JSON body field name constants to avoid string duplication.
 const (
-	fieldName = "name"
+	fieldName   = "name"
+	fieldTables = "tables"
+	fieldJobs   = "jobs"
 )
 
 // globalFlags holds the global CLI flags.
@@ -210,6 +213,22 @@ func runAPIDelete(path string) error {
 	return newFormatter().Format(resp.Body)
 }
 
+// runAPIPatch is a helper that creates a client, performs a PATCH request, and formats the output.
+func runAPIPatch(path string, body interface{}) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	resp, apiErr := client.Patch(ctx, path, body)
+	if apiErr != nil {
+		return apiErr
+	}
+	return newFormatter().Format(resp.Body)
+}
+
 // newRootCmd creates the root command.
 func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -262,6 +281,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newWorkloadCmd(),
 		newQueryCmd(),
 		newBackupCmd(),
+		newMigrateCmd(),
 		newDataLoadingCmd(),
 		newStorageCmd(),
 		newCompletionCmd(),
@@ -643,7 +663,7 @@ func newHACmd() *cobra.Command {
 			tables, _ := cmd.Flags().GetString("tables")
 			if tables != "" {
 				body := map[string]interface{}{
-					"tables": strings.Split(tables, ","),
+					fieldTables: strings.Split(tables, ","),
 				}
 				return runAPIPost(ctl.ClusterActionPath(
 					globals.cluster, "rebalance", globals.namespace), body)
@@ -950,7 +970,7 @@ func newMaintenanceCmd() *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:   "jobs",
+			Use:   cmdJobs,
 			Short: "List maintenance jobs",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				if err := requireCluster(); err != nil {
@@ -2309,6 +2329,69 @@ func newQueryHistoryCmd() *cobra.Command {
 }
 
 // newBackupCmd creates the backup command group.
+// migrateFlags holds the flags for the `migrate` command.
+type migrateFlags struct {
+	sourceCluster  string
+	targetCluster  string
+	database       string
+	tables         []string
+	truncate       bool
+	redirectDb     string
+	redirectSchema string
+	jobs           int32
+}
+
+// newMigrateCmd creates the `migrate` command for cross-cluster database
+// migration. It POSTs to the source cluster's /migrate endpoint, which creates a
+// coordinated backup Job (source) and restore Job (target) sharing one S3 bucket.
+func newMigrateCmd() *cobra.Command {
+	f := &migrateFlags{}
+	cmd := &cobra.Command{
+		Use:   "migrate",
+		Short: "Migrate a database between two clusters",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runMigrate(f)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.sourceCluster, "source-cluster", "", "Source cluster name")
+	fl.StringVar(&f.targetCluster, "target-cluster", "", "Target cluster name")
+	fl.StringVar(&f.database, "database", "", "Database to migrate")
+	fl.StringSliceVar(&f.tables, "tables", nil, "Tables to migrate (comma-separated)")
+	fl.BoolVar(&f.truncate, "truncate", false, "Truncate target tables before restore")
+	fl.StringVar(&f.redirectDb, "redirect-db", "", "gprestore --redirect-db on the target")
+	fl.StringVar(&f.redirectSchema, "redirect-schema", "", "gprestore --redirect-schema on the target")
+	fl.Int32Var(&f.jobs, "jobs", 0, "gprestore --jobs on the target")
+	return cmd
+}
+
+// runMigrate validates the migrate flags and posts the migration request.
+func runMigrate(f *migrateFlags) error {
+	if f.sourceCluster == "" {
+		return fmt.Errorf("--source-cluster is required")
+	}
+	if f.targetCluster == "" {
+		return fmt.Errorf("--target-cluster is required")
+	}
+	req := buildMigrateRequest(f)
+	path := ctl.ClusterSubresourcePath(f.sourceCluster, "migrate", globals.namespace)
+	return runAPIPost(path, req)
+}
+
+// buildMigrateRequest assembles the migrate request body from flags.
+func buildMigrateRequest(f *migrateFlags) map[string]interface{} {
+	return map[string]interface{}{
+		"sourceCluster":  f.sourceCluster,
+		"targetCluster":  f.targetCluster,
+		"database":       f.database,
+		fieldTables:      f.tables,
+		"truncate":       f.truncate,
+		"redirectDb":     f.redirectDb,
+		"redirectSchema": f.redirectSchema,
+		fieldJobs:        f.jobs,
+	}
+}
+
 func newBackupCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "backup",
@@ -2316,78 +2399,329 @@ func newBackupCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		&cobra.Command{
-			Use:   cmdCreate,
-			Short: "Create a new backup",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIPost(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace), nil)
-			},
-		},
-		&cobra.Command{
-			Use:   cmdList,
-			Short: "List available backups",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
-			},
-		},
-		&cobra.Command{
-			Use:   cmdDelete + " [backup-id]",
-			Short: "Delete a backup",
-			Args:  cobra.ExactArgs(1),
-			RunE: func(_ *cobra.Command, args []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				path := appendNamespaceQuery(
-					fmt.Sprintf("/clusters/%s/backups/%s", url.PathEscape(globals.cluster), url.PathEscape(args[0])),
-					globals.namespace)
-				return runAPIDelete(path)
-			},
-		},
-		&cobra.Command{
-			Use:   "restore [backup-id]",
-			Short: "Restore from a backup",
-			Args:  cobra.ExactArgs(1),
-			RunE: func(_ *cobra.Command, args []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				path := appendNamespaceQuery(
-					fmt.Sprintf("/clusters/%s/backups/%s/restore",
-						url.PathEscape(globals.cluster),
-						url.PathEscape(args[0])),
-					globals.namespace)
-				return runAPIPost(path, nil)
-			},
-		},
-		&cobra.Command{
-			Use:   cmdStatus,
-			Short: "Show backup status",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
-			},
-		},
-		&cobra.Command{
-			Use:   "schedule",
-			Short: "Manage backup schedule",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return notImplemented("backup schedule")
-			},
-		},
+		newBackupCreateCmd(),
+		newBackupListCmd(),
+		newBackupStatusCmd(),
+		newBackupDeleteCmd(),
+		newBackupRestoreCmd(),
+		newBackupScheduleCmd(),
+		newBackupJobsCmd(),
 	)
 
+	return cmd
+}
+
+// backupCreateFlags holds the flags for `backup create`.
+type backupCreateFlags struct {
+	databases         []string
+	backupType        string
+	compressionLevel  int32
+	compressionType   string
+	jobs              int32
+	singleDataFile    bool
+	copyQueueSize     int32
+	includeSchemas    []string
+	excludeTables     []string
+	incremental       bool
+	fromTimestamp     string
+	leafPartitionData bool
+	withStats         bool
+	withoutGlobals    bool
+}
+
+// newBackupCreateCmd creates the `backup create` subcommand.
+func newBackupCreateCmd() *cobra.Command {
+	f := &backupCreateFlags{}
+	cmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create a new backup",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			req := buildCreateBackupRequest(f)
+			path := ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace)
+			return runAPIPost(path, req)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringSliceVar(&f.databases, "database", nil, "Database(s) to back up (repeatable or comma-separated)")
+	fl.StringVar(&f.backupType, "type", "", "Backup type: full|incremental")
+	fl.Int32Var(&f.compressionLevel, "compression-level", 0, "gpbackup --compression-level")
+	fl.StringVar(&f.compressionType, "compression-type", "", "gpbackup --compression-type (gzip|zstd)")
+	fl.Int32Var(&f.jobs, "jobs", 0, "gpbackup --jobs")
+	fl.BoolVar(&f.singleDataFile, "single-data-file", false, "gpbackup --single-data-file")
+	fl.Int32Var(&f.copyQueueSize, "copy-queue-size", 0, "gpbackup --copy-queue-size")
+	fl.StringSliceVar(&f.includeSchemas, "include-schema", nil, "gpbackup --include-schema (repeatable)")
+	fl.StringSliceVar(&f.excludeTables, "exclude-table", nil, "gpbackup --exclude-table (repeatable)")
+	fl.BoolVar(&f.incremental, "incremental", false, "gpbackup --incremental")
+	fl.StringVar(&f.fromTimestamp, "from-timestamp", "", "gpbackup --from-timestamp")
+	fl.BoolVar(&f.leafPartitionData, "leaf-partition-data", false, "gpbackup --leaf-partition-data")
+	fl.BoolVar(&f.withStats, "with-stats", false, "gpbackup --with-stats")
+	fl.BoolVar(&f.withoutGlobals, "without-globals", false, "gpbackup --without-globals")
+	return cmd
+}
+
+// buildCreateBackupRequest assembles the create-backup request body from flags.
+func buildCreateBackupRequest(f *backupCreateFlags) map[string]interface{} {
+	gpbackup := map[string]interface{}{
+		"compressionLevel":  f.compressionLevel,
+		"compressionType":   f.compressionType,
+		fieldJobs:           f.jobs,
+		"singleDataFile":    f.singleDataFile,
+		"copyQueueSize":     f.copyQueueSize,
+		"incremental":       f.incremental,
+		"fromTimestamp":     f.fromTimestamp,
+		"includeSchemas":    f.includeSchemas,
+		"excludeTables":     f.excludeTables,
+		"leafPartitionData": f.leafPartitionData,
+		"withStats":         f.withStats,
+		"withoutGlobals":    f.withoutGlobals,
+	}
+	return map[string]interface{}{
+		"type":            f.backupType,
+		"databases":       f.databases,
+		"gpbackupOptions": gpbackup,
+	}
+}
+
+// newBackupListCmd creates the `backup list` subcommand.
+func newBackupListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   cmdList,
+		Short: "List available backups",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
+		},
+	}
+}
+
+// newBackupStatusCmd creates the `backup status` subcommand.
+func newBackupStatusCmd() *cobra.Command {
+	var timestamp string
+	cmd := &cobra.Command{
+		Use:   cmdStatus,
+		Short: "Show backup status by timestamp",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if timestamp == "" {
+				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups", globals.namespace))
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/backups/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(timestamp)),
+				globals.namespace)
+			return runAPIGet(path)
+		},
+	}
+	cmd.Flags().StringVar(&timestamp, "timestamp", "", "gpbackup timestamp")
+	return cmd
+}
+
+// newBackupDeleteCmd creates the `backup delete` subcommand.
+func newBackupDeleteCmd() *cobra.Command {
+	var timestamp string
+	cmd := &cobra.Command{
+		Use:   cmdDelete,
+		Short: "Delete a backup",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if timestamp == "" {
+				return fmt.Errorf("--timestamp is required")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/backups/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(timestamp)),
+				globals.namespace)
+			return runAPIDelete(path)
+		},
+	}
+	cmd.Flags().StringVar(&timestamp, "timestamp", "", "gpbackup timestamp to delete")
+	return cmd
+}
+
+// backupRestoreFlags holds the flags for `backup restore`.
+type backupRestoreFlags struct {
+	timestamp       string
+	redirectDb      string
+	redirectSchema  string
+	createDb        bool
+	includeSchemas  []string
+	includeTables   []string
+	jobs            int32
+	withStats       bool
+	runAnalyze      bool
+	onErrorContinue bool
+	truncateTable   bool
+	resizeCluster   bool
+}
+
+// newBackupRestoreCmd creates the `backup restore` subcommand.
+func newBackupRestoreCmd() *cobra.Command {
+	f := &backupRestoreFlags{}
+	cmd := &cobra.Command{
+		Use:   "restore",
+		Short: "Restore from a backup",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if f.timestamp == "" {
+				return fmt.Errorf("--timestamp is required")
+			}
+			req := buildRestoreRequest(f)
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/backups/%s/restore",
+					url.PathEscape(globals.cluster), url.PathEscape(f.timestamp)),
+				globals.namespace)
+			return runAPIPost(path, req)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.timestamp, "timestamp", "", "gpbackup timestamp to restore from")
+	fl.StringVar(&f.redirectDb, "redirect-db", "", "gprestore --redirect-db")
+	fl.StringVar(&f.redirectSchema, "redirect-schema", "", "gprestore --redirect-schema")
+	fl.BoolVar(&f.createDb, "create-db", false, "gprestore --create-db")
+	fl.StringSliceVar(&f.includeSchemas, "include-schema", nil, "gprestore --include-schema (repeatable)")
+	fl.StringSliceVar(&f.includeTables, "include-table", nil, "gprestore --include-table (repeatable)")
+	fl.Int32Var(&f.jobs, "jobs", 0, "gprestore --jobs")
+	fl.BoolVar(&f.withStats, "with-stats", false, "gprestore --with-stats")
+	fl.BoolVar(&f.runAnalyze, "run-analyze", false, "gprestore --run-analyze")
+	fl.BoolVar(&f.onErrorContinue, "on-error-continue", false, "gprestore --on-error-continue")
+	fl.BoolVar(&f.truncateTable, "truncate-table", false, "gprestore --truncate-table")
+	fl.BoolVar(&f.resizeCluster, "resize-cluster", false, "gprestore --resize-cluster")
+	return cmd
+}
+
+// buildRestoreRequest assembles the restore request body from flags.
+func buildRestoreRequest(f *backupRestoreFlags) map[string]interface{} {
+	gprestore := map[string]interface{}{
+		fieldJobs:         f.jobs,
+		"redirectDb":      f.redirectDb,
+		"redirectSchema":  f.redirectSchema,
+		"createDb":        f.createDb,
+		"includeSchemas":  f.includeSchemas,
+		"includeTables":   f.includeTables,
+		"withStats":       f.withStats,
+		"runAnalyze":      f.runAnalyze,
+		"onErrorContinue": f.onErrorContinue,
+		"truncateTable":   f.truncateTable,
+		"resizeCluster":   f.resizeCluster,
+	}
+	return map[string]interface{}{
+		"timestamp":        f.timestamp,
+		"gprestoreOptions": gprestore,
+	}
+}
+
+// newBackupScheduleCmd creates the `backup schedule` subcommand group.
+func newBackupScheduleCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "schedule",
+		Short: "Show and manage the backup schedule",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups/schedule", globals.namespace))
+		},
+	}
+	cmd.AddCommand(
+		newBackupScheduleSetCmd(),
+		newBackupScheduleSuspendCmd("suspend", true, "Suspend the backup schedule"),
+		newBackupScheduleSuspendCmd("resume", false, "Resume the backup schedule"),
+	)
+	return cmd
+}
+
+// newBackupScheduleSetCmd creates the `backup schedule set` subcommand.
+func newBackupScheduleSetCmd() *cobra.Command {
+	var cron string
+	cmd := &cobra.Command{
+		Use:   "set",
+		Short: "Set the backup cron schedule",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if cron == "" {
+				return fmt.Errorf("--cron is required")
+			}
+			body := map[string]interface{}{"schedule": cron}
+			return runAPIPatch(
+				ctl.ClusterSubresourcePath(globals.cluster, "backups/schedule", globals.namespace), body)
+		},
+	}
+	cmd.Flags().StringVar(&cron, "cron", "", `Cron schedule (e.g. "0 3 * * *")`)
+	return cmd
+}
+
+// newBackupScheduleSuspendCmd creates a suspend/resume subcommand that PATCHes the
+// CronJob's .spec.suspend in place.
+func newBackupScheduleSuspendCmd(use string, suspend bool, short string) *cobra.Command {
+	return &cobra.Command{
+		Use:   use,
+		Short: short,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			body := map[string]interface{}{"suspend": suspend}
+			return runAPIPatch(
+				ctl.ClusterSubresourcePath(globals.cluster, "backups/schedule", globals.namespace), body)
+		},
+	}
+}
+
+// newBackupJobsCmd creates the `backup jobs` subcommand group.
+func newBackupJobsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdJobs,
+		Short: "List backup/restore Jobs",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "backups/jobs", globals.namespace))
+		},
+	}
+	cmd.AddCommand(newBackupJobsLogsCmd())
+	return cmd
+}
+
+// newBackupJobsLogsCmd creates the `backup jobs logs` subcommand. The operator API
+// does not expose a pod-log streaming endpoint, so this prints the equivalent
+// kubectl command for the selected Job rather than silently failing.
+func newBackupJobsLogsCmd() *cobra.Command {
+	var job string
+	cmd := &cobra.Command{
+		Use:   "logs",
+		Short: "Show how to fetch logs for a backup Job",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if job == "" {
+				return fmt.Errorf("--job is required")
+			}
+			ns := globals.namespace
+			if ns == "" {
+				ns = "default"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"log streaming is not exposed by the operator API; run:\n  kubectl logs -n %s job/%s\n",
+				ns, job)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&job, "job", "", "Backup Job name")
 	return cmd
 }
 
@@ -2503,7 +2837,7 @@ func newDataLoadingCmd() *cobra.Command {
 	}
 
 	jobsCmd := &cobra.Command{
-		Use:   "jobs",
+		Use:   cmdJobs,
 		Short: "Manage data loading jobs",
 	}
 

@@ -1,0 +1,143 @@
+# =============================================================================
+# Dockerfile.cloudberry-backup — Backup Toolchain Image for Cloudberry K8s
+# =============================================================================
+# Multi-stage build that compiles the apache/cloudberry-backup Go binaries
+# from source and produces a minimal runtime image for backup/restore Jobs
+# and CronJobs managed by the cloudberry-k8s operator.
+#
+# Binaries provided:
+#   - gpbackup          — parallel logical backup utility
+#   - gprestore         — parallel logical restore utility
+#   - gpbackup_helper   — per-segment helper for --single-data-file mode
+#   - gpbackup_s3_plugin — S3/MinIO storage plugin
+#   - gpbackup_exporter — Prometheus exporter for gpbackup history
+#   - gpbackman         — backup history manager / retention cleanup
+#
+# Build args:
+#   CB_BACKUP_VERSION   — cloudberry-backup release version (default: 2.1.0-incubating)
+#   CB_BACKUP_REPO_URL  — base URL for the source tarball download
+#   GO_VERSION          — Go toolchain version for the builder stage
+#
+# Supports: linux/amd64, linux/arm64
+#
+# Usage:
+#   docker build -f Dockerfile.cloudberry-backup -t cloudberry-backup:2.1.0 .
+# =============================================================================
+
+# =============================================================================
+# Stage 1: Build apache/cloudberry-backup from source
+# =============================================================================
+ARG GO_VERSION=1.26
+FROM golang:${GO_VERSION}-alpine AS builder
+
+# Install build dependencies (sorted alphanumerically)
+RUN apk add --no-cache \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    make \
+    tar
+
+WORKDIR /build
+
+# Download and extract apache/cloudberry-backup source
+# NOTE: The download URL follows the Apache Incubator release layout.
+# Override CB_BACKUP_REPO_URL if the mirror or release structure changes.
+ARG CB_BACKUP_VERSION=2.1.0-incubating
+ARG CB_BACKUP_REPO_URL=https://www.apache.org/dyn/closer.lua/incubator/cloudberry-backup/${CB_BACKUP_VERSION}/apache-cloudberry-backup-${CB_BACKUP_VERSION}-src.tar.gz?action=download
+
+RUN curl -fSL -o /tmp/cloudberry-backup-src.tar.gz "${CB_BACKUP_REPO_URL}" && \
+    tar -xzf /tmp/cloudberry-backup-src.tar.gz -C /build --strip-components=1 && \
+    rm -f /tmp/cloudberry-backup-src.tar.gz
+
+# Build all Go binaries from the cloudberry-backup source tree.
+# The upstream repo contains multiple Go modules (gpbackup, gpbackup_s3_plugin,
+# gpbackup_exporter, gpbackman). We build each binary individually.
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gpbackup \
+        ./gpbackup/ && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gprestore \
+        ./gprestore/ && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gpbackup_helper \
+        ./helper/ && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gpbackup_s3_plugin \
+        ./s3_plugin/ && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gpbackup_exporter \
+        ./gpbackup_exporter/ && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -trimpath -ldflags="-s -w" \
+        -o /usr/local/bin/gpbackman \
+        ./gpbackman/
+
+# =============================================================================
+# Stage 2: Runtime image
+# =============================================================================
+FROM rockylinux/rockylinux:9.6-minimal
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-backup" \
+      org.opencontainers.image.description="Backup toolchain image for Apache Cloudberry Database (gpbackup, gprestore, gpbackup_s3_plugin, gpbackup_exporter, gpbackman)" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry-backup" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="rockylinux/rockylinux:9.6-minimal"
+
+# Install runtime dependencies (sorted alphanumerically)
+# - bash:            shell for Job scripts
+# - ca-certificates: TLS for S3/MinIO endpoints
+# - coreutils:       df for disk-space pre-checks
+# - curl:            S3 HEAD checks in pre-backup init container
+# - gettext:         envsubst for S3 plugin config templating
+# - postgresql:      psql client / libpq for cluster health checks
+# - shadow-utils:    useradd/groupadd
+RUN microdnf -y install \
+      bash \
+      ca-certificates \
+      coreutils \
+      curl \
+      gettext \
+      postgresql \
+      shadow-utils && \
+    microdnf clean all && rm -rf /var/cache/yum
+
+# Create gpadmin user (UID 1000 for Kubernetes compatibility)
+RUN groupadd -g 1000 gpadmin && \
+    useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin
+
+# Copy backup toolchain binaries from builder
+COPY --from=builder /usr/local/bin/gpbackup /usr/local/bin/gpbackup
+COPY --from=builder /usr/local/bin/gprestore /usr/local/bin/gprestore
+COPY --from=builder /usr/local/bin/gpbackup_helper /usr/local/bin/gpbackup_helper
+COPY --from=builder /usr/local/bin/gpbackup_s3_plugin /usr/local/bin/gpbackup_s3_plugin
+COPY --from=builder /usr/local/bin/gpbackup_exporter /usr/local/bin/gpbackup_exporter
+COPY --from=builder /usr/local/bin/gpbackman /usr/local/bin/gpbackman
+
+# Create directories for backup operations
+RUN mkdir -p /tmp/gpbackup /etc/gpbackup && \
+    chown -R gpadmin:gpadmin /tmp/gpbackup /etc/gpbackup
+
+# Ensure binaries are on PATH
+ENV PATH="/usr/local/bin:${PATH}"
+
+# Switch to non-root gpadmin user
+USER 1000:1000
+WORKDIR /home/gpadmin
+
+# Health check: verify gpbackup binary is functional
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD gpbackup --version || exit 1
+
+ENTRYPOINT ["/bin/bash"]
+CMD ["-c", "echo 'cloudberry-backup toolchain ready'; exec bash"]

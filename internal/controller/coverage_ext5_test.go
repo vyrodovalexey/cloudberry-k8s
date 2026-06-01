@@ -436,7 +436,7 @@ func TestAdminReconciler_ReconcileSubComponents_AllFeaturesEnabled(t *testing.T)
 	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:     true,
-		Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "b"},
+		Destination: cbv1alpha1.BackupDestination{Type: "s3", S3: &cbv1alpha1.S3Destination{Bucket: "b"}},
 	}
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
 	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{

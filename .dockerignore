@@ -35,6 +35,7 @@ bin/
 Dockerfile.operator
 Dockerfile.ctl
 Dockerfile.cloudberry
+Dockerfile.cloudberry-backup
 
 # CI/CD
 .github/

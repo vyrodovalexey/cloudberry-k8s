@@ -538,12 +538,19 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 				Enabled: true, Schedule: "0 2 * * *",
 				Retention: BackupRetention{FullCount: 7, IncrementalCount: 30, MaxAge: "90d"},
 				Destination: BackupDestination{
-					Type: "s3", Bucket: "db-backups", Endpoint: "s3.amazonaws.com",
-					Region: "us-east-1", Path: "/cloudberry",
-					CredentialSecret: &SecretReference{Name: "s3-creds", Key: "credentials"},
-					ForcePathStyle:   true,
+					Type: "s3",
+					S3: &S3Destination{
+						Bucket: "db-backups", Endpoint: "s3.amazonaws.com",
+						Region: "us-east-1", Folder: "/cloudberry",
+						CredentialSecret: &S3CredentialSecret{Name: "s3-creds"},
+						ForcePathStyle:   true,
+						Multipart:        &S3Multipart{BackupMaxConcurrentRequests: 4, BackupMultipartChunksize: "10MB"},
+					},
 				},
-				Compression: 6, Parallelism: 4, Incremental: true,
+				Gpbackup:    &GpbackupOptions{CompressionLevel: 6, CompressionType: "zstd", Jobs: 4, Incremental: true},
+				Gprestore:   &GprestoreOptions{Jobs: 4, WithStats: true},
+				JobTemplate: &BackupJobTemplate{ServiceAccountName: "cloudberry-backup-sa"},
+				Image:       "cloudberry-backup:2.1.0",
 			},
 			DataLoading: &DataLoadingSpec{
 				Enabled: true,
@@ -727,18 +734,21 @@ func TestDeepCopy_SubTypes_Populated(t *testing.T) {
 			Enabled: true, Schedule: "0 2 * * *",
 			Retention: BackupRetention{FullCount: 7, IncrementalCount: 30, MaxAge: "90d"},
 			Destination: BackupDestination{
-				Type: "s3", Bucket: "backups",
-				CredentialSecret: &SecretReference{Name: "creds", Key: "key"},
+				Type: "s3",
+				S3: &S3Destination{
+					Bucket:           "backups",
+					CredentialSecret: &S3CredentialSecret{Name: "creds"},
+				},
 			},
-			Compression: 6, Parallelism: 4, Incremental: true,
+			Gpbackup: &GpbackupOptions{CompressionLevel: 6, Jobs: 4, Incremental: true},
 		}
 		copied := original.DeepCopy()
 		require.NotNil(t, copied)
 		assert.Equal(t, original.Schedule, copied.Schedule)
-		assert.Equal(t, original.Destination.CredentialSecret.Name, copied.Destination.CredentialSecret.Name)
+		assert.Equal(t, original.Destination.S3.CredentialSecret.Name, copied.Destination.S3.CredentialSecret.Name)
 
-		copied.Destination.CredentialSecret.Name = "changed"
-		assert.Equal(t, "creds", original.Destination.CredentialSecret.Name)
+		copied.Destination.S3.CredentialSecret.Name = "changed"
+		assert.Equal(t, "creds", original.Destination.S3.CredentialSecret.Name)
 	})
 
 	t.Run("DataLoadingJob with S3Source", func(t *testing.T) {
@@ -1177,8 +1187,13 @@ func TestDeepCopy_SpecAndStatus_NonNil(t *testing.T) {
 		src := &BackupSpec{
 			Enabled: true,
 			Destination: BackupDestination{
-				CredentialSecret: &SecretReference{Name: "cred"},
+				Type: "s3",
+				S3: &S3Destination{
+					CredentialSecret: &S3CredentialSecret{Name: "cred"},
+				},
 			},
+			Gpbackup:  &GpbackupOptions{CompressionLevel: 1},
+			Gprestore: &GprestoreOptions{Jobs: 1},
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
@@ -1187,9 +1202,11 @@ func TestDeepCopy_SpecAndStatus_NonNil(t *testing.T) {
 
 	t.Run("BackupDestination non-nil", func(t *testing.T) {
 		src := &BackupDestination{
-			Type:             "s3",
-			CredentialSecret: &SecretReference{Name: "cred"},
-			ForcePathStyle:   true,
+			Type: "s3",
+			S3: &S3Destination{
+				CredentialSecret: &S3CredentialSecret{Name: "cred"},
+				ForcePathStyle:   true,
+			},
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)

@@ -107,6 +107,11 @@ func (c *OperatorClient) Put(ctx context.Context, path string, body interface{})
 	return c.do(ctx, http.MethodPut, path, body)
 }
 
+// Patch performs a PATCH request to the operator API.
+func (c *OperatorClient) Patch(ctx context.Context, path string, body interface{}) (*APIResponse, error) {
+	return c.do(ctx, http.MethodPatch, path, body)
+}
+
 // Delete performs a DELETE request to the operator API.
 func (c *OperatorClient) Delete(ctx context.Context, path string) (*APIResponse, error) {
 	return c.do(ctx, http.MethodDelete, path, nil)

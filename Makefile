@@ -25,6 +25,7 @@ IMG_OPERATOR         ?= cloudberry-operator:latest
 IMG_CTL              ?= cloudberry-ctl:latest
 IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
 IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
+IMG_BACKUP           ?= cloudberry-backup:2.1.0
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
@@ -145,7 +146,7 @@ endif
 docker-build: docker-build-operator docker-build-ctl ## Build Docker images for operator and ctl
 
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-cloudberry docker-build-query-exporter ## Build all Docker images (operator, ctl, cloudberry, query-exporter)
+docker-build-all: docker-build docker-build-cloudberry docker-build-query-exporter docker-build-backup ## Build all Docker images (operator, ctl, cloudberry, query-exporter, backup)
 
 .PHONY: docker-push
 docker-push: ## Push Docker images
@@ -182,6 +183,13 @@ docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles fro
 	$(DOCKER) build \
 		-t $(IMG_CLOUDBERRY) \
 		-f Dockerfile.cloudberry .
+
+.PHONY: docker-build-backup
+docker-build-backup: ## Build cloudberry-backup toolchain image
+	$(DOCKER) build \
+		$(DOCKER_BUILD_ARGS) \
+		-t $(IMG_BACKUP) \
+		-f Dockerfile.cloudberry-backup .
 
 # =============================================================================
 # Kubernetes / Helm targets

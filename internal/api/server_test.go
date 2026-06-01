@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +35,7 @@ func newTestScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = cbv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
 	return scheme
 }
 
@@ -800,8 +803,26 @@ func TestHandleStartRecovery_NotFound(t *testing.T) {
 
 // Backup endpoint tests.
 
-func TestHandleListBackups(t *testing.T) {
+// newBackupEnabledCluster returns a test cluster with backup enabled to an S3
+// destination, optionally seeded with backup-history entries.
+func newBackupEnabledCluster(history ...cbv1alpha1.BackupHistoryEntry) *cbv1alpha1.CloudberryCluster {
 	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled:  true,
+		Schedule: "0 3 * * *",
+		Destination: cbv1alpha1.BackupDestination{
+			Type: "s3",
+			S3:   &cbv1alpha1.S3Destination{Bucket: "backups"},
+		},
+	}
+	cluster.Status.BackupHistory = history
+	return cluster
+}
+
+func TestHandleListBackups(t *testing.T) {
+	cluster := newBackupEnabledCluster(
+		cbv1alpha1.BackupHistoryEntry{Timestamp: "20260519020000", Type: "full", Status: "Success"},
+	)
 	s := newTestServer(cluster)
 
 	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
@@ -812,8 +833,24 @@ func TestHandleListBackups(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var resp map[string]interface{}
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
-	assert.Equal(t, float64(0), resp["total"])
+	assert.Equal(t, float64(1), resp["total"])
 	assert.Equal(t, "test-cluster", resp["cluster"])
+	backups, ok := resp["backups"].([]interface{})
+	require.True(t, ok)
+	assert.Len(t, backups, 1)
+}
+
+func TestHandleListBackups_Empty(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	s := newTestServer(cluster)
+	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rec := httptest.NewRecorder()
+	s.handleListBackups(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, float64(0), resp["total"])
 }
 
 func TestHandleListBackups_NotFound(t *testing.T) {
@@ -825,103 +862,223 @@ func TestHandleListBackups_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+func postBackupRequest(t *testing.T, name, body string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/"+name+"/backups?namespace=default", strings.NewReader(body))
+	req.SetPathValue("name", name)
+	return req
+}
+
 func TestHandleCreateBackup(t *testing.T) {
 	t.Run("backup not enabled", func(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
 		s := newTestServer(cluster)
-		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
 		rec := httptest.NewRecorder()
-		s.handleCreateBackup(rec, req)
+		s.handleCreateBackup(rec, postBackupRequest(t, "test-cluster", ""))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 
-	t.Run("backup enabled", func(t *testing.T) {
-		cluster := newTestCluster("test-cluster", "default")
-		cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
-			Enabled:     true,
-			Destination: cbv1alpha1.BackupDestination{Type: "s3", Bucket: "backups"},
-		}
+	t.Run("backup enabled creates job", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
 		s := newTestServer(cluster)
-		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
 		rec := httptest.NewRecorder()
-		s.handleCreateBackup(rec, req)
-		assert.Equal(t, http.StatusAccepted, rec.Code)
+		s.handleCreateBackup(rec, postBackupRequest(t, "test-cluster",
+			`{"type":"full","databases":["mydb"],"gpbackupOptions":{"jobs":4}}`))
+		require.Equal(t, http.StatusAccepted, rec.Code)
+
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "backup started", resp["status"])
+		jobName, ok := resp["job"].(string)
+		require.True(t, ok)
+		assert.NotEmpty(t, jobName)
+
+		job := &batchv1.Job{}
+		require.NoError(t, s.k8sClient.Get(context.Background(),
+			types.NamespacedName{Name: jobName, Namespace: "default"}, job))
+		assert.Equal(t, util.BackupOperationBackup, job.Labels[util.LabelBackupOperation])
+	})
+
+	t.Run("invalid type", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, postBackupRequest(t, "test-cluster", `{"type":"bogus"}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid database identifier", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, postBackupRequest(t, "test-cluster", `{"databases":["bad name"]}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleCreateBackup(rec, postBackupRequest(t, "test-cluster", `{not-json`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 
 	t.Run("cluster not found", func(t *testing.T) {
 		s := newTestServer()
-		req := httptest.NewRequest(http.MethodPost, apiPrefix+"/clusters/nonexistent/backups?namespace=default", nil)
-		req.SetPathValue("name", "nonexistent")
 		rec := httptest.NewRecorder()
-		s.handleCreateBackup(rec, req)
+		s.handleCreateBackup(rec, postBackupRequest(t, "nonexistent", ""))
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 }
 
 func TestHandleGetBackup(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
+	cluster := newBackupEnabledCluster(
+		cbv1alpha1.BackupHistoryEntry{Timestamp: "20260519020000", Type: "full", Status: "Success"},
+	)
 	s := newTestServer(cluster)
 
-	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
-	req.SetPathValue("name", "test-cluster")
-	req.SetPathValue("id", "bk-1")
-	rec := httptest.NewRecorder()
-	s.handleGetBackup(rec, req)
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	t.Run("found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups/20260519020000?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("timestamp", "20260519020000")
+		rec := httptest.NewRecorder()
+		s.handleGetBackup(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups/20200101000000?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("timestamp", "20200101000000")
+		rec := httptest.NewRecorder()
+		s.handleGetBackup(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid timestamp", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("timestamp", "bk-1")
+		rec := httptest.NewRecorder()
+		s.handleGetBackup(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
 }
 
 func TestHandleGetBackup_ClusterNotFound(t *testing.T) {
 	s := newTestServer()
-	req := httptest.NewRequest(http.MethodGet, apiPrefix+"/clusters/nonexistent/backups/bk-1?namespace=default", nil)
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/nonexistent/backups/20260519020000?namespace=default", nil)
 	req.SetPathValue("name", "nonexistent")
-	req.SetPathValue("id", "bk-1")
+	req.SetPathValue("timestamp", "20260519020000")
 	rec := httptest.NewRecorder()
 	s.handleGetBackup(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestHandleDeleteBackup(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
+	cluster := newBackupEnabledCluster()
 	s := newTestServer(cluster)
 
-	req := httptest.NewRequest(http.MethodDelete, apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/backups/20260519020000?namespace=default", nil)
 	req.SetPathValue("name", "test-cluster")
-	req.SetPathValue("id", "bk-1")
+	req.SetPathValue("timestamp", "20260519020000")
 	rec := httptest.NewRecorder()
 	s.handleDeleteBackup(rec, req)
-	assert.Equal(t, http.StatusOK, rec.Code)
-	var resp map[string]interface{}
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
-	assert.Equal(t, "deleted", resp["status"])
-	assert.Equal(t, "bk-1", resp["backupID"])
-}
-
-func TestHandleRestoreBackup(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
-	s := newTestServer(cluster)
-
-	req := httptest.NewRequest(http.MethodPost,
-		apiPrefix+"/clusters/test-cluster/backups/bk-1/restore?namespace=default", nil)
-	req.SetPathValue("name", "test-cluster")
-	req.SetPathValue("id", "bk-1")
-	rec := httptest.NewRecorder()
-	s.handleRestoreBackup(rec, req)
 	assert.Equal(t, http.StatusAccepted, rec.Code)
 	var resp map[string]interface{}
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
-	assert.Equal(t, "restore initiated", resp["status"])
+	assert.Equal(t, "deleted", resp["status"])
+	jobName, ok := resp["job"].(string)
+	require.True(t, ok)
+
+	job := &batchv1.Job{}
+	require.NoError(t, s.k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: jobName, Namespace: "default"}, job))
+	assert.Equal(t, util.BackupOperationCleanup, job.Labels[util.LabelBackupOperation])
+}
+
+func TestHandleDeleteBackup_InvalidTimestamp(t *testing.T) {
+	cluster := newBackupEnabledCluster()
+	s := newTestServer(cluster)
+	req := httptest.NewRequest(http.MethodDelete,
+		apiPrefix+"/clusters/test-cluster/backups/bk-1?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("timestamp", "bk-1")
+	rec := httptest.NewRecorder()
+	s.handleDeleteBackup(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func postRestoreRequest(t *testing.T, name, timestamp, body string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/"+name+"/backups/"+timestamp+"/restore?namespace=default",
+		strings.NewReader(body))
+	req.SetPathValue("name", name)
+	req.SetPathValue("timestamp", timestamp)
+	return req
+}
+
+func TestHandleRestoreBackup(t *testing.T) {
+	t.Run("creates restore job", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleRestoreBackup(rec, postRestoreRequest(t, "test-cluster", "20260519020000",
+			`{"gprestoreOptions":{"redirectDb":"mydb_restored","createDb":true}}`))
+		require.Equal(t, http.StatusAccepted, rec.Code)
+
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, "restore started", resp["status"])
+		jobName, ok := resp["job"].(string)
+		require.True(t, ok)
+
+		job := &batchv1.Job{}
+		require.NoError(t, s.k8sClient.Get(context.Background(),
+			types.NamespacedName{Name: jobName, Namespace: "default"}, job))
+		assert.Equal(t, util.BackupOperationRestore, job.Labels[util.LabelBackupOperation])
+	})
+
+	t.Run("timestamp from body", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/backups//restore?namespace=default",
+			strings.NewReader(`{"timestamp":"20260519020000"}`))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleRestoreBackup(rec, req)
+		assert.Equal(t, http.StatusAccepted, rec.Code)
+	})
+
+	t.Run("invalid timestamp", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleRestoreBackup(rec, postRestoreRequest(t, "test-cluster", "bk-1", ""))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleRestoreBackup(rec, postRestoreRequest(t, "test-cluster", "20260519020000", `{bad`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
 }
 
 func TestHandleRestoreBackup_ClusterNotFound(t *testing.T) {
 	s := newTestServer()
-	req := httptest.NewRequest(http.MethodPost,
-		apiPrefix+"/clusters/nonexistent/backups/bk-1/restore?namespace=default", nil)
-	req.SetPathValue("name", "nonexistent")
-	req.SetPathValue("id", "bk-1")
 	rec := httptest.NewRecorder()
-	s.handleRestoreBackup(rec, req)
+	s.handleRestoreBackup(rec, postRestoreRequest(t, "nonexistent", "20260519020000", ""))
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -2073,9 +2230,9 @@ func TestHandleGetUsageReport_NotFound(t *testing.T) {
 func TestHandleDeleteBackup_ClusterNotFound(t *testing.T) {
 	s := newTestServer()
 	req := httptest.NewRequest(http.MethodDelete,
-		apiPrefix+"/clusters/nonexistent/backups/bk-1?namespace=default", nil)
+		apiPrefix+"/clusters/nonexistent/backups/20260519020000?namespace=default", nil)
 	req.SetPathValue("name", "nonexistent")
-	req.SetPathValue("id", "bk-1")
+	req.SetPathValue("timestamp", "20260519020000")
 	rec := httptest.NewRecorder()
 	s.handleDeleteBackup(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)

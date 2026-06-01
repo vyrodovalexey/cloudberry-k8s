@@ -99,6 +99,51 @@ func QueryAlertsPrometheusRuleName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-query-alerts", cluster))
 }
 
+// BackupS3ConfigMapName returns the backup S3 plugin config ConfigMap name.
+func BackupS3ConfigMapName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-backup-s3-config", cluster))
+}
+
+// BackupCronJobName returns the scheduled backup CronJob name.
+func BackupCronJobName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-backup-schedule", cluster))
+}
+
+// BackupJobName returns the on-demand backup Job name with a timestamp suffix.
+func BackupJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-backup-%s", cluster, timestamp))
+}
+
+// RestoreJobName returns the restore Job name with a timestamp suffix.
+func RestoreJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-restore-%s", cluster, timestamp))
+}
+
+// RetentionCleanupJobName returns the retention cleanup Job name with a timestamp suffix.
+func RetentionCleanupJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-cleanup-%s", cluster, timestamp))
+}
+
+// PostRestoreValidationJobName returns the post-restore validation Job name.
+func PostRestoreValidationJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-validate-%s", cluster, timestamp))
+}
+
+// MigrateBackupJobName returns the migration backup Job name on the source cluster.
+func MigrateBackupJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-migrate-backup-%s", cluster, timestamp))
+}
+
+// MigrateRestoreJobName returns the migration restore Job name on the target cluster.
+func MigrateRestoreJobName(cluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-migrate-restore-%s", cluster, timestamp))
+}
+
+// BackupServiceAccountName returns the ServiceAccount name used by backup/restore Jobs.
+func BackupServiceAccountName(_ string) string {
+	return "cloudberry-backup-sa"
+}
+
 // CommonLabels returns the standard labels for a cluster resource.
 func CommonLabels(cluster, component string) map[string]string {
 	return map[string]string{

@@ -24,6 +24,27 @@ const (
 	LabelComponent = "avsoft.io/component"
 	// LabelOperation is the label key for the operation type.
 	LabelOperation = "avsoft.io/operation"
+	// LabelBackupOperation is the label key for the backup operation type.
+	LabelBackupOperation = "avsoft.io/backup-operation"
+
+	// BackupOperationBackup is the backup-operation label value for a backup Job.
+	BackupOperationBackup = "backup"
+	// BackupOperationRestore is the backup-operation label value for a restore Job.
+	BackupOperationRestore = "restore"
+	// BackupOperationCleanup is the backup-operation label value for a retention cleanup Job.
+	BackupOperationCleanup = "cleanup"
+	// BackupOperationValidate is the backup-operation label value for a post-restore validation Job.
+	BackupOperationValidate = "validate"
+	// BackupOperationMigrate is the backup-operation label value for a cross-cluster migration Job.
+	BackupOperationMigrate = "migrate"
+
+	// BackupTypeFull is the full backup type.
+	BackupTypeFull = "full"
+	// BackupTypeIncremental is the incremental backup type.
+	BackupTypeIncremental = "incremental"
+
+	// ComponentBackup is the component label value for backup resources.
+	ComponentBackup = "backup"
 
 	// ComponentCoordinator is the component label value for the coordinator.
 	ComponentCoordinator = "coordinator"
@@ -69,6 +90,12 @@ const (
 	// AnnotationExporterRoleReady indicates the exporter DB role has been created.
 	// When absent or not "true", the admin-controller will retry role setup on each cycle.
 	AnnotationExporterRoleReady = "avsoft.io/exporter-role-ready"
+	// AnnotationBackupRetentionDeleted records the number of backups removed by a
+	// retention cleanup Job, used to drive the cloudberry_backup_retention_deleted_total counter.
+	AnnotationBackupRetentionDeleted = "avsoft.io/backup-retention-deleted"
+	// AnnotationBackupSizeBytes records the size in bytes of a completed backup Job,
+	// used to drive the cloudberry_backup_size_bytes gauge.
+	AnnotationBackupSizeBytes = "avsoft.io/backup-size-bytes"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"

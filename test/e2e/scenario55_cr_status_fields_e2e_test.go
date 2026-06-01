@@ -389,18 +389,23 @@ func (m *scenario55E2EMetricsRecorder) SetBlockedQueries(cluster, namespace stri
 	})
 }
 
-func (m *scenario55E2EMetricsRecorder) RecordWorkloadRuleAction(_, _, _, _ string)         {}
-func (m *scenario55E2EMetricsRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64) {}
-func (m *scenario55E2EMetricsRecorder) RecordIdleSessionTermination(_, _, _ string)        {}
-func (m *scenario55E2EMetricsRecorder) RecordSlowQuery(_, _ string)                        {}
-func (m *scenario55E2EMetricsRecorder) RecordBackup(_, _, _, _ string)                     {}
-func (m *scenario55E2EMetricsRecorder) ObserveBackupDuration(_, _ string, _ time.Duration) {}
-func (m *scenario55E2EMetricsRecorder) SetBackupSizeBytes(_, _ string, _ float64)          {}
-func (m *scenario55E2EMetricsRecorder) RecordRestore(_, _, _ string)                       {}
-func (m *scenario55E2EMetricsRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)    {}
-func (m *scenario55E2EMetricsRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64) {}
-func (m *scenario55E2EMetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64)         {}
-func (m *scenario55E2EMetricsRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)  {}
+func (m *scenario55E2EMetricsRecorder) RecordWorkloadRuleAction(_, _, _, _ string)            {}
+func (m *scenario55E2EMetricsRecorder) SetResourceGroupUsage(_, _, _ string, _, _ float64)    {}
+func (m *scenario55E2EMetricsRecorder) RecordIdleSessionTermination(_, _, _ string)           {}
+func (m *scenario55E2EMetricsRecorder) RecordSlowQuery(_, _ string)                           {}
+func (m *scenario55E2EMetricsRecorder) RecordBackup(_, _, _, _ string)                        {}
+func (m *scenario55E2EMetricsRecorder) ObserveBackupDuration(_, _, _ string, _ time.Duration) {}
+func (m *scenario55E2EMetricsRecorder) SetBackupSizeBytes(_, _, _ string, _ float64)          {}
+func (m *scenario55E2EMetricsRecorder) SetBackupLastSuccessTimestamp(_, _ string, _ float64)  {}
+func (m *scenario55E2EMetricsRecorder) SetBackupLastStatus(_, _ string, _ float64)            {}
+func (m *scenario55E2EMetricsRecorder) ObserveRestoreDuration(_, _ string, _ time.Duration)   {}
+func (m *scenario55E2EMetricsRecorder) RecordBackupRetentionDeleted(_, _ string, _ int)       {}
+func (m *scenario55E2EMetricsRecorder) SetBackupJobStatus(_, _, _, _ string, _ float64)       {}
+func (m *scenario55E2EMetricsRecorder) RecordRestore(_, _, _ string)                          {}
+func (m *scenario55E2EMetricsRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)       {}
+func (m *scenario55E2EMetricsRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)    {}
+func (m *scenario55E2EMetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64)            {}
+func (m *scenario55E2EMetricsRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)     {}
 func (m *scenario55E2EMetricsRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {
 }
 func (m *scenario55E2EMetricsRecorder) SetTableBloatRatio(_, _, _ string, _ float64)     {}

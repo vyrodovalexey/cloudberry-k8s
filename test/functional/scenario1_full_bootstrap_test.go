@@ -700,15 +700,45 @@ func (m *mockMetricsRecorder) RecordBackup(cluster, namespace, backupType, statu
 	})
 }
 
-func (m *mockMetricsRecorder) ObserveBackupDuration(cluster, namespace string, duration time.Duration) {
+func (m *mockMetricsRecorder) ObserveBackupDuration(cluster, namespace, backupType string, duration time.Duration) {
 	m.record("ObserveBackupDuration", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "type": backupType, "duration": duration,
+	})
+}
+
+func (m *mockMetricsRecorder) SetBackupSizeBytes(cluster, namespace, timestamp string, sizeBytes float64) {
+	m.record("SetBackupSizeBytes", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "timestamp": timestamp, "bytes": sizeBytes,
+	})
+}
+
+func (m *mockMetricsRecorder) SetBackupLastSuccessTimestamp(cluster, namespace string, ts float64) {
+	m.record("SetBackupLastSuccessTimestamp", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "ts": ts,
+	})
+}
+
+func (m *mockMetricsRecorder) SetBackupLastStatus(cluster, namespace string, status float64) {
+	m.record("SetBackupLastStatus", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "status": status,
+	})
+}
+
+func (m *mockMetricsRecorder) ObserveRestoreDuration(cluster, namespace string, duration time.Duration) {
+	m.record("ObserveRestoreDuration", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "duration": duration,
 	})
 }
 
-func (m *mockMetricsRecorder) SetBackupSizeBytes(cluster, namespace string, sizeBytes float64) {
-	m.record("SetBackupSizeBytes", map[string]interface{}{
-		"cluster": cluster, "namespace": namespace, "bytes": sizeBytes,
+func (m *mockMetricsRecorder) RecordBackupRetentionDeleted(cluster, namespace string, n int) {
+	m.record("RecordBackupRetentionDeleted", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "n": n,
+	})
+}
+
+func (m *mockMetricsRecorder) SetBackupJobStatus(cluster, namespace, job, operation string, status float64) {
+	m.record("SetBackupJobStatus", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job, "operation": operation, "status": status,
 	})
 }
 
