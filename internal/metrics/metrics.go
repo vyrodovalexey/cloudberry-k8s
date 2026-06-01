@@ -108,7 +108,8 @@ type Recorder interface {
 	// RecordMirroringOperation records a mirroring enable/disable operation.
 	RecordMirroringOperation(cluster, namespace, operation string)
 	// RecordMaintenanceOperation records a maintenance operation event.
-	RecordMaintenanceOperation(cluster, namespace, operation string)
+	// result is "success", "failed", or "started".
+	RecordMaintenanceOperation(cluster, namespace, operation, result string)
 	// RecordPasswordRotation records a password rotation event.
 	RecordPasswordRotation()
 	// RecordQueryHistoryInsert records a query history insert event.
@@ -517,7 +518,7 @@ func (r *PrometheusRecorder) initStorageMetrics() {
 		Namespace: metricsNamespace,
 		Name:      "maintenance_operations_total",
 		Help:      "Total number of maintenance operations (vacuum, analyze, reindex, log-rotate).",
-	}, []string{labelCluster, labelNamespace, labelOperation})
+	}, []string{labelCluster, labelNamespace, labelOperation, labelResult})
 }
 
 // initQueryHistoryMetrics initializes query history metrics.
@@ -945,8 +946,8 @@ func (r *PrometheusRecorder) RecordMirroringOperation(cluster, namespace, operat
 }
 
 // RecordMaintenanceOperation records a maintenance operation event.
-func (r *PrometheusRecorder) RecordMaintenanceOperation(cluster, namespace, operation string) {
-	r.maintenanceOperationsTotal.WithLabelValues(cluster, namespace, operation).Inc()
+func (r *PrometheusRecorder) RecordMaintenanceOperation(cluster, namespace, operation, result string) {
+	r.maintenanceOperationsTotal.WithLabelValues(cluster, namespace, operation, result).Inc()
 }
 
 // RecordPasswordRotation records a password rotation event.
@@ -1218,7 +1219,7 @@ func (n *NoopRecorder) SetPVCSizeBytes(_, _, _ string, _ float64) {}
 func (n *NoopRecorder) RecordMirroringOperation(_, _, _ string) {}
 
 // RecordMaintenanceOperation is a no-op implementation for testing.
-func (n *NoopRecorder) RecordMaintenanceOperation(_, _, _ string) {}
+func (n *NoopRecorder) RecordMaintenanceOperation(_, _, _, _ string) {}
 
 // RecordPasswordRotation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordPasswordRotation() {}

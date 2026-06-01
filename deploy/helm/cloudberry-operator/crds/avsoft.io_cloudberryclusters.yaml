@@ -719,6 +719,14 @@ spec:
                           image:
                             description: Image is the container image for the exporter.
                             type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
                           port:
                             description: Port is the metrics port exposed by the exporter.
                             format: int32
@@ -750,6 +758,13 @@ spec:
                                     type: string
                                 type: object
                             type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
                         type: object
                       nodeExporter:
                         description: NodeExporter configures the Prometheus node_exporter
@@ -762,6 +777,14 @@ spec:
                           image:
                             description: Image is the container image for the exporter.
                             type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
                           port:
                             description: Port is the metrics port exposed by the exporter.
                             format: int32
@@ -793,6 +816,13 @@ spec:
                                     type: string
                                 type: object
                             type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
                         type: object
                       postgresExporter:
                         description: PostgresExporter configures the Prometheus postgres_exporter
@@ -805,6 +835,14 @@ spec:
                           image:
                             description: Image is the container image for the exporter.
                             type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
                           port:
                             description: Port is the metrics port exposed by the exporter.
                             format: int32
@@ -836,6 +874,13 @@ spec:
                                     type: string
                                 type: object
                             type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
                         type: object
                       prometheusRule:
                         description: PrometheusRule configures the Prometheus PrometheusRule

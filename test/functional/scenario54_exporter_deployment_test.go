@@ -237,9 +237,8 @@ func (s *Scenario54ExporterDeploymentSuite) TestFunctional_Scenario54_PostgresEx
 	assert.Contains(s.T(), pgExporter.Args,
 		"--extend.query-path=/etc/postgres-exporter/queries.yaml",
 		"should have extend.query-path arg")
-	assert.Contains(s.T(), pgExporter.Args,
-		"--auto-discover-databases",
-		"should have auto-discover-databases arg")
+	assert.NotContains(s.T(), pgExporter.Args, "--auto-discover-databases",
+		"auto-discover-databases must NOT be set: it causes duplicate-metric HTTP 500 errors when the cluster has multiple databases")
 	assert.Contains(s.T(), pgExporter.Args,
 		"--web.listen-address=:9187",
 		"should have web.listen-address arg with port 9187")

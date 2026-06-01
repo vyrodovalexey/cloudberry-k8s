@@ -54,6 +54,12 @@ func (m *AuthMiddleware) Handler() Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			provider, method, err := m.resolveProvider(r)
 			if err != nil {
+				// The Authorization header is missing, malformed, or uses an
+				// unsupported/unconfigured scheme. Record it as a failed attempt
+				// with an "unknown" method since no provider could be selected.
+				if m.recorder != nil {
+					m.recorder.RecordAuthAttempt("unknown", "failure")
+				}
 				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error())
 				return
 			}

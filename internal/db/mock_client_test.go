@@ -1271,7 +1271,7 @@ func TestClientFactory_NewClient_SSLEnabled(t *testing.T) {
 		assert.Error(t, err)
 	})
 
-	t.Run("SSL enabled with CertSecret uses verify-full", func(t *testing.T) {
+	t.Run("SSL enabled with CertSecret uses verify-ca", func(t *testing.T) {
 		cluster := &cbv1alpha1.CloudberryCluster{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-cluster",
@@ -1291,8 +1291,12 @@ func TestClientFactory_NewClient_SSLEnabled(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
 
+		// The cert Secret "my-cert" does not exist, so verify-ca resolution
+		// fails while reading the SSL root CA, which confirms the verify-ca
+		// path (rather than verify-full) is taken when a CertSecret is set.
 		_, err := factory.NewClient(ctx, cluster)
-		assert.Error(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reading SSL root CA")
 	})
 
 	t.Run("SSL disabled uses disable", func(t *testing.T) {

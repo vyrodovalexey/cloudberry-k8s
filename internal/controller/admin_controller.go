@@ -51,6 +51,10 @@ const (
 	restartPhaseCoordinator = "coordinator"
 	restartPhaseCompleted   = "completed"
 
+	// Backup type label values used for backup/recovery metrics.
+	backupTypeFull        = "full"
+	backupTypeIncremental = "incremental"
+
 	// patchKeyMetadata is the JSON key for metadata in MergePatch payloads.
 	patchKeyMetadata = "metadata"
 	// patchKeyAnnotations is the JSON key for annotations in MergePatch payloads.
@@ -1432,6 +1436,16 @@ func (r *AdminReconciler) reconcileBackup(
 		fmt.Sprintf("Backup configuration reconciled: schedule=%s, destination=%s",
 			cluster.Spec.Backup.Schedule, cluster.Spec.Backup.Destination.Type))
 
+	// Record that a backup schedule has been (re)established. Backup duration
+	// and size are produced by the backup Job at runtime and are not observable
+	// at this configuration-reconcile layer, so only the started event is
+	// recorded here.
+	backupType := backupTypeFull
+	if cluster.Spec.Backup.Incremental {
+		backupType = backupTypeIncremental
+	}
+	r.metrics.RecordBackup(cluster.Name, cluster.Namespace, backupType, "started")
+
 	return nil
 }
 
@@ -2345,11 +2359,12 @@ func (r *AdminReconciler) handleMaintenance(
 		if err := r.executeMaintenanceViaDB(ctx, cluster, maintenance); err != nil {
 			logger.Error("direct maintenance execution failed, falling back to Job",
 				"operation", maintenance, "error", err)
+			r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance, "failed")
 		} else {
 			// Direct execution succeeded — emit completion event and record metric.
 			r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMaintenanceCompleted,
 				fmt.Sprintf("Maintenance operation %s completed successfully", maintenance))
-			r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance)
+			r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance, "success")
 			logger.Info("maintenance operation completed via DB client", "operation", maintenance)
 			return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 		}
@@ -2368,7 +2383,7 @@ func (r *AdminReconciler) handleMaintenance(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonMaintenanceStarted,
 		fmt.Sprintf("Maintenance operation %s initiated, job: %s", maintenance, job.Name))
-	r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance)
+	r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance, "started")
 
 	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 }

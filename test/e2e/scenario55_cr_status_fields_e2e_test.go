@@ -409,7 +409,7 @@ func (m *scenario55E2EMetricsRecorder) SetRedistributionProgress(_, _ string, _ 
 func (m *scenario55E2EMetricsRecorder) SetDataSkewCoefficient(_, _ string, _ float64)    {}
 func (m *scenario55E2EMetricsRecorder) SetPVCSizeBytes(_, _, _ string, _ float64)        {}
 func (m *scenario55E2EMetricsRecorder) RecordMirroringOperation(_, _, _ string)          {}
-func (m *scenario55E2EMetricsRecorder) RecordMaintenanceOperation(_, _, _ string)        {}
+func (m *scenario55E2EMetricsRecorder) RecordMaintenanceOperation(_, _, _, _ string)     {}
 func (m *scenario55E2EMetricsRecorder) RecordPasswordRotation()                          {}
 func (m *scenario55E2EMetricsRecorder) RecordQueryHistoryInsert(_, _ string)             {}
 func (m *scenario55E2EMetricsRecorder) ObserveQueryHistorySearchDuration(_, _ string, _ time.Duration) {

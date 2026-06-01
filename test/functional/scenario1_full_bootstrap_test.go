@@ -784,9 +784,9 @@ func (m *mockMetricsRecorder) RecordMirroringOperation(cluster, namespace, opera
 	})
 }
 
-func (m *mockMetricsRecorder) RecordMaintenanceOperation(cluster, namespace, operation string) {
+func (m *mockMetricsRecorder) RecordMaintenanceOperation(cluster, namespace, operation, result string) {
 	m.record("RecordMaintenanceOperation", map[string]interface{}{
-		"cluster": cluster, "namespace": namespace, "operation": operation,
+		"cluster": cluster, "namespace": namespace, "operation": operation, "result": result,
 	})
 }
 

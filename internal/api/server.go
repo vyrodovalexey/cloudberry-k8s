@@ -3174,9 +3174,18 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	backupID := r.PathValue("id")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	namespace := r.URL.Query().Get("namespace")
+	cluster, err := s.getCluster(r.Context(), name, namespace)
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRestore(name, namespace, "failed")
+		}
 		writeClusterNotFound(w, name)
 		return
+	}
+
+	if s.metrics != nil {
+		s.metrics.RecordRestore(cluster.Name, cluster.Namespace, "initiated")
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
@@ -3357,7 +3366,10 @@ func (s *Server) handleListPVCs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetDiskUsage returns disk usage information for a cluster.
+// handleGetDiskUsage returns disk usage information for a cluster. When a
+// database factory is available the per-database usage is queried live and
+// recorded on the disk_usage_bytes gauge; otherwise the cached status value
+// is returned with an empty per-database breakdown.
 func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -3366,11 +3378,52 @@ func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	usage := s.collectDiskUsage(r.Context(), cluster)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		responseKeyCluster: cluster.Name,
 		"diskUsagePercent": cluster.Status.DiskUsagePercent,
-		"diskUsage":        []interface{}{},
+		"diskUsage":        usage,
 	})
+}
+
+// collectDiskUsage queries per-database disk usage via the DB client when
+// available and records each database's size on the disk_usage_bytes gauge.
+// It returns the usage slice for the API response, or an empty slice when the
+// DB factory is unavailable or the query fails.
+func (s *Server) collectDiskUsage(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) []db.DiskUsage {
+	if s.dbFactory == nil {
+		return []db.DiskUsage{}
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for disk usage",
+			"cluster", cluster.Name, "error", dbErr)
+		return []db.DiskUsage{}
+	}
+	defer dbClient.Close()
+
+	usage, usageErr := dbClient.GetDiskUsage(ctx, "")
+	if usageErr != nil {
+		s.logger.Error("failed to query disk usage",
+			"cluster", cluster.Name, "error", usageErr)
+		return []db.DiskUsage{}
+	}
+
+	if s.metrics != nil {
+		for i := range usage {
+			s.metrics.SetDiskUsageBytes(
+				cluster.Name, cluster.Namespace,
+				usage[i].Database, float64(usage[i].SizeBytes),
+			)
+		}
+	}
+
+	return usage
 }
 
 // handleListTables lists tables in a cluster.
@@ -3436,10 +3489,56 @@ func (s *Server) handleTriggerRecommendationScan(w http.ResponseWriter, r *http.
 		return
 	}
 
+	s.runRecommendationScan(r.Context(), cluster)
+
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		responseKeyStatus:  "scan initiated",
 		responseKeyCluster: cluster.Name,
 	})
+}
+
+// runRecommendationScan performs a best-effort recommendation scan via the DB
+// client when available, recording the scan duration and the number of
+// recommendations per type. It is a no-op when no DB factory is configured.
+func (s *Server) runRecommendationScan(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	if s.dbFactory == nil || s.metrics == nil {
+		return
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for recommendation scan",
+			"cluster", cluster.Name, "error", dbErr)
+		return
+	}
+	defer dbClient.Close()
+
+	start := time.Now()
+	counts := map[string]float64{}
+	for _, fetch := range []func(context.Context) ([]db.Recommendation, error){
+		dbClient.GetBloatRecommendations,
+		dbClient.GetSkewRecommendations,
+		dbClient.GetAgeRecommendations,
+		dbClient.GetIndexBloatRecommendations,
+	} {
+		recs, fetchErr := fetch(ctx)
+		if fetchErr != nil {
+			s.logger.Error("recommendation fetch failed",
+				"cluster", cluster.Name, "error", fetchErr)
+			continue
+		}
+		for i := range recs {
+			counts[recs[i].Type]++
+		}
+	}
+	s.metrics.ObserveRecommendationScanDuration(cluster.Name, cluster.Namespace, time.Since(start))
+
+	for recType, count := range counts {
+		s.metrics.SetRecommendationsTotal(cluster.Name, cluster.Namespace, recType, count)
+	}
 }
 
 // handleGetUsageReport returns a usage report for a cluster.

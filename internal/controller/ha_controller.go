@@ -511,10 +511,10 @@ func (r *HAReconciler) handleRecovery(
 // to "full" for unknown values.
 func normalizeRecoveryType(recoveryType string) string {
 	switch recoveryType {
-	case "incremental", "full", "differential":
+	case backupTypeIncremental, backupTypeFull, "differential":
 		return recoveryType
 	default:
-		return "full"
+		return backupTypeFull
 	}
 }
 

@@ -984,7 +984,7 @@ The standby coordinator maintains a hot copy of the coordinator via WAL streamin
 - **Deployment**: Separate StatefulSet with its own PVC
 - **Replication**: Continuous WAL streaming from coordinator
 - **Activation**: Manual only (requires explicit administrator action via annotation or CLI)
-- **Monitoring**: Replication lag tracked via Prometheus metrics
+- **Monitoring**: Replication lag tracked via Prometheus metrics. The standby pod includes a `postgres-exporter` sidecar (port 9187) for instance/replication-scoped and standby-local health metrics, ensuring monitoring continuity if the standby is promoted. Exporter placement: `postgres-exporter` runs on both the coordinator and standby, while `cloudberry-query-exporter` is coordinator-only (its cluster-global queries would duplicate metric series if run on a non-promoted standby). Primary and mirror segment pods optionally include a `postgres-exporter` sidecar too — opt-in via the independent `queryMonitoring.exporters.postgresExporter.segments` (primaries, `component=segment-primary`) and `queryMonitoring.exporters.postgresExporter.mirrors` (mirrors, `component=segment-mirror`) flags (both default off), connecting in utility mode (`PGOPTIONS=-c gp_role=utility`) for deep per-segment diagnostics. Mirror exporters run against a segment in WAL-replay recovery and still report `pg_up=1` with useful replica/recovery telemetry. The operator tailors `postgres-exporter` for Cloudberry — the `cloudberry_resgroup_status` query is emitted only when resource groups are configured, the Cloudberry-incompatible built-in collectors (`stat_user_tables`, `pg_settings`) are disabled in favor of equivalent custom queries, and the custom WAL query is recovery-safe — so every scrape is clean (`pg_exporter_last_scrape_error=0`) on the coordinator, standby, primary segments, and mirror segments.
 
 Standby activation is intentionally **not automatic** to prevent split-brain scenarios.
 
@@ -1011,8 +1011,13 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Configuration metrics**: `cloudberry_config_reload_total`
 - **FTS metrics**: `cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`, `cloudberry_replication_lag_bytes`
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
-- **Scale metrics**: `cloudberry_scale_operations_total`, `cloudberry_redistribution_progress`
+- **Scale metrics**: `cloudberry_scale_operations_total`, `cloudberry_redistribution_progress` (set during data redistribution)
 - **Mirroring metrics**: `cloudberry_mirroring_operations_total`, `cloudberry_replication_lag_bytes`
+- **Maintenance metrics**: `cloudberry_maintenance_operations_total` (labels `cluster`, `namespace`, `operation`, `result` ∈ {`started`, `success`, `failed`})
+- **Storage metrics**: `cloudberry_pvc_size_bytes` (set on PVC expansion), `cloudberry_disk_usage_bytes` (per-database, set on the disk-usage API)
+- **Backup/restore metrics**: `cloudberry_backup_total` (labels `cluster`, `namespace`, `type`, `result`; recorded on backup reconcile with `result=started`), `cloudberry_restore_total` (labels `cluster`, `namespace`, `result`; recorded on the restore API)
+- **Recommendation metrics**: `cloudberry_recommendations_total` (gauge, labels `cluster`, `namespace`, `type`) and `cloudberry_recommendation_scan_duration_seconds` (histogram), set during a recommendation scan
+- **Auth metrics**: `cloudberry_auth_attempts_total` (labels `method`, `result`). A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}`
 - **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`, `cloudberry_slow_queries_total`, `cloudberry_workload_rule_actions_total`
 - **Query history metrics**: `cloudberry_query_history_total`, `cloudberry_query_history_retention_deleted_total`, `cloudberry_query_history_size_bytes`
 - **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`)
@@ -1379,7 +1384,7 @@ Both controllers and the API server use the factory instead of creating database
 **Key behaviors:**
 - Reads the admin password from the cluster's `{cluster}-admin-password` Secret
 - Resolves the coordinator service endpoint as `{cluster}-coordinator.{namespace}.svc`
-- Respects the cluster's SSL configuration (`spec.auth.ssl`): `disable` (no SSL), `require` (SSL without verification), or `verify-full` (SSL with CA verification)
+- Respects the cluster's SSL configuration (`spec.auth.ssl`): `disable` (SSL off), `require` (SSL without verification, when `ssl.enabled` but no `certSecret`), or `verify-ca` (SSL with CA chain verification, when `ssl.enabled` with a `certSecret`). `verify-ca` (rather than `verify-full`) is used because the operator dials the coordinator headless service, whose name is not present in the cluster certificate SANs; `verify-ca` still validates the server certificate chain against the cluster CA (the `ca.crt` entry of the SSL cert Secret), preserving MITM protection while skipping hostname verification
 - Configures retry options with exponential backoff
 - Returns a `Client` interface for testability
 
@@ -1503,7 +1508,8 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 2. **Issuance**: If no Secret exists or the certificate is invalid, new certificates are generated using the configured source
 3. **Storage**: Certificates are stored in a Kubernetes Secret of type `kubernetes.io/tls`
 4. **Rotation check**: `NeedsRotation()` is called periodically (every 12 hours). Rotation triggers when **2/3 of the certificate lifetime** has elapsed
-5. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources
+5. **Source-mismatch detection**: Rotation is also forced when the serving certificate in the Secret was issued by a different source than the configured `webhook.certSource`. For example, if a stale self-signed certificate is present while `certSource=vault-pki` (or vice versa), the operator re-issues the certificate from the configured source immediately, rather than keeping the stale certificate until its natural expiry
+6. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources
 
 ### Vault PKI Certificate Issuance
 

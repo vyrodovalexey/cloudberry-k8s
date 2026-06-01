@@ -1453,6 +1453,8 @@ The TLS certificates are made available at `/tls` on all StatefulSets (coordinat
 
 This is handled automatically by the operator — no manual configuration is required.
 
+**Operator-to-cluster connections with SSL**: When `auth.ssl.enabled` is set with a `certSecret`, the operator connects to the cluster database using `sslmode=verify-ca`. It validates the server certificate chain against the cluster CA read from the SSL cert Secret's `ca.crt` entry. `verify-ca` is used instead of `verify-full` because the operator connects via the coordinator headless service, whose name is not present in the cluster certificate SANs; `verify-ca` preserves MITM protection (CA chain validation) while allowing the internal service hostname. For this to work, the cluster TLS cert Secret (`certSecret`) should contain `tls.crt`, `tls.key`, and `ca.crt` — the operator uses `ca.crt` to validate the connection. (When SSL is enabled without a `certSecret`, the operator connects with `sslmode=require`.)
+
 **Supported `minTLSVersion` values:**
 
 | Value | PostgreSQL Setting | Description |
@@ -4745,6 +4747,13 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_resource_group_memory_usage` | Gauge | Memory usage per resource group (labels: `cluster`, `namespace`, `group`) |
 | `cloudberry_slow_queries_total` | Counter | Slow queries detected (labels: `cluster`, `namespace`) |
 | `cloudberry_workload_rule_actions_total` | Counter | Workload rule actions applied (labels: `cluster`, `namespace`, `rule`, `action`) |
+| `cloudberry_maintenance_operations_total` | Counter | Maintenance operations (vacuum, analyze, reindex, log-rotate). Labels: `cluster`, `namespace`, `operation`, `result` (`started`, `success`, `failed`) |
+| `cloudberry_disk_usage_bytes` | Gauge | Per-database disk usage in bytes, set on the disk-usage API (labels: `cluster`, `namespace`, `database`) |
+| `cloudberry_backup_total` | Counter | Backup operations, recorded on backup reconcile with `result=started` (labels: `cluster`, `namespace`, `type`, `result`) |
+| `cloudberry_restore_total` | Counter | Restore operations, recorded on the restore API (labels: `cluster`, `namespace`, `result`) |
+| `cloudberry_recommendations_total` | Gauge | Storage recommendations by type, set during a recommendation scan (labels: `cluster`, `namespace`, `type`) |
+| `cloudberry_recommendation_scan_duration_seconds` | Histogram | Recommendation scan duration in seconds (labels: `cluster`, `namespace`) |
+| `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |
 
 ### Security and Lifecycle Metrics
 
@@ -4820,6 +4829,8 @@ spec:
     exporters:
       postgresExporter:
         enabled: true
+        segments: false  # opt-in: deploy a postgres-exporter sidecar into each primary segment pod
+        mirrors: false   # opt-in: deploy a postgres-exporter sidecar into each mirror segment pod
         image: "prometheuscommunity/postgres-exporter:0.16.0"
         port: 9187
         resources:
@@ -4875,7 +4886,44 @@ spec:
 | `nodeExporter` | Exposes host-level metrics via `node_exporter` | 9100 |
 | `cloudberryQueryExporter` | Exposes Cloudberry-specific query metrics | 9188 |
 
-Each exporter supports `enabled`, `image`, `port`, and optional `resources` (requests/limits for CPU and memory).
+Each exporter supports `enabled`, `image`, `port`, and optional `resources` (requests/limits for CPU and memory). In addition, `postgresExporter` supports two independent flags — `segments` (`bool`, default `false`) and `mirrors` (`bool`, default `false`) — that opt in to deploying a postgres-exporter sidecar into each primary segment pod and each mirror segment pod respectively. See **Per-segment postgres-exporter** below.
+
+**Exporter behavior notes:**
+
+- The `postgresExporter` sidecar does not use `--auto-discover-databases`, which previously caused duplicate-metric HTTP 500 errors when a cluster had multiple databases. The custom Cloudberry queries are cluster-global scoped and run once against the default database.
+- During query-monitoring reconciliation, the operator auto-creates the `cloudberry_exporter` database role used by both the `postgresExporter` and `cloudberryQueryExporter`.
+- **Cloudberry-tailored for clean scrapes**: The operator tunes the `postgresExporter` so each scrape succeeds without errors on the coordinator, standby, primary segments, and mirror segments — the healthy state is `pg_up=1` with `pg_exporter_last_scrape_error=0`. Three adjustments make this work:
+  - **Resource-group query is conditional**: The custom `cloudberry_resgroup_status` query (resource-group usage from `gp_toolkit.gp_resgroup_status`) is emitted **only** when the cluster declares resource groups (`spec.workload.resourceGroups` non-empty, i.e. `gp_resource_manager='group'`). On clusters using resource **queues** (the default), the `gp_toolkit.gp_resgroup_status` view does not exist, so the operator omits the query to avoid a per-scrape error. Resource-group exporter metrics therefore appear only when resource groups are configured.
+  - **Incompatible built-in collectors disabled**: The operator passes `--no-collector.stat_user_tables` (the built-in collector fails on Cloudberry with "query plan with multiple segworker groups is not supported"; the custom `cloudberry_table_stats` query covers per-table stats instead) and `--disable-settings-metrics` (the built-in `pg_settings` collector fails on Cloudberry's `NULL` `short_desc` values; the custom `cloudberry_connections_max` query covers `max_connections` instead).
+  - **Recovery-safe WAL query**: The custom `cloudberry_wal` query uses `pg_is_in_recovery()` to select `pg_last_wal_replay_lsn()` on standby/mirror replicas and `pg_current_wal_lsn()` on primaries, so it runs without the "recovery is in progress" error on the coordinator, standby, primary segments, and mirror segments alike.
+- **Exporter placement**: The active coordinator runs both exporters. The standby coordinator runs the `postgresExporter` sidecar only — making the standby pod `2/2` (`cloudberry` + `postgres-exporter`, with `prometheus.io/scrape` annotations on port 9187). The standby's `postgresExporter` connects to the local standby database via `localhost` and provides instance/replication-scoped and standby-local health metrics, ensuring monitoring continuity if the standby is promoted. The `cloudberryQueryExporter` is intentionally **not** run on the standby because its queries are cluster-global scoped (`gp_segment_configuration`, distributed transactions, cluster-wide `pg_stat_activity`, etc.); running it on a non-promoted standby would duplicate the coordinator's cluster-wide metric series. It runs only on the active coordinator and activates on the promoted node after failover. Primary and mirror **segment** pods optionally run a `postgresExporter` sidecar as well — this is **opt-in** via `postgresExporter.segments` (primary segments) and `postgresExporter.mirrors` (mirror segments), both default off and independently toggleable; see below. The `cloudberryQueryExporter` is never deployed to segments.
+
+**Per-segment postgres-exporter:**
+
+The `postgresExporter` sidecar can be deployed into segment pods via two **independent** flags, both defaulting to `false`:
+
+- `postgresExporter.segments: true` deploys a `postgres-exporter` sidecar into **each primary segment pod**.
+- `postgresExporter.mirrors: true` deploys a `postgres-exporter` sidecar into **each mirror segment pod**.
+
+You can enable per-primary, per-mirror, both, or neither. Each makes the affected pods `2/2` (`cloudberry` + `postgres-exporter`) and exposes deep per-segment PostgreSQL diagnostics — instance-level `pg_*` metrics for every segment.
+
+```yaml
+spec:
+  queryMonitoring:
+    enabled: true
+    exporters:
+      postgresExporter:
+        enabled: true
+        segments: true   # deploy a postgres-exporter into each primary segment pod
+        mirrors: true    # deploy a postgres-exporter into each mirror segment pod
+```
+
+- **Opt-in by design**: Enabling `segments` and/or `mirrors` adds one scrape target and one exporter container per affected segment, increasing pod overhead and Prometheus metric cardinality (one full set of `pg_*` series per segment). Leave them off unless you need per-segment depth. Cluster-wide segment health is already covered by the `cloudberryQueryExporter` (`gp_segment_configuration`, etc.) on the coordinator plus the `nodeExporter` DaemonSet.
+- **Utility mode**: Cloudberry rejects direct client connections to segments, so both the primary- and mirror-segment `postgres-exporter` connect in **utility mode** — the operator injects `PGOPTIONS=-c gp_role=utility` into the segment `postgres-exporter` container only. The coordinator and standby exporters connect normally (no utility mode).
+- **Mirror telemetry**: A mirror segment is in WAL-replay recovery, but it still accepts the utility-mode connection (`pg_up=1`) and produces the large majority of metrics — roughly 325 `pg_*` series per mirror, including useful replica/recovery telemetry such as `pg_replication_is_replica`, `pg_replication_lag_seconds`, and WAL metrics.
+- **Mirror scrapes are clean**: A mirror segment is in WAL-replay recovery, but the operator's recovery-safe custom WAL/replication queries (see **Exporter behavior notes** above) run correctly on replicas, so a mirror reports `pg_up=1` with `pg_exporter_last_scrape_error=0` — the same healthy state as a primary.
+- **Metric disambiguation**: Per-segment `pg_*` series are distinguished by the pod label plus an `app.kubernetes.io/component` label (relabeled to `component` by vmagent) — `segment-primary` for primaries and `segment-mirror` for mirrors — so mirror series don't collide with primary, coordinator, or standby series.
+- **Exporter scope**: Segments (primary or mirror) only ever receive the `postgres-exporter`; the `cloudberryQueryExporter` remains coordinator-only.
 
 **ServiceMonitor** creates a Prometheus Operator `ServiceMonitor` resource for automatic scrape target discovery. Set `namespace` to override the target namespace (defaults to the cluster namespace). Use `labels` to add custom labels for Prometheus selector matching.
 

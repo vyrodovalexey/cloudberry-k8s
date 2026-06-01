@@ -1,0 +1,24 @@
+image:
+  repository: timberio/vector
+  tag: "0.43.1-debian"
+  pullPolicy: IfNotPresent
+
+victoriaLogs:
+  endpoint: "http://host.docker.internal:9428"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: ""
+
+rbac:
+  create: true
+
+tolerations: []

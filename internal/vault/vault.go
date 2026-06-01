@@ -433,6 +433,11 @@ func (w *SecretWatcher) checkForChanges(ctx context.Context) {
 		strData[k] = fmt.Sprintf("%v", v)
 	}
 
+	// Suppress the very first observed value: on the initial poll lastHash is
+	// empty, so we record the baseline hash without invoking onChange. The
+	// onChange callback only fires on subsequent polls when the hash actually
+	// differs from the previously recorded value, avoiding a spurious "changed"
+	// event when the watcher first populates its state.
 	hash := util.ComputeHash(strData)
 	if hash != w.lastHash && w.lastHash != "" {
 		w.logger.Info("vault secret changed", "path", w.path)

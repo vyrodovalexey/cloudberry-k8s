@@ -2725,6 +2725,199 @@ func TestIOLimitOption_Construction(t *testing.T) {
 // ResourceGroupInfo IOLimits field test
 // ============================================================================
 
+// ============================================================================
+// SetupExporterRole Tests
+// ============================================================================
+
+func TestPgxClient_SetupExporterRole_Create(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT EXISTS"):
+			// Role does not yet exist.
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"f"})
+		case strings.Contains(query, "CREATE ROLE"):
+			return execResponse("CREATE ROLE")
+		case strings.Contains(query, "GRANT"):
+			return execResponse("GRANT")
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	err := client.SetupExporterRole(context.Background(), "secret-pass")
+	assert.NoError(t, err)
+}
+
+func TestPgxClient_SetupExporterRole_Exists(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT EXISTS"):
+			// Role already exists => ALTER ROLE branch.
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"t"})
+		case strings.Contains(query, "ALTER ROLE"):
+			return execResponse("ALTER ROLE")
+		case strings.Contains(query, "GRANT"):
+			return execResponse("GRANT")
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	err := client.SetupExporterRole(context.Background(), "new-pass")
+	assert.NoError(t, err)
+}
+
+func TestPgxClient_SetupExporterRole_ExistenceCheckError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return errorResponseMsg("permission denied")
+	})
+	defer cleanup()
+
+	err := client.SetupExporterRole(context.Background(), "pass")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking exporter role existence")
+}
+
+func TestPgxClient_SetupExporterRole_CreateError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT EXISTS"):
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"f"})
+		case strings.Contains(query, "CREATE ROLE"):
+			return errorResponseMsg("create failed")
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	err := client.SetupExporterRole(context.Background(), "pass")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating exporter role")
+}
+
+func TestPgxClient_SetupExporterRole_GrantViewErrorIgnored(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT EXISTS"):
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"f"})
+		case strings.Contains(query, "CREATE ROLE"):
+			return execResponse("CREATE ROLE")
+		case strings.Contains(query, "GRANT pg_monitor"):
+			return execResponse("GRANT")
+		case strings.Contains(query, "GRANT SELECT"):
+			// View grants may fail for missing views; must be tolerated.
+			return errorResponseMsg("view does not exist")
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	err := client.SetupExporterRole(context.Background(), "pass")
+	assert.NoError(t, err)
+}
+
+// ============================================================================
+// MoveQueryToResourceGroup Tests
+// ============================================================================
+
+func TestPgxClient_MoveQueryToResourceGroup_Success(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "pg_stat_activity"):
+			return singleRowResponse([]string{"usename"}, []string{"app_user"})
+		case strings.Contains(query, "ALTER ROLE"):
+			return execResponse("ALTER ROLE")
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	err := client.MoveQueryToResourceGroup(context.Background(), 100, "analytics")
+	assert.NoError(t, err)
+}
+
+func TestPgxClient_MoveQueryToResourceGroup_NoSession(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return singleRowResponse([]string{"usename"}, []string{""})
+	})
+	defer cleanup()
+
+	err := client.MoveQueryToResourceGroup(context.Background(), 100, "analytics")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found or has no associated role")
+}
+
+func TestPgxClient_MoveQueryToResourceGroup_LookupError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return errorResponseMsg("lookup failed")
+	})
+	defer cleanup()
+
+	err := client.MoveQueryToResourceGroup(context.Background(), 100, "analytics")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "looking up session")
+}
+
+// ============================================================================
+// GetQueryDetail Tests
+// ============================================================================
+
+func TestPgxClient_GetQueryDetail_Success(t *testing.T) {
+	sessionFields := []fieldDesc{
+		int4Field("pid"), textField("usename"), textField("datname"),
+		textField("state"), textField("query"),
+		{name: "query_start", oid: 1184}, // timestamptz
+		textField("duration"), textField("wait_event_type"), textField("wait_event"),
+		textField("backend_type"),
+	}
+	lockFields := []fieldDesc{
+		textField("locktype"), textField("mode"),
+		boolField("granted"), textField("relation"),
+	}
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		switch {
+		case strings.Contains(query, "pg_stat_activity"):
+			return singleRowResponseTyped(sessionFields, []string{
+				"100", "app_user", "testdb", "active", "SELECT 1",
+				"2024-01-01 00:00:00+00", "0", "", "", "client backend",
+			})
+		case strings.Contains(query, "pg_locks"):
+			return multiRowResponseTyped(
+				lockFields,
+				[][]string{{"relation", "AccessShareLock", "t", "public.orders"}},
+			)
+		case strings.Contains(query, "pg_stat_user_tables"):
+			return multiRowResponse([]string{"table"}, [][]string{{"public.orders"}})
+		default:
+			return execResponse("SELECT 1")
+		}
+	})
+	defer cleanup()
+
+	detail, err := client.GetQueryDetail(context.Background(), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int32(100), detail.PID)
+	assert.Equal(t, "app_user", detail.Username)
+	assert.Len(t, detail.Locks, 1)
+	assert.Equal(t, []string{"public.orders"}, detail.TablesAccessed)
+}
+
+func TestPgxClient_GetQueryDetail_NotFound(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return errorResponseMsg("no rows")
+	})
+	defer cleanup()
+
+	_, err := client.GetQueryDetail(context.Background(), 999)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "query not found or not accessible")
+}
+
 func TestResourceGroupInfo_IOLimits(t *testing.T) {
 	info := ResourceGroupInfo{
 		Name:     "analytics",

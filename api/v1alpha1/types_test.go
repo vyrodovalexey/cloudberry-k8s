@@ -1412,3 +1412,53 @@ func TestDeepCopy_PopulatedSubTypes(t *testing.T) {
 		assert.Equal(t, "secret", copied.Name)
 	})
 }
+
+// TestExporterSpec_Segments verifies the OPT-IN per-segment postgres-exporter
+// toggle: it defaults to false (zero value) and survives a deepcopy round-trip
+// independently of the source.
+func TestExporterSpec_Segments(t *testing.T) {
+	t.Run("zero value defaults to false (OFF)", func(t *testing.T) {
+		var spec ExporterSpec
+		assert.False(t, spec.Segments, "Segments must default to false (opt-in OFF)")
+	})
+
+	t.Run("deepcopy round-trips Segments=true independently", func(t *testing.T) {
+		src := &ExporterSpec{Enabled: true, Image: "img", Port: 9187, Segments: true}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Segments)
+
+		// Mutating the copy must not affect the source.
+		copied.Segments = false
+		assert.True(t, src.Segments, "deepcopy must be independent of the source")
+	})
+}
+
+// TestExporterSpec_Mirrors verifies the OPT-IN per-mirror postgres-exporter
+// toggle: it defaults to false (zero value) and survives a deepcopy round-trip
+// independently of the source and of the Segments toggle.
+func TestExporterSpec_Mirrors(t *testing.T) {
+	t.Run("zero value defaults to false (OFF)", func(t *testing.T) {
+		var spec ExporterSpec
+		assert.False(t, spec.Mirrors, "Mirrors must default to false (opt-in OFF)")
+	})
+
+	t.Run("deepcopy round-trips Mirrors=true independently", func(t *testing.T) {
+		src := &ExporterSpec{Enabled: true, Image: "img", Port: 9187, Mirrors: true}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Mirrors)
+
+		// Mutating the copy must not affect the source.
+		copied.Mirrors = false
+		assert.True(t, src.Mirrors, "deepcopy must be independent of the source")
+	})
+
+	t.Run("Segments and Mirrors are independent toggles", func(t *testing.T) {
+		src := &ExporterSpec{Enabled: true, Segments: true, Mirrors: false}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.True(t, copied.Segments)
+		assert.False(t, copied.Mirrors)
+	})
+}

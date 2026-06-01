@@ -263,7 +263,7 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.SetPVCSizeBytes("c", "n", "coordinator", 10737418240)
 	recorder.RecordMirroringOperation("c", "n", "enable")
 	recorder.RecordMirroringOperation("c", "n", "disable")
-	recorder.RecordMaintenanceOperation("c", "n", "vacuum")
+	recorder.RecordMaintenanceOperation("c", "n", "vacuum", "success")
 	recorder.RecordPasswordRotation()
 	recorder.RecordQueryHistoryInsert("c", "n")
 	recorder.ObserveQueryHistorySearchDuration("c", "n", time.Second)
@@ -591,7 +591,7 @@ func TestNoopRecorder_AllMethods(t *testing.T) {
 	r.SetDataSkewCoefficient("cluster", "ns", 0.15)
 	r.SetPVCSizeBytes("cluster", "ns", "coordinator", 10737418240)
 	r.RecordMirroringOperation("cluster", "ns", "enable")
-	r.RecordMaintenanceOperation("cluster", "ns", "vacuum")
+	r.RecordMaintenanceOperation("cluster", "ns", "vacuum", "success")
 	r.RecordPasswordRotation()
 	r.RecordActiveQueryExport()
 	r.RecordMonitorPause("cluster", "ns")
@@ -1201,4 +1201,86 @@ func TestNoopRecorder_NewMethods(t *testing.T) {
 	r.RecordUpgradeOperation("c", "n", "started")
 	r.RecordRollingRestart("c", "n", "started")
 	r.RecordRecoveryOperation("c", "n", "full", "started")
+}
+
+// ============================================================================
+// Maintenance Operation Metrics Tests
+// ============================================================================
+
+// TestRecordMaintenanceOperation verifies the maintenance_operations_total
+// counter is incremented with the expected cluster/namespace/operation/result
+// labels and value.
+func TestRecordMaintenanceOperation(t *testing.T) {
+	tests := []struct {
+		name      string
+		cluster   string
+		namespace string
+		operation string
+		result    string
+	}{
+		{"vacuum success", "test-cluster", "default", "vacuum", "success"},
+		{"reindex failed", "prod-cluster", "prod", "reindex", "failed"},
+		{"analyze started", "stg-cluster", "staging", "analyze", "started"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+
+			recorder.RecordMaintenanceOperation(tt.cluster, tt.namespace, tt.operation, tt.result)
+
+			families, err := reg.Gather()
+			require.NoError(t, err)
+
+			found := false
+			for _, f := range families {
+				if f.GetName() != "cloudberry_maintenance_operations_total" {
+					continue
+				}
+				found = true
+				require.Len(t, f.GetMetric(), 1)
+				metric := f.GetMetric()[0]
+
+				labels := map[string]string{}
+				for _, l := range metric.GetLabel() {
+					labels[l.GetName()] = l.GetValue()
+				}
+				assert.Equal(t, tt.cluster, labels["cluster"])
+				assert.Equal(t, tt.namespace, labels["namespace"])
+				assert.Equal(t, tt.operation, labels["operation"])
+				assert.Equal(t, tt.result, labels["result"])
+
+				assert.InDelta(t, 1.0, metric.GetCounter().GetValue(), 0.001)
+			}
+			assert.True(t, found,
+				"cloudberry_maintenance_operations_total metric should be registered")
+		})
+	}
+}
+
+// TestRecordMaintenanceOperation_MultipleIncrements verifies repeated calls with
+// the same labels accumulate on the counter.
+func TestRecordMaintenanceOperation_MultipleIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	recorder.RecordMaintenanceOperation("c", "n", "vacuum", "success")
+	recorder.RecordMaintenanceOperation("c", "n", "vacuum", "success")
+	recorder.RecordMaintenanceOperation("c", "n", "vacuum", "failed")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	found := false
+	for _, f := range families {
+		if f.GetName() != "cloudberry_maintenance_operations_total" {
+			continue
+		}
+		found = true
+		// Two distinct result label sets => two metric series.
+		assert.Len(t, f.GetMetric(), 2)
+	}
+	assert.True(t, found,
+		"cloudberry_maintenance_operations_total metric should be registered")
 }

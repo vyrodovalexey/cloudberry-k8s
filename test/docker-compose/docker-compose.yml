@@ -7,6 +7,7 @@
 #   3200       - Tempo HTTP API
 #   4317/4318  - OTLP receivers
 #   8428       - VictoriaMetrics
+#   9428       - VictoriaLogs
 #   3000       - Grafana
 #   9000/9001  - MinIO (S3-compatible storage, minioadmin/minioadmin)
 #   9094       - Kafka (KRaft mode, external listener)
@@ -132,6 +133,24 @@ services:
       - --httpListenAddr=:8428
       - --retentionPeriod=30d
 
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.3.2-victorialogs
+    container_name: victorialogs
+    ports:
+      - 9428:9428
+    volumes:
+      - victorialogs_data:/victoria-logs-data
+    command:
+      - --storageDataPath=/victoria-logs-data
+      - --httpListenAddr=:9428
+      - --retentionPeriod=30d
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   grafana:
     image: grafana/grafana:11.5.2
     container_name: grafana
@@ -142,12 +161,14 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ../../monitoring/grafana:/var/lib/grafana/dashboards/avapigw:ro
     depends_on:
       - victoriametrics
+      - victorialogs
       - tempo
 
   # ===========================================================================
@@ -224,6 +245,7 @@ volumes:
   postgres_data:
   vault_data:
   victoriametrics_data:
+  victorialogs_data:
   grafana_data:
   tempo_data:
   mtls_certs:

@@ -107,7 +107,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			logger.Info("cluster resource not found, likely deleted")
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
+		wrapped := fmt.Errorf("fetching cluster: %w", err)
+		telemetry.SetSpanError(span, wrapped)
+		return ctrl.Result{}, wrapped
 	}
 
 	logger.Debug("cluster resource fetched",
@@ -123,6 +125,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		result, err := r.handleAction(ctx, cluster, action)
 		if err != nil {
 			r.recordReconcileResult(cluster, startTime, "error")
+			telemetry.SetSpanError(span, err)
 			return result, err
 		}
 		return result, nil
@@ -155,7 +158,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Debug("adding finalizer to cluster")
 		controllerutil.AddFinalizer(cluster, util.FinalizerName)
 		if err := r.client.Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
+			wrapped := fmt.Errorf("adding finalizer: %w", err)
+			telemetry.SetSpanError(span, wrapped)
+			return ctrl.Result{}, wrapped
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -905,8 +910,23 @@ func (r *ClusterReconciler) expandCoordinatorPVC(
 	if changed {
 		logger.Info("coordinator PVC expanded",
 			"pvc", coordPVCName, "newSize", desiredSize)
+		r.recordPVCSize(cluster, "coordinator", desiredSize)
 	}
 	return changed, nil
+}
+
+// recordPVCSize parses the desired PVC size quantity to bytes and records it
+// on the pvc_size_bytes gauge for the given component. Parsing failures are
+// ignored since the size was already validated during expansion.
+func (r *ClusterReconciler) recordPVCSize(
+	cluster *cbv1alpha1.CloudberryCluster,
+	component, size string,
+) {
+	q, err := resource.ParseQuantity(size)
+	if err != nil {
+		return
+	}
+	r.metrics.SetPVCSizeBytes(cluster.Name, cluster.Namespace, component, float64(q.Value()))
 }
 
 // expandStandbyPVC expands the standby PVC if needed.
@@ -934,6 +954,7 @@ func (r *ClusterReconciler) expandStandbyPVC(
 	if changed {
 		logger.Info("standby PVC expanded",
 			"pvc", standbyPVCName, "newSize", desiredSize)
+		r.recordPVCSize(cluster, "standby", desiredSize)
 	}
 	return changed, nil
 }
@@ -975,6 +996,10 @@ func (r *ClusterReconciler) expandSegmentPVCs(
 				expanded = true
 			}
 		}
+	}
+
+	if expanded {
+		r.recordPVCSize(cluster, "segment", segmentSize)
 	}
 
 	return expanded
@@ -2025,6 +2050,17 @@ func (r *ClusterReconciler) redistributeData(
 	}); redistErr != nil {
 		return fmt.Errorf("redistributing data: %w", redistErr)
 	}
+
+	// Best-effort progress reporting. GetRedistributionProgress returns a
+	// percentage (0-100); convert to a 0.0..1.0 ratio for the gauge. On a
+	// query error we fall back to 1.0 since RedistributeData has completed.
+	progress := 1.0
+	if pct, progErr := dbClient.GetRedistributionProgress(ctx); progErr != nil {
+		logger.Warn("failed to query redistribution progress", "error", progErr)
+	} else if pct < 100 {
+		progress = float64(pct) / 100.0
+	}
+	r.metrics.SetRedistributionProgress(cluster.Name, cluster.Namespace, progress)
 
 	// Update condition to reflect redistribution completion.
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,

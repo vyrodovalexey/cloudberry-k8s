@@ -1080,6 +1080,21 @@ type ExporterSpec struct {
 	// Resources defines the compute resource requirements for the exporter.
 	// +optional
 	Resources *ResourceRequirements `json:"resources,omitempty"`
+
+	// Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+	// Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+	// intended for deep per-segment diagnostics.
+	// +optional
+	// +kubebuilder:default=false
+	Segments bool `json:"segments,omitempty"`
+
+	// Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+	// segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+	// exporter connects in utility mode and primarily yields recovery/replication
+	// metrics. Increases scrape targets and cardinality (one exporter per mirror).
+	// +optional
+	// +kubebuilder:default=false
+	Mirrors bool `json:"mirrors,omitempty"`
 }
 
 // QueryServiceMonitorSpec defines the Prometheus ServiceMonitor configuration

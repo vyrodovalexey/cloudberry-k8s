@@ -3,6 +3,7 @@ package db
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,15 @@ const (
 	severityInfo     = "info"
 	severityWarning  = "warning"
 	severityCritical = "critical"
+)
+
+// Transient per-database connection pool bounds. Redistribution opens a
+// short-lived pool per database; capping the size and connection lifetime
+// prevents connection spikes against the coordinator when many databases are
+// processed sequentially.
+const (
+	redistributionPoolMaxConns        = int32(4)
+	redistributionPoolMaxConnLifetime = 5 * time.Minute
 )
 
 // sanitizeDistKey sanitizes a comma-separated distribution key by individually
@@ -572,6 +582,13 @@ type Config struct {
 	Password string
 	// SSLMode is the SSL mode (disable, require, verify-ca, verify-full).
 	SSLMode string
+	// SSLRootCA holds the PEM-encoded CA certificate(s) used to verify the
+	// server certificate chain for verify-ca / verify-full SSL modes. When
+	// empty, pgx falls back to the host's system root CA pool. This is
+	// required when connecting to a cluster whose serving certificate is
+	// issued by a private CA (for example, Vault PKI), because the private
+	// CA is not present in the system trust store.
+	SSLRootCA []byte
 	// MaxConns is the maximum number of connections in the pool.
 	MaxConns int32
 	// RetryOpts configures retry behavior.
@@ -623,6 +640,10 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 		return nil, fmt.Errorf("parsing connection string: %w", err)
 	}
 
+	if err := applyRootCA(poolCfg, cfg.SSLRootCA); err != nil {
+		return nil, err
+	}
+
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
 	}
@@ -660,6 +681,36 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 		retryOpts: retryOpts,
 		logger:    logger,
 	}, nil
+}
+
+// applyRootCA installs the supplied PEM-encoded CA certificate(s) into the
+// pool's TLS configuration so that verify-ca / verify-full SSL modes validate
+// the server certificate chain against a private CA (for example, Vault PKI)
+// rather than only the host's system trust store.
+//
+// When rootCA is empty this is a no-op: pgx keeps the TLS configuration it
+// derived from the connection string (system roots), which is correct for the
+// "require" and "disable" modes that do not need a custom CA. When rootCA is
+// non-empty but the SSL mode produced no TLS configuration (for example,
+// sslmode=disable), there is nothing to attach and the CA is ignored.
+func applyRootCA(poolCfg *pgxpool.Config, rootCA []byte) error {
+	if len(rootCA) == 0 {
+		return nil
+	}
+
+	tlsCfg := poolCfg.ConnConfig.TLSConfig
+	if tlsCfg == nil {
+		// SSL is not negotiated for this connection (for example,
+		// sslmode=disable); there is no TLS configuration to attach the CA to.
+		return nil
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(rootCA) {
+		return fmt.Errorf("parsing SSL root CA: no valid certificate found in PEM data")
+	}
+	tlsCfg.RootCAs = pool
+	return nil
 }
 
 // buildConnectionString constructs a PostgreSQL connection string using pgx's
@@ -2100,6 +2151,11 @@ func (c *pgxClient) redistributeDatabase(ctx context.Context, dbName string, opt
 		return fmt.Errorf("parsing connection config: %w", err)
 	}
 	dbConfig.ConnConfig.Database = dbName
+
+	// Bound the transient pool to avoid connection spikes when redistributing
+	// many databases sequentially.
+	dbConfig.MaxConns = redistributionPoolMaxConns
+	dbConfig.MaxConnLifetime = redistributionPoolMaxConnLifetime
 
 	dbPool, err := pgxpool.NewWithConfig(ctx, dbConfig)
 	if err != nil {

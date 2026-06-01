@@ -124,6 +124,13 @@ type ResourceBuilder interface {
 	BuildExporterQueriesConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
 	// BuildExporterSidecarContainers returns the exporter sidecar containers.
 	BuildExporterSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildPostgresExporterSidecarContainers returns only the postgres-exporter
+	// sidecar container (used for the standby coordinator pod).
+	BuildPostgresExporterSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildSegmentPostgresExporterSidecarContainers returns only the
+	// postgres-exporter sidecar container configured for primary segments
+	// (utility mode), used for the segment primary pod.
+	BuildSegmentPostgresExporterSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
 	// BuildExporterSidecarVolumes returns the volumes for exporter sidecars.
 	BuildExporterSidecarVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume
 	// BuildNodeExporterDaemonSet builds the node exporter DaemonSet.
@@ -208,7 +215,7 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 		}
 		sts.Spec.Template.Annotations["prometheus.io/scrape"] = promScrapeTrue
 		sts.Spec.Template.Annotations["prometheus.io/port"] = fmt.Sprintf("%d", pgExporterPort)
-		sts.Spec.Template.Annotations["prometheus.io/path"] = "/metrics"
+		sts.Spec.Template.Annotations["prometheus.io/path"] = keyMetricsPath
 	}
 
 	pvc, err := buildPVC(cluster.Spec.Coordinator.Storage, labels)
@@ -273,6 +280,26 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
+	// Inject ONLY the postgres-exporter sidecar on the standby for
+	// instance/replication-scoped metrics. The cloudberry-query-exporter is
+	// intentionally omitted (it is coordinator-only) because its cluster-global
+	// queries would duplicate the coordinator's metric series from a
+	// non-promoted standby.
+	if cluster.Spec.QueryMonitoring != nil && cluster.Spec.QueryMonitoring.Enabled &&
+		cluster.Spec.QueryMonitoring.Exporters != nil {
+		sidecars := b.BuildPostgresExporterSidecarContainers(cluster)
+		sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, sidecars...)
+		sidecarVolumes := b.BuildExporterSidecarVolumes(cluster)
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, sidecarVolumes...)
+		// Add Prometheus scrape annotations so vmagent/Prometheus discovers the standby exporter metrics.
+		if sts.Spec.Template.Annotations == nil {
+			sts.Spec.Template.Annotations = make(map[string]string)
+		}
+		sts.Spec.Template.Annotations["prometheus.io/scrape"] = promScrapeTrue
+		sts.Spec.Template.Annotations["prometheus.io/port"] = fmt.Sprintf("%d", pgExporterPort)
+		sts.Spec.Template.Annotations["prometheus.io/path"] = keyMetricsPath
+	}
+
 	pvc, err := buildPVC(storage, labels)
 	if err != nil {
 		return nil, fmt.Errorf("building standby PVC: %w", err)
@@ -332,6 +359,17 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
 
+	// OPT-IN: Inject ONLY the postgres-exporter sidecar into each primary segment
+	// pod when explicitly requested via PostgresExporter.Segments. Default is OFF,
+	// so segment pods are unchanged unless the operator opts in. The
+	// cloudberry-query-exporter is intentionally never added to segments: its
+	// queries are cluster-global and would collide with the coordinator's series.
+	// The DSN connects via localhost:5432, so each exporter scrapes its own
+	// segment's local Postgres instance, yielding true per-segment metrics.
+	if segmentPostgresExporterEnabled(cluster) {
+		injectSegmentPostgresExporter(b, cluster, sts)
+	}
+
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {
 		return nil, fmt.Errorf("building segment primary PVC: %w", err)
@@ -340,6 +378,93 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
+}
+
+// segmentPostgresExporterEnabled reports whether the OPT-IN per-segment
+// postgres-exporter sidecar should be injected into primary segment pods. It is
+// strictly gated: query monitoring must be enabled, the exporters block and the
+// PostgresExporter must be present and Enabled, AND the Segments opt-in toggle
+// must be true. The default (any condition false) is OFF, leaving segment pods
+// unchanged. A Segments=true with the exporter disabled is a silent no-op.
+func segmentPostgresExporterEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	qm := cluster.Spec.QueryMonitoring
+	return qm != nil && qm.Enabled &&
+		qm.Exporters != nil &&
+		qm.Exporters.PostgresExporter != nil &&
+		qm.Exporters.PostgresExporter.Enabled &&
+		qm.Exporters.PostgresExporter.Segments
+}
+
+// mirrorPostgresExporterEnabled reports whether the OPT-IN per-mirror
+// postgres-exporter sidecar should be injected into mirror segment pods. It is
+// gated identically to segmentPostgresExporterEnabled except it checks the
+// Mirrors opt-in toggle instead of Segments. The default (any condition false)
+// is OFF, leaving mirror pods unchanged. A Mirrors=true with the exporter
+// disabled is a silent no-op.
+func mirrorPostgresExporterEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	qm := cluster.Spec.QueryMonitoring
+	return qm != nil && qm.Enabled &&
+		qm.Exporters != nil &&
+		qm.Exporters.PostgresExporter != nil &&
+		qm.Exporters.PostgresExporter.Enabled &&
+		qm.Exporters.PostgresExporter.Mirrors
+}
+
+// injectSegmentPostgresExporter appends the postgres-exporter sidecar, its
+// volumes, the Prometheus scrape annotations, and the app.kubernetes.io/component
+// label to the primary segment pod template. The component label is what vmagent
+// relabels into the Prometheus "component" label so per-segment series are
+// disambiguated (component="segment-primary" plus the unique per-pod "pod" label).
+func injectSegmentPostgresExporter(
+	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet,
+) {
+	injectSegmentExporterWithComponent(b, cluster, sts, util.ComponentSegmentPrimary)
+}
+
+// injectMirrorPostgresExporter appends the postgres-exporter sidecar (in utility
+// mode) and its volumes/annotations to the MIRROR segment pod template, tagging
+// it with component="segment-mirror" so vmagent disambiguates the mirror series
+// from the primary-segment series. Mirror segments are in WAL-replay recovery, so
+// the utility-mode exporter primarily yields recovery/replication metrics.
+func injectMirrorPostgresExporter(
+	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet,
+) {
+	injectSegmentExporterWithComponent(b, cluster, sts, util.ComponentSegmentMirror)
+}
+
+// injectSegmentExporterWithComponent is the shared implementation behind
+// injectSegmentPostgresExporter and injectMirrorPostgresExporter. It appends the
+// utility-mode postgres-exporter sidecar, its volumes, the Prometheus scrape
+// annotations, and the app.kubernetes.io/component label to a segment pod
+// template. The component argument is what vmagent's relabel
+// (__meta_kubernetes_pod_label_app_kubernetes_io_component -> component)
+// attaches to every per-segment series, disambiguating primaries
+// (component="segment-primary") from mirrors (component="segment-mirror") and
+// from coordinator/standby exporter series.
+func injectSegmentExporterWithComponent(
+	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet, component string,
+) {
+	sidecars := b.BuildSegmentPostgresExporterSidecarContainers(cluster)
+	sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, sidecars...)
+
+	sidecarVolumes := b.BuildExporterSidecarVolumes(cluster)
+	sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, sidecarVolumes...)
+
+	// Add Prometheus scrape annotations so vmagent/Prometheus discovers the
+	// per-segment exporter metrics.
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = make(map[string]string)
+	}
+	sts.Spec.Template.Annotations["prometheus.io/scrape"] = promScrapeTrue
+	sts.Spec.Template.Annotations["prometheus.io/port"] = fmt.Sprintf("%d", pgExporterPort)
+	sts.Spec.Template.Annotations["prometheus.io/path"] = keyMetricsPath
+
+	// Ensure the pod carries the standard component label so vmagent's relabel
+	// attaches a distinct component label to every per-segment series.
+	if sts.Spec.Template.Labels == nil {
+		sts.Spec.Template.Labels = make(map[string]string)
+	}
+	sts.Spec.Template.Labels[labelAppComponent] = component
 }
 
 // BuildSegmentMirrorStatefulSet builds the mirror segment StatefulSet.
@@ -394,6 +519,15 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 		return nil, fmt.Errorf("building segment mirror main container: %w", err)
 	}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{mainContainer}
+
+	// OPT-IN: Inject ONLY the postgres-exporter sidecar (utility mode) into each
+	// mirror segment pod when explicitly requested via PostgresExporter.Mirrors.
+	// Default is OFF, so mirror pods are unchanged unless the operator opts in.
+	// The cloudberry-query-exporter is intentionally never added to mirrors: its
+	// queries are cluster-global and would collide with the coordinator's series.
+	if mirrorPostgresExporterEnabled(cluster) {
+		injectMirrorPostgresExporter(b, cluster, sts)
+	}
 
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {

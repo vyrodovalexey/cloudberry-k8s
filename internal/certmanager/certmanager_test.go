@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"testing"
 	"time"
@@ -574,6 +575,203 @@ func TestIssueVaultPKICert_EmptyDNSNames(t *testing.T) {
 	assert.Equal(t, []byte("ca-pem"), ca)
 	assert.Equal(t, []byte("cert-pem"), cert)
 	assert.Equal(t, []byte("key-pem"), key)
+}
+
+func TestCheckCertRotation_SelfSignedSource_SelfSignedCert_NoForcedRotation(t *testing.T) {
+	// A self-signed cert with a self-signed source must not be rotated by the
+	// source-mismatch check; only the time-based logic applies (and the cert is
+	// fresh, so no rotation).
+	caCert, tlsCert, _, err := generateSelfSignedCert(
+		[]string{"test-webhook.test-ns.svc"},
+		365*24*time.Hour,
+	)
+	require.NoError(t, err)
+
+	cm := &certManager{config: newTestConfig(), logger: slog.Default()}
+	secret := &corev1.Secret{Data: map[string][]byte{
+		secretKeyCACert:  caCert,
+		secretKeyTLSCert: tlsCert,
+	}}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.NoError(t, err)
+	assert.False(t, needs)
+}
+
+func TestCheckCertRotation_VaultSource_SelfSignedCert_ForcesRotation(t *testing.T) {
+	// A still-valid self-signed cert must be rotated when the configured source
+	// is vault-pki (source mismatch).
+	caCert, tlsCert, _, err := generateSelfSignedCert(
+		[]string{"test-webhook.test-ns.svc"},
+		365*24*time.Hour,
+	)
+	require.NoError(t, err)
+
+	cfg := newTestConfig()
+	cfg.CertSource = CertSourceVaultPKI
+	cm := &certManager{config: cfg, logger: slog.Default()}
+	secret := &corev1.Secret{Data: map[string][]byte{
+		secretKeyCACert:  caCert,
+		secretKeyTLSCert: tlsCert,
+	}}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.NoError(t, err)
+	assert.True(t, needs)
+}
+
+func TestCheckCertRotation_VaultSource_VaultCert_NoForcedRotation(t *testing.T) {
+	// A cert issued by a non-self-signed CA (e.g. vault PKI "Test Root CA") with
+	// a vault-pki source must not be rotated by the source-mismatch check.
+	tlsCert := generateCertWithIssuer(t, "Test Root CA", "Test Org", 365*24*time.Hour)
+
+	cfg := newTestConfig()
+	cfg.CertSource = CertSourceVaultPKI
+	cm := &certManager{config: cfg, logger: slog.Default()}
+	secret := &corev1.Secret{Data: map[string][]byte{
+		secretKeyTLSCert: tlsCert,
+	}}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.NoError(t, err)
+	assert.False(t, needs)
+}
+
+func TestCheckCertRotation_SelfSignedSource_VaultCert_ForcesRotation(t *testing.T) {
+	// A still-valid vault-issued cert must be rotated when the configured source
+	// is self-signed (source mismatch in the opposite direction).
+	tlsCert := generateCertWithIssuer(t, "Test Root CA", "Test Org", 365*24*time.Hour)
+
+	cm := &certManager{config: newTestConfig(), logger: slog.Default()}
+	secret := &corev1.Secret{Data: map[string][]byte{
+		secretKeyTLSCert: tlsCert,
+	}}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.NoError(t, err)
+	assert.True(t, needs)
+}
+
+func TestCheckCertRotation_NearExpiry_ForcesRotation(t *testing.T) {
+	// A self-signed cert past 2/3 of its lifetime must be rotated by the
+	// time-based logic, independent of source.
+	tlsCert := generateSelfSignedLeafWithLifetime(t, -90*24*time.Hour, 30*24*time.Hour)
+
+	cm := &certManager{config: newTestConfig(), logger: slog.Default()}
+	secret := &corev1.Secret{Data: map[string][]byte{
+		secretKeyTLSCert: tlsCert,
+	}}
+
+	needs, err := cm.checkCertRotation(secret)
+	require.NoError(t, err)
+	assert.True(t, needs)
+}
+
+func TestEnsureCertificates_SourceMismatch_RegeneratesFromNewSource(t *testing.T) {
+	// Operator reconfigured from self-signed to vault-pki: a still-valid
+	// self-signed cert in the secret must be re-issued from vault, not kept.
+	scheme := newTestScheme()
+	cfg := newTestConfig()
+	cfg.CertSource = CertSourceVaultPKI
+
+	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+		[]string{"test-webhook.test-ns.svc", "test-webhook.test-ns.svc.cluster.local"},
+		365*24*time.Hour,
+	)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfg.SecretName,
+			Namespace: cfg.SecretNamespace,
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			secretKeyCACert:  caCert,
+			secretKeyTLSCert: tlsCert,
+			secretKeyTLSKey:  tlsKey,
+		},
+	}
+
+	mockVault := &mockVaultClient{
+		enabled: true,
+		writeData: map[string]interface{}{
+			"certificate": "-----BEGIN CERTIFICATE-----\nMIIBleaf\n-----END CERTIFICATE-----",
+			"private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEtest\n-----END RSA PRIVATE KEY-----",
+			"issuing_ca":  "-----BEGIN CERTIFICATE-----\nMIIBvaultca\n-----END CERTIFICATE-----",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	cm := New(k8sClient, mockVault, cfg, nil)
+
+	caBundle, err := cm.EnsureCertificates(context.Background())
+	require.NoError(t, err)
+	// The CA bundle must now come from vault, not the old self-signed CA.
+	assert.Equal(t, []byte("-----BEGIN CERTIFICATE-----\nMIIBvaultca\n-----END CERTIFICATE-----"), caBundle)
+	assert.NotEqual(t, caCert, caBundle)
+}
+
+// generateCertWithIssuer builds a self-signed leaf certificate whose issuer has
+// the given Common Name and Organization, used to simulate certs issued by an
+// external CA (e.g. a Vault PKI root).
+func generateCertWithIssuer(t *testing.T, commonName, org string, validity time.Duration) []byte {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), serialNumberBitSize))
+	require.NoError(t, err)
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{org},
+			CommonName:   commonName,
+		},
+		NotBefore:             now,
+		NotAfter:              now.Add(validity),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+}
+
+// generateSelfSignedLeafWithLifetime builds a self-signed leaf cert issued by the
+// operator's self-signed CA name, with NotBefore/NotAfter offset from now to
+// exercise the time-based rotation threshold.
+func generateSelfSignedLeafWithLifetime(t *testing.T, notBeforeOffset, notAfterOffset time.Duration) []byte {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), serialNumberBitSize))
+	require.NoError(t, err)
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{organizationName},
+			CommonName:   selfSignedCACommonName,
+		},
+		NotBefore:             now.Add(notBeforeOffset),
+		NotAfter:              now.Add(notAfterOffset),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 }
 
 // mockVaultClient implements vault.Client for testing.

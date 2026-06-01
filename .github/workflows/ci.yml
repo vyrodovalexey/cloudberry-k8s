@@ -204,6 +204,17 @@ jobs:
           --health-retries 10
           --health-start-period 15s
 
+      victorialogs:
+        image: victoriametrics/victoria-logs:v1.3.2-victorialogs
+        ports:
+          - 9428:9428
+        options: >-
+          --health-cmd "wget -qO- http://localhost:9428/health || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
@@ -242,6 +253,12 @@ jobs:
           for i in {1..30}; do
             curl -sf http://127.0.0.1:15672/api/health/checks/alarms -u guest:guest > /dev/null 2>&1 && echo "RabbitMQ ready" && break
             echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- VictoriaLogs ---"
+          for i in {1..30}; do
+            curl -sf http://127.0.0.1:9428/health > /dev/null 2>&1 && echo "VictoriaLogs ready" && break
+            echo "  attempt $i …"; sleep 2
           done
 
       - name: Setup Vault
@@ -406,9 +423,9 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
-          - name: cloudberry
-            dockerfile: Dockerfile.cloudberry
-            image_env: DOCKER_IMAGE_CLOUDBERRY
+          # NOTE: cloudberry (Dockerfile.cloudberry) is excluded from PR builds
+          # because it compiles Apache Cloudberry from source and is very slow.
+          # It is only built on tag/release via the docker-build-push job.
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_env: DOCKER_IMAGE_QUERY_EXPORTER
@@ -486,12 +503,14 @@ jobs:
           echo "==> Linting test monitoring charts..."
           helm lint test/monitoring/otel-collector
           helm lint test/monitoring/vmagent
+          helm lint test/monitoring/vector
 
       - name: Validate monitoring chart templates
         run: |
           echo "==> Validating monitoring chart templates..."
           helm template otel-collector test/monitoring/otel-collector > /dev/null
           helm template vmagent test/monitoring/vmagent > /dev/null
+          helm template vector test/monitoring/vector > /dev/null
           echo "Monitoring chart template validation successful!"
 
       - name: Dry-run install monitoring charts
@@ -499,12 +518,14 @@ jobs:
           echo "==> Running Helm dry-run for monitoring charts..."
           helm install --dry-run --debug otel-collector test/monitoring/otel-collector
           helm install --dry-run --debug vmagent test/monitoring/vmagent
+          helm install --dry-run --debug vector test/monitoring/vector
 
       - name: Validate monitoring chart Kubernetes manifests
         run: |
           echo "==> Validating monitoring chart Kubernetes manifests..."
           helm template otel-collector test/monitoring/otel-collector | kubectl apply --dry-run=client -f -
           helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
+          helm template vector test/monitoring/vector | kubectl apply --dry-run=client -f -
           echo "Monitoring chart Kubernetes manifest validation successful!"
 
 

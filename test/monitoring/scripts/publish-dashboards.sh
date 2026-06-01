@@ -112,6 +112,33 @@ create_tempo_datasource() {
 }
 
 # ---------------------------------------------------------------------------
+# Create VictoriaLogs datasource (idempotent)
+# ---------------------------------------------------------------------------
+create_victorialogs_datasource() {
+  log "Creating VictoriaLogs datasource..."
+
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u "${GRAFANA_AUTH}" \
+    -X POST "${GRAFANA_URL}/api/datasources" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "VictoriaLogs",
+      "type": "victoriametrics-logs-datasource",
+      "uid": "victorialogs",
+      "access": "proxy",
+      "url": "http://victorialogs:9428",
+      "isDefault": false
+    }')
+
+  case "${http_code}" in
+    200) ok "Datasource 'VictoriaLogs' created" ;;
+    409) ok "Datasource 'VictoriaLogs' already exists" ;;
+    *)   fail "Datasource 'VictoriaLogs' creation returned HTTP ${http_code}" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Publish a single dashboard
 # ---------------------------------------------------------------------------
 publish_dashboard() {
@@ -240,6 +267,7 @@ main() {
   wait_for_grafana || exit 1
   create_datasource
   create_tempo_datasource
+  create_victorialogs_datasource
   echo ""
 
   # Publish all dashboards

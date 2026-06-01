@@ -138,9 +138,12 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 **Observability**
 - Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, mirroring operations, and PVC sizes
 - Reconciliation metrics: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` with cluster/namespace/result labels
-- Security metrics: `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`, `cloudberry_vault_operations_total`, `cloudberry_vault_operation_duration_seconds`
+- Operational metrics wired to real operations: `cloudberry_pvc_size_bytes` (PVC expansion), `cloudberry_redistribution_progress` (data redistribution), `cloudberry_backup_total` / `cloudberry_restore_total`, per-database `cloudberry_disk_usage_bytes`, and storage recommendation metrics (`cloudberry_recommendations_total`, `cloudberry_recommendation_scan_duration_seconds`)
+- Maintenance metrics: `cloudberry_maintenance_operations_total` with cluster/namespace/operation/`result` (`started`, `success`, `failed`) labels
+- Security metrics: `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`, `cloudberry_vault_operations_total`, `cloudberry_vault_operation_duration_seconds`, and `cloudberry_auth_attempts_total` (a missing/malformed `Authorization` header increments `{method="unknown",result="failure"}`)
 - Admission and lifecycle metrics: `cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`, `cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`
 - Workload and query-history metrics wired through: slow queries, workload rule actions, active connections, and query-history insert/retention/size
+- Exporter sidecars: `postgres-exporter` (port 9187) runs on both the coordinator and standby coordinator pods for monitoring continuity on promotion; `cloudberry-query-exporter` is coordinator-only (its cluster-global queries would otherwise duplicate metric series on a non-promoted standby); a per-segment `postgres-exporter` is available opt-in (default off) for both primary and mirror segments via the independent `queryMonitoring.exporters.postgresExporter.segments` and `queryMonitoring.exporters.postgresExporter.mirrors` flags for deep per-segment diagnostics; the `postgres-exporter` is Cloudberry-tailored (conditional resource-group query, disabled incompatible built-in collectors, recovery-safe WAL query) so scrapes run cleanly (`pg_exporter_last_scrape_error=0`) on coordinator, standby, and segments
 - OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters
 - Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
 - Structured logging (slog) with JSON output including cluster, namespace, controller, and reconcileID fields
@@ -165,6 +168,8 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Admin password persisted to K8s Secret (survives pod restarts)
 - CLI password flag security warning (recommends env var)
 - Webhook CA bundle injection with retry and exponential backoff
+- Webhook cert rotation forces re-issuance on certificate-source mismatch (e.g. a stale self-signed cert while `certSource=vault-pki`) instead of keeping the stale cert until natural expiry
+- Operator-to-cluster database TLS uses `sslmode=verify-ca` (CA chain validation against the cluster CA from the SSL cert Secret's `ca.crt`) when SSL is enabled with a `certSecret`
 - Context cancellation checks in database propagation operations
 - Goroutine leak prevention in idle daemon via `startOrUpdateIdleDaemon`
 - Dependency vulnerability fix: upgraded `golang.org/x/net` (GO-2026-5026)
@@ -631,9 +636,12 @@ Pre-built Grafana dashboards are available in the `monitoring/grafana/` director
 
 The operator has been verified in production-like deployments:
 
-- **Operator**: Deployed with VAULT-PKI webhook certificates (Kubernetes auth to Vault)
-- **Cluster**: Scenario 1 cluster with 4 segments, mirroring enabled (InSync), standby coordinator
-- **OIDC**: Scenario 41 cluster deployed with full OIDC auth flow (Keycloak, 5 permission levels, service accounts)
+- **Operator**: Deployed with Vault-PKI webhook certificates (CN issued by the Vault Root CA) via Kubernetes auth, plus Keycloak OIDC
+- **Cluster**: HA cluster with standby coordinator (`standbyReady`), segment mirroring (`InSync`), and Vault-PKI cluster TLS
+- **Exporters**: Both the postgres-exporter and cloudberry-query-exporter producing metrics into VictoriaMetrics
+- **Data**: ~100 MB of test data loaded into `mydb`
+- **Dashboards**: All 3 Grafana dashboards (operator, exporters, node) reflecting live metrics
+- **Performance**: Performance test PASS — health p95 ~8 ms, 0% errors
 - **Monitoring**: VictoriaMetrics Agent + OpenTelemetry Collector deployed alongside operator
 - **Test Environment**: Docker Compose with 9 services (Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo)
 - **Tests**: All 1,936 tests pass (functional: 1,063, e2e: 833, integration: 38)

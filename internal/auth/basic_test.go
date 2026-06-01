@@ -314,3 +314,32 @@ func TestBasicAuthProvider_Authenticate_AllPermissionLevels(t *testing.T) {
 		})
 	}
 }
+
+func TestNewInMemoryCredentialStoreWithCost(t *testing.T) {
+	tests := []struct {
+		name     string
+		cost     int
+		wantCost int
+	}{
+		{"min cost", bcrypt.MinCost, bcrypt.MinCost},
+		{"valid mid cost", 6, 6},
+		{"below min falls back to default", bcrypt.MinCost - 1, bcrypt.DefaultCost},
+		{"above max falls back to default", bcrypt.MaxCost + 1, bcrypt.DefaultCost},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewInMemoryCredentialStoreWithCost(tt.cost)
+			require.NotNil(t, store)
+			assert.Equal(t, tt.wantCost, store.cost)
+
+			// The configured cost must be used when hashing.
+			store.SetCredentials("user", "secret123", PermissionAdmin)
+			hash, err := store.GetPassword(context.Background(), "user")
+			require.NoError(t, err)
+			gotCost, costErr := bcrypt.Cost([]byte(hash))
+			require.NoError(t, costErr)
+			assert.Equal(t, tt.wantCost, gotCost)
+		})
+	}
+}

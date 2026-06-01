@@ -29,6 +29,11 @@ const (
 	// organizationName is the organization name used in generated certificates.
 	organizationName = "cloudberry-operator"
 
+	// selfSignedCACommonName is the Common Name of the CA produced by the
+	// self-signed generator (see generateSelfSignedCert). It is used as the
+	// marker that identifies a leaf certificate as locally self-signed.
+	selfSignedCACommonName = organizationName + "-ca"
+
 	// secretKeyCACert is the key for the CA certificate in the Secret.
 	secretKeyCACert = "ca.crt"
 	// secretKeyTLSCert is the key for the TLS certificate in the Secret.
@@ -290,6 +295,18 @@ func (m *certManager) checkCertRotation(secret *corev1.Secret) (bool, error) {
 		return true, fmt.Errorf("parsing certificate: %w", err)
 	}
 
+	// Force rotation when the existing certificate's issuer does not correspond
+	// to the configured certificate source. This handles reconfiguration between
+	// self-signed and vault-pki sources, where a still-time-valid cert from the
+	// old source must be re-issued from the new source immediately.
+	if m.certSourceMismatch(cert) {
+		m.logger.Info("forcing certificate rotation due to source mismatch",
+			"configuredSource", m.certSource(),
+			"issuer", cert.Issuer.String(),
+		)
+		return true, nil
+	}
+
 	now := time.Now()
 	if now.After(cert.NotAfter) {
 		return true, nil
@@ -302,6 +319,34 @@ func (m *certManager) checkCertRotation(secret *corev1.Secret) (bool, error) {
 	)
 
 	return now.After(rotationTime), nil
+}
+
+// isSelfSignedIssuer reports whether the certificate was issued by the operator's
+// own self-signed CA, identified by the Common Name and Organization that
+// generateSelfSignedCert assigns to its CA certificate.
+func isSelfSignedIssuer(cert *x509.Certificate) bool {
+	if cert.Issuer.CommonName != selfSignedCACommonName {
+		return false
+	}
+	for _, org := range cert.Issuer.Organization {
+		if org == organizationName {
+			return true
+		}
+	}
+	return false
+}
+
+// certSourceMismatch reports whether the issuer of the existing certificate does
+// not correspond to the configured certificate source. When the source is
+// self-signed, the certificate must be issued by the operator's self-signed CA;
+// when the source is vault-pki, the certificate must NOT be issued by that local
+// self-signed CA.
+func (m *certManager) certSourceMismatch(cert *x509.Certificate) bool {
+	selfSigned := isSelfSignedIssuer(cert)
+	if m.certSource() == CertSourceVaultPKI {
+		return selfSigned
+	}
+	return !selfSigned
 }
 
 // dnsNames returns the DNS SANs for the webhook server certificate.

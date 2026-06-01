@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vector.fullname" . }}
+  labels:
+    {{- include "vector.labels" . | nindent 4 }}
+data:
+  vector.yaml: |
+    data_dir: /vector-data-dir
+    api:
+      enabled: true
+      address: "0.0.0.0:8686"
+    sources:
+      kubernetes_logs:
+        type: kubernetes_logs
+    sinks:
+      victorialogs:
+        type: elasticsearch
+        inputs: ["kubernetes_logs"]
+        endpoints: ["{{ .Values.victoriaLogs.endpoint }}/insert/elasticsearch/"]
+        api_version: "v8"
+        compression: gzip
+        mode: bulk
+        healthcheck:
+          enabled: false
+        request:
+          headers:
+            VL-Time-Field: timestamp
+            VL-Stream-Fields: stream,kubernetes.pod_namespace,kubernetes.pod_name,kubernetes.container_name
+            VL-Msg-Field: message
+            AccountID: "0"
+            ProjectID: "0"

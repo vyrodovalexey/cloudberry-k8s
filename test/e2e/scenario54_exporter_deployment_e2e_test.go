@@ -237,12 +237,60 @@ func (s *Scenario54ExporterDeploymentE2ESuite) TestE2E_Scenario54_PostgresExport
 	assert.Contains(s.T(), pgExporter.Args,
 		"--extend.query-path=/etc/postgres-exporter/queries.yaml",
 		"should have extend.query-path arg")
-	assert.Contains(s.T(), pgExporter.Args,
+	assert.NotContains(s.T(), pgExporter.Args,
 		"--auto-discover-databases",
-		"should have auto-discover-databases arg")
+		"auto-discover-databases must NOT be set: it caused duplicate-metric HTTP 500 errors in multi-database clusters")
 	assert.Contains(s.T(), pgExporter.Args,
 		"--web.listen-address=:9187",
 		"should have web.listen-address arg with port 9187")
+}
+
+// --- 54.4b: Standby coordinator postgres-exporter sidecar ---
+
+// scenario54E2EFullExporterStandbyCluster returns a cluster identical to
+// scenario54E2EFullExporterCluster but with the standby coordinator enabled,
+// used to verify the postgres-exporter sidecar is injected into the standby
+// StatefulSet while the cloudberry-query-exporter remains coordinator-only.
+func scenario54E2EFullExporterStandbyCluster() *cbv1alpha1.CloudberryCluster {
+	cluster := scenario54E2EFullExporterCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+	return cluster
+}
+
+// TestE2E_Scenario54_StandbyStatefulSet_HasPostgresExporterOnly verifies that
+// the standby coordinator StatefulSet built by the builder injects ONLY the
+// postgres-exporter sidecar (for instance/replication-scoped metrics) and does
+// NOT include the coordinator-only cloudberry-query-exporter sidecar, and that
+// the standby pod template carries the Prometheus scrape annotations on port
+// 9187 so the exporter metrics are discovered.
+func (s *Scenario54ExporterDeploymentE2ESuite) TestE2E_Scenario54_StandbyStatefulSet_HasPostgresExporterOnly() {
+	// Arrange
+	cluster := scenario54E2EFullExporterStandbyCluster()
+	b := builder.NewBuilder()
+
+	// Act
+	sts, err := b.BuildStandbyStatefulSet(cluster)
+
+	// Assert
+	require.NoError(s.T(), err, "building standby statefulset should succeed")
+	require.NotNil(s.T(), sts, "standby statefulset should not be nil")
+
+	containerNames := make([]string, 0, len(sts.Spec.Template.Spec.Containers))
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		containerNames = append(containerNames, c.Name)
+	}
+
+	assert.Contains(s.T(), containerNames, "postgres-exporter",
+		"standby pod template should contain the postgres-exporter sidecar")
+	assert.NotContains(s.T(), containerNames, "cloudberry-query-exporter",
+		"standby pod template must NOT contain the coordinator-only cloudberry-query-exporter sidecar")
+
+	annotations := sts.Spec.Template.Annotations
+	require.NotNil(s.T(), annotations, "standby pod template should have annotations")
+	assert.Equal(s.T(), "true", annotations["prometheus.io/scrape"],
+		"standby pod template should have prometheus.io/scrape=true")
+	assert.Equal(s.T(), "9187", annotations["prometheus.io/port"],
+		"standby pod template should advertise the postgres-exporter port 9187")
 }
 
 // --- 54.5: Cloudberry query exporter container args ---

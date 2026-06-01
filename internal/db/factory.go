@@ -18,6 +18,23 @@ const (
 	defaultDatabase = "postgres"
 	// passwordSecretKey is the key in the admin password secret.
 	passwordSecretKey = "password"
+	// caCertSecretKey is the key holding the PEM-encoded CA certificate in the
+	// SSL cert Secret. It mirrors the standard kubernetes.io/tls layout and the
+	// key consumed by the coordinator pod (see internal/builder).
+	caCertSecretKey = "ca.crt"
+
+	// sslModeDisable disables TLS entirely.
+	sslModeDisable = "disable"
+	// sslModeRequire negotiates TLS without validating the server certificate.
+	sslModeRequire = "require"
+	// sslModeVerifyCA validates the server certificate chain against a trusted
+	// CA but does NOT verify that the connection hostname matches a certificate
+	// SAN. This is required when dialing the coordinator headless service
+	// (<cluster>-coord-hl.<ns>.svc), whose name is intentionally absent from the
+	// serving certificate SANs (which cover <cluster>-coordinator / <cluster>).
+	// verify-ca still protects against MITM because the chain must validate
+	// against the cluster CA (for example, Vault Root CA).
+	sslModeVerifyCA = "verify-ca"
 )
 
 // DBClientFactory defines the interface for creating database clients for clusters.
@@ -95,22 +112,28 @@ func (f *ClientFactory) NewClient(ctx context.Context, cluster *cbv1alpha1.Cloud
 	}
 
 	// Determine SSL mode from the cluster's auth configuration.
-	sslMode := "disable"
-	if cluster.Spec.Auth != nil && cluster.Spec.Auth.SSL != nil &&
-		cluster.Spec.Auth.SSL.Enabled {
-		sslMode = "require"
-		if cluster.Spec.Auth.SSL.CertSecret != nil {
-			sslMode = "verify-full"
+	sslMode := resolveSSLMode(cluster)
+
+	// When verifying the certificate chain (verify-ca), load the cluster CA
+	// from the SSL cert Secret so pgx can validate the Vault-issued serving
+	// certificate against the private CA instead of the system trust store.
+	var rootCA []byte
+	if sslMode == sslModeVerifyCA {
+		rootCA, err = f.readSSLRootCA(ctx, cluster)
+		if err != nil {
+			return nil, fmt.Errorf("reading SSL root CA for cluster %s/%s: %w",
+				cluster.Namespace, cluster.Name, err)
 		}
 	}
 
 	cfg := Config{
-		Host:     host,
-		Port:     port,
-		Database: defaultDatabase,
-		Username: username,
-		Password: password,
-		SSLMode:  sslMode,
+		Host:      host,
+		Port:      port,
+		Database:  defaultDatabase,
+		Username:  username,
+		Password:  password,
+		SSLMode:   sslMode,
+		SSLRootCA: rootCA,
 		RetryOpts: util.RetryOptions{
 			MaxRetries:     3,
 			InitialBackoff: util.DefaultRetryOptions().InitialBackoff,
@@ -165,4 +188,60 @@ func (f *ClientFactory) readAdminPassword(ctx context.Context, cluster *cbv1alph
 	}
 
 	return string(passwordBytes), nil
+}
+
+// resolveSSLMode determines the libpq SSL mode for connecting to the cluster
+// coordinator based on the cluster's auth configuration:
+//
+//   - SSL disabled (or unset)            => "disable"
+//   - SSL enabled, no CertSecret         => "require"
+//   - SSL enabled, with CertSecret       => "verify-ca"
+//
+// verify-ca (rather than verify-full) is used with a CertSecret because the
+// factory dials the coordinator headless service (<cluster>-coord-hl.<ns>.svc),
+// whose name is not present in the serving certificate SANs. verify-ca still
+// validates the certificate chain against the cluster CA (protecting against
+// MITM) but skips hostname verification, which is the standard approach for an
+// internal headless service whose name differs from the certificate CN/SANs.
+func resolveSSLMode(cluster *cbv1alpha1.CloudberryCluster) string {
+	if cluster.Spec.Auth == nil || cluster.Spec.Auth.SSL == nil ||
+		!cluster.Spec.Auth.SSL.Enabled {
+		return sslModeDisable
+	}
+	if cluster.Spec.Auth.SSL.CertSecret == nil {
+		return sslModeRequire
+	}
+	return sslModeVerifyCA
+}
+
+// readSSLRootCA reads the PEM-encoded CA certificate (ca.crt) from the cluster's
+// SSL cert Secret. The CA is used to validate the coordinator's serving
+// certificate chain when connecting with verify-ca. If the Secret does not carry
+// a ca.crt entry, it returns nil without error so that verify-ca falls back to
+// the host's system trust store (which is correct when the serving certificate
+// is signed by a publicly trusted CA).
+func (f *ClientFactory) readSSLRootCA(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) ([]byte, error) {
+	secretName := cluster.Spec.Auth.SSL.CertSecret.Name
+
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{
+		Name:      secretName,
+		Namespace: cluster.Namespace,
+	}
+
+	if err := f.k8sClient.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("getting cert secret %s/%s: %w",
+			cluster.Namespace, secretName, err)
+	}
+
+	caBytes, ok := secret.Data[caCertSecretKey]
+	if !ok || len(caBytes) == 0 {
+		// No CA bundle in the cert Secret; fall back to system roots.
+		return nil, nil
+	}
+
+	return caBytes, nil
 }

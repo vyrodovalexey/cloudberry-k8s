@@ -26,8 +26,50 @@ const (
 	// exporterQueriesMountPath is the mount path for the exporter queries ConfigMap.
 	exporterQueriesMountPath = "/etc/postgres-exporter"
 
+	// labelAppComponent is the standard Kubernetes component label key. vmagent's
+	// scrape config relabels this into the Prometheus "component" label, which
+	// disambiguates per-segment postgres-exporter series alongside the unique
+	// per-pod "pod" label.
+	labelAppComponent = "app.kubernetes.io/component"
+
 	// secretKeyDSN is the key used for the DSN data in the exporter credentials Secret.
 	secretKeyDSN = "dsn"
+
+	// envPGOptions is the libpq environment variable that passes connection
+	// options through to the backend. postgres-exporter (prometheuscommunity)
+	// uses standard libpq, which honors PGOPTIONS.
+	envPGOptions = "PGOPTIONS"
+	// segmentExporterPGOptions sets utility mode for the per-segment
+	// postgres-exporter. Cloudberry/Greenplum REJECTS direct client connections
+	// to primary segments ("connections to primary segments are not allowed");
+	// segments only accept connections in utility mode. This matches the GUC
+	// used for utility-mode segment connections in internal/db/client.go
+	// (options='-c gp_role=utility'); as a PGOPTIONS value libpq expects the
+	// bare options string without the surrounding options='...' wrapper.
+	segmentExporterPGOptions = "-c gp_role=utility"
+
+	// argExtendQueryPath points postgres-exporter at the mounted custom queries.
+	argExtendQueryPath = "--extend.query-path=/etc/postgres-exporter/queries.yaml"
+	// argWebListenAddress sets the postgres-exporter metrics listen address.
+	argWebListenAddress = "--web.listen-address=:9187"
+	// argNoCollectorStatUserTables disables the built-in stat_user_tables
+	// collector. On Cloudberry that collector always errors with "query plan
+	// with multiple segworker groups is not supported", and its metrics are
+	// already covered by the custom cloudberry_table_stats query. The
+	// prometheuscommunity/postgres-exporter image exposes per-collector
+	// --no-collector.<name> flags, so disabling it removes the scrape noise
+	// without losing per-table stats.
+	argNoCollectorStatUserTables = "--no-collector.stat_user_tables"
+	// argDisableSettingsMetrics disables the built-in pg_settings metrics. On
+	// Cloudberry the pg_settings view exposes NULL short_desc values that the
+	// upstream postgres_exporter settings scraper cannot handle, causing
+	// "Scan error on column index 3, name \"short_desc\": converting NULL to
+	// string is unsupported" on every scrape. The custom cloudberry_connections_max
+	// query already exposes max_connections, so disabling the built-in settings
+	// metrics loses nothing important.
+	// NOTE: pg_settings metrics are NOT a named collector (--no-collector.<name>);
+	// they are a separate category controlled by --disable-settings-metrics.
+	argDisableSettingsMetrics = "--disable-settings-metrics"
 
 	// pgExporterContainerName is the container name for the postgres exporter sidecar.
 	pgExporterContainerName = "postgres-exporter"
@@ -125,9 +167,36 @@ func (b *DefaultBuilder) BuildExporterQueriesConfigMap(
 			},
 		},
 		Data: map[string]string{
-			"queries.yaml": exporterQueriesYAML,
+			"queries.yaml": buildExporterQueries(cluster),
 		},
 	}
+}
+
+// resourceGroupsEnabled reports whether the cluster manages workloads with
+// resource GROUPS (gp_resource_manager='group') rather than the default
+// resource QUEUES.
+//
+// The gp_toolkit.gp_resgroup_status view only exists when resource groups are
+// active. On resource-queue clusters that relation is absent, so a query
+// referencing it fails at parse time on EVERY scrape (a WHERE guard does not
+// help because Postgres resolves the missing relation before execution). We
+// gate on the spec rather than the live database to avoid a per-scrape DB
+// round-trip.
+func resourceGroupsEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.Workload != nil && len(cluster.Spec.Workload.ResourceGroups) > 0
+}
+
+// buildExporterQueries returns the queries.yaml content for the exporter. The
+// always-safe base queries are emitted unconditionally; the resource-group
+// status query is appended ONLY when the cluster declares resource groups, so
+// resource-queue clusters never scrape the missing gp_toolkit.gp_resgroup_status
+// view (which would otherwise error on every scrape).
+func buildExporterQueries(cluster *cbv1alpha1.CloudberryCluster) string {
+	queries := exporterQueriesYAML
+	if resourceGroupsEnabled(cluster) {
+		queries += resgroupQueriesYAML
+	}
+	return queries
 }
 
 // BuildExporterSidecarContainers returns the exporter sidecar containers based on
@@ -140,11 +209,68 @@ func (b *DefaultBuilder) BuildExporterSidecarContainers(
 	containers := make([]corev1.Container, 0, 2)
 
 	if exporters.PostgresExporter != nil && exporters.PostgresExporter.Enabled {
-		containers = append(containers, buildPostgresExporterContainer(cluster))
+		containers = append(containers, buildPostgresExporterContainer(cluster, false))
 	}
 
 	if exporters.CloudberryQueryExporter != nil && exporters.CloudberryQueryExporter.Enabled {
 		containers = append(containers, buildCloudberryQueryExporterContainer(cluster))
+	}
+
+	return containers
+}
+
+// BuildPostgresExporterSidecarContainers returns ONLY the postgres-exporter
+// sidecar container (never the cloudberry-query-exporter).
+//
+// This builder is used for the STANDBY coordinator pod. The postgres-exporter
+// scrapes instance/replication-scoped metrics (pg_up, WAL/replication position,
+// per-database stats, etc.) which are meaningful on a non-promoted standby and
+// help observe standby-local and replication health.
+//
+// The cloudberry-query-exporter is intentionally excluded from the standby: its
+// queries are cluster-global (gp_segment_configuration, gp_toolkit views,
+// cluster-wide query activity). Running it on a non-promoted standby would emit
+// duplicate cluster-global metric series identical to the coordinator's,
+// causing collisions/double-counting in Prometheus. The query-exporter therefore
+// stays coordinator-only.
+//
+// Returns a single-element slice when PostgresExporter is non-nil and Enabled;
+// otherwise an empty slice.
+func (b *DefaultBuilder) BuildPostgresExporterSidecarContainers(
+	cluster *cbv1alpha1.CloudberryCluster,
+) []corev1.Container {
+	exporters := cluster.Spec.QueryMonitoring.Exporters
+	containers := make([]corev1.Container, 0, 1)
+
+	if exporters.PostgresExporter != nil && exporters.PostgresExporter.Enabled {
+		containers = append(containers, buildPostgresExporterContainer(cluster, false))
+	}
+
+	return containers
+}
+
+// BuildSegmentPostgresExporterSidecarContainers returns ONLY the
+// postgres-exporter sidecar container configured for PRIMARY SEGMENTS.
+//
+// Cloudberry/Greenplum REJECTS direct client connections to primary segments
+// ("connections to primary segments are not allowed"); segments only accept
+// connections in utility mode. This variant therefore injects the PGOPTIONS
+// env var (-c gp_role=utility) so libpq connects in utility mode, matching the
+// GUC used for utility-mode segment connections in internal/db/client.go.
+//
+// The coordinator and standby exporters must NOT use utility mode (they connect
+// normally to the coordinator), so they continue to use the non-utility builder.
+//
+// Returns a single-element slice when PostgresExporter is non-nil and Enabled;
+// otherwise an empty slice.
+func (b *DefaultBuilder) BuildSegmentPostgresExporterSidecarContainers(
+	cluster *cbv1alpha1.CloudberryCluster,
+) []corev1.Container {
+	exporters := cluster.Spec.QueryMonitoring.Exporters
+	containers := make([]corev1.Container, 0, 1)
+
+	if exporters.PostgresExporter != nil && exporters.PostgresExporter.Enabled {
+		containers = append(containers, buildPostgresExporterContainer(cluster, true))
 	}
 
 	return containers
@@ -388,31 +514,60 @@ func (b *DefaultBuilder) BuildQueryAlertsPrometheusRule(
 }
 
 // buildPostgresExporterContainer creates the postgres-exporter sidecar container.
-func buildPostgresExporterContainer(cluster *cbv1alpha1.CloudberryCluster) corev1.Container {
+//
+// When utilityMode is true the container is configured for PRIMARY SEGMENTS,
+// which only accept connections in utility mode. In that case the PGOPTIONS
+// env var (-c gp_role=utility) is added so libpq connects in utility mode. The
+// shared DSN secret is left unchanged, keeping the blast radius to the segment
+// container only. utilityMode MUST be false for coordinator/standby exporters.
+func buildPostgresExporterContainer(
+	cluster *cbv1alpha1.CloudberryCluster, utilityMode bool,
+) corev1.Container {
 	spec := cluster.Spec.QueryMonitoring.Exporters.PostgresExporter
+
+	env := []corev1.EnvVar{
+		{
+			Name: "DATA_SOURCE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: util.ExporterCredentialsSecretName(cluster.Name),
+					},
+					Key:      secretKeyDSN,
+					Optional: &optionalEnv,
+				},
+			},
+		},
+	}
+
+	// Primary segments reject normal client connections; PGOPTIONS forces libpq
+	// into utility mode for the segment exporter only.
+	if utilityMode {
+		env = append(env, corev1.EnvVar{
+			Name:  envPGOptions,
+			Value: segmentExporterPGOptions,
+		})
+	}
 
 	container := corev1.Container{
 		Name:  pgExporterContainerName,
 		Image: spec.Image,
+		// NOTE: --auto-discover-databases is intentionally NOT set. The custom
+		// queries in queries.yaml are cluster/global-scoped (gp_segment_configuration,
+		// pg_stat_replication, pg_stat_activity, etc.) and must run only ONCE
+		// against the default connection database. With
+		// auto-discovery the exporter opens a connection per database and runs the
+		// SAME global queries against EACH one, emitting identical metric+label sets
+		// from multiple connections. That triggers a Prometheus collector collision
+		// ("collected before with the same name and label values") and the exporter
+		// returns HTTP 500, breaking pg_up scraping entirely.
 		Args: []string{
-			"--extend.query-path=/etc/postgres-exporter/queries.yaml",
-			"--auto-discover-databases",
-			"--web.listen-address=:9187",
+			argExtendQueryPath,
+			argWebListenAddress,
+			argNoCollectorStatUserTables,
+			argDisableSettingsMetrics,
 		},
-		Env: []corev1.EnvVar{
-			{
-				Name: "DATA_SOURCE_NAME",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: util.ExporterCredentialsSecretName(cluster.Name),
-						},
-						Key:      secretKeyDSN,
-						Optional: &optionalEnv,
-					},
-				},
-			},
-		},
+		Env: env,
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          pgExporterPortName,
@@ -617,9 +772,12 @@ func buildAlertGroups(clusterName string) []interface{} {
 	}
 }
 
-// exporterQueriesYAML contains the custom queries for postgres_exporter
-// to monitor Cloudberry-specific metrics including segment status,
-// replication lag, connection counts, and resource group usage.
+// exporterQueriesYAML contains the always-safe custom queries for
+// postgres_exporter to monitor Cloudberry-specific metrics including segment
+// status, replication lag, connection counts, and database/table statistics.
+// The resource-group status query is NOT included here; it is appended
+// conditionally via resgroupQueriesYAML (see resourceGroupsEnabled) because the
+// gp_toolkit.gp_resgroup_status view only exists under resource groups.
 //
 //nolint:lll // YAML content requires long lines for readability.
 var exporterQueriesYAML = `# Cloudberry custom queries for postgres_exporter
@@ -730,32 +888,6 @@ cloudberry_connections_max:
     - max_connections:
         usage: "GAUGE"
         description: "Maximum allowed connections"
-
-# ── Resource Group Usage ────────────────────────────────────
-cloudberry_resgroup_status:
-  query: |
-    SELECT rsgname,
-           num_running AS running_queries,
-           num_queueing AS queued_queries,
-           num_executed AS executed_total,
-           total_queue_duration AS queue_duration_seconds_total
-    FROM gp_toolkit.gp_resgroup_status
-  metrics:
-    - rsgname:
-        usage: "LABEL"
-        description: "Resource group name"
-    - running_queries:
-        usage: "GAUGE"
-        description: "Running queries in resource group"
-    - queued_queries:
-        usage: "GAUGE"
-        description: "Queued queries in resource group"
-    - executed_total:
-        usage: "COUNTER"
-        description: "Total queries executed by resource group"
-    - queue_duration_seconds_total:
-        usage: "COUNTER"
-        description: "Total time queries spent in queue"
 
 # ── Database Statistics ─────────────────────────────────────
 cloudberry_database_stats:
@@ -901,11 +1033,53 @@ cloudberry_table_stats:
         description: "Estimated dead rows"
 
 # ── WAL ─────────────────────────────────────────────────────
+# pg_current_wal_lsn() is only available on primaries; standbys and mirrors
+# are in recovery and must use pg_last_wal_replay_lsn() instead. The CASE
+# expression makes this query safe on all roles.
 cloudberry_wal:
   query: |
-    SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') AS wal_bytes_total
+    SELECT CASE
+             WHEN pg_is_in_recovery() THEN pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/0')
+             ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')
+           END AS wal_bytes_total
   metrics:
     - wal_bytes_total:
         usage: "COUNTER"
-        description: "Total WAL bytes generated"
+        description: "Total WAL bytes generated (primary) or replayed (standby/mirror)"
+`
+
+// resgroupQueriesYAML contains the resource-group status query block. It is
+// appended to exporterQueriesYAML ONLY when the cluster declares resource
+// groups (see resourceGroupsEnabled), because gp_toolkit.gp_resgroup_status
+// exists only under gp_resource_manager='group'. On resource-queue clusters the
+// view is absent and the query would fail at parse time on every scrape. The
+// leading newline lets it concatenate cleanly onto the base YAML.
+//
+//nolint:lll // YAML content requires long lines for readability.
+var resgroupQueriesYAML = `
+# ── Resource Group Usage ────────────────────────────────────
+cloudberry_resgroup_status:
+  query: |
+    SELECT rsgname,
+           num_running AS running_queries,
+           num_queueing AS queued_queries,
+           num_executed AS executed_total,
+           total_queue_duration AS queue_duration_seconds_total
+    FROM gp_toolkit.gp_resgroup_status
+  metrics:
+    - rsgname:
+        usage: "LABEL"
+        description: "Resource group name"
+    - running_queries:
+        usage: "GAUGE"
+        description: "Running queries in resource group"
+    - queued_queries:
+        usage: "GAUGE"
+        description: "Queued queries in resource group"
+    - executed_total:
+        usage: "COUNTER"
+        description: "Total queries executed by resource group"
+    - queue_duration_seconds_total:
+        usage: "COUNTER"
+        description: "Total time queries spent in queue"
 `

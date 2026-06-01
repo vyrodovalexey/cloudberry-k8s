@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -186,6 +187,73 @@ func TestBuildStandbyStatefulSet(t *testing.T) {
 		// Should use coordinator storage
 		assert.Equal(t, "10Gi", sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().String())
 	})
+
+	t.Run("query monitoring enabled adds postgres-exporter only", func(t *testing.T) {
+		b := NewBuilder()
+		cluster := newExporterCluster()
+		cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
+			Enabled: true,
+			Storage: &cbv1alpha1.StorageSpec{Size: "10Gi"},
+		}
+
+		sts, err := b.BuildStandbyStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+
+		containers := sts.Spec.Template.Spec.Containers
+		// Main DB container + postgres-exporter, but NOT cloudberry-query-exporter.
+		assert.True(t, hasContainer(containers, pgExporterContainerName),
+			"standby must run the postgres-exporter sidecar")
+		assert.False(t, hasContainer(containers, cbdbExporterContainerName),
+			"standby must NOT run the cloudberry-query-exporter (coordinator-only)")
+
+		// Prometheus scrape annotations must be present so vmagent scrapes the standby.
+		annotations := sts.Spec.Template.Annotations
+		require.NotNil(t, annotations)
+		assert.Equal(t, "true", annotations["prometheus.io/scrape"])
+		assert.Equal(t, "9187", annotations["prometheus.io/port"])
+		assert.Equal(t, "/metrics", annotations["prometheus.io/path"])
+
+		// The exporter-queries volume must be mounted on the standby pod.
+		assert.True(t, hasVolume(sts.Spec.Template.Spec.Volumes, exporterQueriesVolumeName),
+			"standby must mount the exporter-queries volume for postgres-exporter")
+
+		// Regression guard: the standby connects normally to the coordinator and
+		// must NOT use utility mode. PGOPTIONS must not leak from the segment path.
+		pg := containerByName(containers, pgExporterContainerName)
+		require.NotNil(t, pg)
+		assert.False(t, hasEnvVar(pg.Env, envPGOptions),
+			"standby postgres-exporter must NOT set PGOPTIONS (utility mode must not leak)")
+	})
+
+	t.Run("query monitoring disabled leaves only main container", func(t *testing.T) {
+		b := NewBuilder()
+		cluster := newTestCluster()
+		cluster.Spec.Standby = &cbv1alpha1.StandbySpec{
+			Enabled: true,
+			Storage: &cbv1alpha1.StorageSpec{Size: "10Gi"},
+		}
+
+		sts, err := b.BuildStandbyStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+
+		containers := sts.Spec.Template.Spec.Containers
+		require.Len(t, containers, 1)
+		assert.Equal(t, containerName, containers[0].Name)
+		assert.False(t, hasContainer(containers, pgExporterContainerName))
+		assert.False(t, hasContainer(containers, cbdbExporterContainerName))
+	})
+}
+
+// hasVolume reports whether a volume with the given name is present.
+func hasVolume(volumes []corev1.Volume, name string) bool {
+	for _, v := range volumes {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildSegmentPrimaryStatefulSet(t *testing.T) {
@@ -202,6 +270,224 @@ func TestBuildSegmentPrimaryStatefulSet(t *testing.T) {
 	// Check anti-affinity
 	require.NotNil(t, sts.Spec.Template.Spec.Affinity)
 	require.NotNil(t, sts.Spec.Template.Spec.Affinity.PodAntiAffinity)
+}
+
+// segmentOnlyMainContainer asserts the segment pod template carries ONLY the
+// main DB container and no exporter sidecar/volumes/scrape annotations. This is
+// the critical regression guard for the OPT-IN default-OFF behaviour.
+func segmentOnlyMainContainer(t *testing.T, sts *appsv1.StatefulSet) {
+	t.Helper()
+	containers := sts.Spec.Template.Spec.Containers
+	require.Len(t, containers, 1)
+	assert.Equal(t, containerName, containers[0].Name)
+	assert.False(t, hasContainer(containers, pgExporterContainerName),
+		"segment pod must NOT run the postgres-exporter when not opted in")
+	assert.False(t, hasContainer(containers, cbdbExporterContainerName),
+		"segment pod must NEVER run the cloudberry-query-exporter")
+	assert.False(t, hasVolume(sts.Spec.Template.Spec.Volumes, exporterQueriesVolumeName),
+		"segment pod must NOT mount the exporter-queries volume when not opted in")
+	_, hasScrape := sts.Spec.Template.Annotations["prometheus.io/scrape"]
+	assert.False(t, hasScrape, "segment pod must NOT have scrape annotations when not opted in")
+}
+
+// segmentExporterCluster returns a cluster with the OPT-IN per-segment
+// postgres-exporter enabled (Segments=true).
+func segmentExporterCluster() *cbv1alpha1.CloudberryCluster {
+	cluster := newExporterCluster()
+	cluster.Spec.QueryMonitoring.Exporters.PostgresExporter.Segments = true
+	return cluster
+}
+
+// TestBuildSegmentPrimaryStatefulSet_PostgresExporterOptIn verifies that the
+// per-segment postgres-exporter is injected ONLY when explicitly opted in, and
+// that the default (OFF) leaves segment pods unchanged.
+func TestBuildSegmentPrimaryStatefulSet_PostgresExporterOptIn(t *testing.T) {
+	b := NewBuilder()
+
+	t.Run("opt-in enabled injects postgres-exporter only", func(t *testing.T) {
+		cluster := segmentExporterCluster()
+
+		sts, err := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+
+		containers := sts.Spec.Template.Spec.Containers
+		assert.True(t, hasContainer(containers, pgExporterContainerName),
+			"opted-in segment pod must run the postgres-exporter sidecar")
+		assert.False(t, hasContainer(containers, cbdbExporterContainerName),
+			"segment pod must NEVER run the cloudberry-query-exporter")
+
+		// The segment exporter must connect in utility mode: Cloudberry rejects
+		// normal client connections to primary segments. PGOPTIONS forces libpq
+		// into utility mode for the segment container only.
+		pg := containerByName(containers, pgExporterContainerName)
+		require.NotNil(t, pg)
+		assert.Equal(t, segmentExporterPGOptions, envVarValue(pg.Env, envPGOptions),
+			"segment postgres-exporter must set PGOPTIONS=-c gp_role=utility")
+
+		// Scrape annotations on port 9187.
+		annotations := sts.Spec.Template.Annotations
+		require.NotNil(t, annotations)
+		assert.Equal(t, "true", annotations["prometheus.io/scrape"])
+		assert.Equal(t, "9187", annotations["prometheus.io/port"])
+		assert.Equal(t, "/metrics", annotations["prometheus.io/path"])
+
+		// exporter-queries volume must be mounted.
+		assert.True(t, hasVolume(sts.Spec.Template.Spec.Volumes, exporterQueriesVolumeName),
+			"opted-in segment pod must mount the exporter-queries volume")
+
+		// The component label disambiguates per-segment series in Prometheus.
+		assert.Equal(t, util.ComponentSegmentPrimary,
+			sts.Spec.Template.Labels[labelAppComponent],
+			"segment pod must carry app.kubernetes.io/component for series disambiguation")
+	})
+
+	t.Run("DEFAULT OFF: Segments=false leaves only main container", func(t *testing.T) {
+		cluster := newExporterCluster() // PostgresExporter.Enabled=true but Segments defaults false
+		sts, err := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		segmentOnlyMainContainer(t, sts)
+	})
+
+	t.Run("DEFAULT OFF: PostgresExporter disabled leaves only main container", func(t *testing.T) {
+		cluster := segmentExporterCluster()
+		cluster.Spec.QueryMonitoring.Exporters.PostgresExporter.Enabled = false
+		sts, err := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		segmentOnlyMainContainer(t, sts)
+	})
+
+	t.Run("DEFAULT OFF: QueryMonitoring nil leaves only main container", func(t *testing.T) {
+		cluster := newTestCluster() // no QueryMonitoring at all
+		sts, err := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		segmentOnlyMainContainer(t, sts)
+	})
+
+	t.Run("regression: Mirrors=true alone does NOT add exporter to PRIMARY segments", func(t *testing.T) {
+		// Enabling only the mirror opt-in must leave primary segment pods
+		// unchanged: Segments and Mirrors are independent toggles.
+		cluster := mirrorExporterCluster()
+		sts, err := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		segmentOnlyMainContainer(t, sts)
+	})
+}
+
+// mirrorOnlyMainContainer asserts the mirror pod template carries ONLY the main
+// DB container and no exporter sidecar/volumes/scrape annotations. This is the
+// critical regression guard for the OPT-IN default-OFF behaviour on mirrors.
+func mirrorOnlyMainContainer(t *testing.T, sts *appsv1.StatefulSet) {
+	t.Helper()
+	containers := sts.Spec.Template.Spec.Containers
+	require.Len(t, containers, 1)
+	assert.Equal(t, containerName, containers[0].Name)
+	assert.False(t, hasContainer(containers, pgExporterContainerName),
+		"mirror pod must NOT run the postgres-exporter when not opted in")
+	assert.False(t, hasContainer(containers, cbdbExporterContainerName),
+		"mirror pod must NEVER run the cloudberry-query-exporter")
+	assert.False(t, hasVolume(sts.Spec.Template.Spec.Volumes, exporterQueriesVolumeName),
+		"mirror pod must NOT mount the exporter-queries volume when not opted in")
+	_, hasScrape := sts.Spec.Template.Annotations["prometheus.io/scrape"]
+	assert.False(t, hasScrape, "mirror pod must NOT have scrape annotations when not opted in")
+}
+
+// mirrorExporterCluster returns a cluster with mirroring enabled (so the mirror
+// STS is built) and the OPT-IN per-mirror postgres-exporter enabled
+// (Mirrors=true).
+func mirrorExporterCluster() *cbv1alpha1.CloudberryCluster {
+	cluster := newExporterCluster()
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.QueryMonitoring.Exporters.PostgresExporter.Mirrors = true
+	return cluster
+}
+
+// TestBuildSegmentMirrorStatefulSet_PostgresExporterOptIn verifies that the
+// per-mirror postgres-exporter is injected ONLY when explicitly opted in, uses
+// utility mode + component="segment-mirror" disambiguation, and that the default
+// (OFF) leaves mirror pods unchanged. Segments and Mirrors are independent.
+func TestBuildSegmentMirrorStatefulSet_PostgresExporterOptIn(t *testing.T) {
+	b := NewBuilder()
+
+	t.Run("opt-in enabled injects utility-mode postgres-exporter only", func(t *testing.T) {
+		cluster := mirrorExporterCluster()
+
+		sts, err := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+
+		containers := sts.Spec.Template.Spec.Containers
+		assert.True(t, hasContainer(containers, pgExporterContainerName),
+			"opted-in mirror pod must run the postgres-exporter sidecar")
+		assert.False(t, hasContainer(containers, cbdbExporterContainerName),
+			"mirror pod must NEVER run the cloudberry-query-exporter")
+
+		// The mirror exporter must connect in utility mode: a mirror is a segment
+		// instance in WAL-replay recovery and rejects normal client connections.
+		pg := containerByName(containers, pgExporterContainerName)
+		require.NotNil(t, pg)
+		assert.Equal(t, segmentExporterPGOptions, envVarValue(pg.Env, envPGOptions),
+			"mirror postgres-exporter must set PGOPTIONS=-c gp_role=utility")
+
+		// Scrape annotations on port 9187.
+		annotations := sts.Spec.Template.Annotations
+		require.NotNil(t, annotations)
+		assert.Equal(t, "true", annotations["prometheus.io/scrape"])
+		assert.Equal(t, "9187", annotations["prometheus.io/port"])
+		assert.Equal(t, "/metrics", annotations["prometheus.io/path"])
+
+		// exporter-queries volume must be mounted.
+		assert.True(t, hasVolume(sts.Spec.Template.Spec.Volumes, exporterQueriesVolumeName),
+			"opted-in mirror pod must mount the exporter-queries volume")
+
+		// The component label disambiguates per-mirror series in Prometheus as
+		// component="segment-mirror".
+		assert.Equal(t, util.ComponentSegmentMirror,
+			sts.Spec.Template.Labels[labelAppComponent],
+			"mirror pod must carry app.kubernetes.io/component=segment-mirror for series disambiguation")
+	})
+
+	t.Run("DEFAULT OFF: Mirrors=false leaves only main container", func(t *testing.T) {
+		cluster := newExporterCluster() // PostgresExporter.Enabled=true but Mirrors defaults false
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		sts, err := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		mirrorOnlyMainContainer(t, sts)
+	})
+
+	t.Run("DEFAULT OFF: PostgresExporter disabled leaves only main container", func(t *testing.T) {
+		cluster := mirrorExporterCluster()
+		cluster.Spec.QueryMonitoring.Exporters.PostgresExporter.Enabled = false
+		sts, err := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		mirrorOnlyMainContainer(t, sts)
+	})
+
+	t.Run("DEFAULT OFF: QueryMonitoring nil leaves only main container", func(t *testing.T) {
+		cluster := newTestCluster() // no QueryMonitoring at all
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		sts, err := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		mirrorOnlyMainContainer(t, sts)
+	})
+
+	t.Run("regression: Segments=true alone does NOT add exporter to MIRROR segments", func(t *testing.T) {
+		// Enabling only the primary opt-in must leave mirror segment pods
+		// unchanged: Segments and Mirrors are independent toggles.
+		cluster := segmentExporterCluster()
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		sts, err := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, err)
+		require.NotNil(t, sts)
+		mirrorOnlyMainContainer(t, sts)
+	})
 }
 
 func TestBuildSegmentMirrorStatefulSet(t *testing.T) {

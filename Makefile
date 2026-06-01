@@ -261,6 +261,9 @@ monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + node-e
 	$(HELM) upgrade --install node-exporter test/monitoring/node-exporter \
 		--namespace $(NAMESPACE_TEST) \
 		--wait --timeout 2m
+	$(HELM) upgrade --install vector test/monitoring/vector \
+		--namespace $(NAMESPACE_TEST) \
+		--wait --timeout 2m
 	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
 	$(HELM) repo update
 	$(HELM) upgrade --install otel-collector open-telemetry/opentelemetry-collector \
@@ -275,6 +278,7 @@ monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + node-e
 .PHONY: monitoring-undeploy
 monitoring-undeploy: ## Remove monitoring stack from cloudberry-test namespace
 	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
+	$(HELM) uninstall vector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
 	$(HELM) uninstall node-exporter --namespace $(NAMESPACE_TEST) 2>/dev/null || true
 	$(HELM) uninstall vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || true
 	@echo "Monitoring stack removed from namespace $(NAMESPACE_TEST)"
@@ -290,8 +294,11 @@ monitoring-status: ## Check monitoring stack status in cloudberry-test namespace
 	@echo "=== OpenTelemetry Collector ==="
 	$(HELM) status otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "otel-collector: not installed"
 	@echo ""
+	@echo "=== Vector ==="
+	$(HELM) status vector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "vector: not installed"
+	@echo ""
 	@echo "=== Pods ==="
-	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (vmagent,node-exporter,opentelemetry-collector)' 2>/dev/null || echo "No monitoring pods found"
+	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (vmagent,node-exporter,opentelemetry-collector,vector)' 2>/dev/null || echo "No monitoring pods found"
 	@echo ""
 	@echo "=== Grafana Dashboards ==="
 	@curl -sf -u admin:admin http://127.0.0.1:3000/api/search?tag=cloudberry 2>/dev/null | \
@@ -336,6 +343,7 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	bash test/docker-compose/scripts/setup-minio.sh
 	bash test/docker-compose/scripts/setup-kafka.sh
 	bash test/docker-compose/scripts/setup-rabbitmq.sh
+	bash test/docker-compose/scripts/setup-victorialogs.sh
 	bash test/monitoring/scripts/publish-dashboards.sh
 
 # =============================================================================

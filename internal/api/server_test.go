@@ -1694,6 +1694,248 @@ func TestHandleGetDiskUsage_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// ============================================================================
+// collectDiskUsage tests (GAP-1)
+// ============================================================================
+
+func TestServer_CollectDiskUsage_NilDBFactory(t *testing.T) {
+	// Arrange: server with no DB factory.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	s := newTestServerWithDBAndMetrics(nil, rec, cluster)
+
+	// Act
+	usage := s.collectDiskUsage(context.Background(), cluster)
+
+	// Assert: no-op returns empty slice and records nothing.
+	assert.Empty(t, usage)
+	assert.Empty(t, rec.diskUsageCalls)
+}
+
+func TestServer_CollectDiskUsage_NewClientError(t *testing.T) {
+	// Arrange: factory that fails to create a client.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	factory := &mockDBFactory{clientErr: fmt.Errorf("connection refused")}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	usage := s.collectDiskUsage(context.Background(), cluster)
+
+	// Assert
+	assert.Empty(t, usage)
+	assert.Empty(t, rec.diskUsageCalls)
+}
+
+func TestServer_CollectDiskUsage_GetDiskUsageError(t *testing.T) {
+	// Arrange: client whose GetDiskUsage fails.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{diskUsageErr: fmt.Errorf("query failed")}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	usage := s.collectDiskUsage(context.Background(), cluster)
+
+	// Assert: error path returns empty slice, records nothing, closes client.
+	assert.Empty(t, usage)
+	assert.Empty(t, rec.diskUsageCalls)
+	assert.Equal(t, 1, dbClient.closeCalls)
+}
+
+func TestServer_CollectDiskUsage_HappyPath(t *testing.T) {
+	// Arrange: client returns per-database usage.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{
+		diskUsage: []db.DiskUsage{
+			{Database: "postgres", SizeBytes: 1024},
+			{Database: "analytics", SizeBytes: 2048},
+		},
+	}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	usage := s.collectDiskUsage(context.Background(), cluster)
+
+	// Assert: usage returned and SetDiskUsageBytes invoked per database.
+	require.Len(t, usage, 2)
+	require.Len(t, rec.diskUsageCalls, 2)
+	assert.Equal(t, "postgres", rec.diskUsageCalls[0].database)
+	assert.InDelta(t, 1024.0, rec.diskUsageCalls[0].bytes, 0.001)
+	assert.Equal(t, "analytics", rec.diskUsageCalls[1].database)
+	assert.InDelta(t, 2048.0, rec.diskUsageCalls[1].bytes, 0.001)
+	assert.Equal(t, "test-cluster", rec.diskUsageCalls[0].cluster)
+	assert.Equal(t, "default", rec.diskUsageCalls[0].namespace)
+	assert.Equal(t, 1, dbClient.closeCalls)
+}
+
+func TestServer_HandleGetDiskUsage_WithDBFactory(t *testing.T) {
+	// Arrange: full handler exercising collectDiskUsage on the happy path.
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Status.DiskUsagePercent = 60
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{
+		diskUsage: []db.DiskUsage{{Database: "postgres", SizeBytes: 4096}},
+	}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/storage/disk-usage?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rr := httptest.NewRecorder()
+
+	// Act
+	s.handleGetDiskUsage(rr, req)
+
+	// Assert
+	assert.Equal(t, http.StatusOK, rr.Code)
+	require.Len(t, rec.diskUsageCalls, 1)
+	assert.Equal(t, "postgres", rec.diskUsageCalls[0].database)
+}
+
+// ============================================================================
+// runRecommendationScan tests (GAP-2)
+// ============================================================================
+
+func TestServer_RunRecommendationScan_NilDBFactory(t *testing.T) {
+	// Arrange: no DB factory => no-op.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	s := newTestServerWithDBAndMetrics(nil, rec, cluster)
+
+	// Act
+	s.runRecommendationScan(context.Background(), cluster)
+
+	// Assert
+	assert.Empty(t, rec.recommendationsCalls)
+	assert.Zero(t, rec.scanDurationCalls)
+}
+
+func TestServer_RunRecommendationScan_NilMetrics(t *testing.T) {
+	// Arrange: DB factory present but metrics is a Noop (s.metrics != nil but
+	// not the counting recorder). Use NoopRecorder to take the guard branch
+	// where metrics is non-nil; nil metrics is covered via the factory-nil case
+	// since the guard is "dbFactory == nil || metrics == nil".
+	cluster := newTestCluster("test-cluster", "default")
+	dbClient := &mockDBClient{}
+	factory := &mockDBFactory{client: dbClient}
+	// NewServer always sets a recorder; to exercise the metrics==nil guard we
+	// build the server directly with a nil recorder.
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(cluster).Build()
+	s := NewServer(k8sClient, nil, factory, nil, nil, 0)
+
+	// Act / Assert: must not panic and must not touch the client.
+	s.runRecommendationScan(context.Background(), cluster)
+	assert.Zero(t, dbClient.closeCalls)
+}
+
+func TestServer_RunRecommendationScan_NewClientError(t *testing.T) {
+	// Arrange: factory fails to create a client.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	factory := &mockDBFactory{clientErr: fmt.Errorf("connection refused")}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	s.runRecommendationScan(context.Background(), cluster)
+
+	// Assert
+	assert.Empty(t, rec.recommendationsCalls)
+	assert.Zero(t, rec.scanDurationCalls)
+}
+
+func TestServer_RunRecommendationScan_FetchErrorContinues(t *testing.T) {
+	// Arrange: some fetchers error (continue branch), others succeed.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{
+		bloatRecsErr:   fmt.Errorf("bloat query failed"),
+		skewRecs:       []db.Recommendation{{Type: "skew"}},
+		ageRecsErr:     fmt.Errorf("age query failed"),
+		indexBloatRecs: []db.Recommendation{{Type: "index_bloat"}, {Type: "index_bloat"}},
+	}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	s.runRecommendationScan(context.Background(), cluster)
+
+	// Assert: scan duration always observed; only successful fetches counted.
+	assert.Equal(t, 1, rec.scanDurationCalls)
+	counts := map[string]float64{}
+	for _, c := range rec.recommendationsCalls {
+		counts[c.recType] = c.count
+	}
+	assert.InDelta(t, 1.0, counts["skew"], 0.001)
+	assert.InDelta(t, 2.0, counts["index_bloat"], 0.001)
+	_, hasBloat := counts["bloat"]
+	assert.False(t, hasBloat, "errored bloat fetch must not be counted")
+	assert.Equal(t, 1, dbClient.closeCalls)
+}
+
+func TestServer_RunRecommendationScan_HappyPath(t *testing.T) {
+	// Arrange: all fetchers return recommendations.
+	cluster := newTestCluster("test-cluster", "default")
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{
+		bloatRecs:      []db.Recommendation{{Type: "bloat"}, {Type: "bloat"}},
+		skewRecs:       []db.Recommendation{{Type: "skew"}},
+		ageRecs:        []db.Recommendation{{Type: "age"}},
+		indexBloatRecs: []db.Recommendation{{Type: "index_bloat"}},
+	}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	// Act
+	s.runRecommendationScan(context.Background(), cluster)
+
+	// Assert: ObserveRecommendationScanDuration + SetRecommendationsTotal per type.
+	assert.Equal(t, 1, rec.scanDurationCalls)
+	counts := map[string]float64{}
+	for _, c := range rec.recommendationsCalls {
+		counts[c.recType] = c.count
+		assert.Equal(t, "test-cluster", c.cluster)
+		assert.Equal(t, "default", c.namespace)
+	}
+	assert.InDelta(t, 2.0, counts["bloat"], 0.001)
+	assert.InDelta(t, 1.0, counts["skew"], 0.001)
+	assert.InDelta(t, 1.0, counts["age"], 0.001)
+	assert.InDelta(t, 1.0, counts["index_bloat"], 0.001)
+	assert.Equal(t, 1, dbClient.closeCalls)
+}
+
+func TestServer_HandleTriggerRecommendationScan_WithDB(t *testing.T) {
+	// Arrange: full handler exercising runRecommendationScan.
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{
+		RecommendationScan: &cbv1alpha1.RecommendationScanSpec{Enabled: true},
+	}
+	rec := &countingRecorder{}
+	dbClient := &mockDBClient{
+		bloatRecs: []db.Recommendation{{Type: "bloat"}},
+	}
+	factory := &mockDBFactory{client: dbClient}
+	s := newTestServerWithDBAndMetrics(factory, rec, cluster)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/recommendations/scan?namespace=default", nil)
+	req.SetPathValue("name", "test-cluster")
+	rr := httptest.NewRecorder()
+
+	// Act
+	s.handleTriggerRecommendationScan(rr, req)
+
+	// Assert
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	assert.Equal(t, 1, rec.scanDurationCalls)
+}
+
 func TestHandleListTables(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 	s := newTestServer(cluster)
@@ -1976,6 +2218,24 @@ type mockDBClient struct {
 	createResQueueErr        error
 	dropResQueueErr          error
 	closeCalls               int
+
+	// Disk usage / recommendation scan fakes (used by collectDiskUsage and
+	// runRecommendationScan tests).
+	diskUsage         []db.DiskUsage
+	diskUsageErr      error
+	bloatRecs         []db.Recommendation
+	bloatRecsErr      error
+	skewRecs          []db.Recommendation
+	skewRecsErr       error
+	ageRecs           []db.Recommendation
+	ageRecsErr        error
+	indexBloatRecs    []db.Recommendation
+	indexBloatRecsErr error
+
+	// Query-monitoring handler fakes.
+	queryDetailErr   error
+	moveQueryErr     error
+	exportHistoryErr error
 }
 
 func (m *mockDBClient) Ping(_ context.Context) error { return nil }
@@ -2007,7 +2267,7 @@ func (m *mockDBClient) Vacuum(_ context.Context, _ db.VacuumOptions) error   { r
 func (m *mockDBClient) Analyze(_ context.Context, _ string) error            { return nil }
 func (m *mockDBClient) Reindex(_ context.Context, _ db.ReindexOptions) error { return nil }
 func (m *mockDBClient) GetDiskUsage(_ context.Context, _ string) ([]db.DiskUsage, error) {
-	return nil, nil
+	return m.diskUsage, m.diskUsageErr
 }
 func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) { return 0, nil }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error             { return nil }
@@ -2059,16 +2319,16 @@ func (m *mockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInf
 	return nil, nil
 }
 func (m *mockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
-	return nil, nil
+	return m.bloatRecs, m.bloatRecsErr
 }
 func (m *mockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
-	return nil, nil
+	return m.skewRecs, m.skewRecsErr
 }
 func (m *mockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
-	return nil, nil
+	return m.ageRecs, m.ageRecsErr
 }
 func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
-	return nil, nil
+	return m.indexBloatRecs, m.indexBloatRecsErr
 }
 func (m *mockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
 func (m *mockDBClient) GetTableDetails(_ context.Context, _, _ string) (*db.TableDetail, error) {
@@ -2111,6 +2371,9 @@ func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.Se
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) { return nil, nil }
 func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error   { return nil }
 func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
+	if m.queryDetailErr != nil {
+		return nil, m.queryDetailErr
+	}
 	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
 }
 func (m *mockDBClient) EnsureQueryHistoryTable(_ context.Context) error { return nil }
@@ -2123,14 +2386,18 @@ func (m *mockDBClient) GetQueryHistory(_ context.Context, _ db.QueryHistoryFilte
 func (m *mockDBClient) GetQueryHistoryDetail(_ context.Context, _ string) (*db.QueryHistoryEntry, error) {
 	return nil, fmt.Errorf("not found")
 }
-func (m *mockDBClient) ExportQueryHistoryCSV(_ context.Context, _ db.QueryHistoryFilter, _ io.Writer) error {
+func (m *mockDBClient) ExportQueryHistoryCSV(_ context.Context, _ db.QueryHistoryFilter, w io.Writer) error {
+	if m.exportHistoryErr != nil {
+		return m.exportHistoryErr
+	}
+	_, _ = w.Write([]byte("pid,query\n1,SELECT 1\n"))
 	return nil
 }
 func (m *mockDBClient) CleanupQueryHistory(_ context.Context, _ time.Duration) (int64, error) {
 	return 0, nil
 }
 func (m *mockDBClient) MoveQueryToResourceGroup(_ context.Context, _ int32, _ string) error {
-	return nil
+	return m.moveQueryErr
 }
 
 // mockDBFactory implements db.DBClientFactory for testing.
@@ -2165,6 +2432,71 @@ func newTestServerWithDBErr(err error, clusters ...*cbv1alpha1.CloudberryCluster
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	factory := &mockDBFactory{clientErr: err}
 	return NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0)
+}
+
+// diskUsageCall captures a SetDiskUsageBytes invocation.
+type diskUsageCall struct {
+	cluster   string
+	namespace string
+	database  string
+	bytes     float64
+}
+
+// recommendationsCall captures a SetRecommendationsTotal invocation.
+type recommendationsCall struct {
+	cluster   string
+	namespace string
+	recType   string
+	count     float64
+}
+
+// countingRecorder wraps NoopRecorder and tracks the metric calls made by the
+// disk-usage and recommendation-scan code paths.
+type countingRecorder struct {
+	metrics.NoopRecorder
+	diskUsageCalls       []diskUsageCall
+	recommendationsCalls []recommendationsCall
+	scanDurationCalls    int
+}
+
+func (c *countingRecorder) SetDiskUsageBytes(cluster, namespace, database string, bytes float64) {
+	c.diskUsageCalls = append(c.diskUsageCalls, diskUsageCall{
+		cluster: cluster, namespace: namespace, database: database, bytes: bytes,
+	})
+}
+
+func (c *countingRecorder) SetRecommendationsTotal(cluster, namespace, recType string, count float64) {
+	c.recommendationsCalls = append(c.recommendationsCalls, recommendationsCall{
+		cluster: cluster, namespace: namespace, recType: recType, count: count,
+	})
+}
+
+func (c *countingRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {
+	c.scanDurationCalls++
+}
+
+// newTestServerWithObjects creates a test server seeded with arbitrary runtime
+// objects (e.g. clusters plus pods) and no DB factory.
+func newTestServerWithObjects(objs ...runtime.Object) *Server {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
+	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+}
+
+// newTestServerWithDBAndMetrics creates a server wired with both a mock DB
+// factory and a custom metrics recorder.
+func newTestServerWithDBAndMetrics(
+	factory db.DBClientFactory,
+	recorder metrics.Recorder,
+	clusters ...*cbv1alpha1.CloudberryCluster,
+) *Server {
+	scheme := newTestScheme()
+	objs := make([]runtime.Object, 0, len(clusters))
+	for _, c := range clusters {
+		objs = append(objs, c)
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
+	return NewServer(k8sClient, nil, factory, recorder, nil, 0)
 }
 
 // ============================================================================
@@ -4472,4 +4804,525 @@ func TestMatchSince(t *testing.T) {
 	// Invalid duration returns true (no filtering).
 	assert.True(t, matchSince(oldSession, "invalid"))
 	assert.True(t, matchSince(recentSession, ""))
+}
+
+// ============================================================================
+// Query-monitoring handler tests (pre-existing untested handlers)
+// ============================================================================
+
+func newMonitoringCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
+	c := newTestCluster(name, namespace)
+	c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
+	return c
+}
+
+func TestHandleGetQueryDetail(t *testing.T) {
+	cluster := newMonitoringCluster("test-cluster", "default")
+
+	t.Run("invalid PID", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "abc")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "missing")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("db client error", func(t *testing.T) {
+		s := newTestServerWithDBErr(fmt.Errorf("conn refused"), cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("detail not found", func(t *testing.T) {
+		dbClient := &mockDBClient{queryDetailErr: fmt.Errorf("not found")}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		dbClient := &mockDBClient{}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleGetQueryDetail(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+func TestHandleCancelQueryByPID(t *testing.T) {
+	cluster := newMonitoringCluster("test-cluster", "default")
+
+	t.Run("invalid PID", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "abc")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("non-positive PID", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "0")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "missing")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("db client error", func(t *testing.T) {
+		s := newTestServerWithDBErr(fmt.Errorf("conn refused"), cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("cancel error", func(t *testing.T) {
+		dbClient := &mockDBClient{cancelQueryErr: fmt.Errorf("cancel failed")}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+
+	t.Run("happy path with reason", func(t *testing.T) {
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+		body := bytes.NewBufferString(`{"reason":"too slow"}`)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", body)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("happy path no reason", func(t *testing.T) {
+		dbClient := &mockDBClient{cancelResult: true}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		req.SetPathValue("pid", "10")
+		rec := httptest.NewRecorder()
+		s.handleCancelQueryByPID(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+func TestHandleMoveQuery(t *testing.T) {
+	cluster := newMonitoringCluster("test-cluster", "default")
+
+	makeReq := func(pid, body string) *http.Request {
+		var r *http.Request
+		if body == "" {
+			r = httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		} else {
+			r = httptest.NewRequest(http.MethodPost, "/x?namespace=default",
+				bytes.NewBufferString(body))
+		}
+		r.SetPathValue("name", "test-cluster")
+		r.SetPathValue("pid", pid)
+		return r
+	}
+
+	t.Run("invalid PID", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("abc", `{"targetGroup":"g"}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("non-positive PID", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("-1", `{"targetGroup":"g"}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{bad json`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("missing targetGroup", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":""}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("invalid identifier", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":"bad-group!"}`))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		r := makeReq("10", `{"targetGroup":"g"}`)
+		r.SetPathValue("name", "missing")
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, r)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		s := newTestServer(cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":"g"}`))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("db client error", func(t *testing.T) {
+		s := newTestServerWithDBErr(fmt.Errorf("conn refused"), cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":"g"}`))
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("move error", func(t *testing.T) {
+		dbClient := &mockDBClient{moveQueryErr: fmt.Errorf("move failed")}
+		s := newTestServerWithDB(dbClient, cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":"g"}`))
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		dbClient := &mockDBClient{}
+		s := newTestServerWithDB(dbClient, cluster)
+		rec := httptest.NewRecorder()
+		s.handleMoveQuery(rec, makeReq("10", `{"targetGroup":"analytics"}`))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+func TestHandleGetExporterHealth(t *testing.T) {
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "missing")
+		rec := httptest.NewRecorder()
+		s.handleGetExporterHealth(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("monitoring disabled", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: false}
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetExporterHealth(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["monitoringEnabled"])
+	})
+
+	t.Run("no exporters configured", func(t *testing.T) {
+		cluster := newMonitoringCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetExporterHealth(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("exporters configured with ready pod", func(t *testing.T) {
+		cluster := newMonitoringCluster("test-cluster", "default")
+		cluster.Spec.QueryMonitoring.Exporters = &cbv1alpha1.QueryMonitoringExportersSpec{
+			PostgresExporter: &cbv1alpha1.ExporterSpec{Enabled: true},
+			NodeExporter:     &cbv1alpha1.ExporterSpec{Enabled: true, Port: 9200},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-cluster-coordinator-0",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelCluster:   "test-cluster",
+					util.LabelComponent: "coordinator",
+				},
+			},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "postgres-exporter", Ready: true},
+					{Name: "node-exporter", Ready: false},
+				},
+			},
+		}
+		s := newTestServerWithObjects(cluster, pod)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetExporterHealth(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, float64(2), resp[responseKeyTotal])
+	})
+}
+
+func TestExporterStatusFromReady(t *testing.T) {
+	assert.Equal(t, "unknown", exporterStatusFromReady(false, false))
+	assert.Equal(t, "unknown", exporterStatusFromReady(true, false))
+	assert.Equal(t, "up", exporterStatusFromReady(true, true))
+	assert.Equal(t, "down", exporterStatusFromReady(false, true))
+}
+
+func TestBuildExporterStatuses(t *testing.T) {
+	exporters := &cbv1alpha1.QueryMonitoringExportersSpec{
+		PostgresExporter:        &cbv1alpha1.ExporterSpec{Enabled: true},
+		NodeExporter:            &cbv1alpha1.ExporterSpec{Enabled: false},
+		CloudberryQueryExporter: &cbv1alpha1.ExporterSpec{Enabled: true, Port: 9999},
+	}
+	ready := map[string]bool{"postgres-exporter": true}
+	statuses := buildExporterStatuses(exporters, ready, true, "now")
+	require.Len(t, statuses, 2)
+	assert.Equal(t, "postgres-exporter", statuses[0].Name)
+	assert.Equal(t, "up", statuses[0].Status)
+	assert.Equal(t, int32(9999), statuses[1].Port)
+}
+
+func TestHandleExportActiveQueries(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "missing")
+		rec := httptest.NewRecorder()
+		s.handleExportActiveQueries(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportActiveQueries(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("db client error", func(t *testing.T) {
+		s := newTestServerWithDBErr(fmt.Errorf("conn refused"), cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportActiveQueries(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("list error", func(t *testing.T) {
+		dbClient := &mockDBClient{listSessionsWithGroupErr: fmt.Errorf("list failed")}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportActiveQueries(rec, req)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		dbClient := &mockDBClient{
+			sessionsWithGroup: []db.SessionWithGroup{
+				{
+					Session:       db.Session{PID: 1, Username: "u", Database: "d", State: "active", Query: "SELECT, 1"},
+					ResourceGroup: "g",
+				},
+			},
+		}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodGet, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportActiveQueries(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Contains(t, rec.Body.String(), "pid,username,database")
+	})
+}
+
+func TestCsvEscape(t *testing.T) {
+	assert.Equal(t, "plain", csvEscape("plain"))
+	assert.Equal(t, `"a,b"`, csvEscape("a,b"))
+	assert.Equal(t, `"a""b"`, csvEscape(`a"b`))
+	assert.Equal(t, "\"a\nb\"", csvEscape("a\nb"))
+}
+
+func TestHandlePlanCheck(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default",
+			bytes.NewBufferString(`{"planText":"x"}`))
+		req.SetPathValue("name", "missing")
+		rec := httptest.NewRecorder()
+		s.handlePlanCheck(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("invalid body", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default",
+			bytes.NewBufferString(`{bad`))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handlePlanCheck(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("empty planText", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default",
+			bytes.NewBufferString(`{"planText":"   "}`))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handlePlanCheck(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		s := newTestServer(cluster)
+		planText := "Seq Scan on big_table  (cost=0.00..100.00 rows=1000 width=10)"
+		body, _ := json.Marshal(map[string]string{"planText": planText})
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default",
+			bytes.NewBuffer(body))
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handlePlanCheck(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+func TestHandleExportQueryHistory(t *testing.T) {
+	cluster := newMonitoringCluster("test-cluster", "default")
+
+	t.Run("cluster not found", func(t *testing.T) {
+		s := newTestServer()
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "missing")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("monitoring disabled", func(t *testing.T) {
+		c := newTestCluster("test-cluster", "default")
+		c.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: false}
+		s := newTestServer(c)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("no db factory", func(t *testing.T) {
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("db client error", func(t *testing.T) {
+		s := newTestServerWithDBErr(fmt.Errorf("conn refused"), cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("happy path with filter", func(t *testing.T) {
+		dbClient := &mockDBClient{}
+		s := newTestServerWithDB(dbClient, cluster)
+		body := bytes.NewBufferString(`{"user":"alice","since":"5m","until":"2026-01-01T00:00:00Z"}`)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", body)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Contains(t, rec.Body.String(), "pid,query")
+	})
+
+	t.Run("export error", func(t *testing.T) {
+		dbClient := &mockDBClient{exportHistoryErr: fmt.Errorf("export failed")}
+		s := newTestServerWithDB(dbClient, cluster)
+		req := httptest.NewRequest(http.MethodPost, "/x?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleExportQueryHistory(rec, req)
+		// Headers already written with 200 before the export error.
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
 }
