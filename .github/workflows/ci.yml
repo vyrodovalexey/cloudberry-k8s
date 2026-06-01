@@ -208,12 +208,6 @@ jobs:
         image: victoriametrics/victoria-logs:v1.3.2-victorialogs
         ports:
           - 9428:9428
-        options: >-
-          --health-cmd "wget -qO- http://localhost:9428/health || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
