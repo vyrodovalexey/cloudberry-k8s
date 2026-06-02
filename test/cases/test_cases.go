@@ -119,6 +119,73 @@ type BackupRestoreCase struct {
 	ExpectError bool
 }
 
+// Scenario71BackupConfigCase represents a single Scenario 71 "Enable Backup with
+// Full S3 Configuration" variant. Both variants share the same full S3 config
+// (bucket, endpoint, folder, encryption, forcePathStyle, multipart) and differ
+// only in the credential source: a Kubernetes Secret vs a Vault path.
+type Scenario71BackupConfigCase struct {
+	// Name is a short test name.
+	Name string
+	// CredentialSource is "secret" (Kubernetes Secret) or "vault" (Vault path).
+	CredentialSource string
+	// CredentialRef is the Secret name the backup/restore Job env references:
+	// the user Secret for the "secret" variant, or the operator-materialized
+	// "<cluster>-backup-s3-vault-creds" Secret for the "vault" variant.
+	CredentialRef string
+	// Bucket is the configured S3 bucket.
+	Bucket string
+	// Endpoint is the configured S3-compatible endpoint.
+	Endpoint string
+	// Folder is the configured S3 folder prefix.
+	Folder string
+	// Encryption is the configured S3 plugin encryption (on|off).
+	Encryption string
+	// ForcePathStyle is the configured path-style addressing flag.
+	ForcePathStyle bool
+	// Multipart indicates the full multipart tuning block is configured.
+	Multipart bool
+	// Description explains the variant.
+	Description string
+}
+
+// Scenario71BackupConfigCases returns the two Scenario 71 full-S3 backup config
+// variants (Kubernetes Secret vs Vault credentials). Both verify the same S3
+// config fields (bucket, endpoint, folder, encryption, forcePathStyle, multipart)
+// and differ only in the credential source / referenced Secret.
+func Scenario71BackupConfigCases() []Scenario71BackupConfigCase {
+	return []Scenario71BackupConfigCase{
+		{
+			Name:             "71a_secret_credentials",
+			CredentialSource: "secret",
+			CredentialRef:    "backup-s3-credentials",
+			Bucket:           "cloudberry-backups",
+			Endpoint:         "http://minio:9000",
+			Folder:           "/backups",
+			Encryption:       "on",
+			ForcePathStyle:   true,
+			Multipart:        true,
+			Description: "full S3 config with credentials from a Kubernetes Secret; " +
+				"Job env AWS_* reference the 'backup-s3-credentials' Secret",
+		},
+		{
+			Name:             "71b_vault_credentials",
+			CredentialSource: "vault",
+			// The Job never references the Vault path directly; it references the
+			// operator-materialized Secret (BackupS3VaultCredentialsSecretName).
+			CredentialRef:  "<cluster>-backup-s3-vault-creds",
+			Bucket:         "cloudberry-backups",
+			Endpoint:       "http://minio:9000",
+			Folder:         "/backups",
+			Encryption:     "on",
+			ForcePathStyle: true,
+			Multipart:      true,
+			Description: "full S3 config with credentials from Vault (vaultSecret); " +
+				"the operator materializes '<cluster>-backup-s3-vault-creds' and " +
+				"Job env AWS_* reference that Secret instead of 'backup-s3-credentials'",
+		},
+	}
+}
+
 // DataLoadingCase represents a data loading test case.
 type DataLoadingCase struct {
 	Name        string
@@ -3732,6 +3799,106 @@ func MonitoringDisabledCases() []MonitoringDisabledCase {
 			SubScenario: "67b",
 			Step:        "retention_arg",
 			Description: "With historyRetention set, exporter args include --history-retention",
+		},
+	}
+}
+
+// Scenario70DefaultsCase represents a single Scenario 70 webhook backup
+// defaulting case: a field that the mutating webhook must default to a known
+// value when a minimal backup spec (enabled, destination, image only) is
+// applied and the field is left unset. The defaulter mutates the object the
+// API server persists, so these expected values are observed on the persisted
+// object.
+type Scenario70DefaultsCase struct {
+	// ID is the spec rule id (e.g. "70a").
+	ID string
+	// Name is a short test name.
+	Name string
+	// Field is the spec field path that is defaulted.
+	Field string
+	// Expected is the expected defaulted value as a string for catalog display.
+	Expected string
+	// Description explains the default.
+	Description string
+}
+
+// Scenario70DefaultsCases returns the Scenario 70 backup webhook defaulting
+// cases enumerating the 12 fields the mutating webhook defaults when a minimal
+// backup spec is applied. Defaulting is gated on backup.enabled and is
+// non-destructive: explicit user values are never overwritten.
+func Scenario70DefaultsCases() []Scenario70DefaultsCase {
+	return []Scenario70DefaultsCase{
+		{
+			ID: "70a", Name: "gpbackup_compression_level",
+			Field:       "backup.gpbackup.compressionLevel",
+			Expected:    "1",
+			Description: "gpbackup.compressionLevel defaults to 1 when unset",
+		},
+		{
+			ID: "70b", Name: "gpbackup_compression_type",
+			Field:       "backup.gpbackup.compressionType",
+			Expected:    "gzip",
+			Description: "gpbackup.compressionType defaults to gzip when unset",
+		},
+		{
+			ID: "70c", Name: "gpbackup_jobs",
+			Field:       "backup.gpbackup.jobs",
+			Expected:    "1",
+			Description: "gpbackup.jobs defaults to 1 when unset",
+		},
+		{
+			ID: "70d", Name: "gpbackup_single_data_file",
+			Field:       "backup.gpbackup.singleDataFile",
+			Expected:    "false",
+			Description: "gpbackup.singleDataFile defaults to false (zero value)",
+		},
+		{
+			ID: "70e", Name: "gpbackup_with_stats",
+			Field:       "backup.gpbackup.withStats",
+			Expected:    "true",
+			Description: "gpbackup.withStats defaults to true when unset",
+		},
+		{
+			ID: "70f", Name: "gprestore_jobs",
+			Field:       "backup.gprestore.jobs",
+			Expected:    "1",
+			Description: "gprestore.jobs defaults to 1 when unset",
+		},
+		{
+			ID: "70g", Name: "gprestore_with_stats",
+			Field:       "backup.gprestore.withStats",
+			Expected:    "true",
+			Description: "gprestore.withStats defaults to true when unset",
+		},
+		{
+			ID: "70h", Name: "retention_full_count",
+			Field:       "backup.retention.fullCount",
+			Expected:    "3",
+			Description: "retention.fullCount defaults to 3 when unset",
+		},
+		{
+			ID: "70i", Name: "retention_max_age",
+			Field:       "backup.retention.maxAge",
+			Expected:    "30d",
+			Description: "retention.maxAge defaults to 30d when unset",
+		},
+		{
+			ID: "70j", Name: "job_template_backoff_limit",
+			Field:       "backup.jobTemplate.backoffLimit",
+			Expected:    "2",
+			Description: "jobTemplate.backoffLimit defaults to 2 when unset",
+		},
+		{
+			ID: "70k", Name: "job_template_active_deadline_seconds",
+			Field:       "backup.jobTemplate.activeDeadlineSeconds",
+			Expected:    "7200",
+			Description: "jobTemplate.activeDeadlineSeconds defaults to 7200 (2h) when unset",
+		},
+		{
+			ID: "70l", Name: "job_template_ttl_seconds_after_finished",
+			Field:       "backup.jobTemplate.ttlSecondsAfterFinished",
+			Expected:    "86400",
+			Description: "jobTemplate.ttlSecondsAfterFinished defaults to 86400 (24h) when unset",
 		},
 	}
 }

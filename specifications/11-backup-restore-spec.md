@@ -414,6 +414,9 @@ Each rejected request returns a descriptive webhook error naming the offending f
 - `jobTemplate.backoffLimit`: `2`
 - `jobTemplate.activeDeadlineSeconds`: `7200`
 - `jobTemplate.ttlSecondsAfterFinished`: `86400`
+
+Defaults are applied by the mutating admission webhook **only when `backup.enabled: true`** and only to fields the user left unset (explicit values are preserved). After admission, the persisted object reflects these defaults. See **Scenario 70 — Webhook Defaults** in the test scenarios, which applies a minimal backup spec (enabled, destination, image only) and verifies all twelve defaulted fields on the persisted object.
+
 ## Incremental Backup Support
 
 `gpbackup` supports incremental backups that only capture changes to append-optimized tables since the last full or incremental backup. The operator manages incremental backup sets as follows:

@@ -122,8 +122,6 @@ LABEL org.opencontainers.image.title="cloudberry-backup" \
 RUN microdnf -y install \
       bash \
       ca-certificates \
-      coreutils \
-      curl \
       gettext \
       postgresql \
       shadow-utils && \
