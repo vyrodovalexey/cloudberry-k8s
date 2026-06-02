@@ -389,7 +389,64 @@ func TestValidateBackup(t *testing.T) {
 				}
 			}),
 			expectErr:   true,
-			errContains: "backup.destination.s3.credentialSecret.name",
+			errContains: "credentialSecret",
+		},
+		{
+			name: "backup s3 missing credential secret mentions vaultSecret",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type: "s3",
+					S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
+				}
+			}),
+			expectErr:   true,
+			errContains: "vaultSecret",
+		},
+		{
+			name: "backup s3 with vaultSecret and no credentialSecret valid",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type: "s3",
+					S3: &cbv1alpha1.S3Destination{
+						Bucket: "my-bucket",
+						VaultSecret: &cbv1alpha1.S3VaultSecret{
+							Path: "secret/data/cloudberry/backup-s3",
+						},
+					},
+				}
+			}),
+			expectErr: false,
+		},
+		{
+			name: "backup s3 with empty vaultSecret path and no credentialSecret rejected",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type: "s3",
+					S3: &cbv1alpha1.S3Destination{
+						Bucket:      "my-bucket",
+						VaultSecret: &cbv1alpha1.S3VaultSecret{Path: ""},
+					},
+				}
+			}),
+			expectErr:   true,
+			errContains: "credentialSecret",
+		},
+		{
+			name: "backup s3 with credentialSecret and no vaultSecret valid",
+			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
+				b.Image = "cloudberry-backup:2.1.0"
+				b.Destination = cbv1alpha1.BackupDestination{
+					Type: "s3",
+					S3: &cbv1alpha1.S3Destination{
+						Bucket:           "my-bucket",
+						CredentialSecret: &cbv1alpha1.S3CredentialSecret{Name: "backup-s3-credentials"},
+					},
+				}
+			}),
+			expectErr: false,
 		},
 		{
 			name: "backup invalid compression too high",
@@ -400,9 +457,17 @@ func TestValidateBackup(t *testing.T) {
 			errContains: "backup.gpbackup.compressionLevel",
 		},
 		{
+			name: "backup invalid compression level zero",
+			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 0}
+			})),
+			expectErr:   true,
+			errContains: "backup.gpbackup.compressionLevel",
+		},
+		{
 			name: "backup invalid compression type",
 			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
-				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionType: "lz4"}
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 6, CompressionType: "lz4"}
 			})),
 			expectErr:   true,
 			errContains: "backup.gpbackup.compressionType",
@@ -410,7 +475,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup copyQueueSize without singleDataFile",
 			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
-				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CopyQueueSize: 4}
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 6, CopyQueueSize: 4}
 			})),
 			expectErr:   true,
 			errContains: "copyQueueSize",
@@ -418,7 +483,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup jobs combined with singleDataFile",
 			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
-				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Jobs: 4, SingleDataFile: true}
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 6, Jobs: 4, SingleDataFile: true}
 			})),
 			expectErr:   true,
 			errContains: "jobs cannot be combined",
@@ -426,7 +491,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup incremental without leafPartitionData",
 			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
-				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Incremental: true}
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{CompressionLevel: 6, Incremental: true}
 			})),
 			expectErr:   true,
 			errContains: "leafPartitionData",
@@ -434,7 +499,9 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup incremental with leafPartitionData valid",
 			cluster: backupCluster(validS3Backup(func(b *cbv1alpha1.BackupSpec) {
-				b.Gpbackup = &cbv1alpha1.GpbackupOptions{Incremental: true, LeafPartitionData: true}
+				b.Gpbackup = &cbv1alpha1.GpbackupOptions{
+					CompressionLevel: 6, Incremental: true, LeafPartitionData: true,
+				}
 			})),
 			expectErr: false,
 		},

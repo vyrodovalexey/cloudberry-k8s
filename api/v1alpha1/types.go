@@ -1258,9 +1258,30 @@ type S3Destination struct {
 	// +optional
 	CredentialSecret *S3CredentialSecret `json:"credentialSecret,omitempty"`
 
+	// VaultSecret references a Vault secret path holding S3 credentials, as an
+	// alternative to credentialSecret. When set, the operator reads
+	// aws_access_key_id / aws_secret_access_key from this Vault path
+	// (requires spec.vault.enabled).
+	// +optional
+	VaultSecret *S3VaultSecret `json:"vaultSecret,omitempty"`
+
 	// Multipart defines S3 multipart transfer tuning options.
 	// +optional
 	Multipart *S3Multipart `json:"multipart,omitempty"`
+}
+
+// S3VaultSecret references a Vault KV path holding S3 credentials.
+type S3VaultSecret struct {
+	// Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+	Path string `json:"path"`
+
+	// AccessKeyField is the Vault key holding the access key id (default aws_access_key_id).
+	// +optional
+	AccessKeyField string `json:"accessKeyField,omitempty"`
+
+	// SecretKeyField is the Vault key holding the secret access key (default aws_secret_access_key).
+	// +optional
+	SecretKeyField string `json:"secretKeyField,omitempty"`
 }
 
 // S3CredentialSecret references a Secret holding S3 access credentials.

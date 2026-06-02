@@ -306,6 +306,27 @@ spec:
                           region:
                             description: Region is the S3 region.
                             type: string
+                          vaultSecret:
+                            description: |-
+                              VaultSecret references a Vault secret path holding S3 credentials, as an
+                              alternative to credentialSecret. When set, the operator reads
+                              aws_access_key_id / aws_secret_access_key from this Vault path
+                              (requires spec.vault.enabled).
+                            properties:
+                              accessKeyField:
+                                description: AccessKeyField is the Vault key holding
+                                  the access key id (default aws_access_key_id).
+                                type: string
+                              path:
+                                description: Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+                                type: string
+                              secretKeyField:
+                                description: SecretKeyField is the Vault key holding
+                                  the secret access key (default aws_secret_access_key).
+                                type: string
+                            required:
+                            - path
+                            type: object
                         type: object
                       type:
                         description: Type is the destination type (s3, local).

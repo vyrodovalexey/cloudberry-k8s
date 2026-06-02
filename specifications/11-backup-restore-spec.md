@@ -53,10 +53,14 @@ backup:
       folder: /backups                     # S3 folder (maps to gpbackup_s3_plugin `folder`)
       encryption: "on"                     # on|off — S3 plugin SSL encryption
       forcePathStyle: true                 # Required for MinIO
-      credentialSecret:
+      credentialSecret:                      # Option A: credentials from a Kubernetes Secret
         name: backup-s3-credentials        # Secret containing aws_access_key_id / aws_secret_access_key
         accessKeyField: aws_access_key_id
         secretKeyField: aws_secret_access_key
+      vaultSecret:                           # Option B (alternative): credentials from Vault (requires spec.vault.enabled)
+        path: secret/data/cloudberry/backup-s3  # Vault KV path holding the S3 credentials
+        accessKeyField: aws_access_key_id    # defaults to aws_access_key_id
+        secretKeyField: aws_secret_access_key # defaults to aws_secret_access_key
       multipart:
         backupMaxConcurrentRequests: 4     # backup_max_concurrent_requests
         backupMultipartChunksize: "10MB"   # backup_multipart_chunksize
@@ -386,14 +390,16 @@ The operator deploys `gpbackup_exporter` as a sidecar `Deployment` (or as part o
 
 - `backup.destination.type` is required when `backup.enabled: true`
 - `backup.destination.s3.bucket` is required when `destination.type: s3`
-- `backup.destination.s3.credentialSecret.name` is required when `destination.type: s3`
-- `backup.gpbackup.compressionLevel` must be between 1 and 9
+- For `destination.type: s3`, S3 credentials must be provided via **either** `backup.destination.s3.credentialSecret.name` **or** `backup.destination.s3.vaultSecret.path`. Rejection occurs only when **neither** is specified. (`vaultSecret.path` references a Vault KV path and requires `spec.vault.enabled: true` at runtime.)
+- `backup.gpbackup.compressionLevel` must be between 1 and 9 (a value of `0` is rejected by the validator as an explicit invalid level; an omitted field is defaulted to `1` by the mutating webhook before validation)
 - `backup.gpbackup.compressionType` must be `gzip` or `zstd`
 - `backup.gpbackup.copyQueueSize` requires `singleDataFile: true`
 - `backup.gpbackup.jobs` cannot be combined with `singleDataFile: true`
 - `backup.gpbackup.incremental` requires `leafPartitionData: true`
 - `backup.schedule` must be a valid cron expression when provided
 - `backup.image` must be non-empty when `backup.enabled: true`
+
+Each rejected request returns a descriptive webhook error naming the offending field, and the object is **not persisted**. See **Scenario 69 — Webhook Validation (All Rules)** in the test scenarios for the complete negative-test matrix (69a–69j).
 ## Webhook Defaults
 
 - `gpbackup.compressionLevel`: `1`

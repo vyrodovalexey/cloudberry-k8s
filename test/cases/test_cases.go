@@ -989,6 +989,100 @@ func WebhookCertCases() []WebhookCertCase {
 	}
 }
 
+// Scenario69ValidationCase represents a single Scenario 69 webhook backup
+// validation negative test case: an otherwise-valid backup spec with exactly one
+// offending field, expected to be rejected with a descriptive error mentioning
+// the field path.
+type Scenario69ValidationCase struct {
+	// ID is the spec rule id (e.g. "69a").
+	ID string
+	// Name is a short test name.
+	Name string
+	// OffendingField describes the single field mutated to an invalid value.
+	OffendingField string
+	// ErrorSubstrings are substrings expected in the rejection error.
+	ErrorSubstrings []string
+	// Description explains the rule.
+	Description string
+}
+
+// Scenario69ValidationCases returns the Scenario 69 backup webhook validation
+// negative cases 69a-69j. Rule 69c is Vault-aware: S3 credentials may come from
+// credentialSecret.name OR vaultSecret.path, and rejection only occurs when
+// NEITHER source is provided. Rule 69d rejects compressionLevel outside 1-9,
+// including an explicit 0 (the mutating defaulter sets 1 for an omitted value,
+// so a 0 reaching the validator is an explicit invalid level).
+func Scenario69ValidationCases() []Scenario69ValidationCase {
+	return []Scenario69ValidationCase{
+		{
+			ID: "69a", Name: "missing_destination_type",
+			OffendingField:  "backup.destination.type",
+			ErrorSubstrings: []string{"destination.type"},
+			Description:     "destination.type empty must be rejected when backup is enabled",
+		},
+		{
+			ID: "69b", Name: "missing_s3_bucket",
+			OffendingField:  "backup.destination.s3.bucket",
+			ErrorSubstrings: []string{"bucket"},
+			Description:     "s3 destination with no bucket must be rejected",
+		},
+		{
+			ID: "69c", Name: "missing_credential_and_vault",
+			OffendingField:  "backup.destination.s3.credentialSecret / vaultSecret",
+			ErrorSubstrings: []string{"credentialSecret", "vaultSecret"},
+			Description:     "s3 with neither credentialSecret.name nor vaultSecret.path must be rejected",
+		},
+		{
+			ID: "69d", Name: "compression_level_too_high",
+			OffendingField:  "backup.gpbackup.compressionLevel",
+			ErrorSubstrings: []string{"compressionLevel"},
+			Description:     "compressionLevel=10 must be rejected (valid range 1-9)",
+		},
+		{
+			ID: "69d", Name: "compression_level_zero",
+			OffendingField:  "backup.gpbackup.compressionLevel",
+			ErrorSubstrings: []string{"compressionLevel"},
+			Description:     "compressionLevel=0 must be rejected as an explicit invalid level",
+		},
+		{
+			ID: "69e", Name: "invalid_compression_type",
+			OffendingField:  "backup.gpbackup.compressionType",
+			ErrorSubstrings: []string{"compressionType"},
+			Description:     "compressionType=lz4 must be rejected (only gzip or zstd)",
+		},
+		{
+			ID: "69f", Name: "copy_queue_size_without_single_data_file",
+			OffendingField:  "backup.gpbackup.copyQueueSize",
+			ErrorSubstrings: []string{"copyQueueSize"},
+			Description:     "copyQueueSize without singleDataFile must be rejected",
+		},
+		{
+			ID: "69g", Name: "jobs_combined_with_single_data_file",
+			OffendingField:  "backup.gpbackup.jobs",
+			ErrorSubstrings: []string{"jobs cannot be combined"},
+			Description:     "jobs>1 combined with singleDataFile must be rejected",
+		},
+		{
+			ID: "69h", Name: "incremental_without_leaf_partition_data",
+			OffendingField:  "backup.gpbackup.incremental",
+			ErrorSubstrings: []string{"leafPartitionData"},
+			Description:     "incremental without leafPartitionData must be rejected",
+		},
+		{
+			ID: "69i", Name: "invalid_cron_schedule",
+			OffendingField:  "backup.schedule",
+			ErrorSubstrings: []string{"cron"},
+			Description:     "a non-cron schedule must be rejected",
+		},
+		{
+			ID: "69j", Name: "missing_image",
+			OffendingField:  "backup.image",
+			ErrorSubstrings: []string{"backup.image"},
+			Description:     "empty backup.image must be rejected when backup is enabled",
+		},
+	}
+}
+
 // RoleClaimCase represents a test case for role claim source and match mode verification.
 type RoleClaimCase struct {
 	Name        string

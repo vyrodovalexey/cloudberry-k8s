@@ -2309,6 +2309,32 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario52
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario52_RealCluster
 ```
 
+#### Scenario 69 — Webhook Validation (All Rules)
+
+Verifies that the validating admission webhook rejects every invalid `backup` configuration with a descriptive error and that the object is **not persisted**. Each sub-case is a rejected-CR negative test that constructs a CloudberryCluster with `backup.enabled: true`, a valid baseline backup spec, and exactly one offending field. The functional/E2E tests exercise the validator directly (infra-free); the E2E suite additionally includes a `KUBECONFIG`-gated live test that `Create`s each invalid CR against the API server, asserts the create is rejected, and confirms a follow-up `Get` returns `NotFound` (proving non-persistence). The rejection is also verified at deploy time via `kubectl apply`.
+
+- **69a — missing destination type**: `enabled=true`, no `destination.type` → rejected (`backup.destination.type is required`)
+- **69b — S3 missing bucket**: `type: s3`, no `s3.bucket` → rejected (`backup.destination.s3.bucket is required`)
+- **69c — S3 missing credentials**: `type: s3`, no `credentialSecret.name` **and** no `vaultSecret.path` → rejected (`requires either credentialSecret.name or vaultSecret.path`). Providing **either** a `credentialSecret.name` or a `vaultSecret.path` is accepted (the `vaultSecret` path requires `spec.vault.enabled` at runtime)
+- **69d — invalid compression level**: `gpbackup.compressionLevel=10` (and `=0`) → rejected (`compressionLevel must be between 1 and 9`). An omitted level is defaulted to `1` by the mutating webhook; an explicit `0` reaching the validator is rejected
+- **69e — invalid compression type**: `gpbackup.compressionType="lz4"` → rejected (`compressionType must be gzip or zstd`)
+- **69f — copyQueueSize without single data file**: `copyQueueSize=4` with `singleDataFile=false` → rejected (`copyQueueSize requires ... singleDataFile`)
+- **69g — jobs with single data file**: `jobs=4` with `singleDataFile=true` → rejected (`jobs cannot be combined with ... singleDataFile`)
+- **69h — incremental without leaf partition data**: `incremental=true` with `leafPartitionData=false` → rejected (`incremental requires ... leafPartitionData`)
+- **69i — invalid cron schedule**: `schedule="not a cron"` → rejected (`schedule is not a valid cron expression`)
+- **69j — empty backup image**: `enabled=true`, `image=""` → rejected (`backup.image is required`)
+- **Test case catalog**: `Scenario69ValidationCase` type and `Scenario69ValidationCases()` in `test/cases/test_cases.go` (10 cases: 69a–69j)
+- **Functional tests**: `test/functional/scenario69_webhook_validation_test.go`
+- **E2E tests**: `test/e2e/scenario69_webhook_validation_e2e_test.go`
+
+```bash
+# Run Scenario 69 webhook validation functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario69
+
+# Run Scenario 69 webhook validation E2E tests (live rejection gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario69
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

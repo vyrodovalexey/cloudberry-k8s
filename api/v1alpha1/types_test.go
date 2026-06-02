@@ -393,6 +393,7 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		{"BackupSpec", func() interface{} { var s *BackupSpec; return s.DeepCopy() }},
 		{"BackupRetention", func() interface{} { var s *BackupRetention; return s.DeepCopy() }},
 		{"BackupDestination", func() interface{} { var s *BackupDestination; return s.DeepCopy() }},
+		{"S3VaultSecret", func() interface{} { var s *S3VaultSecret; return s.DeepCopy() }},
 		{"SecretReference", func() interface{} { var s *SecretReference; return s.DeepCopy() }},
 		{"DataLoadingSpec", func() interface{} { var s *DataLoadingSpec; return s.DeepCopy() }},
 		{"StreamingServerSpec", func() interface{} { var s *StreamingServerSpec; return s.DeepCopy() }},
@@ -1477,5 +1478,53 @@ func TestExporterSpec_Mirrors(t *testing.T) {
 		require.NotNil(t, copied)
 		assert.True(t, copied.Segments)
 		assert.False(t, copied.Mirrors)
+	})
+}
+
+// TestS3VaultSecret_DeepCopy verifies the Vault-sourced S3 credential alternative
+// (Scenario 69c) survives a deepcopy round-trip independently of the source, both
+// as a standalone type and as the optional VaultSecret pointer field on
+// S3Destination.
+func TestS3VaultSecret_DeepCopy(t *testing.T) {
+	t.Run("standalone round-trip is independent", func(t *testing.T) {
+		src := &S3VaultSecret{
+			Path:           "secret/data/cloudberry/backup-s3",
+			AccessKeyField: "aws_access_key_id",
+			SecretKeyField: "aws_secret_access_key",
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, src.Path, copied.Path)
+		assert.Equal(t, src.AccessKeyField, copied.AccessKeyField)
+		assert.Equal(t, src.SecretKeyField, copied.SecretKeyField)
+
+		// Mutating the copy must not affect the source.
+		copied.Path = "secret/data/changed"
+		assert.Equal(t, "secret/data/cloudberry/backup-s3", src.Path)
+	})
+
+	t.Run("DeepCopyInto copies all fields", func(t *testing.T) {
+		src := S3VaultSecret{Path: "secret/data/p", AccessKeyField: "ak", SecretKeyField: "sk"}
+		var dst S3VaultSecret
+		src.DeepCopyInto(&dst)
+		assert.Equal(t, "secret/data/p", dst.Path)
+		assert.Equal(t, "ak", dst.AccessKeyField)
+		assert.Equal(t, "sk", dst.SecretKeyField)
+	})
+
+	t.Run("S3Destination with VaultSecret pointer field round-trips", func(t *testing.T) {
+		src := &S3Destination{
+			Bucket:      "my-bucket",
+			VaultSecret: &S3VaultSecret{Path: "secret/data/cloudberry/backup-s3"},
+		}
+		copied := src.DeepCopy()
+		require.NotNil(t, copied)
+		require.NotNil(t, copied.VaultSecret)
+		assert.Equal(t, src.VaultSecret.Path, copied.VaultSecret.Path)
+
+		// The pointer must be an independent copy.
+		copied.VaultSecret.Path = "secret/data/changed"
+		assert.Equal(t, "secret/data/cloudberry/backup-s3", src.VaultSecret.Path)
+		assert.NotSame(t, src.VaultSecret, copied.VaultSecret)
 	})
 }

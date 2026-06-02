@@ -356,9 +356,17 @@ func validateBackupDestination(dest *cbv1alpha1.BackupDestination) error {
 	if s3 == nil || s3.Bucket == "" {
 		return fmt.Errorf("backup.destination.s3.bucket is required for S3 destinations")
 	}
-	if s3.CredentialSecret == nil || s3.CredentialSecret.Name == "" {
+	// S3 credentials may come from a Kubernetes Secret (credentialSecret.name)
+	// OR from a Vault path (vaultSecret.path). Validation here only enforces the
+	// spec shape: at least one credential source must be provided. Whether Vault
+	// is enabled (spec.vault.enabled) is a runtime concern handled by the
+	// operator, not by this admission check.
+	hasSecret := s3.CredentialSecret != nil && s3.CredentialSecret.Name != ""
+	hasVault := s3.VaultSecret != nil && s3.VaultSecret.Path != ""
+	if !hasSecret && !hasVault {
 		return fmt.Errorf(
-			"backup.destination.s3.credentialSecret.name is required for S3 destinations")
+			"backup.destination.s3 requires either credentialSecret.name or " +
+				"vaultSecret.path for S3 credentials")
 	}
 	return nil
 }
@@ -368,7 +376,13 @@ func validateBackupGpbackup(gp *cbv1alpha1.GpbackupOptions) error {
 	if gp == nil {
 		return nil
 	}
-	if gp.CompressionLevel != 0 && (gp.CompressionLevel < 1 || gp.CompressionLevel > 9) {
+	// compressionLevel must be 1-9. We reject 0 as well: in the real admission
+	// chain the mutating defaulter runs first and sets compressionLevel=1 when a
+	// user omits it (zero value), so a value of 0 reaching this validator means
+	// the user explicitly set an invalid level (or defaulting was bypassed, as in
+	// direct validator unit/functional tests). Either way 0 is not a valid
+	// gpbackup compression level, so it is rejected here (Scenario 69d).
+	if gp.CompressionLevel < 1 || gp.CompressionLevel > 9 {
 		return fmt.Errorf("backup.gpbackup.compressionLevel must be between 1 and 9, got %d",
 			gp.CompressionLevel)
 	}
