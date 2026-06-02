@@ -16,7 +16,11 @@
 # Build args:
 #   CB_BACKUP_VERSION   — cloudberry-backup release version (default: 2.1.0-incubating)
 #   CB_BACKUP_REPO_URL  — base URL for the source tarball download
-#   GO_VERSION          — Go toolchain version for the builder stage
+#   GO_VERSION          — Go toolchain version installed in the builder stage (default: 1.26.3)
+#
+# Base images:
+#   builder — rockylinux/rockylinux:9.6 (official Go toolchain from go.dev)
+#   runtime — rockylinux/rockylinux:9.6-minimal
 #
 # Supports: linux/amd64, linux/arm64
 #
@@ -27,17 +31,31 @@
 # =============================================================================
 # Stage 1: Build apache/cloudberry-backup from source
 # =============================================================================
-ARG GO_VERSION=1.26
-FROM golang:${GO_VERSION}-alpine AS builder
+ARG GO_VERSION=1.26.3
+FROM rockylinux/rockylinux:9.6 AS builder
 
 # Install build dependencies (sorted alphanumerically)
-RUN apk add --no-cache \
-    bash \
-    ca-certificates \
-    curl \
-    git \
-    make \
-    tar
+RUN dnf -y install \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        gzip \
+        make \
+        tar && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# Install the official Go toolchain (Rocky's dnf Go package can lag versions;
+# pull the exact release from go.dev for the target architecture).
+ARG GO_VERSION
+ARG TARGETARCH
+RUN GO_ARCH="${TARGETARCH:-amd64}" && \
+    curl -fSL -o /tmp/go.tar.gz \
+        "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm -f /tmp/go.tar.gz
+ENV PATH="/usr/local/go/bin:${PATH}" \
+    GOTOOLCHAIN=local
 
 WORKDIR /build
 
@@ -54,7 +72,7 @@ RUN curl -fSL -o /tmp/cloudberry-backup-src.tar.gz "${CB_BACKUP_REPO_URL}" && \
 # Build all Go binaries from the cloudberry-backup source tree.
 # The upstream repo contains multiple Go modules (gpbackup, gpbackup_s3_plugin,
 # gpbackup_exporter, gpbackman). We build each binary individually.
-ARG TARGETARCH
+# TARGETARCH is already declared above for the Go toolchain install.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -trimpath -ldflags="-s -w" \
         -o /usr/local/bin/gpbackup \
