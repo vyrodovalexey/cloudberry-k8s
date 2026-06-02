@@ -38,7 +38,6 @@ FROM rockylinux/rockylinux:9.6 AS builder
 RUN dnf -y install \
         bash \
         ca-certificates \
-        curl \
         git \
         gzip \
         make \
