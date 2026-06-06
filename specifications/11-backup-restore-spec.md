@@ -318,6 +318,15 @@ See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test sce
 
 The scenario is driven by the sample CR `deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml` (full S3 destination with an explicit `jobTemplate`) and is covered by `test/functional/scenario72_backup_infrastructure_test.go` and `test/e2e/scenario72_backup_infrastructure_e2e_test.go`.
 
+### Scenario 73 — On-Demand Backup with gpbackup Options
+
+**Scenario 73** verifies that an on-demand backup (`POST /api/v1alpha1/clusters/{name}/backups`) creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob) and renders the per-request `gpbackupOptions` into the `gpbackup` CLI invocation. The 73a/73b options are supplied **per-request at trigger time via REST** — they are **not** baked into the CR; the sample CR's cluster-level `backup.gpbackup` defaults are harmless and are overridden by the per-request options. Two sub-cases are verified:
+
+- **73a — Standard options.** `compressionLevel=6`, `compressionType=zstd`, `jobs=4`, `withStats=true`, `withoutGlobals=true`, `includeSchemas=[public, analytics]`. The built Job's `gpbackup` container args contain `--compression-level 6 --compression-type zstd --jobs 4 --with-stats --without-globals --include-schema public --include-schema analytics` (one `--include-schema` per schema), and the operator returns a `Job` (not a `CronJob`).
+- **73b — noCompression override.** `noCompression=true` together with `compressionLevel=6`. The args contain `--no-compression` and **omit** `--compression-level` (and `--compression-type`): the compression level is ignored, confirming `--no-compression` precedence.
+
+The scenario is driven by the sample CR `deploy/helm/cloudberry-operator/config/samples/scenario73-backup-options.yaml` (full S3 destination; the 73a/73b gpbackup options are supplied per-request via REST, not in the CR) and is covered by `test/functional/scenario73_backup_options_test.go` and `test/e2e/scenario73_backup_options_e2e_test.go`.
+
 ### Retention Cleanup Job
 
 After each successful backup, the operator creates a short-lived cleanup Job that runs `gpbackman` (from the `apache/cloudberry-backup` project) to enforce retention policy. The cleanup logic:
@@ -341,6 +350,8 @@ After each successful backup, the operator creates a short-lived cleanup Job tha
 
 ### Create Backup Request
 
+`POST /clusters/{name}/backups` accepts an optional `gpbackupOptions` object (`GpbackupOptionsRequest`) carrying **per-request** gpbackup option overrides. An on-demand backup creates a Kubernetes **Job DIRECTLY** (it does **not** go through the scheduled CronJob). The supplied options are merged over the cluster's `backup.gpbackup` defaults and rendered into the `gpbackup` CLI invocation on the Job container.
+
 ```json
 {
   "type": "full",
@@ -352,14 +363,36 @@ After each successful backup, the operator creates a short-lived cleanup Job tha
     "singleDataFile": true,
     "copyQueueSize": 4,
     "incremental": false,
+    "fromTimestamp": "",
     "includeSchemas": ["public", "analytics"],
     "excludeTables": ["public.temp_data"],
     "leafPartitionData": false,
     "withStats": true,
-    "withoutGlobals": false
+    "withoutGlobals": false,
+    "noCompression": false
   }
 }
 ```
+
+The `gpbackupOptions` fields map to `gpbackup` flags as follows:
+
+| Request field | gpbackup flag |
+|---|---|
+| `compressionLevel` | `--compression-level` |
+| `compressionType` (`gzip`\|`zstd`) | `--compression-type` |
+| `jobs` | `--jobs` |
+| `singleDataFile` | `--single-data-file` |
+| `copyQueueSize` (requires `singleDataFile`) | `--copy-queue-size` |
+| `incremental` | `--incremental` |
+| `fromTimestamp` | `--from-timestamp` |
+| `includeSchemas` (repeated) | one `--include-schema` per schema |
+| `excludeTables` (repeated) | one `--exclude-table` per table |
+| `leafPartitionData` | `--leaf-partition-data` |
+| `withStats` | `--with-stats` |
+| `withoutGlobals` | `--without-globals` |
+| `noCompression` | `--no-compression` |
+
+**`noCompression` override semantics.** When `noCompression: true`, the operator invokes `gpbackup` with `--no-compression` and the compression level/type are **ignored**: it emits `--no-compression` and does **not** emit `--compression-level` / `--compression-type`, producing an uncompressed backup — even if `compressionLevel` (or `compressionType`) is also set in the same request. `--no-compression` therefore takes precedence over the compression options.
 
 ### Restore Request
 

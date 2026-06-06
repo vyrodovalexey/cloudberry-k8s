@@ -41,6 +41,7 @@ type GpbackupOptionsRequest struct {
 	LeafPartitionData bool     `json:"leafPartitionData,omitempty"`
 	WithStats         bool     `json:"withStats,omitempty"`
 	WithoutGlobals    bool     `json:"withoutGlobals,omitempty"`
+	NoCompression     bool     `json:"noCompression,omitempty"`
 }
 
 // CreateBackupRequest is the POST /backups request body.
@@ -192,6 +193,7 @@ func mergeGpbackupOptions(
 	out.LeafPartitionData = gp.LeafPartitionData
 	out.WithStats = gp.WithStats
 	out.WithoutGlobals = gp.WithoutGlobals
+	out.NoCompression = gp.NoCompression
 	return out
 }
 

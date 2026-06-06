@@ -35,6 +35,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Run the Live Backup/Restore Cycle](#run-the-live-backuprestore-cycle)
   - [Verified Result](#verified-result)
   - [Scenario 72 — Backup Infrastructure Deployment](#scenario-72--backup-infrastructure-deployment)
+  - [Scenario 73 — On-Demand Backup with gpbackup Options](#scenario-73--on-demand-backup-with-gpbackup-options)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -861,6 +862,42 @@ Six infrastructure verifications pass:
 6. **jobTemplate overrides** — all of the values above propagate to the built Job.
 
 These are covered by `test/functional/scenario72_backup_infrastructure_test.go` and `test/e2e/scenario72_backup_infrastructure_e2e_test.go`.
+
+### Scenario 73 — On-Demand Backup with gpbackup Options
+
+Scenario 73 triggers an **on-demand** backup whose `gpbackup` options are supplied **per-request at trigger time via REST** — they are **not** baked into the CR. The on-demand `POST` creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob). The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario73-backup-options.yaml` provides the destination/infrastructure (full S3 block, Secret credentials); its cluster-level `backup.gpbackup` defaults are harmless and are overridden by the per-request `gpbackupOptions`.
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario73-backup-options.yaml
+```
+
+Two sub-cases are verified:
+
+- **73a — Standard options.** `compressionLevel=6`, `compressionType=zstd`, `jobs=4`, `withStats=true`, `withoutGlobals=true`, `includeSchemas=[public, analytics]`:
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario73/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"compressionLevel":6,"compressionType":"zstd",
+           "jobs":4,"withStats":true,"withoutGlobals":true,
+           "includeSchemas":["public","analytics"]}}'
+  ```
+
+  Verified `gpbackup` args: `--compression-level 6 --compression-type zstd --jobs 4 --with-stats --without-globals --include-schema public --include-schema analytics` (one `--include-schema` per schema). The operator builds a `Job` directly (not a `CronJob`).
+
+- **73b — noCompression override.** `noCompression=true` with `compressionLevel=6`:
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario73/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"noCompression":true,"compressionLevel":6}}'
+  ```
+
+  Verified `gpbackup` args: `--no-compression` is present and `--compression-level` is **absent** — the compression level is ignored (`--no-compression` takes precedence).
+
+These are covered by `test/functional/scenario73_backup_options_test.go` and `test/e2e/scenario73_backup_options_e2e_test.go`.
 
 ## Configuration Management
 

@@ -2456,6 +2456,46 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario72
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario72
 ```
 
+#### Scenario 73 — On-Demand Backup with gpbackup Options
+
+Verifies that an on-demand backup (`POST /api/v1alpha1/clusters/{name}/backups`) creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob) and renders the per-request `gpbackupOptions` into the `gpbackup` CLI invocation. The 73a/73b options are supplied **per-request at trigger time via REST** — they are **not** baked into the CR; the sample CR's cluster-level `backup.gpbackup` defaults are harmless and are overridden by the per-request options.
+
+- **73a — Standard options**: `compressionLevel=6`, `compressionType=zstd`, `jobs=4`, `withStats=true`, `withoutGlobals=true`, `includeSchemas=[public, analytics]`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario73/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"compressionLevel":6,"compressionType":"zstd",
+           "jobs":4,"withStats":true,"withoutGlobals":true,
+           "includeSchemas":["public","analytics"]}}'
+  ```
+
+  Verified gpbackup args: `--compression-level 6 --compression-type zstd --jobs 4 --with-stats --without-globals --include-schema public --include-schema analytics` (one `--include-schema` per schema), and the operator returns a `Job` (never a `CronJob`).
+
+- **73b — noCompression override**: `noCompression=true` together with `compressionLevel=6`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario73/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"noCompression":true,"compressionLevel":6}}'
+  ```
+
+  Verified gpbackup args: `--no-compression` is present and `--compression-level` is **absent** — the compression level is ignored (`--no-compression` precedence).
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario73-backup-options.yaml`
+- **Functional tests**: `test/functional/scenario73_backup_options_test.go`
+- **E2E tests**: `test/e2e/scenario73_backup_options_e2e_test.go`
+
+```bash
+# Run Scenario 73 on-demand backup options functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario73
+
+# Run Scenario 73 on-demand backup options E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario73
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
