@@ -3,7 +3,7 @@
 # =============================================================================
 # Stage 1: Build the cloudberry-ctl binary
 # =============================================================================
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.4-alpine AS builder
 
 # Install build dependencies (sorted alphanumerically)
 RUN apk add --no-cache \

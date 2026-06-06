@@ -1154,7 +1154,7 @@
       "gridPos": { "x": 0, "y": 90, "w": 4, "h": 4 },
       "targets": [
         {
-          "expr": "cloudberry_query_history_insert_total",
+          "expr": "cloudberry_query_history_total",
           "refId": "A"
         }
       ],
@@ -1326,17 +1326,17 @@
       "gridPos": { "x": 4, "y": 98, "w": 12, "h": 8 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket{source=\"history\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(cloudberry_query_duration_seconds_bucket{source=\"history\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(cloudberry_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket{source=\"history\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -1451,6 +1451,768 @@
           "expr": "rate(cloudberry_plan_check_issues_total[5m])",
           "legendFormat": "{{category}}",
           "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Resource Groups",
+      "gridPos": { "x": 0, "y": 115, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Running vs Queued Queries",
+      "description": "Running and queued queries per resource group",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 116, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_running_queries",
+          "legendFormat": "running {{rsgname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_resgroup_queued_queries",
+          "legendFormat": "queued {{rsgname}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Executed Queries Rate",
+      "description": "Rate of executed queries per resource group",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 8, "y": 116, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_resgroup_executed_total[5m])",
+          "legendFormat": "{{rsgname}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue Wait Duration Rate",
+      "description": "Rate of queue wait duration per resource group",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 116, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_resgroup_queue_duration_seconds_total[5m])",
+          "legendFormat": "{{rsgname}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU Usage by Resource Group",
+      "description": "CPU usage percentage per resource group and host",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 124, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_cpu_usage_percent",
+          "legendFormat": "{{rsgname}} {{hostname}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory Usage by Resource Group",
+      "description": "Memory usage and available bytes per resource group and host",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 8, "y": 124, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_memory_usage_bytes",
+          "legendFormat": "used {{rsgname}} {{hostname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_resgroup_memory_available_bytes",
+          "legendFormat": "available {{rsgname}} {{hostname}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory Quota & Shared Usage",
+      "description": "Memory quota used and shared memory used per resource group and host",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 124, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_memory_quota_used_bytes",
+          "legendFormat": "quota used {{rsgname}} {{hostname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_resgroup_memory_shared_used_bytes",
+          "legendFormat": "shared used {{rsgname}} {{hostname}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Resource Group I/O",
+      "gridPos": { "x": 0, "y": 132, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "I/O Throughput",
+      "description": "Read and write bytes per second per resource group, host, and tablespace",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 133, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_io_read_bytes_per_sec",
+          "legendFormat": "read {{rsgname}} {{hostname}} {{tablespace}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_resgroup_io_write_bytes_per_sec",
+          "legendFormat": "write {{rsgname}} {{hostname}} {{tablespace}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "I/O Operations",
+      "description": "Read and write operations per second per resource group, host, and tablespace",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 12, "y": 133, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_resgroup_io_read_ops_per_sec",
+          "legendFormat": "read {{rsgname}} {{hostname}} {{tablespace}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_resgroup_io_write_ops_per_sec",
+          "legendFormat": "write {{rsgname}} {{hostname}} {{tablespace}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "iops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Query Counters",
+      "gridPos": { "x": 0, "y": 141, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Queries Rate by State",
+      "description": "Rate of observed queries by database, user, and state",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 142, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_queries_total[5m])",
+          "legendFormat": "{{state}} {{datname}} {{usename}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Slow Queries Rate",
+      "description": "Rate of slow queries by database and user",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 8, "y": 142, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_queries_slow_total[5m])",
+          "legendFormat": "{{datname}} {{usename}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Canceled Queries Rate",
+      "description": "Rate of canceled queries by reason",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 142, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_queries_canceled_total[5m])",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Spill & Skew",
+      "gridPos": { "x": 0, "y": 150, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Spill Files per Segment",
+      "description": "Spill file size in bytes per segment",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 151, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, cloudberry_spill_files_per_segment)",
+          "legendFormat": "seg {{segment_id}} {{hostname}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Spill Files per Query",
+      "description": "Spill file size in bytes per query",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 8, "y": 151, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, cloudberry_spill_files_per_query)",
+          "legendFormat": "{{datname}} pid={{pid}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Table Skew Coefficient",
+      "description": "Data distribution skew coefficient per table",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 151, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, cloudberry_table_skew_coefficient)",
+          "legendFormat": "{{schemaname}}.{{tablename}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Exporter Self-Health",
+      "gridPos": { "x": 0, "y": 159, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Query Exporter Up",
+      "description": "Whether the query exporter database connection is healthy",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 160, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "cloudberry_query_exporter_up",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Down", "color": "red" }, "1": { "text": "Up", "color": "green" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Exporter Scrape Duration",
+      "description": "Duration percentiles of database metric scrape (p50, p95, p99)",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 4, "y": 160, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Total Connections",
+      "description": "Total number of database connections",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 160, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "cloudberry_total_connections",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Database Stats (postgres-exporter custom SQL)",
+      "gridPos": { "x": 0, "y": 168, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Backends & Connections",
+      "description": "Active backends, connection count, and max connections",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 169, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_database_stats_numbackends",
+          "legendFormat": "backends {{datname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_connections_count",
+          "legendFormat": "connections",
+          "refId": "B"
+        },
+        {
+          "expr": "cloudberry_connections_max_max_connections",
+          "legendFormat": "max connections",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tuples Returned & Temp Files",
+      "description": "Tuples returned rate and temp files per database",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 8, "y": 169, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_database_stats_tup_returned[5m])",
+          "legendFormat": "tup_returned/s {{datname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_database_stats_temp_files",
+          "legendFormat": "temp_files {{datname}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Replication Lag (write/flush/replay)",
+      "description": "Replication lag in bytes for write, flush, and replay stages",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 169, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "cloudberry_replication_write_lag_bytes",
+          "legendFormat": "write {{application_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "cloudberry_replication_flush_lag_bytes",
+          "legendFormat": "flush {{application_name}}",
+          "refId": "B"
+        },
+        {
+          "expr": "cloudberry_replication_replay_lag_bytes",
+          "legendFormat": "replay {{application_name}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Table Scan Tuples (seq read / idx fetch)",
+      "description": "Sequential tuples read and index tuples fetched per table",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 0, "y": 177, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, rate(cloudberry_table_stats_seq_tup_read[5m]))",
+          "legendFormat": "seq_tup_read {{relname}}",
+          "refId": "A"
+        },
+        {
+          "expr": "topk(10, rate(cloudberry_table_stats_idx_tup_fetch[5m]))",
+          "legendFormat": "idx_tup_fetch {{relname}}",
+          "refId": "B"
         }
       ],
       "fieldConfig": {

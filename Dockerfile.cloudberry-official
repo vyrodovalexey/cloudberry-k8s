@@ -1,0 +1,164 @@
+# =============================================================================
+# Dockerfile.cloudberry-official — Apache Cloudberry Database 2.1.0 (OFFICIAL RPM)
+# =============================================================================
+# Builds a Kubernetes-ready Cloudberry image from the OFFICIAL Apache Cloudberry
+# prebuilt release RPM instead of compiling from source.
+#
+# Why this image exists
+# ---------------------
+# The from-source image (Dockerfile.cloudberry) exhibits a segment-backend crash
+# (exit 255) during gpbackup's data phase — a build-specific defect, NOT a
+# Cloudberry code defect. The OFFICIAL Apache prebuilt binary does NOT have this
+# defect: a real gpbackup/gprestore MPP backup+restore completes successfully on
+# it. Use THIS image for clusters that need working gpbackup/gprestore.
+#
+# Architecture note
+# -----------------
+# The official Apache Cloudberry 2.1.0 release ships x86_64 (el9) RPMs only;
+# there is no published aarch64 RPM. This image is therefore linux/amd64. On
+# arm64 hosts it runs under emulation (qemu).
+#
+# It also bundles the gpbackup toolchain binaries (gpbackup, gprestore,
+# gpbackup_helper, gpbackup_s3_plugin) built from apache/cloudberry-backup so
+# the same image can run MPP backups.
+#
+# Build args:
+#   CB_RPM_URL          — URL of the official Cloudberry RPM (el9 x86_64)
+#   CB_BACKUP_VERSION   — apache/cloudberry-backup version for the gpbackup tools
+#   GO_VERSION          — Go toolchain version for building the gpbackup tools
+#
+# Usage:
+#   docker build --platform linux/amd64 -f Dockerfile.cloudberry-official \
+#       -t cloudberry-official:2.1.0 .
+# =============================================================================
+
+# =============================================================================
+# Stage 1: Build the gpbackup toolchain (from apache/cloudberry-backup source)
+# =============================================================================
+ARG GO_VERSION=1.23
+FROM --platform=linux/amd64 golang:${GO_VERSION}-bookworm AS gpbackup-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git make gcc libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+ARG CB_BACKUP_VERSION=2.1.0-incubating
+ARG CB_BACKUP_REPO_URL=https://github.com/apache/cloudberry-backup/archive/refs/tags/${CB_BACKUP_VERSION}.tar.gz
+RUN curl -fSL -o /tmp/src.tar.gz "${CB_BACKUP_REPO_URL}" && \
+    tar -xzf /tmp/src.tar.gz -C /build --strip-components=1 && \
+    rm -f /tmp/src.tar.gz
+
+# Build the four binaries using the upstream build tags. gpbackup/gprestore need
+# CGO (sqlite history); the helper/plugin do not.
+RUN CGO_ENABLED=1 go build -tags 'gpbackup' \
+        -ldflags="-X github.com/apache/cloudberry-backup/backup.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup . && \
+    CGO_ENABLED=1 go build -tags 'gprestore' \
+        -ldflags="-X github.com/apache/cloudberry-backup/restore.version=${CB_BACKUP_VERSION}" \
+        -o /out/gprestore . && \
+    CGO_ENABLED=0 go build -tags 'gpbackup_helper' \
+        -ldflags="-X github.com/apache/cloudberry-backup/helper.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup_helper . && \
+    CGO_ENABLED=0 go build -tags 'gpbackup_s3_plugin' \
+        -ldflags="-X github.com/apache/cloudberry-backup/plugins/s3plugin/s3plugin.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup_s3_plugin .
+
+# =============================================================================
+# Stage 2: Runtime image — official Cloudberry RPM
+# =============================================================================
+FROM --platform=linux/amd64 rockylinux/rockylinux:9
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-database-official" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 (official RPM) for Kubernetes, with gpbackup toolchain" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="rockylinux/rockylinux:9"
+
+# Install the official Apache Cloudberry RPM plus runtime dependencies.
+ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
+RUN dnf -y install \
+        apr bash bzip2 ca-certificates glibc-langpack-en hostname iproute \
+        keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
+        lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
+        pam perl procps-ng python3 readline rsync shadow-utils sudo which zlib && \
+    dnf -y install "${CB_RPM_URL}" && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# The RPM installs Cloudberry to /usr/local/cloudberry-db (versioned dir +
+# symlink). Confirm GPHOME exists.
+RUN test -d /usr/local/cloudberry-db && test -x /usr/local/cloudberry-db/bin/postgres
+
+# Bundle the gpbackup toolchain into GPHOME/bin so backups can run.
+COPY --from=gpbackup-builder /out/gpbackup            /usr/local/cloudberry-db/bin/gpbackup
+COPY --from=gpbackup-builder /out/gprestore           /usr/local/cloudberry-db/bin/gprestore
+COPY --from=gpbackup-builder /out/gpbackup_helper     /usr/local/cloudberry-db/bin/gpbackup_helper
+COPY --from=gpbackup-builder /out/gpbackup_s3_plugin  /usr/local/cloudberry-db/bin/gpbackup_s3_plugin
+RUN chmod +x /usr/local/cloudberry-db/bin/gpbackup \
+             /usr/local/cloudberry-db/bin/gprestore \
+             /usr/local/cloudberry-db/bin/gpbackup_helper \
+             /usr/local/cloudberry-db/bin/gpbackup_s3_plugin
+
+# Create gpadmin user (UID 1000 for Kubernetes compatibility)
+RUN groupadd -g 1000 gpadmin && \
+    useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin && \
+    echo "gpadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gpadmin && \
+    chmod 440 /etc/sudoers.d/gpadmin && \
+    chown -R gpadmin:gpadmin /usr/local/cloudberry-db
+
+# Prepare SSH daemon directory (host keys generated at runtime by entrypoint)
+RUN mkdir -p /run/sshd && chmod 755 /run/sshd
+
+# Operator-expected directory layout
+RUN mkdir -p /data/pgdata /etc/cloudberry /var/run/cloudberry && \
+    chown -R gpadmin:gpadmin /data /etc/cloudberry /var/run/cloudberry
+
+# System limits for Cloudberry
+RUN printf '* soft core unlimited\n\
+* hard core unlimited\n\
+* soft nofile 524288\n\
+* hard nofile 524288\n\
+* soft nproc 131072\n\
+* hard nproc 131072\n' > /etc/security/limits.d/90-cbdb-limits.conf
+
+# SSH dir (keypair generated at runtime by entrypoint)
+RUN mkdir -p /home/gpadmin/.ssh && chmod 700 /home/gpadmin/.ssh && \
+    chown -R gpadmin:gpadmin /home/gpadmin/.ssh
+
+# gpadmin environment
+RUN { \
+      echo ''; \
+      echo '# Apache Cloudberry environment'; \
+      echo 'if [ -f /usr/local/cloudberry-db/cloudberry-env.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/cloudberry-env.sh'; \
+      echo 'elif [ -f /usr/local/cloudberry-db/greenplum_path.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/greenplum_path.sh'; \
+      echo 'fi'; \
+      echo 'export COORDINATOR_DATA_DIRECTORY="${COORDINATOR_DATA_DIRECTORY:-/data/pgdata/gpseg-1}"'; \
+    } >> /home/gpadmin/.bashrc
+
+# Entrypoint
+COPY --chmod=755 hack/docker-entrypoint-cloudberry.sh /usr/local/bin/docker-entrypoint.sh
+
+# Environment variables for operator integration
+ENV PGDATA=/data/pgdata \
+    CLOUDBERRY_ROLE=coordinator \
+    CLOUDBERRY_CONTENT_ID=-1 \
+    CLOUDBERRY_COORDINATOR_HOST=localhost \
+    GPHOME=/usr/local/cloudberry-db \
+    COORDINATOR_DATA_DIRECTORY=/data/pgdata/gpseg-1 \
+    LANG=en_US.UTF-8
+
+USER 1000:1000
+WORKDIR /home/gpadmin
+
+EXPOSE 5432 22
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD pg_isready -h localhost -p 5432 -U gpadmin -d postgres || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["postgres"]

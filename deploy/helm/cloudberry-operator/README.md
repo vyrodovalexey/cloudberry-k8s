@@ -403,6 +403,8 @@ To use Vault PKI for webhook certificates:
    kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
    ```
 
+> **Vault Kubernetes Auth (docker-desktop) — `kubernetes.docker.internal` gotcha**: When the operator authenticates to Vault with `vault.authMethod=kubernetes` on Docker Desktop, the Vault Kubernetes auth backend must be configured with `kubernetes_host=https://kubernetes.docker.internal:6443` — **not** `host.docker.internal`. The Docker Desktop API-server serving certificate includes only `kubernetes.docker.internal` in its SANs; using `host.docker.internal` makes Vault's `TokenReview` TLS hostname verification fail, and operator login returns `403 permission denied`. In the bundled test environment, this is handled by `test/docker-compose/scripts/setup-vault-k8s-auth.sh` (run via `make test-env-setup`); deploy the operator into `cloudberry-test` with `make helm-install-test`. See the [Installation Guide](../../docs/installation.md#vault-pki-with-kubernetes-auth-on-docker-desktop-make-targets) for the full flow.
+
 ### Webhook Configuration Values
 
 | Parameter | Description | Default |

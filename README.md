@@ -173,6 +173,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Context cancellation checks in database propagation operations
 - Goroutine leak prevention in idle daemon via `startOrUpdateIdleDaemon`
 - Dependency vulnerability fix: upgraded `golang.org/x/net` (GO-2026-5026)
+- Dependency security update: bumped `golang.org/x/crypto` to v0.52.0 (Go toolchain pinned to 1.26.4)
 
 **Administration**
 - Configuration management with automatic hot-reload vs rolling restart detection
@@ -252,7 +253,7 @@ cloudberry-ctl cluster status --cluster my-cluster --namespace cloudberry-test
 |-------------|---------|
 | Kubernetes | >= 1.26 |
 | Helm | >= 3.x |
-| Go (for building) | >= 1.26.3 |
+| Go (for building) | >= 1.26.4 |
 | kubectl | >= 1.26 |
 
 Optional:
@@ -599,9 +600,9 @@ bash test/scenarios/scenario7_load_data.sh
 
 Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
 
-**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), automatic segment failover via FTS (20), bootstrap workload management via CRD (25), webhook validation negative tests for backup configuration (69a–69j), and webhook defaults verification for backup configuration (70). See [docs/development.md](docs/development.md) for detailed test descriptions.
+**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), automatic segment failover via FTS (20), bootstrap workload management via CRD (25), webhook validation negative tests for backup configuration (69a–69j), webhook defaults verification for backup configuration (70), and full S3 backup configuration with Secret and Vault credential sources (71). See [docs/development.md](docs/development.md) for detailed test descriptions.
 
-The project targets **90%+ unit test statement coverage** per package. Total coverage: **91.3%** with all 14 internal packages at 90%+. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90.1%, `internal/auth` at ~97.6%, `internal/idle` at ~97%, `cmd/cloudberry-ctl` at ~91.6%, `cmd/operator` at ~30.0%. All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38). See [docs/development.md](docs/development.md) for the full development and testing guide.
+The project targets **90%+ unit test statement coverage** per package. Total coverage: **91.4%** with all 14 internal packages at 90%+. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90.1%, `internal/auth` at ~97.6%, `internal/idle` at ~97%, `cmd/cloudberry-ctl` at ~91.6%, `cmd/operator` at ~30.0%. All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38). See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Monitoring Quick Start
 
@@ -636,16 +637,16 @@ Pre-built Grafana dashboards are available in the `monitoring/grafana/` director
 
 The operator has been verified in production-like deployments:
 
-- **Operator**: Deployed with Vault-PKI webhook certificates (CN issued by the Vault Root CA) via Kubernetes auth, plus Keycloak OIDC
-- **Cluster**: HA cluster with standby coordinator (`standbyReady`), segment mirroring (`InSync`), and Vault-PKI cluster TLS
-- **Exporters**: Both the postgres-exporter and cloudberry-query-exporter producing metrics into VictoriaMetrics
+- **Operator**: Deployed into `cloudberry-test` via `make helm-install-test` with Vault-PKI webhook certificates (CN issued by the Vault Root CA) using Vault Kubernetes auth, plus Keycloak OIDC. Vault Kubernetes auth is configured by `make test-env-setup` (`setup-vault-k8s-auth.sh`)
+- **Cluster**: HA cluster (`scenario67`) with standby coordinator (`standbyReady`), segment mirroring (`InSync`), and Vault-PKI cluster TLS (the `scenario67-tls` Secret)
+- **Exporters**: postgres-exporter on the coordinator, standby, and every segment primary and mirror, plus the coordinator-only cloudberry-query-exporter, producing metrics into VictoriaMetrics
 - **Data**: ~100 MB of test data loaded into `mydb`
-- **Dashboards**: All 3 Grafana dashboards (operator, exporters, node) reflecting live metrics
-- **Performance**: Performance test PASS — health p95 ~8 ms, 0% errors
-- **Monitoring**: VictoriaMetrics Agent + OpenTelemetry Collector deployed alongside operator
+- **Dashboards**: All Grafana dashboards in `monitoring/grafana/` (operator, exporters, node) reflecting live metrics; published via `make grafana-publish`
+- **Monitoring**: vmagent (remote-writing to VictoriaMetrics), Vector (tailing `kubernetes_logs` to VictoriaLogs), OpenTelemetry Collector, and node-exporter deployed alongside the operator via `make monitoring-deploy`
 - **Test Environment**: Docker Compose with 9 services (Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo)
-- **Tests**: All 1,936 tests pass (functional: 1,063, e2e: 833, integration: 38)
-- **Coverage**: 91.3% overall project coverage
+- **Quality gates**: build PASS, `golangci-lint` 0 issues, `govulncheck` no vulnerabilities
+- **Tests**: unit (91.4% coverage), functional, integration, and e2e (881 e2e cases) all PASS; performance smoke 900 requests / 0 errors
+- **Coverage**: 91.4% overall project coverage
 
 ## Performance Characteristics
 

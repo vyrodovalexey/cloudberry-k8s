@@ -130,7 +130,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Register all controllers and health checks with the manager.
-	if err := registerControllers(mgr, metricsRecorder, logger); err != nil {
+	if err := registerControllers(ctx, mgr, cfg, metricsRecorder, logger); err != nil {
 		return err
 	}
 
@@ -189,7 +189,9 @@ func run(ctx context.Context) error {
 // registerControllers creates and registers all reconcilers and health checks
 // with the controller manager.
 func registerControllers(
+	ctx context.Context,
 	mgr ctrl.Manager,
+	cfg *config.OperatorConfig,
 	metricsRecorder metrics.Recorder,
 	logger *slog.Logger,
 ) error {
@@ -244,6 +246,14 @@ func registerControllers(
 		return fmt.Errorf("setting up auth controller: %w", err)
 	}
 
+	// Create an optional Vault client for the admin controller so it can source
+	// backup S3 credentials from a Vault path (spec.backup.destination.s3.vaultSecret).
+	// When Vault is disabled the client is omitted and the vaultSecret path is skipped.
+	adminVaultClient, err := newAdminVaultClient(ctx, cfg, metricsRecorder, logger)
+	if err != nil {
+		return fmt.Errorf("creating vault client for admin controller: %w", err)
+	}
+
 	// Register admin controller.
 	adminReconciler := controller.NewAdminReconciler(
 		mgr.GetClient(),
@@ -253,6 +263,7 @@ func registerControllers(
 		dbFactory,
 		metricsRecorder,
 		logger,
+		adminVaultClient,
 	)
 	if err := adminReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setting up admin controller: %w", err)
@@ -267,6 +278,39 @@ func registerControllers(
 	}
 
 	return nil
+}
+
+// newAdminVaultClient builds the optional Vault client used by the admin
+// controller to source backup S3 credentials. It returns (nil, nil) when Vault
+// is disabled so the reconciler runs without Vault support and the vaultSecret
+// credential path is skipped with a warning.
+func newAdminVaultClient(
+	ctx context.Context,
+	cfg *config.OperatorConfig,
+	metricsRecorder metrics.Recorder,
+	logger *slog.Logger,
+) (vault.Client, error) {
+	if !cfg.Vault.Enabled {
+		return nil, nil
+	}
+	vaultCfg := vault.Config{
+		Enabled:    true,
+		Address:    cfg.Vault.Address,
+		AuthMethod: cfg.Vault.AuthMethod,
+		AuthPath:   cfg.Vault.AuthPath,
+		Role:       cfg.Vault.Role,
+		Token:      cfg.Vault.Token.Value(),
+		SecretPath: cfg.Vault.SecretPath,
+	}
+	vc, err := vault.NewClient(ctx, vaultCfg, logger, metricsRecorder)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("vault client created for admin controller backup S3 credentials",
+		"address", cfg.Vault.Address,
+		"authMethod", cfg.Vault.AuthMethod,
+	)
+	return vc, nil
 }
 
 // startAPIServer creates and starts the REST API server.

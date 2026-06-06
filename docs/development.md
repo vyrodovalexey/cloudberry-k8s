@@ -138,13 +138,17 @@ make test-env-down
 1. `docker compose up -d` — start all services
 2. Wait for Vault and Keycloak to be ready (health checks)
 3. `scripts/setup-vault.sh` — configures PKI engine, issues certificates
-4. `scripts/setup-keycloak.sh` — creates realm, clients for service-to-service auth
-5. `scripts/setup-minio.sh` — creates test buckets
-6. `scripts/setup-kafka.sh` — creates test topics
-7. `scripts/setup-rabbitmq.sh` — creates test queues
+4. `scripts/setup-vault-k8s-auth.sh` — configures Vault Kubernetes auth + PKI for the operator (required before deploying with `webhook.certSource=vault-pki`)
+5. `scripts/setup-keycloak.sh` — creates realm, clients for service-to-service auth
+6. `scripts/setup-minio.sh` — creates test buckets
+7. `scripts/setup-kafka.sh` — creates test topics
+8. `scripts/setup-rabbitmq.sh` — creates test queues
 
 The setup scripts (`test/docker-compose/scripts/`) configure:
 - **Vault**: Enables the PKI secrets engine, creates policies and Kubernetes auth roles
+- **Vault Kubernetes auth** (`setup-vault-k8s-auth.sh`): Enables `auth/kubernetes`; creates a token-reviewer ServiceAccount (`system:auth-delegator`) plus a long-lived token Secret in `cloudberry-test`; configures `auth/kubernetes` with `kubernetes_host=https://kubernetes.docker.internal:6443`; creates the `cloudberry-operator` Vault policy (`pki/issue`, `pki/sign`, `pki/cert/ca` read, `secret/data/cloudberry*` read), the `auth/kubernetes/role/cloudberry-operator` role (bound to SA `cloudberry-operator` in `cloudberry-test`), the PKI role `pki/roles/cloudberry-operator`, and a placeholder KV secret at `secret/data/cloudberry`. The script is idempotent and wired into `make test-env-setup`.
+
+> **Vault Kubernetes Auth (docker-desktop) — `kubernetes.docker.internal` gotcha**: `setup-vault-k8s-auth.sh` must point Vault at `kubernetes_host=https://kubernetes.docker.internal:6443`, **not** `host.docker.internal`. The Docker Desktop API-server serving certificate only includes `kubernetes.docker.internal` in its SANs; using `host.docker.internal` makes Vault's `TokenReview` TLS hostname verification fail and operator login returns `403 permission denied`.
 - **Keycloak**: Creates the `cloudberry` realm, `cloudberry-operator` client, and test users with roles
 - **MinIO**: Creates S3-compatible test buckets for backup testing
 - **Kafka**: Creates test topics for event streaming
@@ -152,11 +156,13 @@ The setup scripts (`test/docker-compose/scripts/`) configure:
 
 ### Monitoring Stack Deployment
 
-The project includes monitoring configurations in the `monitoring/` directory and the Docker Compose test environment:
+The project includes monitoring configurations in the `monitoring/` directory, Helm charts under `test/monitoring/`, and the Docker Compose test environment:
 
-- **Grafana dashboards**: Pre-built dashboards for operator metrics in `monitoring/grafana/`
-- **vmagent**: VictoriaMetrics agent for Prometheus-compatible metrics collection
-- **otel-collector**: OpenTelemetry Collector for distributed tracing
+- **Grafana dashboards**: Pre-built dashboards for operator metrics in `monitoring/grafana/`. They cover all exported metrics — operator metrics, the cloudberry-query-exporter resource-group/IO/spill/skew metrics, and the postgres-exporter custom SQL metrics. Publish them with `make grafana-publish`
+- **vmagent** (`test/monitoring/vmagent`): VictoriaMetrics agent that scrapes Prometheus-compatible metrics and remote-writes to VictoriaMetrics (`host.docker.internal:8428`)
+- **vector** (`test/monitoring/vector`): Vector tails the `kubernetes_logs` source and ships logs to VictoriaLogs (`host.docker.internal:9428`)
+- **otel-collector** (`open-telemetry/opentelemetry-collector`): OpenTelemetry Collector for distributed tracing
+- **node-exporter** (`test/monitoring/node-exporter`): Node-level metrics
 
 **Local development (Docker Compose):**
 
@@ -173,7 +179,21 @@ make test-env-up
 
 **Kubernetes deployment:**
 
-To deploy the monitoring stack alongside the operator in a local Kubernetes cluster:
+To deploy the monitoring stack (vmagent + vector + otel-collector + node-exporter) into the `cloudberry-test` namespace alongside the operator:
+
+```bash
+# Deploy the vmagent/vector/otel-collector/node-exporter charts to cloudberry-test
+make monitoring-deploy
+
+# Check status / remove
+make monitoring-status
+make monitoring-undeploy
+
+# Publish the Grafana dashboards to the test-environment Grafana
+make grafana-publish
+```
+
+Or deploy the operator itself with metrics and telemetry enabled:
 
 ```bash
 # Deploy the operator with metrics and telemetry enabled
@@ -509,7 +529,7 @@ IMG_OPERATOR=myregistry/cloudberry-operator:v0.2.0 make docker-build-operator
 
 The operator uses a multi-stage Dockerfile:
 
-1. **Builder stage**: Go 1.26 Alpine, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
+1. **Builder stage**: `golang:1.26.4-alpine`, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
 2. **Runtime stage**: `gcr.io/distroless/static-debian12:nonroot` (minimal, non-root)
 
 The final image is under 100MB and runs as user `65532` (nonroot). Version information is injected via build arguments (`VERSION`, `COMMIT`, `BUILD_DATE`) passed through Docker build args.
@@ -2335,6 +2355,64 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario69
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario69
 ```
 
+#### Scenario 70 — Webhook Defaults
+
+Verifies that the mutating admission webhook applies all twelve backup defaults when a **minimal** backup spec (enabled, destination, image only) is submitted, and that the defaulted values appear on the **persisted** object. The functional/E2E tests exercise the public defaulter (`webhook.NewCloudberryClusterDefaulter().Default`) — the same code path the admission server runs — and assert the resulting object's fields. The E2E suite additionally includes a `KUBECONFIG`-gated live test that `Create`s a minimal-backup CloudberryCluster, `Get`s it back, and asserts the defaults were persisted by the webhook (then deletes it). Defaulting is gated on `backup.enabled: true` and is non-destructive (explicit user values are preserved).
+
+Defaulted fields verified (minimal spec → persisted object):
+
+| Field | Default |
+|-------|---------|
+| `gpbackup.compressionLevel` | `1` |
+| `gpbackup.compressionType` | `gzip` |
+| `gpbackup.jobs` | `1` |
+| `gpbackup.singleDataFile` | `false` |
+| `gpbackup.withStats` | `true` |
+| `gprestore.jobs` | `1` |
+| `gprestore.withStats` | `true` |
+| `retention.fullCount` | `3` |
+| `retention.maxAge` | `30d` |
+| `jobTemplate.backoffLimit` | `2` |
+| `jobTemplate.activeDeadlineSeconds` | `7200` |
+| `jobTemplate.ttlSecondsAfterFinished` | `86400` |
+
+- **Negative control**: backup `enabled: false` → no defaults applied (`gpbackup`/`gprestore`/`jobTemplate` stay nil)
+- **Preserve control**: explicit values (e.g. `compressionLevel: 9`, `retention.fullCount: 5`) are preserved while unset fields are still defaulted
+- **Test case catalog**: `Scenario70DefaultsCase` type and `Scenario70DefaultsCases()` in `test/cases/test_cases.go` (12 entries: 70a–70l)
+- **Functional tests**: `test/functional/scenario70_webhook_defaults_test.go`
+- **E2E tests**: `test/e2e/scenario70_webhook_defaults_e2e_test.go`
+
+```bash
+# Run Scenario 70 webhook defaults functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario70
+
+# Run Scenario 70 webhook defaults E2E tests (live persisted-defaults check gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario70
+```
+
+#### Scenario 71 — Enable Backup with Full S3 Configuration
+
+Exercises the full S3 backup configuration (bucket, endpoint, region, folder, encryption, `forcePathStyle`, multipart tuning, retention, schedule) against MinIO, with **two credential-source variants**, and performs a backup → clean → restore data cycle on a live cluster.
+
+**Precondition**: running CloudberryCluster, MinIO reachable, Secret `backup-s3-credentials` present (and, for the Vault variant, the same credentials stored at Vault path `secret/data/cloudberry/backup-s3`).
+
+- **71a — Secret credentials**: `destination.s3.credentialSecret` references the Kubernetes Secret `backup-s3-credentials` (`accessKeyField: aws_access_key_id`, `secretKeyField: aws_secret_access_key`). The backup/restore Job injects `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SecretKeyRef` to that Secret.
+- **71b — Vault credentials**: `destination.s3.vaultSecret` references Vault path `secret/data/cloudberry/backup-s3` (requires `spec.vault.enabled`). The operator reads the path at reconcile time and materializes the Secret `<cluster>-backup-s3-vault-creds`, which the Job consumes via `SecretKeyRef`. Credentials are never written into the Job spec as plaintext.
+
+Both variants verify the full S3 plugin config (`region`, `endpoint`, `bucket`, `folder`, `encryption`, `aws_signature_version`) and env (`S3_FORCE_PATH_STYLE=true`, multipart `BACKUP_*`/`RESTORE_*` = `4`/`10MB`). The functional/E2E Go tests assert the operator produces the correct ConfigMap, materialized creds Secret (Vault variant), and Job env/args; the actual backup→clean→restore data cycle (≈100 MB in `mydb`) is exercised at live deployment time.
+
+- **Test case catalog**: `Scenario71BackupConfigCase` type and `Scenario71BackupConfigCases()` in `test/cases/test_cases.go` (71a secret, 71b vault)
+- **Functional tests**: `test/functional/scenario71_backup_s3_config_test.go`
+- **E2E tests**: `test/e2e/scenario71_backup_s3_config_e2e_test.go`
+
+```bash
+# Run Scenario 71 backup S3 config functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario71
+
+# Run Scenario 71 backup S3 config E2E tests (live resource-creation check gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario71
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -2855,7 +2933,7 @@ All new code must meet the following coverage targets:
 | `internal/controller` | 90.1% |
 | `cmd/cloudberry-ctl` | 91.6% |
 | `cmd/operator` | 30.0% |
-| **Overall project** | **91.3%** |
+| **Overall project** | **91.4%** |
 
 **Test counts**: All **1,936 tests** pass:
 - Functional: 1,063

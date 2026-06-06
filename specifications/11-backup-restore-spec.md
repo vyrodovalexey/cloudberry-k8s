@@ -257,6 +257,7 @@ data:
       endpoint: ${S3_ENDPOINT}
       aws_access_key_id: ${AWS_ACCESS_KEY_ID}
       aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}
       bucket: ${S3_BUCKET}
       folder: ${S3_FOLDER}
       encryption: ${S3_ENCRYPTION}
@@ -265,6 +266,15 @@ data:
       restore_max_concurrent_requests: ${RESTORE_MAX_CONCURRENT_REQUESTS}
       restore_multipart_chunksize: ${RESTORE_MULTIPART_CHUNKSIZE}
 ```
+
+**Path-style addressing (`forcePathStyle`):** the `gpbackup_s3_plugin` derives path-style addressing automatically when a custom (non-AWS) `endpoint` is configured — which is the case for MinIO. The operator surfaces `S3_FORCE_PATH_STYLE` (from `destination.s3.forcePathStyle`) and `S3_AWS_SIGNATURE_VERSION` (default `4`, the SigV4 algorithm MinIO expects) as environment variables for explicitness and observability; setting `forcePathStyle: true` together with a custom `endpoint` is the supported way to back up to MinIO.
+
+**S3 credential sources.** S3 credentials are provided by one of two mutually-exclusive sources on `destination.s3`:
+
+- `credentialSecret` — references an existing Kubernetes Secret (`name`, `accessKeyField`, `secretKeyField`). The backup/restore Job's `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef`.
+- `vaultSecret` — references a Vault KV path (`path`, `accessKeyField`, `secretKeyField`); requires `spec.vault.enabled: true`. At reconcile time the operator reads the Vault path and **materializes** a Kubernetes Secret named `<cluster>-backup-s3-vault-creds` (owner-referenced to the cluster) holding the credentials, which the Job then consumes via `SecretKeyRef`. Credentials are never embedded in the Job spec as plaintext.
+
+See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test scenarios, which exercises both credential sources against MinIO with the full S3 config (folder, encryption, forcePathStyle, multipart) and performs a backup → clean → restore cycle.
 
 ### Retention Cleanup Job
 

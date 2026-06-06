@@ -28,7 +28,7 @@ metadata:
     scenario: "67"
 spec:
   version: "2.1.0"
-  image: "cloudberrydb/cloudberry:2.1.0"
+  image: "cloudberry-official:2.1.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -76,6 +76,12 @@ spec:
     basic:
       enabled: true
       adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario67-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario67-tls
+      minTLSVersion: "1.2"
     oidc:
       enabled: true
       issuerURL: "http://host.docker.internal:8090/realms/test"
@@ -116,7 +122,9 @@ spec:
   vault:
     enabled: true
     address: "http://host.docker.internal:8200"
-    authMethod: token
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
     secretPath: "secret/data/cloudberry"
 
   queryMonitoring:
@@ -131,6 +139,8 @@ spec:
         enabled: true
         image: "prometheuscommunity/postgres-exporter:v0.16.0"
         port: 9187
+        segments: true
+        mirrors: true
       cloudberryQueryExporter:
         enabled: true
         image: "cloudberry-query-exporter:1.0.0"

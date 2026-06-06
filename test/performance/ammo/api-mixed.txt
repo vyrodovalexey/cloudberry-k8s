@@ -1,72 +1,62 @@
-160 /api/v1alpha1/clusters
+117 /api/v1alpha1/clusters
 GET /api/v1alpha1/clusters HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-178 /api/v1alpha1/clusters/scenario1-cluster
-GET /api/v1alpha1/clusters/scenario1-cluster HTTP/1.1
+130 /api/v1alpha1/clusters/scenario67
+GET /api/v1alpha1/clusters/scenario67 HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-185 /api/v1alpha1/clusters/scenario1-cluster/status
-GET /api/v1alpha1/clusters/scenario1-cluster/status HTTP/1.1
+137 /api/v1alpha1/clusters/scenario67/status
+GET /api/v1alpha1/clusters/scenario67/status HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-187 /api/v1alpha1/clusters/scenario1-cluster/segments
-GET /api/v1alpha1/clusters/scenario1-cluster/segments HTTP/1.1
+139 /api/v1alpha1/clusters/scenario67/segments
+GET /api/v1alpha1/clusters/scenario67/segments HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-187 /api/v1alpha1/clusters/scenario1-cluster/sessions
-GET /api/v1alpha1/clusters/scenario1-cluster/sessions HTTP/1.1
+139 /api/v1alpha1/clusters/scenario67/sessions
+GET /api/v1alpha1/clusters/scenario67/sessions HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-185 /api/v1alpha1/clusters/scenario1-cluster/config
-GET /api/v1alpha1/clusters/scenario1-cluster/config HTTP/1.1
+137 /api/v1alpha1/clusters/scenario67/config
+GET /api/v1alpha1/clusters/scenario67/config HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-188 /api/v1alpha1/clusters/scenario1-cluster/mirroring
-GET /api/v1alpha1/clusters/scenario1-cluster/mirroring HTTP/1.1
+140 /api/v1alpha1/clusters/scenario67/mirroring
+GET /api/v1alpha1/clusters/scenario67/mirroring HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-186 /api/v1alpha1/clusters/scenario1-cluster/standby
-GET /api/v1alpha1/clusters/scenario1-cluster/standby HTTP/1.1
+138 /api/v1alpha1/clusters/scenario67/standby
+GET /api/v1alpha1/clusters/scenario67/standby HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 
-236 /api/v1alpha1/clusters/scenario1-cluster/start
-POST /api/v1alpha1/clusters/scenario1-cluster/start HTTP/1.1
+188 /api/v1alpha1/clusters/scenario67/start
+POST /api/v1alpha1/clusters/scenario67/start HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 Content-Type: application/json
 Content-Length: 0
 
-235 /api/v1alpha1/clusters/scenario1-cluster/stop
-POST /api/v1alpha1/clusters/scenario1-cluster/stop HTTP/1.1
+187 /api/v1alpha1/clusters/scenario67/stop
+POST /api/v1alpha1/clusters/scenario67/stop HTTP/1.1
 Host: localhost:8190
-Authorization: Basic YWRtaW46YWRtaW4=
 User-Agent: yandex-tank/perftest
 Accept: application/json
 Content-Type: application/json

@@ -436,10 +436,10 @@ For local development, the Docker Compose test environment includes VictoriaMetr
 
 #### Kubernetes Monitoring Stack (Makefile Targets)
 
-The Makefile provides dedicated targets for deploying the monitoring stack (vmagent + OpenTelemetry Collector) to a Kubernetes cluster:
+The Makefile provides dedicated targets for deploying the monitoring stack (vmagent + vector + otel-collector + node-exporter) to a Kubernetes cluster:
 
 ```bash
-# Deploy the monitoring stack (vmagent + otel-collector)
+# Deploy the monitoring stack (vmagent + vector + otel-collector + node-exporter)
 make monitoring-deploy
 
 # Check the status of the monitoring stack
@@ -447,17 +447,22 @@ make monitoring-status
 
 # Remove the monitoring stack
 make monitoring-undeploy
+
+# Publish the Grafana dashboards to the test-environment Grafana
+make grafana-publish
 ```
 
-**`monitoring-deploy`** installs:
-- **vmagent** (via `prometheus-community/prometheus` Helm chart) — Prometheus-compatible metrics collection agent with server, alertmanager, and exporters disabled (agent-only mode)
-- **otel-collector** (via `open-telemetry/opentelemetry-collector` Helm chart) — OpenTelemetry Collector with OTLP gRPC (port 4317) and HTTP (port 4318) receivers
+**`monitoring-deploy`** installs (all to the `cloudberry-test` namespace, configurable via the `NAMESPACE_TEST` Make variable):
+- **vmagent** (`test/monitoring/vmagent` Helm chart) — Prometheus-compatible metrics collection agent that remote-writes to VictoriaMetrics at `host.docker.internal:8428`
+- **node-exporter** (`test/monitoring/node-exporter` Helm chart) — node-level metrics
+- **vector** (`test/monitoring/vector` Helm chart) — tails the `kubernetes_logs` source and ships logs to VictoriaLogs at `host.docker.internal:9428`
+- **otel-collector** (`open-telemetry/opentelemetry-collector` Helm chart) — OpenTelemetry Collector with OTLP gRPC (port 4317) and HTTP (port 4318) receivers
 
-Both are deployed to the `cloudberry-test` namespace by default (configurable via `NAMESPACE_TEST` Make variable).
+**`monitoring-status`** shows the Helm release status and running pods for all components, plus the published Grafana dashboard URLs.
 
-**`monitoring-status`** shows the Helm release status and running pods for both components.
+**`monitoring-undeploy`** removes all four Helm releases from the namespace.
 
-**`monitoring-undeploy`** removes both Helm releases from the namespace.
+The Grafana dashboards in `monitoring/grafana/` cover all exported metrics — operator metrics, the cloudberry-query-exporter resource-group/IO/spill/skew metrics, and the postgres-exporter custom SQL metrics — and are published with `make grafana-publish`.
 
 #### Manual Monitoring Deployment
 
@@ -622,6 +627,62 @@ The flow is:
    ```
 
 The operator authenticates to Vault on startup and on each certificate rotation, recording `cloudberry_vault_operations_total` and `cloudberry_cert_rotation_total` metrics for observability. See [Monitoring and Observability](user-guide.md#monitoring-and-observability) for the metric reference.
+
+#### Vault PKI with Kubernetes Auth on Docker Desktop (Make targets)
+
+For the Docker Desktop test environment, the entire Vault Kubernetes-auth + PKI setup is scripted and wired into the Makefile, so you do not run the `vault` CLI steps above by hand.
+
+1. **Start and configure the test services.** The `setup-vault-k8s-auth.sh` script (run by `make test-env-setup`) performs the full Vault Kubernetes-auth bootstrap and is a **required step before deploying the operator with `webhook.certSource=vault-pki`**:
+
+   ```bash
+   make test-env-up      # start Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo
+   make test-env-setup   # runs setup-vault.sh, setup-vault-k8s-auth.sh, and the other service setups
+   ```
+
+   `setup-vault-k8s-auth.sh` (`test/docker-compose/scripts/`) is idempotent and:
+   - enables `auth/kubernetes`;
+   - creates a token-reviewer ServiceAccount (`vault-auth-reviewer`, bound to `system:auth-delegator`) and a long-lived token Secret in the `cloudberry-test` namespace, which Vault uses for `TokenReview` calls;
+   - configures `auth/kubernetes` with `kubernetes_host=https://kubernetes.docker.internal:6443`;
+   - creates the Vault policy `cloudberry-operator` (`pki/issue`, `pki/sign`, `pki/cert/ca` read, and `secret/data/cloudberry*` read);
+   - creates the Kubernetes auth role `auth/kubernetes/role/cloudberry-operator`, bound to ServiceAccount `cloudberry-operator` in namespace `cloudberry-test`;
+   - creates the PKI role `pki/roles/cloudberry-operator` for webhook and cluster TLS;
+   - stores a placeholder KV secret at `secret/data/cloudberry`.
+
+   > **Vault Kubernetes Auth (docker-desktop) — `kubernetes.docker.internal` gotcha**: The script configures `kubernetes_host=https://kubernetes.docker.internal:6443` and **must not** use `host.docker.internal`. The Docker Desktop API-server serving certificate includes only `kubernetes.docker.internal` in its SANs; pointing Vault at `host.docker.internal` causes the `TokenReview` TLS hostname verification to fail, and operator login returns `403 permission denied`.
+
+2. **Create the OIDC client secret** that the operator references (the `helm-install-test` target enables OIDC):
+
+   ```bash
+   kubectl create secret generic oidc-client-secret \
+     -n cloudberry-test \
+     --from-literal=client-secret=some-secret
+   ```
+
+3. **Deploy the operator** with the `helm-install-test` target, which installs into the `cloudberry-test` namespace with Vault-PKI webhook certs, Vault Kubernetes auth, and Keycloak OIDC:
+
+   ```bash
+   make helm-install-test
+   ```
+
+   The target runs `helm upgrade --install` with these flags:
+
+   ```text
+   webhook.certSource=vault-pki
+   webhook.vaultPKI.mountPath=pki
+   webhook.vaultPKI.role=cloudberry-operator
+   vault.enabled=true
+   vault.address=http://host.docker.internal:8200
+   vault.authMethod=kubernetes
+   vault.authPath=auth/kubernetes
+   vault.role=cloudberry-operator
+   vault.pkiRole=cloudberry-operator
+   vault.secretPath=secret/data/cloudberry
+   oidc.enabled=true
+   oidc.issuerURL=http://host.docker.internal:8090/realms/test
+   oidc.clientID=cloudberry-operator
+   ```
+
+   Note that the operator pod reaches Vault and Keycloak at `host.docker.internal`, while Vault reaches the Kubernetes API at `kubernetes.docker.internal` (the SAN gotcha above).
 
 ## Upgrading
 

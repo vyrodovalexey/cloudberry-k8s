@@ -32,6 +32,7 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 )
 
 const (
@@ -76,6 +77,9 @@ const (
 
 	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
 	secretKeyPassword = "password"
+
+	// backupDestinationTypeS3 is the S3 backup destination discriminator.
+	backupDestinationTypeS3 = "s3"
 )
 
 // restartRequiredParams lists PostgreSQL parameters that require a server
@@ -127,9 +131,20 @@ type AdminReconciler struct {
 	idleDaemon *idle.Daemon
 	// idleDaemonMu protects idleDaemon access.
 	idleDaemonMu sync.Mutex
+	// vault is an optional Vault client used to source backup S3 credentials from
+	// a Vault path (spec.backup.destination.s3.vaultSecret). It may be nil; when
+	// nil the vaultSecret path logs a warning and is skipped. All usage is
+	// nil-safe, mirroring the optional metrics-recorder pattern.
+	vault vault.Client
 }
 
 // NewAdminReconciler creates a new AdminReconciler.
+//
+// An optional Vault client may be supplied as the final variadic argument to
+// enable sourcing backup S3 credentials from a Vault path
+// (spec.backup.destination.s3.vaultSecret). When omitted (or nil), the
+// vaultSecret credential path is skipped with a warning. This is kept variadic
+// so existing call sites that do not need Vault continue to compile unchanged.
 func NewAdminReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
@@ -138,11 +153,12 @@ func NewAdminReconciler(
 	dbFactory db.DBClientFactory,
 	m metrics.Recorder,
 	logger *slog.Logger,
+	vaultClient ...vault.Client,
 ) *AdminReconciler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AdminReconciler{
+	r := &AdminReconciler{
 		client:    c,
 		scheme:    scheme,
 		recorder:  recorder,
@@ -151,6 +167,10 @@ func NewAdminReconciler(
 		metrics:   m,
 		logger:    logger.With("controller", adminControllerName),
 	}
+	if len(vaultClient) > 0 {
+		r.vault = vaultClient[0]
+	}
+	return r
 }
 
 // Reconcile handles the admin reconciliation for CloudberryCluster resources.
@@ -1444,6 +1464,13 @@ func (r *AdminReconciler) reconcileBackup(
 		return err
 	}
 
+	// Materialize Vault-sourced S3 credentials into a Secret BEFORE any Jobs or
+	// the CronJob are created, so the Job spec can reference the Secret uniformly
+	// (never embedding plaintext credentials).
+	if err := r.ensureBackupS3VaultCredentials(ctx, cluster); err != nil {
+		return err
+	}
+
 	if err := r.ensureBackupCronJob(ctx, cluster); err != nil {
 		return err
 	}
@@ -1502,6 +1529,152 @@ func (r *AdminReconciler) ensureBackupS3ConfigMap(
 		}
 	}
 	return nil
+}
+
+// vaultS3CredsField extracts a string value from a Vault secret data map for the
+// given field, tolerating both flat and KV-v2 "data"-nested shapes already
+// normalized by the vault client. Non-string values are stringified.
+func vaultS3CredsField(data map[string]interface{}, field string) (string, bool) {
+	v, ok := data[field]
+	if !ok {
+		return "", false
+	}
+	switch s := v.(type) {
+	case string:
+		return s, true
+	default:
+		return fmt.Sprintf("%v", v), true
+	}
+}
+
+// s3VaultCredentialFields returns the access-key and secret-key Vault field names
+// for the given VaultSecret, applying the canonical defaults when unset.
+func s3VaultCredentialFields(vs *cbv1alpha1.S3VaultSecret) (accessKeyField, secretKeyField string) {
+	accessKeyField = vs.AccessKeyField
+	if accessKeyField == "" {
+		accessKeyField = util.DefaultS3AccessKeyField
+	}
+	secretKeyField = vs.SecretKeyField
+	if secretKeyField == "" {
+		secretKeyField = util.DefaultS3SecretKeyField
+	}
+	return accessKeyField, secretKeyField
+}
+
+// ensureBackupS3VaultCredentials reads S3 credentials from the configured Vault
+// path and materializes them into a Kubernetes Secret owned by the cluster, so
+// backup/restore Jobs reference a Secret uniformly without embedding plaintext.
+//
+// It is a no-op unless the destination is S3 with a vaultSecret configured. When
+// no Vault client is wired (r.vault == nil) it logs a clear warning and skips,
+// so existing construction with a nil Vault client never panics.
+func (r *AdminReconciler) ensureBackupS3VaultCredentials(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	s3 := backupS3VaultSpec(cluster)
+	if s3 == nil {
+		return nil
+	}
+	logger := util.LoggerFromContext(ctx)
+
+	if r.vault == nil || !r.vault.IsEnabled() {
+		logger.Warn("backup s3 vaultSecret configured but no Vault client is available; "+
+			"skipping vault credential materialization",
+			"path", s3.VaultSecret.Path,
+		)
+		return nil
+	}
+
+	accessKeyField, secretKeyField := s3VaultCredentialFields(s3.VaultSecret)
+	data, err := r.vault.ReadSecret(ctx, s3.VaultSecret.Path)
+	if err != nil {
+		return fmt.Errorf("reading backup s3 credentials from vault path %s: %w",
+			s3.VaultSecret.Path, err)
+	}
+	if data == nil {
+		return fmt.Errorf("no data found at vault path %s for backup s3 credentials",
+			s3.VaultSecret.Path)
+	}
+
+	accessKey, ok := vaultS3CredsField(data, accessKeyField)
+	if !ok {
+		return fmt.Errorf("vault path %s missing access key field %q",
+			s3.VaultSecret.Path, accessKeyField)
+	}
+	secretKey, ok := vaultS3CredsField(data, secretKeyField)
+	if !ok {
+		return fmt.Errorf("vault path %s missing secret key field %q",
+			s3.VaultSecret.Path, secretKeyField)
+	}
+
+	return r.materializeBackupS3VaultSecret(ctx, cluster, accessKey, secretKey, logger)
+}
+
+// materializeBackupS3VaultSecret creates or updates the Kubernetes Secret holding
+// the Vault-sourced S3 credentials, owner-ref'd to the cluster, using the
+// canonical default field names consumed by the backup Job env.
+func (r *AdminReconciler) materializeBackupS3VaultSecret(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	accessKey, secretKey string,
+	logger *slog.Logger,
+) error {
+	secretName := util.BackupS3VaultCredentialsSecretName(cluster.Name)
+	desiredData := map[string][]byte{
+		util.DefaultS3AccessKeyField: []byte(accessKey),
+		util.DefaultS3SecretKeyField: []byte(secretKey),
+	}
+
+	existing := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}
+	err := r.client.Get(ctx, key, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: cluster.Namespace,
+				Labels:    util.CommonLabels(cluster.Name, util.ComponentBackup),
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(cluster, cbv1alpha1.GroupVersion.WithKind("CloudberryCluster")),
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: desiredData,
+		}
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating backup s3 vault credentials secret %s: %w", secretName, createErr)
+		}
+		logger.Info("materialized backup s3 vault credentials secret", "name", secretName)
+	case err != nil:
+		return fmt.Errorf("getting backup s3 vault credentials secret %s: %w", secretName, err)
+	default:
+		if !equality.Semantic.DeepEqual(existing.Data, desiredData) {
+			existing.Data = desiredData
+			if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+				return fmt.Errorf("updating backup s3 vault credentials secret %s: %w", secretName, updateErr)
+			}
+			logger.Info("updated backup s3 vault credentials secret", "name", secretName)
+		}
+	}
+	return nil
+}
+
+// backupS3VaultSpec returns the S3 destination when the cluster has an S3 backup
+// destination configured with a non-empty vaultSecret path; otherwise nil.
+func backupS3VaultSpec(cluster *cbv1alpha1.CloudberryCluster) *cbv1alpha1.S3Destination {
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		return nil
+	}
+	dest := cluster.Spec.Backup.Destination
+	if dest.Type != backupDestinationTypeS3 || dest.S3 == nil {
+		return nil
+	}
+	if dest.S3.VaultSecret == nil || dest.S3.VaultSecret.Path == "" {
+		return nil
+	}
+	return dest.S3
 }
 
 // ensureBackupCronJob creates/updates the scheduled backup CronJob when a

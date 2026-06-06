@@ -64,9 +64,13 @@ const (
 	destinationTypeLocal = "local"
 
 	// defaultS3AccessKeyField is the default Secret key for the S3 access key id.
-	defaultS3AccessKeyField = "aws_access_key_id" //nolint:gosec // field name, not a credential
+	defaultS3AccessKeyField = util.DefaultS3AccessKeyField
 	// defaultS3SecretKeyField is the default Secret key for the S3 secret access key.
-	defaultS3SecretKeyField = "aws_secret_access_key" //nolint:gosec // field name, not a credential
+	defaultS3SecretKeyField = util.DefaultS3SecretKeyField
+
+	// defaultS3AwsSignatureVersion is the AWS signature version used by the s3
+	// plugin (SigV4); it is the default for both AWS and MinIO.
+	defaultS3AwsSignatureVersion = "4"
 
 	// preBackupCheckContainerName is the name of the pre-backup health-check init container.
 	preBackupCheckContainerName = "pre-backup-check"
@@ -76,6 +80,16 @@ const (
 	// minBackupDiskFreeKB is the minimum free space (KiB) required on the local
 	// backup-dir mount before a backup proceeds (best-effort check).
 	minBackupDiskFreeKB = 1048576
+
+	// gpEnvPreamble is prepended to every backup/restore script to ensure
+	// GPHOME/bin is on PATH and LD_LIBRARY_PATH includes GPHOME/lib.  It
+	// sources the Cloudberry env file when present (official RPM images ship
+	// cloudberry-env.sh instead of greenplum_path.sh) and falls back to a
+	// manual export so the script works with any image layout.
+	gpEnvPreamble = "if [ -f \"${GPHOME}/cloudberry-env.sh\" ]; then source \"${GPHOME}/cloudberry-env.sh\"; " +
+		"elif [ -f \"${GPHOME}/greenplum_path.sh\" ]; then source \"${GPHOME}/greenplum_path.sh\"; " +
+		"else export PATH=\"${GPHOME}/bin:${PATH}\"; " +
+		"export LD_LIBRARY_PATH=\"${GPHOME}/lib:${GPHOME}/lib64:${LD_LIBRARY_PATH:-}\"; fi\n"
 
 	// validateContainerName is the container name for the post-restore validation Job.
 	validateContainerName = "post-restore-validate"
@@ -294,12 +308,22 @@ func appendRepeatedFlag(args []string, flag string, values []string) []string {
 	return args
 }
 
-// renderToolScript builds the bash script that renders the S3 plugin config via
-// envsubst and then runs the given tool with its arguments.
+// renderToolScript builds the bash script that renders the S3 plugin config
+// (substituting environment variables) and then runs the given tool with its
+// arguments.  It prefers envsubst when available but falls back to a
+// POSIX-compatible eval+heredoc so the script works on minimal images that
+// lack the gettext package.
 func renderToolScript(tool string, args []string) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
-	fmt.Fprintf(&b, "envsubst < %s/%s > %s\n", s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+	b.WriteString(gpEnvPreamble)
+	// Render the S3 plugin config template, substituting env vars.
+	// Use envsubst if present; otherwise fall back to eval with heredoc.
+	fmt.Fprintf(&b,
+		"if command -v envsubst >/dev/null 2>&1; then "+
+			"envsubst < %[1]s/%[2]s > %[3]s; "+
+			"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
+		s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
 	b.WriteString(tool)
 	for _, a := range args {
 		b.WriteString(" ")
@@ -321,11 +345,21 @@ func (b *DefaultBuilder) BuildBackupS3ConfigMap(cluster *cbv1alpha1.CloudberryCl
 		return nil
 	}
 
+	// The gpbackup_s3_plugin uses path-style addressing automatically whenever a
+	// custom (non-AWS) "endpoint" is set, which is exactly the MinIO case, so
+	// emitting the endpoint already satisfies ForcePathStyle at the wire level.
+	// The upstream plugin does not expose a dedicated force_path_style option, so
+	// we do NOT invent an unsupported template key. Instead we add the supported
+	// "aws_signature_version" option (SigV4, the default for AWS and MinIO) which
+	// improves S3-compatible-store compatibility, and we surface
+	// S3_FORCE_PATH_STYLE as an env var (see buildS3Env) for explicitness and
+	// observability.
 	template := strings.Join([]string{
-		"executablepath: /usr/local/bin/gpbackup_s3_plugin",
+		"executablepath: ${GPHOME}/bin/gpbackup_s3_plugin",
 		"options:",
 		"  region: ${S3_REGION}",
 		"  endpoint: ${S3_ENDPOINT}",
+		"  aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}",
 		"  aws_access_key_id: ${AWS_ACCESS_KEY_ID}",
 		"  aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}",
 		"  bucket: ${S3_BUCKET}",
@@ -507,6 +541,7 @@ func postRestoreValidationScript(opts *ValidationJobOptions) string {
 
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
+	b.WriteString(gpEnvPreamble)
 	b.WriteString("echo 'post-restore-validate: row-count probe (best-effort)'\n")
 	b.WriteString("psql -tA -c \"SELECT count(*) FROM pg_class WHERE relkind='r'\" || " +
 		"echo 'post-restore-validate: row-count probe skipped'\n")
@@ -612,6 +647,7 @@ func addPreBackupCheckInitContainer(cluster *cbv1alpha1.CloudberryCluster, podSp
 func preBackupCheckScript(cluster *cbv1alpha1.CloudberryCluster) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
+	b.WriteString(gpEnvPreamble)
 	b.WriteString("echo 'pre-backup-check: verifying segment health'\n")
 	fmt.Fprintf(&b,
 		"down=$(psql -tA -c \"SELECT count(*) FROM gp_segment_configuration WHERE status='d'\")\n")
@@ -727,12 +763,12 @@ func buildBackupEnv(cluster *cbv1alpha1.CloudberryCluster) []corev1.EnvVar {
 	if cluster.Spec.Backup == nil || cluster.Spec.Backup.Destination.Type != destinationTypeS3 {
 		return env
 	}
-	return append(env, buildS3Env(cluster.Spec.Backup.Destination.S3)...)
+	return append(env, buildS3Env(cluster, cluster.Spec.Backup.Destination.S3)...)
 }
 
 // buildS3Env builds the S3-related environment variables consumed by the
 // envsubst-rendered plugin config.
-func buildS3Env(s3 *cbv1alpha1.S3Destination) []corev1.EnvVar {
+func buildS3Env(cluster *cbv1alpha1.CloudberryCluster, s3 *cbv1alpha1.S3Destination) []corev1.EnvVar {
 	if s3 == nil {
 		return nil
 	}
@@ -742,17 +778,54 @@ func buildS3Env(s3 *cbv1alpha1.S3Destination) []corev1.EnvVar {
 		encryption = "on"
 	}
 
-	env := make([]corev1.EnvVar, 0, 11)
+	env := make([]corev1.EnvVar, 0, 13)
 	env = append(env, []corev1.EnvVar{
 		{Name: "S3_REGION", Value: s3.Region},
 		{Name: "S3_ENDPOINT", Value: s3.Endpoint},
 		{Name: "S3_BUCKET", Value: s3.Bucket},
 		{Name: "S3_FOLDER", Value: s3.Folder},
 		{Name: "S3_ENCRYPTION", Value: encryption},
+		// S3_FORCE_PATH_STYLE is surfaced for explicitness/observability. The s3
+		// plugin itself derives path-style addressing from a custom endpoint
+		// (MinIO), so this env var documents intent and lets future plugin
+		// versions or tooling consume it without changing the Job shape.
+		{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(s3.ForcePathStyle)},
+		{Name: "S3_AWS_SIGNATURE_VERSION", Value: defaultS3AwsSignatureVersion},
 	}...)
 	env = append(env, buildS3MultipartEnv(s3.Multipart)...)
-	env = append(env, buildS3CredentialEnv(s3.CredentialSecret)...)
+	name, accessKeyField, secretKeyField := resolveS3CredentialSource(cluster, s3)
+	env = append(env, buildS3CredentialEnv(name, accessKeyField, secretKeyField)...)
 	return env
+}
+
+// resolveS3CredentialSource selects the Kubernetes Secret name and field keys
+// that supply the AWS credentials for the S3 plugin. When a CredentialSecret is
+// configured it is used directly; otherwise, when a VaultSecret is configured,
+// the operator-materialized Secret (BackupS3VaultCredentialsSecretName) is used
+// with the default field names so the Job spec always references a Secret and
+// never embeds plaintext credentials. Returns empty name when neither is set.
+func resolveS3CredentialSource(
+	cluster *cbv1alpha1.CloudberryCluster,
+	s3 *cbv1alpha1.S3Destination,
+) (name, accessKeyField, secretKeyField string) {
+	if cred := s3.CredentialSecret; cred != nil && cred.Name != "" {
+		accessKeyField = cred.AccessKeyField
+		if accessKeyField == "" {
+			accessKeyField = defaultS3AccessKeyField
+		}
+		secretKeyField = cred.SecretKeyField
+		if secretKeyField == "" {
+			secretKeyField = defaultS3SecretKeyField
+		}
+		return cred.Name, accessKeyField, secretKeyField
+	}
+	if vs := s3.VaultSecret; vs != nil && vs.Path != "" {
+		// The Vault-sourced credentials are materialized into a Secret with the
+		// canonical default field names (see ensureBackupS3VaultCredentials).
+		return util.BackupS3VaultCredentialsSecretName(cluster.Name),
+			defaultS3AccessKeyField, defaultS3SecretKeyField
+	}
+	return "", "", ""
 }
 
 // buildS3MultipartEnv builds the multipart tuning environment variables, applying
@@ -784,25 +857,20 @@ func buildS3MultipartEnv(mp *cbv1alpha1.S3Multipart) []corev1.EnvVar {
 	}
 }
 
-// buildS3CredentialEnv builds AWS credential env vars sourced from the Secret.
-func buildS3CredentialEnv(cred *cbv1alpha1.S3CredentialSecret) []corev1.EnvVar {
-	if cred == nil || cred.Name == "" {
+// buildS3CredentialEnv builds AWS credential env vars sourced from the named
+// Secret using the given field keys. It is a pure function: the caller resolves
+// the Secret name and field names (see resolveS3CredentialSource). When name is
+// empty no credential env vars are emitted.
+func buildS3CredentialEnv(name, accessKeyField, secretKeyField string) []corev1.EnvVar {
+	if name == "" {
 		return nil
-	}
-	accessKeyField := cred.AccessKeyField
-	if accessKeyField == "" {
-		accessKeyField = defaultS3AccessKeyField
-	}
-	secretKeyField := cred.SecretKeyField
-	if secretKeyField == "" {
-		secretKeyField = defaultS3SecretKeyField
 	}
 	return []corev1.EnvVar{
 		{
 			Name: "AWS_ACCESS_KEY_ID",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: cred.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: name},
 					Key:                  accessKeyField,
 				},
 			},
@@ -811,7 +879,7 @@ func buildS3CredentialEnv(cred *cbv1alpha1.S3CredentialSecret) []corev1.EnvVar {
 			Name: "AWS_SECRET_ACCESS_KEY",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: cred.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: name},
 					Key:                  secretKeyField,
 				},
 			},

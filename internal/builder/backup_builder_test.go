@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -164,6 +165,119 @@ func TestBuildBackupS3ConfigMap(t *testing.T) {
 		cluster.Spec.Backup.Destination.S3 = nil
 		assert.Nil(t, b.BuildBackupS3ConfigMap(cluster))
 	})
+
+	t.Run("config template includes aws_signature_version", func(t *testing.T) {
+		cm := b.BuildBackupS3ConfigMap(newBackupCluster())
+		require.NotNil(t, cm)
+		assert.Contains(t, cm.Data[s3ConfigTemplateKey],
+			"aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}")
+		assert.Contains(t, cm.Data[s3ConfigTemplateKey], "endpoint: ${S3_ENDPOINT}")
+	})
+}
+
+func TestBuildS3EnvForcePathStyle(t *testing.T) {
+	t.Run("force path style true with endpoint", func(t *testing.T) {
+		cluster := newBackupCluster()
+		cluster.Spec.Backup.Destination.S3.ForcePathStyle = true
+		env := buildS3Env(cluster, cluster.Spec.Backup.Destination.S3)
+
+		vals := envMap(env)
+		assert.Equal(t, "true", vals["S3_FORCE_PATH_STYLE"])
+		assert.Equal(t, "4", vals["S3_AWS_SIGNATURE_VERSION"])
+		assert.Equal(t, "http://minio:9000", vals["S3_ENDPOINT"])
+	})
+
+	t.Run("force path style false default", func(t *testing.T) {
+		cluster := newBackupCluster()
+		cluster.Spec.Backup.Destination.S3.ForcePathStyle = false
+		env := buildS3Env(cluster, cluster.Spec.Backup.Destination.S3)
+		assert.Equal(t, "false", envMap(env)["S3_FORCE_PATH_STYLE"])
+	})
+
+	t.Run("nil s3 returns nil", func(t *testing.T) {
+		assert.Nil(t, buildS3Env(newBackupCluster(), nil))
+	})
+}
+
+func TestBuildBackupEnvVaultSecretCredentials(t *testing.T) {
+	cluster := newBackupCluster()
+	// Vault-based credentials: no CredentialSecret, only VaultSecret.
+	cluster.Spec.Backup.Destination.S3.CredentialSecret = nil
+	cluster.Spec.Backup.Destination.S3.VaultSecret = &cbv1alpha1.S3VaultSecret{
+		Path: "secret/data/cloudberry/backup-s3",
+	}
+
+	env := buildBackupEnv(cluster)
+	wantSecret := util.BackupS3VaultCredentialsSecretName(cluster.Name)
+
+	var hasAccessKey, hasSecretKey bool
+	for _, e := range env {
+		if e.Name == "AWS_ACCESS_KEY_ID" {
+			require.NotNil(t, e.ValueFrom)
+			require.NotNil(t, e.ValueFrom.SecretKeyRef)
+			assert.Equal(t, wantSecret, e.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, "aws_access_key_id", e.ValueFrom.SecretKeyRef.Key)
+			hasAccessKey = true
+		}
+		if e.Name == "AWS_SECRET_ACCESS_KEY" {
+			require.NotNil(t, e.ValueFrom)
+			require.NotNil(t, e.ValueFrom.SecretKeyRef)
+			assert.Equal(t, wantSecret, e.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, "aws_secret_access_key", e.ValueFrom.SecretKeyRef.Key)
+			hasSecretKey = true
+		}
+	}
+	assert.True(t, hasAccessKey, "expected AWS_ACCESS_KEY_ID from materialized vault secret")
+	assert.True(t, hasSecretKey, "expected AWS_SECRET_ACCESS_KEY from materialized vault secret")
+}
+
+func TestResolveS3CredentialSource(t *testing.T) {
+	cluster := newBackupCluster()
+
+	t.Run("credential secret takes precedence with custom fields", func(t *testing.T) {
+		s3 := &cbv1alpha1.S3Destination{
+			CredentialSecret: &cbv1alpha1.S3CredentialSecret{
+				Name:           "my-creds",
+				AccessKeyField: "ak",
+				SecretKeyField: "sk",
+			},
+			VaultSecret: &cbv1alpha1.S3VaultSecret{Path: "secret/data/x"},
+		}
+		name, ak, sk := resolveS3CredentialSource(cluster, s3)
+		assert.Equal(t, "my-creds", name)
+		assert.Equal(t, "ak", ak)
+		assert.Equal(t, "sk", sk)
+	})
+
+	t.Run("vault secret used when no credential secret", func(t *testing.T) {
+		s3 := &cbv1alpha1.S3Destination{
+			VaultSecret: &cbv1alpha1.S3VaultSecret{Path: "secret/data/x"},
+		}
+		name, ak, sk := resolveS3CredentialSource(cluster, s3)
+		assert.Equal(t, util.BackupS3VaultCredentialsSecretName(cluster.Name), name)
+		assert.Equal(t, "aws_access_key_id", ak)
+		assert.Equal(t, "aws_secret_access_key", sk)
+	})
+
+	t.Run("neither set returns empty", func(t *testing.T) {
+		name, _, _ := resolveS3CredentialSource(cluster, &cbv1alpha1.S3Destination{})
+		assert.Empty(t, name)
+	})
+
+	t.Run("empty vault path returns empty", func(t *testing.T) {
+		s3 := &cbv1alpha1.S3Destination{VaultSecret: &cbv1alpha1.S3VaultSecret{Path: ""}}
+		name, _, _ := resolveS3CredentialSource(cluster, s3)
+		assert.Empty(t, name)
+	})
+}
+
+// envMap converts a slice of EnvVars to a name->value map for plain-value vars.
+func envMap(env []corev1.EnvVar) map[string]string {
+	m := make(map[string]string, len(env))
+	for _, e := range env {
+		m[e.Name] = e.Value
+	}
+	return m
 }
 
 func TestBuildBackupCronJob(t *testing.T) {

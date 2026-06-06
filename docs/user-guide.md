@@ -1503,6 +1503,49 @@ Vault PKI issues certificates with the following fields:
 
 **Certificate rotation**: Certificates are automatically rotated when 2/3 of their lifetime has elapsed. The rotation check runs every 12 hours. After rotation, the new CA bundle is injected into the webhook configurations.
 
+> **Note**: `webhook.certSource: vault-pki` only governs the operator's own admission **webhook** certificate. The cluster TLS Secret referenced by `auth.ssl.certSecret` is a separate `kubernetes.io/tls`/generic Secret that you create yourself — see [Issuing the cluster TLS Secret from Vault PKI](#issuing-the-cluster-tls-secret-from-vault-pki).
+
+#### Issuing the cluster TLS Secret from Vault PKI
+
+The cluster TLS Secret (the one referenced by `auth.ssl.certSecret`) can be issued from the same Vault PKI role that the operator uses for its webhook certificate (`pki/roles/cloudberry-operator`). The `scenario67-ha-mirroring-vault-pki.yaml` sample uses this approach, referencing a Secret named `scenario67-tls`.
+
+1. **Issue a certificate** from the Vault PKI role and capture the PEM material:
+
+   ```bash
+   vault write -format=json pki/issue/cloudberry-operator \
+     common_name="scenario67-coordinator.cloudberry-test.svc" \
+     alt_names="scenario67-coordinator.cloudberry-test.svc.cluster.local" \
+     ttl=8760h > /tmp/scenario67-cert.json
+
+   jq -r '.data.certificate'  /tmp/scenario67-cert.json > /tmp/tls.crt
+   jq -r '.data.private_key'  /tmp/scenario67-cert.json > /tmp/tls.key
+   jq -r '.data.issuing_ca'   /tmp/scenario67-cert.json > /tmp/ca.crt
+   ```
+
+2. **Create the cluster TLS Secret** (include `ca.crt` so the operator can connect with `sslmode=verify-ca`):
+
+   ```bash
+   kubectl create secret generic scenario67-tls \
+     -n cloudberry-test \
+     --from-file=tls.crt=/tmp/tls.crt \
+     --from-file=tls.key=/tmp/tls.key \
+     --from-file=ca.crt=/tmp/ca.crt
+   ```
+
+3. **Reference it** from the cluster CR (as in `scenario67-ha-mirroring-vault-pki.yaml`):
+
+   ```yaml
+   spec:
+     auth:
+       ssl:
+         enabled: true
+         certSecret:
+           name: scenario67-tls
+         minTLSVersion: "1.2"
+   ```
+
+The `scenario67` sample uses image `cloudberry-official:2.1.0`, `vault.authMethod: kubernetes`, and enables the per-segment postgres-exporter on every segment and mirror (`queryMonitoring.exporters.postgresExporter.segments: true` and `.mirrors: true`). The resulting pod topology is: coordinator `[cloudberry + postgres-exporter + cloudberry-query-exporter]`; standby, each segment primary, and each segment mirror `[cloudberry + postgres-exporter]`.
+
 #### Verifying SSL Configuration
 
 ```bash

@@ -46,6 +46,11 @@ const (
 	// ComponentBackup is the component label value for backup resources.
 	ComponentBackup = "backup"
 
+	// DefaultS3AccessKeyField is the canonical Secret/Vault key for the S3 access key id.
+	DefaultS3AccessKeyField = "aws_access_key_id" //nolint:gosec // field name, not a credential
+	// DefaultS3SecretKeyField is the canonical Secret/Vault key for the S3 secret access key.
+	DefaultS3SecretKeyField = "aws_secret_access_key" //nolint:gosec // field name, not a credential
+
 	// ComponentCoordinator is the component label value for the coordinator.
 	ComponentCoordinator = "coordinator"
 	// ComponentStandby is the component label value for the standby coordinator.

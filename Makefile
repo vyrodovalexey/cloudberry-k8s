@@ -213,6 +213,36 @@ helm-install: ## Install operator via Helm in cloudberry-system namespace
 		--set installCRDs=true \
 		--wait --timeout 5m
 
+.PHONY: helm-install-test
+helm-install-test: ## Install operator via Helm in cloudberry-test namespace with vault-pki + k8s-auth
+	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic oidc-client-secret \
+		--namespace $(NAMESPACE_TEST) \
+		--from-literal=client-secret=some-secret \
+		--dry-run=client -o yaml | kubectl apply -f -
+	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
+		--namespace $(NAMESPACE_TEST) \
+		--set installCRDs=true \
+		--set image.repository=cloudberry-operator \
+		--set image.tag=latest \
+		--set image.pullPolicy=IfNotPresent \
+		--set webhook.certSource=vault-pki \
+		--set webhook.vaultPKI.mountPath=pki \
+		--set webhook.vaultPKI.role=cloudberry-operator \
+		--set vault.enabled=true \
+		--set vault.address=http://host.docker.internal:8200 \
+		--set vault.authMethod=kubernetes \
+		--set vault.authPath=auth/kubernetes \
+		--set vault.role=cloudberry-operator \
+		--set vault.pkiRole=cloudberry-operator \
+		--set vault.secretPath=secret/data/cloudberry \
+		--set oidc.enabled=true \
+		--set oidc.issuerURL=http://host.docker.internal:8090/realms/test \
+		--set oidc.clientID=cloudberry-operator \
+		--set oidc.existingSecret=oidc-client-secret \
+		--set oidc.existingSecretKey=client-secret \
+		--wait --timeout 5m
+
 .PHONY: helm-upgrade
 helm-upgrade: ## Upgrade operator via Helm
 	$(HELM) upgrade $(HELM_RELEASE) $(HELM_CHART) \
@@ -223,6 +253,10 @@ helm-upgrade: ## Upgrade operator via Helm
 .PHONY: helm-uninstall
 helm-uninstall: ## Uninstall operator
 	$(HELM) uninstall $(HELM_RELEASE) --namespace $(NAMESPACE_OPERATOR) || true
+
+.PHONY: helm-uninstall-test
+helm-uninstall-test: ## Uninstall operator from cloudberry-test namespace
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(NAMESPACE_TEST) || true
 
 .PHONY: deploy-cluster
 deploy-cluster: ## Deploy sample CloudberryCluster in cloudberry-test namespace
@@ -347,6 +381,7 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	@echo "Waiting for services to be ready..."
 	@sleep 10
 	bash test/docker-compose/scripts/setup-vault.sh
+	bash test/docker-compose/scripts/setup-vault-k8s-auth.sh
 	bash test/docker-compose/scripts/setup-keycloak.sh
 	bash test/docker-compose/scripts/setup-minio.sh
 	bash test/docker-compose/scripts/setup-kafka.sh

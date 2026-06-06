@@ -48,6 +48,7 @@ RPS_OVERRIDE=""
 DURATION_OVERRIDE=""
 AMMO_OVERRIDE=""
 USE_DOCKER=true
+USE_HEY=false
 GENERATE_DATA=false
 SQL_BENCH=false
 DB_HOST="localhost"
@@ -56,6 +57,14 @@ DB_NAME="postgres"
 DB_USER="gpadmin"
 ANALYZE_ONLY=false
 DRY_RUN=false
+PORT_FORWARD=false
+PF_PID_COUNT=0
+K8S_NAMESPACE="cloudberry-test"
+K8S_OPERATOR_DEPLOY="cloudberry-operator"
+OPERATOR_API_PORT="8090"
+LOCAL_API_PORT="8190"
+LOCAL_HEALTH_PORT="8081"
+LOCAL_METRICS_PORT="8080"
 RESULTS_DIR="${SCRIPT_DIR}/.yandextank"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 TEST_RUN_DIR="${RESULTS_DIR}/${TIMESTAMP}"
@@ -155,11 +164,26 @@ parse_args() {
                 ;;
             --docker)
                 USE_DOCKER=true
+                USE_HEY=false
                 shift
                 ;;
             --native)
                 USE_DOCKER=false
+                USE_HEY=false
                 shift
+                ;;
+            --hey)
+                USE_HEY=true
+                USE_DOCKER=false
+                shift
+                ;;
+            --port-forward)
+                PORT_FORWARD=true
+                shift
+                ;;
+            --namespace)
+                K8S_NAMESPACE="$2"
+                shift 2
                 ;;
             --analyze-only)
                 ANALYZE_ONLY=true
@@ -940,9 +964,363 @@ run_sql_bench() {
     log_success "SQL benchmark complete"
 }
 
+# Start kubectl port-forwards for the operator
+start_port_forwards() {
+    log_header "Starting Port Forwards"
+
+    # Port-forward REST API (8090 -> LOCAL_API_PORT)
+    kubectl port-forward -n "${K8S_NAMESPACE}" "deployment/${K8S_OPERATOR_DEPLOY}" \
+        "${LOCAL_API_PORT}:${OPERATOR_API_PORT}" >/dev/null 2>&1 &
+    eval "PF_PID_${PF_PID_COUNT}=$!"
+    log_info "Port-forward: localhost:${LOCAL_API_PORT} -> operator:${OPERATOR_API_PORT} (REST API) [PID: $!]"
+    PF_PID_COUNT=$((PF_PID_COUNT + 1))
+
+    # Port-forward health probe (8081 -> LOCAL_HEALTH_PORT)
+    kubectl port-forward -n "${K8S_NAMESPACE}" "deployment/${K8S_OPERATOR_DEPLOY}" \
+        "${LOCAL_HEALTH_PORT}:8081" >/dev/null 2>&1 &
+    eval "PF_PID_${PF_PID_COUNT}=$!"
+    log_info "Port-forward: localhost:${LOCAL_HEALTH_PORT} -> operator:8081 (health) [PID: $!]"
+    PF_PID_COUNT=$((PF_PID_COUNT + 1))
+
+    # Port-forward metrics (8080 -> LOCAL_METRICS_PORT)
+    kubectl port-forward -n "${K8S_NAMESPACE}" "deployment/${K8S_OPERATOR_DEPLOY}" \
+        "${LOCAL_METRICS_PORT}:8080" >/dev/null 2>&1 &
+    eval "PF_PID_${PF_PID_COUNT}=$!"
+    log_info "Port-forward: localhost:${LOCAL_METRICS_PORT} -> operator:8080 (metrics) [PID: $!]"
+    PF_PID_COUNT=$((PF_PID_COUNT + 1))
+
+    # Wait for port-forwards to establish
+    sleep 3
+
+    # Verify port-forwards are alive
+    local all_ok=true
+    local i=0
+    while [[ $i -lt $PF_PID_COUNT ]]; do
+        local pid
+        eval "pid=\$PF_PID_${i}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "Port-forward process $pid died"
+            all_ok=false
+        fi
+        i=$((i + 1))
+    done
+
+    if [[ "$all_ok" == "true" ]]; then
+        log_success "All port-forwards established"
+    else
+        log_error "Some port-forwards failed to start"
+        stop_port_forwards
+        exit 1
+    fi
+}
+
+# Stop kubectl port-forwards
+stop_port_forwards() {
+    local i=0
+    while [[ $i -lt $PF_PID_COUNT ]]; do
+        local pid
+        eval "pid=\$PF_PID_${i}"
+        kill "$pid" 2>/dev/null || true
+        i=$((i + 1))
+    done
+    # Wait briefly for processes to exit
+    sleep 1
+    PF_PID_COUNT=0
+    log_info "Port-forwards stopped"
+}
+
+# Run the test using hey (Go HTTP load generator)
+run_hey() {
+    log_header "Running Load Test (hey)"
+
+    if ! command -v hey &>/dev/null; then
+        log_error "hey is not installed. Install: brew install hey"
+        exit 1
+    fi
+
+    local protocol="http"
+    [[ "$SSL" == "true" ]] && protocol="https"
+
+    local host
+    host=$(echo "$TARGET" | cut -d: -f1)
+
+    # Determine endpoints and parameters based on scenario
+    # Health endpoints use the health port (8081), REST API uses the API port (8190)
+    local duration=60
+    local rps=10
+    local concurrency=5
+
+    case "$SCENARIO" in
+        smoke)
+            duration=30
+            rps=10
+            concurrency=5
+            ;;
+        baseline)
+            duration=120
+            rps=100
+            concurrency=20
+            ;;
+        stress)
+            duration=60
+            rps=500
+            concurrency=50
+            ;;
+        endurance)
+            duration=300
+            rps=50
+            concurrency=10
+            ;;
+        custom)
+            duration="${DURATION_OVERRIDE:-60}"
+            rps="${RPS_OVERRIDE:-10}"
+            concurrency=$((rps / 2))
+            [[ "$concurrency" -lt 1 ]] && concurrency=1
+            ;;
+    esac
+
+    # Apply overrides
+    [[ -n "$RPS_OVERRIDE" ]] && rps="$RPS_OVERRIDE"
+    [[ -n "$DURATION_OVERRIDE" ]] && duration="$DURATION_OVERRIDE"
+
+    # hey -q is per-worker rate. Calculate per-worker QPS for target total RPS.
+    local qps_per_worker
+    qps_per_worker=$(awk "BEGIN {v=int(${rps}/${concurrency}); if(v<1) v=1; print v}")
+
+    log_info "Tool: hey"
+    log_info "Health target: ${protocol}://${host}:${LOCAL_HEALTH_PORT}"
+    log_info "API target: ${protocol}://${TARGET}"
+    log_info "Target RPS: ${rps} (${concurrency} workers x ${qps_per_worker} QPS/worker), Duration: ${duration}s"
+    echo ""
+
+    local all_pass=true
+
+    # Test 1: /healthz on health port
+    local url="${protocol}://${host}:${LOCAL_HEALTH_PORT}/healthz"
+    local output_file="${TEST_RUN_DIR}/hey_healthz.txt"
+    log_info "Testing: /healthz on port ${LOCAL_HEALTH_PORT} (~${rps} RPS, ${duration}s)"
+
+    hey -q "$qps_per_worker" \
+        -c "$concurrency" \
+        -z "${duration}s" \
+        -H "User-Agent: yandex-tank/perftest" \
+        "$url" > "$output_file" 2>&1 || {
+        log_error "hey failed for /healthz"
+        all_pass=false
+    }
+    if [[ -f "$output_file" ]] && grep -q "Requests/sec" "$output_file"; then
+        log_success "Completed: /healthz"
+        parse_hey_results "$output_file" "/healthz"
+    fi
+
+    # Test 2: /readyz on health port
+    url="${protocol}://${host}:${LOCAL_HEALTH_PORT}/readyz"
+    output_file="${TEST_RUN_DIR}/hey_readyz.txt"
+    log_info "Testing: /readyz on port ${LOCAL_HEALTH_PORT} (~${rps} RPS, ${duration}s)"
+
+    hey -q "$qps_per_worker" \
+        -c "$concurrency" \
+        -z "${duration}s" \
+        -H "User-Agent: yandex-tank/perftest" \
+        "$url" > "$output_file" 2>&1 || {
+        log_error "hey failed for /readyz"
+        all_pass=false
+    }
+    if [[ -f "$output_file" ]] && grep -q "Requests/sec" "$output_file"; then
+        log_success "Completed: /readyz"
+        parse_hey_results "$output_file" "/readyz"
+    fi
+
+    # Test 3: /healthz on REST API port (JSON response)
+    url="${protocol}://${TARGET}/healthz"
+    output_file="${TEST_RUN_DIR}/hey_api_healthz.txt"
+    log_info "Testing: /healthz on REST API port ${LOCAL_API_PORT} (~${rps} RPS, ${duration}s)"
+
+    hey -q "$qps_per_worker" \
+        -c "$concurrency" \
+        -z "${duration}s" \
+        -H "User-Agent: yandex-tank/perftest" \
+        "$url" > "$output_file" 2>&1 || {
+        log_error "hey failed for API /healthz"
+        all_pass=false
+    }
+    if [[ -f "$output_file" ]] && grep -q "Requests/sec" "$output_file"; then
+        log_success "Completed: API /healthz"
+        parse_hey_results "$output_file" "/api-healthz"
+    fi
+
+    # Generate combined summary
+    generate_hey_summary
+
+    if [[ "$all_pass" == "true" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Parse hey output and extract metrics
+parse_hey_results() {
+    local output_file="$1"
+    local endpoint="$2"
+
+    if [[ ! -f "$output_file" ]]; then
+        log_warn "No output file for ${endpoint}"
+        return
+    fi
+
+    local rps_achieved avg_latency p50 p95 p99
+    rps_achieved=$(grep "Requests/sec:" "$output_file" | awk '{print $2}')
+    avg_latency=$(grep "Average:" "$output_file" | awk '{print $2}')
+
+    # hey percentile format: "  50%% in 0.0029 secs"
+    p50=$(grep "50%%" "$output_file" | awk '{print $3}')
+    p95=$(grep "95%%" "$output_file" | awk '{print $3}')
+    p99=$(grep "99%%" "$output_file" | awk '{print $3}')
+
+    # Convert to ms for display
+    local avg_ms p50_ms p95_ms p99_ms
+    avg_ms=$(awk "BEGIN {printf \"%.2f\", ${avg_latency:-0} * 1000}")
+    p50_ms=$(awk "BEGIN {printf \"%.2f\", ${p50:-0} * 1000}")
+    p95_ms=$(awk "BEGIN {printf \"%.2f\", ${p95:-0} * 1000}")
+    p99_ms=$(awk "BEGIN {printf \"%.2f\", ${p99:-0} * 1000}")
+
+    # Count status codes
+    local status_200 status_4xx status_5xx total_responses
+    status_200=$(grep -E "^\s*\[200\]" "$output_file" | awk '{print $2}' || echo "0")
+    status_4xx=$(grep -E "^\s*\[4[0-9][0-9]\]" "$output_file" | awk '{sum+=$2} END {print sum+0}')
+    status_5xx=$(grep -E "^\s*\[5[0-9][0-9]\]" "$output_file" | awk '{sum+=$2} END {print sum+0}')
+    total_responses=$(grep -E "^\s*\[[0-9]+\]" "$output_file" | awk '{sum+=$2} END {print sum+0}')
+    [[ -z "$status_200" ]] && status_200=0
+    [[ -z "$status_4xx" ]] && status_4xx=0
+    [[ -z "$status_5xx" ]] && status_5xx=0
+    [[ -z "$total_responses" || "$total_responses" == "0" ]] && total_responses=1
+
+    echo ""
+    echo -e "  ${CYAN}${endpoint}${NC}"
+    echo -e "  ─────────────────────────────────────────"
+    echo -e "  RPS Achieved:  ${rps_achieved}"
+    echo -e "  Avg Latency:   ${avg_ms} ms"
+    echo -e "  p50:           ${p50_ms} ms"
+    echo -e "  p95:           ${p95_ms} ms"
+    echo -e "  p99:           ${p99_ms} ms"
+    echo -e "  Total:         ${total_responses} responses"
+    echo -e "  Status 200:    ${GREEN}${status_200}${NC}"
+    [[ "${status_4xx}" != "0" ]] && echo -e "  Status 4xx:    ${YELLOW}${status_4xx}${NC}"
+    [[ "${status_5xx}" != "0" ]] && echo -e "  Status 5xx:    ${RED}${status_5xx}${NC}"
+    echo ""
+}
+
+# Generate combined summary from hey results
+generate_hey_summary() {
+    log_header "Combined Results Summary"
+
+    local summary_file="${TEST_RUN_DIR}/results_summary.json"
+    local report_file="${TEST_RUN_DIR}/REPORT.md"
+
+    # Collect all hey output files
+    local hey_files=("${TEST_RUN_DIR}"/hey_*.txt)
+
+    if [[ ${#hey_files[@]} -eq 0 ]]; then
+        log_warn "No hey result files found"
+        return
+    fi
+
+    # Generate JSON summary
+    echo "{" > "$summary_file"
+    echo "  \"scenario\": \"${SCENARIO}\"," >> "$summary_file"
+    echo "  \"timestamp\": \"${TIMESTAMP}\"," >> "$summary_file"
+    echo "  \"target\": \"${TARGET}\"," >> "$summary_file"
+    echo "  \"tool\": \"hey\"," >> "$summary_file"
+    echo "  \"endpoints\": {" >> "$summary_file"
+
+    local first=true
+    for f in "${hey_files[@]}"; do
+        local endpoint_name
+        endpoint_name=$(basename "$f" .txt | sed 's/hey_//' | tr '_' '/')
+        local rps_val avg_val p50_val p95_val p99_val
+        rps_val=$(grep "Requests/sec:" "$f" | awk '{print $2}' || echo "0")
+        avg_val=$(grep "Average:" "$f" | awk '{print $2}' || echo "0")
+        p50_val=$(grep "50%%" "$f" | awk '{print $3}' || echo "0")
+        p95_val=$(grep "95%%" "$f" | awk '{print $3}' || echo "0")
+        p99_val=$(grep "99%%" "$f" | awk '{print $3}' || echo "0")
+
+        # Convert seconds to ms
+        local avg_ms p50_ms p95_ms p99_ms
+        avg_ms=$(awk "BEGIN {printf \"%.2f\", ${avg_val:-0} * 1000}")
+        p50_ms=$(awk "BEGIN {printf \"%.2f\", ${p50_val:-0} * 1000}")
+        p95_ms=$(awk "BEGIN {printf \"%.2f\", ${p95_val:-0} * 1000}")
+        p99_ms=$(awk "BEGIN {printf \"%.2f\", ${p99_val:-0} * 1000}")
+
+        [[ "$first" == "true" ]] && first=false || echo "," >> "$summary_file"
+        cat >> "$summary_file" <<ENDPOINT
+    "${endpoint_name}": {
+      "rps": ${rps_val:-0},
+      "latency_ms": {
+        "avg": ${avg_ms},
+        "p50": ${p50_ms},
+        "p95": ${p95_ms},
+        "p99": ${p99_ms}
+      }
+    }
+ENDPOINT
+    done
+
+    echo "  }" >> "$summary_file"
+    echo "}" >> "$summary_file"
+
+    log_success "Results saved to: ${summary_file}"
+
+    # SLO evaluation
+    log_header "SLO Evaluation"
+
+    for f in "${hey_files[@]}"; do
+        local endpoint_name
+        endpoint_name=$(basename "$f" .txt | sed 's/hey_//' | tr '_' '/')
+        local p95_val p99_val error_pct
+        p95_val=$(grep "95%%" "$f" | awk '{print $3}' || echo "0")
+        p99_val=$(grep "99%%" "$f" | awk '{print $3}' || echo "0")
+
+        local p95_ms p99_ms
+        p95_ms=$(awk "BEGIN {printf \"%.2f\", ${p95_val:-0} * 1000}")
+        p99_ms=$(awk "BEGIN {printf \"%.2f\", ${p99_val:-0} * 1000}")
+
+        # Count errors
+        local total_resp status_non200
+        total_resp=$(grep -E "^\s*\[[0-9]+\]" "$f" | awk '{sum+=$2} END {print sum+0}')
+        status_non200=$(grep -E "^\s*\[[^2][0-9][0-9]\]" "$f" | awk '{sum+=$2} END {print sum+0}')
+        [[ -z "$total_resp" || "$total_resp" == "0" ]] && total_resp=1
+        [[ -z "$status_non200" ]] && status_non200=0
+        error_pct=$(awk "BEGIN {printf \"%.2f\", ($status_non200 / $total_resp) * 100}")
+
+        echo -e "  ${CYAN}${endpoint_name}${NC}"
+
+        case "$SCENARIO" in
+            smoke)
+                evaluate_slo "p95 Latency (ms)" "$p95_ms" "1000" "< 1000ms"
+                evaluate_slo "Error Rate (%)" "$error_pct" "0" "= 0%"
+                ;;
+            baseline)
+                evaluate_slo "p95 Latency (ms)" "$p95_ms" "200" "< 200ms"
+                evaluate_slo "p99 Latency (ms)" "$p99_ms" "500" "< 500ms"
+                evaluate_slo "Error Rate (%)" "$error_pct" "0.1" "< 0.1%"
+                ;;
+            *)
+                evaluate_slo "p95 Latency (ms)" "$p95_ms" "1000" "< 1000ms"
+                evaluate_slo "Error Rate (%)" "$error_pct" "1" "< 1%"
+                ;;
+        esac
+        echo ""
+    done
+}
+
 # Cleanup function
 cleanup() {
     log_info "Cleaning up..."
+    # Stop port-forwards
+    if [[ $PF_PID_COUNT -gt 0 ]]; then
+        stop_port_forwards
+    fi
     # Stop any running Docker containers
     docker rm -f "yandex-tank-${SCENARIO}-${TIMESTAMP}" 2>/dev/null || true
 }
@@ -996,6 +1374,41 @@ main() {
         exit 0
     fi
 
+    # Set up cleanup trap early
+    trap cleanup EXIT
+
+    # Start port-forwards if requested
+    if [[ "$PORT_FORWARD" == "true" ]]; then
+        start_port_forwards
+    fi
+
+    if [[ "$USE_HEY" == "true" ]]; then
+        # hey-based mode (works on macOS without Docker --net host)
+        check_target
+        print_test_summary
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_success "Dry run complete. Configuration is valid."
+            exit 0
+        fi
+
+        # Record test start
+        echo "${TIMESTAMP}" > "${TEST_RUN_DIR}/test_start"
+        echo "${SCENARIO}" > "${TEST_RUN_DIR}/scenario"
+        echo "hey" > "${TEST_RUN_DIR}/tool"
+
+        local exit_code=0
+        run_hey || exit_code=$?
+
+        # Record test end
+        date +%Y%m%d_%H%M%S > "${TEST_RUN_DIR}/test_end"
+
+        log_header "Test Complete"
+        log_info "Results directory: ${TEST_RUN_DIR}"
+        exit $exit_code
+    fi
+
+    # Yandex Tank mode (Docker or native)
     check_prerequisites
     check_target
     print_test_summary
@@ -1016,9 +1429,6 @@ main() {
         fi
     fi
 
-    # Set up cleanup trap
-    trap cleanup EXIT
-
     # Create runtime config with overrides
     local runtime_config
     runtime_config=$(create_runtime_config)
@@ -1027,6 +1437,7 @@ main() {
     # Record test start
     echo "${TIMESTAMP}" > "${TEST_RUN_DIR}/test_start"
     echo "${SCENARIO}" > "${TEST_RUN_DIR}/scenario"
+    echo "yandex-tank" > "${TEST_RUN_DIR}/tool"
 
     # Run the test
     local exit_code=0

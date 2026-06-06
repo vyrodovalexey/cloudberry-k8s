@@ -21,7 +21,7 @@ Performance and load testing suite for the Cloudberry K8s Operator REST API usin
 - **Docker** (recommended) or native Yandex Tank installation
 - **Running Cloudberry Operator** with REST API accessible on port `:8090` (default)
 - **bash** 4.0+ (for the runner script)
-- **Go** 1.26.3+ (for building the operator from source)
+- **Go** 1.26.4+ (for building the operator from source)
 
 ### Docker (Recommended)
 
@@ -85,7 +85,7 @@ Default authentication: `admin:admin` (Basic Auth, bcrypt-hashed). The API serve
 ### Test Infrastructure Status
 
 - All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38)
-- Overall test coverage: **91.3%** (`internal/controller`: 90.1%, `cmd/cloudberry-ctl`: 91.6%)
+- Overall test coverage: **91.4%** (`internal/controller`: 90.1%, `cmd/cloudberry-ctl`: 91.6%)
 - Docker images build successfully (`make docker-build`)
 - Helm chart deploys to local Kubernetes clusters
 - Monitoring stack (vmagent, otel-collector) can be deployed alongside the operator

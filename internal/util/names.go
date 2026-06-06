@@ -104,6 +104,14 @@ func BackupS3ConfigMapName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-s3-config", cluster))
 }
 
+// BackupS3VaultCredentialsSecretName returns the name of the Kubernetes Secret
+// that the operator materializes from Vault-sourced S3 credentials. The Job spec
+// always references a Secret (never embeds plaintext), so Vault credentials are
+// projected into this Secret before the backup/restore Jobs run.
+func BackupS3VaultCredentialsSecretName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-backup-s3-vault-creds", cluster))
+}
+
 // BackupCronJobName returns the scheduled backup CronJob name.
 func BackupCronJobName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-schedule", cluster))
