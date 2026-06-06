@@ -96,15 +96,6 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
 	}
 
-	// Skip full reconciliation if only status changed (ObservedGeneration matches)
-	// and there are no annotation-based actions pending.
-	if cluster.Status.ObservedGeneration == cluster.Generation &&
-		cluster.Annotations[util.AnnotationRecovery] == "" &&
-		cluster.Annotations[util.AnnotationAction] == "" {
-		logger.Debug("skipping HA reconciliation, generation unchanged")
-		return ctrl.Result{RequeueAfter: r.probeInterval(cluster)}, nil
-	}
-
 	// Handle annotation-based actions first.
 	if result, handled, err := r.handleAnnotations(ctx, cluster); handled {
 		logger.Debug("HA annotation action handled")
@@ -311,6 +302,14 @@ func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.Clou
 
 	// Update cluster status.
 	r.updateFTSProbeStatus(cluster, analysis)
+
+	// Emit a concise INFO log so periodic probe outcomes are visible at the
+	// operator's default (info) level, including any mirroring status change.
+	logger.Info("FTS probe completed",
+		"cluster", cluster.Name,
+		"namespace", cluster.Namespace,
+		"mirroringStatus", cluster.Status.MirroringStatus,
+		"failedSegments", len(analysis.failedSegments))
 
 	// Report replication lag for mirror segments.
 	r.reportMirrorReplicationLag(ctx, cluster, dbClient)

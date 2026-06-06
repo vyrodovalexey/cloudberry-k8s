@@ -664,8 +664,11 @@ func TestHAReconciler_MonitorStandby_NilDBFactory(t *testing.T) {
 	assert.Contains(t, err.Error(), "database client factory is not configured")
 }
 
-func TestHAReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
-	// When ObservedGeneration matches and no annotations, should skip.
+func TestHAReconciler_Reconcile_ObservedGenerationSteadyState(t *testing.T) {
+	// Regression: ObservedGeneration == Generation (steady state) and no
+	// annotations must NOT skip periodic health checks. For a Running cluster
+	// the reconcile still runs and requeues at the probe interval. With no
+	// mirroring/standby enabled, runHealthChecks is a no-op but is still invoked.
 	scheme := newTestScheme()
 	cluster := newTestCluster()
 	cluster.Generation = 2
@@ -687,7 +690,9 @@ func TestHAReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.NotZero(t, result.RequeueAfter)
+	// Requeue uses the probe interval (default 60s), proving the reconcile did
+	// not take the old early-return path (which used requeueAfterDefault).
+	assert.Equal(t, r.probeInterval(cluster), result.RequeueAfter)
 }
 
 func TestHAReconciler_Reconcile_ObservedGenerationNotSkippedWithRecoveryAnnotation(t *testing.T) {
