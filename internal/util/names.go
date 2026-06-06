@@ -117,6 +117,16 @@ func BackupCronJobName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-schedule", cluster))
 }
 
+// ClusterSSHSecretName returns the name of the cluster-wide gpadmin SSH keypair
+// Secret. The operator generates ONE ed25519 keypair per cluster and stores it
+// here; every cluster pod (coordinator, standby, segment primaries/mirrors) and
+// the backup/restore Jobs mount it so passwordless SSH works cluster-wide.
+// gpbackup/gprestore (MPP tools) dispatch over SSH to each segment, so a SHARED
+// identity is required for the coordinator to reach the segments.
+func ClusterSSHSecretName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-ssh-keys", cluster))
+}
+
 // BackupJobName returns the on-demand backup Job name with a timestamp suffix.
 func BackupJobName(cluster, timestamp string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-%s", cluster, timestamp))

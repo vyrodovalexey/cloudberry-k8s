@@ -102,6 +102,25 @@ load_cloudberry_env() {
 }
 
 # ---------------------------------------------------------------------------
+# Ensure gpbackup toolchain binaries are symlinked into /usr/local/bin.
+# The operator's gpbackup_s3_plugin config uses
+#   executablepath: /usr/local/bin/gpbackup_s3_plugin
+# and gpbackup dispatches the plugin to segments using that path. On the
+# cloudberry-official image the binaries live at $GPHOME/bin; the Dockerfile
+# creates the symlinks at build time, but this runtime safety net re-creates
+# them idempotently in case the image was rebuilt without the symlink step.
+# ---------------------------------------------------------------------------
+ensure_gpbackup_symlinks() {
+    local bins="gpbackup gprestore gpbackup_helper gpbackup_s3_plugin"
+    for bin in ${bins}; do
+        if [ ! -x "/usr/local/bin/${bin}" ] && [ -x "${GPHOME}/bin/${bin}" ]; then
+            ln -sf "${GPHOME}/bin/${bin}" "/usr/local/bin/${bin}" 2>/dev/null || \
+            sudo ln -sf "${GPHOME}/bin/${bin}" "/usr/local/bin/${bin}" 2>/dev/null || true
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 log_info()  { echo "[entrypoint] INFO:  $*"; }
@@ -109,13 +128,111 @@ log_warn()  { echo "[entrypoint] WARN:  $*" >&2; }
 log_error() { echo "[entrypoint] ERROR: $*" >&2; }
 
 # ---------------------------------------------------------------------------
-# Start SSH daemon (needed for inter-segment communication).
-# Host keys and user keypair are generated at runtime (not baked into the image)
-# to avoid storing secrets in container layers.
+# Directory where the operator mounts the cluster-wide SHARED gpadmin SSH
+# keypair Secret (read-only). When present, the entrypoint installs it into
+# /home/gpadmin/.ssh with the strict permissions sshd requires INSTEAD of
+# generating a per-pod key, so the whole cluster shares one SSH identity.
+# ---------------------------------------------------------------------------
+readonly SHARED_SSH_DIR="${SHARED_SSH_DIR:-/etc/cloudberry/ssh}"
+
+# ---------------------------------------------------------------------------
+# Write a silent SSH client config so coordinator->segment SSH (used by
+# gpbackup/gprestore MPP dispatch) produces NO extra stdout/stderr. gpbackup's
+# command-runner treats any noise on the SSH session as a failure (exit 254):
+#   - host-key "Warning: Permanently added ..." (StrictHostKeyChecking), and
+#   - the host-key check itself.
+# Disabling StrictHostKeyChecking + UserKnownHostsFile + lowering LogLevel keeps
+# the session clean. PAM lastlog/MOTD noise is suppressed separately (see
+# silence_login_noise + the image-build sshd/pam changes).
+# ---------------------------------------------------------------------------
+write_ssh_client_config() {
+    cat > /home/gpadmin/.ssh/config <<'EOF'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+  BatchMode yes
+EOF
+    chmod 600 /home/gpadmin/.ssh/config 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Install the SHARED gpadmin SSH keypair (mounted by the operator) into
+# /home/gpadmin/.ssh with the strict ownership/permissions sshd requires. A
+# Secret volume is symlinked and not 0600, which sshd rejects, so we copy.
+# Returns 0 when the shared keys were installed, 1 when they are absent (caller
+# then falls back to per-pod key generation for non-operator/local runs).
+# ---------------------------------------------------------------------------
+install_shared_ssh_keys() {
+    if [ ! -f "${SHARED_SSH_DIR}/id_ed25519" ] || [ ! -f "${SHARED_SSH_DIR}/id_ed25519.pub" ]; then
+        return 1
+    fi
+    log_info "Installing shared gpadmin SSH keypair from ${SHARED_SSH_DIR}..."
+    install -m 600 "${SHARED_SSH_DIR}/id_ed25519"     /home/gpadmin/.ssh/id_ed25519
+    install -m 644 "${SHARED_SSH_DIR}/id_ed25519.pub" /home/gpadmin/.ssh/id_ed25519.pub
+    if [ -f "${SHARED_SSH_DIR}/authorized_keys" ]; then
+        install -m 600 "${SHARED_SSH_DIR}/authorized_keys" /home/gpadmin/.ssh/authorized_keys
+    else
+        install -m 600 "${SHARED_SSH_DIR}/id_ed25519.pub" /home/gpadmin/.ssh/authorized_keys
+    fi
+    chmod 700 /home/gpadmin/.ssh 2>/dev/null || true
+    chown -R gpadmin:gpadmin /home/gpadmin/.ssh 2>/dev/null || true
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Suppress PAM session failures and login noise for gpadmin SSH sessions.
+#
+# ROOT CAUSE: the stock /etc/pam.d/sshd session stack includes container-hostile
+# modules (pam_namespace.so, pam_selinux.so, pam_loginuid.so, pam_lastlog.so)
+# via "session include password-auth" and "session include postlogin". These
+# cause pam_open_session() to fail => sshd logs "PAM session not opened,
+# exiting" => every remote command exits 254.
+#
+# The preferred fix is at image-build time (Dockerfile.cloudberry-official
+# replaces /etc/pam.d/sshd with a minimal container-friendly version). This
+# runtime fallback re-applies the same minimal PAM config idempotently, so the
+# fix is robust even if the image was not rebuilt.
+# ---------------------------------------------------------------------------
+silence_login_noise() {
+    touch /home/gpadmin/.hushlogin 2>/dev/null || true
+
+    local sshd_cfg=/etc/ssh/sshd_config
+    if [ -w "${sshd_cfg}" ] || sudo test -w "${sshd_cfg}" 2>/dev/null; then
+        sudo sed -i \
+            -e 's/^[#[:space:]]*PrintMotd.*/PrintMotd no/' \
+            -e 's/^[#[:space:]]*PrintLastLog.*/PrintLastLog no/' \
+            "${sshd_cfg}" 2>/dev/null || true
+        grep -q '^PrintMotd no'     "${sshd_cfg}" 2>/dev/null || echo 'PrintMotd no'     | sudo tee -a "${sshd_cfg}" >/dev/null 2>&1 || true
+        grep -q '^PrintLastLog no'  "${sshd_cfg}" 2>/dev/null || echo 'PrintLastLog no'  | sudo tee -a "${sshd_cfg}" >/dev/null 2>&1 || true
+    fi
+
+    # Replace /etc/pam.d/sshd with a minimal container-friendly version that
+    # keeps only pam_unix.so for session management. This is idempotent — if the
+    # image already has the correct content, the write is a no-op.
+    if [ -f /etc/pam.d/sshd ]; then
+        sudo tee /etc/pam.d/sshd >/dev/null 2>&1 <<'PAMEOF' || true
+#%PAM-1.0
+auth       substack     password-auth
+account    required     pam_nologin.so
+account    include      password-auth
+password   include      password-auth
+session    required     pam_unix.so
+session    optional     pam_keyinit.so force revoke
+PAMEOF
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Start SSH daemon (needed for inter-segment communication and gpbackup MPP
+# dispatch). The cluster-wide SHARED keypair is preferred (mounted by the
+# operator); a per-pod key is generated only as a fallback for local runs.
 # ---------------------------------------------------------------------------
 start_sshd() {
     log_info "Starting SSH daemon..."
     sudo mkdir -p /run/sshd 2>/dev/null || true
+    mkdir -p /home/gpadmin/.ssh 2>/dev/null || true
+    chmod 700 /home/gpadmin/.ssh 2>/dev/null || true
 
     # Generate SSH host keys if they don't exist (first start)
     if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
@@ -123,15 +240,23 @@ start_sshd() {
         sudo ssh-keygen -A 2>/dev/null || log_warn "Failed to generate SSH host keys"
     fi
 
-    # Generate gpadmin SSH keypair if it doesn't exist (first start)
-    if [ ! -f /home/gpadmin/.ssh/id_ed25519 ]; then
-        log_info "Generating gpadmin SSH keypair..."
+    # Prefer the operator-mounted SHARED keypair; fall back to a per-pod key so
+    # non-operator/local runs still work.
+    if install_shared_ssh_keys; then
+        log_info "Using cluster-wide shared gpadmin SSH identity"
+    elif [ ! -f /home/gpadmin/.ssh/id_ed25519 ]; then
+        log_info "Shared SSH keys absent; generating per-pod gpadmin SSH keypair (fallback)..."
         ssh-keygen -t ed25519 -N '' -C 'gpadmin@cloudberry-k8s' \
                    -f /home/gpadmin/.ssh/id_ed25519 2>/dev/null || true
         cat /home/gpadmin/.ssh/id_ed25519.pub >> /home/gpadmin/.ssh/authorized_keys 2>/dev/null || true
         chmod 600 /home/gpadmin/.ssh/id_ed25519 /home/gpadmin/.ssh/authorized_keys 2>/dev/null || true
         chmod 644 /home/gpadmin/.ssh/id_ed25519.pub 2>/dev/null || true
     fi
+
+    # Silence host-key warnings on the client side and PAM lastlog/MOTD noise so
+    # gpbackup/gprestore SSH sessions stay clean (exit-254 root cause).
+    write_ssh_client_config
+    silence_login_noise
 
     sudo /usr/sbin/sshd 2>/dev/null || log_warn "SSH daemon failed to start (non-fatal)"
 }
@@ -617,6 +742,7 @@ start_postgres() {
 # ---------------------------------------------------------------------------
 main() {
     load_cloudberry_env
+    ensure_gpbackup_symlinks
 
     log_info "Apache Cloudberry Database — Kubernetes Entrypoint"
     log_info "Role: ${CLOUDBERRY_ROLE}, Content ID: ${CLOUDBERRY_CONTENT_ID}"

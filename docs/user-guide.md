@@ -27,6 +27,13 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
     - [Deletion Events](#deletion-events)
     - [Monitoring Deletion](#monitoring-deletion)
     - [No Finalizer Behavior](#no-finalizer-behavior)
+- [Backup and Restore to S3](#backup-and-restore-to-s3)
+  - [Scenario 71 — Enable Backup with Full S3 Configuration](#scenario-71--enable-backup-with-full-s3-configuration)
+  - [Preconditions](#preconditions)
+  - [Apply the Cluster CR](#apply-the-cluster-cr)
+  - [Execution Model (Coordinator-Exec)](#execution-model-coordinator-exec)
+  - [Run the Live Backup/Restore Cycle](#run-the-live-backuprestore-cycle)
+  - [Verified Result](#verified-result)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -763,6 +770,66 @@ kubectl get pvc -n cloudberry-test -l avsoft.io/cluster=my-cluster
 If the cluster does not have a finalizer (e.g., it was removed manually), Kubernetes deletes the resource immediately without invoking the operator's deletion logic. No backup is performed, no PVC cleanup occurs, and no deletion events are emitted.
 
 > **Note**: The operator automatically adds a finalizer when creating a cluster. Removing the finalizer manually bypasses all deletion safeguards.
+
+## Backup and Restore to S3
+
+The operator backs up Cloudberry databases to S3-compatible storage (AWS S3 or MinIO) using the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`). Enable backups by adding a `backup` block to the cluster spec; S3 credentials are sourced from either a Kubernetes Secret or HashiCorp Vault. See [Specification 11: Backup and Restore](../specifications/11-backup-restore-spec.md) for the full CRD schema and reconciliation logic.
+
+### Scenario 71 — Enable Backup with Full S3 Configuration
+
+Scenario 71 is the verified end-to-end walkthrough for enabling backup with a full S3 configuration (folder, encryption, `forcePathStyle`, multipart) against MinIO, for **both** credential sources. Two ready-to-apply sample CRs are provided:
+
+| Variant | Sample CR | Credential source |
+|---------|-----------|-------------------|
+| Secret | `deploy/helm/cloudberry-operator/config/samples/scenario71-backup-s3-secret.yaml` | Kubernetes Secret `backup-s3-credentials` |
+| Vault | `deploy/helm/cloudberry-operator/config/samples/scenario71-backup-s3-vault.yaml` | Vault KV `secret/data/cloudberry/backup-s3` |
+
+Both CRs configure an HA cluster (coordinator + standby, segment mirroring) with the full Scenario 71 backup block targeting bucket `cloudberry-backups`, folder `/backups`, endpoint `http://minio:9000`, `forcePathStyle: true`, and `encryption: "on"`.
+
+### Preconditions
+
+The test environment setup scripts create everything needed:
+
+- **MinIO + Secret + Service** — `test/docker-compose/scripts/setup-minio.sh` creates the `cloudberry-backups` bucket, the Kubernetes Secret `backup-s3-credentials` (keys `aws_access_key_id` / `aws_secret_access_key`), and the `minio` **ExternalName** Service so the CR endpoint `http://minio:9000` resolves from inside the cluster.
+- **Vault S3 credentials** — `test/docker-compose/scripts/setup-vault-k8s-auth.sh` seeds the S3 credentials at the Vault KV path `secret/data/cloudberry/backup-s3`. At reconcile time the operator reads this path and materializes the Secret `<cluster>-backup-s3-vault-creds` for the Vault variant.
+
+These run as part of `make test-env-setup`.
+
+### Apply the Cluster CR
+
+```bash
+# Secret-credential variant
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario71-backup-s3-secret.yaml
+
+# Vault-credential variant
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario71-backup-s3-vault.yaml
+```
+
+Once the cluster is `Running`, the operator reconciles the backup resources: the S3 plugin ConfigMap `<cluster>-backup-s3-config`, the schedule CronJob `<cluster>-backup-schedule`, and (for the Vault variant) the materialized Secret `<cluster>-backup-s3-vault-creds`. The operator also reconciles the cluster-wide shared SSH keypair Secret `<cluster>-ssh-keys`, which `gpbackup` uses to dispatch to the segments.
+
+### Execution Model (Coordinator-Exec)
+
+`gpbackup` is an MPP tool: the coordinator dispatches to every segment over SSH (port 22) to create per-segment backup directories and run `gpbackup_s3_plugin`, which streams only the **data** files to S3; **metadata** and the history database are written to the coordinator data directory. Because a standalone backup Job pod is not a real segment host in `gp_segment_configuration`, the supported live data cycle runs `gpbackup`/`gprestore` **inside the coordinator pod** (the coordinator-exec model). This is the default mode of the Scenario 71 orchestration script (`EXEC_MODE=coordinator`); `EXEC_MODE=rest` (standalone backup Job via the REST API) is kept for reference. See [Specification 11 — MPP Dispatch and the Coordinator-Exec Data Cycle](../specifications/11-backup-restore-spec.md#mpp-dispatch-and-the-coordinator-exec-data-cycle) for the full rationale.
+
+### Run the Live Backup/Restore Cycle
+
+The script `test/e2e/scripts/scenario71-backup-restore.sh` drives a real backup → verify → clean → restore → verify cycle against an already-deployed, Ready cluster. It creates `mydb` with `DATA_TARGET_MB` of data, captures baseline row counts, backs up to MinIO, drops `mydb`, restores it, and asserts the per-table row counts match.
+
+```bash
+# Secret-credential variant (100MB of data)
+DATA_TARGET_MB=100 bash test/e2e/scripts/scenario71-backup-restore.sh \
+  --cluster scenario71-secret --variant secret
+
+# Vault-credential variant
+DATA_TARGET_MB=100 bash test/e2e/scripts/scenario71-backup-restore.sh \
+  --cluster scenario71-vault --variant vault
+```
+
+Useful environment overrides: `DATA_TARGET_MB` (target data volume, default `100`), `BUCKET` (default `cloudberry-backups`), `FOLDER` (default `backups`), `EXEC_MODE` (`coordinator` default, or `rest`), and `JOB_TIMEOUT` (default `15m`).
+
+### Verified Result
+
+For both the Secret-credential and Vault-credential variants, a real 100MB `mydb` backup completes to bucket `cloudberry-backups/backups`, `mydb` is dropped, the backup is restored, and the per-table row counts match the pre-backup baseline. The script prints a `PASS` summary with the backup timestamp and the matched row counts.
 
 ## Configuration Management
 

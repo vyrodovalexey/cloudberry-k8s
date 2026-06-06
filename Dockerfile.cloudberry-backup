@@ -174,6 +174,35 @@ RUN GOLIBS_DIR=$(find $(go env GOMODCACHE)/github.com/apache/cloudberry-go-libs*
     echo "--- Patch 6: Switched to lib/pq driver ---" && \
     grep -n "lib/pq\|postgres\|pgx" "$GOLIBS_DIR/dbconn/dbconn.go" | head -10
 
+# ---------------------------------------------------------------------------
+# Add github.com/lib/pq to the module graph so the patched blank import in
+# cloudberry-go-libs/dbconn/dbconn.go resolves at build time. Without this,
+# the -mod=readonly build cannot find lib/pq (it was not in the original
+# go.mod/go.sum) and gprestore fails at runtime with:
+#   sql: unknown driver "postgres" (forgotten import?)
+# Running `go get` + `go mod tidy` adds lib/pq to go.mod and go.sum, making
+# the driver available to ALL binaries (gpbackup, gprestore, helper, plugin).
+# ---------------------------------------------------------------------------
+RUN go get github.com/lib/pq@latest && go mod tidy
+
+# ===========================================================================
+# PATCH 7: Register lib/pq driver in gprestore binary
+# PATCH 6 swaps the pgx driver import to lib/pq in cloudberry-go-libs
+# dbconn/dbconn.go, but that module-cache change only takes effect if the
+# BINARY being built actually links something that blank-imports lib/pq.
+# gpbackup works because backup/statistics.go already imports lib/pq.
+# gprestore does NOT — neither gprestore.go nor the restore package imports
+# lib/pq, so the driver is never registered and gprestore fails at runtime:
+#   sql: unknown driver "postgres" (forgotten import?)
+# Fix: inject a blank import of github.com/lib/pq into gprestore.go so the
+# driver self-registers via its init() function in the gprestore binary.
+# ===========================================================================
+RUN sed -i 's|"github.com/apache/cloudberry-backup/options"|_ "github.com/lib/pq"\n\t"github.com/apache/cloudberry-backup/options"|' \
+        gprestore.go && \
+    echo "--- Patch 7: gprestore.go now imports lib/pq ---" && \
+    grep -n 'lib/pq' gprestore.go && \
+    grep -n '//go:build gprestore' gprestore.go
+
 # Build all Go binaries from the cloudberry-backup source tree.
 #
 # The upstream repo uses Go BUILD TAGS to select which root main file to
@@ -190,19 +219,19 @@ RUN GOLIBS_DIR=$(find $(go env GOMODCACHE)/github.com/apache/cloudberry-go-libs*
 #
 # TARGETARCH is already declared above for the Go toolchain install.
 ARG GIT_VERSION=2.1.0-incubating
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -tags 'gpbackup' -trimpath \
         -ldflags="-s -w -X github.com/apache/cloudberry-backup/backup.version=${GIT_VERSION}" \
         -o /usr/local/bin/gpbackup . && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -tags 'gprestore' -trimpath \
         -ldflags="-s -w -X github.com/apache/cloudberry-backup/restore.version=${GIT_VERSION}" \
         -o /usr/local/bin/gprestore . && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -tags 'gpbackup_helper' -trimpath \
         -ldflags="-s -w -X github.com/apache/cloudberry-backup/helper.version=${GIT_VERSION}" \
         -o /usr/local/bin/gpbackup_helper . && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -mod=readonly \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -tags 'gpbackup_s3_plugin' -trimpath \
         -ldflags="-s -w -X github.com/apache/cloudberry-backup/plugins/s3plugin.version=${GIT_VERSION}" \
         -o /usr/local/bin/gpbackup_s3_plugin .

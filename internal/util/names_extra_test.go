@@ -44,6 +44,29 @@ func TestExporterAndBackupNames(t *testing.T) {
 	}
 }
 
+// TestClusterSSHSecretName verifies the cluster-wide gpadmin SSH keypair Secret
+// name builder produces "<cluster>-ssh-keys" (sanitized).
+func TestClusterSSHSecretName(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "prod-ssh-keys", ClusterSSHSecretName("prod"))
+	// Sanitized/lowercased for non-conforming cluster names.
+	got := ClusterSSHSecretName("My_Cluster")
+	assert.Equal(t, "my-cluster-ssh-keys", got)
+	assert.LessOrEqual(t, len(got), 63)
+	assert.Equal(t, strings.ToLower(got), got)
+}
+
+// TestSSHFieldConstants pins the canonical Secret data-key names for the shared
+// gpadmin SSH identity to the OpenSSH file names the entrypoint installs.
+func TestSSHFieldConstants(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "id_ed25519", SSHPrivateKeyField)
+	assert.Equal(t, "id_ed25519.pub", SSHPublicKeyField)
+	assert.Equal(t, "authorized_keys", SSHAuthorizedKeysField)
+}
+
 // TestTimestampedBackupNames exercises the timestamp-suffixed backup/restore
 // Job name builders.
 func TestTimestampedBackupNames(t *testing.T) {

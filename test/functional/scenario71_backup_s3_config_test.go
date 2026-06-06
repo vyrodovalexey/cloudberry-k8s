@@ -172,7 +172,14 @@ func (s *Scenario71Suite) assertFullS3Env(container corev1.Container) {
 	s.assertS3PlainEnv(container, "S3_FOLDER", "/backups")
 	s.assertS3PlainEnv(container, "S3_ENCRYPTION", "on")
 	s.assertS3PlainEnv(container, "S3_FORCE_PATH_STYLE", "true")
-	s.assertS3PlainEnv(container, "S3_AWS_SIGNATURE_VERSION", "4")
+	// NOTE: S3_AWS_SIGNATURE_VERSION is intentionally NOT emitted. The
+	// version-matched gpbackup_s3_plugin (2.1.0-incubating) rejects the
+	// aws_signature_version option ("field aws_signature_version not found in
+	// type s3plugin.PluginOptions"), so the operator no longer sets it (SigV4 is
+	// the plugin default).
+	if _, ok := envByName(container, "S3_AWS_SIGNATURE_VERSION"); ok {
+		s.T().Errorf("S3_AWS_SIGNATURE_VERSION must not be emitted")
+	}
 	s.assertS3PlainEnv(container, "BACKUP_MAX_CONCURRENT_REQUESTS", "4")
 	s.assertS3PlainEnv(container, "BACKUP_MULTIPART_CHUNKSIZE", "10MB")
 	s.assertS3PlainEnv(container, "RESTORE_MAX_CONCURRENT_REQUESTS", "4")
@@ -182,7 +189,9 @@ func (s *Scenario71Suite) assertFullS3Env(container corev1.Container) {
 // --- Variant 1: credentials from a Kubernetes Secret ---
 
 // TestFunctional_Scenario71_Secret_S3ConfigMap asserts the rendered S3 plugin
-// template carries all the configured placeholders + aws_signature_version.
+// template carries all the configured placeholders and the canonical
+// executablepath, but NOT aws_signature_version (the version-matched
+// gpbackup_s3_plugin 2.1.0-incubating rejects that option).
 func (s *Scenario71Suite) TestFunctional_Scenario71_Secret_S3ConfigMap() {
 	cluster := scenario71Cluster("s71-secret-cm", false)
 
@@ -192,12 +201,17 @@ func (s *Scenario71Suite) TestFunctional_Scenario71_Secret_S3ConfigMap() {
 	tpl := cm.Data["s3-plugin-config.yaml.tpl"]
 
 	assert.Contains(s.T(), tpl, "gpbackup_s3_plugin")
+	assert.Contains(s.T(), tpl, "executablepath: /usr/local/bin/gpbackup_s3_plugin")
 	assert.Contains(s.T(), tpl, "region: ${S3_REGION}")
 	assert.Contains(s.T(), tpl, "endpoint: ${S3_ENDPOINT}")
 	assert.Contains(s.T(), tpl, "bucket: ${S3_BUCKET}")
 	assert.Contains(s.T(), tpl, "folder: ${S3_FOLDER}")
 	assert.Contains(s.T(), tpl, "encryption: ${S3_ENCRYPTION}")
-	assert.Contains(s.T(), tpl, "aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}")
+	// aws_signature_version was intentionally removed: the version-matched
+	// gpbackup_s3_plugin (2.1.0-incubating) rejects the unknown field. SigV4 is
+	// the plugin default, so no explicit option is needed.
+	assert.NotContains(s.T(), tpl, "aws_signature_version")
+	assert.NotContains(s.T(), tpl, "S3_AWS_SIGNATURE_VERSION")
 	assert.Contains(s.T(), tpl, "backup_max_concurrent_requests: ${BACKUP_MAX_CONCURRENT_REQUESTS}")
 	assert.Contains(s.T(), tpl, "backup_multipart_chunksize: ${BACKUP_MULTIPART_CHUNKSIZE}")
 	assert.Contains(s.T(), tpl, "restore_max_concurrent_requests: ${RESTORE_MAX_CONCURRENT_REQUESTS}")

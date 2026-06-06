@@ -42,6 +42,14 @@ const (
 	// localBackupMountPath is the mount path for the local backup destination.
 	localBackupMountPath = "/backups"
 
+	// backupHistoryVolumeName is the emptyDir volume that backs the writable
+	// COORDINATOR_DATA_DIRECTORY used by gpbackup for its history database.
+	backupHistoryVolumeName = "backup-history"
+	// backupHistoryMountPath is where the backup-history emptyDir is mounted; it
+	// is exported as COORDINATOR_DATA_DIRECTORY so gpbackup writes its history DB
+	// to a writable path (the standalone Job pod lacks the coordinator PGDATA).
+	backupHistoryMountPath = "/var/lib/gpbackup"
+
 	// shellCommand is the shell used to render the plugin config and run the tool.
 	shellCommand = "/bin/bash"
 	// shellFlag is the shell flag for executing an inline script.
@@ -68,9 +76,9 @@ const (
 	// defaultS3SecretKeyField is the default Secret key for the S3 secret access key.
 	defaultS3SecretKeyField = util.DefaultS3SecretKeyField
 
-	// defaultS3AwsSignatureVersion is the AWS signature version used by the s3
-	// plugin (SigV4); it is the default for both AWS and MinIO.
-	defaultS3AwsSignatureVersion = "4"
+	// NOTE: aws_signature_version was removed from the S3 plugin config template
+	// because the version-matched gpbackup_s3_plugin (2.1.0-incubating) does not
+	// recognize this option. SigV4 is the default for both AWS and MinIO.
 
 	// preBackupCheckContainerName is the name of the pre-backup health-check init container.
 	preBackupCheckContainerName = "pre-backup-check"
@@ -86,15 +94,56 @@ const (
 	// sources the Cloudberry env file when present (official RPM images ship
 	// cloudberry-env.sh instead of greenplum_path.sh) and falls back to a
 	// manual export so the script works with any image layout.
-	gpEnvPreamble = "if [ -f \"${GPHOME}/cloudberry-env.sh\" ]; then source \"${GPHOME}/cloudberry-env.sh\"; " +
-		"elif [ -f \"${GPHOME}/greenplum_path.sh\" ]; then source \"${GPHOME}/greenplum_path.sh\"; " +
-		"else export PATH=\"${GPHOME}/bin:${PATH}\"; " +
-		"export LD_LIBRARY_PATH=\"${GPHOME}/lib:${GPHOME}/lib64:${LD_LIBRARY_PATH:-}\"; fi\n"
+	//
+	// The whole block is a no-op when GPHOME is unset/empty: the
+	// cloudberry-backup:2.1.0 runtime image does NOT set GPHOME and ships the
+	// gpbackup/gprestore/gpbackup_s3_plugin binaries on the default PATH
+	// (/usr/local/bin per Dockerfile.cloudberry-backup), so touching GPHOME
+	// paths there is unnecessary.  Every reference uses ${GPHOME:-} and the
+	// outer guard checks for a non-empty value so the script stays safe under
+	// `set -u` (a bare ${GPHOME} would abort with "GPHOME: unbound variable").
+	gpEnvPreamble = "if [ -n \"${GPHOME:-}\" ]; then " +
+		"if [ -f \"${GPHOME:-}/cloudberry-env.sh\" ]; then source \"${GPHOME:-}/cloudberry-env.sh\"; " +
+		"elif [ -f \"${GPHOME:-}/greenplum_path.sh\" ]; then source \"${GPHOME:-}/greenplum_path.sh\"; " +
+		"else export PATH=\"${GPHOME:-}/bin:${PATH}\"; " +
+		"export LD_LIBRARY_PATH=\"${GPHOME:-}/lib:${GPHOME:-}/lib64:${LD_LIBRARY_PATH:-}\"; fi; fi\n"
 
 	// validateContainerName is the container name for the post-restore validation Job.
 	validateContainerName = "post-restore-validate"
 	// defaultHealthCheckQuery is the default connectivity health-check query.
 	defaultHealthCheckQuery = "SELECT 1"
+
+	// sshSetupPreamble installs the cluster-wide shared gpadmin SSH identity (the
+	// operator mounts it read-only at /etc/cloudberry/ssh) into ~/.ssh with the
+	// strict permissions sshd/ssh require, and writes a SILENT ssh client config.
+	// gpbackup/gprestore dispatch over SSH to every segment to create per-segment
+	// backup directories and run gpbackup_helper, so the Job needs the same
+	// identity the cluster pods trust. The client config disables host-key
+	// warnings (StrictHostKeyChecking/UserKnownHostsFile) which would otherwise
+	// be treated as failure (exit 254) by gpbackup's command-runner. The whole
+	// block is a guarded no-op when the shared keys are absent (e.g. local runs).
+	sshSetupPreamble = "if [ -f /etc/cloudberry/ssh/id_ed25519 ]; then " +
+		"mkdir -p \"${HOME}/.ssh\" && chmod 700 \"${HOME}/.ssh\"; " +
+		"install -m 600 /etc/cloudberry/ssh/id_ed25519 \"${HOME}/.ssh/id_ed25519\"; " +
+		"install -m 644 /etc/cloudberry/ssh/id_ed25519.pub \"${HOME}/.ssh/id_ed25519.pub\"; " +
+		"if [ -f /etc/cloudberry/ssh/authorized_keys ]; then " +
+		"install -m 600 /etc/cloudberry/ssh/authorized_keys \"${HOME}/.ssh/authorized_keys\"; " +
+		"else install -m 600 /etc/cloudberry/ssh/id_ed25519.pub \"${HOME}/.ssh/authorized_keys\"; fi; " +
+		"printf 'Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n" +
+		"  LogLevel ERROR\\n  BatchMode yes\\n' > \"${HOME}/.ssh/config\"; " +
+		"chmod 600 \"${HOME}/.ssh/config\"; touch \"${HOME}/.hushlogin\"; fi\n"
+
+	// gpbackupPluginPathPreamble guarantees /usr/local/bin/gpbackup_s3_plugin
+	// (the path pinned in the plugin config template) exists at runtime. On the
+	// cloudberry-backup image the binary is already there. On the
+	// cloudberry-official image it lives at $GPHOME/bin, so we symlink it into
+	// /usr/local/bin (via sudo when needed). The block is a best-effort no-op
+	// when the binary is already in place or cannot be linked.
+	gpbackupPluginPathPreamble = "if [ ! -x /usr/local/bin/gpbackup_s3_plugin ] && " +
+		"[ -n \"${GPHOME:-}\" ] && [ -x \"${GPHOME:-}/bin/gpbackup_s3_plugin\" ]; then " +
+		"ln -sf \"${GPHOME}/bin/gpbackup_s3_plugin\" /usr/local/bin/gpbackup_s3_plugin 2>/dev/null || " +
+		"sudo ln -sf \"${GPHOME}/bin/gpbackup_s3_plugin\" /usr/local/bin/gpbackup_s3_plugin 2>/dev/null || " +
+		"true; fi\n"
 )
 
 // BackupJobOptions carries per-request overrides for an on-demand backup Job.
@@ -317,6 +366,12 @@ func renderToolScript(tool string, args []string) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString(gpEnvPreamble)
+	b.WriteString(sshSetupPreamble)
+	// Resolve the gpbackup_s3_plugin path for THIS image and export it so the
+	// envsubst-rendered plugin config (executablepath: ${GPBACKUP_PLUGIN_PATH})
+	// points at the real binary on either the cloudberry-backup image
+	// (/usr/local/bin) or the cloudberry-official image ($GPHOME/bin).
+	b.WriteString(gpbackupPluginPathPreamble)
 	// Render the S3 plugin config template, substituting env vars.
 	// Use envsubst if present; otherwise fall back to eval with heredoc.
 	fmt.Fprintf(&b,
@@ -349,17 +404,27 @@ func (b *DefaultBuilder) BuildBackupS3ConfigMap(cluster *cbv1alpha1.CloudberryCl
 	// custom (non-AWS) "endpoint" is set, which is exactly the MinIO case, so
 	// emitting the endpoint already satisfies ForcePathStyle at the wire level.
 	// The upstream plugin does not expose a dedicated force_path_style option, so
-	// we do NOT invent an unsupported template key. Instead we add the supported
-	// "aws_signature_version" option (SigV4, the default for AWS and MinIO) which
-	// improves S3-compatible-store compatibility, and we surface
+	// we do NOT invent an unsupported template key. We surface
 	// S3_FORCE_PATH_STYLE as an env var (see buildS3Env) for explicitness and
 	// observability.
+	//
+	// NOTE: aws_signature_version is intentionally NOT included in the template.
+	// The version-matched gpbackup_s3_plugin (2.1.0-incubating) does not
+	// recognize this option and rejects it with "field aws_signature_version not
+	// found in type s3plugin.PluginOptions". SigV4 is the default for both AWS
+	// and MinIO, so omitting it is safe.
 	template := strings.Join([]string{
-		"executablepath: ${GPHOME}/bin/gpbackup_s3_plugin",
+		// The gpbackup_s3_plugin lives at different paths per image: the
+		// cloudberry-backup:2.1.0 image installs it at /usr/local/bin (and does
+		// NOT set GPHOME), while the cloudberry-official:2.1.0 image bundles it
+		// at $GPHOME/bin.  The executablepath is pinned to the canonical
+		// /usr/local/bin/gpbackup_s3_plugin; the tool script guarantees that path
+		// exists at runtime (symlinking to $GPHOME/bin/gpbackup_s3_plugin on the
+		// official image) so the same template works on either image.
+		"executablepath: /usr/local/bin/gpbackup_s3_plugin",
 		"options:",
 		"  region: ${S3_REGION}",
 		"  endpoint: ${S3_ENDPOINT}",
-		"  aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}",
 		"  aws_access_key_id: ${AWS_ACCESS_KEY_ID}",
 		"  aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}",
 		"  bucket: ${S3_BUCKET}",
@@ -618,8 +683,40 @@ func (b *DefaultBuilder) buildBackupPodSpec(
 		Containers:    []corev1.Container{container},
 		Volumes:       buildBackupVolumes(cluster),
 	}
+	// gpbackup/gprestore dispatch over SSH to every segment to create per-segment
+	// backup directories and run gpbackup_helper, even when streaming to S3. The
+	// Job therefore needs the SHARED cluster SSH identity so it can reach the
+	// segments listed in gp_segment_configuration.
+	addBackupSSHIdentity(cluster, &podSpec)
 	applyJobTemplatePod(cluster, &podSpec)
 	return podSpec
+}
+
+// addBackupSSHIdentity mounts the cluster-wide shared SSH keypair Secret into the
+// backup/restore Job pod and provides a writable scratch
+// COORDINATOR_DATA_DIRECTORY for the gpbackup history database. The shared SSH
+// identity lets the Job's gpbackup/gprestore dispatch to every segment over SSH
+// using the same key the cluster pods install (see ssh_builder.go and the
+// entrypoint start_sshd). The history DB needs a writable path because the Job
+// pod is a standalone backup pod that does not carry the coordinator's PGDATA.
+func addBackupSSHIdentity(cluster *cbv1alpha1.CloudberryCluster, podSpec *corev1.PodSpec) {
+	podSpec.Volumes = append(podSpec.Volumes,
+		sshSecretVolume(cluster),
+		corev1.Volume{
+			Name: backupHistoryVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	)
+	for i := range podSpec.Containers {
+		podSpec.Containers[i].VolumeMounts = append(
+			podSpec.Containers[i].VolumeMounts,
+			sshSecretVolumeMount(),
+			corev1.VolumeMount{Name: backupHistoryVolumeName, MountPath: backupHistoryMountPath},
+		)
+		setEnvVar(&podSpec.Containers[i], "COORDINATOR_DATA_DIRECTORY", backupHistoryMountPath)
+	}
 }
 
 // addPreBackupCheckInitContainer prepends the pre-backup health-check init
@@ -778,7 +875,7 @@ func buildS3Env(cluster *cbv1alpha1.CloudberryCluster, s3 *cbv1alpha1.S3Destinat
 		encryption = "on"
 	}
 
-	env := make([]corev1.EnvVar, 0, 13)
+	env := make([]corev1.EnvVar, 0, 12)
 	env = append(env, []corev1.EnvVar{
 		{Name: "S3_REGION", Value: s3.Region},
 		{Name: "S3_ENDPOINT", Value: s3.Endpoint},
@@ -790,7 +887,6 @@ func buildS3Env(cluster *cbv1alpha1.CloudberryCluster, s3 *cbv1alpha1.S3Destinat
 		// (MinIO), so this env var documents intent and lets future plugin
 		// versions or tooling consume it without changing the Job shape.
 		{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(s3.ForcePathStyle)},
-		{Name: "S3_AWS_SIGNATURE_VERSION", Value: defaultS3AwsSignatureVersion},
 	}...)
 	env = append(env, buildS3MultipartEnv(s3.Multipart)...)
 	name, accessKeyField, secretKeyField := resolveS3CredentialSource(cluster, s3)

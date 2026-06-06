@@ -166,12 +166,18 @@ func TestBuildBackupS3ConfigMap(t *testing.T) {
 		assert.Nil(t, b.BuildBackupS3ConfigMap(cluster))
 	})
 
-	t.Run("config template includes aws_signature_version", func(t *testing.T) {
+	t.Run("config template omits aws_signature_version", func(t *testing.T) {
+		// aws_signature_version was intentionally removed: the version-matched
+		// gpbackup_s3_plugin (2.1.0-incubating) rejects the unknown field. SigV4
+		// is the default for both AWS and MinIO, so the template must NOT emit it.
 		cm := b.BuildBackupS3ConfigMap(newBackupCluster())
 		require.NotNil(t, cm)
-		assert.Contains(t, cm.Data[s3ConfigTemplateKey],
-			"aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}")
+		assert.NotContains(t, cm.Data[s3ConfigTemplateKey], "aws_signature_version")
+		assert.NotContains(t, cm.Data[s3ConfigTemplateKey], "S3_AWS_SIGNATURE_VERSION")
 		assert.Contains(t, cm.Data[s3ConfigTemplateKey], "endpoint: ${S3_ENDPOINT}")
+		// executablepath stays pinned to the canonical /usr/local/bin path.
+		assert.Contains(t, cm.Data[s3ConfigTemplateKey],
+			"executablepath: /usr/local/bin/gpbackup_s3_plugin")
 	})
 }
 
@@ -183,7 +189,10 @@ func TestBuildS3EnvForcePathStyle(t *testing.T) {
 
 		vals := envMap(env)
 		assert.Equal(t, "true", vals["S3_FORCE_PATH_STYLE"])
-		assert.Equal(t, "4", vals["S3_AWS_SIGNATURE_VERSION"])
+		// S3_AWS_SIGNATURE_VERSION was intentionally removed (SigV4 is the
+		// default for the version-matched plugin); buildS3Env must NOT emit it.
+		_, hasSigVer := vals["S3_AWS_SIGNATURE_VERSION"]
+		assert.False(t, hasSigVer, "S3_AWS_SIGNATURE_VERSION must not be set")
 		assert.Equal(t, "http://minio:9000", vals["S3_ENDPOINT"])
 	})
 

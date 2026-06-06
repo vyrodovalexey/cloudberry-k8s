@@ -346,6 +346,14 @@ func (r *ClusterReconciler) reconcileCoreResources(
 		return fmt.Errorf("reconciling admin secret: %w", err)
 	}
 
+	// Reconcile the cluster-wide shared gpadmin SSH keypair Secret (must exist
+	// before StatefulSets reference it as a volume). Every cluster pod and the
+	// backup/restore Jobs mount this single identity so gpbackup/gprestore can
+	// dispatch over SSH to all segments.
+	if err := r.reconcileClusterSSHSecret(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling cluster ssh secret: %w", err)
+	}
+
 	// Reconcile ConfigMaps.
 	if err := r.reconcileConfigMaps(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling configmaps: %w", err)
@@ -454,6 +462,55 @@ func (r *ClusterReconciler) reconcileAdminSecret(
 	util.LoggerFromContext(ctx).Info("created admin password secret", "name", secretName)
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "SecretCreated",
 		fmt.Sprintf("Admin password secret %s created", secretName))
+
+	return nil
+}
+
+// reconcileClusterSSHSecret ensures the cluster-wide shared gpadmin SSH keypair
+// Secret exists. If it is absent the operator generates ONE ed25519 keypair and
+// creates the Secret (private key, public key and authorized_keys all derived
+// from that single key). If it already exists it is left unchanged so the shared
+// identity is stable across reconciles and pod restarts.
+//
+// This shared identity is what makes cluster-wide passwordless SSH work:
+// gpbackup/gprestore (MPP tools) dispatch over SSH from the coordinator to every
+// segment, so all pods MUST trust the same key.
+func (r *ClusterReconciler) reconcileClusterSSHSecret(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	secretName := util.ClusterSSHSecretName(cluster.Name)
+	existing := &corev1.Secret{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: cluster.Namespace,
+	}, existing)
+
+	if err == nil {
+		// Secret already exists — keep the stable shared identity.
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting cluster ssh secret %s: %w", secretName, err)
+	}
+
+	privateKeyPEM, authorizedKey, genErr := builder.GenerateClusterSSHKeyPair()
+	if genErr != nil {
+		return fmt.Errorf("generating cluster ssh keypair: %w", genErr)
+	}
+
+	desired := r.builder.BuildClusterSSHSecret(cluster, privateKeyPEM, authorizedKey)
+	if createErr := r.client.Create(ctx, desired); createErr != nil {
+		if apierrors.IsAlreadyExists(createErr) {
+			// Lost a race with a concurrent reconcile — the Secret now exists.
+			return nil
+		}
+		return fmt.Errorf("creating cluster ssh secret %s: %w", secretName, createErr)
+	}
+
+	util.LoggerFromContext(ctx).Info("created cluster ssh secret", "name", secretName)
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "SecretCreated",
+		fmt.Sprintf("Cluster SSH keypair secret %s created", secretName))
 
 	return nil
 }

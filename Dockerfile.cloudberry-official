@@ -33,9 +33,14 @@
 # =============================================================================
 
 # =============================================================================
-# Stage 1: Build the gpbackup toolchain (from apache/cloudberry-backup source)
+# Stage 1: Build the PATCHED gpbackup toolchain (from apache/cloudberry-backup)
 # =============================================================================
-ARG GO_VERSION=1.23
+# This stage mirrors the patches in Dockerfile.cloudberry-backup so the four
+# binaries (gpbackup, gprestore, gpbackup_helper, gpbackup_s3_plugin) are
+# version-matched and include the lib/pq driver fix, the GetDBSize crash fix,
+# the LOCK TABLE / SAVEPOINT / snapshot fixes, and the --version flag support.
+# =============================================================================
+ARG GO_VERSION=1.26.4
 FROM --platform=linux/amd64 golang:${GO_VERSION}-bookworm AS gpbackup-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,19 +54,85 @@ RUN curl -fSL -o /tmp/src.tar.gz "${CB_BACKUP_REPO_URL}" && \
     tar -xzf /tmp/src.tar.gz -C /build --strip-components=1 && \
     rm -f /tmp/src.tar.gz
 
-# Build the four binaries using the upstream build tags. gpbackup/gprestore need
-# CGO (sqlite history); the helper/plugin do not.
-RUN CGO_ENABLED=1 go build -tags 'gpbackup' \
-        -ldflags="-X github.com/apache/cloudberry-backup/backup.version=${CB_BACKUP_VERSION}" \
+# ---------------------------------------------------------------------------
+# PATCH 1: Neutralize GetDBSize (segment crash on pg_database_size query)
+# ---------------------------------------------------------------------------
+RUN sed -i '/^func GetDBSize/,/^}$/c\func GetDBSize(connectionPool *dbconn.DBConn) string {\n\treturn ""\n}' \
+        backup/queries_globals.go && \
+    ! grep -q "pg_database_size" backup/queries_globals.go
+
+# ---------------------------------------------------------------------------
+# PATCH 2: Skip LOCK TABLE for CBDB (segment crash workaround)
+# ---------------------------------------------------------------------------
+RUN sed -i '/if connectionPool.Version.IsCBDB() {/{n;s/lockMode = .*/return/;}' \
+        backup/queries_relations.go
+
+# ---------------------------------------------------------------------------
+# PATCH 3: Skip SAVEPOINT in GetAllViews (segment crash on SAVEPOINT)
+# ---------------------------------------------------------------------------
+RUN sed -i 's|connectionPool.MustExec("SAVEPOINT gpbackup_get_views")|// PATCHED: skip SAVEPOINT|' \
+        backup/queries_relations.go && \
+    sed -i 's|defer connectionPool.MustExec("ROLLBACK TO SAVEPOINT gpbackup_get_views")|// PATCHED: skip ROLLBACK TO SAVEPOINT|' \
+        backup/queries_relations.go
+
+# ---------------------------------------------------------------------------
+# PATCH 4: Skip LockTableNoWait for CBDB (segment crash workaround)
+# ---------------------------------------------------------------------------
+RUN sed -i '/if connectionPool.Version.IsCBDB() {/{n;s/lockMode = .*/return nil/;}' \
+        backup/data.go
+
+# ---------------------------------------------------------------------------
+# PATCH 5: Disable synchronized snapshots for CBDB
+# ---------------------------------------------------------------------------
+RUN sed -i 's/if ((connectionPool.Version.IsGPDB() && connectionPool.Version.AtLeast(SNAPSHOT_GPDB_MIN_VERSION)) || connectionPool.Version.IsCBDB()) && backupSnapshot == "" {/if false \&\& ((connectionPool.Version.IsGPDB() \&\& connectionPool.Version.AtLeast(SNAPSHOT_GPDB_MIN_VERSION)) || connectionPool.Version.IsCBDB()) \&\& backupSnapshot == "" {/' \
+        backup/wrappers.go
+
+# Download Go module dependencies first (better layer caching).
+RUN go mod download
+
+# ---------------------------------------------------------------------------
+# PATCH 6: Switch from pgx to lib/pq driver (cloudberry-go-libs dbconn)
+# ---------------------------------------------------------------------------
+RUN GOLIBS_DIR=$(find $(go env GOMODCACHE)/github.com/apache/cloudberry-go-libs* -maxdepth 0 -type d 2>/dev/null | head -1) && \
+    if [ -z "$GOLIBS_DIR" ]; then \
+      echo "ERROR: cloudberry-go-libs not found in module cache"; exit 1; \
+    fi && \
+    chmod -R u+w "$GOLIBS_DIR" && \
+    sed -i 's|_ "github.com/jackc/pgx/v5/stdlib"|_ "github.com/lib/pq"|' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|dbconn.Driver.Connect("pgx"|dbconn.Driver.Connect("postgres"|g' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|default_query_exec_mode=exec||g' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|sslmode = "prefer"|sslmode = "disable"|' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's| statement_cache_capacity=0||g' "$GOLIBS_DIR/dbconn/dbconn.go"
+
+# Add lib/pq to the module graph so the patched import resolves at build time.
+RUN go get github.com/lib/pq@latest && go mod tidy
+
+# ---------------------------------------------------------------------------
+# PATCH 7: Register lib/pq driver in gprestore binary
+# (see Dockerfile.cloudberry-backup PATCH 7 for full rationale)
+# ---------------------------------------------------------------------------
+RUN sed -i 's|"github.com/apache/cloudberry-backup/options"|_ "github.com/lib/pq"\n\t"github.com/apache/cloudberry-backup/options"|' \
+        gprestore.go && \
+    echo "--- Patch 7: gprestore.go now imports lib/pq ---" && \
+    grep -n 'lib/pq' gprestore.go && \
+    grep -n '//go:build gprestore' gprestore.go
+
+# Build the four binaries (CGO_ENABLED=1 for sqlite3 history dependency).
+RUN CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/backup.version=${CB_BACKUP_VERSION}" \
         -o /out/gpbackup . && \
-    CGO_ENABLED=1 go build -tags 'gprestore' \
-        -ldflags="-X github.com/apache/cloudberry-backup/restore.version=${CB_BACKUP_VERSION}" \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gprestore' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/restore.version=${CB_BACKUP_VERSION}" \
         -o /out/gprestore . && \
-    CGO_ENABLED=0 go build -tags 'gpbackup_helper' \
-        -ldflags="-X github.com/apache/cloudberry-backup/helper.version=${CB_BACKUP_VERSION}" \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup_helper' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/helper.version=${CB_BACKUP_VERSION}" \
         -o /out/gpbackup_helper . && \
-    CGO_ENABLED=0 go build -tags 'gpbackup_s3_plugin' \
-        -ldflags="-X github.com/apache/cloudberry-backup/plugins/s3plugin/s3plugin.version=${CB_BACKUP_VERSION}" \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup_s3_plugin' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/plugins/s3plugin.version=${CB_BACKUP_VERSION}" \
         -o /out/gpbackup_s3_plugin .
 
 # =============================================================================
@@ -102,6 +173,18 @@ RUN chmod +x /usr/local/cloudberry-db/bin/gpbackup \
              /usr/local/cloudberry-db/bin/gpbackup_helper \
              /usr/local/cloudberry-db/bin/gpbackup_s3_plugin
 
+# ---------------------------------------------------------------------------
+# Symlink gpbackup toolchain binaries into /usr/local/bin so the operator's
+# generated gpbackup_s3_plugin config (executablepath: /usr/local/bin/...)
+# and gpbackup/gprestore dispatch work without $GPHOME on PATH. gpbackup
+# sends the executablepath to segments over SSH, so the path must exist on
+# every pod in the cluster.
+# ---------------------------------------------------------------------------
+RUN ln -sf /usr/local/cloudberry-db/bin/gpbackup            /usr/local/bin/gpbackup && \
+    ln -sf /usr/local/cloudberry-db/bin/gprestore           /usr/local/bin/gprestore && \
+    ln -sf /usr/local/cloudberry-db/bin/gpbackup_helper     /usr/local/bin/gpbackup_helper && \
+    ln -sf /usr/local/cloudberry-db/bin/gpbackup_s3_plugin  /usr/local/bin/gpbackup_s3_plugin
+
 # Create gpadmin user (UID 1000 for Kubernetes compatibility)
 RUN groupadd -g 1000 gpadmin && \
     useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin && \
@@ -111,6 +194,33 @@ RUN groupadd -g 1000 gpadmin && \
 
 # Prepare SSH daemon directory (host keys generated at runtime by entrypoint)
 RUN mkdir -p /run/sshd && chmod 755 /run/sshd
+
+# -----------------------------------------------------------------------------
+# Silence SSH login noise so gpbackup/gprestore MPP dispatch over SSH succeeds.
+# gpbackup runs remote commands over SSH (per-segment backup dir creation +
+# gpbackup_helper) and treats ANY extra stdout/stderr on the session as a
+# failure (exit 254).
+#
+# ROOT CAUSE: the stock /etc/pam.d/sshd session stack includes container-hostile
+# modules (pam_namespace.so, pam_selinux.so, pam_loginuid.so, pam_lastlog.so)
+# via "session include password-auth" and "session include postlogin". These
+# cause pam_open_session() to fail, which makes sshd log "PAM session not
+# opened, exiting" and every remote command exits 254.
+#
+# PROVEN FIX: replace /etc/pam.d/sshd with a minimal container-friendly version
+# that keeps only pam_unix.so for session management. Also set PrintMotd/
+# PrintLastLog no in sshd_config and touch .hushlogin.
+# (The entrypoint re-applies these at runtime as a safety net.)
+# -----------------------------------------------------------------------------
+RUN printf '#%%PAM-1.0\nauth       substack     password-auth\naccount    required     pam_nologin.so\naccount    include      password-auth\npassword   include      password-auth\nsession    required     pam_unix.so\nsession    optional     pam_keyinit.so force revoke\n' \
+        > /etc/pam.d/sshd && \
+    sed -i \
+        -e 's/^[#[:space:]]*PrintMotd.*/PrintMotd no/' \
+        -e 's/^[#[:space:]]*PrintLastLog.*/PrintLastLog no/' \
+        /etc/ssh/sshd_config && \
+    grep -q '^PrintMotd no'    /etc/ssh/sshd_config || echo 'PrintMotd no'    >> /etc/ssh/sshd_config && \
+    grep -q '^PrintLastLog no' /etc/ssh/sshd_config || echo 'PrintLastLog no' >> /etc/ssh/sshd_config && \
+    touch /home/gpadmin/.hushlogin && chown gpadmin:gpadmin /home/gpadmin/.hushlogin
 
 # Operator-expected directory layout
 RUN mkdir -p /data/pgdata /etc/cloudberry /var/run/cloudberry && \

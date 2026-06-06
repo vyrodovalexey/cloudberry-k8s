@@ -19,7 +19,7 @@ The operator relies on the following binaries from the `apache/cloudberry-backup
 
 ### Execution Model
 
-Every backup or restore action is executed as a Kubernetes **Job** (or **CronJob** for scheduled backups). The operator never runs backup logic in the controller process itself.
+The operator builds Kubernetes **Jobs** and **CronJobs** for scheduling backup/restore work, and never runs backup logic in the controller process itself.
 
 | Action | Kubernetes Resource |
 |---|---|
@@ -29,6 +29,30 @@ Every backup or restore action is executed as a Kubernetes **Job** (or **CronJob
 | Backup retention cleanup | `Job` (created by the operator or as a sidecar step in the CronJob) |
 
 Jobs run in the same namespace as the `CloudberryCluster` and are labelled with `app.kubernetes.io/managed-by: cloudberry-operator`, `cloudberry.apache.org/cluster: <cluster-name>`, and `cloudberry.apache.org/operation: backup|restore|cleanup`.
+
+#### MPP Dispatch and the Coordinator-Exec Data Cycle
+
+`gpbackup` is a Massively Parallel Processing (MPP) tool. The coordinator dispatches to **every** segment over SSH (port 22) to create per-segment backup directories and run `gpbackup_helper`/`gpbackup_s3_plugin`. With the S3 plugin, only the **DATA** files are streamed to S3 by each segment's `gpbackup_s3_plugin`, while the **metadata** files and the `gpbackup` **history database** are written to the coordinator data directory.
+
+A standalone backup Job pod is **not** a real segment host in `gp_segment_configuration`. Its plugin-config distribution (the per-run `/tmp/<ts>_s3-config.yaml`) therefore never reaches the segments, so a live data cycle cannot complete from an isolated Job pod alone. The supported live backup/restore **data cycle** runs `gpbackup`/`gprestore` **inside the coordinator pod** (the *coordinator-exec* model). The coordinator pod is segment `-1`: it has the `GPHOME` toolchain, the coordinator data directory, and the shared SSH identity required to dispatch to the segments.
+
+The operator still builds backup/restore Jobs and CronJobs for scheduling (the resources documented below). The live data cycle is exercised by the Scenario 71 orchestration script `test/e2e/scripts/scenario71-backup-restore.sh`, which supports `EXEC_MODE=coordinator` (default — runs `gpbackup`/`gprestore` inside the coordinator pod) and `EXEC_MODE=rest` (creates a standalone backup Job via the operator REST API, kept for reference/compat).
+
+#### Passwordless Inter-Pod SSH
+
+To enable `gpbackup`'s coordinator→segment dispatch, the operator generates **one** shared `gpadmin` `ed25519` keypair per cluster, stored in the Secret `<cluster>-ssh-keys`. The keypair is mounted read-only at `/etc/cloudberry/ssh` (mode `0444`) into every cluster pod. The container entrypoint installs it into `~/.ssh` with the correct permissions (`0600` private key, `0644` public key) and writes a silent SSH client config (`StrictHostKeyChecking no`, `UserKnownHostsFile /dev/null`, `LogLevel ERROR`) so remote command output is not polluted by login noise.
+
+#### Container SSH/PAM Requirement
+
+The cluster image (`Dockerfile.cloudberry-official`) ships a minimal, container-friendly `/etc/pam.d/sshd` (session uses `pam_unix` only). The stock RHEL session stack — `pam_namespace`/`pam_selinux`/`pam_loginuid` pulled in via `session include password-auth`/`postlogin` — fails `pam_open_session()` inside containers, which makes `sshd` log "PAM session not opened, exiting" and causes every remote SSH command to exit `254`. The minimal `pam.d/sshd` is therefore a hard requirement for MPP backup dispatch.
+
+#### Backup Toolchain Compatibility
+
+The cluster image must carry version-matched `gpbackup`/`gprestore`/`gpbackup_helper`/`gpbackup_s3_plugin` (`2.1.0-incubating`, built with the `gpbackup` segment-crash patches PATCH 1–7, including the `lib/pq` driver fix so `gprestore` links the `"postgres"` driver). A symlink `/usr/local/bin/gpbackup_s3_plugin → $GPHOME/bin/gpbackup_s3_plugin` ensures the plugin config's `executablepath` resolves on every pod (the coordinator sends `executablepath` to the segments over SSH, so the path must exist cluster-wide).
+
+#### Resource Sizing
+
+Under amd64 emulation the `gpbackup_s3_plugin` can be memory-heavy during metadata uploads. The Scenario 71 sample clusters use **1Gi** coordinator/segment memory limits to avoid OOM-killing the plugin mid-upload.
 
 ## CRD Specification
 
@@ -257,7 +281,6 @@ data:
       endpoint: ${S3_ENDPOINT}
       aws_access_key_id: ${AWS_ACCESS_KEY_ID}
       aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
-      aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}
       bucket: ${S3_BUCKET}
       folder: ${S3_FOLDER}
       encryption: ${S3_ENCRYPTION}
@@ -267,14 +290,16 @@ data:
       restore_multipart_chunksize: ${RESTORE_MULTIPART_CHUNKSIZE}
 ```
 
-**Path-style addressing (`forcePathStyle`):** the `gpbackup_s3_plugin` derives path-style addressing automatically when a custom (non-AWS) `endpoint` is configured — which is the case for MinIO. The operator surfaces `S3_FORCE_PATH_STYLE` (from `destination.s3.forcePathStyle`) and `S3_AWS_SIGNATURE_VERSION` (default `4`, the SigV4 algorithm MinIO expects) as environment variables for explicitness and observability; setting `forcePathStyle: true` together with a custom `endpoint` is the supported way to back up to MinIO.
+**Path-style addressing (`forcePathStyle`):** the `gpbackup_s3_plugin` derives path-style addressing automatically when a custom (non-AWS) `endpoint` is configured — which is the case for MinIO. The operator surfaces `S3_FORCE_PATH_STYLE` (from `destination.s3.forcePathStyle`) as an environment variable for explicitness and observability; setting `forcePathStyle: true` together with a custom `endpoint` is the supported way to back up to MinIO.
+
+> **Note:** `gpbackup_s3_plugin` 2.1.0 does **not** accept the `aws_signature_version` option (it rejects an unknown config key). The operator's generated S3 plugin config therefore no longer emits `aws_signature_version`; path-style addressing is auto-derived for custom MinIO endpoints via `forcePathStyle`.
 
 **S3 credential sources.** S3 credentials are provided by one of two mutually-exclusive sources on `destination.s3`:
 
 - `credentialSecret` — references an existing Kubernetes Secret (`name`, `accessKeyField`, `secretKeyField`). The backup/restore Job's `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef`.
 - `vaultSecret` — references a Vault KV path (`path`, `accessKeyField`, `secretKeyField`); requires `spec.vault.enabled: true`. At reconcile time the operator reads the Vault path and **materializes** a Kubernetes Secret named `<cluster>-backup-s3-vault-creds` (owner-referenced to the cluster) holding the credentials, which the Job then consumes via `SecretKeyRef`. Credentials are never embedded in the Job spec as plaintext.
 
-See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test scenarios, which exercises both credential sources against MinIO with the full S3 config (folder, encryption, forcePathStyle, multipart) and performs a backup → clean → restore cycle.
+See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test scenarios, which exercises both credential sources against MinIO with the full S3 config (folder, encryption, forcePathStyle, multipart) and performs a live backup → clean → restore cycle. The live data cycle runs via the coordinator-exec model (see [MPP Dispatch and the Coordinator-Exec Data Cycle](#mpp-dispatch-and-the-coordinator-exec-data-cycle)) and is driven by `test/e2e/scripts/scenario71-backup-restore.sh` for both the Secret and Vault credential variants. A real 100MB `mydb` backup → S3 (MinIO) → drop → restore cycle passes with matching row counts for both variants.
 
 ### Retention Cleanup Job
 

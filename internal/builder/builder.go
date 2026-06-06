@@ -116,6 +116,10 @@ type ResourceBuilder interface {
 	BuildPgHBAConfConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
 	// BuildAdminPasswordSecret builds the admin password Secret.
 	BuildAdminPasswordSecret(cluster *cbv1alpha1.CloudberryCluster, password string) *corev1.Secret
+	// BuildClusterSSHSecret builds the cluster-wide shared gpadmin SSH keypair
+	// Secret from a pre-generated private key and authorized_keys line.
+	BuildClusterSSHSecret(
+		cluster *cbv1alpha1.CloudberryCluster, privateKeyPEM, authorizedKey []byte) *corev1.Secret
 	// BuildMaintenanceJob builds a Kubernetes Job for a maintenance operation.
 	BuildMaintenanceJob(cluster *cbv1alpha1.CloudberryCluster, operation, timestamp string) *batchv1.Job
 	// BuildExporterCredentialsSecret builds the exporter credentials Secret.
@@ -239,6 +243,10 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
+	// Mount the cluster-wide shared SSH keypair so the coordinator can SSH to
+	// every segment for gpbackup/gprestore MPP dispatch.
+	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
+
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
 }
@@ -321,6 +329,8 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
+	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
+
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
 }
@@ -390,6 +400,8 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 		return nil, fmt.Errorf("building segment primary PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
+
+	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
@@ -549,6 +561,8 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 		return nil, fmt.Errorf("building segment mirror PVC: %w", err)
 	}
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
+
+	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil

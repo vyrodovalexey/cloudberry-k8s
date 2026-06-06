@@ -179,6 +179,13 @@ func (s *Scenario71BackupS3ConfigE2ESuite) s71AssertFullS3Env(container corev1.C
 	s.s71AssertPlainEnv(container, "S3_FOLDER", "/backups")
 	s.s71AssertPlainEnv(container, "S3_ENCRYPTION", "on")
 	s.s71AssertPlainEnv(container, "S3_FORCE_PATH_STYLE", "true")
+	// NOTE: S3_AWS_SIGNATURE_VERSION is intentionally NOT emitted. The
+	// version-matched gpbackup_s3_plugin (2.1.0-incubating) rejects the
+	// aws_signature_version option, so the operator no longer sets it (SigV4 is
+	// the plugin default).
+	if _, ok := s71EnvByName(container, "S3_AWS_SIGNATURE_VERSION"); ok {
+		s.T().Errorf("S3_AWS_SIGNATURE_VERSION must not be emitted")
+	}
 	s.s71AssertPlainEnv(container, "BACKUP_MAX_CONCURRENT_REQUESTS", "4")
 	s.s71AssertPlainEnv(container, "BACKUP_MULTIPART_CHUNKSIZE", "10MB")
 	s.s71AssertPlainEnv(container, "RESTORE_MAX_CONCURRENT_REQUESTS", "4")
@@ -206,7 +213,12 @@ func (s *Scenario71BackupS3ConfigE2ESuite) TestE2E_Scenario71_Secret_ProvisionsR
 	require.NoError(s.T(), err, "S3 plugin ConfigMap should be provisioned")
 	tpl := cm.Data["s3-plugin-config.yaml.tpl"]
 	assert.Contains(s.T(), tpl, "gpbackup_s3_plugin")
-	assert.Contains(s.T(), tpl, "aws_signature_version: ${S3_AWS_SIGNATURE_VERSION}")
+	assert.Contains(s.T(), tpl, "executablepath: /usr/local/bin/gpbackup_s3_plugin")
+	// aws_signature_version was intentionally removed: the version-matched
+	// gpbackup_s3_plugin (2.1.0-incubating) rejects the unknown field. SigV4 is
+	// the plugin default, so no explicit option is needed.
+	assert.NotContains(s.T(), tpl, "aws_signature_version")
+	assert.NotContains(s.T(), tpl, "S3_AWS_SIGNATURE_VERSION")
 
 	cron := &batchv1.CronJob{}
 	require.NoError(s.T(), env.Client.Get(s.ctx, types.NamespacedName{

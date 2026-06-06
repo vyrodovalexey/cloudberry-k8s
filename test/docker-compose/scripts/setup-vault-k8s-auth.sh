@@ -9,6 +9,8 @@
 #   4. Creates a kubernetes auth role bound to the operator ServiceAccount
 #   5. Creates a PKI role for webhook + cluster TLS
 #   6. Stores a placeholder KV secret at secret/data/cloudberry
+#   7. Seeds S3 backup credentials at secret/data/cloudberry/backup-s3
+#      (Scenario 71 Vault credential variant)
 #
 # All operations are idempotent (safe to re-run).
 #
@@ -53,6 +55,11 @@ VAULT_ROLE_NAME="${VAULT_ROLE_NAME:-cloudberry-operator}"
 PKI_MOUNT="${PKI_MOUNT:-pki}"
 PKI_ROLE_NAME="${PKI_ROLE_NAME:-cloudberry-operator}"
 KV_MOUNT="${KV_MOUNT:-secret}"
+# S3 backup credentials seeded into Vault for the Scenario 71 Vault variant.
+# The operator reads these from secret/data/cloudberry/backup-s3 and materializes
+# them into the <cluster>-backup-s3-vault-creds Secret before backup Jobs run.
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-${MINIO_ACCESS_KEY:-minioadmin}}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-${MINIO_SECRET_KEY:-minioadmin}}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -301,6 +308,31 @@ store_kv_secret() {
 }
 
 # ---------------------------------------------------------------------------
+# Step f2: Seed S3 backup credentials at secret/data/cloudberry/backup-s3
+# Required by the Scenario 71 Vault credential variant. Keys match the CR
+# sample (vaultSecret.accessKeyField / secretKeyField) and the Go fixtures.
+# Idempotent: skips when the secret is already present (same pattern as the
+# placeholder KV seed above).
+# ---------------------------------------------------------------------------
+store_backup_s3_secret() {
+    log_step "Storing S3 backup credentials at '${KV_MOUNT}/data/cloudberry/backup-s3'..."
+
+    if vault_api GET "${KV_MOUNT}/data/cloudberry/backup-s3" > /dev/null 2>&1; then
+        log_info "  Secret already exists at '${KV_MOUNT}/data/cloudberry/backup-s3', skipping"
+        return 0
+    fi
+
+    vault_api POST "${KV_MOUNT}/data/cloudberry/backup-s3" \
+        -d "{
+            \"data\": {
+                \"aws_access_key_id\": \"${S3_ACCESS_KEY}\",
+                \"aws_secret_access_key\": \"${S3_SECRET_KEY}\"
+            }
+        }" > /dev/null
+    log_info "  S3 backup credentials stored at '${KV_MOUNT}/data/cloudberry/backup-s3'"
+}
+
+# ---------------------------------------------------------------------------
 # Step g: Verify setup
 # ---------------------------------------------------------------------------
 verify_setup() {
@@ -384,6 +416,14 @@ if not sa_names:
         log_info "  ✓ KV secret exists at '${KV_MOUNT}/data/cloudberry'"
     else
         log_warn "  ⚠ KV secret not found at '${KV_MOUNT}/data/cloudberry'"
+    fi
+
+    # Check S3 backup credentials (Scenario 71 Vault variant)
+    log_step "Checking S3 backup creds at '${KV_MOUNT}/data/cloudberry/backup-s3'..."
+    if vault_api GET "${KV_MOUNT}/data/cloudberry/backup-s3" > /dev/null 2>&1; then
+        log_info "  ✓ S3 backup creds exist at '${KV_MOUNT}/data/cloudberry/backup-s3'"
+    else
+        log_warn "  ⚠ S3 backup creds not found at '${KV_MOUNT}/data/cloudberry/backup-s3'"
     fi
 
     # Test-issue a certificate via the operator PKI role
@@ -483,6 +523,9 @@ main() {
 
     # Step f: Store placeholder KV secret
     store_kv_secret
+
+    # Step f2: Seed S3 backup credentials (Scenario 71 Vault variant)
+    store_backup_s3_secret
 
     echo ""
     log_info "=== Vault Kubernetes Auth setup complete ==="

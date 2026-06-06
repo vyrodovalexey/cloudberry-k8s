@@ -169,4 +169,14 @@ const (
 
 	// PasswordSecretKey is the key within the admin password Secret.
 	PasswordSecretKey = "password"
+
+	// SSHPrivateKeyField is the Secret data key holding the shared gpadmin
+	// ed25519 private key.
+	SSHPrivateKeyField = "id_ed25519"
+	// SSHPublicKeyField is the Secret data key holding the shared gpadmin
+	// ed25519 public key.
+	SSHPublicKeyField = "id_ed25519.pub" //nolint:gosec // field name, not a credential
+	// SSHAuthorizedKeysField is the Secret data key holding the authorized_keys
+	// file (the single shared public key) installed into every pod.
+	SSHAuthorizedKeysField = "authorized_keys"
 )

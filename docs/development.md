@@ -2399,8 +2399,26 @@ Exercises the full S3 backup configuration (bucket, endpoint, region, folder, en
 - **71a — Secret credentials**: `destination.s3.credentialSecret` references the Kubernetes Secret `backup-s3-credentials` (`accessKeyField: aws_access_key_id`, `secretKeyField: aws_secret_access_key`). The backup/restore Job injects `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SecretKeyRef` to that Secret.
 - **71b — Vault credentials**: `destination.s3.vaultSecret` references Vault path `secret/data/cloudberry/backup-s3` (requires `spec.vault.enabled`). The operator reads the path at reconcile time and materializes the Secret `<cluster>-backup-s3-vault-creds`, which the Job consumes via `SecretKeyRef`. Credentials are never written into the Job spec as plaintext.
 
-Both variants verify the full S3 plugin config (`region`, `endpoint`, `bucket`, `folder`, `encryption`, `aws_signature_version`) and env (`S3_FORCE_PATH_STYLE=true`, multipart `BACKUP_*`/`RESTORE_*` = `4`/`10MB`). The functional/E2E Go tests assert the operator produces the correct ConfigMap, materialized creds Secret (Vault variant), and Job env/args; the actual backup→clean→restore data cycle (≈100 MB in `mydb`) is exercised at live deployment time.
+Both variants verify the full S3 plugin config (`region`, `endpoint`, `bucket`, `folder`, `encryption`) and env (`S3_FORCE_PATH_STYLE=true`, multipart `BACKUP_*`/`RESTORE_*` = `4`/`10MB`). The functional/E2E Go tests assert the operator produces the correct ConfigMap, materialized creds Secret (Vault variant), and Job env/args; the actual backup→clean→restore data cycle (≈100 MB in `mydb`) is exercised at live deployment time.
 
+> **Note**: `gpbackup_s3_plugin` 2.1.0 rejects the `aws_signature_version` option, so the operator's generated S3 plugin config no longer emits it (path-style is auto-derived for custom MinIO endpoints via `forcePathStyle`).
+
+**Live data cycle (coordinator-exec)**: because `gpbackup` is an MPP tool — the coordinator dispatches to every segment over SSH (port 22) and a standalone Job pod is not a real segment host — the supported live backup/restore data cycle runs `gpbackup`/`gprestore` **inside the coordinator pod**. The orchestration script `test/e2e/scripts/scenario71-backup-restore.sh` drives this cycle for both variants and supports `EXEC_MODE=coordinator` (default) and `EXEC_MODE=rest`:
+
+```bash
+# Secret variant — 100MB live backup -> S3(MinIO) -> drop -> restore -> verify
+DATA_TARGET_MB=100 bash test/e2e/scripts/scenario71-backup-restore.sh \
+  --cluster scenario71-secret --variant secret
+
+# Vault variant
+DATA_TARGET_MB=100 bash test/e2e/scripts/scenario71-backup-restore.sh \
+  --cluster scenario71-vault --variant vault
+```
+
+Verified live for both variants: 100MB `mydb` backed up to `cloudberry-backups/backups`, `mydb` dropped, restored, row counts match.
+
+- **Sample CRs**: `deploy/helm/cloudberry-operator/config/samples/scenario71-backup-s3-secret.yaml`, `scenario71-backup-s3-vault.yaml`
+- **Live orchestration script**: `test/e2e/scripts/scenario71-backup-restore.sh`
 - **Test case catalog**: `Scenario71BackupConfigCase` type and `Scenario71BackupConfigCases()` in `test/cases/test_cases.go` (71a secret, 71b vault)
 - **Functional tests**: `test/functional/scenario71_backup_s3_config_test.go`
 - **E2E tests**: `test/e2e/scenario71_backup_s3_config_e2e_test.go`

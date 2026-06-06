@@ -419,9 +419,9 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
-          # cloudberry compiles Apache Cloudberry from source (slow); built on PRs and releases.
+          # cloudberry builds the Apache Cloudberry image from the official RPM; built on PRs and releases.
           - name: cloudberry
-            dockerfile: Dockerfile.cloudberry
+            dockerfile: Dockerfile.cloudberry-official
             image_env: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
@@ -616,7 +616,7 @@ jobs:
             dockerfile: Dockerfile.ctl
             image_key: DOCKER_IMAGE_CTL
           - name: cloudberry
-            dockerfile: Dockerfile.cloudberry
+            dockerfile: Dockerfile.cloudberry-official
             image_key: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
