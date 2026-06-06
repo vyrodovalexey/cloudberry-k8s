@@ -189,6 +189,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - S3 credentials from a Kubernetes Secret or HashiCorp Vault (materialized to a Secret at reconcile time)
   - Full S3 config: bucket, folder, region, encryption, `forcePathStyle`, multipart tuning, retention, schedule (CronJob)
   - Live data cycle runs `gpbackup`/`gprestore` inside the coordinator pod (MPP coordinator→segment SSH dispatch); verified end-to-end by Scenario 71 for both Secret and Vault credential variants
+  - Backup infrastructure verified by Scenario 72: toolchain image (`gpbackup`/`gprestore`/`gpbackup_s3_plugin`), backup RBAC (`cloudberry-backup-sa` + `cloudberry-backup-role`), the `<cluster>-backup-s3-config` ConfigMap, and the `jobTemplate` pod-template overrides (resources, nodeSelector, tolerations, serviceAccountName, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished)
 - Session management: list active sessions from `pg_stat_activity`, cancel queries via `pg_cancel_backend()`, terminate sessions via `pg_terminate_backend()` (with PID validation and graceful degradation when DB is unavailable)
 - Resource group management: create, list, assign, and delete resource groups for workload isolation
   - Create groups with concurrency, CPU, and memory limits
@@ -646,6 +647,7 @@ The operator has been verified in production-like deployments:
 - **Exporters**: postgres-exporter on the coordinator, standby, and every segment primary and mirror, plus the coordinator-only cloudberry-query-exporter, producing metrics into VictoriaMetrics
 - **Data**: ~100 MB of test data loaded into `mydb`
 - **Backup/Restore**: Scenario 71 verified live for both credential variants — a real 100 MB `mydb` backup → S3 (MinIO, bucket `cloudberry-backups/backups`) → drop → restore cycle passes with matching row counts. Runs the MPP backup inside the coordinator pod (coordinator→segment SSH dispatch) via `test/e2e/scripts/scenario71-backup-restore.sh` for the `scenario71-secret` (Secret credentials) and `scenario71-vault` (Vault credentials) sample clusters
+- **Backup Infrastructure**: Scenario 72 verified — toolchain image binaries (`gpbackup`/`gprestore`/`gpbackup_s3_plugin` in `cloudberry-backup:2.1.0`), backup RBAC (`cloudberry-backup-sa` + `cloudberry-backup-role`), the `<cluster>-backup-s3-config` ConfigMap, Job labels/namespace + env (`envsubst` → `/tmp/s3-config.yaml`), and the explicit `jobTemplate` overrides from `deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml`
 - **Dashboards**: All Grafana dashboards in `monitoring/grafana/` (operator, exporters, node) reflecting live metrics; published via `make grafana-publish`
 - **Monitoring**: vmagent (remote-writing to VictoriaMetrics), Vector (tailing `kubernetes_logs` to VictoriaLogs), OpenTelemetry Collector, and node-exporter deployed alongside the operator via `make monitoring-deploy`
 - **Test Environment**: Docker Compose with 9 services (Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo)

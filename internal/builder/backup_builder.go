@@ -63,6 +63,24 @@ const (
 	// defaultCoordinatorDatabase is the database used for backup connections.
 	defaultCoordinatorDatabase = "postgres"
 
+	// envCBDBDatabase is the env key holding the backup target database. It is
+	// informational/inspectable (spec 11): the gpbackup invocation continues to
+	// pass the database via the --dbname CLI arg (see buildGpbackupArgs).
+	envCBDBDatabase = "CBDB_DATABASE"
+	// envCompressionLevel is the env key holding the gpbackup compression level.
+	envCompressionLevel = "COMPRESSION_LEVEL"
+	// envCompressionType is the env key holding the gpbackup compression type.
+	envCompressionType = "COMPRESSION_TYPE"
+	// envBackupJobs is the env key holding the gpbackup parallel job count.
+	envBackupJobs = "BACKUP_JOBS"
+
+	// defaultCompressionLevel is the COMPRESSION_LEVEL env default when unset.
+	defaultCompressionLevel = "1"
+	// defaultCompressionType is the COMPRESSION_TYPE env default when unset.
+	defaultCompressionType = "gzip"
+	// defaultBackupJobs is the BACKUP_JOBS env default when unset.
+	defaultBackupJobs = "1"
+
 	// pluginConfigFlag is the gpbackup/gprestore plugin-config flag.
 	pluginConfigFlag = "--plugin-config"
 
@@ -460,6 +478,9 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	labels := backupLabels(cluster.Name, util.BackupOperationBackup)
 	args := buildGpbackupArgs(cluster.Spec.Backup.Gpbackup, nil)
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
+	// The CronJob's backup target databases are resolved at runtime, so
+	// CBDB_DATABASE is emitted empty (still inspectable) per spec 11.
+	applyBackupGpbackupEnv(&podSpec, "", cluster.Spec.Backup.Gpbackup)
 	addPreBackupCheckInitContainer(cluster, &podSpec)
 
 	historyLimit := int32(3)
@@ -501,6 +522,7 @@ func (b *DefaultBuilder) BuildBackupJob(
 	}
 	args := buildGpbackupArgs(gpOpts, opts)
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
+	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
 	addPreBackupCheckInitContainer(cluster, &podSpec)
 
 	return &batchv1.Job{
@@ -530,6 +552,14 @@ func (b *DefaultBuilder) BuildRestoreJob(
 	}
 	args := buildGprestoreArgs(grOpts, opts)
 	podSpec := b.buildBackupPodSpec(cluster, restoreContainerName, "gprestore", args)
+	// The restore Job carries the same informational gpbackup env (spec 11) so
+	// the container env is inspectable; compression/jobs come from the cluster's
+	// gpbackupOptions and the database from the restore request.
+	var gpOpts *cbv1alpha1.GpbackupOptions
+	if cluster.Spec.Backup != nil {
+		gpOpts = cluster.Spec.Backup.Gpbackup
+	}
+	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -834,6 +864,54 @@ func jobTemplate(cluster *cbv1alpha1.CloudberryCluster) *cbv1alpha1.BackupJobTem
 		return nil
 	}
 	return cluster.Spec.Backup.JobTemplate
+}
+
+// applyBackupGpbackupEnv sets the informational/inspectable gpbackup env vars
+// (CBDB_DATABASE, COMPRESSION_LEVEL, COMPRESSION_TYPE, BACKUP_JOBS) on the first
+// container of the pod spec. These mirror the existing gpbackup CLI args (which
+// remain the source of truth for the actual invocation) so the Job container env
+// is inspectable per spec 11. database is the resolved backup target ("" when
+// none, e.g. the CronJob path whose databases are resolved at runtime); gpOpts
+// supplies compression/jobs (defaults 1/gzip/1 apply when unset).
+func applyBackupGpbackupEnv(
+	podSpec *corev1.PodSpec,
+	database string,
+	gpOpts *cbv1alpha1.GpbackupOptions,
+) {
+	if len(podSpec.Containers) == 0 {
+		return
+	}
+	container := &podSpec.Containers[0]
+
+	compressionLevel := defaultCompressionLevel
+	compressionType := defaultCompressionType
+	backupJobs := defaultBackupJobs
+	if gpOpts != nil {
+		if gpOpts.CompressionLevel > 0 {
+			compressionLevel = strconv.Itoa(int(gpOpts.CompressionLevel))
+		}
+		if gpOpts.CompressionType != "" {
+			compressionType = gpOpts.CompressionType
+		}
+		if gpOpts.Jobs > 0 {
+			backupJobs = strconv.Itoa(int(gpOpts.Jobs))
+		}
+	}
+
+	setEnvVar(container, envCBDBDatabase, database)
+	setEnvVar(container, envCompressionLevel, compressionLevel)
+	setEnvVar(container, envCompressionType, compressionType)
+	setEnvVar(container, envBackupJobs, backupJobs)
+}
+
+// firstDatabase returns the backup target database (the first entry), or "" when
+// none is configured (e.g. the scheduled CronJob whose databases are resolved at
+// runtime).
+func firstDatabase(databases []string) string {
+	if len(databases) > 0 {
+		return databases[0]
+	}
+	return ""
 }
 
 // buildBackupEnv builds environment variables for backup/restore containers.

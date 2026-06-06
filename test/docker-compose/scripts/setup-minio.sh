@@ -162,12 +162,30 @@ create_bucket "cloudberry-data"
 #   2. Service minio (ExternalName -> host MinIO) so the CR's
 #      endpoint http://minio:9000 resolves from in-cluster backup/restore Jobs.
 # Both are idempotent (apply with --dry-run=client | kubectl apply -f -) and are
-# only attempted when kubectl is available, so docker-compose-only runs (CI mode
-# or hosts without a cluster) do not fail.
+# only attempted when:
+#   - not running in --ci mode (CI has no k8s cluster), AND
+#   - kubectl is installed, AND
+#   - a Kubernetes API server is actually reachable.
+# In GitHub CI the kubectl binary exists but no cluster is reachable
+# (localhost:8080 refused), so a `command -v kubectl` check alone is not enough;
+# we additionally probe the API server and skip gracefully when absent.
 # ---------------------------------------------------------------------------
 setup_k8s_backup_artifacts() {
+  if [ "$CI_MODE" = true ]; then
+    echo ""
+    echo "  CI mode: skipping k8s backup-s3-credentials Secret + minio Service"
+    return 0
+  fi
+
   if ! command -v kubectl > /dev/null 2>&1; then
     echo "  kubectl not found; skipping k8s backup-s3-credentials Secret + minio Service"
+    return 0
+  fi
+
+  # The kubectl binary may exist without a reachable cluster (e.g. GitHub CI).
+  # Probe the API server; skip the k8s artifacts when it is unreachable.
+  if ! kubectl cluster-info > /dev/null 2>&1; then
+    echo "  No reachable Kubernetes cluster; skipping k8s backup-s3-credentials Secret + minio Service"
     return 0
   fi
 

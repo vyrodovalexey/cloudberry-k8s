@@ -34,6 +34,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Execution Model (Coordinator-Exec)](#execution-model-coordinator-exec)
   - [Run the Live Backup/Restore Cycle](#run-the-live-backuprestore-cycle)
   - [Verified Result](#verified-result)
+  - [Scenario 72 — Backup Infrastructure Deployment](#scenario-72--backup-infrastructure-deployment)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -830,6 +831,36 @@ Useful environment overrides: `DATA_TARGET_MB` (target data volume, default `100
 ### Verified Result
 
 For both the Secret-credential and Vault-credential variants, a real 100MB `mydb` backup completes to bucket `cloudberry-backups/backups`, `mydb` is dropped, the backup is restored, and the per-table row counts match the pre-backup baseline. The script prints a `PASS` summary with the backup timestamp and the matched row counts.
+
+### Scenario 72 — Backup Infrastructure Deployment
+
+Scenario 72 verifies the backup **infrastructure** the operator deploys for a cluster with backups enabled. The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml` configures an HA cluster with the full S3 backup block (Secret credentials) plus an **explicit `backup.jobTemplate`** that exercises every pod-template override:
+
+| Override | Value |
+|----------|-------|
+| `resources.requests` | `cpu: 500m`, `memory: 512Mi` |
+| `resources.limits` | `cpu: 2`, `memory: 2Gi` |
+| `nodeSelector` | `kubernetes.io/os: linux` |
+| `tolerations` | `dedicated=backup:NoSchedule` |
+| `serviceAccountName` | `cloudberry-backup-sa` |
+| `backoffLimit` | `2` |
+| `activeDeadlineSeconds` | `7200` |
+| `ttlSecondsAfterFinished` | `86400` |
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml
+```
+
+Six infrastructure verifications pass:
+
+1. **Image binaries** — `gpbackup`, `gprestore`, and `gpbackup_s3_plugin` present in `cloudberry-backup:2.1.0`.
+2. **RBAC** — `cloudberry-backup-sa` ServiceAccount + `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch) + RoleBinding.
+3. **S3 ConfigMap** — `<cluster>-backup-s3-config` with `executablepath: /usr/local/bin/gpbackup_s3_plugin`, the region/endpoint/credentials/bucket/folder/encryption placeholders, the four multipart placeholders, and no `aws_signature_version`.
+4. **Job labels/namespace** — Jobs in the cluster namespace labelled `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster>`, `avsoft.io/component: backup`, `avsoft.io/backup-operation: backup`.
+5. **Job env + envsubst** — `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, `BACKUP_JOBS` (AWS creds via `SecretKeyRef`), rendering `/tmp/s3-config.yaml`.
+6. **jobTemplate overrides** — all of the values above propagate to the built Job.
+
+These are covered by `test/functional/scenario72_backup_infrastructure_test.go` and `test/e2e/scenario72_backup_infrastructure_e2e_test.go`.
 
 ## Configuration Management
 

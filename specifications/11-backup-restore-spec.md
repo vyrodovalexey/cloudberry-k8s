@@ -28,7 +28,7 @@ The operator builds Kubernetes **Jobs** and **CronJobs** for scheduling backup/r
 | Restore from backup | `Job` (created directly by the operator) |
 | Backup retention cleanup | `Job` (created by the operator or as a sidecar step in the CronJob) |
 
-Jobs run in the same namespace as the `CloudberryCluster` and are labelled with `app.kubernetes.io/managed-by: cloudberry-operator`, `cloudberry.apache.org/cluster: <cluster-name>`, and `cloudberry.apache.org/operation: backup|restore|cleanup`.
+Jobs run in the same namespace as the `CloudberryCluster` and are labelled with the operator's own API group `avsoft.io` (the CRD group is `avsoft.io/v1alpha1`): `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster-name>`, `avsoft.io/component: backup`, and `avsoft.io/backup-operation: backup|restore` (the value is the operation).
 
 #### MPP Dispatch and the Coordinator-Exec Data Cycle
 
@@ -167,10 +167,12 @@ metadata:
   name: <cluster>-backup-schedule
   namespace: <namespace>
   labels:
-    cloudberry.apache.org/cluster: <cluster>
-    cloudberry.apache.org/operation: backup
+    app.kubernetes.io/managed-by: cloudberry-operator
+    avsoft.io/cluster: <cluster>
+    avsoft.io/component: backup
+    avsoft.io/backup-operation: backup
   ownerReferences:
-    - apiVersion: cloudberry.apache.org/v1
+    - apiVersion: avsoft.io/v1alpha1
       kind: CloudberryCluster
       name: <cluster>
 spec:
@@ -234,6 +236,8 @@ spec:
               configMap:
                 name: <cluster>-backup-s3-config
 ```
+
+**Backup Job/CronJob container env.** The operator emits `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` on both the on-demand backup/restore Job and the scheduled backup CronJob containers. `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` are taken from `backup.gpbackup` and **default to `1`, `gzip`, and `1`** respectively when unset. `CBDB_DATABASE` is the backup target database (it is **empty for the CronJob**, whose databases are resolved at runtime). `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef` to `backup-s3-credentials`. These env vars are **informational/inspectable**: the `gpbackup`/`gprestore` CLI invocation still passes `--dbname` / `--compression-level` / `--compression-type` / `--jobs` as explicit args.
 
 ### Job for On-Demand Backup
 
@@ -300,6 +304,19 @@ data:
 - `vaultSecret` — references a Vault KV path (`path`, `accessKeyField`, `secretKeyField`); requires `spec.vault.enabled: true`. At reconcile time the operator reads the Vault path and **materializes** a Kubernetes Secret named `<cluster>-backup-s3-vault-creds` (owner-referenced to the cluster) holding the credentials, which the Job then consumes via `SecretKeyRef`. Credentials are never embedded in the Job spec as plaintext.
 
 See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test scenarios, which exercises both credential sources against MinIO with the full S3 config (folder, encryption, forcePathStyle, multipart) and performs a live backup → clean → restore cycle. The live data cycle runs via the coordinator-exec model (see [MPP Dispatch and the Coordinator-Exec Data Cycle](#mpp-dispatch-and-the-coordinator-exec-data-cycle)) and is driven by `test/e2e/scripts/scenario71-backup-restore.sh` for both the Secret and Vault credential variants. A real 100MB `mydb` backup → S3 (MinIO) → drop → restore cycle passes with matching row counts for both variants.
+
+### Scenario 72 — Backup Infrastructure Deployment
+
+**Scenario 72** verifies the backup **infrastructure** the operator deploys for a cluster with backups enabled — the toolchain image, the backup RBAC, the S3 plugin ConfigMap, the Job labels/namespace, the Job container env, and the `jobTemplate` pod-template overrides. Six verifications are covered by tests plus live checks:
+
+1. **Image binaries** — the `gpbackup`, `gprestore`, and `gpbackup_s3_plugin` binaries are present in the `cloudberry-backup:2.1.0` toolchain image (verified live via `docker run`; the Job container uses the configured image).
+2. **RBAC** — the `cloudberry-backup-sa` ServiceAccount and the `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch) plus the RoleBinding. The backup Job references `cloudberry-backup-sa`.
+3. **S3 ConfigMap** — the generated `{cluster}-backup-s3-config` ConfigMap carries `executablepath: /usr/local/bin/gpbackup_s3_plugin` plus the region/endpoint/credentials/bucket/folder/encryption placeholders and the four multipart placeholders, and **no** `aws_signature_version` key.
+4. **Job labels/namespace** — the Job lives in the cluster namespace and carries `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster>`, `avsoft.io/component: backup`, and `avsoft.io/backup-operation: backup`.
+5. **Job env + envsubst** — the container carries `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` (AWS creds via `SecretKeyRef` to `backup-s3-credentials`) and runs `envsubst` to render `/tmp/s3-config.yaml`.
+6. **jobTemplate overrides** — `resources`, `nodeSelector`, `tolerations`, `serviceAccountName`, `backoffLimit`, `activeDeadlineSeconds`, and `ttlSecondsAfterFinished` all propagate to the built Job.
+
+The scenario is driven by the sample CR `deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml` (full S3 destination with an explicit `jobTemplate`) and is covered by `test/functional/scenario72_backup_infrastructure_test.go` and `test/e2e/scenario72_backup_infrastructure_e2e_test.go`.
 
 ### Retention Cleanup Job
 

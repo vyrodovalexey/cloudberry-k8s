@@ -2431,6 +2431,31 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario71
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario71
 ```
 
+#### Scenario 72 — Backup Infrastructure Deployment
+
+Verifies the backup **infrastructure** the operator deploys for a cluster with backups enabled — the toolchain image, the backup RBAC, the S3 plugin ConfigMap, the Job labels/namespace, the Job container env (incl. `envsubst`), and the `jobTemplate` pod-template overrides. The sample CR enables backups with the full S3 destination block (Secret credentials) **and** an explicit `backup.jobTemplate` exercising every override.
+
+Six infrastructure verifications:
+
+- **V1 — Image binaries**: `gpbackup`, `gprestore`, `gpbackup_s3_plugin` present in `cloudberry-backup:2.1.0` (verified live via `docker run`; the Job container uses the configured image).
+- **V2 — RBAC**: `cloudberry-backup-sa` ServiceAccount + `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch) + RoleBinding (rendered from `deploy/helm/cloudberry-operator/templates/backup-rbac.yaml`; verified live and by `helm template`). The Job references `cloudberry-backup-sa`.
+- **V3 — S3 ConfigMap**: `<cluster>-backup-s3-config` carries `executablepath: /usr/local/bin/gpbackup_s3_plugin`, the region/endpoint/credentials/bucket/folder/encryption placeholders and the four multipart placeholders, and **no** `aws_signature_version`.
+- **V4 — Job labels/namespace**: Job in the cluster namespace labelled `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster>`, `avsoft.io/component: backup`, `avsoft.io/backup-operation: backup`.
+- **V5 — Job env + envsubst**: `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, `BACKUP_JOBS` (defaults `1`/`gzip`/`1`; AWS creds via `SecretKeyRef` to `backup-s3-credentials`), rendering `/tmp/s3-config.yaml`. These env vars are informational; the CLI still passes `--dbname`/`--compression-level`/`--compression-type`/`--jobs`.
+- **V6 — jobTemplate overrides**: `resources` (req `500m`/`512Mi`, lim `2`/`2Gi`), `nodeSelector` (`kubernetes.io/os=linux`), `tolerations` (`dedicated=backup:NoSchedule`), `serviceAccountName` (`cloudberry-backup-sa`), `backoffLimit=2`, `activeDeadlineSeconds=7200`, `ttlSecondsAfterFinished=86400` all propagate to the built Job.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario72-backup-infrastructure.yaml`
+- **Functional tests**: `test/functional/scenario72_backup_infrastructure_test.go`
+- **E2E tests**: `test/e2e/scenario72_backup_infrastructure_e2e_test.go`
+
+```bash
+# Run Scenario 72 backup infrastructure functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario72
+
+# Run Scenario 72 backup infrastructure E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario72
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
