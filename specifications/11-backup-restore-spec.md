@@ -526,6 +526,85 @@ and is covered by `test/functional/scenario74_single_data_file_test.go`,
 `internal/api/scenario74_restore_test.go`, and the live data cycle
 `test/e2e/scripts/scenario74-single-data-file.sh`.
 
+### Scenario 75 — Compression Matrix (gzip vs zstd)
+
+**Scenario 75** triggers two on-demand full backups of the **same** data that
+differ **only** by compression algorithm — `gzip` and `zstd` — at the **same**
+compression level (`6`), so the comparison is apples-to-apples (same level,
+different codec). The operator builds a `Job` **directly** (not a `CronJob`) for
+each on-demand backup and renders `--compression-type gzip|zstd
+--compression-level 6` from the per-request `gpbackupOptions`; `zstd` is passed
+through verbatim with no special-casing. The functional/e2e tests
+(`test/functional/scenario75_compression_matrix_test.go`,
+`internal/api/scenario75_compression_test.go`) assert the rendered **builder
+args** (`--compression-type gzip`/`zstd`, `--compression-level 6`) and that the
+gzip and zstd arg slices differ in **exactly one** arg (the compression-type
+value).
+
+**Compression matrix on substantial public-schema data.** The live data cycle
+(`test/e2e/scripts/scenario75-compression-matrix.sh`) exercises the matrix on the
+**substantial `public` schema** (`public.users` + `public.orders`, ~189 MB at the
+default `DATA_TARGET_MB`): **both** the gzip and the zstd backup are scoped with
+`--include-schema public` at `--compression-level 6`. Both backups complete
+cleanly (2/2 tables), their on-disk data-file totals are both `> 0` and **differ**
+(the size comparison reports both totals and which codec is smaller), and **both**
+restore cleanly into their own redirect databases (`mydb_gzip_restored` /
+`mydb_zstd_restored`) with row counts matching the public-schema baseline
+(`users=9533`, `orders=476625`).
+
+**Verified run.** In the live verification the gzip backup's total data-file bytes
+were **4,204,206** (~4.01 MiB) and the zstd backup's were **3,759,562**
+(~3.59 MiB) — **zstd smaller by 444,644 bytes (~10.6%)**, the expected outcome at
+the same compression level. Both restored cleanly into `mydb_gzip_restored` /
+`mydb_zstd_restored` with row counts equal to the baseline (`users=9533`,
+`orders=476625`).
+
+**`zstd` CLI image requirement (zstd-backup prerequisite).** zstd-compressed
+backups **require** the `zstd` command-line tool in the cluster image. `gpbackup`
+pipes each segment's `COPY` output through `zstd --compress`
+(`COPY … TO PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin …'`); without the
+`zstd` CLI on the segment hosts the pipe breaks with *"could not write to COPY
+program: Broken pipe"* and the zstd backup fails. `Dockerfile.cloudberry-official`
+therefore installs the `zstd` package (`gzip` is already present in the base
+image), so `cloudberry-official:2.1.0` carries both codecs. This is a hard
+prerequisite for `compressionType: zstd` backups (gzip needs no extra package).
+
+**Multipart-stability operational note.** The live matrix runs the
+`gpbackup_s3_plugin` with the **CR's** multipart settings — `backup_multipart_chunksize: 10MB`,
+`backup_max_concurrent_requests: 4` (and the matching restore values) — rather than
+the plugin's `500MB × 6` default, which is unstable under amd64 emulation. These
+smaller multipart settings keep the plugin stable across both the gzip and zstd
+backups and their restores.
+
+`mydb` is generated with a realistic tiny `analytics.daily_totals` aggregate
+table (365 rows) **in addition** to the substantial public tables, but because the
+backups are scoped to `--include-schema public` the analytics table is simply
+**not part of the backup set**. This deliberately keeps the tiny aggregate out of
+the backups: a **whole-DB zstd** backup consistently fails **only** on
+`analytics.daily_totals` with `pq: command error message: (2F000)` — a
+`gpbackup_s3_plugin` + zstd **small-file pipe** edge case under amd64 emulation
+(it is **not** zstd-missing — the `zstd` CLI ships in `cloudberry-official:2.1.0`,
+and both `zstd --compress` and `COPY ... TO PROGRAM 'zstd -c'` on that table
+succeed; the plugin's tiny pipe is the trigger). Scoping both codecs to the same
+`public` schema uses the substantial comparable data the matrix needs while
+sidestepping the emulation edge case.
+
+**`gpbackup` data-file extensions differ by codec.** `gpbackup` names per-segment
+data files by compression algorithm: **gzip** backups produce
+`gpbackup_<contentid>_<TS>.gz` and **zstd** backups produce
+`gpbackup_<contentid>_<TS>.zst`. The live size-measurement step therefore matches
+**both** the `.gz` and `.zst` data-file extensions for the respective timestamps
+(excluding the `*_toc.yaml` / `*_metadata.sql` / `*_config.yaml` / `*_report` /
+`*_plugin_config.yaml` sidecars, which never carry those extensions) before
+asserting that the gzip and zstd totals are both `> 0` and not equal.
+
+The scenario is driven by the sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario75-compression-matrix.yaml`
+and is covered by `test/functional/scenario75_compression_matrix_test.go`,
+`test/e2e/scenario75_compression_matrix_e2e_test.go`,
+`internal/api/scenario75_compression_test.go`, and the live data cycle
+`test/e2e/scripts/scenario75-compression-matrix.sh`.
+
 ## CLI Commands
 
 ```bash

@@ -2550,6 +2550,53 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario74
 go test ./internal/api/... -v -run TestHandleRestoreBackup_Scenario74Args
 ```
 
+#### Scenario 75 — Compression Matrix (gzip vs zstd)
+
+Triggers **two** on-demand full backups of the **same** data that differ **only** by compression algorithm — `gzip` and `zstd` — at the **same** compression level (`6`). Both backups complete cleanly and **both** restore into their own redirect databases; the on-disk sizes differ (zstd smaller). Both option sets are supplied **per-request via REST**; each on-demand `POST` creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob).
+
+- **gzip backup**: `gpbackupOptions{compressionType:"gzip", compressionLevel:6, includeSchemas:["public"]}`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"compressionType":"gzip","compressionLevel":6,"includeSchemas":["public"]}}'
+  ```
+
+- **zstd backup**: `gpbackupOptions{compressionType:"zstd", compressionLevel:6, includeSchemas:["public"]}`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"compressionType":"zstd","compressionLevel":6,"includeSchemas":["public"]}}'
+  ```
+
+  Verified gpbackup args differ in **exactly one** value: `--compression-type gzip` vs `--compression-type zstd` (both with `--compression-level 6`). `gpbackup` names per-segment data files by codec — gzip produces `gpbackup_<contentid>_<TS>_<oid>.gz`, zstd produces `gpbackup_<contentid>_<TS>_<oid>.zst` (the `.gz` vs `.zst` extension).
+
+- **zstd CLI prerequisite**: zstd-compressed backups **require** the `zstd` CLI in the cluster image — `gpbackup` pipes each segment's `COPY` output through `zstd --compress` (`COPY … TO PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin …'`), so without it the pipe breaks (*"could not write to COPY program: Broken pipe"*). `Dockerfile.cloudberry-official` installs the `zstd` package (gzip is already in the base image), so `cloudberry-official:2.1.0` carries both codecs.
+
+- **Operational notes**: both backups are scoped to `--include-schema public` (the substantial `public.users` + `public.orders` data) for a meaningful comparison; the `gpbackup_s3_plugin` runs with the CR's multipart settings (`chunksize 10MB`, `concurrency 4`) — not the unstable `500MB × 6` default under emulation; each backup is restored to its own redirect DB and row counts are verified.
+
+- **Verified outcome**: both backups complete cleanly (2/2 tables); data-file totals differ — gzip = **4,204,206 bytes** (~4.01 MiB), zstd = **3,759,562 bytes** (~3.59 MiB), **zstd smaller by 444,644 bytes (~10.6%)**. Both restore into `mydb_gzip_restored` / `mydb_zstd_restored` with row counts matching the baseline (`users=9533`, `orders=476625`).
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario75-compression-matrix.yaml`
+- **Functional tests**: `test/functional/scenario75_compression_matrix_test.go`
+- **E2E tests**: `test/e2e/scenario75_compression_matrix_e2e_test.go`
+- **API tests**: `internal/api/scenario75_compression_test.go`
+- **Live data cycle**: `test/e2e/scripts/scenario75-compression-matrix.sh`
+
+```bash
+# Run Scenario 75 compression-matrix functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario75
+
+# Run Scenario 75 compression-matrix E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario75
+
+# Run Scenario 75 API gzip/zstd backup arg tests
+go test ./internal/api/... -v -run TestHandleCreateBackup_Scenario75
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

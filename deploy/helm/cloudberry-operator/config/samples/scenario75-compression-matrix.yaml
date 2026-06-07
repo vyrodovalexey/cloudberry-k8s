@@ -1,0 +1,221 @@
+# =============================================================================
+# Scenario 75 — Compression Matrix (gzip vs zstd)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus the full backup block targeting an
+# S3-compatible (MinIO) destination.
+#
+# IMPORTANT — the Scenario 75 compression algorithm (gzip vs zstd) is supplied
+# PER-REQUEST at trigger time via the REST API, NOT baked into this CR. Both
+# backups use the SAME compression level (6) so the comparison is
+# apples-to-apples (same level, different algorithm). The operator renders
+#   gpbackup ... --compression-level 6 --compression-type <gzip|zstd>
+# from the per-request gpbackupOptions and overrides the harmless cluster-level
+# gpbackup defaults below:
+#
+#   # gzip backup: the operator emits
+#   #   gpbackup ... --compression-level 6 --compression-type gzip
+#   POST /api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test
+#     body: {"type":"full","databases":["mydb"],
+#            "gpbackupOptions":{"compressionType":"gzip","compressionLevel":6}}
+#
+#   # zstd backup: the operator emits
+#   #   gpbackup ... --compression-level 6 --compression-type zstd
+#   POST /api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test
+#     body: {"type":"full","databases":["mydb"],
+#            "gpbackupOptions":{"compressionType":"zstd","compressionLevel":6}}
+#
+#   # Restore EACH backup (from the timestamp returned by its backup) to its OWN
+#   # redirect DB so both restored copies can be verified independently:
+#   POST /api/v1alpha1/clusters/scenario75/backups/<TS_GZIP>/restore?namespace=cloudberry-test
+#     body: {"databases":["mydb"],
+#            "gprestoreOptions":{"redirectDb":"mydb_gzip_restored","createDb":true}}
+#   POST /api/v1alpha1/clusters/scenario75/backups/<TS_ZSTD>/restore?namespace=cloudberry-test
+#     body: {"databases":["mydb"],
+#            "gprestoreOptions":{"redirectDb":"mydb_zstd_restored","createDb":true}}
+#
+# The two backups cover the SAME mydb data; their on-disk data-file sizes DIFFER
+# (different codec at the same level) — the live script reports both sizes and
+# notes which is smaller (it does NOT hard-assert zstd < gzip).
+#
+# The on-demand POST creates a Job DIRECTLY (not a CronJob). The CR backup block
+# below is the destination/infrastructure; its cluster-level gpbackup defaults
+# are harmless and are overridden by the per-request gpbackupOptions.
+#
+# Credential source: Kubernetes Secret `backup-s3-credentials`
+#   (created by test/docker-compose/scripts/setup-minio.sh).
+#
+# In-cluster MinIO reachability: the CR endpoint `http://minio:9000` resolves via
+# the `minio` ExternalName Service (also created by setup-minio.sh) pointing at
+# host.docker.internal:9000.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario75
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "75"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario75-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario75-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination, Secret credential source. The
+  # cluster-level gpbackup defaults are harmless: Scenario 75 overrides them
+  # per-request via the REST API at backup trigger time (gzip then zstd, both at
+  # compressionLevel 6 — see header comment).
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Delete

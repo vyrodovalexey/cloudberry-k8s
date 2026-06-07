@@ -150,12 +150,18 @@ LABEL org.opencontainers.image.title="cloudberry-database-official" \
       org.opencontainers.image.base.name="rockylinux/rockylinux:9"
 
 # Install the official Apache Cloudberry RPM plus runtime dependencies.
+# NOTE: the `zstd` CLI is REQUIRED for gpbackup zstd-compressed backups —
+# gpbackup pipes segment COPY output through `zstd --compress` (COPY ... TO
+# PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin ...'). Without the zstd
+# command-line tool the pipe breaks ("could not write to COPY program: Broken
+# pipe") and zstd backups fail. gzip is already provided by the base image.
 ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
 RUN dnf -y install \
         apr bash bzip2 ca-certificates glibc-langpack-en hostname iproute \
         keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
         lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
-        pam perl procps-ng python3 readline rsync shadow-utils sudo which zlib && \
+        pam perl procps-ng python3 readline rsync shadow-utils sudo which zlib \
+        zstd && \
     dnf -y install "${CB_RPM_URL}" && \
     dnf clean all && rm -rf /var/cache/dnf
 

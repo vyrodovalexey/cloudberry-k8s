@@ -37,6 +37,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Scenario 72 — Backup Infrastructure Deployment](#scenario-72--backup-infrastructure-deployment)
   - [Scenario 73 — On-Demand Backup with gpbackup Options](#scenario-73--on-demand-backup-with-gpbackup-options)
   - [Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore](#scenario-74--single-data-file--copy-queue--gpbackup_helper--full-option-restore)
+  - [Scenario 75 — Compression Matrix (gzip vs zstd)](#scenario-75--compression-matrix-gzip-vs-zstd)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -944,6 +945,40 @@ The `withGlobals=false` and `truncateTable=false` options are **omitted** (their
 **Verified outcome:** `mydb_restored` is created and populated; `public.users` / `public.orders` are redirected into the `restored` schema; and ANALYZE ran (`pg_stats` has rows for the restored tables).
 
 The live data cycle is driven by `test/e2e/scripts/scenario74-single-data-file.sh` and is covered by `test/functional/scenario74_single_data_file_test.go`, `test/e2e/scenario74_single_data_file_e2e_test.go`, and `internal/api/scenario74_restore_test.go`.
+
+### Scenario 75 — Compression Matrix (gzip vs zstd)
+
+Scenario 75 triggers **two** on-demand full backups of the **same** data that differ **only** by compression algorithm — `gzip` and `zstd` — at the **same** compression level (`6`), so the comparison is apples-to-apples. Both backups complete cleanly and **both** restore into their own redirect databases; the on-disk backup sizes differ (zstd smaller). Both option sets are supplied **per-request via REST**; each on-demand `POST` creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob). The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario75-compression-matrix.yaml` provides the destination/infrastructure (full S3 block, Secret credentials).
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario75-compression-matrix.yaml
+```
+
+> **zstd CLI prerequisite.** zstd-compressed backups **require** the `zstd` command-line tool in the cluster image: `gpbackup` pipes each segment's `COPY` output through `zstd --compress` (`COPY … TO PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin …'`), so without the `zstd` CLI the pipe breaks with *"could not write to COPY program: Broken pipe"*. `cloudberry-official:2.1.0` now ships the `zstd` package (`gzip` is already in the base image), so both codecs work. Both backups are scoped to `--include-schema public` (the substantial `public.users` + `public.orders` data) for a meaningful comparison, and the `gpbackup_s3_plugin` runs with the CR's multipart settings (`chunksize 10MB`, `concurrency 4`) to stay stable under emulation.
+
+**gzip backup** — `gpbackupOptions{compressionType:"gzip", compressionLevel:6, includeSchemas:["public"]}`:
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test' \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"full","databases":["mydb"],
+       "gpbackupOptions":{"compressionType":"gzip","compressionLevel":6,"includeSchemas":["public"]}}'
+```
+
+**zstd backup** — `gpbackupOptions{compressionType:"zstd", compressionLevel:6, includeSchemas:["public"]}`:
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario75/backups?namespace=cloudberry-test' \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"full","databases":["mydb"],
+       "gpbackupOptions":{"compressionType":"zstd","compressionLevel":6,"includeSchemas":["public"]}}'
+```
+
+Verified `gpbackup` args differ in **exactly one** value: `--compression-type gzip` vs `--compression-type zstd` (both with `--compression-level 6`). `gpbackup` names per-segment data files by codec — gzip produces `gpbackup_<contentid>_<TS>_<oid>.gz` and zstd produces `gpbackup_<contentid>_<TS>_<oid>.zst` (note the `.gz` vs `.zst` extension).
+
+**Verified outcome:** both backups complete cleanly (2/2 tables) and their data-file totals differ — gzip = **4,204,206 bytes** (~4.01 MiB), zstd = **3,759,562 bytes** (~3.59 MiB), **zstd smaller by 444,644 bytes (~10.6%)**. Both restore cleanly into their own redirect databases (`mydb_gzip_restored` / `mydb_zstd_restored`) with row counts matching the baseline (`users=9533`, `orders=476625`).
+
+The live data cycle is driven by `test/e2e/scripts/scenario75-compression-matrix.sh` and is covered by `test/functional/scenario75_compression_matrix_test.go`, `test/e2e/scenario75_compression_matrix_e2e_test.go`, and `internal/api/scenario75_compression_test.go`.
 
 ## Configuration Management
 
