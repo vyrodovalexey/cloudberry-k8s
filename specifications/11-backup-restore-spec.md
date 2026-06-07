@@ -420,6 +420,112 @@ The `gpbackupOptions` fields map to `gpbackup` flags as follows:
 }
 ```
 
+The `gprestoreOptions` fields map to `gprestore` flags as follows:
+
+| Request field | gprestore flag |
+|---|---|
+| `timestamp` | `--timestamp` |
+| `jobs` | `--jobs` |
+| `redirectDb` | `--redirect-db` |
+| `redirectSchema` | `--redirect-schema` |
+| `createDb` | `--create-db` |
+| `includeSchemas` (repeated) | one `--include-schema` per schema |
+| `includeTables` (repeated) | one `--include-table` per table |
+| `excludeTables` (repeated) | one `--exclude-table` per table |
+| `withGlobals` | `--with-globals` |
+| `withStats` | `--with-stats` |
+| `runAnalyze` | `--run-analyze` |
+| `onErrorContinue` | `--on-error-continue` |
+| `dataOnly` | `--data-only` |
+| `metadataOnly` | `--metadata-only` |
+| `truncateTable` | `--truncate-table` |
+| `resizeCluster` | `--resize-cluster` |
+
+**`include-schema` / `include-table` mutual exclusivity (restore).** `gprestore`
+enforces that `--include-schema` and `--include-table` may **not** be specified
+together (it aborts with *"The following flags may not be specified together:
+include-schema, include-table, include-table-file"*). When a **restore** request
+supplies **both** `includeSchemas` and `includeTables`, the operator emits the
+more specific `--include-table` (one per table — **table-level precedence**) and
+**omits** `--include-schema`, keeping the `gprestore` invocation valid. When only
+one of the two is set, that filter is emitted as-is. `--exclude-table` is
+unaffected and is always emitted when present. This rule applies to the
+**restore** path only; the **backup** path (`gpbackup`) accepts `--include-schema`
+and `--include-table` together and is unchanged.
+
+**`run-analyze` / `with-stats` mutual exclusivity (restore).** `gprestore`
+enforces that `--run-analyze` and `--with-stats` may **not** be specified
+together (it aborts with *"The following flags may not be specified together:
+run-analyze, with-stats"*). When a **restore** request supplies **both**
+`runAnalyze=true` and `withStats=true`, the operator emits `--run-analyze` and
+**omits** `--with-stats` — **run-analyze precedence**: recomputing planner
+statistics via `ANALYZE` supersedes restoring the backed-up statistics, so the
+fresher result wins and the `gprestore` invocation stays valid. When only one of
+the two is set, that flag is emitted as-is. This rule applies to the **restore**
+path only; the **backup** path (`gpbackup --with-stats`) is unaffected and
+unchanged.
+
+### Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore
+
+**Scenario 74** triggers an on-demand **single-data-file** backup
+(`singleDataFile=true`, `copyQueueSize=4`; the args contain `--single-data-file`
+and `--copy-queue-size 4` and **omit** `--jobs`, which `gpbackup` rejects with
+`--single-data-file`) followed by a full-option **restore** supplied per-request:
+`jobs=4`, `redirectDb=mydb_restored`, `redirectSchema=restored`, `createDb`,
+`onErrorContinue` (and `withGlobals=false`, `truncateTable=false`, which are
+**omitted**). The restore request supplies **both** `includeSchemas=[public,
+analytics]` and `includeTables=[public.users, public.orders]`; per the
+mutual-exclusivity rule above the operator emits `--include-table public.users
+--include-table public.orders` (table-level precedence) and **omits**
+`--include-schema`. The restore also supplies **both** `withStats=true` and
+`runAnalyze=true`; per the run-analyze/with-stats mutual-exclusivity rule the
+operator emits `--run-analyze` (run-analyze precedence — ANALYZE recomputes the
+statistics and verifies "ANALYZE ran (stats present)") and **omits**
+`--with-stats`. The operator returns a `Job` (not a `CronJob`) for both the
+backup and the restore.
+
+**Single-data-file backup mechanics.** `--single-data-file` requires the
+`gpbackup_helper` binary on **every** segment host — it consolidates each
+segment's per-table COPY streams into one file. `gpbackup_helper` ships in the
+cluster image (`cloudberry-official:2.1.0`, at `$GPHOME/bin/gpbackup_helper`,
+symlinked cluster-wide); the live script asserts its presence before backing up.
+A single-data-file backup produces exactly **one consolidated data file per
+segment** (`gpbackup_<contentid>_<TS>.gz`) instead of many per-table data files,
+plus a per-segment `gpbackup_<contentid>_<TS>_toc.yaml` and the shared
+coordinator metadata. `--copy-queue-size` controls how many concurrent COPY
+streams feed that single file (it replaces `--jobs`, which is invalid in
+single-data-file mode).
+
+**`--copy-queue-size` for single-data-file restore.** `gprestore` **rejects
+`--jobs`** when restoring a single-data-file backup (*"Cannot use jobs flag when
+restoring backups with a single data file per segment"*). The parallelism flag
+for a single-data-file restore is `--copy-queue-size`, so the live data cycle
+maps the request's `jobs=4` to `--copy-queue-size 4`. (The REST builder, which
+targets the general multi-file restore path, emits `--jobs` for `jobs`; the
+single-data-file `--copy-queue-size` substitution is applied on the
+single-data-file restore path exercised by the live script.)
+
+**`--redirect-schema` pre-existence requirement.** `gprestore`'s
+`--redirect-schema` requires the target schema to **already exist** in the
+redirect database (*"Schema … to redirect into does not exist"*). `--create-db`
+creates the database but **not** the redirect schema, so the operator/live flow
+**pre-creates both** the redirect database (`mydb_restored`) and the redirect
+schema (`restored`) before running `gprestore`, then restores into the existing
+schema.
+
+**Verified outcome.** `mydb_restored` is created and populated (row counts > 0);
+the `public.users` / `public.orders` objects are redirected into the `restored`
+schema; and ANALYZE ran (`pg_stats` has rows for the restored tables —
+`pg_stats` presence is the reliable signal, since `last_analyze` may be NULL on
+segments).
+
+The scenario is driven by the sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario74-single-data-file.yaml`
+and is covered by `test/functional/scenario74_single_data_file_test.go`,
+`test/e2e/scenario74_single_data_file_e2e_test.go`,
+`internal/api/scenario74_restore_test.go`, and the live data cycle
+`test/e2e/scripts/scenario74-single-data-file.sh`.
+
 ## CLI Commands
 
 ```bash

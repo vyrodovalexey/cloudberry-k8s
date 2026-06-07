@@ -36,6 +36,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Verified Result](#verified-result)
   - [Scenario 72 — Backup Infrastructure Deployment](#scenario-72--backup-infrastructure-deployment)
   - [Scenario 73 — On-Demand Backup with gpbackup Options](#scenario-73--on-demand-backup-with-gpbackup-options)
+  - [Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore](#scenario-74--single-data-file--copy-queue--gpbackup_helper--full-option-restore)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -898,6 +899,51 @@ Two sub-cases are verified:
   Verified `gpbackup` args: `--no-compression` is present and `--compression-level` is **absent** — the compression level is ignored (`--no-compression` takes precedence).
 
 These are covered by `test/functional/scenario73_backup_options_test.go` and `test/e2e/scenario73_backup_options_e2e_test.go`.
+
+### Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore
+
+Scenario 74 verifies a **single-data-file** backup (with `--copy-queue-size`, which requires `gpbackup_helper` on every segment) followed by a **full-option restore** that exercises every `gprestore` option and the operator's three mutual-exclusivity precedence rules. Both the backup and the restore options are supplied **per-request via REST**. The on-demand `POST` creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob). The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario74-single-data-file.yaml` provides the destination/infrastructure (full S3 block, Secret credentials).
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario74-single-data-file.yaml
+```
+
+**Single-data-file backup.** `gpbackupOptions{singleDataFile:true, copyQueueSize:4}`:
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario74/backups?namespace=cloudberry-test' \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"full","databases":["mydb"],
+       "gpbackupOptions":{"singleDataFile":true,"copyQueueSize":4}}'
+```
+
+Verified `gpbackup` args: `--single-data-file --copy-queue-size 4`, with `--jobs` **omitted** (`gpbackup` rejects `--jobs` in single-data-file mode). `--single-data-file` requires the `gpbackup_helper` binary on **every** segment (present in `cloudberry-official:2.1.0` at `$GPHOME/bin/gpbackup_helper`); the backup produces exactly **one consolidated data file per segment** (`gpbackup_<contentid>_<TS>.gz`) plus a per-segment `_toc.yaml` and the shared coordinator metadata. The operator builds a `Job` directly (not a `CronJob`).
+
+**Full-option restore.** From the captured timestamp, `gprestoreOptions` with `jobs=4`, `redirectDb=mydb_restored`, `redirectSchema=restored`, `createDb=true`, `includeSchemas=[public, analytics]`, `includeTables=[public.users, public.orders]`, `withGlobals=false`, `withStats=true`, `runAnalyze=true`, `onErrorContinue=true`, `truncateTable=false`:
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario74/backups/<timestamp>/restore?namespace=cloudberry-test' \
+  -H 'Content-Type: application/json' \
+  -d '{"databases":["mydb"],
+       "gprestoreOptions":{"jobs":4,"redirectDb":"mydb_restored","redirectSchema":"restored",
+         "createDb":true,"includeSchemas":["public","analytics"],
+         "includeTables":["public.users","public.orders"],
+         "withGlobals":false,"withStats":true,"runAnalyze":true,
+         "onErrorContinue":true,"truncateTable":false}}'
+```
+
+The operator resolves the conflicting options so the `gprestore` invocation stays valid:
+
+- **`--include-schema` / `--include-table` are mutually exclusive** → with both `includeSchemas` and `includeTables` supplied, the operator emits `--include-table public.users --include-table public.orders` (**table-level precedence**) and **omits** `--include-schema`.
+- **`--with-stats` / `--run-analyze` are mutually exclusive** → with both `withStats` and `runAnalyze` supplied, the operator emits `--run-analyze` (**run-analyze precedence** — ANALYZE recomputes the statistics) and **omits** `--with-stats`.
+- **`--jobs` is invalid for a single-data-file restore** → the single-data-file restore parallelism flag is `--copy-queue-size`, so the live cycle maps `jobs=4` to `--copy-queue-size 4`.
+- **`--redirect-schema` requires the target schema to pre-exist** → `--create-db` creates the database but not the schema, so the flow pre-creates **both** the redirect database (`mydb_restored`) and the redirect schema (`restored`) before restoring.
+
+The `withGlobals=false` and `truncateTable=false` options are **omitted** (their flags are not emitted).
+
+**Verified outcome:** `mydb_restored` is created and populated; `public.users` / `public.orders` are redirected into the `restored` schema; and ANALYZE ran (`pg_stats` has rows for the restored tables).
+
+The live data cycle is driven by `test/e2e/scripts/scenario74-single-data-file.sh` and is covered by `test/functional/scenario74_single_data_file_test.go`, `test/e2e/scenario74_single_data_file_e2e_test.go`, and `internal/api/scenario74_restore_test.go`.
 
 ## Configuration Management
 

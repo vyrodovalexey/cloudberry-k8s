@@ -331,8 +331,17 @@ func buildGprestoreArgs(opts *cbv1alpha1.GprestoreOptions, jobOpts *RestoreJobOp
 		if jobOpts.RedirectSchema != "" {
 			args = append(args, "--redirect-schema", jobOpts.RedirectSchema)
 		}
-		args = appendRepeatedFlag(args, "--include-schema", jobOpts.IncludeSchemas)
-		args = appendRepeatedFlag(args, "--include-table", jobOpts.IncludeTables)
+		// gprestore enforces that --include-schema and --include-table are
+		// MUTUALLY EXCLUSIVE ("flags may not be specified together:
+		// include-schema, include-table"). When both filters are supplied on a
+		// restore we emit the more specific --include-table (table-level
+		// precedence) and OMIT --include-schema, so the gprestore invocation
+		// stays valid. When only one is set, emit that one as-is.
+		if len(jobOpts.IncludeTables) > 0 {
+			args = appendRepeatedFlag(args, "--include-table", jobOpts.IncludeTables)
+		} else {
+			args = appendRepeatedFlag(args, "--include-schema", jobOpts.IncludeSchemas)
+		}
 		args = appendRepeatedFlag(args, "--exclude-table", jobOpts.ExcludeTables)
 	}
 
@@ -341,14 +350,23 @@ func buildGprestoreArgs(opts *cbv1alpha1.GprestoreOptions, jobOpts *RestoreJobOp
 
 // appendGprestoreBoolFlags appends the gprestore boolean option flags that are
 // enabled in opts, in a stable order.
+//
+// gprestore enforces that --run-analyze and --with-stats are MUTUALLY EXCLUSIVE
+// ("flags may not be specified together: run-analyze, with-stats"). When BOTH
+// are requested we emit --run-analyze (run-analyze precedence: recomputing
+// planner statistics via ANALYZE supersedes restoring the backed-up stats) and
+// OMIT --with-stats so the gprestore invocation stays valid. When only one is
+// set, that one is emitted as-is.
 func appendGprestoreBoolFlags(args []string, opts *cbv1alpha1.GprestoreOptions) []string {
+	effectiveWithStats := opts.WithStats && !opts.RunAnalyze
+
 	flags := []struct {
 		enabled bool
 		flag    string
 	}{
 		{opts.CreateDb, "--create-db"},
 		{opts.WithGlobals, "--with-globals"},
-		{opts.WithStats, "--with-stats"},
+		{effectiveWithStats, "--with-stats"},
 		{opts.RunAnalyze, "--run-analyze"},
 		{opts.OnErrorContinue, "--on-error-continue"},
 		{opts.TruncateTable, "--truncate-table"},

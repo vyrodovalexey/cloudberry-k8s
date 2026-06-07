@@ -2496,6 +2496,60 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario73
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario73
 ```
 
+#### Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore
+
+Verifies a **single-data-file** backup (with `--copy-queue-size`, which requires `gpbackup_helper` on every segment) followed by a **full-option restore** that exercises every `gprestore` option and the operator's three mutual-exclusivity precedence rules. Both option sets are supplied **per-request via REST**; the on-demand `POST` creates a Kubernetes **Job DIRECTLY** (not via the scheduled CronJob).
+
+- **Single-data-file backup**: `gpbackupOptions{singleDataFile:true, copyQueueSize:4}`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario74/backups?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"full","databases":["mydb"],
+         "gpbackupOptions":{"singleDataFile":true,"copyQueueSize":4}}'
+  ```
+
+  Verified gpbackup args: `--single-data-file --copy-queue-size 4`, with `--jobs` **omitted** (`gpbackup` rejects `--jobs` in single-data-file mode). Requires `gpbackup_helper` on every segment (present in `cloudberry-official:2.1.0`); produces exactly **one consolidated data file per segment** (`gpbackup_<contentid>_<TS>.gz`) plus a per-segment `_toc.yaml` and shared coordinator metadata. The operator returns a `Job` (never a `CronJob`).
+
+- **Full-option restore**: `jobs=4`, `redirectDb=mydb_restored`, `redirectSchema=restored`, `createDb=true`, `includeSchemas=[public, analytics]`, `includeTables=[public.users, public.orders]`, `withGlobals=false`, `withStats=true`, `runAnalyze=true`, `onErrorContinue=true`, `truncateTable=false`.
+
+  ```bash
+  curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario74/backups/<timestamp>/restore?namespace=cloudberry-test' \
+    -H 'Content-Type: application/json' \
+    -d '{"databases":["mydb"],
+         "gprestoreOptions":{"jobs":4,"redirectDb":"mydb_restored","redirectSchema":"restored",
+           "createDb":true,"includeSchemas":["public","analytics"],
+           "includeTables":["public.users","public.orders"],
+           "withGlobals":false,"withStats":true,"runAnalyze":true,
+           "onErrorContinue":true,"truncateTable":false}}'
+  ```
+
+  The operator resolves the conflicting options so the `gprestore` invocation stays valid:
+
+  - **`--include-schema` / `--include-table` mutually exclusive** → emits `--include-table public.users --include-table public.orders` (table-level precedence), **omits** `--include-schema`.
+  - **`--with-stats` / `--run-analyze` mutually exclusive** → emits `--run-analyze` (run-analyze precedence — ANALYZE recomputes statistics), **omits** `--with-stats`.
+  - **`--jobs` invalid for a single-data-file restore** → the single-data-file restore parallelism flag is `--copy-queue-size`, so the live cycle maps `jobs=4` to `--copy-queue-size 4`.
+  - **`--redirect-schema` requires a pre-existing schema** → `--create-db` creates the database but not the schema, so the flow pre-creates **both** `mydb_restored` and the `restored` schema before restoring.
+
+  `withGlobals=false` / `truncateTable=false` are **omitted**. Verified outcome: `mydb_restored` is created and populated; objects are redirected into the `restored` schema; ANALYZE ran (`pg_stats` has rows for the restored tables).
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario74-single-data-file.yaml`
+- **Functional tests**: `test/functional/scenario74_single_data_file_test.go`
+- **E2E tests**: `test/e2e/scenario74_single_data_file_e2e_test.go`
+- **API restore test**: `internal/api/scenario74_restore_test.go`
+- **Live data cycle**: `test/e2e/scripts/scenario74-single-data-file.sh`
+
+```bash
+# Run Scenario 74 single-data-file functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario74
+
+# Run Scenario 74 single-data-file E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario74
+
+# Run Scenario 74 API restore round-trip test
+go test ./internal/api/... -v -run TestHandleRestoreBackup_Scenario74Args
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

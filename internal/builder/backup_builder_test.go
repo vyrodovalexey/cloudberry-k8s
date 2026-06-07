@@ -118,32 +118,64 @@ func TestBuildGpbackupArgs(t *testing.T) {
 }
 
 func TestBuildGprestoreArgs(t *testing.T) {
-	args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
-		Jobs:            4,
-		CreateDb:        true,
-		WithStats:       true,
-		RunAnalyze:      true,
-		OnErrorContinue: true,
-		TruncateTable:   true,
-	}, &RestoreJobOptions{
-		Timestamp:      "20260519020000",
-		RedirectDb:     "mydb_restored",
-		RedirectSchema: "restored",
-		IncludeSchemas: []string{"public"},
-		IncludeTables:  []string{"public.users"},
+	// gprestore forbids --include-schema together with --include-table. When
+	// BOTH filters are supplied the builder emits --include-table (table-level
+	// precedence) and OMITS --include-schema.
+	t.Run("both filters: include-table wins, include-schema omitted", func(t *testing.T) {
+		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
+			Jobs:            4,
+			CreateDb:        true,
+			WithStats:       true,
+			RunAnalyze:      true,
+			OnErrorContinue: true,
+			TruncateTable:   true,
+		}, &RestoreJobOptions{
+			Timestamp:      "20260519020000",
+			RedirectDb:     "mydb_restored",
+			RedirectSchema: "restored",
+			IncludeSchemas: []string{"public"},
+			IncludeTables:  []string{"public.users"},
+		})
+		joined := strings.Join(args, " ")
+		assert.Contains(t, joined, "--timestamp 20260519020000")
+		assert.Contains(t, joined, "--jobs 4")
+		assert.Contains(t, joined, "--create-db")
+		// gprestore forbids --run-analyze together with --with-stats. With both
+		// set the builder emits --run-analyze (precedence) and OMITS
+		// --with-stats so the gprestore invocation stays valid.
+		assert.Contains(t, joined, "--run-analyze")
+		assert.NotContains(t, joined, "--with-stats")
+		assert.Contains(t, joined, "--on-error-continue")
+		assert.Contains(t, joined, "--truncate-table")
+		assert.Contains(t, joined, "--redirect-db mydb_restored")
+		assert.Contains(t, joined, "--redirect-schema restored")
+		assert.Contains(t, joined, "--include-table public.users")
+		assert.NotContains(t, joined, "--include-schema")
 	})
-	joined := strings.Join(args, " ")
-	assert.Contains(t, joined, "--timestamp 20260519020000")
-	assert.Contains(t, joined, "--jobs 4")
-	assert.Contains(t, joined, "--create-db")
-	assert.Contains(t, joined, "--with-stats")
-	assert.Contains(t, joined, "--run-analyze")
-	assert.Contains(t, joined, "--on-error-continue")
-	assert.Contains(t, joined, "--truncate-table")
-	assert.Contains(t, joined, "--redirect-db mydb_restored")
-	assert.Contains(t, joined, "--redirect-schema restored")
-	assert.Contains(t, joined, "--include-schema public")
-	assert.Contains(t, joined, "--include-table public.users")
+
+	// When ONLY includeSchemas is set, --include-schema is emitted per schema.
+	t.Run("schema-only: include-schema emitted, no include-table", func(t *testing.T) {
+		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{Jobs: 4}, &RestoreJobOptions{
+			Timestamp:      "20260519020000",
+			IncludeSchemas: []string{"public", "analytics"},
+		})
+		joined := strings.Join(args, " ")
+		assert.Contains(t, joined, "--include-schema public")
+		assert.Contains(t, joined, "--include-schema analytics")
+		assert.NotContains(t, joined, "--include-table")
+	})
+
+	// When ONLY withStats is set (runAnalyze=false), --with-stats is emitted and
+	// --run-analyze is absent (complementary to the mutual-exclusivity rule).
+	t.Run("with-stats only: with-stats emitted, no run-analyze", func(t *testing.T) {
+		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
+			Jobs:      4,
+			WithStats: true,
+		}, &RestoreJobOptions{Timestamp: "20260519020000"})
+		joined := strings.Join(args, " ")
+		assert.Contains(t, joined, "--with-stats")
+		assert.NotContains(t, joined, "--run-analyze")
+	})
 }
 
 func TestBuildBackupS3ConfigMap(t *testing.T) {
