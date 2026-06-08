@@ -2597,6 +2597,39 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario75
 go test ./internal/api/... -v -run TestHandleCreateBackup_Scenario75
 ```
 
+#### Scenario 76 — Scheduled Backup via CronJob + Status Population
+
+Exercises the **scheduled** backup path. Setting `spec.backup.schedule` causes the operator to reconcile a **CronJob** that fires on schedule and spawns a backup **Job**; after the Job succeeds the operator **populates the backup status** on the `CloudberryCluster`. Unlike the on-demand scenarios (73–75), which create a Kubernetes **Job DIRECTLY**, Scenario 76 verifies the `CronJob → Job` mechanism.
+
+- **CronJob spec**: the operator creates `{cluster}-backup-schedule` (here `scenario76-backup-schedule`) with `ownerReferences` → the `CloudberryCluster`, `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit: 3`, `failedJobsHistoryLimit: 3`, and a `jobTemplate` whose pod `restartPolicy` is `Never`. When the CronJob fires, Kubernetes spawns a Job `{cluster}-backup-schedule-<hash>`.
+
+- **Near-future schedule for testing**: the sample CR ships the production schedule `0 2 * * *`; the live test patches it to `*/2 * * * *` via `kubectl patch --type=merge` so the CronJob fires within ~2 minutes.
+
+- **Status population**: after the backup Job succeeds, the operator populates `status.backup` — `lastBackupTime`, `lastBackupTimestamp` (14-digit `YYYYMMDDHHMMSS`), `lastBackupStatus: Success`, `lastBackupType: full`, `lastBackupJobName` (matches the Job), `cronJobName` (`{cluster}-backup-schedule`), and `backupHistory[]` entries each with `timestamp`, `type`, `status`, `size`, and `duration`.
+
+- **14-digit timestamp guarantee**: `lastBackupTimestamp` is always a valid 14-digit `YYYYMMDDHHMMSS`. On-demand Jobs (`{cluster}-backup-<TS>`) keep the embedded timestamp; for CronJob-spawned Jobs (`{cluster}-backup-schedule-<hash>`), whose names don't embed a parseable timestamp, the operator derives it from the Job's `CompletionTime` (UTC).
+
+- **Steady-state status refresh**: backup status (`lastBackup*`, `backupHistory`) is refreshed on the operator's periodic reconcile **even when the cluster spec generation is unchanged**. The CronJob's Job completes asynchronously (no spec change), and the next periodic reconcile discovers it and updates the status — this is the key behavior that makes scheduled-backup status population work.
+
+- **`backupHistory` `size`**: each history entry now includes `size`, derived best-effort from the backup Job's `avsoft.io/backup-size-bytes` annotation (empty when unavailable).
+
+- **Execution model**: the CronJob firing and spawning a Job verifies the schedule mechanism plus the CronJob spec (`Forbid`, `3/3` history, `ownerReferences`, pod `restartPolicy: Never`). A standalone CronJob Job pod is not a segment host in `gp_segment_configuration`, so the real `gpbackup` data cycle runs via the proven coordinator-exec path; status population is verified from the resulting successful backup.
+
+- **Verified outcome**: the scheduled backup completes and the operator populates the status — `lastBackupTimestamp=20260607224409` (14-digit), `lastBackupStatus=Success`, `lastBackupType=full`, and `backupHistory[0]={timestamp, type:full, status:Success, size:4204206, duration:4s}`; `cronJobName=scenario76-backup-schedule` and `lastBackupJobName` matches the Job.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario76-scheduled-backup.yaml` (schedule `0 2 * * *`, test override `*/2 * * * *`)
+- **Functional tests**: `test/functional/scenario76_scheduled_backup_test.go`
+- **E2E tests**: `test/e2e/scenario76_scheduled_backup_e2e_test.go`
+- **Live data cycle**: `test/e2e/scripts/scenario76-scheduled-backup.sh`
+
+```bash
+# Run Scenario 76 scheduled-backup functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario76
+
+# Run Scenario 76 scheduled-backup E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario76
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

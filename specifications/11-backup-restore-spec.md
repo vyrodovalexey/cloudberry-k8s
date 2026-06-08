@@ -605,6 +605,82 @@ and is covered by `test/functional/scenario75_compression_matrix_test.go`,
 `internal/api/scenario75_compression_test.go`, and the live data cycle
 `test/e2e/scripts/scenario75-compression-matrix.sh`.
 
+### Scenario 76 — Scheduled Backup via CronJob + Status Population
+
+**Scenario 76** verifies the **scheduled** backup path: setting `spec.backup.schedule`
+causes the operator to reconcile a **CronJob** that fires on schedule and spawns a
+backup **Job**, after which the operator **populates the backup status** on the
+`CloudberryCluster` from the completed Job. Unlike the on-demand scenarios (73–75),
+which create a `Job` **directly**, Scenario 76 exercises the `CronJob → Job` mechanism.
+
+**CronJob spec.** When `backup.enabled: true` and `backup.schedule` is set, the
+operator creates/updates the CronJob `{cluster}-backup-schedule` (for this scenario,
+`scenario76-backup-schedule`) with:
+
+- `ownerReferences` → the `CloudberryCluster` (the CronJob is garbage-collected with the cluster);
+- `concurrencyPolicy: Forbid` (a new run is skipped while a previous run is still active);
+- `successfulJobsHistoryLimit: 3` and `failedJobsHistoryLimit: 3`;
+- a `jobTemplate` whose pod `restartPolicy` is `Never`.
+
+When the CronJob fires, Kubernetes spawns a Job named `{cluster}-backup-schedule-<hash>`
+(the `<hash>` is Kubernetes' CronJob run suffix and does **not** embed a parseable
+`gpbackup` timestamp — see the timestamp guarantee below).
+
+**Status population.** After a backup Job **succeeds**, the operator populates on
+`CloudberryClusterStatus.backup`:
+
+- `lastBackupTime` — the backup completion time (RFC3339);
+- `lastBackupTimestamp` — a **14-digit `YYYYMMDDHHMMSS`** value (see guarantee below);
+- `lastBackupStatus: Success` (`Success | Failed | InProgress`);
+- `lastBackupType: full` (`full | incremental`);
+- `lastBackupJobName` — the name of the backup Job that produced the status;
+- `cronJobName` — `{cluster}-backup-schedule`;
+- `backupHistory[]` — recent backup entries, each carrying `timestamp`, `type`,
+  `status`, **`size`**, and `duration`.
+
+**`backupHistory` `size` field.** Each `backupHistory` entry now includes `size`,
+derived (best-effort) from the backup Job's `avsoft.io/backup-size-bytes` annotation.
+When the annotation is unavailable the field is left empty; it is no longer omitted
+from history.
+
+**14-digit timestamp guarantee.** `lastBackupTimestamp` is **always** a valid 14-digit
+`YYYYMMDDHHMMSS` value. For on-demand Jobs (`{cluster}-backup-<TS>`) the operator keeps
+the timestamp **embedded in the Job name**. For CronJob-spawned Jobs
+(`{cluster}-backup-schedule-<hash>`), whose names do **not** embed a parseable
+timestamp, the operator **derives** the timestamp from the Job's `CompletionTime`
+(in **UTC**), so scheduled backups still report a well-formed 14-digit timestamp.
+
+**Steady-state status refresh.** Backup status (`lastBackup*` and `backupHistory`) is
+refreshed on the operator's **periodic reconcile** even when the cluster spec
+**generation is unchanged** (steady state). The operator keeps the backup status up to
+date from completed backup Jobs on an ongoing basis — not only when the spec changes.
+This steady-state refresh is the key behavior that makes scheduled-backup status
+population work: the CronJob's Job completes asynchronously (no spec change), and the
+next periodic reconcile discovers it and updates the status.
+
+**Execution model (live verification).** The CronJob firing and spawning a Job verifies
+the **schedule mechanism** plus the CronJob spec (`Forbid`, `3/3` history,
+`ownerReferences`, pod `restartPolicy: Never`). As with the other scenarios, a
+standalone CronJob Job pod is **not** a segment host in `gp_segment_configuration`, so
+the real `gpbackup` **data cycle** runs via the proven **coordinator-exec** path (see
+[MPP Dispatch and the Coordinator-Exec Data Cycle](#mpp-dispatch-and-the-coordinator-exec-data-cycle));
+status population is then verified from the resulting successful backup. For testing, a
+near-future schedule (`*/2 * * * *`) is used so the CronJob fires within ~2 minutes; the
+sample CR ships the production schedule `0 2 * * *`.
+
+**Verified outcome.** A scheduled backup completes and the operator populates the status:
+`lastBackupTimestamp=20260607224409` (14-digit), `lastBackupStatus=Success`,
+`lastBackupType=full`, and `backupHistory[0]={timestamp, type: full, status: Success,
+size: 4204206, duration: 4s}`. `cronJobName` is `scenario76-backup-schedule` and
+`lastBackupJobName` matches the backup Job.
+
+The scenario is driven by the sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario76-scheduled-backup.yaml`
+(schedule `0 2 * * *`, overridden to `*/2 * * * *` by the live test) and is covered by
+`test/functional/scenario76_scheduled_backup_test.go`,
+`test/e2e/scenario76_scheduled_backup_e2e_test.go`, and the live data cycle
+`test/e2e/scripts/scenario76-scheduled-backup.sh`.
+
 ## CLI Commands
 
 ```bash

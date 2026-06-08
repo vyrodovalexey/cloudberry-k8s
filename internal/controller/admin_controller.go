@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -58,6 +60,10 @@ const (
 	// Backup type label values used for backup/recovery metrics.
 	backupTypeFull        = "full"
 	backupTypeIncremental = "incremental"
+
+	// backupTimestampLayout is the gpbackup-style YYYYMMDDHHMMSS timestamp layout,
+	// used to derive a valid 14-digit timestamp for CronJob-spawned backup Jobs.
+	backupTimestampLayout = "20060102150405"
 
 	// Backup Job status codes for the cloudberry_backup_job_status gauge.
 	backupJobStatusPending   = 0.0
@@ -288,6 +294,12 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 		cluster.Annotations[util.AnnotationMaintenance] == "" &&
 		isExporterRoleReady(cluster) {
 		logger.Debug("skipping admin reconciliation, generation unchanged")
+		// The generation gate only short-circuits SPEC-DRIVEN reconciliation.
+		// Time/Job-derived status (e.g. backup status from completed Jobs) must
+		// still be refreshed on the periodic requeue; otherwise, once the cluster
+		// reaches steady state, backup status would never be populated after a
+		// scheduled/on-demand backup Job succeeds.
+		r.refreshBackupStatusOnSteadyState(ctx, cluster)
 		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true, nil
 	}
 
@@ -299,6 +311,37 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 	}
 
 	return ctrl.Result{}, false, nil
+}
+
+// refreshBackupStatusOnSteadyState refreshes the backup-related status fields
+// from completed backup/restore Jobs and persists them, even when the spec
+// generation is unchanged (steady state). This is required because the
+// generation gate in handleAdminEarlyReturns short-circuits spec-driven
+// reconciliation (which normally runs refreshBackupStatus via reconcileBackup),
+// but time/Job-derived status must still be refreshed on each periodic requeue.
+// Errors are handled non-fatally (logged and ignored), mirroring how the main
+// reconcile path treats sub-component failures.
+func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		return
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	if err := r.refreshBackupStatus(ctx, cluster); err != nil {
+		logger.Warn("failed to refresh backup status on steady-state reconcile", "error", err)
+		return
+	}
+
+	// Persist refreshed backup status. MergePatch is used so already-set fields
+	// written by other controllers (e.g. cronJobName) are not clobbered, and a
+	// status-only change does not bump the spec generation (status subresource).
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
+		logger.Warn("failed to patch backup status on steady-state reconcile", "error", err)
+	}
 }
 
 // handleConfigError handles a config reconciliation error by setting the condition and returning.
@@ -1943,6 +1986,7 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 		Timestamp: timestamp,
 		Type:      backupType,
 		Status:    status,
+		Size:      backupJobSizeHuman(job),
 		Duration:  duration,
 	})
 
@@ -2001,19 +2045,65 @@ func backupJobSizeBytes(job *batchv1.Job) float64 {
 	return size
 }
 
-// backupTimestampFromJob extracts a gpbackup-style timestamp from the Job name,
-// falling back to the last status timestamp.
+// backupJobSizeHuman returns a human-readable backup size (e.g. "2400Mi") derived
+// from the Job's avsoft.io/backup-size-bytes annotation. It returns "" when the
+// size is unknown (best-effort) so the omitempty BackupHistoryEntry.Size is dropped.
+func backupJobSizeHuman(job *batchv1.Job) string {
+	bytes := backupJobSizeBytes(job)
+	if bytes <= 0 {
+		return ""
+	}
+	return resource.NewQuantity(int64(bytes), resource.BinarySI).String()
+}
+
+// backupTimestampRegex validates a gpbackup-style YYYYMMDDHHMMSS (14-digit) timestamp.
+var backupTimestampRegex = regexp.MustCompile(`^\d{14}$`)
+
+// backupTimestampFromJob extracts a gpbackup-style 14-digit YYYYMMDDHHMMSS
+// timestamp for a backup/restore Job.
+//
+// On-demand Jobs encode the timestamp in their name
+// ("{cluster}-backup-<timestamp>"), which is parsed by prefix-trimming. CronJob
+// spawned Jobs are named "{cluster}-backup-schedule-<hash>" by Kubernetes, from
+// which a real 14-digit timestamp cannot be parsed; for these we fall back to the
+// Job's CompletionTime (else StartTime) formatted as YYYYMMDDHHMMSS in UTC. This
+// guarantees status.lastBackupTimestamp (and BackupHistoryEntry.Timestamp) is
+// always a valid 14-digit value.
 func backupTimestampFromJob(cluster *cbv1alpha1.CloudberryCluster, job *batchv1.Job) string {
 	prefixes := []string{
 		util.BackupJobName(cluster.Name, ""),
 		util.RestoreJobName(cluster.Name, ""),
 	}
 	for _, prefix := range prefixes {
-		if strings.HasPrefix(job.Name, prefix) {
-			return strings.TrimPrefix(job.Name, prefix)
+		if !strings.HasPrefix(job.Name, prefix) {
+			continue
+		}
+		// util.BackupJobName/RestoreJobName sanitize the name, trimming the
+		// trailing hyphen of the empty-timestamp prefix, so the remainder keeps a
+		// leading "-" (e.g. "-20260101020000"); trim it before validating.
+		parsed := strings.TrimPrefix(strings.TrimPrefix(job.Name, prefix), "-")
+		if backupTimestampRegex.MatchString(parsed) {
+			return parsed
 		}
 	}
+	if ts := backupTimestampFromJobTimes(job); ts != "" {
+		return ts
+	}
 	return cluster.Status.LastBackupTimestamp
+}
+
+// backupTimestampFromJobTimes derives a 14-digit YYYYMMDDHHMMSS timestamp from a
+// Job's CompletionTime (preferred) or StartTime in UTC, returning "" when neither
+// is set.
+func backupTimestampFromJobTimes(job *batchv1.Job) string {
+	switch {
+	case job.Status.CompletionTime != nil:
+		return job.Status.CompletionTime.UTC().Format(backupTimestampLayout)
+	case job.Status.StartTime != nil:
+		return job.Status.StartTime.UTC().Format(backupTimestampLayout)
+	default:
+		return ""
+	}
 }
 
 // backupTypeFromLabels resolves the backup type from the cluster's gpbackup spec.
