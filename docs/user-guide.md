@@ -46,6 +46,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Local Backup Destination (Scenario 81)](#local-backup-destination-scenario-81)
   - [Backup Security (Scenario 82)](#backup-security-scenario-82)
   - [Backup Failure Handling & Retries (Scenario 83)](#backup-failure-handling--retries-scenario-83)
+  - [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -1840,6 +1841,99 @@ so the cluster's deadline stays safe). The behavior is covered by
 
 ```bash
 bash test/e2e/scripts/scenario83-backup-failure.sh --cluster scenario83-s3
+```
+
+### Backup/Restore Metrics (Scenario 84)
+
+The operator exposes **nine** backup/restore Prometheus metrics derived from the backup,
+restore, and cleanup Jobs it observes. They let you alert on backup health, track backup
+size and duration over time, and confirm restores and retention cleanups succeed.
+
+#### How the metrics are exposed
+
+The `gpbackup_exporter` is implemented as the **operator's own `/metrics` endpoint** — the
+operator derives these metrics from the Kubernetes Jobs it observes (backup-, restore-, and
+cleanup-operation Jobs) plus their `avsoft.io/*` annotations and history outcomes, rather
+than from a separate sidecar binary. **vmagent** scrapes the operator `/metrics` endpoint
+(via the `prometheus.io/scrape` annotations on the operator Deployment/Service) into
+**VictoriaMetrics**, and the **Grafana operator dashboard** renders a panel for each
+metric. All nine metrics share the `cluster` and `namespace` labels.
+
+#### The nine metrics
+
+| Metric | Type | Extra labels | Meaning |
+|--------|------|--------------|---------|
+| `cloudberry_backup_total` | Counter | `type`, `result` | Total backups. `type` is `full` or `incremental`; **`result`** is `success` or `failed`. |
+| `cloudberry_backup_duration_seconds` | Histogram | `type` | Backup duration per `type` (use the `_count`/`_bucket`/`_sum` series). |
+| `cloudberry_backup_size_bytes` | Gauge | `timestamp` | Size in bytes of the backup with that 14-digit `YYYYMMDDHHMMSS` timestamp. |
+| `cloudberry_backup_last_success_timestamp` | Gauge | — | Unix time of the last successful backup (alert when `time() - <value>` grows too large). |
+| `cloudberry_backup_last_status` | Gauge | — | Latest backup status: **`0`=success, `1`=failed, `2`=in-progress**. |
+| `cloudberry_restore_total` | Counter | `result` | Total restores. **`result`** is `success` or `failed`. |
+| `cloudberry_restore_duration_seconds` | Histogram | — | Restore duration distribution. |
+| `cloudberry_backup_retention_deleted_total` | Counter | — | Backups deleted by retention cleanup (read as a monotonic increase). |
+| `cloudberry_backup_job_status` | Gauge | `job`, `operation` | Per-Job status: **`0`=pending, `1`=running, `2`=succeeded, `3`=failed**. `operation` is `backup`, `restore`, or `cleanup`. |
+
+> **The outcome label is `result`, not `status`.** On `cloudberry_backup_total` and
+> `cloudberry_restore_total` the outcome label is **`result`** (`success`|`failed`). Query
+> with `{result="success"}` / `{result="failed"}`. (The `cloudberry_backup_last_status` and
+> `cloudberry_backup_job_status` gauges encode their outcome as a numeric **value** — the
+> `0/1/2` and `0/1/2/3` codes above — not as a label.)
+
+#### Label and code reference
+
+- **`type`** (`backup_total`, `backup_duration_seconds`) — `full` or `incremental`, taken
+  from the backup Job's `avsoft.io/backup-type` label.
+- **`result`** (`backup_total`, `restore_total`) — `success` or `failed`, the Job outcome.
+- **`cloudberry_backup_last_status`** — `0` = last backup succeeded, `1` = last backup
+  failed, `2` = a backup is in progress.
+- **`cloudberry_backup_job_status`** — `0` = pending, `1` = running, `2` = succeeded,
+  `3` = failed, per individual Job (`job` label) and `operation`.
+
+#### Viewing the metrics
+
+Query them in VictoriaMetrics/Prometheus (port `8428` in the test environment):
+
+```bash
+C=scenario84-s3; N=cloudberry-test
+VM=http://localhost:8428
+
+# Full + incremental backups succeeded
+curl -s "$VM/api/v1/query" \
+  --data-urlencode "query=cloudberry_backup_total{cluster=\"$C\",namespace=\"$N\",result=\"success\"}"
+
+# Latest backup status (0=success, 1=failed, 2=in-progress)
+curl -s "$VM/api/v1/query" \
+  --data-urlencode "query=cloudberry_backup_last_status{cluster=\"$C\",namespace=\"$N\"}"
+
+# Seconds since the last successful backup (alert if this grows)
+curl -s "$VM/api/v1/query" \
+  --data-urlencode "query=time() - cloudberry_backup_last_success_timestamp{cluster=\"$C\",namespace=\"$N\"}"
+
+# Restores + retention deletions
+curl -s "$VM/api/v1/query" \
+  --data-urlencode "query=cloudberry_restore_total{cluster=\"$C\",namespace=\"$N\",result=\"success\"}"
+curl -s "$VM/api/v1/query" \
+  --data-urlencode "query=cloudberry_backup_retention_deleted_total{cluster=\"$C\",namespace=\"$N\"}"
+```
+
+On the **Grafana operator dashboard** (published with `make grafana-publish`), each metric
+has its own panel — Backup Operations Rate, Backup Duration (and Duration by Type), Backup
+Size, Backup Last Status, Time Since Last Successful Backup, Restores, Restore Duration,
+Backup Retention Deleted, and Backup Job Status — so you can watch backup health, size, and
+duration trends without writing PromQL by hand.
+
+#### Sample CR and verification
+
+The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`
+ships a single S3 cluster (`scenario84-s3`) that exercises full + incremental backups, a
+restore, a retention cleanup, and a forced failure, so every metric is populated. The
+behavior is covered by `test/functional/scenario84_metrics_test.go`,
+`test/integration/scenario84_metrics_integration_test.go`, and
+`test/e2e/scenario84_metrics_e2e_test.go`, and the live full-lifecycle metric check is
+driven by `test/e2e/scripts/scenario84-metrics.sh`:
+
+```bash
+bash test/e2e/scripts/scenario84-metrics.sh --cluster scenario84-s3
 ```
 
 ## Configuration Management
@@ -5870,8 +5964,15 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_workload_rule_actions_total` | Counter | Workload rule actions applied (labels: `cluster`, `namespace`, `rule`, `action`) |
 | `cloudberry_maintenance_operations_total` | Counter | Maintenance operations (vacuum, analyze, reindex, log-rotate). Labels: `cluster`, `namespace`, `operation`, `result` (`started`, `success`, `failed`) |
 | `cloudberry_disk_usage_bytes` | Gauge | Per-database disk usage in bytes, set on the disk-usage API (labels: `cluster`, `namespace`, `database`) |
-| `cloudberry_backup_total` | Counter | Backup operations, recorded on backup reconcile with `result=started` (labels: `cluster`, `namespace`, `type`, `result`) |
-| `cloudberry_restore_total` | Counter | Restore operations, recorded on the restore API (labels: `cluster`, `namespace`, `result`) |
+| `cloudberry_backup_total` | Counter | Backup operations by type and outcome (labels: `cluster`, `namespace`, `type` = `full`/`incremental`, `result` = `success`/`failed`). See [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84) |
+| `cloudberry_backup_duration_seconds` | Histogram | Backup duration per `type` (labels: `cluster`, `namespace`, `type`) |
+| `cloudberry_backup_size_bytes` | Gauge | Backup size in bytes per 14-digit timestamp (labels: `cluster`, `namespace`, `timestamp`) |
+| `cloudberry_backup_last_success_timestamp` | Gauge | Unix time of the last successful backup (labels: `cluster`, `namespace`) |
+| `cloudberry_backup_last_status` | Gauge | Latest backup status: `0`=success, `1`=failed, `2`=in-progress (labels: `cluster`, `namespace`) |
+| `cloudberry_restore_total` | Counter | Restore operations by outcome (labels: `cluster`, `namespace`, `result` = `success`/`failed`) |
+| `cloudberry_restore_duration_seconds` | Histogram | Restore duration distribution (labels: `cluster`, `namespace`) |
+| `cloudberry_backup_retention_deleted_total` | Counter | Backups deleted by retention cleanup (labels: `cluster`, `namespace`) |
+| `cloudberry_backup_job_status` | Gauge | Per-Job backup status: `0`=pending, `1`=running, `2`=succeeded, `3`=failed (labels: `cluster`, `namespace`, `job`, `operation` = `backup`/`restore`/`cleanup`) |
 | `cloudberry_recommendations_total` | Gauge | Storage recommendations by type, set during a recommendation scan (labels: `cluster`, `namespace`, `type`) |
 | `cloudberry_recommendation_scan_duration_seconds` | Histogram | Recommendation scan duration in seconds (labels: `cluster`, `namespace`) |
 | `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |

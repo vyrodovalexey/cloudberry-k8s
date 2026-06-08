@@ -413,7 +413,7 @@ func TestSetBackupJobStatus(t *testing.T) {
 	recorder.SetBackupJobStatus("test", "default", "job1", "backup", 2)
 
 	got := valueWithLabels(t, reg, "cloudberry_backup_job_status",
-		map[string]string{"cluster": "test", "namespace": "default", "job": "job1", "operation": "backup"})
+		map[string]string{"cluster": "test", "namespace": "default", "job_name": "job1", "operation": "backup"})
 	assert.InDelta(t, 2.0, got, 0.001)
 }
 

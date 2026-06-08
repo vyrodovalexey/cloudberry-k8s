@@ -3803,6 +3803,131 @@ func MonitoringDisabledCases() []MonitoringDisabledCase {
 	}
 }
 
+// Scenario84MetricCase represents a single Scenario 84 (Prometheus Metrics /
+// gpbackup_exporter) verification case: one of the 9 backup-lifecycle metrics,
+// the recorder method that emits it, the Job-shape trigger that drives it, and
+// the VictoriaMetrics query the live script asserts. Scenario 84 is a
+// VERIFICATION scenario — all 9 metrics are already wired; these cases enumerate
+// the proof that each one fires across a full lifecycle and lands in
+// VictoriaMetrics.
+type Scenario84MetricCase struct {
+	// ID is the metric id (M1..M9).
+	ID string
+	// Metric is the Prometheus metric family name (namespace "cloudberry").
+	Metric string
+	// Recorder is the metrics.Recorder method that emits the metric.
+	Recorder string
+	// Trigger is the Job-shape / status that drives the recorder.
+	Trigger string
+	// VMQuery is the VictoriaMetrics query the live script asserts.
+	VMQuery string
+	// Expected is the human-readable assertion (e.g. ">= 1", "== 0").
+	Expected string
+	// Description explains the verification.
+	Description string
+}
+
+// Scenario84MetricCases returns the Scenario 84 metric verification cases — the
+// 9 backup-lifecycle metrics mapped to their recorder, trigger and the
+// VictoriaMetrics query asserted by the live script (test/e2e/scripts/
+// scenario84-metrics.sh) against the scenario84-s3 cluster. The outcome label is
+// `result` (success|failed), NOT `status` (GAP-A): the Scenario-84 wording
+// "status" maps to the implemented `result` label; do NOT rename it.
+func Scenario84MetricCases() []Scenario84MetricCase {
+	return []Scenario84MetricCase{
+		{
+			ID:       "M1",
+			Metric:   "cloudberry_backup_total",
+			Recorder: "RecordBackup",
+			Trigger:  "latest Succeeded backup Job (avsoft.io/backup-type=full|incremental)",
+			VMQuery:  `cloudberry_backup_total{type="full|incremental",result="success"}`,
+			Expected: ">= 1 per type",
+			Description: "a Succeeded full + incremental backup each increment " +
+				"backup_total{type,result=success} on their own series",
+		},
+		{
+			ID:       "M2",
+			Metric:   "cloudberry_backup_duration_seconds",
+			Recorder: "ObserveBackupDuration",
+			Trigger:  "Succeeded backup Job with startTime + completionTime, per type",
+			VMQuery:  `cloudberry_backup_duration_seconds_count{type="full|incremental"}`,
+			Expected: ">= 1 per type",
+			Description: "the per-type duration histogram is populated for the latest " +
+				"Succeeded full + incremental backup",
+		},
+		{
+			ID:       "M3",
+			Metric:   "cloudberry_backup_size_bytes",
+			Recorder: "SetBackupSizeBytes",
+			Trigger:  "Succeeded backup Job + avsoft.io/backup-size-bytes annotation + 14-digit ts",
+			VMQuery:  `cloudberry_backup_size_bytes{timestamp=...}`,
+			Expected: ">= 1 series, value > 0",
+			Description: "a Succeeded backup carrying the size annotation sets the " +
+				"per-timestamp size gauge (no annotation => not set)",
+		},
+		{
+			ID:       "M4",
+			Metric:   "cloudberry_backup_last_success_timestamp",
+			Recorder: "SetBackupLastSuccessTimestamp",
+			Trigger:  "latest Succeeded backup Job with completionTime",
+			VMQuery:  `time() - cloudberry_backup_last_success_timestamp`,
+			Expected: "< 600 (recent)",
+			Description: "the last successful backup's completionTime.Unix() is recorded " +
+				"and is ~ now after a real backup",
+		},
+		{
+			ID:       "M5",
+			Metric:   "cloudberry_backup_last_status",
+			Recorder: "SetBackupLastStatus",
+			Trigger:  "latest backup Job status (Success=0, Failed=1, InProgress=2)",
+			VMQuery:  `cloudberry_backup_last_status`,
+			Expected: "0 after success; 1 after forced failure; 2 best-effort in-progress",
+			Description: "reflects the LATEST backup Job: 0 on a Succeeded backup, 1 on a " +
+				"forced-failure backup, 2 (best-effort) while a backup is running",
+		},
+		{
+			ID:       "M6",
+			Metric:   "cloudberry_restore_total",
+			Recorder: "RecordRestore",
+			Trigger:  "latest restore Job (avsoft.io/backup-operation=restore) Succeeded",
+			VMQuery:  `cloudberry_restore_total{result="success"}`,
+			Expected: ">= 1",
+			Description: "a Succeeded restore Job increments restore_total{result=success} " +
+				"via the latest-Job path",
+		},
+		{
+			ID:       "M7",
+			Metric:   "cloudberry_restore_duration_seconds",
+			Recorder: "ObserveRestoreDuration",
+			Trigger:  "Succeeded restore Job with startTime + completionTime (per-Job loop)",
+			VMQuery:  `cloudberry_restore_duration_seconds_count`,
+			Expected: ">= 1",
+			Description: "the restore duration histogram is observed for a Succeeded restore " +
+				"Job carrying both timestamps (no completionTime => not observed)",
+		},
+		{
+			ID:       "M8",
+			Metric:   "cloudberry_backup_retention_deleted_total",
+			Recorder: "RecordBackupRetentionDeleted",
+			Trigger:  "Succeeded cleanup Job + avsoft.io/backup-retention-deleted=N (N>0)",
+			VMQuery:  `cloudberry_backup_retention_deleted_total`,
+			Expected: ">= 1",
+			Description: "a Succeeded retention cleanup Job carrying the retention-deleted " +
+				"annotation increments the counter by N",
+		},
+		{
+			ID:       "M9",
+			Metric:   "cloudberry_backup_job_status",
+			Recorder: "SetBackupJobStatus",
+			Trigger:  "every observed backup/restore/cleanup Job (0=pending,1=running,2=succeeded,3=failed)",
+			VMQuery:  `cloudberry_backup_job_status{operation="backup|restore|cleanup"}`,
+			Expected: "2 for healthy ops; 3 for the bad backup Job",
+			Description: "the per-Job gauge reflects the lifecycle: a healthy backup/restore/" +
+				"cleanup reaches 2 (succeeded); a forced-failure backup reaches 3 (failed)",
+		},
+	}
+}
+
 // Scenario70DefaultsCase represents a single Scenario 70 webhook backup
 // defaulting case: a field that the mutating webhook must default to a known
 // value when a minimal backup spec (enabled, destination, image only) is

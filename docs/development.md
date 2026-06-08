@@ -2985,6 +2985,82 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario83
 bash test/e2e/scripts/scenario83-backup-failure.sh --cluster scenario83-s3
 ```
 
+#### Scenario 84 — Prometheus Metrics / `gpbackup_exporter`
+
+Verifies the **nine** backup/restore metrics end-to-end. This is a **verification +
+documentation + dashboard** scenario — all nine metrics were already defined and wired
+incrementally across Scenarios 76–83, so **no operator code change** is required. The
+`gpbackup_exporter` is implemented as the **operator metric endpoint**: the operator
+derives the metrics from the Kubernetes Jobs it observes (backup-/restore-/cleanup-operation
+Jobs) plus their `avsoft.io/*` annotations and history outcomes, and exposes them on its own
+Prometheus `/metrics` endpoint — there is no separate exporter sidecar binary. vmagent
+scrapes the operator `/metrics` (via the `prometheus.io/scrape` annotations on the operator
+Deployment/Service) into VictoriaMetrics.
+
+- **Where the metric definitions live** — `internal/metrics/metrics.go`:
+  - `initBackupMetrics()` defines all nine under namespace `cloudberry` and registers them.
+    The outcome label on `backup_total` / `restore_total` is **`labelResult`** (`result`,
+    values `success`|`failed`) — **not** `status`. Recorder methods: `RecordBackup`,
+    `ObserveBackupDuration`, `SetBackupSizeBytes`, `SetBackupLastSuccessTimestamp`,
+    `SetBackupLastStatus`, `ObserveRestoreDuration`, `RecordBackupRetentionDeleted`,
+    `SetBackupJobStatus`, `RecordRestore`. `RecordBackup`/`RecordRestore` lower-case the Job
+    status (`Success → "success"`, `Failed → "failed"`).
+
+- **Where the metrics are recorded** — `internal/controller/admin_controller.go`:
+  - `refreshBackupStatus` calls `recordBackupJobMetrics(...)` for **every** observed
+    backup/restore/cleanup Job, then `applyBackupJobToStatus(...)` on the latest Job.
+  - `recordBackupJobMetrics(...)` — `SetBackupJobStatus` for each Job (code from
+    `backupJobStatusCode`: `0=pending, 1=running, 2=succeeded, 3=failed`); on a Succeeded
+    restore Job → `ObserveRestoreDuration`; on a Succeeded cleanup Job → 
+    `RecordBackupRetentionDeleted` (from the `avsoft.io/backup-retention-deleted` annotation).
+  - `applyBackupJobToStatus(...)` — restore Jobs → `RecordRestore`; backup Jobs →
+    `recordLatestBackupMetrics`.
+  - `recordLatestBackupMetrics(...)` — `RecordBackup` always; on Success →
+    `SetBackupLastStatus(0)`, `SetBackupLastSuccessTimestamp`, `ObserveBackupDuration`
+    (when both `startTime`+`completionTime` set), `SetBackupSizeBytes` (when the
+    `avsoft.io/backup-size-bytes` annotation + a 14-digit timestamp are present); on Failed
+    → `SetBackupLastStatus(1)`; otherwise (in-progress) → `SetBackupLastStatus(2)`.
+    `type` (`full`|`incremental`) comes from `backupTypeFromJob` (the Job's
+    `avsoft.io/backup-type` label, spec fallback).
+
+- **`result` (not `status`) — doc alignment (GAP-A).** Scenario 84's wording said
+  `cloudberry_backup_total{type,status}`; the implemented outcome label is **`result`**.
+  The label is **not** renamed (dashboards/PromQL across 76–83 query `result`); the
+  functional `…_ResultLabelContract` test guards that `backup_total`/`restore_total` expose
+  `result` and emit **no** `status` label. Query with `{result="success"}` /
+  `{result="failed"}`.
+
+- **Dashboard** — `monitoring/grafana/cloudberry-operator.json` already has a panel for each
+  of the nine metrics (queries use `result`); publish with `make grafana-publish`.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`
+  (single S3 cluster `scenario84-s3` exercising full + incremental + restore + cleanup +
+  failure so every metric is populated)
+- **Functional tests**: `test/functional/scenario84_metrics_test.go` (`TestFunctional_Scenario84`)
+- **Integration tests**: `test/integration/scenario84_metrics_integration_test.go` (`TestIntegration_Scenario84`)
+- **E2E tests**: `test/e2e/scenario84_metrics_e2e_test.go` (`TestE2E_Scenario84`)
+- **Test-case catalog**: `Scenario84MetricCases` in `test/cases/test_cases.go`
+- **Live script**: `test/e2e/scripts/scenario84-metrics.sh` (drives the full lifecycle and
+  asserts all nine metrics in VictoriaMetrics)
+
+```bash
+# Run Scenario 84 metrics functional tests (full-lifecycle recorder sweep, forced-failure last_status, job-status lifecycle, restore metrics, result-label contract)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario84
+
+# Run Scenario 84 integration tests (envtest: full/incremental backup, restore, cleanup, failed backup record the metrics)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario84
+
+# Run Scenario 84 metrics unit tests (registry round-trip confirms the `result` label; recorder invocations)
+go test ./internal/metrics/... -v -run Backup
+go test ./internal/controller/... -v -run Scenario84
+
+# Run Scenario 84 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario84
+
+# Run the live full-lifecycle metric verification against the deployed cluster + VictoriaMetrics
+bash test/e2e/scripts/scenario84-metrics.sh --cluster scenario84-s3
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

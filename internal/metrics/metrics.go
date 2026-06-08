@@ -10,16 +10,21 @@ import (
 const (
 	metricsNamespace = "cloudberry"
 
-	labelCluster    = "cluster"
-	labelNamespace  = "namespace"
-	labelPhase      = "phase"
-	labelVersion    = "version"
-	labelSegment    = "segment"
-	labelComponent  = "component"
-	labelOperation  = "operation"
-	labelResult     = "result"
-	labelType       = "type"
-	labelJob        = "job"
+	labelCluster   = "cluster"
+	labelNamespace = "namespace"
+	labelPhase     = "phase"
+	labelVersion   = "version"
+	labelSegment   = "segment"
+	labelComponent = "component"
+	labelOperation = "operation"
+	labelResult    = "result"
+	labelType      = "type"
+	labelJob       = "job"
+	// labelJobName is the non-reserved label carrying the Kubernetes Job name
+	// for backup_job_status. The reserved Prometheus label `job` is overwritten
+	// by the scrape config's job_name during scrape, so a dedicated label is
+	// required to preserve the per-Job identity in VictoriaMetrics.
+	labelJobName    = "job_name"
 	labelSourceType = "source_type"
 	labelSource     = "source"
 	labelWebhook    = "webhook"
@@ -495,7 +500,7 @@ func (r *PrometheusRecorder) initBackupMetrics() {
 		Namespace: metricsNamespace,
 		Name:      "backup_job_status",
 		Help:      "Kubernetes backup Job status (0=pending, 1=running, 2=succeeded, 3=failed).",
-	}, []string{labelCluster, labelNamespace, labelJob, labelOperation})
+	}, []string{labelCluster, labelNamespace, labelJobName, labelOperation})
 	r.restoreTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "restore_total",

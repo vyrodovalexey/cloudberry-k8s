@@ -1451,7 +1451,7 @@
       "targets": [
         {
           "expr": "cloudberry_backup_job_status",
-          "legendFormat": "{{cluster}} {{job}} {{operation}}",
+          "legendFormat": "{{cluster}} {{job_name}} {{operation}}",
           "refId": "A"
         }
       ],
@@ -3514,7 +3514,7 @@
           "targets": [
             {
               "expr": "cloudberry_backup_job_status{operation=\"backup\"}",
-              "legendFormat": "{{cluster}}/{{namespace}} {{job}}",
+              "legendFormat": "{{cluster}}/{{namespace}} {{job_name}}",
               "refId": "A"
             }
           ],

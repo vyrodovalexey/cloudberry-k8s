@@ -946,19 +946,104 @@ cloudberry-ctl backup jobs logs --cluster mycluster --job <job-name>
 
 ## Prometheus Metrics
 
-The operator deploys `gpbackup_exporter` as a sidecar `Deployment` (or as part of the operator's metric endpoint) to expose the following metrics sourced from the `gpbackup` history database:
+### `gpbackup_exporter` is the operator `/metrics` endpoint
+
+The spec allows the `gpbackup_exporter` to be deployed as a sidecar `Deployment`
+**OR** as part of the operator's metric endpoint. The implemented design is the
+**operator metric endpoint**: the operator **derives** the backup/restore/cleanup
+metrics from the **observed Kubernetes Jobs** (backup-, restore-, and cleanup-operation
+Jobs labelled `avsoft.io/backup-operation=*`) **plus their `avsoft.io/*` annotations and
+history outcomes**, and exposes them on its own Prometheus `/metrics` endpoint
+(`metrics.port`). There is **no** separate `gpbackup_exporter` sidecar binary — reading
+the `gpbackup` history outcomes via the Jobs is what "operator metric endpoint" means here.
+
+The operator Deployment and Service carry the `prometheus.io/scrape=true` +
+`prometheus.io/port` + `prometheus.io/path=/metrics` annotations
+(`deploy/helm/cloudberry-operator/templates/deployment.yaml` / `service.yaml`), and
+**vmagent** (`test/monitoring/vmagent`) discovers them via Kubernetes service-discovery
+(role `pod` + `endpointslice`, honouring the `prometheus.io/scrape` annotations) and
+scrapes the operator `/metrics` into **VictoriaMetrics**. The Grafana operator dashboard
+(`monitoring/grafana/cloudberry-operator.json`) then renders a panel for each metric.
+
+### Metrics table
+
+The operator exposes the following nine backup/restore metrics (namespace `cloudberry`),
+recorded from observed Jobs and their outcomes:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `cloudberry_backup_total` | Counter | cluster, namespace, type, status | Total backup operations by type and result |
-| `cloudberry_backup_duration_seconds` | Histogram | cluster, namespace, type | Backup duration distribution |
-| `cloudberry_backup_size_bytes` | Gauge | cluster, namespace, timestamp | Backup size per timestamp |
-| `cloudberry_backup_last_success_timestamp` | Gauge | cluster, namespace | Unix timestamp of last successful backup |
-| `cloudberry_backup_last_status` | Gauge | cluster, namespace | 0=success, 1=failed, 2=in-progress |
-| `cloudberry_restore_total` | Counter | cluster, namespace, status | Total restore operations |
-| `cloudberry_restore_duration_seconds` | Histogram | cluster, namespace | Restore duration distribution |
+| `cloudberry_backup_total` | Counter | cluster, namespace, type, **result** | Total backup operations by type (`full`\|`incremental`) and outcome (`result=success`\|`failed`) |
+| `cloudberry_backup_duration_seconds` | Histogram | cluster, namespace, type | Backup duration distribution, per `type` (buckets `ExponentialBuckets(1, 2, 15)`) |
+| `cloudberry_backup_size_bytes` | Gauge | cluster, namespace, timestamp | Backup size in bytes per 14-digit `YYYYMMDDHHMMSS` timestamp |
+| `cloudberry_backup_last_success_timestamp` | Gauge | cluster, namespace | Unix timestamp of the last successful backup |
+| `cloudberry_backup_last_status` | Gauge | cluster, namespace | Latest backup status: `0=success, 1=failed, 2=in-progress` |
+| `cloudberry_restore_total` | Counter | cluster, namespace, **result** | Total restore operations by outcome (`result=success`\|`failed`) |
+| `cloudberry_restore_duration_seconds` | Histogram | cluster, namespace | Restore duration distribution (buckets `ExponentialBuckets(1, 2, 15)`) |
 | `cloudberry_backup_retention_deleted_total` | Counter | cluster, namespace | Backups deleted by retention policy |
-| `cloudberry_backup_job_status` | Gauge | cluster, namespace, job, operation | Kubernetes Job status (0=pending, 1=running, 2=succeeded, 3=failed) |
+| `cloudberry_backup_job_status` | Gauge | cluster, namespace, job_name, operation | Per-Job Kubernetes status: `0=pending, 1=running, 2=succeeded, 3=failed` (`operation` ∈ `backup`\|`restore`\|`cleanup`) |
+
+> **Outcome label is `result` (not `status`).** The outcome label on
+> `cloudberry_backup_total` and `cloudberry_restore_total` is **`result`** with values
+> `success`\|`failed` — **not** `status`. Earlier wording (and Scenario 84's prose) said
+> `status`; the **implemented** label is `result`, and the value semantics are identical
+> (`RecordBackup`/`RecordRestore` lower-case the Job status: `Success → "success"`,
+> `Failed → "failed"`). The label is **not** renamed in code — dashboards and PromQL
+> queries built across Scenarios 76–83 use `result`, so a rename would be a breaking
+> change. Always query with `{result="success"}` / `{result="failed"}`. The
+> `cloudberry_backup_last_status` and `cloudberry_backup_job_status` gauges keep their
+> numeric code semantics shown above (these are gauge **values**, not a label).
+
+### Scenario 84 — Prometheus Metrics / `gpbackup_exporter`
+
+**Scenario 84** is a **verification + documentation + dashboard** scenario: all nine
+metrics were already defined and wired incrementally across Scenarios 76–83, so **no
+operator code change** is required. It confirms the operator-endpoint exporter exposes
+every metric, vmagent scrapes them into VictoriaMetrics, and the Grafana operator
+dashboard renders a panel for each. The metric definitions live in
+`internal/metrics/metrics.go` (`initBackupMetrics`) and are recorded from observed Jobs in
+`internal/controller/admin_controller.go` (`recordLatestBackupMetrics`,
+`recordBackupJobMetrics`, `applyBackupJobToStatus`).
+
+**Acceptance — the nine-metric checklist.** After driving a full lifecycle (full +
+incremental backup, a restore, a retention cleanup, and a forced failure) on the live
+cluster, all nine metrics are present and correct in VictoriaMetrics (`cluster` and
+`namespace` labels elided; `result` is the outcome label):
+
+1. `cloudberry_backup_total{type="full",result="success"}` ≥ 1 and
+   `{type="incremental",result="success"}` ≥ 1 — recorded by `RecordBackup` via
+   `recordLatestBackupMetrics` on a Succeeded backup Job (`type` from the Job's
+   `avsoft.io/backup-type` label via `backupTypeFromJob`).
+2. `cloudberry_backup_duration_seconds_count{type="full"}` ≥ 1 and
+   `{type="incremental"}` ≥ 1 — `ObserveBackupDuration` on a Succeeded backup Job that
+   carries **both** `startTime` and `completionTime`.
+3. `cloudberry_backup_size_bytes` ≥ 1 series with value > 0 — `SetBackupSizeBytes` on a
+   Succeeded backup Job annotated `avsoft.io/backup-size-bytes` with a valid 14-digit
+   timestamp.
+4. `time() - cloudberry_backup_last_success_timestamp` < 600 —
+   `SetBackupLastSuccessTimestamp` from the latest Succeeded backup Job's `completionTime`.
+5. `cloudberry_backup_last_status` is `0` after a successful backup is the latest, `1`
+   after a forced failure is the latest, and `2` (best-effort) while a backup is
+   in-progress — `SetBackupLastStatus(0|1|2)` in `recordLatestBackupMetrics`.
+6. `cloudberry_restore_total{result="success"}` ≥ 1 — `RecordRestore` via
+   `applyBackupJobToStatus` when the latest Job is a Succeeded restore-operation Job.
+7. `cloudberry_restore_duration_seconds_count` ≥ 1 — `ObserveRestoreDuration` in
+   `recordBackupJobMetrics` on a Succeeded restore Job with both timestamps.
+8. `cloudberry_backup_retention_deleted_total` ≥ 1 — `RecordBackupRetentionDeleted` on a
+   Succeeded cleanup Job annotated `avsoft.io/backup-retention-deleted=<n>` (n > 0).
+9. `cloudberry_backup_job_status{operation="backup"}` has a series `== 2` (healthy) and
+   `== 3` (the forced-fail Job); `operation="restore"` and `operation="cleanup"` series
+   `== 2` — `SetBackupJobStatus` for **every** observed Job, code from
+   `backupJobStatusCode` (`0=pending, 1=running, 2=succeeded, 3=failed`).
+
+The scenario is driven by the sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml` (single S3 cluster
+exercising full + incremental + restore + cleanup + failure so every metric is hit) and is
+covered by `test/functional/scenario84_metrics_test.go`,
+`test/integration/scenario84_metrics_integration_test.go`,
+`test/e2e/scenario84_metrics_e2e_test.go`, the test-case catalog `Scenario84MetricCases`
+in `test/cases/test_cases.go`, and the live verification script
+`test/e2e/scripts/scenario84-metrics.sh` (drives the full lifecycle and asserts all nine
+metrics in VictoriaMetrics).
 
 ## Webhook Validation
 
