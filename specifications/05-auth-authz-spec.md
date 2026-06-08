@@ -2630,3 +2630,31 @@ cloudberry-ctl auth status --cluster my-cluster
 # Logout (clear cached tokens)
 cloudberry-ctl auth logout --cluster my-cluster
 ```
+
+## 13. Backup ServiceAccount Authorization (Kubernetes RBAC)
+
+The sections above cover the operator **API** authentication/authorization. Backup and
+restore work runs as Kubernetes **Jobs** whose pods are authorized by **Kubernetes RBAC**,
+not by the operator API auth chain. Those Jobs run as the dedicated, namespace-fixed
+ServiceAccount `cloudberry-backup-sa`, bound to a minimal Role (`cloudberry-backup-role`)
+created by the operator chart (`backup.rbac.create: true`).
+
+**Minimal RBAC scoping (Scenario 82c).** By default the Role grants `secrets: [get]`
+namespace-wide (backward-compatible). Two Helm values harden it to least privilege:
+
+- `backup.rbac.scopeSecrets` (default `false`) — when `true`, the `secrets: [get]` rule is
+  scoped to an explicit `resourceNames` allow-list, so the SA **cannot** read unrelated
+  Secrets (a `get` on an unrelated Secret is **denied**).
+- `backup.rbac.secretNames` (default `[backup-s3-credentials]`) — the allow-list of Secret
+  names the SA may `get` when scoping is on. It **must** include every Secret the
+  backup/restore/validate/cleanup Jobs consume: the S3 `credentialSecret.name`, and the
+  per-cluster `<cluster>-ssh-keys`, `<cluster>-admin-password`,
+  `<cluster>-backup-s3-vault-creds` (and optionally `<cluster>-tls`).
+
+Pod `secretKeyRef` env and volume mounts are resolved by the **kubelet** (its own
+credentials), so scoping `secrets: get` restricts only the SA's own API `get` calls and does
+**not** break credential injection. Production deployments should set `scopeSecrets: true`
+and union all per-cluster Secret names in `secretNames`. Full details, including the
+multi-cluster union note, are in
+[Specification 11 — RBAC Requirements](11-backup-restore-spec.md#rbac-requirements) and
+[Scenario 82 — Security and Encryption](11-backup-restore-spec.md#scenario-82--security-and-encryption).

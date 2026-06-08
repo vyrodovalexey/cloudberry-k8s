@@ -458,6 +458,21 @@ spec:
                           the Job is marked failed.
                         format: int32
                         type: integer
+                      imagePullSecrets:
+                        description: |-
+                          ImagePullSecrets references secrets for pulling the backup Job's images
+                          from a private registry.
+                        items:
+                          description: ImagePullSecret references a Kubernetes secret
+                            for image pulling.
+                          properties:
+                            name:
+                              description: Name is the name of the secret.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
                       nodeSelector:
                         additionalProperties:
                           type: string
@@ -544,6 +559,31 @@ spec:
                     description: Schedule is the cron expression for scheduled backups.
                       Empty disables the CronJob.
                     type: string
+                  validation:
+                    description: |-
+                      Validation configures the post-restore validation Job (spec 11
+                      §Post-Restore Validation). When unset the operator uses defaults
+                      (validation enabled, "SELECT 1" health-check, run-analyze driven from the
+                      gprestore RunAnalyze intent).
+                    properties:
+                      enabled:
+                        description: |-
+                          Enabled controls whether post-restore validation Jobs are created. When nil
+                          validation defaults to enabled (the historical behavior).
+                        type: boolean
+                      healthCheckQuery:
+                        description: |-
+                          HealthCheckQuery is the connectivity health-check query the validation Job
+                          runs to confirm application connectivity. When empty it defaults to
+                          "SELECT 1".
+                        type: string
+                      runAnalyze:
+                        default: false
+                        description: |-
+                          RunAnalyze, when true, makes the validation Job run a database-wide ANALYZE
+                          to refresh planner statistics before the row-count compare.
+                        type: boolean
+                    type: object
                 required:
                 - destination
                 type: object

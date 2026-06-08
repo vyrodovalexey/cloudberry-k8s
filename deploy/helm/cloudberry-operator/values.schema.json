@@ -235,7 +235,31 @@
     "readinessProbe": { "type": "object" },
     "extraEnv": { "type": "array" },
     "extraVolumeMounts": { "type": "array" },
-    "extraVolumes": { "type": "array" }
+    "extraVolumes": { "type": "array" },
+    "backup": {
+      "type": "object",
+      "description": "Backup RBAC configuration for the cloudberry-backup-sa ServiceAccount",
+      "properties": {
+        "rbac": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean",
+              "description": "Create the cloudberry-backup-sa ServiceAccount, Role and RoleBinding"
+            },
+            "scopeSecrets": {
+              "type": "boolean",
+              "description": "Scope secrets:get to an explicit resourceNames allow-list"
+            },
+            "secretNames": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Secret names the backup SA may GET when scopeSecrets is true"
+            }
+          }
+        }
+      }
+    }
   },
   "required": ["image", "replicaCount"]
 }

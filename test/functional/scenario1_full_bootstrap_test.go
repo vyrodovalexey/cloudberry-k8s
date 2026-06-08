@@ -748,6 +748,12 @@ func (m *mockMetricsRecorder) RecordRestore(cluster, namespace, status string) {
 	})
 }
 
+func (m *mockMetricsRecorder) RecordRestoreValidation(cluster, namespace, result string) {
+	m.record("RecordRestoreValidation", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
 func (m *mockMetricsRecorder) SetDataLoadingJobsActive(cluster, namespace string, count float64) {
 	m.record("SetDataLoadingJobsActive", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "count": count,

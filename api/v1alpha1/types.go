@@ -258,6 +258,17 @@ const (
 	// execution). It is emitted as an EventTypeWarning, de-duplicated per failed
 	// Job name so periodic reconciles do not re-emit for the same failure.
 	EventReasonBackupFailed = "BackupFailed"
+	// EventReasonRestoreFailed indicates a restore Job failed (e.g. gprestore
+	// refusing an incomplete incremental set). It is emitted as an
+	// EventTypeWarning, de-duplicated per failed Job name so periodic reconciles
+	// do not re-emit for the same failure.
+	EventReasonRestoreFailed = "RestoreFailed"
+	// EventReasonValidationFailed indicates a post-restore validation Job failed
+	// (e.g. a row-count mismatch vs gpbackup history or an invalid index). It is
+	// emitted as an EventTypeWarning, de-duplicated per failed validation Job
+	// name so periodic reconciles do not re-emit for the same failure. A failed
+	// validation does NOT retroactively fail the already-succeeded restore.
+	EventReasonValidationFailed = "ValidationFailed"
 	// EventReasonDataLoadingReconciled indicates data loading has been reconciled.
 	EventReasonDataLoadingReconciled = "DataLoadingReconciled"
 	// EventReasonStorageReconciled indicates storage management has been reconciled.
@@ -1175,6 +1186,35 @@ type BackupSpec struct {
 	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// Validation configures the post-restore validation Job (spec 11
+	// §Post-Restore Validation). When unset the operator uses defaults
+	// (validation enabled, "SELECT 1" health-check, run-analyze driven from the
+	// gprestore RunAnalyze intent).
+	// +optional
+	Validation *BackupValidation `json:"validation,omitempty"`
+}
+
+// BackupValidation configures the post-restore validation Job that runs after a
+// successful restore. Expected per-table row counts are computed by the operator
+// (from gpbackup history metadata) and are NOT user-facing.
+type BackupValidation struct {
+	// Enabled controls whether post-restore validation Jobs are created. When nil
+	// validation defaults to enabled (the historical behavior).
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// HealthCheckQuery is the connectivity health-check query the validation Job
+	// runs to confirm application connectivity. When empty it defaults to
+	// "SELECT 1".
+	// +optional
+	HealthCheckQuery string `json:"healthCheckQuery,omitempty"`
+
+	// RunAnalyze, when true, makes the validation Job run a database-wide ANALYZE
+	// to refresh planner statistics before the row-count compare.
+	// +kubebuilder:default=false
+	// +optional
+	RunAnalyze bool `json:"runAnalyze,omitempty"`
 }
 
 // BackupHistoryEntry describes a single backup recorded in cluster status.
@@ -1465,6 +1505,11 @@ type BackupJobTemplate struct {
 	// TTLSecondsAfterFinished cleans up finished Jobs after the given seconds.
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+
+	// ImagePullSecrets references secrets for pulling the backup Job's images
+	// from a private registry.
+	// +optional
+	ImagePullSecrets []ImagePullSecret `json:"imagePullSecrets,omitempty"`
 }
 
 // SecretReference references a Kubernetes secret.

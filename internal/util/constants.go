@@ -26,6 +26,10 @@ const (
 	LabelOperation = "avsoft.io/operation"
 	// LabelBackupOperation is the label key for the backup operation type.
 	LabelBackupOperation = "avsoft.io/backup-operation"
+	// LabelBackupType is the label key for the effective backup type
+	// (full|incremental) of a backup Job. It records the type of the backup that
+	// actually ran so status can be derived from the Job rather than the spec.
+	LabelBackupType = "avsoft.io/backup-type"
 
 	// BackupOperationBackup is the backup-operation label value for a backup Job.
 	BackupOperationBackup = "backup"
@@ -101,6 +105,17 @@ const (
 	// AnnotationBackupSizeBytes records the size in bytes of a completed backup Job,
 	// used to drive the cloudberry_backup_size_bytes gauge.
 	AnnotationBackupSizeBytes = "avsoft.io/backup-size-bytes"
+	// AnnotationExpectedRowCounts carries the expected per-table row counts
+	// (a JSON object of fully-qualified table -> count) captured from the gpbackup
+	// history metadata of the restored timestamp. When present on a restore Job
+	// the operator wires it into the post-restore validation Job so the row-count
+	// compare can flag discrepancies; absent it falls back to a best-effort probe.
+	AnnotationExpectedRowCounts = "avsoft.io/expected-row-counts"
+	// AnnotationValidationRecorded marks a terminal validation Job whose outcome
+	// has already been recorded (metric + de-duplicated Warning Event), so
+	// periodic reconciles of the same finished Job do not double-count or emit an
+	// event storm. Its value is the recorded result ("success" or "failed").
+	AnnotationValidationRecorded = "avsoft.io/validation-recorded"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"

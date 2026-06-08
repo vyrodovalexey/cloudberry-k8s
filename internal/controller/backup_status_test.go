@@ -734,7 +734,7 @@ func TestCreateValidationJob_GetError(t *testing.T) {
 	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
 		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
 
-	err := r.createValidationJob(context.Background(), cluster, "20260101080000")
+	err := r.createValidationJob(context.Background(), cluster, "20260101080000", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "getting validation job")
 }
@@ -760,7 +760,7 @@ func TestCreateValidationJob_AlreadyExistsOnCreate(t *testing.T) {
 	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
 		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
 
-	require.NoError(t, r.createValidationJob(context.Background(), cluster, "20260101090000"))
+	require.NoError(t, r.createValidationJob(context.Background(), cluster, "20260101090000", nil))
 }
 
 // TestEnsurePostRestoreValidation_EmptyTimestampSkipped verifies a succeeded

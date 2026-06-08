@@ -55,7 +55,7 @@ func TestBuildGprestoreArgsIncludeTablePrecedence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{}, &RestoreJobOptions{
+			args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{}, &RestoreJobOptions{
 				Timestamp:      "20260607020000",
 				IncludeSchemas: tc.includeSchemas,
 				IncludeTables:  tc.includeTables,

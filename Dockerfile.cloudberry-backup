@@ -10,6 +10,7 @@
 #   - gprestore          — parallel logical restore utility
 #   - gpbackup_helper    — per-segment helper for --single-data-file mode
 #   - gpbackup_s3_plugin — S3/MinIO storage plugin
+#   - gpbackman           — backup management CLI (woblerr/gpbackman) for retention cleanup
 #
 # Build notes:
 #   The upstream repo uses Go build tags to select which root main file to
@@ -20,6 +21,7 @@
 #   CB_BACKUP_VERSION   — cloudberry-backup release version (default: 2.1.0-incubating)
 #   CB_BACKUP_REPO_URL  — base URL for the source tarball download
 #   GO_VERSION          — Go toolchain version installed in the builder stage (default: 1.26.4)
+#   GPBACKMAN_VERSION   — gpbackman release tag (default: v0.8.1)
 #
 # Base images:
 #   builder — rockylinux/rockylinux:9.6 (official Go toolchain from go.dev)
@@ -236,6 +238,24 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
         -ldflags="-s -w -X github.com/apache/cloudberry-backup/plugins/s3plugin.version=${GIT_VERSION}" \
         -o /usr/local/bin/gpbackup_s3_plugin .
 
+# ===========================================================================
+# Build gpbackman (woblerr/gpbackman) — backup management CLI for retention
+# cleanup (backup-info, backup-delete, backup-clean, history-clean).
+# gpbackman uses CGO (mattn/go-sqlite3) — gcc + sqlite-devel are already
+# present in this builder stage. The repo vendors its dependencies so we
+# build with -mod=vendor.
+# ===========================================================================
+ARG GPBACKMAN_VERSION=v0.8.1
+RUN git clone --depth 1 --branch ${GPBACKMAN_VERSION} \
+        https://github.com/woblerr/gpbackman.git /build-gpbackman && \
+    cd /build-gpbackman && \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
+        -mod=vendor -trimpath \
+        -ldflags="-s -w -X main.version=${GPBACKMAN_VERSION}" \
+        -o /usr/local/bin/gpbackman gpbackman.go && \
+    /usr/local/bin/gpbackman --version && \
+    rm -rf /build-gpbackman
+
 # =============================================================================
 # Stage 2: Runtime image
 # =============================================================================
@@ -243,7 +263,7 @@ FROM rockylinux/rockylinux:9.6-minimal
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-backup" \
-      org.opencontainers.image.description="Backup toolchain image for Apache Cloudberry Database (gpbackup, gprestore, gpbackup_helper, gpbackup_s3_plugin)" \
+      org.opencontainers.image.description="Backup toolchain image for Apache Cloudberry Database (gpbackup, gprestore, gpbackup_helper, gpbackup_s3_plugin, gpbackman)" \
       org.opencontainers.image.version="2.1.0" \
       org.opencontainers.image.vendor="Apache Software Foundation" \
       org.opencontainers.image.source="https://github.com/apache/cloudberry-backup" \
@@ -257,14 +277,43 @@ LABEL org.opencontainers.image.title="cloudberry-backup" \
 # - postgresql:      psql client / libpq for cluster health checks
 # - shadow-utils:    useradd/groupadd
 # - sqlite-libs:     runtime dependency for mattn/go-sqlite3 (CGO-linked)
-RUN microdnf -y install \
+#
+# SECURITY: a full `microdnf update` first pulls the latest patched releases of
+# every base-image package (including transitive deps), then the explicit
+# package list below upgrades/installs the CVE-affected packages to their fixed
+# versions. Pinning the specific fixed packages keeps the build reproducible and
+# documents which CVEs are addressed:
+#   gnupg2     CVE-2025-68973  -> 2.3.3-5.el9_7
+#   gnutls     CVE-2026-33845  -> 3.8.10-4.el9_8 (>= 3.8.9 stream)
+#   krb5-libs  CVE-2026-40355  -> 1.21.1-10.el9_8
+#   libarchive CVE-2025-5914   -> 3.5.3-6.el9_6
+#   libbrotli  CVE-2025-6176   -> 1.0.9-9.el9_7
+#   libcap     CVE-2026-4878   -> 2.48-10.el9_7.1
+#   libnghttp2 CVE-2026-27135  -> 1.43.0-6.el9_7.1
+#   libxml2    CVE-2025-49794  -> 2.9.13-10.el9_6
+#   openssl    CVE-2025-11187  -> 3.5.1-7.el9_7 (openssl-libs)
+#   pam        CVE-2025-6020   -> 1.5.1-26.el9_6
+RUN microdnf -y update && \
+    microdnf -y install \
       bash \
       ca-certificates \
       gettext \
       postgresql \
       shadow-utils \
       sqlite-libs && \
-    microdnf clean all && rm -rf /var/cache/yum
+    microdnf -y upgrade \
+      gnupg2 \
+      gnutls \
+      krb5-libs \
+      libarchive \
+      libbrotli \
+      libcap \
+      libnghttp2 \
+      libxml2 \
+      openssl \
+      openssl-libs \
+      pam && \
+    microdnf clean all && rm -rf /var/cache/yum /var/cache/dnf
 
 # Create gpadmin user (UID 1000 for Kubernetes compatibility)
 RUN groupadd -g 1000 gpadmin && \
@@ -275,6 +324,7 @@ COPY --from=builder /usr/local/bin/gpbackup /usr/local/bin/gpbackup
 COPY --from=builder /usr/local/bin/gprestore /usr/local/bin/gprestore
 COPY --from=builder /usr/local/bin/gpbackup_helper /usr/local/bin/gpbackup_helper
 COPY --from=builder /usr/local/bin/gpbackup_s3_plugin /usr/local/bin/gpbackup_s3_plugin
+COPY --from=builder /usr/local/bin/gpbackman /usr/local/bin/gpbackman
 
 # Create directories for backup operations
 RUN mkdir -p /tmp/gpbackup /etc/gpbackup && \

@@ -318,6 +318,7 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.RecordBackupRetentionDeleted("c", "n", 2)
 	recorder.SetBackupJobStatus("c", "n", "job1", "backup", 2)
 	recorder.RecordRestore("c", "n", "success")
+	recorder.RecordRestoreValidation("c", "n", "success")
 	recorder.SetDataLoadingJobsActive("c", "n", 1)
 	recorder.RecordDataLoadingRows("c", "n", "job1", "s3", 100)
 	recorder.SetDiskUsagePercent("c", "n", 50)
@@ -420,6 +421,36 @@ func TestRecordRestore(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
 	recorder.RecordRestore("test", "default", "success")
+}
+
+// TestRecordRestoreValidation_Scenario80 verifies the post-restore validation
+// counter increments per {result} label and is registered under the expected
+// metric name.
+func TestRecordRestoreValidation_Scenario80(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	recorder.RecordRestoreValidation("test", "default", "success")
+	recorder.RecordRestoreValidation("test", "default", "success")
+	recorder.RecordRestoreValidation("test", "default", "failed")
+
+	gotSuccess := valueWithLabels(t, reg, "cloudberry_restore_validation_total",
+		map[string]string{"cluster": "test", "namespace": "default", "result": "success"})
+	assert.InDelta(t, 2.0, gotSuccess, 0.001)
+
+	gotFailed := valueWithLabels(t, reg, "cloudberry_restore_validation_total",
+		map[string]string{"cluster": "test", "namespace": "default", "result": "failed"})
+	assert.InDelta(t, 1.0, gotFailed, 0.001)
+}
+
+// TestNoopRecorder_RecordRestoreValidation_Scenario80 verifies the Noop
+// implementation is a safe no-op (no panic).
+func TestNoopRecorder_RecordRestoreValidation_Scenario80(t *testing.T) {
+	var r Recorder = &NoopRecorder{}
+	assert.NotPanics(t, func() {
+		r.RecordRestoreValidation("c", "n", "success")
+		r.RecordRestoreValidation("c", "n", "failed")
+	})
 }
 
 func TestSetDataLoadingJobsActive(t *testing.T) {
@@ -710,6 +741,7 @@ func TestNoopRecorder_AllMethods(t *testing.T) {
 	r.RecordBackupRetentionDeleted("cluster", "ns", 2)
 	r.SetBackupJobStatus("cluster", "ns", "job1", "backup", 2)
 	r.RecordRestore("cluster", "ns", "success")
+	r.RecordRestoreValidation("cluster", "ns", "failed")
 	r.SetDataLoadingJobsActive("cluster", "ns", 3)
 	r.RecordDataLoadingRows("cluster", "ns", "s3-loader", "s3", 1000)
 	r.SetDiskUsagePercent("cluster", "ns", 75.5)

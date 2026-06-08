@@ -21,14 +21,23 @@ metadata:
     {{- include "cloudberry-operator.labels" . | nindent 4 }}
     app.kubernetes.io/component: backup
 rules:
-  # The credential Secret name is dynamic (per-cluster), so the Secret get
-  # permission is scoped to the namespace rather than to a fixed resourceName.
+  # Secret get permission. When backup.rbac.scopeSecrets is enabled and a
+  # secretNames allow-list is provided, the rule is scoped to those
+  # resourceNames so the SA cannot read unrelated Secrets. Otherwise the
+  # permission stays namespace-wide for backwards compatibility (the
+  # credential Secret name is dynamic per-cluster).
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
       - get
+    {{- if and .Values.backup.rbac.scopeSecrets .Values.backup.rbac.secretNames }}
+    resourceNames:
+      {{- range .Values.backup.rbac.secretNames }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- end }}
   - apiGroups:
       - ""
     resources:

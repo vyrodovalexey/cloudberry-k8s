@@ -126,7 +126,7 @@ func TestBuildRestoreJobSSHAndHistoryWiring(t *testing.T) {
 // config) and the gpbackup plugin-path preamble/symlink, and that it references
 // the canonical /usr/local/bin/gpbackup_s3_plugin path.
 func TestRenderToolScriptSSHPreamble(t *testing.T) {
-	script := renderToolScript("gpbackup", []string{"--dbname", "mydb"})
+	script := renderToolScript(newBackupCluster(), "gpbackup", []string{"--dbname", "mydb"})
 
 	// SSH setup preamble.
 	assert.Contains(t, script, "/etc/cloudberry/ssh/id_ed25519")

@@ -1,0 +1,237 @@
+# =============================================================================
+# Scenario 80 — Post-Restore Validation (S3 destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus the full backup block targeting an
+# S3-compatible (MinIO) destination with post-restore validation ENABLED.
+#
+# Scenario 80 exercises the post-restore validation lifecycle. After a successful
+# restore the operator creates a single validation Job
+# (<cluster>-validate-<restore-ts>, idempotent) that:
+#   80a row-count vs history : compares the actual restored per-table row counts
+#       against the EXPECTED counts captured from the gpbackup history metadata
+#       (passed to the validation Job via the restore Job's
+#       avsoft.io/expected-row-counts annotation). It emits a parsable
+#       ROW_COUNT_MATCH / ROW_COUNT_MISMATCH marker per table and FAILS (exit 1)
+#       on ANY mismatch — the headline row-count-vs-history check.
+#   80b run-analyze          : because backup.validation.runAnalyze=true (and the
+#       gprestore.runAnalyze intent), the validation Job runs a database-wide
+#       ANALYZE to refresh planner statistics and emits ANALYZE_OK.
+#   80c invalid-index/health : a must-pass invalid-index scan
+#       (relkind='i' AND NOT indisvalid -> exit 1 on any invalid index) plus a
+#       configurable health-check query (healthCheckQuery, default "SELECT 1")
+#       confirming application connectivity.
+#   80e deliberate mismatch  : a data-only restore into a table pre-populated with
+#       EXTRA rows makes actual > expected -> ROW_COUNT_MISMATCH -> the validation
+#       Job FAILS -> the operator records
+#       cloudberry_restore_validation_total{result="failed"} and emits a
+#       ValidationFailed Warning event (the restore Job itself stays Succeeded).
+#
+# KEY CONFIG NOTES
+#   * backup.validation.enabled:true creates one validation Job per Succeeded
+#     restore. runAnalyze:true makes the validation refresh + confirm planner
+#     stats; healthCheckQuery:"SELECT 1" is the connectivity probe.
+#   * gprestore.runAnalyze:true so the restore itself also refreshes stats (the
+#     validation RunAnalyze falls back to this intent when the validation block
+#     omits it).
+#   * Same bucket + folder (/backups) for the backup so gpbackup history is read
+#     from ONE destination (gpbackup_history.db on the coordinator); the live
+#     test captures per-table expected counts at backup time.
+#   * The backup image MUST ship psql + gpbackup/gprestore
+#     (cloudberry-backup:2.1.0) — the validation Job runs psql queries and the
+#     live test runs real gpbackup/gprestore via coordinator-exec.
+#   * Multipart 10MB/4 (carried from scenario76/77/78/79) for MinIO emulation.
+#   * No `schedule` is set: Scenario 80 drives on-demand backup/restore so each
+#     restore + its validation Job surfaces on a discrete reconciled Job.
+#
+# Credential source: Kubernetes Secret `backup-s3-credentials`
+#   (created by test/docker-compose/scripts/setup-minio.sh).
+# In-cluster MinIO reachability: the CR endpoint `http://minio:9000` resolves via
+# the `minio` ExternalName Service (also created by setup-minio.sh).
+#
+# Live test: test/e2e/scripts/scenario80-post-restore-validation.sh \
+#   --cluster scenario80-s3
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario80-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "80"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario80-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario80-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination, Secret credential source, with
+  # post-restore validation enabled. No schedule is set: Scenario 80 drives an
+  # on-demand backup + restore so each restore + its validation Job surfaces on a
+  # discrete Job the operator reconciles.
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    # Post-restore validation: after a Succeeded restore the operator creates a
+    # validation Job that compares restored row counts vs gpbackup history,
+    # refreshes planner stats (ANALYZE), scans for invalid indexes and runs the
+    # health-check query. A row-count mismatch FAILS the validation Job and emits
+    # a ValidationFailed Warning + the cloudberry_restore_validation_total metric.
+    validation:
+      enabled: true
+      # 80b: refresh + confirm planner statistics during validation (ANALYZE_OK).
+      runAnalyze: true
+      # 80c/80d: configurable connectivity health-check query.
+      healthCheckQuery: "SELECT 1"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+      leafPartitionData: true
+    gprestore:
+      # 80b: the restore itself also refreshes planner stats; the validation
+      # RunAnalyze falls back to this intent when validation.runAnalyze is unset.
+      runAnalyze: true
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        # SAME folder for the backup so gpbackup history is read from a single
+        # destination for the row-count-vs-history compare.
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Delete

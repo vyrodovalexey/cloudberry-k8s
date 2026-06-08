@@ -61,6 +61,24 @@ backup:
     # for backup/restore Jobs in the release namespace.
     create: true
 
+    # -- Scope the backup ServiceAccount's `secrets: [get]` permission to an
+    # explicit resourceNames allow-list (see `secretNames`) so the SA cannot
+    # read unrelated Secrets. When false (default) the Role keeps a
+    # namespace-wide `secrets: [get]` for backwards compatibility.
+    scopeSecrets: false
+
+    # -- Secret names the backup ServiceAccount may GET when `scopeSecrets` is
+    # true. Scope minimal RBAC so the SA cannot read unrelated Secrets. The
+    # backup/restore/validate/cleanup Jobs mount several per-cluster Secrets
+    # whose names depend on the cluster name; include them all here or backups
+    # break. For a cluster named `<cluster>` the Jobs consume:
+    #   - <cluster>-admin-password         (PGPASSWORD)
+    #   - <cluster>-ssh-keys               (SSH identity)
+    #   - <cluster>-backup-s3-vault-creds  (Vault-rendered S3 creds)
+    #   - your S3 credentialSecret.name    (e.g. backup-s3-credentials)
+    secretNames:
+      - backup-s3-credentials
+
 # =============================================================================
 # Operator Configuration
 # =============================================================================

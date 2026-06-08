@@ -27,6 +27,7 @@ IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
 IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
 IMG_BACKUP           ?= cloudberry-backup:2.1.0
 IMG_OFFICIAL         ?= cloudberry-official:2.1.0
+GPBACKMAN_VERSION    ?= v0.8.1
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
@@ -186,9 +187,10 @@ docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles fro
 		-f Dockerfile.cloudberry .
 
 .PHONY: docker-build-backup
-docker-build-backup: ## Build cloudberry-backup toolchain image
+docker-build-backup: ## Build cloudberry-backup toolchain image (incl. gpbackman)
 	$(DOCKER) build \
 		$(DOCKER_BUILD_ARGS) \
+		--build-arg GPBACKMAN_VERSION=$(GPBACKMAN_VERSION) \
 		-t $(IMG_BACKUP) \
 		-f Dockerfile.cloudberry-backup .
 
@@ -248,6 +250,38 @@ helm-install-test: ## Install operator via Helm in cloudberry-test namespace wit
 		--set oidc.clientID=cloudberry-operator \
 		--set oidc.existingSecret=oidc-client-secret \
 		--set oidc.existingSecretKey=client-secret \
+		--wait --timeout 5m
+
+.PHONY: helm-install-test-scenario82
+helm-install-test-scenario82: ## Install operator for Scenario 82 (scoped backup RBAC)
+	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic oidc-client-secret \
+		--namespace $(NAMESPACE_TEST) \
+		--from-literal=client-secret=some-secret \
+		--dry-run=client -o yaml | kubectl apply -f -
+	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
+		--namespace $(NAMESPACE_TEST) \
+		--set installCRDs=true \
+		--set image.repository=cloudberry-operator \
+		--set image.tag=latest \
+		--set image.pullPolicy=IfNotPresent \
+		--set webhook.certSource=vault-pki \
+		--set webhook.vaultPKI.mountPath=pki \
+		--set webhook.vaultPKI.role=cloudberry-operator \
+		--set vault.enabled=true \
+		--set vault.address=http://host.docker.internal:8200 \
+		--set vault.authMethod=kubernetes \
+		--set vault.authPath=auth/kubernetes \
+		--set vault.role=cloudberry-operator \
+		--set vault.pkiRole=cloudberry-operator \
+		--set vault.secretPath=secret/data/cloudberry \
+		--set oidc.enabled=true \
+		--set oidc.issuerURL=http://host.docker.internal:8090/realms/test \
+		--set oidc.clientID=cloudberry-operator \
+		--set oidc.existingSecret=oidc-client-secret \
+		--set oidc.existingSecretKey=client-secret \
+		--set backup.rbac.scopeSecrets=true \
+		--set 'backup.rbac.secretNames={s3-credentials,backup-s3-credentials,scenario82-s3-admin-password,scenario82-s3-ssh-keys,scenario82-s3-backup-s3-vault-creds,scenario82-s3-tls}' \
 		--wait --timeout 5m
 
 .PHONY: helm-upgrade

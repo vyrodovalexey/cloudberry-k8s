@@ -40,6 +40,12 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Scenario 75 — Compression Matrix (gzip vs zstd)](#scenario-75--compression-matrix-gzip-vs-zstd)
   - [Scenario 76 — Scheduled Backup via CronJob + Status Population](#scenario-76--scheduled-backup-via-cronjob--status-population)
   - [Pre-Backup Health Checks (Scenario 77)](#pre-backup-health-checks-scenario-77)
+  - [Incremental Backups (Scenario 78)](#incremental-backups-scenario-78)
+  - [Backup Retention (Scenario 79)](#backup-retention-scenario-79)
+  - [Post-Restore Validation (Scenario 80)](#post-restore-validation-scenario-80)
+  - [Local Backup Destination (Scenario 81)](#local-backup-destination-scenario-81)
+  - [Backup Security (Scenario 82)](#backup-security-scenario-82)
+  - [Backup Failure Handling & Retries (Scenario 83)](#backup-failure-handling--retries-scenario-83)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -1103,6 +1109,737 @@ The live fault → block → heal → success cycle is driven by `test/e2e/scrip
 # Run all four checks against the deployed clusters
 bash test/e2e/scripts/scenario77-prebackup-checks.sh \
   --cluster scenario77-s3 --local-cluster scenario77-local
+```
+
+### Incremental Backups (Scenario 78)
+
+Incremental backups capture only the changes to **append-optimized (AO) tables** since
+the last full or incremental backup, so a chain of small incrementals on top of a
+periodic full is far cheaper than repeated full backups. AO tables benefit **most** from
+incrementals — heap tables see little or no delta savings — so model your high-churn data
+as AO tables to get the most out of this feature.
+
+#### Enabling incrementals
+
+Set `gpbackup.incremental: true` on the backup spec. The operator then **always** renders
+`gpbackup --incremental --leaf-partition-data` for the backup (`--leaf-partition-data` is
+required by gpbackup for incrementals and is added automatically — you do not need to set
+`leafPartitionData` yourself, and it is de-duplicated if you do):
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    retention:
+      fullCount: 3
+      incrementalCount: 10   # cap on retained incrementals in the set
+      maxAge: "30d"
+    gpbackup:
+      incremental: true      # forces --incremental --leaf-partition-data
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        folder: /backups       # SAME folder for the full + every incremental
+        # …endpoint, region, credentials, multipart…
+```
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario78-incremental-backup.yaml
+```
+
+> **Same bucket + folder for the whole chain.** Use the **same** `destination.s3.bucket`
+> and `folder` for the full backup and every incremental. gpbackup's auto-base discovery
+> reads the backup history on the destination, so a different folder for incrementals
+> breaks auto-base selection.
+
+> **`retention.incrementalCount`** caps how many incrementals are retained in a set;
+> `retention.fullCount` and `retention.maxAge` continue to govern fulls and overall age.
+
+#### How auto-base selection works
+
+When you run an incremental **without** pinning a base, gpbackup automatically forms the
+incremental against the **most recent compatible backup** already on the destination.
+A typical cycle:
+
+1. Run a **full** backup → `lastBackupType: full`.
+2. Modify an AO table (the delta to capture).
+3. Run an **incremental** (`incremental: true`, or an on-demand request with
+   `type: incremental`) **without** a `fromTimestamp` → gpbackup keys it to the most
+   recent full/incremental, and the operator sets `lastBackupType: incremental`.
+
+```bash
+kubectl get cloudberrycluster scenario78-s3 -n cloudberry-test \
+  -o jsonpath='{.status.backup.lastBackupType}'
+# incremental
+```
+
+The reported `lastBackupType` (and each `backupHistory[].type`) is derived from the
+backup Job's `avsoft.io/backup-type` label — so even a per-request incremental against a
+cluster whose spec is `full` is reported correctly as `incremental`.
+
+#### Pinning a base with `fromTimestamp`
+
+To pin an incremental to a **specific** base (rather than letting gpbackup auto-select),
+supply the full backup's 14-digit timestamp. On-demand via the API/CLI:
+
+```bash
+# API: pin this incremental to the full backup at 20260518020000
+curl -X POST .../clusters/scenario78-s3/backups \
+  -d '{"type":"incremental","gpbackupOptions":{"fromTimestamp":"20260518020000"}}'
+```
+
+The incremental is then based on `20260518020000` **even if** a more-recent compatible
+backup exists. The rendered args include
+`--incremental --leaf-partition-data --from-timestamp 20260518020000`.
+
+#### Restoring from an incremental
+
+Restore from the **latest** incremental's timestamp — gprestore automatically pulls in the
+full and all intermediate incrementals it depends on:
+
+```bash
+cloudberry-ctl backup restore --cluster scenario78-s3 --timestamp <latest-incremental-ts>
+```
+
+gprestore validates that the **entire chain** (full + all incrementals) is present before
+restoring.
+
+#### What happens if the chain is incomplete
+
+If an **intermediate** incremental is missing (deleted, expired, or never reached the
+destination), restoring from a later incremental **cannot** succeed — gprestore reports
+the incremental set is incomplete and **refuses**, and the restore Job fails. The operator
+surfaces this as:
+
+- **`lastBackupStatus: Failed`** for the restore:
+
+  ```bash
+  kubectl get cloudberrycluster scenario78-s3 -n cloudberry-test \
+    -o jsonpath='{.status.backup.lastBackupStatus}'
+  # Failed
+  ```
+
+- A **Warning Event** with reason **`RestoreFailed`** (emitted **once** per failed restore
+  Job — periodic reconciles of the same failed Job do not repeat it):
+
+  ```bash
+  kubectl get events -n cloudberry-test \
+    --field-selector reason=RestoreFailed,type=Warning \
+    --sort-by='.lastTimestamp'
+  # Warning  RestoreFailed  cloudberrycluster/scenario78-s3
+  ```
+
+> **Note:** `RestoreFailed` is distinct from `BackupFailed`. Restore failures emit
+> **only** `RestoreFailed`; backup failures emit `BackupFailed` (see Scenario 77).
+
+**How to recover.** Restore the missing intermediate incremental to the destination (from
+another copy/replica) so the chain is complete again, then retry the restore. If the
+intermediate is unrecoverable, restore from the **most recent complete prefix** of the
+chain — the full plus the contiguous incrementals up to (but not past) the gap — and, if
+needed, take a fresh full backup to start a new chain.
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario78-incremental-backup.yaml`
+enables incrementals on a single S3 (MinIO) destination with the same `folder: /backups`
+for the whole chain and `retention.incrementalCount: 10`; its data load creates an AO
+table (`public.events_ao`) so incrementals capture real deltas. The behavior is covered
+by `test/functional/scenario78_incremental_backup_test.go`,
+`test/integration/scenario78_incremental_backup_integration_test.go`, and
+`test/e2e/scenario78_incremental_backup_e2e_test.go`, and the live cycle is driven by
+`test/e2e/scripts/scenario78-incremental-backup.sh`.
+
+```bash
+bash test/e2e/scripts/scenario78-incremental-backup.sh --cluster scenario78-s3
+```
+
+### Backup Retention (Scenario 79)
+
+Backup retention keeps your backup set bounded by **count** and by **age**. The operator
+enforces **three** independent policies under `spec.backup.retention`, runs a cleanup
+**after each successful backup**, and exposes the number of deletions as a Prometheus
+counter.
+
+#### Configuring retention
+
+Set any combination of the three policies on the backup spec:
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"   # must include gpbackman (ships v0.8.1)
+    retention:
+      fullCount: 3            # keep the newest 3 FULL backups
+      incrementalCount: 10    # keep the newest 10 INCREMENTAL backups
+      maxAge: "30d"           # delete any backup older than 30 days
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        folder: /backups       # SAME folder for fulls + incrementals
+        # …endpoint, region, credentials, multipart…
+```
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario79-retention.yaml
+```
+
+| Policy | What it does | How it is enforced |
+|--------|--------------|--------------------|
+| `retention.fullCount` | Keeps the newest **N** full backups | The cleanup Job lists fulls with `gpbackman backup-info --type full` and deletes the oldest excess with `gpbackman backup-delete --timestamp <ts> --cascade` |
+| `retention.incrementalCount` | Keeps the newest **N** incremental backups | Same, with `--type incremental` (see the [cascade caveat](#cascade-behavior-caveat)) |
+| `retention.maxAge` | Deletes any backup older than the window | `gpbackman backup-clean --older-than-days <N> --cascade` (`"30d"` → 30, `"4w"` → 28, `"720h"` → 30, `"25h"` → 1) |
+
+> **Same bucket + folder.** Use the **same** `destination.s3.bucket` and `folder` for fulls
+> and every incremental so `gpbackman` enumerates a single backup history on the
+> destination — a split folder breaks the count/age enumeration.
+
+> **`gpbackman` is provided by the backup image.** Retention cleanup runs `gpbackman` (the
+> `woblerr/gpbackman` CLI), which ships in `cloudberry-backup:2.1.0` (v0.8.1) alongside
+> `gpbackup`/`gprestore`. Use a backup image that includes it.
+
+> **Defaults.** The mutating webhook defaults `retention.fullCount: 3` and
+> `retention.maxAge: "30d"` when `backup.enabled: true` and you leave them unset; set
+> `incrementalCount` explicitly if you back up incrementally.
+
+#### When cleanup runs
+
+Cleanup runs **after each successful backup**, never inside the backup itself. When a backup
+Job Succeeds and any retention policy is set, the operator creates **one** cleanup Job named
+`<cluster>-cleanup-<latest-backup-ts>`. Because the name is keyed off the latest successful
+backup timestamp, cleanup runs **exactly once per backup** — a reconcile rerun never creates
+a duplicate. With no retention policy set (or no successful backup yet), no cleanup Job is
+created.
+
+#### Observing deletions
+
+Watch the cleanup Job and its annotation:
+
+```bash
+# The cleanup Job created after the latest successful backup
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=scenario79-s3,avsoft.io/backup-operation=cleanup
+
+# The deletion count the operator recorded onto the Succeeded cleanup Job
+kubectl get job <cluster>-cleanup-<ts> -n cloudberry-test \
+  -o jsonpath='{.metadata.annotations.avsoft\.io/backup-retention-deleted}'
+# 1
+```
+
+The cleanup script prints a `RETENTION_DELETED=<n>` marker (also written to the pod's
+termination message); the operator reads `<n>`, patches the
+`avsoft.io/backup-retention-deleted=<n>` annotation onto the Succeeded cleanup Job, and the
+metrics loop turns it into the counter
+**`cloudberry_backup_retention_deleted_total{cluster,namespace}`** (incremented per
+deletion):
+
+```bash
+# Query the retention counter (e.g. via VictoriaMetrics)
+curl -s 'http://localhost:8428/api/v1/query' \
+  --data-urlencode 'query=cloudberry_backup_retention_deleted_total{cluster="scenario79-s3",namespace="cloudberry-test"}'
+```
+
+Each successive backup yields its own cleanup Job and contributes its own delta — read the
+counter as a **monotonic increase**, not an absolute value.
+
+#### Cascade behavior caveat
+
+`gpbackman backup-delete` and `backup-clean` run with **`--cascade`**: deleting a backup
+also removes the backups that **depend** on it. This is correct for fulls (deleting an
+oldest full removes its dependent incrementals too), but for **incremental** count
+enforcement it means deleting an older incremental can cascade into newer ones. The cleanup
+script therefore **re-enumerates** the current Success backups after every delete and stops
+as soon as the retained count is within the limit, so it neither over- nor under-deletes —
+and the reported deletion count (and the metric) reflects the **actual** number of backups
+removed, including any taken by cascade.
+
+#### Sample CR and verification
+
+The sample CR `deploy/helm/cloudberry-operator/config/samples/scenario79-retention.yaml`
+enables all three policies (`fullCount: 3`, `incrementalCount: 10`, `maxAge: "30d"`) on a
+single S3 (MinIO) destination with the same `folder: /backups`, `gpbackup.incremental: true`,
+and no schedule (on-demand). The behavior is covered by
+`test/functional/scenario79_retention_test.go`,
+`test/integration/scenario79_retention_integration_test.go`, and
+`test/e2e/scenario79_retention_e2e_test.go`, and the live cycle is driven by
+`test/e2e/scripts/scenario79-retention.sh`:
+
+```bash
+bash test/e2e/scripts/scenario79-retention.sh --cluster scenario79-s3
+```
+
+### Post-Restore Validation (Scenario 80)
+
+After a restore Job **Succeeds**, the operator automatically creates a **validation Job**
+that confirms the restored database is sound: it compares restored row counts against the
+backed-up counts, optionally refreshes planner statistics, scans for invalid indexes, and
+runs a connectivity health-check. A failed validation surfaces a Warning Event and a metric
+— but it never undoes the restore (the restore stays Succeeded).
+
+#### Enabling and configuring
+
+Validation is **enabled by default**. Configure it (or disable it) under
+`spec.backup.validation`:
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    validation:
+      enabled: true                 # default; set false to skip validation Jobs
+      healthCheckQuery: "SELECT 1"  # connectivity probe (default SELECT 1)
+      runAnalyze: true              # run ANALYZE to refresh planner stats
+```
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario80-post-restore-validation.yaml
+```
+
+| Field | Default | What it does |
+|-------|---------|--------------|
+| `validation.enabled` | `true` (when unset) | Whether the operator creates a post-restore validation Job. Set `false` to disable. |
+| `validation.healthCheckQuery` | `SELECT 1` | The query the validation Job runs to confirm application connectivity. |
+| `validation.runAnalyze` | `false` (falls back to `gprestore.runAnalyze`) | When `true`, the validation Job runs a database-wide `ANALYZE` to refresh planner statistics. |
+
+> **Expected row counts are operator-managed.** You do **not** configure the expected
+> per-table counts — the operator captures them from the gpbackup history metadata of the
+> restored timestamp and passes them to the validation Job via the restore Job's
+> `avsoft.io/expected-row-counts` annotation.
+
+#### What each check does
+
+The validation Job runs four checks in order:
+
+1. **Row-count compare (must-pass).** For each table recorded in the gpbackup history, the
+   Job runs `SELECT count(*)` and compares the ACTUAL restored count against the EXPECTED
+   one. A match prints `ROW_COUNT_MATCH table=<t> count=<a>`; a discrepancy prints
+   `ROW_COUNT_MISMATCH table=<t> expected=<e> actual=<a>` and **fails** the Job. When no
+   expected counts are available the Job logs `ROW_COUNT_PROBE_SKIPPED` and does not fail.
+2. **Run-analyze.** When enabled, the Job runs `ANALYZE` to refresh planner statistics and
+   logs `ANALYZE_OK`.
+3. **Invalid-index scan (must-pass).** The Job scans for invalid indexes
+   (`pg_class.relkind='i' AND NOT indisvalid`) and **fails** if any exist.
+4. **Health-check query.** The Job runs your `healthCheckQuery` (default `SELECT 1`) to
+   confirm connectivity.
+
+#### Interpreting the results
+
+Watch the validation Job and read its outcome:
+
+```bash
+# The validation Job created after a successful restore
+kubectl get jobs -n cloudberry-test \
+  -l avsoft.io/cluster=scenario80-s3,avsoft.io/backup-operation=validate
+
+# Inspect the validation log markers (every marker is prefixed "post-restore-validate: ")
+kubectl logs -n cloudberry-test job/<cluster>-validate-<ts>
+# post-restore-validate: ROW_COUNT_MATCH table=public.users count=9533
+# post-restore-validate: ANALYZE_OK
+# post-restore-validate: passed
+```
+
+- **Metric** — every terminal validation Job increments
+  **`cloudberry_restore_validation_total{cluster,namespace,result}`**, with `result="success"`
+  when the Job Succeeds and `result="failed"` when it Fails:
+
+  ```bash
+  curl -s 'http://localhost:8428/api/v1/query' \
+    --data-urlencode 'query=cloudberry_restore_validation_total{cluster="scenario80-s3",namespace="cloudberry-test"}'
+  ```
+
+- **Event** — a Failed validation Job emits a de-duplicated `Warning`/`ValidationFailed`
+  Event (one per Job):
+
+  ```bash
+  kubectl get events -n cloudberry-test --field-selector reason=ValidationFailed
+  # … Warning  ValidationFailed  Post-restore validation job <cluster>-validate-<ts> failed …; the restore remains successful
+  ```
+
+- **The restore is never failed by validation.** A `ROW_COUNT_MISMATCH`, an invalid index,
+  or any other validation failure raises the Warning + `failed` metric, but the **restore**
+  Job stays Succeeded.
+
+#### Deliberate-mismatch example
+
+To see validation flag a discrepancy, pre-populate a target table with extra rows and then
+restore **data-only** into it, so the restored count exceeds the backed-up (expected) count:
+
+```bash
+# 1. Pre-populate the target table with extra rows the backup never had
+psql -d mydb_restored -c "INSERT INTO public.users SELECT * FROM public.users LIMIT 100;"
+
+# 2. Restore data-only into it (data is appended, not truncated)
+#    -> actual = expected + 100  -> row-count mismatch
+
+# 3. The validation Job fails and flags the discrepancy
+kubectl logs -n cloudberry-test job/<cluster>-validate-<ts>
+# post-restore-validate: ROW_COUNT_MISMATCH table=public.users expected=9533 actual=9633
+# the validation Job exits non-zero (Failed)
+
+# 4. The operator records the failure and emits the Warning
+#    cloudberry_restore_validation_total{result="failed"} += 1
+kubectl get events -n cloudberry-test --field-selector reason=ValidationFailed
+```
+
+The restore Job itself remains Succeeded — only the validation result reflects the
+discrepancy.
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario80-post-restore-validation.yaml`
+enables validation (`runAnalyze: true`, `healthCheckQuery: "SELECT 1"`) on a single S3
+(MinIO) destination. The behavior is covered by
+`test/functional/scenario80_post_restore_validation_test.go`,
+`test/integration/scenario80_post_restore_validation_integration_test.go`, and
+`test/e2e/scenario80_post_restore_validation_e2e_test.go`, and the live cycle is driven by
+`test/e2e/scripts/scenario80-post-restore-validation.sh`:
+
+```bash
+bash test/e2e/scripts/scenario80-post-restore-validation.sh --cluster scenario80-s3
+```
+
+### Local Backup Destination (Scenario 81)
+
+Besides S3/MinIO, you can back up to a **local** PersistentVolumeClaim (PVC). With
+`destination.type: local` the operator wires `gpbackup`/`gprestore` to a `--backup-dir` on
+a mounted PVC instead of streaming through the S3 plugin: no S3 plugin config, no S3
+ConfigMap, and no Vault/Secret S3 credentials are involved.
+
+#### Provisioning the PVC
+
+Create a PVC for the backup data. Size it for your backup set plus headroom (the sample
+uses ~5Gi); use a StorageClass available in your cluster:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-pvc
+  namespace: cloudberry-test
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: "5Gi"
+```
+
+> **Do not over-fill a hostpath PVC.** On a kind/hostpath provisioner a PVC has no hard
+> quota; an over-large backup can fill the node and cause `DiskPressure`. Keep the PVC
+> reasonably sized and clean old backups (retention applies to local too).
+
+#### Configuring a local destination
+
+Set `destination.type: local` with the path and PVC under `destination.local`:
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    destination:
+      type: local
+      local:
+        path: /backups                      # gpbackup/gprestore --backup-dir (default /backups)
+        persistentVolumeClaim: backup-pvc   # the PVC mounted at local.path on the Job pod
+```
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario81-local-destination.yaml
+```
+
+| Field | Default | What it does |
+|-------|---------|--------------|
+| `destination.local.path` | `/backups` | The on-pod directory passed to `gpbackup`/`gprestore` as `--backup-dir`. The PVC is mounted here. |
+| `destination.local.persistentVolumeClaim` | — | The name of the PVC the backup/restore Job pod mounts read-write at `local.path`. |
+
+#### What happens (local vs S3)
+
+For a local destination the operator:
+
+- mounts the named PVC as the `backup-data` volume at `local.path` (`/backups`) on the
+  backup/restore Job pod;
+- runs `gpbackup`/`gprestore` with `--backup-dir <path>` and **no** `--plugin-config` — no
+  `s3-plugin-config` volume, no `/etc/gpbackup` mount, and no `S3_*`/`AWS_*` environment;
+- creates **no** S3 ConfigMap and **no** Vault/Secret S3 credentials;
+- still runs the pre-backup health checks, including the **local disk-space** check
+  (`df` free space must be ≥ 1 GiB, or the backup is blocked) — see
+  [Pre-Backup Health Checks (Scenario 77)](#pre-backup-health-checks-scenario-77);
+- enforces retention with `gpbackman … --backup-dir <path>` (instead of `--plugin-config`).
+
+```bash
+# Inspect the rendered backup Job: PVC volume + --backup-dir, no S3 plugin
+kubectl get job -n cloudberry-test \
+  -l avsoft.io/cluster=scenario81-local,avsoft.io/backup-operation=backup \
+  -o yaml | grep -E 'backup-data|backup-dir|persistentVolumeClaim|claimName'
+# … volume backup-data -> claimName: backup-pvc, mountPath: /backups
+# … args contain: --backup-dir /backups   (and NOT --plugin-config)
+```
+
+#### Restoring from a local backup
+
+Restore from a local backup the same way as any backup — by timestamp. The operator mounts
+the **same** PVC at `local.path` on the restore Job and runs
+`gprestore --timestamp <ts> --backup-dir <path>` (no `--plugin-config`):
+
+```bash
+# Restore from a local backup (creates a restore Job)
+cloudberry-ctl backup restore --cluster scenario81-local --timestamp 20260608020000 \
+  [--create-db] [--jobs 4]
+```
+
+The RWO PVC is mounted by one pod at a time, so a backup Job followed by a restore Job runs
+sequentially without contention.
+
+#### MPP / per-segment visibility consideration
+
+`gpbackup --backup-dir <dir>` is a Massively Parallel Processing operation: the coordinator
+dispatches over SSH to **every** segment host, and each writes its **own** per-segment
+backup set under `<dir>` on **that host**. A single ReadWriteOnce PVC mounted on one
+backup Job pod therefore holds **one** backup set, not the full cluster-wide per-segment
+fan-out. For a real multi-segment local backup the `--backup-dir` must exist and be writable
+on the coordinator **and** every segment host (for example, a shared/host path the cluster
+pods can all write). The operator's PVC mount proves the destination wiring (the PVC at
+`local.path`, `--backup-dir` in the args, no S3 plugin); the end-to-end data cycle targets a
+segment-visible `--backup-dir` (e.g. one under each pod's writable `/tmp`).
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario81-local-destination.yaml`
+declares both the `backup-pvc` PVC and a cluster with `destination.type: local`
+(`path: /backups`, `persistentVolumeClaim: backup-pvc`), no schedule (on-demand). The
+behavior is covered by `test/functional/scenario81_local_destination_test.go`,
+`test/integration/scenario81_local_destination_integration_test.go`, and
+`test/e2e/scenario81_local_destination_e2e_test.go`, and the live cycle is driven by
+`test/e2e/scripts/scenario81-local-destination.sh`:
+
+```bash
+bash test/e2e/scripts/scenario81-local-destination.sh --cluster scenario81-local
+```
+
+### Backup Security (Scenario 82)
+
+The backup/restore path is built so your S3 credentials never persist outside a Kubernetes
+Secret, the backup Jobs hold only minimal RBAC, S3 traffic is encrypted, and you can pull the
+backup image from a private registry. This section shows how to configure each.
+
+#### Credentials live only in a Secret (never on disk/ConfigMap)
+
+Provide your S3 credentials in a Kubernetes Secret and reference it from the CR — never inline:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: cloudberry-test
+type: Opaque
+stringData:
+  aws_access_key_id: <key>
+  aws_secret_access_key: <secret>
+---
+spec:
+  backup:
+    destination:
+      type: s3
+      s3:
+        # ...
+        credentialSecret:
+          name: s3-credentials              # creds live ONLY here
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+```
+
+The operator's generated `<cluster>-backup-s3-config` ConfigMap contains **only** `${...}`
+placeholders — no real credential ever lands in a ConfigMap or on disk. Credentials reach the
+running pod **only** as `secretKeyRef` env vars, and the S3 plugin config is resolved at
+runtime with `envsubst` into `/tmp/s3-config.yaml`, which exists **only** in the ephemeral
+Job pod (it is never written to a ConfigMap, a Secret, or the host). You can confirm the
+ConfigMap holds only placeholders:
+
+```bash
+kubectl get configmap -n cloudberry-test scenario82-s3-backup-s3-config \
+  -o jsonpath='{.data.s3-plugin-config\.yaml\.tpl}'
+# … aws_access_key_id: ${AWS_ACCESS_KEY_ID}   (placeholder, not a real value)
+```
+
+#### Scoped RBAC for the backup ServiceAccount
+
+Backup/restore/validate/cleanup Jobs run as the dedicated `cloudberry-backup-sa`
+ServiceAccount. By default its Role can `get` any Secret in the namespace (backward
+compatible). For production, **enable scoping** so the SA can read only the backup-relevant
+Secrets and is **denied** access to unrelated Secrets. Set these operator chart values:
+
+```yaml
+# Helm values for the operator chart (install/upgrade)
+backup:
+  rbac:
+    create: true
+    scopeSecrets: true                      # scope secrets:get to an allow-list
+    secretNames:                            # MUST list every Secret the Jobs consume
+      - s3-credentials                      # your S3 credentialSecret.name
+      - scenario82-s3-admin-password        # <cluster>-admin-password
+      - scenario82-s3-ssh-keys              # <cluster>-ssh-keys
+      - scenario82-s3-backup-s3-vault-creds # <cluster>-backup-s3-vault-creds (Vault S3 creds)
+```
+
+> **Include every consumed Secret, or backups break.** The allow-list must cover the S3
+> credential Secret plus the per-cluster `<cluster>-admin-password`, `<cluster>-ssh-keys`,
+> and `<cluster>-backup-s3-vault-creds` Secrets. With **multiple clusters** in one namespace,
+> **union** all their per-cluster names. (Scoping the SA's API `get` does not affect the
+> Job's env/volume credentials — those are injected by the kubelet.)
+
+```bash
+NS=cloudberry-test; SA=system:serviceaccount:$NS:cloudberry-backup-sa
+kubectl auth can-i get secret/s3-credentials   --as="$SA" -n "$NS"   # yes (allowed)
+kubectl auth can-i get secret/unrelated-secret --as="$SA" -n "$NS"   # no  (denied)
+```
+
+#### Encryption on/off
+
+`destination.s3.encryption` controls the S3 plugin's TLS/SSL option and accepts only `on` or
+`off` (default `on`). With `encryption: "on"` traffic to S3/MinIO uses TLS:
+
+```yaml
+spec:
+  backup:
+    destination:
+      s3:
+        encryption: "on"                    # on (TLS, default) | off
+```
+
+```bash
+# Flip encryption off (then trigger a fresh backup); reset to on afterwards
+kubectl patch cloudberrycluster scenario82-s3 -n cloudberry-test --type merge \
+  -p '{"spec":{"backup":{"destination":{"s3":{"encryption":"off"}}}}}'
+```
+
+The rendered `/tmp/s3-config.yaml` in the pod will then carry `encryption: on` or
+`encryption: off` accordingly. Any value other than `on`/`off` is rejected by the CRD.
+
+#### Pulling the backup image from a private registry
+
+Set `imagePullSecrets` on the backup `jobTemplate` so the backup Job pods (and the restore,
+validation, cleanup, and CronJob pods) can pull from a private registry:
+
+```yaml
+spec:
+  backup:
+    jobTemplate:
+      imagePullSecrets:
+        - name: regcred                     # dockerconfigjson Secret
+```
+
+```bash
+# Verify the secret is present on the backup Job pod spec
+kubectl get job -n cloudberry-test <backup-job> \
+  -o jsonpath='{.spec.template.spec.imagePullSecrets[*].name}'
+# regcred
+```
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario82-security-encryption.yaml`
+declares the `s3-credentials` Secret, an `unrelated-secret` (for the deny check), and an S3
+cluster (`scenario82-s3`) with `encryption: "on"` and a `jobTemplate.imagePullSecrets` entry.
+The behavior is covered by `test/functional/scenario82_security_encryption_test.go`,
+`test/integration/scenario82_security_encryption_integration_test.go`, and
+`test/e2e/scenario82_security_encryption_e2e_test.go`, and the live checks are driven by
+`test/e2e/scripts/scenario82-security-encryption.sh`:
+
+```bash
+bash test/e2e/scripts/scenario82-security-encryption.sh --cluster scenario82-s3
+```
+
+### Backup Failure Handling & Retries (Scenario 83)
+
+Backup Jobs are bounded by two Kubernetes Job guards so a backup that **cannot succeed**
+retries a fixed number of times and is **killed** if it runs too long — and is then
+recorded as `Failed`. Both are configurable per cluster on the backup `jobTemplate`:
+
+| Setting | `jobTemplate` field | Default | What it does |
+|---------|---------------------|---------|--------------|
+| Retries | `backoffLimit` | `2` | How many times a failing backup pod retries before the Job is marked `Failed`. With `2`, a persistently failing backup makes **up to 3** pod attempts, then ends with the Job condition `reason=BackoffLimitExceeded`. |
+| Deadline | `activeDeadlineSeconds` | `7200` (2 h) | Maximum wall-clock time the whole backup Job may run. When the deadline is reached Kubernetes **kills** the Job (condition `reason=DeadlineExceeded`). |
+
+```yaml
+spec:
+  backup:
+    jobTemplate:
+      backoffLimit: 2                # retries before the backup Job is marked Failed
+      activeDeadlineSeconds: 7200    # kill the backup Job after 2h (production-safe default)
+```
+
+> Leave `activeDeadlineSeconds` at the production-safe default (`7200`) for real clusters.
+> A very low value (e.g. `5`) is useful **only** to deliberately exercise the deadline-kill
+> path on a throwaway/per-run Job — do not lower it on a production cluster, or normal
+> backups will be killed before they finish.
+
+#### What happens on failure
+
+When a backup fails — whether it exhausts `backoffLimit` (e.g. an unreachable S3 endpoint
+or bad credentials, caught fast by the pre-backup S3-reachability check) **or** it is
+killed at `activeDeadlineSeconds` — the operator:
+
+1. Sets **`status.backup.lastBackupStatus: Failed`** and appends a `backupHistory[]` entry
+   with `status: Failed`.
+2. Sets the metric **`cloudberry_backup_last_status{cluster,namespace} = 1`** (gauge:
+   `0=success, 1=failed, 2=in-progress`). A later successful backup sets it back to `0`.
+3. Emits a Kubernetes **`Warning`/`BackupFailed`** Event referencing the failed Job
+   (one per failed Job).
+
+```bash
+NS=cloudberry-test; C=scenario83-s3
+
+# Watch the backup Job retry up to backoffLimit and end Failed
+kubectl get job -n "$NS" <backup-job> -o jsonpath='{.status.failed}{"\n"}'
+kubectl get job -n "$NS" <backup-job> \
+  -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}{"\n"}'
+#   BackoffLimitExceeded   (force-failure)   |   DeadlineExceeded   (deadline kill)
+
+# The cluster status reflects the failure
+kubectl get cloudberrycluster -n "$NS" "$C" -o jsonpath='{.status.lastBackupStatus}{"\n"}'
+#   Failed
+
+# Exactly one Warning per failed Job
+kubectl get events -n "$NS" --field-selector reason=BackupFailed
+
+# Metric is 1 on failure (query VictoriaMetrics / Prometheus)
+#   cloudberry_backup_last_status{cluster="scenario83-s3",namespace="cloudberry-test"} == 1
+```
+
+#### Interpreting a deadline-killed backup
+
+A backup killed at `activeDeadlineSeconds` ends with the Job condition
+`type=Failed reason=DeadlineExceeded` — its failed-**pod** count may even be `0`, because
+Kubernetes terminated the Job at the deadline rather than the pod failing on its own. The
+operator still records it as `Failed` (it treats **any** Job carrying a terminal `Failed`
+condition as failed, not just a non-zero failed-pod count), so a deadline-killed backup
+yields the same `lastBackupStatus=Failed` + `cloudberry_backup_last_status=1` +
+`BackupFailed` Warning as a backoffLimit-exhausted one. Read `reason=DeadlineExceeded`
+(rather than `BackoffLimitExceeded`) on the Job's `Failed` condition to tell the two
+apart: the deadline reason means the backup **ran too long** for its configured deadline,
+not that the destination was unreachable.
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario83-backup-failure.yaml`
+ships an S3 cluster (`scenario83-s3`) with an explicit `jobTemplate.backoffLimit: 2` and
+the production-safe default `activeDeadlineSeconds` (the deadline test uses a per-run Job
+so the cluster's deadline stays safe). The behavior is covered by
+`test/functional/scenario83_backup_failure_test.go`,
+`test/integration/scenario83_backup_failure_integration_test.go`, and
+`test/e2e/scenario83_backup_failure_e2e_test.go`, and the live checks are driven by
+`test/e2e/scripts/scenario83-backup-failure.sh`:
+
+```bash
+bash test/e2e/scripts/scenario83-backup-failure.sh --cluster scenario83-s3
 ```
 
 ## Configuration Management

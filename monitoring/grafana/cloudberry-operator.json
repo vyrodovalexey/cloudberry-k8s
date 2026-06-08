@@ -1476,6 +1476,43 @@
       }
     },
     {
+      "id": 130,
+      "type": "timeseries",
+      "title": "Backup Duration by Type (p99)",
+      "description": "Backup duration p99 split by backup type (full vs incremental) from cloudberry_backup_duration_seconds{type}",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 12, "y": 82, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (type, le) (rate(cloudberry_backup_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{type}} p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (type, le) (rate(cloudberry_backup_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
       "id": 44,
       "type": "timeseries",
       "title": "Data Loading Jobs Active",
@@ -1534,6 +1571,49 @@
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
         "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 131,
+      "type": "stat",
+      "title": "Retention Deletions (1h)",
+      "description": "Backups deleted by retention policy in the last 1h per cluster (Scenario 79 retention cleanup activity) from cloudberry_backup_retention_deleted_total",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "x": 16, "y": 90, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (cluster) (increase(cloudberry_backup_retention_deleted_total[1h]))",
+          "legendFormat": "{{cluster}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(cloudberry_backup_retention_deleted_total[1h]))",
+          "legendFormat": "total",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "blue", "value": 1 }
+            ]
+          },
+          "unit": "short",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
       }
     },
     {
@@ -3225,8 +3305,8 @@
     {
       "id": 122,
       "type": "row",
-      "title": "Backup Health (Scenario 77 — Pre-Backup Checks)",
-      "description": "Surfaces backup-Job health so pre-backup-check failures (segments-down, long-running txn, S3 unreachable, low disk) are immediately visible. Backup blocked => Job Failed (status=3), backup_last_status=Failed (1) and backup_total{result=\"failed\"} increments.",
+      "title": "Backup & Restore Health (Scenario 77 Pre-Backup Checks / Scenario 80 Post-Restore Validation)",
+      "description": "Surfaces backup-Job health so pre-backup-check failures (segments-down, long-running txn, S3 unreachable, low disk) are immediately visible. Backup blocked => Job Failed (status=3), backup_last_status=Failed (1) and backup_total{result=\"failed\"} increments. Also surfaces Scenario 80 post-restore validation outcomes (cloudberry_restore_validation_total{result=success|failed}): the validation Job compares restored row counts vs gpbackup history, runs an invalid-index scan and a health-check query, and flags any discrepancy.",
       "gridPos": { "x": 0, "y": 223, "w": 24, "h": 1 },
       "collapsed": true,
       "panels": [
@@ -3490,6 +3570,133 @@
                 "matcher": { "id": "byRegexp", "options": ".*failed.*" },
                 "properties": [
                   { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "id": 132,
+          "type": "stat",
+          "title": "Restore Validations Failed (1h)",
+          "description": "Post-restore validation failures in the last hour (cloudberry_restore_validation_total{result=\"failed\"}). Scenario 80: a non-zero value means the validation Job flagged an issue (e.g. row-count mismatch vs gpbackup history, invalid index, or failed health check).",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 0, "y": 236, "w": 6, "h": 4 },
+          "targets": [
+            {
+              "expr": "sum(increase(cloudberry_restore_validation_total{result=\"failed\"}[1h]))",
+              "legendFormat": "failed (1h)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              },
+              "unit": "short",
+              "noValue": "0"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 133,
+          "type": "stat",
+          "title": "Restore Validation (1h)",
+          "description": "Post-restore validation outcomes by result in the last hour (cloudberry_restore_validation_total{result=success|failed}). Scenario 80 records this from the validation Job's terminal status.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 6, "y": 236, "w": 6, "h": 4 },
+          "targets": [
+            {
+              "expr": "sum by (result) (increase(cloudberry_restore_validation_total[1h]))",
+              "legendFormat": "{{result}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "blue", "value": null }
+                ]
+              },
+              "unit": "short",
+              "noValue": "0"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byRegexp", "options": ".*failed.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "textMode": "value_and_name"
+          }
+        },
+        {
+          "id": 134,
+          "type": "timeseries",
+          "title": "Restore Validation Outcomes (success vs failed)",
+          "description": "Post-restore validation outcomes over time by result (cloudberry_restore_validation_total{result}). Scenario 80: the failed series rises when validation flags a row-count mismatch vs gpbackup history, an invalid index, or a failed health-check query.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 12, "y": 236, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (result) (increase(cloudberry_restore_validation_total[1h]))",
+              "legendFormat": "{{result}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 10,
+                "pointSize": 5,
+                "showPoints": "auto"
+              },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byRegexp", "options": ".*failed.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              },
+              {
+                "matcher": { "id": "byRegexp", "options": ".*success.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
                 ]
               }
             ]
