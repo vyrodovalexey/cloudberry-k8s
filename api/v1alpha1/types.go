@@ -254,6 +254,10 @@ const (
 	EventReasonQueryMonitoringReconciled = "QueryMonitoringReconciled"
 	// EventReasonBackupReconciled indicates backup configuration has been reconciled.
 	EventReasonBackupReconciled = "BackupReconciled"
+	// EventReasonBackupFailed indicates a backup Job failed (pre-backup checks or
+	// execution). It is emitted as an EventTypeWarning, de-duplicated per failed
+	// Job name so periodic reconciles do not re-emit for the same failure.
+	EventReasonBackupFailed = "BackupFailed"
 	// EventReasonDataLoadingReconciled indicates data loading has been reconciled.
 	EventReasonDataLoadingReconciled = "DataLoadingReconciled"
 	// EventReasonStorageReconciled indicates storage management has been reconciled.

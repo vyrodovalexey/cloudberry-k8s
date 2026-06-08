@@ -3221,6 +3221,285 @@
         "justifyMode": "auto",
         "textMode": "auto"
       }
+    },
+    {
+      "id": 122,
+      "type": "row",
+      "title": "Backup Health (Scenario 77 — Pre-Backup Checks)",
+      "description": "Surfaces backup-Job health so pre-backup-check failures (segments-down, long-running txn, S3 unreachable, low disk) are immediately visible. Backup blocked => Job Failed (status=3), backup_last_status=Failed (1) and backup_total{result=\"failed\"} increments.",
+      "gridPos": { "x": 0, "y": 223, "w": 24, "h": 1 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 123,
+          "type": "stat",
+          "title": "Failed Backup Jobs (current)",
+          "description": "Number of backup Jobs currently in the Failed state (cloudberry_backup_job_status == 3, operation=backup). A non-zero value indicates a Scenario 77 pre-backup-check block or a failed backup execution.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 0, "y": 224, "w": 4, "h": 4 },
+          "targets": [
+            {
+              "expr": "count(cloudberry_backup_job_status{operation=\"backup\"} == 3) or vector(0)",
+              "legendFormat": "failed jobs",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              },
+              "unit": "short",
+              "noValue": "0"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 124,
+          "type": "stat",
+          "title": "Backups Failed (1h)",
+          "description": "Backup operations that failed in the last hour (cloudberry_backup_total{result=\"failed\"}). Each Scenario 77 pre-backup-check block increments this counter.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 4, "y": 224, "w": 4, "h": 4 },
+          "targets": [
+            {
+              "expr": "sum(increase(cloudberry_backup_total{result=\"failed\"}[1h]))",
+              "legendFormat": "failed (1h)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "orange", "value": 1 },
+                  { "color": "red", "value": 3 }
+                ]
+              },
+              "unit": "short",
+              "noValue": "0"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 125,
+          "type": "stat",
+          "title": "Last Backup Status",
+          "description": "Most recent backup status per cluster (cloudberry_backup_last_status: 0=Success, 1=Failed, 2=In-Progress). Failed means a pre-backup check blocked the backup or the backup itself failed.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 8, "y": 224, "w": 4, "h": 4 },
+          "targets": [
+            {
+              "expr": "cloudberry_backup_last_status",
+              "legendFormat": "{{cluster}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 },
+                  { "color": "yellow", "value": 2 }
+                ]
+              },
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Success", "color": "green" }, "1": { "text": "Failed", "color": "red" }, "2": { "text": "In-Progress", "color": "yellow" } } }
+              ],
+              "noValue": "N/A"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 126,
+          "type": "stat",
+          "title": "Last Successful Backup",
+          "description": "Wall-clock time of the last successful backup per cluster (cloudberry_backup_last_success_timestamp, Unix seconds).",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 12, "y": 224, "w": 6, "h": 4 },
+          "targets": [
+            {
+              "expr": "cloudberry_backup_last_success_timestamp * 1000",
+              "legendFormat": "{{cluster}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "dateTimeAsIso",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "blue", "value": null }
+                ]
+              },
+              "noValue": "No backup yet"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "none",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 127,
+          "type": "stat",
+          "title": "Time Since Last Successful Backup",
+          "description": "Elapsed time since the last successful backup per cluster (time() - cloudberry_backup_last_success_timestamp). Grows while pre-backup checks keep blocking backups.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 18, "y": 224, "w": 6, "h": 4 },
+          "targets": [
+            {
+              "expr": "time() - cloudberry_backup_last_success_timestamp",
+              "legendFormat": "{{cluster}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 86400 },
+                  { "color": "red", "value": 172800 }
+                ]
+              },
+              "unit": "s",
+              "noValue": "No backup yet"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"]
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 128,
+          "type": "timeseries",
+          "title": "Backup Job Status Over Time",
+          "description": "Per-Job backup status timeline (cloudberry_backup_job_status, operation=backup). Codes: 0=Pending, 1=Running, 2=Succeeded, 3=Failed. A drop to 3 marks a Scenario 77 pre-backup-check block or a failed backup run.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 0, "y": 228, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "cloudberry_backup_job_status{operation=\"backup\"}",
+              "legendFormat": "{{cluster}}/{{namespace}} {{job}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "stepAfter",
+                "fillOpacity": 10,
+                "pointSize": 6,
+                "showPoints": "always"
+              },
+              "min": 0,
+              "max": 3,
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Pending", "color": "blue" }, "1": { "text": "Running", "color": "yellow" }, "2": { "text": "Succeeded", "color": "green" }, "3": { "text": "Failed", "color": "red" } } }
+              ]
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "id": 129,
+          "type": "timeseries",
+          "title": "Backup Outcomes Rate (success vs failed)",
+          "description": "Rate of backup outcomes by result (cloudberry_backup_total). Rising failed series indicates recurring Scenario 77 pre-backup-check blocks.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 12, "y": 228, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (cluster, type, result) (rate(cloudberry_backup_total[5m]))",
+              "legendFormat": "{{cluster}} {{type}} {{result}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 10,
+                "pointSize": 5,
+                "showPoints": "auto"
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byRegexp", "options": ".*failed.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        }
+      ]
     }
   ]
 }

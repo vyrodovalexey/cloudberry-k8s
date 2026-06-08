@@ -2630,6 +2630,41 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario76
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario76
 ```
 
+#### Scenario 77 — Pre-Backup Health Checks
+
+Every backup Job carries a `pre-backup-check` **init container** that validates cluster + destination health **before** the backup proceeds. Init-container semantics make it blocking: a non-zero exit means the `gpbackup` container never starts and the Job fails. On a backup-Job failure the operator records `status.backup.lastBackupStatus=Failed` and emits a de-duplicated **Warning** Event (reason `BackupFailed`); healing the fault lets a fresh backup reach `Success`.
+
+- **Where the checks live** — `internal/builder/backup_builder.go`:
+  - `addPreBackupCheckInitContainer` prepends the `pre-backup-check` init container (shares the backup image, env, and volume mounts with the `gpbackup` container) to the backup Job/CronJob pod spec.
+  - `preBackupCheckScript` runs under `set -euo pipefail` and performs **77a** segments-up (`SELECT count(*) FROM gp_segment_configuration WHERE status='d'` → `exit 1` if `> 0`) and **77b** long-running txn (`pg_stat_activity` where `state <> 'idle'` and `now() - xact_start > interval`, threshold `longRunningTxnThresholdSeconds = 3600` → `exit 1` if `> 0`).
+  - `preBackupDestinationCheck` appends the destination check: **77d** local (`df -Pk <path>` free KB `< minBackupDiskFreeKB = 1048576` KiB / 1 GiB → `exit 1`); **77c** S3 → `s3ReachabilityCheckScript`.
+  - `s3ReachabilityCheckScript` builds a **fail-closed** SigV4-signed `curl -I` HEAD against `${S3_ENDPOINT}/${S3_BUCKET}` (path-style), region `${S3_REGION:-us-east-1}`, signing with the injected `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` and the `openssl`-HMAC chain mirroring `test/docker-compose/scripts/setup-minio.sh`; non-2xx/3xx (or a `--max-time 15` timeout → `000`) → `exit 1`. This replaces the prior best-effort `aws s3 ls` that never failed.
+
+- **Where the event lives** — `internal/controller/admin_controller.go`:
+  - `applyBackupJobToStatus` captures the previous `lastBackupStatus`/`lastBackupJobName` **before** overwriting, then calls `emitBackupFailureEvent`.
+  - `emitBackupFailureEvent` emits `EventTypeWarning` / `EventReasonBackupFailed` (`api/v1alpha1.EventReasonBackupFailed = "BackupFailed"`) only on a real **transition into Failed** for a given Job name (de-dup), and only for **backup**-operation Jobs (restore failures are excluded).
+
+- **Sample CRs**: `deploy/helm/cloudberry-operator/config/samples/scenario77-s3-prebackup.yaml` (S3 dest — 77a/77b/77c) and `scenario77-local-prebackup.yaml` (local dest + small `scenario77-backup-pvc` — 77d)
+- **Functional tests**: `test/functional/scenario77_prebackup_checks_test.go` (`TestFunctional_Scenario77`)
+- **Controller event/status tests**: `internal/controller/backup_event_scenario77_test.go` (`TestEmitBackupFailureEvent_Scenario77`, `TestApplyBackupJobToStatus_*_Scenario77`)
+- **E2E tests**: `test/e2e/scenario77_prebackup_checks_e2e_test.go` (`TestE2E_Scenario77`)
+- **Live script**: `test/e2e/scripts/scenario77-prebackup-checks.sh`
+
+```bash
+# Run Scenario 77 pre-backup-check functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario77
+
+# Run Scenario 77 controller event/status tests
+go test ./internal/controller/... -v -run Scenario77
+
+# Run Scenario 77 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario77
+
+# Run the live fault -> block -> heal -> success cycle against deployed clusters
+bash test/e2e/scripts/scenario77-prebackup-checks.sh \
+  --cluster scenario77-s3 --local-cluster scenario77-local
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

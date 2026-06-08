@@ -1,0 +1,189 @@
+# =============================================================================
+# Scenario 77 — Pre-Backup Health Checks (local destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus a LOCAL (PVC-backed) backup destination.
+#
+# This local-destination cluster runs 77d (local disk-space): the backup PVC
+# (scenario77-backup-pvc, sized SMALL at ~2Gi) is filled near-full so the
+# pre-backup-check `df` free-space check (minBackupDiskFreeKB = 1 GiB) fails and
+# blocks the backup; freeing the space lets a fresh backup reach Success. It can
+# also re-run 77a/77b as a cross-check.
+#
+# The small PVC is defined below alongside the cluster so filling it below the
+# 1 GiB free threshold is fast/cheap.
+#
+# Live test: test/e2e/scripts/scenario77-prebackup-checks.sh \
+#              --cluster scenario77-s3 --local-cluster scenario77-local
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scenario77-backup-pvc
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "77"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # SMALL on purpose so the 77d disk-fill can drop free space below the
+      # 1 GiB (minBackupDiskFreeKB) threshold quickly.
+      storage: "2Gi"
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario77-local
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "77"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: scenario77-local-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — LOCAL (PVC-backed) destination. No schedule is set:
+  # Scenario 77 triggers on-demand backups so the pre-backup health-check
+  # failure surfaces on a discrete Job the operator reconciles.
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: local
+      local:
+        path: /backups
+        persistentVolumeClaim: scenario77-backup-pvc
+
+  deletionPolicy: Delete

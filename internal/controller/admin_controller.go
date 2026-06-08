@@ -65,6 +65,12 @@ const (
 	// used to derive a valid 14-digit timestamp for CronJob-spawned backup Jobs.
 	backupTimestampLayout = "20060102150405"
 
+	// Human-readable backup Job statuses recorded in cluster.Status.LastBackupStatus
+	// and the BackupHistory entries.
+	backupStatusSuccess    = "Success"
+	backupStatusFailed     = "Failed"
+	backupStatusInProgress = "InProgress"
+
 	// Backup Job status codes for the cloudberry_backup_job_status gauge.
 	backupJobStatusPending   = 0.0
 	backupJobStatusRunning   = 1.0
@@ -1953,11 +1959,11 @@ func latestBackupJob(jobs []batchv1.Job) *batchv1.Job {
 func backupJobStatus(job *batchv1.Job) string {
 	switch {
 	case job.Status.Succeeded > 0:
-		return "Success"
+		return backupStatusSuccess
 	case job.Status.Failed > 0:
-		return "Failed"
+		return backupStatusFailed
 	default:
-		return "InProgress"
+		return backupStatusInProgress
 	}
 }
 
@@ -1971,6 +1977,12 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 	timestamp := backupTimestampFromJob(cluster, job)
 	backupType := backupTypeFromLabels(cluster)
 	duration := backupJobDuration(job)
+
+	// Capture the previous status/job name BEFORE overwriting so a backup
+	// failure Warning Event is emitted only on a real transition into "Failed"
+	// for this Job (de-duplicated across periodic reconciles of the same Job).
+	prevStatus := cluster.Status.LastBackupStatus
+	prevJobName := cluster.Status.LastBackupJobName
 
 	cluster.Status.LastBackupStatus = status
 	cluster.Status.LastBackupJobName = job.Name
@@ -1997,6 +2009,31 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 	}
 
 	r.recordLatestBackupMetrics(cluster, job, backupType, timestamp, status)
+	r.emitBackupFailureEvent(cluster, job, status, prevStatus, prevJobName)
+}
+
+// emitBackupFailureEvent emits a single de-duplicated Warning Event when a
+// backup-operation Job transitions into the "Failed" state (spec 11
+// §Pre-Backup Health Checks / Scenario 77). De-duplication gates on a real
+// transition: the event fires only when the previously recorded status was not
+// already "Failed" for this same Job name, so periodic reconciles of an
+// unchanged failed Job do not produce an event storm.
+func (r *AdminReconciler) emitBackupFailureEvent(
+	cluster *cbv1alpha1.CloudberryCluster,
+	job *batchv1.Job,
+	status, prevStatus, prevJobName string,
+) {
+	if status != backupStatusFailed {
+		return
+	}
+	// Only emit on a transition into Failed for this Job: skip when the same Job
+	// was already recorded as Failed on a prior reconcile.
+	if prevJobName == job.Name && prevStatus == backupStatusFailed {
+		return
+	}
+	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonBackupFailed,
+		fmt.Sprintf("Backup job %s failed pre-backup checks or execution (timestamp %s)",
+			job.Name, backupTimestampFromJob(cluster, job)))
 }
 
 // recordLatestBackupMetrics wires the spec-11 backup metrics for the latest
@@ -2011,7 +2048,7 @@ func (r *AdminReconciler) recordLatestBackupMetrics(
 	r.metrics.RecordBackup(name, namespace, backupType, strings.ToLower(status))
 
 	switch status {
-	case "Success":
+	case backupStatusSuccess:
 		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusSuccess)
 		if job.Status.CompletionTime != nil {
 			r.metrics.SetBackupLastSuccessTimestamp(
@@ -2024,7 +2061,7 @@ func (r *AdminReconciler) recordLatestBackupMetrics(
 		if size := backupJobSizeBytes(job); size > 0 && timestamp != "" {
 			r.metrics.SetBackupSizeBytes(name, namespace, timestamp, size)
 		}
-	case "Failed":
+	case backupStatusFailed:
 		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusFailed)
 	default:
 		r.metrics.SetBackupLastStatus(name, namespace, backupLastStatusInProgress)

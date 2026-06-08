@@ -532,8 +532,19 @@ func TestBuildPostRestoreValidationJobDefaultQuery(t *testing.T) {
 
 func TestPreBackupDestinationCheckS3(t *testing.T) {
 	script := preBackupCheckScript(newBackupCluster())
-	assert.Contains(t, script, "s3 bucket connectivity")
+	// The S3 branch performs a real, fail-closed SigV4 HEAD reachability check.
+	assert.Contains(t, script, "verifying s3 bucket reachability")
+	assert.Contains(t, script, "${S3_ENDPOINT")
 	assert.Contains(t, script, "${S3_BUCKET}")
+	assert.Contains(t, script, "${S3_REGION:-us-east-1}")
+	assert.Contains(t, script, "${AWS_ACCESS_KEY_ID}")
+	assert.Contains(t, script, "${AWS_SECRET_ACCESS_KEY}")
+	assert.Contains(t, script, "AWS4-HMAC-SHA256")
+	assert.Contains(t, script, "-X HEAD")
+	assert.Contains(t, script, "--max-time")
+	// Fail-closed: non-2xx/3xx must exit 1.
+	assert.Contains(t, script, "s3 bucket unreachable")
+	assert.Contains(t, script, "exit 1")
 }
 
 func TestPreBackupDestinationCheckNoBackup(t *testing.T) {

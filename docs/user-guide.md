@@ -39,6 +39,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore](#scenario-74--single-data-file--copy-queue--gpbackup_helper--full-option-restore)
   - [Scenario 75 — Compression Matrix (gzip vs zstd)](#scenario-75--compression-matrix-gzip-vs-zstd)
   - [Scenario 76 — Scheduled Backup via CronJob + Status Population](#scenario-76--scheduled-backup-via-cronjob--status-population)
+  - [Pre-Backup Health Checks (Scenario 77)](#pre-backup-health-checks-scenario-77)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -1021,6 +1022,88 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario76-sched
 **Verified outcome:** the scheduled backup completes and the operator populates the status — `lastBackupTimestamp=20260607224409` (14-digit), `lastBackupStatus=Success`, `lastBackupType=full`, and `backupHistory[0]={timestamp, type:full, status:Success, size:4204206, duration:4s}`; `cronJobName=scenario76-backup-schedule` and `lastBackupJobName` matches the Job.
 
 The live data cycle is driven by `test/e2e/scripts/scenario76-scheduled-backup.sh` and is covered by `test/functional/scenario76_scheduled_backup_test.go` and `test/e2e/scenario76_scheduled_backup_e2e_test.go`.
+
+### Pre-Backup Health Checks (Scenario 77)
+
+Every backup Job carries a `pre-backup-check` **init container** that validates cluster and destination health **before** the backup proceeds. If any check fails, the init container exits non-zero, the `gpbackup` container **never starts**, and the Job fails. The operator then records `status.backup.lastBackupStatus=Failed` and emits a **Warning** Kubernetes Event (reason `BackupFailed`). Healing the fault and triggering a fresh backup lets all checks pass and the backup reach `Success`.
+
+There are **four** checks, each of which blocks the backup:
+
+| Check | Protects against | Blocks when |
+|-------|------------------|-------------|
+| **77a — Segments-up** | Backing up a cluster with a down segment (incomplete/at-risk data) | `gp_segment_configuration` has any segment with `status='d'` |
+| **77b — Long-running transaction** | A long-held transaction stalling `gpbackup`'s metadata locks | a non-idle transaction is older than **1 hour** (`pg_stat_activity.xact_start`) |
+| **77c — S3 reachability** *(S3 destinations)* | Wrong credentials, a missing bucket, or an unreachable endpoint silently producing an unusable backup | a fail-closed SigV4-signed HTTP **HEAD** to the bucket returns **non-2xx/3xx** (403/404/connection failure) |
+| **77d — Local disk space** *(local destinations)* | A near-full PVC causing a partial/failed backup | `df` reports **less than 1 GiB** free on the backup directory |
+
+> **S3 reachability is now fail-closed.** Earlier releases used a best-effort `aws s3 ls` probe that never failed; 77c now performs a **real SigV4-signed HEAD** request (path-style, MinIO-compatible) against `${S3_ENDPOINT}/${S3_BUCKET}` and **blocks** the backup on any non-2xx/3xx response. The request is bounded by a 15-second timeout so an unreachable endpoint fails closed rather than hanging.
+
+#### Interpreting a blocked backup
+
+A blocked backup surfaces as:
+
+- **`lastBackupStatus: Failed`** on the cluster, plus a `backupHistory[]` entry with `status: Failed`:
+
+  ```bash
+  kubectl get cloudberrycluster scenario77-s3 -n cloudberry-test \
+    -o jsonpath='{.status.backup.lastBackupStatus}'
+  # Failed
+  ```
+
+- A **Warning Event** with reason `BackupFailed` on the cluster (emitted **once** per failed Job — periodic reconciles of the same failed Job do not repeat it):
+
+  ```bash
+  kubectl get events -n cloudberry-test \
+    --field-selector reason=BackupFailed,type=Warning \
+    --sort-by='.lastTimestamp'
+  # Warning  BackupFailed  cloudberrycluster/scenario77-s3
+  #   Backup job scenario77-s3-backup-<ts> failed pre-backup checks or execution (timestamp <ts>)
+  ```
+
+- The Job's `pre-backup-check` init container logs name the failing check:
+
+  ```bash
+  kubectl logs job/<backup-job> -n cloudberry-test -c pre-backup-check
+  # pre-backup-check: 1 down segment(s)              # 77a
+  # pre-backup-check: 1 long-running transaction(s)  # 77b
+  # pre-backup-check: s3 bucket unreachable (http 403) # 77c
+  # pre-backup-check: insufficient free space 524288KB # 77d
+  ```
+
+> **Note:** Only **backup** Job failures emit a `BackupFailed` Warning. Restore-operation Job failures are excluded from this signal.
+
+#### Remediation
+
+| Check | How to remediate |
+|-------|------------------|
+| **77a — Segments-up** | Recover the down segment with `gprecoverseg` (and `gprecoverseg -r` to rebalance if roles swapped) until no segment reports `status='d'`. |
+| **77b — Long-running transaction** | Commit/roll back the offending transaction, or terminate its backend: `SELECT pg_terminate_backend(<pid>)`. Confirm no non-idle txn is older than 1 hour. |
+| **77c — S3 reachability** | Fix the S3 credentials (`backup-s3-credentials` Secret or the Vault path) and/or the `spec.backup.destination.s3.bucket` so a HEAD returns 2xx. Verify the endpoint (`http://minio:9000`) is reachable from the cluster. |
+| **77d — Local disk space** | Free space on the backup PVC (remove old backups / ballast files) so `df` reports **≥ 1 GiB** free on the backup directory, or expand the PVC. |
+
+After healing the fault, trigger a fresh backup; all four checks pass and `lastBackupStatus` transitions to `Success`.
+
+#### Sample CRs and verification
+
+Scenario 77 ships **two** sample clusters because the destination checks split by `destination.type`:
+
+| Sample CR | Destination | Checks |
+|-----------|-------------|--------|
+| `deploy/helm/cloudberry-operator/config/samples/scenario77-s3-prebackup.yaml` | S3 (MinIO), Secret credentials | 77a, 77b, **77c** |
+| `deploy/helm/cloudberry-operator/config/samples/scenario77-local-prebackup.yaml` | local (PVC-backed, ~2Gi `scenario77-backup-pvc`) | **77d** (and 77a/77b cross-check) |
+
+```bash
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario77-s3-prebackup.yaml
+kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario77-local-prebackup.yaml
+```
+
+The live fault → block → heal → success cycle is driven by `test/e2e/scripts/scenario77-prebackup-checks.sh` and the behavior is covered by `test/functional/scenario77_prebackup_checks_test.go`, `test/e2e/scenario77_prebackup_checks_e2e_test.go`, and `internal/controller/backup_event_scenario77_test.go`.
+
+```bash
+# Run all four checks against the deployed clusters
+bash test/e2e/scripts/scenario77-prebackup-checks.sh \
+  --cluster scenario77-s3 --local-cluster scenario77-local
+```
 
 ## Configuration Management
 

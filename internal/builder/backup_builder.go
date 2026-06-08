@@ -106,6 +106,13 @@ const (
 	// minBackupDiskFreeKB is the minimum free space (KiB) required on the local
 	// backup-dir mount before a backup proceeds (best-effort check).
 	minBackupDiskFreeKB = 1048576
+	// defaultS3SigningRegion is the SigV4 region used for the S3 reachability
+	// HEAD when S3_REGION is empty. MinIO accepts us-east-1 by default and it
+	// matches the signing region used in test/docker-compose/scripts/setup-minio.sh.
+	defaultS3SigningRegion = "us-east-1"
+	// s3ReachabilityMaxTimeSeconds bounds the SigV4 HEAD request so a hung/unreachable
+	// endpoint fails closed (curl --max-time) instead of stalling the init container.
+	s3ReachabilityMaxTimeSeconds = 15
 
 	// gpEnvPreamble is prepended to every backup/restore script to ensure
 	// GPHOME/bin is on PATH and LD_LIBRARY_PATH includes GPHOME/lib.  It
@@ -813,9 +820,11 @@ func preBackupCheckScript(cluster *cbv1alpha1.CloudberryCluster) string {
 	return b.String()
 }
 
-// preBackupDestinationCheck returns the best-effort destination-readiness portion
-// of the pre-backup script. For local destinations it verifies free disk space on
-// the backup mount; for S3 it performs a lightweight, non-fatal connectivity probe.
+// preBackupDestinationCheck returns the destination-readiness portion of the
+// pre-backup script. For local destinations it verifies free disk space on the
+// backup mount (fail-closed below minBackupDiskFreeKB). For S3 it performs a
+// real, fail-closed SigV4-signed HEAD request against the bucket so wrong
+// credentials, a missing bucket or an unreachable endpoint block the backup.
 func preBackupDestinationCheck(cluster *cbv1alpha1.CloudberryCluster) string {
 	if cluster.Spec.Backup == nil {
 		return ""
@@ -833,14 +842,73 @@ func preBackupDestinationCheck(cluster *cbv1alpha1.CloudberryCluster) string {
 				"echo \"pre-backup-check: insufficient free space ${free}KB\" >&2; exit 1; fi\n",
 			shellQuote(path), minBackupDiskFreeKB)
 	case destinationTypeS3:
-		// Best-effort: the s3 plugin/aws cli may be absent, so never fail here.
-		return "echo 'pre-backup-check: s3 bucket connectivity (best-effort)'\n" +
-			"command -v aws >/dev/null 2>&1 && " +
-			"aws s3 ls \"s3://${S3_BUCKET}\" >/dev/null 2>&1 || " +
-			"echo 'pre-backup-check: skipping s3 connectivity probe'\n"
+		return s3ReachabilityCheckScript()
 	default:
 		return ""
 	}
+}
+
+// s3ReachabilityCheckScript builds a self-contained POSIX-sh snippet that
+// performs a fail-closed S3 bucket reachability check. It issues a SigV4-signed
+// HTTP HEAD request (path-style, e.g. MinIO) against ${S3_ENDPOINT}/${S3_BUCKET}
+// using the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY already injected into the
+// init container, mirroring the openssl-HMAC SigV4 signing used in
+// test/docker-compose/scripts/setup-minio.sh. A 2xx/3xx response means the
+// bucket is reachable; any other response (403/404/000/connection refused)
+// causes "exit 1" so the backup is blocked. The request is bounded by
+// curl --max-time so an unreachable endpoint fails closed instead of hanging.
+//
+// The snippet is built from constant pieces only (no untrusted interpolation):
+// all S3 values are read at runtime from the container env vars, so there is no
+// shell-injection surface. The few %-format verbs below substitute the
+// signing region default and the curl timeout constants.
+func s3ReachabilityCheckScript() string {
+	return fmt.Sprintf(`echo 'pre-backup-check: verifying s3 bucket reachability'
+_s3_region="${S3_REGION:-%[1]s}"
+_s3_service="s3"
+# Strip a trailing slash from the endpoint so ${endpoint}/${bucket} is clean.
+_s3_endpoint="${S3_ENDPOINT%%/}"
+# Derive host[:port] from the endpoint for the canonical Host header.
+_s3_hostport="${_s3_endpoint#*://}"
+_s3_hostport="${_s3_hostport%%/*}"
+# openssl-based SigV4 helpers (mirror setup-minio.sh).
+_hmac_hex() { printf '%%s' "$2" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$1" | sed 's/^.*= //'; }
+_sha256_hex() { printf '%%s' "$1" | openssl dgst -sha256 | sed 's/^.*= //'; }
+_amzdate="$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"
+_datestamp="$(date -u +%%Y%%m%%d)"
+_payload_hash="$(_sha256_hex '')"
+# Canonical request for HEAD /<bucket> (path-style, empty query, empty body).
+_canonical_headers="host:${_s3_hostport}
+x-amz-content-sha256:${_payload_hash}
+x-amz-date:${_amzdate}
+"
+_signed_headers="host;x-amz-content-sha256;x-amz-date"
+_canonical_request="$(printf '%%s\n%%s\n%%s\n%%s\n%%s\n%%s' \
+  "HEAD" "/${S3_BUCKET}" "" "${_canonical_headers}" "${_signed_headers}" "${_payload_hash}")"
+_scope="${_datestamp}/${_s3_region}/${_s3_service}/aws4_request"
+_string_to_sign="$(printf '%%s\n%%s\n%%s\n%%s' \
+  "AWS4-HMAC-SHA256" "${_amzdate}" "${_scope}" "$(_sha256_hex "${_canonical_request}")")"
+# Derive the SigV4 signing key (HMAC chain seeded with "AWS4"+secret).
+_k_secret_hex="$(printf 'AWS4%%s' "${AWS_SECRET_ACCESS_KEY}" | od -An -tx1 | tr -d ' \n')"
+_k_date="$(_hmac_hex "${_k_secret_hex}" "${_datestamp}")"
+_k_region="$(_hmac_hex "${_k_date}" "${_s3_region}")"
+_k_service="$(_hmac_hex "${_k_region}" "${_s3_service}")"
+_k_signing="$(_hmac_hex "${_k_service}" "aws4_request")"
+_signature="$(_hmac_hex "${_k_signing}" "${_string_to_sign}")"
+_authz="AWS4-HMAC-SHA256 Credential=${AWS_ACCESS_KEY_ID}/${_scope}, "
+_authz="${_authz}SignedHeaders=${_signed_headers}, Signature=${_signature}"
+# Fail closed: any curl error yields code 000 (-> exit 1 below).
+_code="$(curl -s -o /dev/null -w '%%{http_code}' --max-time %[2]d \
+  -I -X HEAD "${_s3_endpoint}/${S3_BUCKET}" \
+  -H "Host: ${_s3_hostport}" \
+  -H "x-amz-content-sha256: ${_payload_hash}" \
+  -H "x-amz-date: ${_amzdate}" \
+  -H "Authorization: ${_authz}" 2>/dev/null || echo 000)"
+case "${_code}" in
+  2??|3??) echo "pre-backup-check: s3 bucket reachable (http ${_code})" ;;
+  *) echo "pre-backup-check: s3 bucket unreachable (http ${_code})" >&2; exit 1 ;;
+esac
+`, defaultS3SigningRegion, s3ReachabilityMaxTimeSeconds)
 }
 
 // buildJobSpec builds the JobSpec with template overrides applied.

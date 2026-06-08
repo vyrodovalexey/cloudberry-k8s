@@ -802,13 +802,114 @@ This internally:
 4. Post-migration validation Job runs row-count and checksum verification.
 ## Pre-Backup Health Checks
 
-The operator runs a lightweight init container in each backup Job that verifies:
+Every backup Job (on-demand and CronJob-spawned) carries a `pre-backup-check`
+**init container** that the operator prepends to the pod spec
+(`addPreBackupCheckInitContainer` in `internal/builder/backup_builder.go`). It
+shares the backup image, environment, and volume mounts with the main `gpbackup`
+container, so it connects to the coordinator and reaches the destination exactly
+as the backup will. Init-container semantics make the check **blocking**: if any
+sub-check exits non-zero the `gpbackup` container **never starts** and the Job
+fails (after `backoffLimit` is exhausted).
 
-- Cluster health: all segments are up (`SELECT * FROM gp_segment_configuration WHERE status = 'd'` returns zero rows).
-- No long-running transactions that could block backup (checks `pg_stat_activity` for transactions older than a configurable threshold).
-- For S3 destinations: validates credentials and bucket accessibility via a HEAD request.
-- For local destinations: validates available disk space on the PVC.
-  If any check fails, the init container exits non-zero and the Job does not proceed. The failure is recorded in backup status and emitted as a Kubernetes Event.
+The script (`preBackupCheckScript` / `preBackupDestinationCheck`) runs under
+`set -euo pipefail` and performs **four** sub-checks, each of which **blocks**
+(exits non-zero) on a fault:
+
+| # | Check | Test | Threshold / constant | Blocks when |
+|---|-------|------|----------------------|-------------|
+| **77a** | Segments-up | `SELECT count(*) FROM gp_segment_configuration WHERE status='d'` | — | count `> 0` (any down segment) |
+| **77b** | Long-running transaction | `pg_stat_activity` where `state <> 'idle'` and `now() - xact_start > interval` | `longRunningTxnThresholdSeconds = 3600` (1 hour) | count `> 0` (any txn older than the threshold) |
+| **77c** | S3 reachability (S3 destinations) | fail-closed SigV4-signed HTTP **HEAD** to `${S3_ENDPOINT}/${S3_BUCKET}` (path-style) | `s3ReachabilityMaxTimeSeconds = 15` (curl `--max-time`) | response is **non-2xx/3xx** (403/404/`000`/connection refused) |
+| **77d** | Local disk space (local destinations) | `df -Pk <backup-dir>` free KB | `minBackupDiskFreeKB = 1048576` KiB (**1 GiB**) | free space `< 1 GiB` |
+
+### Sub-check details
+
+- **77a — Segments-up.** A single down segment (`status='d'`) blocks the backup so
+  `gpbackup`'s coordinator→segment dispatch is not attempted against an
+  incomplete cluster. Heal by recovering the segment (`gprecoverseg`).
+
+- **77b — Long-running transaction.** A transaction older than
+  `longRunningTxnThresholdSeconds` (3600 s) in a non-idle state blocks the
+  backup, since long-held transactions can stall `gpbackup`'s metadata locks.
+  Heal by committing/rolling back or terminating the offending backend.
+
+- **77c — S3 reachability (fail-closed SigV4 HEAD).** For S3 destinations the
+  check issues a **SigV4-signed** HTTP `HEAD` against `${S3_ENDPOINT}/${S3_BUCKET}`
+  using **path-style** addressing (MinIO-compatible) and the
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` already injected into the init
+  container. The signing mirrors the `openssl`-HMAC SigV4 approach in
+  `test/docker-compose/scripts/setup-minio.sh` (canonical headers
+  `host;x-amz-content-sha256;x-amz-date`, signing region from `${S3_REGION}` and
+  defaulting to `us-east-1`). A `2xx`/`3xx` response means the bucket is
+  reachable; **any other outcome blocks the backup** — wrong credentials
+  (`403`), a missing bucket (`404`), or an unreachable endpoint (`000` /
+  connection refused, bounded by `curl --max-time 15` so a hung endpoint
+  **fails closed** instead of stalling). This **replaces** the prior best-effort
+  `aws s3 ls` probe, which never failed; S3 reachability is now a real blocking
+  pre-condition.
+
+- **77d — Local disk space.** For local (PVC-backed) destinations the check runs
+  `df -Pk` against the backup directory and blocks the backup when free space is
+  below `minBackupDiskFreeKB` (1048576 KiB = **1 GiB**), so a near-full PVC does
+  not cause a partial backup. Heal by freeing space on the PVC.
+
+The destination check (77c/77d) runs only for the matching `destination.type`:
+when `backup` is nil or the destination type is unknown, `preBackupDestinationCheck`
+returns an empty string (no destination check) while 77a/77b still apply.
+
+### Failure-handling contract
+
+When a backup-operation Job fails (a blocked pre-check or a failed backup
+execution), the operator:
+
+1. **Records `status.backup.lastBackupStatus = Failed`** and appends a
+   `backupHistory[]` entry with `status=Failed` (see
+   `applyBackupJobToStatus`), and sets the `cloudberry_backup_last_status` gauge
+   to failed.
+2. **Emits a Kubernetes Warning Event** with **type `Warning`**, reason
+   **`BackupFailed`** (`api/v1alpha1.EventReasonBackupFailed`), `involvedObject`
+   = the `CloudberryCluster`, naming the failed Job and its timestamp.
+
+The Warning is **de-duplicated per failed Job**: `emitBackupFailureEvent`
+(`internal/controller/admin_controller.go`) emits the event only on a real
+**transition into `Failed`** for a given Job name — it captures the previous
+`lastBackupStatus`/`lastBackupJobName` before overwriting and skips emission when
+the same Job was already recorded as `Failed`. This means periodic reconciles of
+an unchanged failed Job produce **exactly one** Warning, distinct failed Jobs
+each produce their own Warning, and **restore-operation** Job failures are
+**excluded** (Scenario 77 is backup-only). Healing the fault and triggering a
+fresh backup lets all four checks pass and the Job reach `Success`, transitioning
+`lastBackupStatus` back to `Success`.
+
+### Scenario 77 — Pre-Backup Health Checks
+
+**Scenario 77** verifies the `pre-backup-check` init container blocks the backup
+when any of the four sub-checks (77a–77d) fails, records
+`lastBackupStatus=Failed`, and emits the de-duplicated `Warning`/`BackupFailed`
+Event; healing the fault then lets a fresh backup reach `Success`. Because the
+checks split by destination type, the scenario uses **two** sample clusters:
+
+- **`scenario77-s3`** — S3 (MinIO) destination, Secret credentials. Exercises
+  **77a** (segments-up), **77b** (long-running txn), and **77c** (S3
+  reachability — a SigV4 HEAD against a wrong bucket/creds returns non-2xx, so
+  the init container blocks). Sample CR
+  `deploy/helm/cloudberry-operator/config/samples/scenario77-s3-prebackup.yaml`.
+- **`scenario77-local`** — local (PVC-backed) destination with a small ~2Gi
+  backup PVC (`scenario77-backup-pvc`). Exercises **77d** (disk-fill below the
+  1 GiB free threshold) and can re-run 77a/77b. Sample CR
+  `deploy/helm/cloudberry-operator/config/samples/scenario77-local-prebackup.yaml`.
+
+**Acceptance (per sub-check):** inject the fault → the init container exits
+non-zero (the `gpbackup` container never starts) → the Job reaches Failed →
+`status.lastBackupStatus=Failed` with a `backupHistory[]` `status=Failed` entry
+→ a `Warning`/`BackupFailed` Event references the failed Job (emitted **once**
+per failed Job) → heal the fault → a fresh on-demand backup passes all four
+checks and reaches `Success` with `lastBackupStatus=Success`.
+
+The scenario is covered by `test/functional/scenario77_prebackup_checks_test.go`,
+`test/e2e/scenario77_prebackup_checks_e2e_test.go`,
+`internal/controller/backup_event_scenario77_test.go`, and the live verification
+script `test/e2e/scripts/scenario77-prebackup-checks.sh`.
 
 ## Post-Restore Validation
 
