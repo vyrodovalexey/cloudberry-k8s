@@ -1,0 +1,21 @@
+apiVersion: v2
+name: cloudberry-operator
+description: A Helm chart for the Cloudberry Database Kubernetes Operator
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/cloudberry-contrib/cloudberry-k8s
+sources:
+  - https://github.com/cloudberry-contrib/cloudberry-k8s
+maintainers:
+  - name: Cloudberry Contributors
+    url: https://github.com/cloudberry-contrib
+keywords:
+  - cloudberry
+  - database
+  - operator
+  - kubernetes
+  - postgresql
+  - greenplum
+icon: https://cloudberry.apache.org/img/logo.svg

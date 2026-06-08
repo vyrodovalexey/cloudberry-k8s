@@ -1,0 +1,16 @@
+# Cloudberry K8s CODEOWNERS
+# These owners will be requested for review on PRs that modify matching paths.
+
+# CI/CD workflows
+.github/workflows/ @cloudberry-contrib/devops
+
+# Helm chart
+deploy/helm/ @cloudberry-contrib/devops
+
+# Dockerfiles
+Dockerfile @cloudberry-contrib/devops
+Dockerfile.ctl @cloudberry-contrib/devops
+.dockerignore @cloudberry-contrib/devops
+
+# Build system
+Makefile @cloudberry-contrib/devops

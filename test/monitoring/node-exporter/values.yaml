@@ -1,0 +1,35 @@
+image:
+  repository: prom/node-exporter
+  tag: "v1.8.2"
+  pullPolicy: IfNotPresent
+
+# Port for node-exporter metrics
+metricsPort: 9100
+
+# Host-level access
+hostPID: true
+hostNetwork: true
+
+# Filesystem mount-points to exclude from collector
+filesystemMountPointsExclude: "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)"
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 32Mi
+
+serviceAccount:
+  create: true
+  name: ""
+
+rbac:
+  create: true
+
+# Prometheus scrape annotations
+prometheus:
+  scrape: true
+  port: "9100"
+  path: "/metrics"

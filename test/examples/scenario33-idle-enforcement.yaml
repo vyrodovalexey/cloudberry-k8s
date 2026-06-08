@@ -1,0 +1,20 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario33-idle-enforcement
+spec:
+  version: "2.1.0"
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: analytics
+        concurrency: 10
+        cpuMaxPercent: 50
+        cpuWeight: 100
+    idleRules:
+      - name: terminate-idle-analytics
+        enabled: true
+        resourceGroup: analytics
+        idleTimeout: "30m"
+        excludeInTransaction: true
+        terminateMessage: "Session terminated due to inactivity"

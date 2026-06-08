@@ -1,0 +1,7 @@
+name: cli_test_rule
+enabled: true
+resourceGroup: analytics
+action: cancel
+thresholdType: running_time
+threshold: "3600"
+priority: 5

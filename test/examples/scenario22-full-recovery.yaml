@@ -1,0 +1,185 @@
+# Scenario 22: Full Recovery (Corrupted Mirror with PVC Re-initialization)
+#
+# This scenario tests full recovery when a mirror segment's data directory is
+# corrupted beyond repair, making incremental recovery impossible. The procedure
+# involves deleting the corrupted PVC and letting the StatefulSet recreate the
+# pod with a fresh volume, triggering pg_basebackup from the primary.
+#
+# Unlike Scenario 21 (incremental recovery from a killed primary), this scenario
+# simulates unrecoverable data corruption where WAL files, pg_control, and
+# PG_VERSION are destroyed, causing the mirror to enter CrashLoopBackOff.
+#
+# Prerequisites:
+#   - Scenario 19 cluster running with mirrors (9 pods: 1 coord + 4 pri + 4 mir)
+#   - All segments status='u', mode='s' (up and synced)
+#   - Cluster phase=Running, mirroringStatus=InSync
+#
+# Test Flow:
+#
+#   Step 1: Corrupt mirror-1's data directory
+#     # Verify mirror-1 is healthy
+#     kubectl exec -n cloudberry-test scenario19-cluster-segment-mirror-1 -- \
+#       env PGOPTIONS="-c gp_role=utility" /usr/local/cloudberry-db/bin/psql \
+#       -U gpadmin -d postgres -c "SELECT pg_is_in_recovery();"
+#     # Corrupt critical files
+#     kubectl exec -n cloudberry-test scenario19-cluster-segment-mirror-1 -- bash -c "
+#       find /data/pgdata/gpseg1/pg_wal -type f -exec truncate -s 0 {} \;
+#       truncate -s 0 /data/pgdata/gpseg1/global/pg_control
+#     "
+#
+#   Step 2: Force mirror down and corrupt aggressively
+#     # Force-kill the mirror pod
+#     kubectl delete pod scenario19-cluster-segment-mirror-1 \
+#       -n cloudberry-test --grace-period=0 --force
+#     # Remove critical files so pg_basebackup fails (directory not empty)
+#     kubectl exec -n cloudberry-test scenario19-cluster-segment-mirror-1 -- bash -c "
+#       rm -rf /data/pgdata/gpseg1/pg_wal/*
+#       rm -f /data/pgdata/gpseg1/global/pg_control
+#       rm -f /data/pgdata/gpseg1/PG_VERSION
+#       rm -f /data/pgdata/gpseg1/postgresql.auto.conf
+#     "
+#     # Mirror enters CrashLoopBackOff because:
+#     #   - pg_basebackup fails: "directory exists but is not empty"
+#     #   - PostgreSQL cannot start: missing pg_control
+#
+#   Step 3: Full recovery via PVC deletion
+#     # Force-delete the crashing pod
+#     kubectl delete pod scenario19-cluster-segment-mirror-1 \
+#       -n cloudberry-test --grace-period=0 --force
+#     # Delete the corrupted PVC (StatefulSet will create a new one)
+#     kubectl delete pvc data-scenario19-cluster-segment-mirror-1 \
+#       -n cloudberry-test
+#     # The StatefulSet controller:
+#     #   1. Detects the pod is missing
+#     #   2. Creates a new PVC (fresh empty volume)
+#     #   3. Creates a new pod bound to the new PVC
+#     #   4. The entrypoint detects empty data directory
+#     #   5. Runs pg_basebackup from primary-1 to initialize the mirror
+#     #   6. Starts PostgreSQL in recovery mode (streaming replication)
+#     #
+#     # Trigger the operator's full recovery annotation
+#     kubectl annotate cloudberrycluster scenario19-cluster \
+#       -n cloudberry-test avsoft.io/recovery=full --overwrite
+#     # Wait for mirror-1 to become ready
+#     kubectl wait --for=condition=ready \
+#       pod/scenario19-cluster-segment-mirror-1 \
+#       -n cloudberry-test --timeout=300s
+#
+#   Step 4: Verify all acceptance criteria
+#     # All 9 cluster pods Running 1/1
+#     kubectl get pods -n cloudberry-test -l avsoft.io/cluster=scenario19-cluster
+#     # All segments up and synchronized
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d postgres -c \
+#       "SELECT content, role, preferred_role, mode, status \
+#        FROM gp_segment_configuration ORDER BY content, role;"
+#     # WAL replication streaming on primary-1
+#     kubectl exec -n cloudberry-test scenario19-cluster-segment-primary-1 -- \
+#       env PGOPTIONS="-c gp_role=utility" /usr/local/cloudberry-db/bin/psql \
+#       -U gpadmin -d postgres -c \
+#       "SELECT client_addr, state, sent_lsn, write_lsn FROM pg_stat_replication;"
+#     # Mirror-1 in recovery mode
+#     kubectl exec -n cloudberry-test scenario19-cluster-segment-mirror-1 -- \
+#       env PGOPTIONS="-c gp_role=utility" /usr/local/cloudberry-db/bin/psql \
+#       -U gpadmin -d postgres -c "SELECT pg_is_in_recovery();"
+#     # Data operations succeed
+#     kubectl exec -n cloudberry-test scenario19-cluster-coordinator-0 -- \
+#       /usr/local/cloudberry-db/bin/psql -U gpadmin -d mydb -c \
+#       "INSERT INTO orders (customer_id, amount, status) \
+#        VALUES (22, 22.22, 'scenario22_full_recovery');
+#        SELECT count(*) FROM orders;"
+#
+# Key Observations:
+#   - When a mirror's data directory is corrupted but not empty, pg_basebackup
+#     refuses to initialize into it ("directory exists but is not empty")
+#   - The only way to recover is to provide a completely empty data directory
+#   - Deleting the PVC and letting the StatefulSet recreate it is the cleanest
+#     approach — no need to scale the StatefulSet up/down
+#   - The entrypoint script automatically detects an empty data directory and
+#     runs pg_basebackup from the corresponding primary
+#   - Recovery is fast (~20-30s) since pg_basebackup streams the full dataset
+#   - WAL replication re-establishes automatically after pg_basebackup completes
+#   - FTS may not detect the brief mirror outage if recovery completes within
+#     the probe interval (ftsProbeInterval: 10s)
+#
+# Important: StatefulSet Scaling Caveat
+#   Scaling down a StatefulSet removes pods from the HIGHEST ordinal first.
+#   To recover mirror-1, you cannot scale to 1 replica (that removes mirror-3,
+#   mirror-2 first). Instead, directly delete the pod and PVC — the StatefulSet
+#   will recreate both automatically.
+#
+# Recovery Procedure Summary:
+#   1. kubectl delete pod <mirror-pod> --grace-period=0 --force
+#   2. kubectl delete pvc <mirror-pvc>
+#   3. kubectl annotate cloudberrycluster <cluster> avsoft.io/recovery=full --overwrite
+#   4. Wait for pod Ready (pg_basebackup + streaming replication)
+#
+# Expected Results:
+#   - All 9 cluster pods Running 1/1
+#   - gp_segment_configuration: all segments status='u', mode='s'
+#   - pg_stat_replication: streaming with matching LSNs on primary-1
+#   - pg_is_in_recovery() = true on mirror-1
+#   - Cluster phase=Running, mirroringStatus=InSync
+#   - failedSegments=[]
+#   - Data operations (INSERT/SELECT) succeed across all segments
+#   - Operator emits RecoveryStarted event with type "full"
+#   - Recovery annotation removed after processing
+#   - New PVC created with fresh volume (different PVC UID)
+#
+# Metrics to verify:
+#   - cloudberry_mirroring_in_sync = 1
+#   - cloudberry_replication_lag_bytes{segment="N"} = 0 for all segments
+#   - cloudberry_segments_failed = 0 (eventually consistent; see note below)
+#
+# Note: cloudberry_segments_failed gauge may remain stale at 1 after recovery
+# because updateFTSProbeStatus() only calls SetSegmentsFailed() in the degraded
+# path but does not reset it to 0 in the healthy path. The authoritative source
+# is status.failedSegments=[] which is always correct.
+#
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario19-cluster
+  namespace: cloudberry-test
+  annotations:
+    avsoft.io/recovery: full
+spec:
+  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+    port: 5432
+  standby:
+    enabled: false
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: true
+      layout: group
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    storage:
+      size: "5Gi"
+  config:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+  ha:
+    ftsProbeInterval: 10
+    ftsProbeTimeout: 5
+    ftsProbeRetries: 2
+  deletionPolicy: Retain

@@ -1,0 +1,199 @@
+# =============================================================================
+# Scenario 76 — Scheduled Backup via CronJob + Status Population
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus the full backup block targeting an
+# S3-compatible (MinIO) destination.
+#
+# IMPORTANT — Scenario 76 exercises the SCHEDULED backup path. When
+# spec.backup.schedule is set, the operator reconciles a CronJob named
+#   {cluster}-backup-schedule   (here: scenario76-backup-schedule)
+# with ownerReferences -> this CloudberryCluster, concurrencyPolicy=Forbid,
+# successfulJobsHistoryLimit=3, failedJobsHistoryLimit=3, and a jobTemplate whose
+# pod restartPolicy is Never. When the CronJob fires, Kubernetes spawns a Job
+# "{cluster}-backup-schedule-<hash>"; the operator discovers the completed backup
+# Job and populates status.* (lastBackupTime / lastBackupTimestamp (14-digit) /
+# lastBackupStatus / lastBackupType / lastBackupJobName / cronJobName) and appends
+# a backupHistory entry (timestamp / type / status / size / duration).
+#
+# This CR ships the PRODUCTION schedule "0 2 * * *" (daily at 02:00). The live
+# test (test/e2e/scripts/scenario76-scheduled-backup.sh) OVERRIDES the schedule
+# to "*/2 * * * *" via `kubectl patch --type=merge` so the CronJob fires within
+# ~2 minutes; the operator then reconciles the CronJob's schedule accordingly.
+#
+# Credential source: Kubernetes Secret `backup-s3-credentials`
+#   (created by test/docker-compose/scripts/setup-minio.sh).
+#
+# In-cluster MinIO reachability: the CR endpoint `http://minio:9000` resolves via
+# the `minio` ExternalName Service (also created by setup-minio.sh) pointing at
+# host.docker.internal:9000.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario76
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "76"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario76-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario76-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination, Secret credential source. The
+  # schedule below is the PRODUCTION value ("0 2 * * *"); the live test patches it
+  # to "*/2 * * * *" so the CronJob fires within ~2 minutes (see header comment).
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Delete

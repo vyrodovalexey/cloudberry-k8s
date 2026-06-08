@@ -1,0 +1,340 @@
+# Scenario 6: Resource Management
+#
+# This file documents the CLI commands and API endpoints used for resource
+# management on a running Cloudberry cluster. The operator API connects to
+# the Cloudberry coordinator to manage resource groups and resource queues.
+#
+# Architecture:
+#   cloudberry-ctl --> Operator REST API (port 8090) --> DB Client Factory
+#                                                        --> Coordinator (SQL DDL)
+#
+# The DBClientFactory resolves the coordinator service endpoint:
+#   <cluster-name>-coordinator.<namespace>.svc:<port>
+# and reads the admin password from the Kubernetes Secret:
+#   <cluster-name>-admin-password
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the target namespace
+#   2. The operator API accessible (via port-forward or service)
+#   3. Valid credentials (basic auth or OIDC)
+#
+# Port-forward the operator API:
+#   kubectl port-forward -n cloudberry-test svc/cloudberry-operator 8090:8090
+#
+# Environment setup:
+#   export CLOUDBERRY_OPERATOR_URL=http://localhost:8090
+#   export CLOUDBERRY_CLUSTER=my-cluster
+#   export CLOUDBERRY_NAMESPACE=cloudberry-test
+#   export CLOUDBERRY_USERNAME=admin
+#   export CLOUDBERRY_PASSWORD=<admin-password>
+#
+# ============================================================================
+# 6a. Resource Groups
+# ============================================================================
+#
+# Resource groups provide CPU and memory isolation for workloads in Cloudberry.
+# They allow administrators to control concurrency, CPU usage, and memory
+# allocation per group of users or applications.
+#
+# --- Create a Resource Group ---
+#
+# CLI:
+#   cloudberry-ctl resource-group create \
+#     --name analytics \
+#     --concurrency 10 \
+#     --cpu-max-percent 50 \
+#     --memory-limit 30 \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   POST /api/v1alpha1/clusters/{name}/workload/resource-groups?namespace={namespace}
+#
+# Request body:
+# {
+#   "name": "analytics",
+#   "concurrency": 10,
+#   "cpuMaxPercent": 50,
+#   "memoryLimit": 30
+# }
+#
+# Response:
+# {
+#   "name": "analytics",
+#   "concurrency": 10,
+#   "cpuMaxPercent": 50,
+#   "memoryLimit": 30,
+#   "status": "created"
+# }
+#
+# SQL executed:
+#   CREATE RESOURCE GROUP "analytics" WITH (concurrency=10, cpu_max_percent=50, cpu_weight=0)
+#
+# --- Assign a Role to a Resource Group ---
+#
+# CLI:
+#   cloudberry-ctl resource-group assign \
+#     --group analytics \
+#     --role analyst \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   POST /api/v1alpha1/clusters/{name}/workload/resource-groups/{groupName}/assign?namespace={namespace}
+#
+# Request body:
+# {
+#   "role": "analyst"
+# }
+#
+# Response:
+# {
+#   "group": "analytics",
+#   "role": "analyst",
+#   "status": "assigned"
+# }
+#
+# SQL executed:
+#   ALTER ROLE "analyst" RESOURCE GROUP "analytics"
+#
+# --- List Resource Groups ---
+#
+# CLI:
+#   cloudberry-ctl resource-group list \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   GET /api/v1alpha1/clusters/{name}/workload/resource-groups?namespace={namespace}
+#
+# Response:
+# {
+#   "resourceGroups": [
+#     {
+#       "name": "admin_group",
+#       "concurrency": 10,
+#       "cpuMaxPercent": 10,
+#       "cpuWeight": 100,
+#       "memoryLimit": 0,
+#       "cpuUsage": 5.2,
+#       "memoryUsage": 12.3
+#     },
+#     {
+#       "name": "analytics",
+#       "concurrency": 10,
+#       "cpuMaxPercent": 50,
+#       "cpuWeight": 0,
+#       "memoryLimit": 30,
+#       "cpuUsage": 0.0,
+#       "memoryUsage": 0.0
+#     }
+#   ],
+#   "total": 2
+# }
+#
+# SQL executed:
+#   SELECT rsgname, COALESCE(num_running, 0), COALESCE(num_queueing, 0),
+#     COALESCE(cpu_usage, 0), COALESCE(memory_usage, 0)
+#     FROM gp_toolkit.gp_resgroup_status ORDER BY rsgname
+#
+# --- Delete a Resource Group ---
+#
+# CLI:
+#   cloudberry-ctl resource-group delete \
+#     --name analytics \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   DELETE /api/v1alpha1/clusters/{name}/workload/resource-groups/{groupName}?namespace={namespace}
+#
+# Response:
+# {
+#   "group": "analytics",
+#   "status": "deleted"
+# }
+#
+# SQL executed:
+#   DROP RESOURCE GROUP "analytics"
+#
+# --- Verify via gp_toolkit ---
+#
+# Connect to the coordinator and run:
+#   SELECT * FROM gp_toolkit.gp_resgroup_config;
+#
+# ============================================================================
+# 6b. Resource Queues
+# ============================================================================
+#
+# Resource queues provide statement-level resource management in Cloudberry.
+# They control the number of active statements, memory limits, and query
+# priority for users assigned to the queue.
+#
+# --- Create a Resource Queue ---
+#
+# CLI:
+#   cloudberry-ctl resource-queue create \
+#     --name myqueue \
+#     --active-statements 10 \
+#     --memory-limit 2GB \
+#     --priority HIGH \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   POST /api/v1alpha1/clusters/{name}/workload/resource-queues?namespace={namespace}
+#
+# Request body:
+# {
+#   "name": "myqueue",
+#   "activeStatements": 10,
+#   "memoryLimit": "2GB",
+#   "priority": "HIGH"
+# }
+#
+# Response:
+# {
+#   "name": "myqueue",
+#   "activeStatements": 10,
+#   "memoryLimit": "2GB",
+#   "priority": "HIGH",
+#   "status": "created"
+# }
+#
+# SQL executed:
+#   CREATE RESOURCE QUEUE "myqueue" WITH (ACTIVE_STATEMENTS=10, MEMORY_LIMIT='2GB', PRIORITY="HIGH")
+#
+# --- List Resource Queues ---
+#
+# CLI:
+#   cloudberry-ctl resource-queue list \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   GET /api/v1alpha1/clusters/{name}/workload/resource-queues?namespace={namespace}
+#
+# Response:
+# {
+#   "resourceQueues": [
+#     {
+#       "name": "pg_default",
+#       "activeStatements": 20,
+#       "memoryLimit": "-1",
+#       "priority": "MEDIUM",
+#       "maxCost": -1,
+#       "minCost": 0,
+#       "activeWaiters": 0
+#     },
+#     {
+#       "name": "myqueue",
+#       "activeStatements": 10,
+#       "memoryLimit": "2GB",
+#       "priority": "HIGH",
+#       "maxCost": -1,
+#       "minCost": 0,
+#       "activeWaiters": 0
+#     }
+#   ],
+#   "total": 2
+# }
+#
+# SQL executed:
+#   SELECT rsqname, COALESCE(rsqcountlimit, -1)::int AS active_statements,
+#     COALESCE(rsqmemorylimit, '-1') AS memory_limit,
+#     COALESCE(rsqovercommit, false)::text AS priority,
+#     COALESCE(rsqcostlimit, -1) AS max_cost,
+#     COALESCE(rsqignorecostlimit, 0) AS min_cost
+#     FROM pg_resqueue ORDER BY rsqname
+#
+# --- Delete a Resource Queue ---
+#
+# CLI:
+#   cloudberry-ctl resource-queue delete \
+#     --name myqueue \
+#     --cluster my-cluster \
+#     --namespace cloudberry-test
+#
+# API endpoint:
+#   DELETE /api/v1alpha1/clusters/{name}/workload/resource-queues/{queueName}?namespace={namespace}
+#
+# Response:
+# {
+#   "name": "myqueue",
+#   "status": "deleted"
+# }
+#
+# SQL executed:
+#   DROP RESOURCE QUEUE "myqueue"
+#
+# --- Verify via pg_resqueue ---
+#
+# Connect to the coordinator and run:
+#   SELECT * FROM pg_resqueue;
+#
+# ============================================================================
+# Error Handling
+# ============================================================================
+#
+# If the database connection is not available:
+# {
+#   "resourceQueues": [],
+#   "total": 0,
+#   "message": "database connection not available"
+# }
+#
+# If the cluster is not found:
+# {
+#   "error": {
+#     "code": "CLUSTER_NOT_FOUND",
+#     "message": "cluster \"nonexistent\" not found"
+#   }
+# }
+#
+# If the resource queue name is missing:
+# {
+#   "error": {
+#     "code": "INVALID_REQUEST",
+#     "message": "resource queue name is required"
+#   }
+# }
+#
+
+---
+# Example CloudberryCluster resource for resource management testing
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: resource-test
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    replicas: 1
+    port: 5432
+    storage:
+      size: "10Gi"
+  segments:
+    count: 4
+    primariesPerHost: 2
+    storage:
+      size: "20Gi"
+    mirroring:
+      enabled: true
+      layout: group
+  auth:
+    basic:
+      adminUser: gpadmin
+      adminPasswordSecret: resource-test-admin-password
+  workload:
+    enabled: true
+    resourceGroups:
+      - name: analytics
+        concurrency: 10
+        cpuMaxPercent: 50
+        memoryLimit: 30
+      - name: etl_group
+        concurrency: 5
+        cpuMaxPercent: 30
+        memoryLimit: 20

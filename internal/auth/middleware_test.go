@@ -1,0 +1,613 @@
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+)
+
+// mockProvider implements Provider for testing.
+type mockProvider struct {
+	identity *Identity
+	err      error
+	typeName string
+}
+
+func (m *mockProvider) Authenticate(_ context.Context, _ *http.Request) (*Identity, error) {
+	return m.identity, m.err
+}
+
+func (m *mockProvider) Type() string {
+	return m.typeName
+}
+
+func TestNewAuthMiddleware(t *testing.T) {
+	mw := NewAuthMiddleware(nil, nil, nil, nil)
+	require.NotNil(t, mw)
+}
+
+func TestAuthMiddleware_Handler_MissingAuthHeader(t *testing.T) {
+	mw := NewAuthMiddleware(nil, nil, nil, nil)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	var resp errorResponse
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "UNAUTHORIZED", resp.Error.Code)
+}
+
+func TestAuthMiddleware_Handler_BasicAuth(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: &Identity{
+			Username:   "admin",
+			Permission: PermissionAdmin,
+			AuthMethod: "basic",
+		},
+		typeName: "basic",
+	}
+
+	recorder := &metrics.NoopRecorder{}
+	mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+
+	var capturedIdentity *Identity
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedIdentity = IdentityFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("admin", "password")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, capturedIdentity)
+	assert.Equal(t, "admin", capturedIdentity.Username)
+}
+
+func TestAuthMiddleware_Handler_BearerAuth(t *testing.T) {
+	oidcProvider := &mockProvider{
+		identity: &Identity{
+			Username:   "oidc-user",
+			Permission: PermissionOperator,
+			AuthMethod: "oidc",
+		},
+		typeName: "oidc",
+	}
+
+	recorder := &metrics.NoopRecorder{}
+	mw := NewAuthMiddleware(nil, oidcProvider, nil, recorder)
+
+	var capturedIdentity *Identity
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedIdentity = IdentityFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, capturedIdentity)
+	assert.Equal(t, "oidc-user", capturedIdentity.Username)
+}
+
+func TestAuthMiddleware_Handler_BasicNotConfigured(t *testing.T) {
+	mw := NewAuthMiddleware(nil, nil, nil, nil)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("user", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestAuthMiddleware_Handler_OIDCNotConfigured(t *testing.T) {
+	mw := NewAuthMiddleware(nil, nil, nil, nil)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestAuthMiddleware_Handler_UnsupportedAuthType(t *testing.T) {
+	mw := NewAuthMiddleware(nil, nil, nil, nil)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Digest username=test")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestAuthMiddleware_Handler_AuthFailure(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: nil,
+		err:      fmt.Errorf("authentication failed"),
+		typeName: "basic",
+	}
+
+	recorder := &metrics.NoopRecorder{}
+	mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("user", "wrong")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestRequirePermission(t *testing.T) {
+	tests := []struct {
+		name           string
+		identity       *Identity
+		requiredLevel  PermissionLevel
+		expectedStatus int
+	}{
+		{
+			name: "sufficient permission",
+			identity: &Identity{
+				Username:   "admin",
+				Permission: PermissionAdmin,
+			},
+			requiredLevel:  PermissionOperator,
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "exact permission",
+			identity: &Identity{
+				Username:   "operator",
+				Permission: PermissionOperator,
+			},
+			requiredLevel:  PermissionOperator,
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "insufficient permission",
+			identity: &Identity{
+				Username:   "viewer",
+				Permission: PermissionBasic,
+			},
+			requiredLevel:  PermissionAdmin,
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "no identity",
+			identity:       nil,
+			requiredLevel:  PermissionBasic,
+			expectedStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := RequirePermission(tt.requiredLevel)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.identity != nil {
+				ctx := ContextWithIdentity(req.Context(), tt.identity)
+				req = req.WithContext(ctx)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.expectedStatus, rec.Code)
+		})
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	handler := SecurityHeaders()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	assert.Equal(t, "default-src 'self'", rec.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", rec.Header().Get("X-Frame-Options"))
+	assert.Equal(t, "1; mode=block", rec.Header().Get("X-XSS-Protection"))
+	assert.Contains(t, rec.Header().Get("Strict-Transport-Security"), "max-age=31536000")
+	assert.Equal(t, "strict-origin-when-cross-origin", rec.Header().Get("Referrer-Policy"))
+	assert.Equal(t, "camera=(), microphone=()", rec.Header().Get("Permissions-Policy"))
+}
+
+func TestWriteErrorResponse(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeErrorResponse(rec, http.StatusBadRequest, "BAD_REQUEST", "invalid input")
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+	var resp errorResponse
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "BAD_REQUEST", resp.Error.Code)
+	assert.Equal(t, "invalid input", resp.Error.Message)
+}
+
+func TestContextWithIdentity_IdentityFromContext(t *testing.T) {
+	t.Run("set and get identity", func(t *testing.T) {
+		identity := &Identity{
+			Username:   "test-user",
+			Permission: PermissionAdmin,
+		}
+		ctx := ContextWithIdentity(context.Background(), identity)
+		retrieved := IdentityFromContext(ctx)
+		require.NotNil(t, retrieved)
+		assert.Equal(t, "test-user", retrieved.Username)
+		assert.Equal(t, PermissionAdmin, retrieved.Permission)
+	})
+
+	t.Run("no identity in context", func(t *testing.T) {
+		retrieved := IdentityFromContext(context.Background())
+		assert.Nil(t, retrieved)
+	})
+}
+
+func TestPermissionLevel_String(t *testing.T) {
+	tests := []struct {
+		level    PermissionLevel
+		expected string
+	}{
+		{PermissionSelfOnly, "Self Only"},
+		{PermissionBasic, "Basic"},
+		{PermissionOperatorBasic, "Operator Basic"},
+		{PermissionOperator, "Operator"},
+		{PermissionAdmin, "Admin"},
+		{PermissionLevel(99), "Unknown(99)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.level.String())
+		})
+	}
+}
+
+func TestParsePermissionLevel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected PermissionLevel
+	}{
+		{"Self Only", PermissionSelfOnly},
+		{"Basic", PermissionBasic},
+		{"Operator Basic", PermissionOperatorBasic},
+		{"Operator", PermissionOperator},
+		{"Admin", PermissionAdmin},
+		{"unknown", PermissionSelfOnly},
+		{"", PermissionSelfOnly},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := ParsePermissionLevel(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestAuthMiddleware_Handler_BothProviders(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: &Identity{Username: "basic-user", Permission: PermissionBasic, AuthMethod: "basic"},
+		typeName: "basic",
+	}
+	oidcProvider := &mockProvider{
+		identity: &Identity{Username: "oidc-user", Permission: PermissionAdmin, AuthMethod: "oidc"},
+		typeName: "oidc",
+	}
+	recorder := &metrics.NoopRecorder{}
+	mw := NewAuthMiddleware(basicProvider, oidcProvider, nil, recorder)
+
+	t.Run("basic auth routes to basic provider", func(t *testing.T) {
+		var captured *Identity
+		handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			captured = IdentityFromContext(r.Context())
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.SetBasicAuth("basic-user", "pass")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured)
+		assert.Equal(t, "basic-user", captured.Username)
+	})
+
+	t.Run("bearer auth routes to oidc provider", func(t *testing.T) {
+		var captured *Identity
+		handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			captured = IdentityFromContext(r.Context())
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer some-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured)
+		assert.Equal(t, "oidc-user", captured.Username)
+	})
+}
+
+func TestRequirePermission_AllLevels(t *testing.T) {
+	levels := []struct {
+		name     string
+		identity PermissionLevel
+		required PermissionLevel
+		allowed  bool
+	}{
+		{"SelfOnly accessing SelfOnly", PermissionSelfOnly, PermissionSelfOnly, true},
+		{"SelfOnly accessing Basic", PermissionSelfOnly, PermissionBasic, false},
+		{"Basic accessing SelfOnly", PermissionBasic, PermissionSelfOnly, true},
+		{"Basic accessing Basic", PermissionBasic, PermissionBasic, true},
+		{"Basic accessing OperatorBasic", PermissionBasic, PermissionOperatorBasic, false},
+		{"OperatorBasic accessing OperatorBasic", PermissionOperatorBasic, PermissionOperatorBasic, true},
+		{"OperatorBasic accessing Operator", PermissionOperatorBasic, PermissionOperator, false},
+		{"Operator accessing Operator", PermissionOperator, PermissionOperator, true},
+		{"Operator accessing Admin", PermissionOperator, PermissionAdmin, false},
+		{"Admin accessing Admin", PermissionAdmin, PermissionAdmin, true},
+		{"Admin accessing SelfOnly", PermissionAdmin, PermissionSelfOnly, true},
+	}
+
+	for _, tt := range levels {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := RequirePermission(tt.required)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			identity := &Identity{Username: "test", Permission: tt.identity}
+			ctx := ContextWithIdentity(req.Context(), identity)
+			req = req.WithContext(ctx)
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if tt.allowed {
+				assert.Equal(t, http.StatusOK, rec.Code)
+			} else {
+				assert.Equal(t, http.StatusForbidden, rec.Code)
+			}
+		})
+	}
+}
+
+func TestSecurityHeaders_AllHeaders(t *testing.T) {
+	handler := SecurityHeaders()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	expectedHeaders := map[string]string{
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": "default-src 'self'",
+		"Permissions-Policy":      "camera=(), microphone=()",
+		"Referrer-Policy":         "strict-origin-when-cross-origin",
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"X-XSS-Protection":        "1; mode=block",
+	}
+
+	for header, expected := range expectedHeaders {
+		assert.Equal(t, expected, rec.Header().Get(header), "header %s mismatch", header)
+	}
+	assert.Contains(t, rec.Header().Get("Strict-Transport-Security"), "max-age=31536000")
+	assert.Contains(t, rec.Header().Get("Strict-Transport-Security"), "includeSubDomains")
+}
+
+// authAttemptCall captures the arguments of a RecordAuthAttempt invocation.
+type authAttemptCall struct {
+	method string
+	result string
+}
+
+// countingRecorder wraps NoopRecorder and records RecordAuthAttempt calls so
+// tests can assert the method/result labels passed to the metrics layer.
+type countingRecorder struct {
+	metrics.NoopRecorder
+	authAttempts []authAttemptCall
+}
+
+func (c *countingRecorder) RecordAuthAttempt(method, result string) {
+	c.authAttempts = append(c.authAttempts, authAttemptCall{method: method, result: result})
+}
+
+func TestAuthMiddleware_Handler_MissingAuthHeader_RecordsUnknownFailure(t *testing.T) {
+	rec := &countingRecorder{}
+	mw := NewAuthMiddleware(nil, nil, nil, rec)
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// No Authorization header at all.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
+	require.Len(t, rec.authAttempts, 1)
+	assert.Equal(t, "unknown", rec.authAttempts[0].method)
+	assert.Equal(t, "failure", rec.authAttempts[0].result)
+}
+
+func TestAuthMiddleware_Handler_MalformedAuthHeader_RecordsUnknownFailure(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"unsupported scheme", "Digest username=test"},
+		{"basic not configured", "Basic dXNlcjpwYXNz"},
+		{"bearer not configured", "Bearer some-token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &countingRecorder{}
+			// No providers configured: any scheme fails to resolve a provider.
+			mw := NewAuthMiddleware(nil, nil, nil, rec)
+			handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", tt.header)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			assert.Equal(t, http.StatusUnauthorized, rr.Code)
+			require.Len(t, rec.authAttempts, 1)
+			assert.Equal(t, "unknown", rec.authAttempts[0].method)
+			assert.Equal(t, "failure", rec.authAttempts[0].result)
+		})
+	}
+}
+
+func TestAuthMiddleware_GuestHandler(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: &Identity{Username: "admin", Permission: PermissionAdmin, AuthMethod: "basic"},
+		typeName: "basic",
+	}
+	recorder := &metrics.NoopRecorder{}
+
+	t.Run("auth header present uses normal flow", func(t *testing.T) {
+		mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+		var captured *Identity
+		handler := mw.GuestHandler(func(_ *http.Request) bool { return true })(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured = IdentityFromContext(r.Context())
+				w.WriteHeader(http.StatusOK)
+			}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.SetBasicAuth("admin", "pass")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured)
+		assert.Equal(t, "admin", captured.Username)
+	})
+
+	t.Run("guest disabled returns 401", func(t *testing.T) {
+		mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+		handler := mw.GuestHandler(func(_ *http.Request) bool { return false })(
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("guest write operation returns 401", func(t *testing.T) {
+		mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+		handler := mw.GuestHandler(func(_ *http.Request) bool { return true })(
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("guest read access granted", func(t *testing.T) {
+		mw := NewAuthMiddleware(basicProvider, nil, nil, recorder)
+		var captured *Identity
+		handler := mw.GuestHandler(func(_ *http.Request) bool { return true })(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured = IdentityFromContext(r.Context())
+				w.WriteHeader(http.StatusOK)
+			}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured)
+		assert.Equal(t, guestUsername, captured.Username)
+		assert.Equal(t, PermissionBasic, captured.Permission)
+	})
+}
+
+func TestAuthMiddleware_Handler_NilRecorder(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: &Identity{Username: "admin", Permission: PermissionAdmin, AuthMethod: "basic"},
+		typeName: "basic",
+	}
+	mw := NewAuthMiddleware(basicProvider, nil, nil, nil)
+
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("admin", "pass")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestAuthMiddleware_Handler_AuthFailure_NilRecorder(t *testing.T) {
+	basicProvider := &mockProvider{
+		identity: nil,
+		err:      fmt.Errorf("auth failed"),
+		typeName: "basic",
+	}
+	mw := NewAuthMiddleware(basicProvider, nil, nil, nil)
+
+	handler := mw.Handler()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("user", "wrong")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}

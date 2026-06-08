@@ -1,0 +1,146 @@
+# Scenario 8: Scale-Out Procedure
+#
+# This file documents the scale-out procedure for a Cloudberry cluster.
+# Scale-out adds new segment pods, registers them in gp_segment_configuration,
+# and redistributes data across all segments (including new ones).
+#
+# Architecture:
+#   User --> kubectl patch CR --> Operator detects scale-out -->
+#     Phase 1: Scale StatefulSets (new pods start)
+#     Phase 2: Register new segments in gp_segment_configuration
+#     Phase 3: Redistribute data across all segments
+#     Phase 4: Complete (cluster returns to Running)
+#
+# Prerequisites:
+#   1. A running Cloudberry cluster in the cloudberry-test namespace
+#   2. kubectl access to the cluster
+#   3. The cluster must be in "Running" phase
+#
+# ============================================================================
+# 8a. Trigger Scale-Out
+# ============================================================================
+#
+# Scale from 4 to 6 segments by patching the CR:
+#
+#   kubectl patch cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     --type merge -p '{"spec":{"segments":{"count":6}}}'
+#
+# The operator will:
+#   1. Detect the segment count change in reconcileSegments()
+#   2. Transition the cluster to "Scaling" phase
+#   3. Update the primary StatefulSet replicas to 6
+#   4. Update the mirror StatefulSet replicas to 6 (if mirroring enabled)
+#   5. Store scale state annotation for multi-phase tracking
+#
+# ============================================================================
+# 8b. Monitor Scale Progress
+# ============================================================================
+#
+# Watch the cluster status:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test -w
+#
+# Check the scale state annotation:
+#
+#   kubectl get cloudberrycluster scenario1-cluster -n cloudberry-test \
+#     -o jsonpath='{.metadata.annotations.avsoft\.io/scale-state}'
+#
+# Expected phases in order:
+#   - "scaling-sts"     : Waiting for new segment pods to become Ready
+#   - "registering"     : Registering new segments in gp_segment_configuration
+#   - "redistributing"  : Redistributing data across all segments
+#   - "completed"       : Scale-out finished, transitioning to Running
+#
+# ============================================================================
+# 8c. Verify Segment Registration
+# ============================================================================
+#
+# After scale-out completes, verify new segments are registered:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d postgres -c "
+#     SELECT content, dbid, role, preferred_role, mode, status, hostname, port
+#     FROM gp_segment_configuration
+#     WHERE content >= 0
+#     ORDER BY content, role;"
+#
+# Expected: 6 primary segments (content 0-5) and 6 mirror segments
+#
+# ============================================================================
+# 8d. Verify Data Redistribution
+# ============================================================================
+#
+# Check that data is distributed across all segments:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d mydb -c "
+#     SELECT gp_segment_id, count(*)
+#     FROM customers
+#     GROUP BY gp_segment_id
+#     ORDER BY gp_segment_id;"
+#
+# Expected: Data should be present on all 6 segments (0-5)
+#
+# ============================================================================
+# 8e. Scale-Out with Mirroring
+# ============================================================================
+#
+# When mirroring is enabled, the operator also:
+#   - Scales the mirror StatefulSet
+#   - Registers mirror segments in gp_segment_configuration
+#   - Mirrors are initialized via WAL streaming replication
+#
+# Verify mirror status:
+#
+#   kubectl exec -n cloudberry-test scenario1-cluster-coordinator-0 -- \
+#     psql -U gpadmin -d postgres -c "
+#     SELECT content, role, preferred_role, mode, status, hostname
+#     FROM gp_segment_configuration
+#     WHERE role = 'm'
+#     ORDER BY content;"
+#
+# ============================================================================
+# 8f. Troubleshooting
+# ============================================================================
+#
+# If scale-out times out (default: 10 minutes):
+#   - Check pod status: kubectl get pods -n cloudberry-test
+#   - Check events: kubectl describe cloudberrycluster scenario1-cluster -n cloudberry-test
+#   - Check operator logs: kubectl logs -n cloudberry-system deploy/cloudberry-operator
+#
+# If segment registration fails:
+#   - Verify coordinator connectivity
+#   - Check gp_segment_configuration manually
+#   - The operator will retry on the next reconciliation cycle
+#
+# If redistribution fails:
+#   - Check for long-running queries that may block ALTER TABLE
+#   - The operator will retry on the next reconciliation cycle
+#   - Individual table failures are logged but don't block other tables
+#
+# ============================================================================
+# 8g. Scale-Out CR Example
+# ============================================================================
+#
+# Full CR with scale-out configuration:
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario8-cluster
+  namespace: cloudberry-test
+spec:
+  version: "7.1.0"
+  image: cloudberrydb/cloudberry:7.1.0
+  coordinator:
+    storage:
+      size: 10Gi
+      storageClass: standard
+  segments:
+    count: 6  # Scaled from 4 to 6
+    storage:
+      size: 20Gi
+      storageClass: standard
+    mirroring:
+      enabled: true
+      layout: group
+  deletionPolicy: Retain

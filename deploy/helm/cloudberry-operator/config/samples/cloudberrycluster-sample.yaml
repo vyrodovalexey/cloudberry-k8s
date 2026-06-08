@@ -1,0 +1,110 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-sample
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+spec:
+  version: "16"
+  image: "postgres:16"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    port: 5432
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+      adminPasswordSecret:
+        name: cloudberry-admin-password
+        key: password
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+    checksums: true
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  workload:
+    enabled: false
+
+  queryMonitoring:
+    enabled: false
+
+  backup:
+    enabled: false
+    schedule: "0 2 * * *"
+    retention:
+      fullCount: 3
+      maxAge: "30d"
+    destination:
+      type: s3
+      bucket: cloudberry-backups
+      endpoint: "http://minio:9000"
+      forcePathStyle: true
+      credentialSecret:
+        name: minio-credentials
+    compression: 6
+    parallelism: 1
+    incremental: false
+
+  dataLoading:
+    enabled: false
+
+  storage:
+    diskMonitoring: true
+    recommendationScan:
+      enabled: false
+      schedule: "0 3 * * 0"
+      bloatThreshold: 20
+      skewThreshold: 50
+      ageThreshold: 500000000
+      indexBloatThreshold: 30
+      scanDuration: "2h"
+    usageReport:
+      enabled: false
+      monthly: false
+
+  deletionPolicy: Retain
+  backupOnDelete: false

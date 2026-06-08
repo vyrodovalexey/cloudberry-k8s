@@ -1,0 +1,62 @@
+{{- if .Values.backup.rbac.create -}}
+# ServiceAccount, Role and RoleBinding used by backup/restore Jobs.
+# The ServiceAccount name MUST match internal/util/names.go
+# BackupServiceAccountName ("cloudberry-backup-sa") so the Job builder can
+# reference it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudberry-backup-sa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloudberry-backup-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+rules:
+  # The credential Secret name is dynamic (per-cluster), so the Secret get
+  # permission is scoped to the namespace rather than to a fixed resourceName.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloudberry-backup-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cloudberry-backup-role
+subjects:
+  - kind: ServiceAccount
+    name: cloudberry-backup-sa
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,1865 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.3
+  name: cloudberryclusters.avsoft.io
+spec:
+  group: avsoft.io
+  names:
+    kind: CloudberryCluster
+    listKind: CloudberryClusterList
+    plural: cloudberryclusters
+    singular: cloudberrycluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.version
+      name: Version
+      type: string
+    - jsonPath: .status.segmentsReady
+      name: Segments
+      type: integer
+    - jsonPath: .status.mirroringStatus
+      name: Mirroring
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: CloudberryCluster is the Schema for the cloudberryclusters API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: CloudberryClusterSpec defines the desired state of CloudberryCluster.
+            properties:
+              auth:
+                description: Auth defines authentication and authorization configuration.
+                properties:
+                  basic:
+                    description: Basic defines basic authentication configuration.
+                    properties:
+                      adminPasswordSecret:
+                        description: AdminPasswordSecret references the secret containing
+                          the admin password.
+                        properties:
+                          key:
+                            description: Key is the key within the secret.
+                            type: string
+                          name:
+                            description: Name is the name of the secret.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      adminUser:
+                        default: gpadmin
+                        description: AdminUser is the admin username.
+                        type: string
+                      enabled:
+                        default: true
+                        description: Enabled controls whether basic authentication
+                          is active.
+                        type: boolean
+                    type: object
+                  hbaRules:
+                    description: HBARules defines pg_hba.conf rules.
+                    items:
+                      description: HBARule defines a pg_hba.conf rule.
+                      properties:
+                        address:
+                          description: Address is the client address (CIDR notation).
+                          type: string
+                        database:
+                          description: Database is the target database.
+                          type: string
+                        method:
+                          description: Method is the authentication method.
+                          type: string
+                        options:
+                          description: Options are additional authentication options.
+                          type: string
+                        type:
+                          description: Type is the connection type.
+                          enum:
+                          - local
+                          - host
+                          - hostssl
+                          - hostnossl
+                          type: string
+                        user:
+                          description: User is the target user.
+                          type: string
+                      required:
+                      - database
+                      - method
+                      - type
+                      - user
+                      type: object
+                    type: array
+                  oidc:
+                    description: OIDC defines OpenID Connect authentication configuration.
+                    properties:
+                      allowLocalSignIn:
+                        default: true
+                        description: AllowLocalSignIn allows local sign-in when OIDC
+                          is enabled.
+                        type: boolean
+                      clientID:
+                        description: ClientID is the OIDC client identifier.
+                        type: string
+                      clientSecret:
+                        description: ClientSecret references the secret containing
+                          the OIDC client secret.
+                        properties:
+                          secretRef:
+                            description: SecretRef references a Kubernetes secret.
+                            properties:
+                              key:
+                                description: Key is the key within the secret.
+                                type: string
+                              name:
+                                description: Name is the name of the secret.
+                                type: string
+                            required:
+                            - key
+                            - name
+                            type: object
+                        type: object
+                      enabled:
+                        default: false
+                        description: Enabled controls whether OIDC authentication
+                          is active.
+                        type: boolean
+                      issuerURL:
+                        description: IssuerURL is the OIDC issuer URL.
+                        type: string
+                      pkce:
+                        default: true
+                        description: PKCE enables Proof Key for Code Exchange.
+                        type: boolean
+                      roleClaimPath:
+                        default: realm_access.roles
+                        description: RoleClaimPath is the JSON path to extract roles
+                          from the token.
+                        type: string
+                      roleClaimSource:
+                        default: id_token
+                        description: RoleClaimSource defines where to extract role
+                          claims from.
+                        enum:
+                        - id_token
+                        - userinfo
+                        type: string
+                      roleMapping:
+                        additionalProperties:
+                          type: string
+                        description: RoleMapping maps IdP roles to permission levels.
+                        type: object
+                      roleMatchMode:
+                        default: exact
+                        description: RoleMatchMode defines how to match IdP roles.
+                        enum:
+                        - exact
+                        - suffix
+                        - prefix
+                        - contains
+                        type: string
+                      scopes:
+                        description: Scopes defines the OIDC scopes to request.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  ssl:
+                    description: SSL defines TLS/SSL configuration.
+                    properties:
+                      certSecret:
+                        description: CertSecret references the TLS certificate secret.
+                        properties:
+                          name:
+                            description: Name is the name of the TLS secret.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      enabled:
+                        default: false
+                        description: Enabled controls whether SSL is active.
+                        type: boolean
+                      minTLSVersion:
+                        default: "1.2"
+                        description: MinTLSVersion is the minimum TLS version.
+                        enum:
+                        - "1.2"
+                        - "1.3"
+                        type: string
+                    type: object
+                type: object
+              backup:
+                description: Backup defines backup and restore configuration.
+                properties:
+                  destination:
+                    description: Destination defines where backups are stored.
+                    properties:
+                      local:
+                        description: Local defines the local (PVC-backed) destination
+                          configuration.
+                        properties:
+                          path:
+                            description: Path maps to gpbackup --backup-dir.
+                            type: string
+                          persistentVolumeClaim:
+                            description: PersistentVolumeClaim is the PVC mounted
+                              into the Job pod.
+                            type: string
+                        type: object
+                      s3:
+                        description: S3 defines the S3-compatible destination configuration.
+                        properties:
+                          bucket:
+                            description: Bucket is the S3 bucket name.
+                            type: string
+                          credentialSecret:
+                            description: CredentialSecret references the Secret containing
+                              S3 credentials.
+                            properties:
+                              accessKeyField:
+                                description: AccessKeyField is the Secret key holding
+                                  the access key id.
+                                type: string
+                              name:
+                                description: Name is the name of the Secret.
+                                type: string
+                              secretKeyField:
+                                description: SecretKeyField is the Secret key holding
+                                  the secret access key.
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          encryption:
+                            description: Encryption controls S3 plugin SSL encryption
+                              (on|off).
+                            enum:
+                            - "on"
+                            - "off"
+                            type: string
+                          endpoint:
+                            description: Endpoint is the S3-compatible endpoint (for
+                              MinIO); omit for AWS.
+                            type: string
+                          folder:
+                            description: Folder is the S3 folder prefix (maps to gpbackup_s3_plugin
+                              folder).
+                            type: string
+                          forcePathStyle:
+                            default: false
+                            description: ForcePathStyle enables path-style addressing
+                              (required for MinIO).
+                            type: boolean
+                          multipart:
+                            description: Multipart defines S3 multipart transfer tuning
+                              options.
+                            properties:
+                              backupMaxConcurrentRequests:
+                                description: BackupMaxConcurrentRequests maps to backup_max_concurrent_requests.
+                                format: int32
+                                type: integer
+                              backupMultipartChunksize:
+                                description: BackupMultipartChunksize maps to backup_multipart_chunksize
+                                  (e.g. "10MB").
+                                type: string
+                              restoreMaxConcurrentRequests:
+                                description: RestoreMaxConcurrentRequests maps to
+                                  restore_max_concurrent_requests.
+                                format: int32
+                                type: integer
+                              restoreMultipartChunksize:
+                                description: RestoreMultipartChunksize maps to restore_multipart_chunksize
+                                  (e.g. "10MB").
+                                type: string
+                            type: object
+                          region:
+                            description: Region is the S3 region.
+                            type: string
+                          vaultSecret:
+                            description: |-
+                              VaultSecret references a Vault secret path holding S3 credentials, as an
+                              alternative to credentialSecret. When set, the operator reads
+                              aws_access_key_id / aws_secret_access_key from this Vault path
+                              (requires spec.vault.enabled).
+                            properties:
+                              accessKeyField:
+                                description: AccessKeyField is the Vault key holding
+                                  the access key id (default aws_access_key_id).
+                                type: string
+                              path:
+                                description: Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+                                type: string
+                              secretKeyField:
+                                description: SecretKeyField is the Vault key holding
+                                  the secret access key (default aws_secret_access_key).
+                                type: string
+                            required:
+                            - path
+                            type: object
+                        type: object
+                      type:
+                        description: Type is the destination type (s3, local).
+                        enum:
+                        - s3
+                        - local
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enabled controls whether backup is active.
+                    type: boolean
+                  gpbackup:
+                    description: Gpbackup defines default gpbackup options applied
+                      to backup Jobs.
+                    properties:
+                      compressionLevel:
+                        description: CompressionLevel maps to --compression-level
+                          (1-9).
+                        format: int32
+                        maximum: 9
+                        minimum: 1
+                        type: integer
+                      compressionType:
+                        description: CompressionType maps to --compression-type (gzip|zstd).
+                        enum:
+                        - gzip
+                        - zstd
+                        type: string
+                      copyQueueSize:
+                        description: CopyQueueSize maps to --copy-queue-size (requires
+                          SingleDataFile).
+                        format: int32
+                        type: integer
+                      incremental:
+                        default: false
+                        description: Incremental maps to --incremental.
+                        type: boolean
+                      jobs:
+                        description: Jobs maps to --jobs (parallel backup workers).
+                        format: int32
+                        type: integer
+                      leafPartitionData:
+                        default: false
+                        description: LeafPartitionData maps to --leaf-partition-data.
+                        type: boolean
+                      noCompression:
+                        default: false
+                        description: NoCompression maps to --no-compression (overrides
+                          compressionLevel).
+                        type: boolean
+                      singleDataFile:
+                        default: false
+                        description: SingleDataFile maps to --single-data-file.
+                        type: boolean
+                      withStats:
+                        description: WithStats maps to --with-stats.
+                        type: boolean
+                      withoutGlobals:
+                        default: false
+                        description: WithoutGlobals maps to --without-globals.
+                        type: boolean
+                    type: object
+                  gprestore:
+                    description: Gprestore defines default gprestore options applied
+                      to restore Jobs.
+                    properties:
+                      createDb:
+                        default: false
+                        description: CreateDb maps to --create-db.
+                        type: boolean
+                      dataOnly:
+                        default: false
+                        description: |-
+                          DataOnly maps to --data-only (restore data without recreating objects).
+                          Mutually exclusive with MetadataOnly.
+                        type: boolean
+                      jobs:
+                        description: Jobs maps to --jobs (parallel restore workers).
+                        format: int32
+                        type: integer
+                      metadataOnly:
+                        default: false
+                        description: |-
+                          MetadataOnly maps to --metadata-only (restore object definitions only).
+                          Mutually exclusive with DataOnly.
+                        type: boolean
+                      onErrorContinue:
+                        default: false
+                        description: OnErrorContinue maps to --on-error-continue.
+                        type: boolean
+                      resizeCluster:
+                        default: false
+                        description: ResizeCluster maps to --resize-cluster (restore
+                          into a differently sized cluster).
+                        type: boolean
+                      runAnalyze:
+                        default: false
+                        description: RunAnalyze maps to --run-analyze.
+                        type: boolean
+                      truncateTable:
+                        default: false
+                        description: TruncateTable maps to --truncate-table.
+                        type: boolean
+                      withGlobals:
+                        default: false
+                        description: WithGlobals maps to --with-globals.
+                        type: boolean
+                      withStats:
+                        description: WithStats maps to --with-stats.
+                        type: boolean
+                    type: object
+                  image:
+                    description: Image is the backup toolchain container image (e.g.
+                      cloudberry-backup:2.1.0).
+                    type: string
+                  jobTemplate:
+                    description: JobTemplate defines pod template overrides for all
+                      backup/restore Jobs.
+                    properties:
+                      activeDeadlineSeconds:
+                        description: ActiveDeadlineSeconds is the Job timeout in seconds.
+                        format: int64
+                        type: integer
+                      backoffLimit:
+                        description: BackoffLimit is the number of retries before
+                          the Job is marked failed.
+                        format: int32
+                        type: integer
+                      nodeSelector:
+                        additionalProperties:
+                          type: string
+                        description: NodeSelector constrains the Job pod to matching
+                          nodes.
+                        type: object
+                      resources:
+                        description: Resources defines compute resource requirements
+                          for the Job pod.
+                        properties:
+                          limits:
+                            description: Limits defines maximum resource limits.
+                            properties:
+                              cpu:
+                                description: CPU is the CPU resource quantity.
+                                type: string
+                              memory:
+                                description: Memory is the memory resource quantity.
+                                type: string
+                            type: object
+                          requests:
+                            description: Requests defines minimum resource requirements.
+                            properties:
+                              cpu:
+                                description: CPU is the CPU resource quantity.
+                                type: string
+                              memory:
+                                description: Memory is the memory resource quantity.
+                                type: string
+                            type: object
+                        type: object
+                      serviceAccountName:
+                        description: ServiceAccountName is the ServiceAccount used
+                          by the Job pod.
+                        type: string
+                      tolerations:
+                        description: Tolerations allow the Job pod to schedule onto
+                          tainted nodes.
+                        items:
+                          description: Toleration defines a Kubernetes toleration.
+                          properties:
+                            effect:
+                              description: Effect is the taint effect.
+                              type: string
+                            key:
+                              description: Key is the taint key.
+                              type: string
+                            operator:
+                              description: Operator is the toleration operator.
+                              type: string
+                            tolerationSeconds:
+                              description: TolerationSeconds is the toleration duration.
+                              format: int64
+                              type: integer
+                            value:
+                              description: Value is the taint value.
+                              type: string
+                          type: object
+                        type: array
+                      ttlSecondsAfterFinished:
+                        description: TTLSecondsAfterFinished cleans up finished Jobs
+                          after the given seconds.
+                        format: int32
+                        type: integer
+                    type: object
+                  retention:
+                    description: Retention defines backup retention policy.
+                    properties:
+                      fullCount:
+                        description: FullCount is the number of full backups to retain.
+                        format: int32
+                        type: integer
+                      incrementalCount:
+                        description: IncrementalCount is the number of incremental
+                          backups to retain.
+                        format: int32
+                        type: integer
+                      maxAge:
+                        description: MaxAge is the maximum age of backups to retain
+                          (e.g. "30d").
+                        type: string
+                    type: object
+                  schedule:
+                    description: Schedule is the cron expression for scheduled backups.
+                      Empty disables the CronJob.
+                    type: string
+                required:
+                - destination
+                type: object
+              backupOnDelete:
+                default: false
+                description: BackupOnDelete triggers a backup before cluster deletion.
+                type: boolean
+              config:
+                description: Config defines cluster configuration parameters.
+                properties:
+                  coordinatorParameters:
+                    additionalProperties:
+                      type: string
+                    description: CoordinatorParameters are coordinator-only parameters.
+                    type: object
+                  databaseParameters:
+                    additionalProperties:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    description: DatabaseParameters are per-database parameters.
+                    type: object
+                  parameters:
+                    additionalProperties:
+                      type: string
+                    description: Parameters are cluster-wide postgresql.conf parameters.
+                    type: object
+                  roleParameters:
+                    additionalProperties:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    description: RoleParameters are per-role parameters.
+                    type: object
+                type: object
+              coordinator:
+                description: Coordinator defines the coordinator node configuration.
+                properties:
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: NodeSelector constrains scheduling to nodes with
+                      matching labels.
+                    type: object
+                  port:
+                    default: 5432
+                    description: Port is the coordinator listening port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  replicas:
+                    default: 1
+                    description: Replicas is the number of coordinator replicas (always
+                      1).
+                    format: int32
+                    maximum: 1
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: Resources defines compute resource requirements.
+                    properties:
+                      limits:
+                        description: Limits defines maximum resource limits.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                      requests:
+                        description: Requests defines minimum resource requirements.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                    type: object
+                  storage:
+                    description: Storage defines storage configuration.
+                    properties:
+                      size:
+                        default: 10Gi
+                        description: Size is the storage volume size.
+                        type: string
+                      storageClass:
+                        description: StorageClass is the Kubernetes storage class
+                          name.
+                        type: string
+                    type: object
+                  tolerations:
+                    description: Tolerations allow scheduling on tainted nodes.
+                    items:
+                      description: Toleration defines a Kubernetes toleration.
+                      properties:
+                        effect:
+                          description: Effect is the taint effect.
+                          type: string
+                        key:
+                          description: Key is the taint key.
+                          type: string
+                        operator:
+                          description: Operator is the toleration operator.
+                          type: string
+                        tolerationSeconds:
+                          description: TolerationSeconds is the toleration duration.
+                          format: int64
+                          type: integer
+                        value:
+                          description: Value is the taint value.
+                          type: string
+                      type: object
+                    type: array
+                required:
+                - storage
+                type: object
+              dataLoading:
+                description: DataLoading defines data loading configuration.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled controls whether data loading is active.
+                    type: boolean
+                  jobs:
+                    description: Jobs defines data loading job configurations.
+                    items:
+                      description: DataLoadingJob defines a data loading job configuration.
+                      properties:
+                        enabled:
+                          default: false
+                          description: Enabled controls whether the job is active.
+                          type: boolean
+                        kafkaSource:
+                          description: KafkaSource defines the Kafka source configuration.
+                          properties:
+                            brokers:
+                              description: Brokers is the list of Kafka broker addresses.
+                              items:
+                                type: string
+                              type: array
+                            format:
+                              description: Format is the message format (json, avro,
+                                csv).
+                              enum:
+                              - json
+                              - avro
+                              - csv
+                              type: string
+                            groupId:
+                              description: GroupID is the consumer group ID.
+                              type: string
+                            startOffset:
+                              default: earliest
+                              description: StartOffset defines where to start consuming
+                                (earliest, latest).
+                              enum:
+                              - earliest
+                              - latest
+                              type: string
+                            topic:
+                              description: Topic is the Kafka topic to consume from.
+                              type: string
+                          required:
+                          - brokers
+                          - topic
+                          type: object
+                        name:
+                          description: Name is the job name.
+                          type: string
+                        rabbitMQSource:
+                          description: RabbitMQSource defines the RabbitMQ source
+                            configuration.
+                          properties:
+                            credentialSecret:
+                              description: CredentialSecret references the secret
+                                containing RabbitMQ credentials.
+                              properties:
+                                key:
+                                  description: Key is the key within the secret.
+                                  type: string
+                                name:
+                                  description: Name is the name of the secret.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            format:
+                              description: Format is the message format (json, avro,
+                                csv).
+                              enum:
+                              - json
+                              - avro
+                              - csv
+                              type: string
+                            host:
+                              description: Host is the RabbitMQ hostname.
+                              type: string
+                            port:
+                              description: Port is the RabbitMQ port.
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                            queue:
+                              description: Queue is the RabbitMQ queue name.
+                              type: string
+                            vhost:
+                              description: VHost is the RabbitMQ virtual host.
+                              type: string
+                          required:
+                          - host
+                          - queue
+                          type: object
+                        s3Source:
+                          description: S3Source defines the S3 source configuration.
+                          properties:
+                            bucket:
+                              description: Bucket is the S3 bucket name.
+                              type: string
+                            credentialSecret:
+                              description: CredentialSecret references the secret
+                                containing S3 credentials.
+                              properties:
+                                key:
+                                  description: Key is the key within the secret.
+                                  type: string
+                                name:
+                                  description: Name is the name of the secret.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            endpoint:
+                              description: Endpoint is the S3-compatible endpoint.
+                              type: string
+                            forcePathStyle:
+                              default: false
+                              description: ForcePathStyle enables path-style addressing
+                                for S3-compatible storage.
+                              type: boolean
+                            format:
+                              description: Format is the data format (csv, json, avro).
+                              enum:
+                              - csv
+                              - json
+                              - avro
+                              type: string
+                            path:
+                              description: Path is the object path prefix.
+                              type: string
+                            region:
+                              description: Region is the S3 region.
+                              type: string
+                          required:
+                          - bucket
+                          type: object
+                        schedule:
+                          description: Schedule is the cron expression for scheduled
+                            jobs.
+                          type: string
+                        targetTable:
+                          description: TargetTable is the target database table.
+                          type: string
+                        type:
+                          description: Type is the source type (s3, kafka, rabbitmq).
+                          enum:
+                          - s3
+                          - kafka
+                          - rabbitmq
+                          type: string
+                      required:
+                      - name
+                      - targetTable
+                      - type
+                      type: object
+                    type: array
+                  streamingServer:
+                    description: StreamingServer defines the streaming server configuration.
+                    properties:
+                      credentialSecret:
+                        description: CredentialSecret references the secret containing
+                          server credentials.
+                        properties:
+                          key:
+                            description: Key is the key within the secret.
+                            type: string
+                          name:
+                            description: Name is the name of the secret.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      host:
+                        description: Host is the streaming server hostname.
+                        type: string
+                      port:
+                        description: Port is the streaming server port.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      tlsMode:
+                        default: none
+                        description: TLSMode defines the TLS mode (none, tls, skip-verify).
+                        enum:
+                        - none
+                        - tls
+                        - skip-verify
+                        type: string
+                    required:
+                    - host
+                    type: object
+                type: object
+              deletionPolicy:
+                default: Retain
+                description: DeletionPolicy defines the PV reclaim policy on cluster
+                  deletion.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              ha:
+                description: HA defines high availability configuration.
+                properties:
+                  checksums:
+                    default: true
+                    description: Checksums enables storage-layer checksums.
+                    type: boolean
+                  ftsProbeInterval:
+                    default: 60
+                    description: FTSProbeInterval is the FTS probe interval in seconds.
+                    format: int32
+                    type: integer
+                  ftsProbeRetries:
+                    default: 5
+                    description: FTSProbeRetries is the FTS probe retry count.
+                    format: int32
+                    type: integer
+                  ftsProbeTimeout:
+                    default: 20
+                    description: FTSProbeTimeout is the FTS probe timeout in seconds.
+                    format: int32
+                    type: integer
+                type: object
+              image:
+                default: cloudberrydb/cloudberry:2.1.0
+                description: Image is the container image for Cloudberry DB.
+                type: string
+              imagePullPolicy:
+                default: IfNotPresent
+                description: ImagePullPolicy defines when to pull the container image.
+                enum:
+                - Always
+                - IfNotPresent
+                - Never
+                type: string
+              imagePullSecrets:
+                description: ImagePullSecrets is a list of references to secrets for
+                  pulling images.
+                items:
+                  description: ImagePullSecret references a Kubernetes secret for
+                    image pulling.
+                  properties:
+                    name:
+                      description: Name is the name of the secret.
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              monitoring:
+                description: Monitoring defines monitoring configuration.
+                properties:
+                  enabled:
+                    default: true
+                    description: Enabled controls whether monitoring is active.
+                    type: boolean
+                  metricsPort:
+                    default: 9187
+                    description: MetricsPort is the Prometheus metrics port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  serviceMonitor:
+                    default: false
+                    description: ServiceMonitor controls whether a ServiceMonitor
+                      is created.
+                    type: boolean
+                type: object
+              queryMonitoring:
+                description: QueryMonitoring defines query monitoring and analysis
+                  configuration.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled controls whether query monitoring is active.
+                    type: boolean
+                  exporters:
+                    description: Exporters defines the monitoring exporters configuration.
+                    properties:
+                      cloudberryQueryExporter:
+                        description: CloudberryQueryExporter configures the Cloudberry
+                          query exporter sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
+                        type: object
+                      nodeExporter:
+                        description: NodeExporter configures the Prometheus node_exporter
+                          sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
+                        type: object
+                      postgresExporter:
+                        description: PostgresExporter configures the Prometheus postgres_exporter
+                          sidecar.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether this exporter is
+                              deployed.
+                            type: boolean
+                          image:
+                            description: Image is the container image for the exporter.
+                            type: string
+                          mirrors:
+                            default: false
+                            description: |-
+                              Mirrors enables deploying this postgres-exporter as a sidecar in each MIRROR
+                              segment pod. Default false. Mirror segments are in WAL-replay recovery; the
+                              exporter connects in utility mode and primarily yields recovery/replication
+                              metrics. Increases scrape targets and cardinality (one exporter per mirror).
+                            type: boolean
+                          port:
+                            description: Port is the metrics port exposed by the exporter.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          resources:
+                            description: Resources defines the compute resource requirements
+                              for the exporter.
+                            properties:
+                              limits:
+                                description: Limits defines maximum resource limits.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                              requests:
+                                description: Requests defines minimum resource requirements.
+                                properties:
+                                  cpu:
+                                    description: CPU is the CPU resource quantity.
+                                    type: string
+                                  memory:
+                                    description: Memory is the memory resource quantity.
+                                    type: string
+                                type: object
+                            type: object
+                          segments:
+                            default: false
+                            description: |-
+                              Segments enables deploying this postgres-exporter as a sidecar in each primary segment pod.
+                              Default false. Increases scrape targets and metric cardinality (one exporter per segment);
+                              intended for deep per-segment diagnostics.
+                            type: boolean
+                        type: object
+                      prometheusRule:
+                        description: PrometheusRule configures the Prometheus PrometheusRule
+                          resource.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether a PrometheusRule
+                              resource is created.
+                            type: boolean
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels are additional labels to add to the
+                              PrometheusRule.
+                            type: object
+                          namespace:
+                            description: Namespace is the namespace for the PrometheusRule.
+                              Defaults to the cluster namespace.
+                            type: string
+                        type: object
+                      serviceMonitor:
+                        description: ServiceMonitor configures the Prometheus ServiceMonitor
+                          resource.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether a ServiceMonitor
+                              resource is created.
+                            type: boolean
+                          interval:
+                            description: Interval is the Prometheus scrape interval.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels are additional labels to add to the
+                              ServiceMonitor.
+                            type: object
+                          namespace:
+                            description: Namespace is the namespace for the ServiceMonitor.
+                              Defaults to the cluster namespace.
+                            type: string
+                          scrapeTimeout:
+                            description: ScrapeTimeout is the Prometheus scrape timeout.
+                            type: string
+                        type: object
+                    type: object
+                  guestAccess:
+                    default: false
+                    description: GuestAccess allows guest access to query monitoring
+                      data.
+                    type: boolean
+                  historyRetention:
+                    description: HistoryRetention is the query history retention period
+                      (e.g. "30d", "90d").
+                    type: string
+                  planCollection:
+                    default: false
+                    description: PlanCollection enables query plan collection.
+                    type: boolean
+                  samplingInterval:
+                    description: SamplingInterval is the metrics sampling interval
+                      in seconds.
+                    format: int32
+                    type: integer
+                  slowQueryThreshold:
+                    description: SlowQueryThreshold is the threshold for slow query
+                      detection (e.g. "1000ms").
+                    type: string
+                type: object
+              segments:
+                description: Segments defines the segment nodes configuration.
+                properties:
+                  antiAffinity:
+                    default: preferred
+                    description: AntiAffinity defines the pod anti-affinity strategy.
+                    enum:
+                    - preferred
+                    - required
+                    type: string
+                  count:
+                    description: Count is the total number of primary segments.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  mirroring:
+                    description: Mirroring defines segment mirroring configuration.
+                    properties:
+                      enabled:
+                        default: true
+                        description: Enabled controls whether segment mirroring is
+                          active.
+                        type: boolean
+                      layout:
+                        default: group
+                        description: Layout defines the mirror placement strategy.
+                        enum:
+                        - group
+                        - spread
+                        type: string
+                    type: object
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: NodeSelector constrains scheduling to nodes with
+                      matching labels.
+                    type: object
+                  primariesPerHost:
+                    default: 2
+                    description: PrimariesPerHost is the number of primary segments
+                      per host.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  rebalance:
+                    description: Rebalance defines segment rebalancing configuration.
+                    properties:
+                      excludeTables:
+                        description: ExcludeTables lists tables to skip during rebalance
+                          (supports glob patterns).
+                        items:
+                          type: string
+                        type: array
+                      parallelism:
+                        default: 2
+                        description: Parallelism is the number of tables to redistribute
+                          concurrently.
+                        format: int32
+                        type: integer
+                      skewThreshold:
+                        default: 10
+                        description: SkewThreshold is the percentage skew threshold
+                          to trigger rebalance.
+                        format: int32
+                        type: integer
+                    type: object
+                  resources:
+                    description: Resources defines compute resource requirements.
+                    properties:
+                      limits:
+                        description: Limits defines maximum resource limits.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                      requests:
+                        description: Requests defines minimum resource requirements.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                    type: object
+                  storage:
+                    description: Storage defines storage configuration.
+                    properties:
+                      size:
+                        default: 10Gi
+                        description: Size is the storage volume size.
+                        type: string
+                      storageClass:
+                        description: StorageClass is the Kubernetes storage class
+                          name.
+                        type: string
+                    type: object
+                  tolerations:
+                    description: Tolerations allow scheduling on tainted nodes.
+                    items:
+                      description: Toleration defines a Kubernetes toleration.
+                      properties:
+                        effect:
+                          description: Effect is the taint effect.
+                          type: string
+                        key:
+                          description: Key is the taint key.
+                          type: string
+                        operator:
+                          description: Operator is the toleration operator.
+                          type: string
+                        tolerationSeconds:
+                          description: TolerationSeconds is the toleration duration.
+                          format: int64
+                          type: integer
+                        value:
+                          description: Value is the taint value.
+                          type: string
+                      type: object
+                    type: array
+                required:
+                - count
+                - storage
+                type: object
+              standby:
+                description: Standby defines the standby coordinator configuration.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled controls whether a standby coordinator is
+                      deployed.
+                    type: boolean
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: NodeSelector constrains scheduling to nodes with
+                      matching labels.
+                    type: object
+                  resources:
+                    description: Resources defines compute resource requirements.
+                    properties:
+                      limits:
+                        description: Limits defines maximum resource limits.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                      requests:
+                        description: Requests defines minimum resource requirements.
+                        properties:
+                          cpu:
+                            description: CPU is the CPU resource quantity.
+                            type: string
+                          memory:
+                            description: Memory is the memory resource quantity.
+                            type: string
+                        type: object
+                    type: object
+                  storage:
+                    description: Storage defines storage configuration.
+                    properties:
+                      size:
+                        default: 10Gi
+                        description: Size is the storage volume size.
+                        type: string
+                      storageClass:
+                        description: StorageClass is the Kubernetes storage class
+                          name.
+                        type: string
+                    type: object
+                type: object
+              storage:
+                description: Storage defines storage management configuration.
+                properties:
+                  diskMonitoring:
+                    default: false
+                    description: DiskMonitoring enables disk usage monitoring.
+                    type: boolean
+                  recommendationScan:
+                    description: RecommendationScan defines recommendation scanning
+                      configuration.
+                    properties:
+                      ageThreshold:
+                        description: AgeThreshold is the XID age threshold.
+                        format: int64
+                        type: integer
+                      bloatThreshold:
+                        description: BloatThreshold is the dead tuple percentage threshold.
+                        format: int32
+                        type: integer
+                      enabled:
+                        default: false
+                        description: Enabled controls whether recommendation scanning
+                          is active.
+                        type: boolean
+                      indexBloatThreshold:
+                        description: IndexBloatThreshold is the index bloat percentage
+                          threshold.
+                        format: int32
+                        type: integer
+                      scanDuration:
+                        description: ScanDuration is the maximum scan duration (e.g.
+                          "2h").
+                        type: string
+                      schedule:
+                        description: Schedule is the cron expression for scheduled
+                          scans.
+                        type: string
+                      skewThreshold:
+                        description: SkewThreshold is the skew coefficient percentage
+                          threshold.
+                        format: int32
+                        type: integer
+                    type: object
+                  usageReport:
+                    description: UsageReport defines usage reporting configuration.
+                    properties:
+                      enabled:
+                        default: false
+                        description: Enabled controls whether usage reporting is active.
+                        type: boolean
+                      monthly:
+                        default: false
+                        description: Monthly enables monthly usage reports.
+                        type: boolean
+                    type: object
+                type: object
+              telemetry:
+                description: Telemetry defines OTLP telemetry configuration.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled controls whether telemetry is active.
+                    type: boolean
+                  otlpEndpoint:
+                    description: OTLPEndpoint is the OTLP collector endpoint.
+                    type: string
+                  otlpProtocol:
+                    default: grpc
+                    description: OTLPProtocol is the OTLP exporter protocol.
+                    enum:
+                    - grpc
+                    - http
+                    type: string
+                  samplingRate:
+                    default: 1
+                    description: SamplingRate is the trace sampling rate (0.0 to 1.0).
+                    type: number
+                type: object
+              vault:
+                description: Vault defines HashiCorp Vault integration configuration.
+                properties:
+                  address:
+                    description: Address is the Vault server address.
+                    type: string
+                  authMethod:
+                    default: kubernetes
+                    description: AuthMethod is the Vault authentication method.
+                    enum:
+                    - token
+                    - kubernetes
+                    - approle
+                    type: string
+                  authPath:
+                    description: AuthPath is the Vault auth mount path.
+                    type: string
+                  enabled:
+                    default: false
+                    description: Enabled controls whether Vault integration is active.
+                    type: boolean
+                  role:
+                    description: Role is the Vault role name.
+                    type: string
+                  secretPath:
+                    description: SecretPath is the Vault secret path.
+                    type: string
+                  tlsSecret:
+                    description: TLSSecret references the Vault TLS secret.
+                    properties:
+                      name:
+                        description: Name is the name of the TLS secret.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
+              version:
+                default: 2.1.0
+                description: Version is the Cloudberry DB version.
+                type: string
+              workload:
+                description: Workload defines workload management configuration.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled controls whether workload management is active.
+                    type: boolean
+                  idleRules:
+                    description: IdleRules defines idle session termination rules.
+                    items:
+                      description: IdleSessionRule defines an idle session termination
+                        rule.
+                      properties:
+                        enabled:
+                          default: true
+                          description: Enabled controls whether the rule is active.
+                          type: boolean
+                        excludeInTransaction:
+                          default: false
+                          description: ExcludeInTransaction excludes sessions that
+                            are in a transaction.
+                          type: boolean
+                        idleTimeout:
+                          description: IdleTimeout is the idle timeout duration (e.g.
+                            "30m", "1h").
+                          type: string
+                        name:
+                          description: Name is the rule name.
+                          type: string
+                        resourceGroup:
+                          description: ResourceGroup is the target resource group.
+                          type: string
+                        terminateMessage:
+                          description: TerminateMessage is the message sent to the
+                            client on termination.
+                          type: string
+                      required:
+                      - idleTimeout
+                      - name
+                      - resourceGroup
+                      type: object
+                    type: array
+                  resourceGroups:
+                    description: ResourceGroups defines the resource groups for workload
+                      management.
+                    items:
+                      description: ResourceGroupSpec defines a resource group for
+                        workload management.
+                      properties:
+                        concurrency:
+                          description: Concurrency is the maximum number of concurrent
+                            transactions.
+                          format: int32
+                          type: integer
+                        cpuMaxPercent:
+                          description: CPUMaxPercent is the maximum CPU usage percentage.
+                          format: int32
+                          type: integer
+                        cpuWeight:
+                          description: CPUWeight is the CPU scheduling weight.
+                          format: int32
+                          type: integer
+                        ioLimits:
+                          description: IOLimits defines per-tablespace disk I/O limits.
+                          items:
+                            description: |-
+                              TablespaceIOLimitSpec defines per-tablespace disk I/O limits for a resource group.
+                              Applied via ALTER RESOURCE GROUP ... SET io_limit.
+                            properties:
+                              readBytesPerSec:
+                                description: ReadBytesPerSec is the maximum read throughput
+                                  in bytes per second.
+                                format: int64
+                                type: integer
+                              readIOPS:
+                                description: ReadIOPS is the maximum read I/O operations
+                                  per second.
+                                format: int32
+                                type: integer
+                              tablespace:
+                                description: Tablespace is the target tablespace name.
+                                  Use "*" for all tablespaces.
+                                type: string
+                              writeBytesPerSec:
+                                description: WriteBytesPerSec is the maximum write
+                                  throughput in bytes per second.
+                                format: int64
+                                type: integer
+                              writeIOPS:
+                                description: WriteIOPS is the maximum write I/O operations
+                                  per second.
+                                format: int32
+                                type: integer
+                            required:
+                            - tablespace
+                            type: object
+                          type: array
+                        memoryLimit:
+                          description: MemoryLimit is the memory limit in MB.
+                          format: int32
+                          type: integer
+                        minCost:
+                          description: MinCost is the minimum query cost to be managed.
+                          format: int32
+                          type: integer
+                        name:
+                          description: Name is the resource group name.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  rules:
+                    description: Rules defines workload management rules.
+                    items:
+                      description: WorkloadRule defines a workload management rule.
+                      properties:
+                        action:
+                          description: Action is the action to take (cancel, move,
+                            log).
+                          enum:
+                          - cancel
+                          - move
+                          - log
+                          type: string
+                        enabled:
+                          default: true
+                          description: Enabled controls whether the rule is active.
+                          type: boolean
+                        moveTarget:
+                          description: MoveTarget is the target resource group for
+                            move actions.
+                          type: string
+                        name:
+                          description: Name is the rule name.
+                          type: string
+                        priority:
+                          description: Priority is the rule evaluation priority.
+                          format: int32
+                          type: integer
+                        queryTag:
+                          description: QueryTag is the query tag to match.
+                          type: string
+                        resourceGroup:
+                          description: ResourceGroup is the target resource group.
+                          type: string
+                        role:
+                          description: Role is the database role to match.
+                          type: string
+                        threshold:
+                          description: Threshold is the threshold value for the rule.
+                          type: string
+                        thresholdType:
+                          description: ThresholdType is the type of threshold (cpu_skew,
+                            cpu_time, running_time, spill_size, etc.).
+                          type: string
+                      required:
+                      - action
+                      - name
+                      type: object
+                    type: array
+                type: object
+            required:
+            - coordinator
+            - segments
+            type: object
+          status:
+            description: CloudberryClusterStatus defines the observed state of CloudberryCluster.
+            properties:
+              activeQueries:
+                description: ActiveQueries is the number of currently active queries.
+                format: int32
+                type: integer
+              backupHistory:
+                description: BackupHistory contains the most recent backup entries.
+                items:
+                  description: BackupHistoryEntry describes a single backup recorded
+                    in cluster status.
+                  properties:
+                    duration:
+                      description: Duration is the human-readable backup duration
+                        (e.g. "5m32s").
+                      type: string
+                    size:
+                      description: Size is the human-readable backup size (e.g. "2.4Gi").
+                      type: string
+                    status:
+                      description: Status is the backup result (Success | Failed |
+                        InProgress).
+                      type: string
+                    timestamp:
+                      description: Timestamp is the gpbackup YYYYMMDDHHMMSS timestamp.
+                      type: string
+                    type:
+                      description: Type is the backup type (full | incremental).
+                      type: string
+                  type: object
+                type: array
+              blockedQueries:
+                description: BlockedQueries is the number of currently blocked queries.
+                format: int32
+                type: integer
+              clusterVersion:
+                description: ClusterVersion is the running cluster version.
+                type: string
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the cluster state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              coordinatorReady:
+                description: CoordinatorReady indicates whether the coordinator is
+                  ready.
+                type: boolean
+              cronJobName:
+                description: CronJobName is the name of the scheduled backup CronJob,
+                  when present.
+                type: string
+              dataLoadingJobs:
+                description: DataLoadingJobs is the number of active data loading
+                  jobs.
+                format: int32
+                type: integer
+              diskUsagePercent:
+                description: DiskUsagePercent is the current disk usage percentage.
+                format: int32
+                type: integer
+              failedSegments:
+                description: FailedSegments lists segments that are currently in a
+                  failed state.
+                items:
+                  description: FailedSegment describes a segment that is in a failed
+                    state.
+                  properties:
+                    contentID:
+                      description: ContentID is the segment content identifier.
+                      format: int32
+                      type: integer
+                    hostname:
+                      description: Hostname is the host where the segment was running.
+                      type: string
+                    role:
+                      description: Role is the segment role (primary or mirror).
+                      type: string
+                    status:
+                      description: Status is the segment status description.
+                      type: string
+                  required:
+                  - contentID
+                  - hostname
+                  - role
+                  - status
+                  type: object
+                type: array
+              lastBackupJobName:
+                description: LastBackupJobName is the name of the Job that produced
+                  the last backup.
+                type: string
+              lastBackupStatus:
+                description: LastBackupStatus is the status of the last backup (Success,
+                  Failed, InProgress).
+                type: string
+              lastBackupTime:
+                description: LastBackupTime is the timestamp of the last backup.
+                format: date-time
+                type: string
+              lastBackupTimestamp:
+                description: LastBackupTimestamp is the gpbackup YYYYMMDDHHMMSS timestamp
+                  of the last backup.
+                type: string
+              lastBackupType:
+                description: LastBackupType is the type of the last backup (full |
+                  incremental).
+                type: string
+              lastConfigChangeTime:
+                description: LastConfigChangeTime is the timestamp of the last configuration
+                  change.
+                format: date-time
+                type: string
+              lastReconcileTime:
+                description: LastReconcileTime is the timestamp of the last reconciliation.
+                format: date-time
+                type: string
+              mirroringStatus:
+                description: MirroringStatus is the current mirroring state.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current cluster phase.
+                type: string
+              queuedQueries:
+                description: QueuedQueries is the number of currently queued queries.
+                format: int32
+                type: integer
+              recommendationCount:
+                description: RecommendationCount is the number of active recommendations.
+                format: int32
+                type: integer
+              segmentsReady:
+                description: SegmentsReady is the number of ready segments.
+                format: int32
+                type: integer
+              segmentsTotal:
+                description: SegmentsTotal is the total number of segments.
+                format: int32
+                type: integer
+              standbyReady:
+                description: StandbyReady indicates whether the standby coordinator
+                  is ready.
+                type: boolean
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

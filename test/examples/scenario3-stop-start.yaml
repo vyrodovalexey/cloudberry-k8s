@@ -1,0 +1,178 @@
+# =============================================================================
+# Scenario 3: Stop/Start Modes
+# =============================================================================
+# This file documents the annotation commands for testing stop/start modes
+# on a running Cloudberry cluster.
+#
+# Prerequisites:
+#   - A running Cloudberry cluster (e.g., from scenario1-cluster.yaml)
+#   - Cluster must be in "Running" phase before stop operations
+#
+# Stop Modes:
+#   - stop (smart): Cancel active queries, terminate backends, then scale to 0
+#   - stop-fast: Immediately terminate all backends, then scale to 0
+#   - stop-immediate: Scale to 0 without DB-level graceful shutdown
+#
+# Start Modes:
+#   - start (normal): Scale all components back up, transition to Running
+#   - start-restricted: Scale all components up, superuser connections only
+#   - start-maintenance: Scale only coordinator up in utility mode
+# =============================================================================
+
+---
+# Sub-test 3.1: Smart Stop (default)
+# Cancels active queries, waits for clients to disconnect, terminates remaining
+# backends, then scales all StatefulSets to 0.
+# Expected: Phase transitions Running → Stopping → Stopped
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-smart-stop
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger smart stop"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=stop \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.2: Normal Start (after stop)
+# Scales all components back up via full reconciliation.
+# Expected: Phase transitions Stopped → Initializing → Running
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-normal-start
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger normal start"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=start \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.3: Fast Stop
+# Immediately terminates all backends (rolls back active transactions),
+# then scales all StatefulSets to 0.
+# Expected: Phase transitions Running → Stopping → Stopped
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-fast-stop
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger fast stop"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=stop-fast \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.4: Immediate Stop
+# Scales all StatefulSets to 0 without any DB-level graceful shutdown.
+# This is the fastest stop mode but may leave transactions in an inconsistent state.
+# Expected: Phase transitions Running → Stopping → Stopped
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-immediate-stop
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger immediate stop"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=stop-immediate \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.5: Restricted Start
+# Scales all components back up but only allows superuser (gpadmin) connections.
+# Useful for maintenance operations that require exclusive access.
+# Expected: Phase transitions Stopped → Restricted
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-restricted-start
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger restricted start"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=start-restricted \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.6: Maintenance Start
+# Scales only the coordinator to 1 in utility mode. Segments remain at 0.
+# Useful for catalog-only operations (e.g., fixing system tables).
+# Expected: Phase transitions Stopped → Maintenance
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-maintenance-start
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger maintenance start"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=start-maintenance \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.7: Restart (Fast Stop + Normal Start)
+# Performs a fast stop followed by a normal start.
+# Expected: Phase transitions Running → Stopping → Initializing → Running
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-restart
+  namespace: cloudberry-test
+  annotations:
+    description: "Apply action annotation to trigger restart"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=restart \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.8: Transition from Restricted to Running
+# After a restricted start, apply normal start to transition to full Running mode.
+# Expected: Phase transitions Restricted → Initializing → Running
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-restricted-to-running
+  namespace: cloudberry-test
+  annotations:
+    description: "Transition from restricted mode to normal running"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=start \
+      --namespace=cloudberry-test --overwrite
+
+---
+# Sub-test 3.9: Transition from Maintenance to Running
+# After a maintenance start, apply normal start to bring up all components.
+# Expected: Phase transitions Maintenance → Initializing → Running
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scenario3-maintenance-to-running
+  namespace: cloudberry-test
+  annotations:
+    description: "Transition from maintenance mode to normal running"
+data:
+  command: |
+    kubectl annotate cloudberrycluster scenario1-cluster \
+      avsoft.io/action=start \
+      --namespace=cloudberry-test --overwrite

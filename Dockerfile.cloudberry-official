@@ -1,0 +1,280 @@
+# =============================================================================
+# Dockerfile.cloudberry-official — Apache Cloudberry Database 2.1.0 (OFFICIAL RPM)
+# =============================================================================
+# Builds a Kubernetes-ready Cloudberry image from the OFFICIAL Apache Cloudberry
+# prebuilt release RPM instead of compiling from source.
+#
+# Why this image exists
+# ---------------------
+# The from-source image (Dockerfile.cloudberry) exhibits a segment-backend crash
+# (exit 255) during gpbackup's data phase — a build-specific defect, NOT a
+# Cloudberry code defect. The OFFICIAL Apache prebuilt binary does NOT have this
+# defect: a real gpbackup/gprestore MPP backup+restore completes successfully on
+# it. Use THIS image for clusters that need working gpbackup/gprestore.
+#
+# Architecture note
+# -----------------
+# The official Apache Cloudberry 2.1.0 release ships x86_64 (el9) RPMs only;
+# there is no published aarch64 RPM. This image is therefore linux/amd64. On
+# arm64 hosts it runs under emulation (qemu).
+#
+# It also bundles the gpbackup toolchain binaries (gpbackup, gprestore,
+# gpbackup_helper, gpbackup_s3_plugin) built from apache/cloudberry-backup so
+# the same image can run MPP backups.
+#
+# Build args:
+#   CB_RPM_URL          — URL of the official Cloudberry RPM (el9 x86_64)
+#   CB_BACKUP_VERSION   — apache/cloudberry-backup version for the gpbackup tools
+#   GO_VERSION          — Go toolchain version for building the gpbackup tools
+#
+# Usage:
+#   docker build --platform linux/amd64 -f Dockerfile.cloudberry-official \
+#       -t cloudberry-official:2.1.0 .
+# =============================================================================
+
+# =============================================================================
+# Stage 1: Build the PATCHED gpbackup toolchain (from apache/cloudberry-backup)
+# =============================================================================
+# This stage mirrors the patches in Dockerfile.cloudberry-backup so the four
+# binaries (gpbackup, gprestore, gpbackup_helper, gpbackup_s3_plugin) are
+# version-matched and include the lib/pq driver fix, the GetDBSize crash fix,
+# the LOCK TABLE / SAVEPOINT / snapshot fixes, and the --version flag support.
+# =============================================================================
+ARG GO_VERSION=1.26.4
+FROM --platform=linux/amd64 golang:${GO_VERSION}-bookworm AS gpbackup-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git make gcc libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+ARG CB_BACKUP_VERSION=2.1.0-incubating
+ARG CB_BACKUP_REPO_URL=https://github.com/apache/cloudberry-backup/archive/refs/tags/${CB_BACKUP_VERSION}.tar.gz
+RUN curl -fSL -o /tmp/src.tar.gz "${CB_BACKUP_REPO_URL}" && \
+    tar -xzf /tmp/src.tar.gz -C /build --strip-components=1 && \
+    rm -f /tmp/src.tar.gz
+
+# ---------------------------------------------------------------------------
+# PATCH 1: Neutralize GetDBSize (segment crash on pg_database_size query)
+# ---------------------------------------------------------------------------
+RUN sed -i '/^func GetDBSize/,/^}$/c\func GetDBSize(connectionPool *dbconn.DBConn) string {\n\treturn ""\n}' \
+        backup/queries_globals.go && \
+    ! grep -q "pg_database_size" backup/queries_globals.go
+
+# ---------------------------------------------------------------------------
+# PATCH 2: Skip LOCK TABLE for CBDB (segment crash workaround)
+# ---------------------------------------------------------------------------
+RUN sed -i '/if connectionPool.Version.IsCBDB() {/{n;s/lockMode = .*/return/;}' \
+        backup/queries_relations.go
+
+# ---------------------------------------------------------------------------
+# PATCH 3: Skip SAVEPOINT in GetAllViews (segment crash on SAVEPOINT)
+# ---------------------------------------------------------------------------
+RUN sed -i 's|connectionPool.MustExec("SAVEPOINT gpbackup_get_views")|// PATCHED: skip SAVEPOINT|' \
+        backup/queries_relations.go && \
+    sed -i 's|defer connectionPool.MustExec("ROLLBACK TO SAVEPOINT gpbackup_get_views")|// PATCHED: skip ROLLBACK TO SAVEPOINT|' \
+        backup/queries_relations.go
+
+# ---------------------------------------------------------------------------
+# PATCH 4: Skip LockTableNoWait for CBDB (segment crash workaround)
+# ---------------------------------------------------------------------------
+RUN sed -i '/if connectionPool.Version.IsCBDB() {/{n;s/lockMode = .*/return nil/;}' \
+        backup/data.go
+
+# ---------------------------------------------------------------------------
+# PATCH 5: Disable synchronized snapshots for CBDB
+# ---------------------------------------------------------------------------
+RUN sed -i 's/if ((connectionPool.Version.IsGPDB() && connectionPool.Version.AtLeast(SNAPSHOT_GPDB_MIN_VERSION)) || connectionPool.Version.IsCBDB()) && backupSnapshot == "" {/if false \&\& ((connectionPool.Version.IsGPDB() \&\& connectionPool.Version.AtLeast(SNAPSHOT_GPDB_MIN_VERSION)) || connectionPool.Version.IsCBDB()) \&\& backupSnapshot == "" {/' \
+        backup/wrappers.go
+
+# Download Go module dependencies first (better layer caching).
+RUN go mod download
+
+# ---------------------------------------------------------------------------
+# PATCH 6: Switch from pgx to lib/pq driver (cloudberry-go-libs dbconn)
+# ---------------------------------------------------------------------------
+RUN GOLIBS_DIR=$(find $(go env GOMODCACHE)/github.com/apache/cloudberry-go-libs* -maxdepth 0 -type d 2>/dev/null | head -1) && \
+    if [ -z "$GOLIBS_DIR" ]; then \
+      echo "ERROR: cloudberry-go-libs not found in module cache"; exit 1; \
+    fi && \
+    chmod -R u+w "$GOLIBS_DIR" && \
+    sed -i 's|_ "github.com/jackc/pgx/v5/stdlib"|_ "github.com/lib/pq"|' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|dbconn.Driver.Connect("pgx"|dbconn.Driver.Connect("postgres"|g' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|default_query_exec_mode=exec||g' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's|sslmode = "prefer"|sslmode = "disable"|' "$GOLIBS_DIR/dbconn/dbconn.go" && \
+    sed -i 's| statement_cache_capacity=0||g' "$GOLIBS_DIR/dbconn/dbconn.go"
+
+# Add lib/pq to the module graph so the patched import resolves at build time.
+RUN go get github.com/lib/pq@latest && go mod tidy
+
+# ---------------------------------------------------------------------------
+# PATCH 7: Register lib/pq driver in gprestore binary
+# (see Dockerfile.cloudberry-backup PATCH 7 for full rationale)
+# ---------------------------------------------------------------------------
+RUN sed -i 's|"github.com/apache/cloudberry-backup/options"|_ "github.com/lib/pq"\n\t"github.com/apache/cloudberry-backup/options"|' \
+        gprestore.go && \
+    echo "--- Patch 7: gprestore.go now imports lib/pq ---" && \
+    grep -n 'lib/pq' gprestore.go && \
+    grep -n '//go:build gprestore' gprestore.go
+
+# Build the four binaries (CGO_ENABLED=1 for sqlite3 history dependency).
+RUN CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/backup.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup . && \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gprestore' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/restore.version=${CB_BACKUP_VERSION}" \
+        -o /out/gprestore . && \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup_helper' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/helper.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup_helper . && \
+    CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackup_s3_plugin' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/plugins/s3plugin.version=${CB_BACKUP_VERSION}" \
+        -o /out/gpbackup_s3_plugin .
+
+# =============================================================================
+# Stage 2: Runtime image — official Cloudberry RPM
+# =============================================================================
+FROM --platform=linux/amd64 rockylinux/rockylinux:9
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-database-official" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 (official RPM) for Kubernetes, with gpbackup toolchain" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="rockylinux/rockylinux:9"
+
+# Install the official Apache Cloudberry RPM plus runtime dependencies.
+# NOTE: the `zstd` CLI is REQUIRED for gpbackup zstd-compressed backups —
+# gpbackup pipes segment COPY output through `zstd --compress` (COPY ... TO
+# PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin ...'). Without the zstd
+# command-line tool the pipe breaks ("could not write to COPY program: Broken
+# pipe") and zstd backups fail. gzip is already provided by the base image.
+ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
+RUN dnf -y install \
+        apr bash bzip2 ca-certificates glibc-langpack-en hostname iproute \
+        keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
+        lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
+        pam perl procps-ng python3 readline rsync shadow-utils sudo which zlib \
+        zstd && \
+    dnf -y install "${CB_RPM_URL}" && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# The RPM installs Cloudberry to /usr/local/cloudberry-db (versioned dir +
+# symlink). Confirm GPHOME exists.
+RUN test -d /usr/local/cloudberry-db && test -x /usr/local/cloudberry-db/bin/postgres
+
+# Bundle the gpbackup toolchain into GPHOME/bin so backups can run.
+COPY --from=gpbackup-builder /out/gpbackup            /usr/local/cloudberry-db/bin/gpbackup
+COPY --from=gpbackup-builder /out/gprestore           /usr/local/cloudberry-db/bin/gprestore
+COPY --from=gpbackup-builder /out/gpbackup_helper     /usr/local/cloudberry-db/bin/gpbackup_helper
+COPY --from=gpbackup-builder /out/gpbackup_s3_plugin  /usr/local/cloudberry-db/bin/gpbackup_s3_plugin
+RUN chmod +x /usr/local/cloudberry-db/bin/gpbackup \
+             /usr/local/cloudberry-db/bin/gprestore \
+             /usr/local/cloudberry-db/bin/gpbackup_helper \
+             /usr/local/cloudberry-db/bin/gpbackup_s3_plugin
+
+# ---------------------------------------------------------------------------
+# Symlink gpbackup toolchain binaries into /usr/local/bin so the operator's
+# generated gpbackup_s3_plugin config (executablepath: /usr/local/bin/...)
+# and gpbackup/gprestore dispatch work without $GPHOME on PATH. gpbackup
+# sends the executablepath to segments over SSH, so the path must exist on
+# every pod in the cluster.
+# ---------------------------------------------------------------------------
+RUN ln -sf /usr/local/cloudberry-db/bin/gpbackup            /usr/local/bin/gpbackup && \
+    ln -sf /usr/local/cloudberry-db/bin/gprestore           /usr/local/bin/gprestore && \
+    ln -sf /usr/local/cloudberry-db/bin/gpbackup_helper     /usr/local/bin/gpbackup_helper && \
+    ln -sf /usr/local/cloudberry-db/bin/gpbackup_s3_plugin  /usr/local/bin/gpbackup_s3_plugin
+
+# Create gpadmin user (UID 1000 for Kubernetes compatibility)
+RUN groupadd -g 1000 gpadmin && \
+    useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin && \
+    echo "gpadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gpadmin && \
+    chmod 440 /etc/sudoers.d/gpadmin && \
+    chown -R gpadmin:gpadmin /usr/local/cloudberry-db
+
+# Prepare SSH daemon directory (host keys generated at runtime by entrypoint)
+RUN mkdir -p /run/sshd && chmod 755 /run/sshd
+
+# -----------------------------------------------------------------------------
+# Silence SSH login noise so gpbackup/gprestore MPP dispatch over SSH succeeds.
+# gpbackup runs remote commands over SSH (per-segment backup dir creation +
+# gpbackup_helper) and treats ANY extra stdout/stderr on the session as a
+# failure (exit 254).
+#
+# ROOT CAUSE: the stock /etc/pam.d/sshd session stack includes container-hostile
+# modules (pam_namespace.so, pam_selinux.so, pam_loginuid.so, pam_lastlog.so)
+# via "session include password-auth" and "session include postlogin". These
+# cause pam_open_session() to fail, which makes sshd log "PAM session not
+# opened, exiting" and every remote command exits 254.
+#
+# PROVEN FIX: replace /etc/pam.d/sshd with a minimal container-friendly version
+# that keeps only pam_unix.so for session management. Also set PrintMotd/
+# PrintLastLog no in sshd_config and touch .hushlogin.
+# (The entrypoint re-applies these at runtime as a safety net.)
+# -----------------------------------------------------------------------------
+RUN printf '#%%PAM-1.0\nauth       substack     password-auth\naccount    required     pam_nologin.so\naccount    include      password-auth\npassword   include      password-auth\nsession    required     pam_unix.so\nsession    optional     pam_keyinit.so force revoke\n' \
+        > /etc/pam.d/sshd && \
+    sed -i \
+        -e 's/^[#[:space:]]*PrintMotd.*/PrintMotd no/' \
+        -e 's/^[#[:space:]]*PrintLastLog.*/PrintLastLog no/' \
+        /etc/ssh/sshd_config && \
+    grep -q '^PrintMotd no'    /etc/ssh/sshd_config || echo 'PrintMotd no'    >> /etc/ssh/sshd_config && \
+    grep -q '^PrintLastLog no' /etc/ssh/sshd_config || echo 'PrintLastLog no' >> /etc/ssh/sshd_config && \
+    touch /home/gpadmin/.hushlogin && chown gpadmin:gpadmin /home/gpadmin/.hushlogin
+
+# Operator-expected directory layout
+RUN mkdir -p /data/pgdata /etc/cloudberry /var/run/cloudberry && \
+    chown -R gpadmin:gpadmin /data /etc/cloudberry /var/run/cloudberry
+
+# System limits for Cloudberry
+RUN printf '* soft core unlimited\n\
+* hard core unlimited\n\
+* soft nofile 524288\n\
+* hard nofile 524288\n\
+* soft nproc 131072\n\
+* hard nproc 131072\n' > /etc/security/limits.d/90-cbdb-limits.conf
+
+# SSH dir (keypair generated at runtime by entrypoint)
+RUN mkdir -p /home/gpadmin/.ssh && chmod 700 /home/gpadmin/.ssh && \
+    chown -R gpadmin:gpadmin /home/gpadmin/.ssh
+
+# gpadmin environment
+RUN { \
+      echo ''; \
+      echo '# Apache Cloudberry environment'; \
+      echo 'if [ -f /usr/local/cloudberry-db/cloudberry-env.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/cloudberry-env.sh'; \
+      echo 'elif [ -f /usr/local/cloudberry-db/greenplum_path.sh ]; then'; \
+      echo '  source /usr/local/cloudberry-db/greenplum_path.sh'; \
+      echo 'fi'; \
+      echo 'export COORDINATOR_DATA_DIRECTORY="${COORDINATOR_DATA_DIRECTORY:-/data/pgdata/gpseg-1}"'; \
+    } >> /home/gpadmin/.bashrc
+
+# Entrypoint
+COPY --chmod=755 hack/docker-entrypoint-cloudberry.sh /usr/local/bin/docker-entrypoint.sh
+
+# Environment variables for operator integration
+ENV PGDATA=/data/pgdata \
+    CLOUDBERRY_ROLE=coordinator \
+    CLOUDBERRY_CONTENT_ID=-1 \
+    CLOUDBERRY_COORDINATOR_HOST=localhost \
+    GPHOME=/usr/local/cloudberry-db \
+    COORDINATOR_DATA_DIRECTORY=/data/pgdata/gpseg-1 \
+    LANG=en_US.UTF-8
+
+USER 1000:1000
+WORKDIR /home/gpadmin
+
+EXPOSE 5432 22
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD pg_isready -h localhost -p 5432 -U gpadmin -d postgres || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["postgres"]

@@ -1,0 +1,60 @@
+# =============================================================================
+# Endurance (Soak) Test Scenario
+# =============================================================================
+#
+# Purpose: Verify the operator API remains stable under sustained moderate load
+#          over an extended period. Detects memory leaks, connection pool
+#          exhaustion, goroutine leaks, file descriptor leaks, and other
+#          time-dependent degradation issues.
+#
+# Profile: 50 RPS constant for 30 minutes
+# Expected: Stable latency, no memory growth, 0% errors
+# Duration: ~32 minutes (including ramp-up)
+#
+# Key Metrics to Watch:
+#   - Memory usage trend (should be flat, not growing)
+#   - Goroutine count (should be stable)
+#   - Response time trend (should not increase over time)
+#   - Error rate (should remain at 0%)
+#   - File descriptor count (should be stable)
+#
+# Usage:
+#   ./run-perftest.sh --scenario endurance
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/api-read.txt
+  load_profile:
+    load_type: rps
+    # Gentle warmup then sustained constant load
+    # Warmup: ramp from 1 to 50 RPS over 60 seconds
+    # Sustain: hold 50 RPS for 30 minutes (1800 seconds)
+    schedule: line(1, 50, 60s) const(50, 1800s)
+  timeout: 5s
+  instances: 100
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    # Moderate thresholds - focus on stability over time
+    # Stop if average response time exceeds 2 seconds for 60 seconds
+    - time(2000, 60s)
+    # Stop if 5xx error rate exceeds 2% for 30 seconds
+    - http(5xx, 2%, 30s)
+    # Stop if 4xx error rate exceeds 20% for 30 seconds
+    - http(4xx, 20%, 30s)
+    # Stop if network errors exceed 3% for 20 seconds
+    - net(xx, 3%, 20s)
+    # Stop if 99th percentile exceeds 5 seconds for 60 seconds
+    - quantile(99, 5000, 60s)
+    # Stop if total 5xx count exceeds 100 in 120 seconds
+    - total_http(5xx, 100, 120s)
+
+console:
+  enabled: true
+  short_only: false

@@ -1,0 +1,18 @@
+# Scenario 34: Workload Management Disabled
+#
+# This example shows a CloudberryCluster with workload management explicitly disabled.
+# When spec.workload.enabled is set to false, the operator:
+#   - Drops all user-created resource groups from the database
+#   - Deletes the workload-rules ConfigMap
+#   - Stops the idle session daemon
+#   - Zeros out resource group metrics
+#   - Sets WorkloadConfigured=False with reason WorkloadDisabled
+#   - Emits a WorkloadDisabled event
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario34-workload-disabled
+spec:
+  version: "2.1.0"
+  workload:
+    enabled: false

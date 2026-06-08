@@ -1,0 +1,91 @@
+# =============================================================================
+# Cloudberry Operator - Yandex Tank Load Test Configuration
+# =============================================================================
+#
+# Default configuration for load testing the Cloudberry K8s Operator REST API.
+# This is the main configuration file. For specific scenarios, see scenarios/.
+#
+# Usage:
+#   docker run --rm -v $(pwd):/var/loadtest -v $(pwd)/.yandextank:/tmp/artifacts \
+#     --net host direvius/yandex-tank -c load.yaml
+#
+# =============================================================================
+
+phantom:
+  # Target address (operator API server)
+  address: localhost:8190
+  # Use HTTP (set to true for HTTPS)
+  ssl: false
+  # Ammo type: uri-style for simple GET requests, request-style for full HTTP
+  ammo_type: uri
+  # Path to ammo file
+  ammofile: ammo/api-read.txt
+  # Load schedule: ramp-up then constant load
+  # Format: type(start_rps, end_rps, duration) or const(rps, duration)
+  load_profile:
+    load_type: rps
+    schedule: line(1, 100, 60s) const(100, 300s)
+  # Connection settings
+  connection_test: true
+  # Timeout for each request (milliseconds)
+  timeout: 3s
+  # Number of instances (concurrent connections)
+  instances: 100
+  # Use HTTP/1.1 keep-alive
+  writelog: all
+
+# =============================================================================
+# Autostop conditions - safety net to prevent overloading the target
+# =============================================================================
+autostop:
+  autostop:
+    # Stop if average response time exceeds 2 seconds for 30 seconds
+    - time(2000, 30s)
+    # Stop if HTTP 5xx error rate exceeds 10% for 15 seconds
+    - http(5xx, 10%, 15s)
+    # Stop if HTTP 4xx error rate exceeds 50% for 15 seconds
+    - http(4xx, 50%, 15s)
+    # Stop if network error rate exceeds 5% for 10 seconds
+    - net(xx, 5%, 10s)
+    # Stop if 99th percentile response time exceeds 5 seconds for 30 seconds
+    - quantile(99, 5000, 30s)
+    # Stop if total number of non-200 responses exceeds 500
+    - total_http(5xx, 500, 60s)
+
+# =============================================================================
+# Console output during test
+# =============================================================================
+console:
+  enabled: true
+  short_only: false
+
+# =============================================================================
+# Telegraf monitoring (optional - for target server metrics)
+# =============================================================================
+# Uncomment and configure if you have telegraf agent on the target host
+#
+# telegraf:
+#   enabled: true
+#   package: yandextank.plugins.Telegraf
+#   config: monitoring.xml
+#   default_target: localhost
+#   ssh_timeout: 5s
+
+# =============================================================================
+# Result storage
+# =============================================================================
+# Overload (Yandex Tank web interface) - uncomment to upload results
+# overload:
+#   enabled: true
+#   token_file: overload_token.txt
+#   job_name: cloudberry-operator-perftest
+#   job_dsc: "Cloudberry Operator API load test"
+
+# =============================================================================
+# Shell exec plugin - for pre/post test hooks
+# =============================================================================
+# shellexec:
+#   prepare: echo "Preparing test environment..."
+#   start: echo "Test started at $(date)"
+#   end: echo "Test finished at $(date)"
+#   post_process: echo "Post-processing results..."

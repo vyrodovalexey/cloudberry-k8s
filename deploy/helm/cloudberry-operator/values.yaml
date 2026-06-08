@@ -1,0 +1,294 @@
+# =============================================================================
+# Cloudberry Operator Helm Chart - Default Values
+# =============================================================================
+
+# -- Number of operator replicas
+replicaCount: 1
+
+# -- Operator image configuration
+image:
+  # -- Container image repository
+  repository: cloudberry-operator
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (defaults to chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+# -- Install CRDs with the chart
+installCRDs: true
+
+# =============================================================================
+# Service Account
+# =============================================================================
+serviceAccount:
+  # -- Create a service account
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- The name of the service account (auto-generated if empty)
+  name: ""
+  # -- Automount API credentials
+  automountServiceAccountToken: true
+
+# =============================================================================
+# RBAC
+# =============================================================================
+rbac:
+  # -- Create RBAC resources
+  create: true
+
+# =============================================================================
+# Backup RBAC
+# =============================================================================
+# Backup/restore Jobs run under the dedicated `cloudberry-backup-sa`
+# ServiceAccount (see internal/util/names.go BackupServiceAccountName). The
+# chart creates the ServiceAccount, Role and RoleBinding in the chart release
+# namespace. Note: backup Jobs run in the CLUSTER's namespace; for clusters
+# deployed in a namespace other than the chart release namespace, the
+# `cloudberry-backup-sa` ServiceAccount, Role and RoleBinding must also be
+# created in that namespace.
+backup:
+  rbac:
+    # -- Create the cloudberry-backup-sa ServiceAccount, Role and RoleBinding
+    # for backup/restore Jobs in the release namespace.
+    create: true
+
+# =============================================================================
+# Operator Configuration
+# =============================================================================
+operator:
+  # -- Operator log level (debug, info, warn, error)
+  logLevel: info
+  # -- Operator log format (json, text)
+  logFormat: json
+  # -- Enable leader election for HA deployments
+  leaderElection: true
+  # -- Reconciliation interval
+  reconcileInterval: 30s
+  # -- Operation timeout
+  operationTimeout: 5m
+  # -- Namespace to watch (empty for all namespaces)
+  watchNamespace: ""
+  # -- Metrics bind address
+  metricsAddress: ":8080"
+  # -- Health probe bind address
+  healthProbeAddress: ":8081"
+  # -- Webhook server port
+  webhookPort: 9443
+
+# =============================================================================
+# Vault Integration
+# =============================================================================
+vault:
+  # -- Enable Vault integration
+  enabled: false
+  # -- Vault server address
+  address: ""
+  # -- Vault authentication method (token, kubernetes, approle)
+  authMethod: kubernetes
+  # -- Vault auth mount path
+  authPath: auth/kubernetes
+  # -- Vault role name
+  role: cloudberry-operator
+  # -- Vault token (for token auth method only; use existingSecret in production)
+  token: ""
+  # -- Vault secret path
+  secretPath: secret/data/cloudberry
+  # -- Vault TLS secret name
+  tlsSecretName: ""
+  # -- Vault PKI mount path (used for vault-pki webhook cert source)
+  pkiMountPath: "pki"
+  # -- Vault PKI role name (used for vault-pki webhook cert source)
+  pkiRole: "cloudberry-operator"
+
+# =============================================================================
+# OIDC Configuration
+# =============================================================================
+oidc:
+  # -- Enable OIDC authentication
+  enabled: false
+  # -- OIDC issuer URL
+  issuerURL: ""
+  # -- OIDC client ID
+  clientID: ""
+  # -- OIDC client secret (use existingSecret for production)
+  clientSecret: ""
+  # -- Use an existing secret for OIDC client secret
+  existingSecret: ""
+  # -- Key in the existing secret
+  existingSecretKey: client-secret
+
+# =============================================================================
+# Telemetry
+# =============================================================================
+telemetry:
+  # -- Enable OTLP telemetry
+  enabled: false
+  # -- OTLP collector endpoint
+  otlpEndpoint: ""
+  # -- OTLP protocol (grpc, http)
+  otlpProtocol: grpc
+  # -- Use insecure (plaintext) connection for OTLP exporter
+  otlpInsecure: false
+  # -- Trace sampling rate (0.0 to 1.0)
+  samplingRate: 1.0
+  # -- Service name for traces
+  serviceName: cloudberry-operator
+
+# =============================================================================
+# Metrics & Monitoring
+# =============================================================================
+metrics:
+  # -- Enable metrics endpoint
+  enabled: true
+  # -- Metrics service port
+  port: 8080
+
+# -- ServiceMonitor for Prometheus Operator (disabled by default)
+serviceMonitor:
+  # -- Create a ServiceMonitor resource
+  enabled: false
+  # -- Namespace for the ServiceMonitor (defaults to release namespace)
+  namespace: ""
+  # -- Additional labels for the ServiceMonitor
+  labels: {}
+  # -- Scrape interval
+  interval: 30s
+  # -- Scrape timeout
+  scrapeTimeout: 10s
+  # -- Metric relabeling configs
+  metricRelabelings: []
+  # -- Relabeling configs
+  relabelings: []
+
+# =============================================================================
+# Webhook Configuration
+# =============================================================================
+webhook:
+  # -- Enable admission webhooks
+  enabled: true
+  # -- Webhook service port
+  port: 443
+  # -- Target port on the operator
+  targetPort: 9443
+  # -- Failure policy for validating webhook (Fail or Ignore)
+  failurePolicy: Fail
+  # -- Certificate source: "self-signed" or "vault-pki"
+  certSource: "self-signed"
+  # -- TLS certificate secret name (auto-generated if empty)
+  certSecretName: ""
+  # -- Webhook service name (defaults to release-name-webhook)
+  serviceName: ""
+  # -- Static CA bundle to inject into webhook configurations (base64-encoded)
+  # -- Leave empty for operator to inject at runtime
+  caBundle: ""
+  # -- Vault PKI configuration (when certSource is "vault-pki")
+  vaultPKI:
+    # -- Vault PKI mount path
+    mountPath: "pki"
+    # -- Vault PKI role name
+    role: "cloudberry-operator"
+
+# =============================================================================
+# Network Policy
+# =============================================================================
+networkPolicy:
+  # -- Enable network policies
+  enabled: false
+  # -- Additional ingress rules
+  additionalIngress: []
+  # -- Additional egress rules
+  additionalEgress: []
+
+# =============================================================================
+# Pod Configuration
+# =============================================================================
+
+# -- Resource requests and limits
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -- Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+
+# -- Node selector
+nodeSelector: {}
+
+# -- Tolerations
+tolerations: []
+
+# -- Affinity rules
+affinity: {}
+
+# -- Pod annotations
+podAnnotations: {}
+
+# -- Pod labels
+podLabels: {}
+
+# -- Pod Disruption Budget
+podDisruptionBudget:
+  # -- Enable PDB
+  enabled: false
+  # -- Minimum available pods
+  minAvailable: 1
+  # -- Maximum unavailable pods (mutually exclusive with minAvailable)
+  # maxUnavailable: 1
+
+# -- Liveness probe configuration
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# -- Readiness probe configuration
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# -- Additional environment variables
+extraEnv: []
+
+# -- Additional volume mounts
+extraVolumeMounts: []
+
+# -- Additional volumes
+extraVolumes: []

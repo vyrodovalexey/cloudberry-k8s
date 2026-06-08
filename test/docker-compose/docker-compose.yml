@@ -1,0 +1,254 @@
+# =============================================================================
+# Cloudberry Operator Test Environment
+# =============================================================================
+# Port allocation:
+#   8200       - Vault (dev mode, root token: myroot)
+#   8090/8091  - Keycloak (admin/admin)
+#   3200       - Tempo HTTP API
+#   4317/4318  - OTLP receivers
+#   8428       - VictoriaMetrics
+#   9428       - VictoriaLogs
+#   3000       - Grafana
+#   9000/9001  - MinIO (S3-compatible storage, minioadmin/minioadmin)
+#   9094       - Kafka (KRaft mode, external listener)
+#   5672/15672 - RabbitMQ (guest/guest)
+#
+# Setup order:
+#   1. docker compose up -d
+#   2. Wait for Vault and Keycloak to be ready
+#   3. Run scripts/setup-vault.sh   (configures PKI, issues certs)
+#   4. Run scripts/setup-keycloak.sh (creates realm, clients for service-to-service)
+#   5. Run scripts/setup-minio.sh    (creates test buckets)
+#   6. Run scripts/setup-kafka.sh    (creates test topics)
+#   7. Run scripts/setup-rabbitmq.sh (creates test queues)
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # Vault - PKI for mTLS certificates
+  # ===========================================================================
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault
+    volumes:
+      - vault_data:/vault/file
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: myroot
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - 8200:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+
+  # ===========================================================================
+  # Keycloak - OIDC provider for authentication testing
+  # ===========================================================================
+  keycloak_web:
+    image: quay.io/keycloak/keycloak:26.5
+    container_name: keycloak_web
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: password
+
+      KC_HTTP_PORT: 8090
+      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_HTTP_ENABLED: true
+      KC_PROXY_HEADERS: xforwarded
+      KC_FEATURES: token-exchange,admin-fine-grained-authz
+      KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
+
+      KC_LOG_LEVEL: info
+      KC_METRICS_ENABLED: true
+      KC_HEALTH_ENABLED: true
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    command: start-dev
+    depends_on:
+      keycloakdb:
+        condition: service_healthy
+    ports:
+      - 8090:8090
+      - 8091:9000
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  keycloakdb:
+    image: postgres:16
+    container_name: keycloakdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # Observability stack
+  # ===========================================================================
+  tempo:
+    image: grafana/tempo:2.7.1
+    container_name: tempo
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - tempo_data:/var/tempo
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - 3200:3200    # Tempo HTTP API
+      - 4317:4317    # OTLP gRPC receiver
+      - 4318:4318    # OTLP HTTP receiver
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.108.1
+    container_name: victoriametrics
+    ports:
+      - 8428:8428
+    volumes:
+      - victoriametrics_data:/victoria-metrics-data
+      - ./victoriametrics/scrape.yml:/etc/victoriametrics/promscrape.yml:ro
+    command:
+      - --promscrape.config=/etc/victoriametrics/promscrape.yml
+      - --storageDataPath=/victoria-metrics-data
+      - --httpListenAddr=:8428
+      - --retentionPeriod=30d
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.3.2-victorialogs
+    container_name: victorialogs
+    ports:
+      - 9428:9428
+    volumes:
+      - victorialogs_data:/victoria-logs-data
+    command:
+      - --storageDataPath=/victoria-logs-data
+      - --httpListenAddr=:9428
+      - --retentionPeriod=30d
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: grafana
+    ports:
+      - 3000:3000
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../monitoring/grafana:/var/lib/grafana/dashboards/avapigw:ro
+    depends_on:
+      - victoriametrics
+      - victorialogs
+      - tempo
+
+  # ===========================================================================
+  # MinIO - S3-compatible object storage for backup testing
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ===========================================================================
+  # Kafka (KRaft mode - no ZooKeeper)
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "cloudberry-test-kafka-cluster"
+    ports:
+      - 9094:9094
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ===========================================================================
+  # RabbitMQ
+  # ===========================================================================
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - 5672:5672
+      - 15672:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  postgres_data:
+  vault_data:
+  victoriametrics_data:
+  victorialogs_data:
+  grafana_data:
+  tempo_data:
+  mtls_certs:
+  minio_data:
+  kafka_data:
+  rabbitmq_data:

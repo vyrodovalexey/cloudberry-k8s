@@ -1,0 +1,131 @@
+# =============================================================================
+# Scenario 1 — Full Cluster Bootstrap
+# =============================================================================
+# Webhook enabled + Vault PKI + Keycloak OIDC
+# Coordinator + standby + 4 primary segments + 4 mirrors,
+# with all config layers populated.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario1-cluster
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "1"
+spec:
+  version: "7.1.0"
+  image: "postgres:16"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    port: 5432
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  segments:
+    count: 4
+    primariesPerHost: 2
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+    storage:
+      size: "5Gi"
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  config:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+      gp_enable_global_deadlock_detector: "on"
+    coordinatorParameters:
+      log_min_duration_statement: "500"
+    databaseParameters:
+      mydb:
+        work_mem: "256MB"
+    roleParameters:
+      analyst:
+        statement_mem: "1GB"
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+    checksums: true
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: token
+    secretPath: "secret/data/cloudberry"
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  deletionPolicy: Retain
+  backupOnDelete: true

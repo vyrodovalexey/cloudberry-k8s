@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cloudberry-operator.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    listen-address: ":8443"
+    metrics-address: {{ .Values.operator.metricsAddress | quote }}
+    health-probe-address: {{ .Values.operator.healthProbeAddress | quote }}
+    webhook-port: {{ .Values.operator.webhookPort }}
+    webhook-enabled: {{ .Values.webhook.enabled }}
+    log-level: {{ .Values.operator.logLevel | quote }}
+    log-format: {{ .Values.operator.logFormat | quote }}
+    leader-election: {{ .Values.operator.leaderElection }}
+    reconcile-interval: {{ .Values.operator.reconcileInterval | quote }}
+    operation-timeout: {{ .Values.operator.operationTimeout | quote }}
+    namespace: {{ .Values.operator.watchNamespace | quote }}
+    vault:
+      enabled: {{ .Values.vault.enabled }}
+      {{- if .Values.vault.enabled }}
+      address: {{ .Values.vault.address | quote }}
+      auth-method: {{ .Values.vault.authMethod | quote }}
+      auth-path: {{ .Values.vault.authPath | quote }}
+      role: {{ .Values.vault.role | quote }}
+      secret-path: {{ .Values.vault.secretPath | quote }}
+      {{- end }}
+    vault-pki-mount-path: {{ .Values.vault.pkiMountPath | default "" | quote }}
+    vault-pki-role: {{ .Values.vault.pkiRole | default "" | quote }}
+    oidc:
+      enabled: {{ .Values.oidc.enabled }}
+      {{- if .Values.oidc.enabled }}
+      issuer-url: {{ .Values.oidc.issuerURL | quote }}
+      client-id: {{ .Values.oidc.clientID | quote }}
+      {{- end }}
+    telemetry:
+      enabled: {{ .Values.telemetry.enabled }}
+      {{- if .Values.telemetry.enabled }}
+      otlp-endpoint: {{ .Values.telemetry.otlpEndpoint | quote }}
+      otlp-protocol: {{ .Values.telemetry.otlpProtocol | quote }}
+      otlp-insecure: {{ .Values.telemetry.otlpInsecure }}
+      sampling-rate: {{ .Values.telemetry.samplingRate }}
+      service-name: {{ .Values.telemetry.serviceName | quote }}
+      {{- end }}

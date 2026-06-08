@@ -1,0 +1,62 @@
+# Scenario 57: cloudberry-query-exporter Metrics
+# HA cluster with standby, mirroring, and both exporters.
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario57
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "10Gi"
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "10Gi"
+  segments:
+    count: 2
+    mirroring:
+      enabled: true
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+  auth:
+    basic:
+      enabled: true
+      adminUser: "gpadmin"
+  queryMonitoring:
+    enabled: true
+    historyRetention: "30d"
+    samplingInterval: 5
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188

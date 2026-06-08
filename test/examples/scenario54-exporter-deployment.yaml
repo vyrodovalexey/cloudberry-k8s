@@ -1,0 +1,68 @@
+# Scenario 54: Exporter Deployment Verification
+# Deploys postgres-exporter and cloudberry-query-exporter as sidecars,
+# plus exporter credentials Secret, queries ConfigMap, and exporter Service.
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario54-exporter-deployment
+  namespace: cloudberry-test
+spec:
+  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.1.0"
+  coordinator:
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "10Gi"
+  segments:
+    count: 2
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+  auth:
+    basic:
+      enabled: true
+      adminUser: "gpadmin"
+  queryMonitoring:
+    enabled: true
+    historyRetention: "30d"
+    samplingInterval: 5
+    guestAccess: false
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+      nodeExporter:
+        enabled: false
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"

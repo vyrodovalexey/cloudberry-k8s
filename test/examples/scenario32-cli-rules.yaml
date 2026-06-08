@@ -1,0 +1,12 @@
+- name: import_rule_one
+  enabled: true
+  action: log
+  thresholdType: cpu_time
+  threshold: "120"
+  priority: 10
+- name: import_rule_two
+  enabled: true
+  action: cancel
+  thresholdType: running_time
+  threshold: "7200"
+  priority: 1

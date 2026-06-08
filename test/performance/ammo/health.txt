@@ -1,0 +1,13 @@
+[Host: localhost:8190]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest]
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz
