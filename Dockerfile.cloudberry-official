@@ -155,7 +155,7 @@ RUN git clone --depth 1 --branch "${GPBACKMAN_VERSION}" \
 # =============================================================================
 # Stage 2: Runtime image — official Cloudberry RPM
 # =============================================================================
-FROM --platform=linux/amd64 rockylinux/rockylinux:9
+FROM --platform=linux/amd64 rockylinux/rockylinux:10
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database-official" \

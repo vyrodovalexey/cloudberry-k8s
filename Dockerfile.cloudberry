@@ -14,7 +14,7 @@
 # =============================================================================
 # Stage 1: Build Apache Cloudberry from source
 # =============================================================================
-FROM rockylinux/rockylinux:9.6 AS builder
+FROM rockylinux/rockylinux:10.1 AS builder
 
 # Install build toolchains and development headers
 RUN dnf makecache && \
@@ -117,7 +117,7 @@ RUN cd /home/gpadmin/cloudberry && \
 # =============================================================================
 # Stage 2: Runtime image
 # =============================================================================
-FROM rockylinux/rockylinux:9.6-minimal
+FROM rockylinux/rockylinux:10.1-minimal
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database" \
