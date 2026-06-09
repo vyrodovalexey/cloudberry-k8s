@@ -689,7 +689,7 @@ jobs:
             skip_dirs: ''
           - name: cloudberry
             image_key: DOCKER_IMAGE_CLOUDBERRY
-            skip_dirs: ''
+            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
           - name: query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
             skip_dirs: ''
