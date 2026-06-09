@@ -146,7 +146,24 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 | DELETE | /clusters/{name}/workload/resource-groups/{group} | Operator | Delete resource group |
 | POST | /clusters/{name}/workload/resource-groups/{group}/assign | Operator | Assign role to group |
 
-### 4.9 Health and Metrics
+### 4.9 Backup and Restore
+
+All backup/restore endpoints are namespaced under `/clusters/{name}/backups`, are OIDC/JWT-authenticated (`withAuth`), and enforce per-endpoint RBAC (`withPermission`). A missing cluster returns `404 CLUSTER_NOT_FOUND`. These are the seven endpoints verified by **Scenario 85** (see §10).
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| GET | /clusters/{name}/backups | Basic | List backups from the operator's recorded backup history (`status.backup.backupHistory`) |
+| POST | /clusters/{name}/backups | Operator | Create a backup (creates a Job directly) |
+| GET | /clusters/{name}/backups/{timestamp} | Basic | Get details for a specific backup timestamp |
+| DELETE | /clusters/{name}/backups/{timestamp} | Admin | Delete a backup (creates a `gpbackman` cleanup Job) |
+| POST | /clusters/{name}/backups/{timestamp}/restore | Admin | Restore from a backup (creates a restore Job) |
+| GET | /clusters/{name}/backups/jobs | Basic | List backup/restore/cleanup Job statuses |
+| GET | /clusters/{name}/backups/schedule | Basic | Get CronJob status + computed `nextScheduleTime` |
+| PATCH | /clusters/{name}/backups/schedule | Operator | Update `spec.backup.schedule` / suspend the CronJob (outside the Scenario 85 set) |
+
+The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest.gprestoreOptions`), the option → `gpbackup`/`gprestore` flag mapping, and the mutual-exclusivity rules are documented in §5.15–§5.18.
+
+### 4.10 Health and Metrics
 
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
@@ -343,6 +360,119 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 }
 ```
 
+### 5.15 Create Backup Request (`POST /clusters/{name}/backups`)
+
+**Permission**: `Operator`. **Pre-req**: `spec.backup.enabled: true` (else `400 BACKUP_NOT_ENABLED`). An on-demand backup creates a Kubernetes **Job directly** (it does **not** go through the scheduled CronJob). The per-request options are merged over the cluster's `backup.gpbackup` defaults and rendered into the `gpbackup` CLI invocation on the Job container.
+
+```json
+{
+  "type": "full",
+  "databases": ["mydb"],
+  "gpbackupOptions": {
+    "compressionLevel": 5,
+    "compressionType": "zstd",
+    "jobs": 4,
+    "singleDataFile": true,
+    "copyQueueSize": 8,
+    "incremental": false,
+    "fromTimestamp": "",
+    "includeSchemas": ["public", "analytics"],
+    "excludeTables": ["public.temp_data", "public.scratch"],
+    "leafPartitionData": true,
+    "withStats": true,
+    "withoutGlobals": true,
+    "noCompression": false
+  }
+}
+```
+
+- `type` — `full` (default) or `incremental`; any other value → `400 INVALID_REQUEST`.
+- `databases` — each entry must be a valid identifier (else `400 INVALID_REQUEST`); the first DB drives `--dbname`.
+- `gpbackupOptions` (`GpbackupOptionsRequest`) — the full field list is mapped in §5.16.
+
+**Response `202`**: `{ "status": "backup started", "cluster": "...", "job": "...", "timestamp": "...", "type": "full" }`.
+
+### 5.16 `gpbackupOptions` → `gpbackup` flag mapping
+
+| Request field | gpbackup flag | Notes |
+|---|---|---|
+| `databases[0]` | `--dbname <db>` | First database only |
+| `compressionLevel` (> 0) | `--compression-level <n>` | Skipped when `noCompression` |
+| `compressionType` (`gzip`\|`zstd`) | `--compression-type <t>` | Skipped when `noCompression` |
+| `noCompression` | `--no-compression` | **Precedence** over level/type |
+| `singleDataFile` | `--single-data-file` | Mutually exclusive with `--jobs` |
+| `copyQueueSize` (> 0) | `--copy-queue-size <n>` | Emitted **only** with `singleDataFile` |
+| `jobs` (> 0) | `--jobs <n>` | Emitted **only** when **not** `singleDataFile` |
+| `withStats` | `--with-stats` | |
+| `withoutGlobals` | `--without-globals` | |
+| `leafPartitionData` | `--leaf-partition-data` | **Emitted on FULL backups too**, exactly once (see note) |
+| `incremental` (or `type=incremental`) | `--incremental --leaf-partition-data` | Leaf-partition-data forced **exactly once** for incrementals |
+| `fromTimestamp` | `--from-timestamp <ts>` | Incremental only |
+| `includeSchemas[]` | `--include-schema <s>` (repeated) | |
+| `excludeTables[]` | `--exclude-table <t>` (repeated) | |
+
+> **`leafPartitionData` on full backups.** `--leaf-partition-data` is valid and meaningful for **full** backups (it backs up leaf-partition data as separate files instead of the whole partitioned table). The operator now emits `--leaf-partition-data` for a full backup whenever `leafPartitionData: true`, and emits it **exactly once** — the incremental path (which force-pairs `--incremental --leaf-partition-data`) is guarded so the flag is never duplicated. Net behavior: full + `leafPartitionData:false` → none; full + `leafPartitionData:true` → exactly one; incremental (any value) → exactly one.
+
+> **`noCompression` override.** When `noCompression: true`, the operator emits `--no-compression` and **omits** `--compression-level` / `--compression-type` even when those are also set — `--no-compression` takes precedence.
+
+### 5.17 Restore Request (`POST /clusters/{name}/backups/{timestamp}/restore`)
+
+**Permission**: `Admin`. The `{timestamp}` path value (or body `timestamp`; path preferred) must match `^\d{14}$` (else `400 INVALID_REQUEST`). The restore creates a Kubernetes **Job directly**.
+
+```json
+{
+  "databases": ["mydb"],
+  "gprestoreOptions": {
+    "jobs": 4,
+    "redirectDb": "mydb_restored",
+    "redirectSchema": "restored",
+    "createDb": true,
+    "includeSchemas": ["public", "analytics"],
+    "includeTables": ["public.users", "public.orders"],
+    "excludeTables": ["public.audit"],
+    "withGlobals": true,
+    "withStats": true,
+    "runAnalyze": true,
+    "onErrorContinue": true,
+    "dataOnly": true,
+    "metadataOnly": false,
+    "truncateTable": true,
+    "resizeCluster": true
+  }
+}
+```
+
+**Response `202`**: `{ "status": "restore started", "cluster": "...", "job": "...", "timestamp": "..." }`.
+
+### 5.18 `gprestoreOptions` → `gprestore` flag mapping
+
+The leading args are destination-aware (S3 → `--plugin-config /tmp/s3-config.yaml`; local → `--backup-dir <path>`) plus `--timestamp <ts>`.
+
+| Request field | gprestore flag | Notes |
+|---|---|---|
+| `timestamp` | `--timestamp <ts>` | From the path (preferred) or body |
+| `jobs` (> 0) | `--jobs <n>` | |
+| `redirectDb` | `--redirect-db <db>` | |
+| `redirectSchema` | `--redirect-schema <s>` | |
+| `createDb` | `--create-db` | |
+| `includeTables[]` | `--include-table <t>` (repeated) | **Precedence**: emitted when both include\* set |
+| `includeSchemas[]` | `--include-schema <s>` (repeated) | Emitted **only** when `includeTables` empty |
+| `excludeTables[]` | `--exclude-table <t>` (repeated) | |
+| `withGlobals` | `--with-globals` | |
+| `runAnalyze` | `--run-analyze` | **Precedence** over `--with-stats` |
+| `withStats` | `--with-stats` | Emitted **only** when **not** `runAnalyze` |
+| `onErrorContinue` | `--on-error-continue` | |
+| `dataOnly` | `--data-only` | Mutually exclusive with `metadataOnly` |
+| `metadataOnly` | `--metadata-only` | Mutually exclusive with `dataOnly` |
+| `truncateTable` | `--truncate-table` | |
+| `resizeCluster` | `--resize-cluster` | |
+
+**Mutual-exclusivity rules and their responses:**
+
+1. **`dataOnly` + `metadataOnly`** — rejected at the handler with `400 INVALID_REQUEST` **before** the Job is built (`restoreOptionsConflict`); `gprestore` rejects the pair.
+2. **`includeSchemas` vs `includeTables`** — when both are supplied the operator emits the more specific `--include-table` (table-level precedence) and **omits** `--include-schema`, keeping the `gprestore` invocation valid (no 400).
+3. **`runAnalyze` vs `withStats`** — when both are supplied the operator emits `--run-analyze` and **omits** `--with-stats` (run-analyze precedence; no 400).
+
 ## 6. Error Handling
 
 ### 6.1 Error Response Format
@@ -369,6 +499,8 @@ curl -X POST http://keycloak:8090/realms/cloudberry/protocol/openid-connect/toke
 | 403 | FORBIDDEN | Insufficient permissions |
 | 404 | CLUSTER_NOT_FOUND | Cluster does not exist |
 | 404 | SEGMENT_NOT_FOUND | Segment does not exist |
+| 404 | BACKUP_NOT_FOUND | Backup timestamp not found in the cluster's backup history |
+| 400 | BACKUP_NOT_ENABLED | `spec.backup.enabled` is `false` (backup create rejected) |
 | 409 | CONFLICT | Operation conflicts with current state |
 | 422 | VALIDATION_ERROR | Request validation failed |
 | 500 | INTERNAL_ERROR | Unexpected server error |
@@ -426,3 +558,25 @@ The operator serves OpenAPI v3 specification at:
 ```
 GET /openapi/v3
 ```
+
+## 10. Scenario 85 — All Backup API Endpoints
+
+**Scenario 85** verifies the **seven** backup/restore REST API endpoints end-to-end: routing, per-endpoint RBAC, the full request schemas, the option → `gpbackup`/`gprestore` flag mapping (§5.16, §5.18), and the negative/mutual-exclusivity responses. Every endpoint is OIDC/JWT-authenticated and a missing cluster returns `404 CLUSTER_NOT_FOUND`. The acceptance contract per sub-case (85a–85g):
+
+- **85a — `GET /backups` (Basic).** Returns the operator's recorded backup history (`status.backup.backupHistory` — the operator's view of `gpbackup` outcomes derived from observed Jobs), **not** a live `gpbackman` query. Response `200`: `{ cluster, backups:[...], total, lastBackupTime, lastBackupTimestamp, lastBackupStatus }`.
+
+- **85b — `POST /backups` (Operator).** Creates a backup **Job** (label `avsoft.io/backup-operation=backup`) whose `gpbackup` args match the `CreateBackupRequest.gpbackupOptions` per §5.16, including `--leaf-partition-data` on a **full** backup when `leafPartitionData: true` (emitted exactly once). Negatives: invalid `type` / DB identifier / malformed JSON → `400`; backup not enabled → `400 BACKUP_NOT_ENABLED`; a Basic identity → `403`.
+
+- **85c — `GET /backups/{timestamp}` (Basic).** Returns the matching `BackupHistoryEntry` from the recorded history. Negatives: a non-14-digit timestamp → `400 INVALID_REQUEST`; an unknown 14-digit timestamp → `404 BACKUP_NOT_FOUND`.
+
+- **85d — `DELETE /backups/{timestamp}` (Admin).** Creates a `gpbackman` cleanup Job (`backup-delete`, label `avsoft.io/backup-operation=cleanup`) to remove the backup. Response `202`: `{ status:"deleted", cluster, job, timestamp }`. Negatives: invalid timestamp → `400`; Operator/Basic identity → `403`.
+
+- **85e — `POST /backups/{timestamp}/restore` (Admin).** Creates a restore **Job** (label `avsoft.io/backup-operation=restore`) whose `gprestore` args match `RestoreRequest.gprestoreOptions` per §5.18 (e.g. `dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`). Mutual exclusivity: `dataOnly`+`metadataOnly` → `400 INVALID_REQUEST`; include-schema vs include-table and run-analyze vs with-stats resolved in favor of the more specific flag (no 400). Negatives: invalid timestamp / DB / JSON → `400`; Operator/Basic identity → `403`.
+
+- **85f — `GET /backups/jobs` (Basic).** Lists backup/restore/cleanup Job statuses for the cluster (status ∈ `succeeded|failed|running|pending`); unrelated Jobs are excluded. Response `200`: `{ cluster, jobs:[{ name, operation, status, startTime?, completionTime? }], total }`.
+
+- **85g — `GET /backups/schedule` (Basic).** Returns the backup CronJob status with a **computed** `nextScheduleTime`. No CronJob → `200 { cluster, scheduled:false }`; CronJob present → `200 { cluster, scheduled:true, schedule, suspend, activeJobs, lastScheduleTime?, nextScheduleTime? }`.
+
+The handlers live in `internal/api/server.go` (`handleListBackups`, `handleCreateBackup`, `handleGetBackup`, `handleDeleteBackup`, `handleRestoreBackup`, `handleListBackupJobs`, `handleGetBackupSchedule`); the DTOs and option mapping live in `internal/api/backup.go` (`buildBackupJobOptions`/`mergeGpbackupOptions`, `buildRestoreJobOptions`/`mergeGprestoreOptions`, `restoreOptionsConflict`); the args are rendered by `buildGpbackupArgs`/`buildGprestoreArgs` in `internal/builder/backup_builder.go`.
+
+The scenario is driven by the sample CR `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml` and is covered by `test/functional/scenario85_api_endpoints_test.go`, `test/integration/scenario85_api_endpoints_integration_test.go`, `test/e2e/scenario85_api_endpoints_e2e_test.go`, the test-case catalog in `test/cases/scenario85_api_endpoints_cases.go`, and the live OIDC-authed verification script `test/e2e/scripts/scenario85-api-endpoints.sh`.

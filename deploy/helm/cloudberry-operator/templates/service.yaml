@@ -24,6 +24,12 @@ spec:
       port: 8081
       targetPort: health
       protocol: TCP
+    {{- if .Values.api.enabled }}
+    - name: api
+      port: {{ .Values.api.port }}
+      targetPort: api
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "cloudberry-operator.selectorLabels" . | nindent 4 }}
 ---

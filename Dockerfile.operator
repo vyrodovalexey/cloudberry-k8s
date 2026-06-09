@@ -55,6 +55,6 @@ COPY --from=builder /workspace/bin/cloudberry-operator /cloudberry-operator
 # Use non-root user (65532 is the nonroot user in distroless)
 USER 65532:65532
 
-EXPOSE 8080 8081 8443 9443
+EXPOSE 8080 8081 8090 8443 9443
 
 ENTRYPOINT ["/cloudberry-operator"]

@@ -53,6 +53,22 @@
         "create": { "type": "boolean" }
       }
     },
+    "api": {
+      "type": "object",
+      "description": "REST API configuration (backup endpoints, cluster management)",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the REST API service port"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "REST API listen port"
+        }
+      }
+    },
     "operator": {
       "type": "object",
       "properties": {

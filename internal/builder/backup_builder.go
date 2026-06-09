@@ -315,6 +315,7 @@ func buildGpbackupArgs(
 	args = appendCompressionArgs(args, opts)
 	args = appendDataFileArgs(args, opts)
 	args = appendIncrementalArgs(args, opts, jobOpts)
+	args = appendLeafPartitionDataArgs(args, opts, jobOpts)
 
 	if opts.WithStats {
 		args = append(args, "--with-stats")
@@ -363,6 +364,19 @@ func appendDataFileArgs(args []string, opts *cbv1alpha1.GpbackupOptions) []strin
 	return args
 }
 
+// isEffectivelyIncremental reports whether the backup that will actually run is
+// incremental: the gpbackup options set Incremental, OR the per-request job
+// options pin Type=="incremental". It is the single source of truth shared by
+// appendIncrementalArgs and appendLeafPartitionDataArgs so the incremental vs
+// full decision (and therefore where --leaf-partition-data is emitted) stays
+// consistent and never double-emits the flag.
+func isEffectivelyIncremental(opts *cbv1alpha1.GpbackupOptions, jobOpts *BackupJobOptions) bool {
+	if opts != nil && opts.Incremental {
+		return true
+	}
+	return jobOpts != nil && jobOpts.Type == util.BackupTypeIncremental
+}
+
 // appendIncrementalArgs appends incremental-related flags, including the optional
 // per-request --from-timestamp pin.
 func appendIncrementalArgs(
@@ -370,21 +384,42 @@ func appendIncrementalArgs(
 	opts *cbv1alpha1.GpbackupOptions,
 	jobOpts *BackupJobOptions,
 ) []string {
-	incremental := opts.Incremental
-	if jobOpts != nil && jobOpts.Type == "incremental" {
-		incremental = true
-	}
-	if !incremental {
+	if !isEffectivelyIncremental(opts, jobOpts) {
 		return args
 	}
 	// gpbackup REQUIRES --leaf-partition-data for incremental backups, so force
 	// it whenever an incremental is effective. opts.LeafPartitionData is already
 	// implied here; emitting it unconditionally (and only once) avoids both a
 	// missing flag when LeafPartitionData is unset and a duplicate when it is
-	// set. Full backups are unaffected: this branch only runs for incrementals.
+	// set. Full backups are handled by appendLeafPartitionDataArgs: this branch
+	// only runs for incrementals.
 	args = append(args, "--incremental", "--leaf-partition-data")
 	if jobOpts != nil && jobOpts.FromTimestamp != "" {
 		args = append(args, "--from-timestamp", jobOpts.FromTimestamp)
+	}
+	return args
+}
+
+// appendLeafPartitionDataArgs emits --leaf-partition-data for a FULL backup when
+// opts.LeafPartitionData is requested. --leaf-partition-data is valid and
+// meaningful for full backups (it backs up leaf-partition data as separate files
+// rather than the whole partitioned table), so a requested LeafPartitionData
+// must be honored even when the backup is not incremental.
+//
+// The incremental path (appendIncrementalArgs) already force-emits
+// --leaf-partition-data EXACTLY once, so this helper guards on
+// !isEffectivelyIncremental to preserve that invariant and never duplicate the
+// flag. Net behavior:
+//   - full + LeafPartitionData=false   => no --leaf-partition-data
+//   - full + LeafPartitionData=true    => exactly one --leaf-partition-data
+//   - incremental (any LeafPartitionData) => exactly one (from the incr path)
+func appendLeafPartitionDataArgs(
+	args []string,
+	opts *cbv1alpha1.GpbackupOptions,
+	jobOpts *BackupJobOptions,
+) []string {
+	if opts.LeafPartitionData && !isEffectivelyIncremental(opts, jobOpts) {
+		args = append(args, "--leaf-partition-data")
 	}
 	return args
 }

@@ -47,6 +47,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Backup Security (Scenario 82)](#backup-security-scenario-82)
   - [Backup Failure Handling & Retries (Scenario 83)](#backup-failure-handling--retries-scenario-83)
   - [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84)
+  - [Backup REST API (Scenario 85)](#backup-rest-api-scenario-85)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -1934,6 +1935,164 @@ driven by `test/e2e/scripts/scenario84-metrics.sh`:
 
 ```bash
 bash test/e2e/scripts/scenario84-metrics.sh --cluster scenario84-s3
+```
+
+### Backup REST API (Scenario 85)
+
+The operator exposes **seven** backup/restore endpoints under
+`/api/v1alpha1/clusters/{name}/backups`. They let you list, create, inspect, delete, and
+restore backups, watch backup/restore Job statuses, and read the backup schedule — all
+without `kubectl`. Every endpoint requires an OIDC bearer token and enforces a permission
+level (Basic / Operator / Admin).
+
+| Method | Path | Permission | What it does |
+|--------|------|-----------|--------------|
+| `GET` | `/backups` | Basic | List backups from the operator's recorded history |
+| `POST` | `/backups` | Operator | Create a backup (creates a Job) |
+| `GET` | `/backups/{timestamp}` | Basic | Get details for one backup timestamp |
+| `DELETE` | `/backups/{timestamp}` | Admin | Delete a backup (creates a `gpbackman` cleanup Job) |
+| `POST` | `/backups/{timestamp}/restore` | Admin | Restore from a backup (creates a restore Job) |
+| `GET` | `/backups/jobs` | Basic | List backup/restore/cleanup Job statuses |
+| `GET` | `/backups/schedule` | Basic | Get the CronJob status + computed next run time |
+
+> `GET /backups` and `GET /backups/{timestamp}` return the operator's **recorded backup
+> history** (`status.backup.backupHistory`, derived from the backup Jobs the operator has
+> observed) — not a live query against the backup tooling.
+
+#### Authenticate (OIDC bearer token)
+
+Obtain a token from Keycloak (the `POST`/`DELETE`/restore endpoints need an **Admin**- or
+**Operator**-role user), then pass it as `Authorization: Bearer <token>`:
+
+```bash
+TOKEN=$(curl -s -X POST \
+  'http://keycloak:8090/realms/cloudberry/protocol/openid-connect/token' \
+  -d grant_type=password -d client_id=cloudberry-ctl \
+  -d username=adminuser -d password=adminpass | jq -r .access_token)
+
+# The operator REST API listens on its TLS port (e.g. 8090); port-forward it first:
+# kubectl -n cloudberry-test port-forward svc/<operator-api-service> 8090:8090
+
+API='https://localhost:8090/api/v1alpha1/clusters/scenario85-s3'
+NS='?namespace=cloudberry-test'
+
+# List backups (Basic)
+curl -sk -H "Authorization: Bearer $TOKEN" "$API/backups$NS"
+```
+
+#### Create a backup
+
+`POST /backups` (Operator). The request merges per-request `gpbackupOptions` over the
+cluster defaults and creates a Job directly. `type` is `full` (default) or `incremental`;
+`databases[0]` drives `--dbname`.
+
+```bash
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' "$API/backups$NS" -d '{
+  "type": "full",
+  "databases": ["mydb"],
+  "gpbackupOptions": {
+    "compressionLevel": 5,
+    "compressionType": "zstd",
+    "singleDataFile": true,
+    "copyQueueSize": 8,
+    "includeSchemas": ["public", "analytics"],
+    "excludeTables": ["public.temp_data"],
+    "leafPartitionData": true,
+    "withStats": true,
+    "withoutGlobals": true
+  }
+}'
+# 202 -> {"status":"backup started","job":"...","timestamp":"...","type":"full"}
+```
+
+The `gpbackupOptions` fields:
+
+| Field | `gpbackup` flag |
+|-------|-----------------|
+| `compressionLevel` / `compressionType` | `--compression-level` / `--compression-type` |
+| `noCompression` | `--no-compression` (takes precedence over level/type) |
+| `singleDataFile` / `copyQueueSize` | `--single-data-file` / `--copy-queue-size` (queue size needs single-data-file) |
+| `jobs` | `--jobs` (only when **not** single-data-file) |
+| `includeSchemas[]` / `excludeTables[]` | one `--include-schema` / `--exclude-table` each |
+| `leafPartitionData` | `--leaf-partition-data` — **now emitted on full backups too**, exactly once |
+| `withStats` / `withoutGlobals` | `--with-stats` / `--without-globals` |
+| `incremental` / `fromTimestamp` | `--incremental --leaf-partition-data` / `--from-timestamp` |
+
+#### Restore from a backup
+
+`POST /backups/{timestamp}/restore` (Admin). The `{timestamp}` is the 14-digit
+`YYYYMMDDHHMMSS` backup timestamp.
+
+```bash
+curl -sk -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  "$API/backups/20260601020000/restore$NS" -d '{
+  "databases": ["mydb"],
+  "gprestoreOptions": {
+    "jobs": 4,
+    "redirectDb": "mydb_restored",
+    "redirectSchema": "restored",
+    "createDb": true,
+    "includeTables": ["public.users", "public.orders"],
+    "excludeTables": ["public.audit"],
+    "withGlobals": true,
+    "runAnalyze": true,
+    "onErrorContinue": true,
+    "dataOnly": true,
+    "truncateTable": true,
+    "resizeCluster": true
+  }
+}'
+# 202 -> {"status":"restore started","job":"...","timestamp":"20260601020000"}
+```
+
+The `gprestoreOptions` fields:
+
+| Field | `gprestore` flag |
+|-------|------------------|
+| `jobs` | `--jobs` |
+| `redirectDb` / `redirectSchema` / `createDb` | `--redirect-db` / `--redirect-schema` / `--create-db` |
+| `includeTables[]` / `includeSchemas[]` | `--include-table` / `--include-schema` (table wins when both set) |
+| `excludeTables[]` | `--exclude-table` |
+| `withGlobals` | `--with-globals` |
+| `runAnalyze` / `withStats` | `--run-analyze` / `--with-stats` (run-analyze wins when both set) |
+| `onErrorContinue` | `--on-error-continue` |
+| `dataOnly` / `metadataOnly` | `--data-only` / `--metadata-only` (**mutually exclusive** → `400`) |
+| `truncateTable` / `resizeCluster` | `--truncate-table` / `--resize-cluster` |
+
+> **Mutual-exclusivity.** Setting **both** `dataOnly` and `metadataOnly` is rejected with
+> `400`. When you set both `includeTables` and `includeSchemas`, the more specific
+> `--include-table` wins (schema omitted); when you set both `runAnalyze` and `withStats`,
+> `--run-analyze` wins (with-stats omitted).
+
+#### Delete a backup, watch Jobs, and read the schedule
+
+```bash
+# Delete a backup (Admin) -> creates a gpbackman cleanup Job
+curl -sk -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "$API/backups/20260601020000$NS"
+
+# List backup/restore/cleanup Job statuses (Basic)
+curl -sk -H "Authorization: Bearer $TOKEN" "$API/backups/jobs$NS"
+
+# Read the schedule + computed nextScheduleTime (Basic)
+curl -sk -H "Authorization: Bearer $TOKEN" "$API/backups/schedule$NS"
+# {"cluster":"...","scheduled":true,"schedule":"0 2 * * *","nextScheduleTime":"..."}
+```
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml` ships a
+single S3 cluster (`scenario85-s3`) with a backup schedule so all seven endpoints have data.
+The behavior is covered by `test/functional/scenario85_api_endpoints_test.go`,
+`test/integration/scenario85_api_endpoints_integration_test.go`, and
+`test/e2e/scenario85_api_endpoints_e2e_test.go`, and the live OIDC-authed exercise of all
+seven endpoints is driven by `test/e2e/scripts/scenario85-api-endpoints.sh`:
+
+```bash
+bash test/e2e/scripts/scenario85-api-endpoints.sh --cluster scenario85-s3
 ```
 
 ## Configuration Management

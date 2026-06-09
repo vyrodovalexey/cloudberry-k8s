@@ -8,6 +8,7 @@ metadata:
 data:
   config.yaml: |
     listen-address: ":8443"
+    api-address: ":{{ .Values.api.port }}"
     metrics-address: {{ .Values.operator.metricsAddress | quote }}
     health-probe-address: {{ .Values.operator.healthProbeAddress | quote }}
     webhook-port: {{ .Values.operator.webhookPort }}

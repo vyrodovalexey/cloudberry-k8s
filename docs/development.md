@@ -3061,6 +3061,74 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario84
 bash test/e2e/scripts/scenario84-metrics.sh --cluster scenario84-s3
 ```
 
+#### Scenario 85 — All Backup API Endpoints
+
+Verifies the **seven** backup/restore REST API endpoints under
+`/api/v1alpha1/clusters/{name}/backups` end-to-end: routing, per-endpoint OIDC/JWT auth +
+RBAC, the request schemas, the option → `gpbackup`/`gprestore` flag mapping, and the
+negative/mutual-exclusivity responses. It is mostly **verification + comprehensive tests**
+plus **one** code fix (`leafPartitionData` on full backups).
+
+- **Where the routes + RBAC live** — `internal/api/server.go` (registration `~297–312`):
+  - `GET /backups` → `handleListBackups` (`PermissionBasic`)
+  - `POST /backups` → `handleCreateBackup` (`PermissionOperator`)
+  - `GET /backups/{timestamp}` → `handleGetBackup` (`PermissionBasic`)
+  - `DELETE /backups/{timestamp}` → `handleDeleteBackup` (`PermissionAdmin`)
+  - `POST /backups/{timestamp}/restore` → `handleRestoreBackup` (`PermissionAdmin`)
+  - `GET /backups/jobs` → `handleListBackupJobs` (`PermissionBasic`)
+  - `GET /backups/schedule` → `handleGetBackupSchedule` (`PermissionBasic`)
+  - (`PATCH /backups/schedule` → `handleUpdateBackupSchedule`, `PermissionOperator` — outside
+    the Scenario 85 seven). A missing cluster returns `404` via `writeClusterNotFound`.
+
+- **Where the DTOs + option mapping live** — `internal/api/backup.go`:
+  - `CreateBackupRequest` / `GpbackupOptionsRequest` and `RestoreRequest` /
+    `GprestoreOptionsRequest` are the request bodies.
+  - `buildBackupJobOptions` → `mergeGpbackupOptions` overlays the request `gpbackupOptions`
+    over the cluster's `backup.gpbackup` defaults; `buildRestoreJobOptions` →
+    `mergeGprestoreOptions` does the same for restore.
+  - `restoreOptionsConflict` rejects `dataOnly`+`metadataOnly` with `400` **before** the Job
+    is built. `backupScheduleResponse` / `nextScheduleTime` compute the 85g `nextScheduleTime`.
+  - The merged options are rendered into CLI args by `buildGpbackupArgs` /
+    `buildGprestoreArgs` in `internal/builder/backup_builder.go`.
+
+- **The 85b fix — `leafPartitionData` on full backups.** `buildGpbackupArgs` calls
+  `appendLeafPartitionDataArgs(args, opts, jobOpts)`, which emits `--leaf-partition-data`
+  for a **full** backup when `opts.LeafPartitionData` is set, guarded on
+  `!isEffectivelyIncremental(...)` so it never duplicates the `--leaf-partition-data` that
+  `appendIncrementalArgs` force-pairs with `--incremental`. Previously the option was
+  silently dropped on full backups. `isEffectivelyIncremental` is the single source of truth
+  shared by both helpers so the flag is emitted **exactly once** in every case.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`
+  (single S3 cluster `scenario85-s3` with a `backup.schedule` so all seven endpoints have data)
+- **Functional tests**: `test/functional/scenario85_api_endpoints_test.go` (`TestFunctional_Scenario85`)
+- **Integration tests**: `test/integration/scenario85_api_endpoints_integration_test.go` (`TestIntegration_Scenario85`)
+- **E2E tests**: `test/e2e/scenario85_api_endpoints_e2e_test.go` (`TestE2E_Scenario85`)
+- **Handler/builder unit tests**: `internal/api/backup_scenario85_test.go`,
+  `internal/builder/backup_builder_scenario85_test.go`
+- **Test-case catalog**: `test/cases/scenario85_api_endpoints_cases.go`
+- **Live script**: `test/e2e/scripts/scenario85-api-endpoints.sh` (obtains an OIDC token,
+  port-forwards the operator REST API, and exercises all seven endpoints — asserting the
+  created Job args via `kubectl get job -o jsonpath`)
+
+```bash
+# Run Scenario 85 API-endpoints functional tests (all 7 endpoints: status + response shape + created Job args)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario85
+
+# Run Scenario 85 integration tests (envtest: RBAC 403, 404, 400 paths through the real router + auth; Job not CronJob)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario85
+
+# Run Scenario 85 handler + builder unit tests (option->flag matrices, leafPartitionData-on-full, RBAC, exclusivity)
+go test ./internal/api/... -v -run Scenario85
+go test ./internal/builder/... -v -run Scenario85
+
+# Run Scenario 85 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario85
+
+# Run the live OIDC-authed exercise of all 7 endpoints against the deployed cluster
+bash test/e2e/scripts/scenario85-api-endpoints.sh --cluster scenario85-s3
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

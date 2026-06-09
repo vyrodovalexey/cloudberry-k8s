@@ -566,15 +566,26 @@ invocations resolve at runtime.
 
 ## API Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/clusters/{name}/backups` | List all backups (queries `gpbackman` history) |
-| POST | `/clusters/{name}/backups` | Create a new backup (creates a Job) |
-| GET | `/clusters/{name}/backups/{timestamp}` | Get backup details by gpbackup timestamp |
-| DELETE | `/clusters/{name}/backups/{timestamp}` | Delete a backup (creates a cleanup Job) |
-| POST | `/clusters/{name}/backups/{timestamp}/restore` | Restore from backup (creates a restore Job) |
-| GET | `/clusters/{name}/backups/jobs` | List backup/restore Job statuses |
-| GET | `/clusters/{name}/backups/schedule` | Get CronJob status and next run time |
+| Method | Path | Permission | Description |
+|---|---|---|---|
+| GET | `/clusters/{name}/backups` | Basic | List backups from the operator's recorded backup history (`status.backup.backupHistory`) |
+| POST | `/clusters/{name}/backups` | Operator | Create a new backup (creates a Job) |
+| GET | `/clusters/{name}/backups/{timestamp}` | Basic | Get backup details by gpbackup timestamp (from the recorded history) |
+| DELETE | `/clusters/{name}/backups/{timestamp}` | Admin | Delete a backup (creates a `gpbackman` cleanup Job) |
+| POST | `/clusters/{name}/backups/{timestamp}/restore` | Admin | Restore from backup (creates a restore Job) |
+| GET | `/clusters/{name}/backups/jobs` | Basic | List backup/restore/cleanup Job statuses |
+| GET | `/clusters/{name}/backups/schedule` | Basic | Get CronJob status and computed next run time |
+
+> **`GET /backups` and `GET /backups/{timestamp}` return the operator's backup history.** Both
+> read endpoints serve the **operator's recorded backup history** — `status.backup.backupHistory`,
+> the operator's view of `gpbackup` outcomes derived from the **observed backup Jobs** (see
+> [BackupStatus](#backupstatus) and `applyBackupJobToStatus`) — rather than issuing a live
+> `gpbackman backup-info` query against the history database. `GET /backups` returns the full list
+> (with `total`, `lastBackupTime`, `lastBackupTimestamp`, `lastBackupStatus`); `GET /backups/{timestamp}`
+> scans that history for the 14-digit timestamp and returns the matching entry (`404 BACKUP_NOT_FOUND`
+> when absent, `400` for a non-14-digit timestamp). This status-history design is the implemented and
+> intended behavior; the only `gpbackman`-history interaction is in the **retention cleanup** path
+> (`backup-info`/`backup-delete`/`backup-clean`, see [Retention Cleanup Job](#retention-cleanup-job)).
 
 ### Create Backup Request
 
@@ -621,6 +632,8 @@ The `gpbackupOptions` fields map to `gpbackup` flags as follows:
 | `noCompression` | `--no-compression` |
 
 **`noCompression` override semantics.** When `noCompression: true`, the operator invokes `gpbackup` with `--no-compression` and the compression level/type are **ignored**: it emits `--no-compression` and does **not** emit `--compression-level` / `--compression-type`, producing an uncompressed backup — even if `compressionLevel` (or `compressionType`) is also set in the same request. `--no-compression` therefore takes precedence over the compression options.
+
+**`leafPartitionData` on full backups (Scenario 85b fix).** `--leaf-partition-data` is valid and meaningful for **full** backups (it backs up leaf-partition data as separate files instead of the whole partitioned table), so a requested `leafPartitionData: true` is now honored on full backups too: `buildGpbackupArgs` calls `appendLeafPartitionDataArgs`, which emits `--leaf-partition-data` for a full backup when `leafPartitionData` is set. The flag is emitted **exactly once** — `appendLeafPartitionDataArgs` is guarded on `!isEffectivelyIncremental(...)` so it never duplicates the `--leaf-partition-data` that the incremental path force-pairs with `--incremental` (see [Forced `--incremental --leaf-partition-data` pairing (78a)](#forced---incremental---leaf-partition-data-pairing-78a)). Net behavior: full + `leafPartitionData:false` → none; full + `leafPartitionData:true` → exactly one; incremental (any value) → exactly one. (Previously a full backup silently dropped `leafPartitionData`; the option is now mapped end-to-end.)
 
 ### Restore Request
 
@@ -1044,6 +1057,57 @@ covered by `test/functional/scenario84_metrics_test.go`,
 in `test/cases/test_cases.go`, and the live verification script
 `test/e2e/scripts/scenario84-metrics.sh` (drives the full lifecycle and asserts all nine
 metrics in VictoriaMetrics).
+
+### Scenario 85 — All Backup API Endpoints
+
+**Scenario 85** verifies the **seven** backup/restore REST API endpoints (under
+`/api/v1alpha1/clusters/{name}/backups`) end-to-end — routing, per-endpoint OIDC/JWT auth +
+RBAC, the full request schemas, the option → `gpbackup`/`gprestore` flag mapping (the
+[Create Backup Request](#create-backup-request) and [Restore Request](#restore-request)
+tables above), and the negative/mutual-exclusivity responses. A missing cluster returns
+`404 CLUSTER_NOT_FOUND` for every endpoint. The full per-endpoint contract (request bodies,
+responses, RBAC table) lives in
+[API Specification §10 — Scenario 85](06-api-specification.md#10-scenario-85--all-backup-api-endpoints);
+this section captures the backup-spec acceptance contract per sub-case:
+
+- **85a — `GET /backups` (Basic).** Lists the operator's recorded backup history
+  (`status.backup.backupHistory`, the operator's view of `gpbackup` outcomes derived from
+  observed Jobs — **not** a live `gpbackman` query); response carries `backups`, `total`,
+  `lastBackupTime`, `lastBackupTimestamp`, `lastBackupStatus`.
+- **85b — `POST /backups` (Operator).** Creates a backup **Job** (label
+  `avsoft.io/backup-operation=backup`) whose `gpbackup` args match
+  `CreateBackupRequest.gpbackupOptions`, including `--leaf-partition-data` on a **full**
+  backup when `leafPartitionData: true` (emitted exactly once — the 85b fix). Requires
+  `spec.backup.enabled: true` (else `400 BACKUP_NOT_ENABLED`).
+- **85c — `GET /backups/{timestamp}` (Basic).** Returns the matching `BackupHistoryEntry`
+  from the recorded history; non-14-digit → `400`, unknown 14-digit → `404 BACKUP_NOT_FOUND`.
+- **85d — `DELETE /backups/{timestamp}` (Admin).** Creates a `gpbackman` cleanup Job
+  (`backup-delete`, label `avsoft.io/backup-operation=cleanup`) to remove the backup.
+- **85e — `POST /backups/{timestamp}/restore` (Admin).** Creates a restore **Job** (label
+  `avsoft.io/backup-operation=restore`) whose `gprestore` args match
+  `RestoreRequest.gprestoreOptions` (e.g. `dataOnly→--data-only`,
+  `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`). `dataOnly`+`metadataOnly`
+  → `400`; include-schema vs include-table and run-analyze vs with-stats resolve to the more
+  specific flag (no 400, per the mutual-exclusivity rules above).
+- **85f — `GET /backups/jobs` (Basic).** Lists backup/restore/cleanup Job statuses
+  (`succeeded|failed|running|pending`); unrelated Jobs excluded.
+- **85g — `GET /backups/schedule` (Basic).** Returns the CronJob status with a **computed**
+  `nextScheduleTime` (no CronJob → `{ scheduled:false }`).
+
+The handlers live in `internal/api/server.go` (`handleListBackups`, `handleCreateBackup`,
+`handleGetBackup`, `handleDeleteBackup`, `handleRestoreBackup`, `handleListBackupJobs`,
+`handleGetBackupSchedule`); the DTOs and option mapping live in `internal/api/backup.go`
+(`buildBackupJobOptions`/`mergeGpbackupOptions`, `buildRestoreJobOptions`/`mergeGprestoreOptions`,
+`restoreOptionsConflict`); the args are rendered by `buildGpbackupArgs`/`buildGprestoreArgs`
+in `internal/builder/backup_builder.go`.
+
+The scenario is driven by the sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`
+and is covered by `test/functional/scenario85_api_endpoints_test.go`,
+`test/integration/scenario85_api_endpoints_integration_test.go`,
+`test/e2e/scenario85_api_endpoints_e2e_test.go`, the test-case catalog in
+`test/cases/scenario85_api_endpoints_cases.go`, and the live OIDC-authed verification script
+`test/e2e/scripts/scenario85-api-endpoints.sh`.
 
 ## Webhook Validation
 
