@@ -1,0 +1,219 @@
+# =============================================================================
+# Scenario 78 — Incremental Backup Lifecycle (S3 destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus the full backup block targeting an
+# S3-compatible (MinIO) destination with INCREMENTAL backups enabled.
+#
+# Scenario 78 exercises the incremental backup lifecycle:
+#   78a Incremental flag wiring : gpbackup.incremental:true forces
+#       `--incremental --leaf-partition-data` on the rendered backup Job/CronJob
+#       (leaf-partition-data is required by gpbackup for incrementals and is
+#       de-duplicated when leafPartitionData is also set explicitly below).
+#   78b Auto-locate base        : a FULL backup, then (after modifying an
+#       append-optimized table) an INCREMENTAL backup WITHOUT --from-timestamp
+#       auto-forms against the most recent compatible backup =>
+#       status.backup.lastBackupType: incremental.
+#   78c Pinned base             : an INCREMENTAL with explicit
+#       `--from-timestamp <full-ts>` is based on the pinned timestamp.
+#   78d Restore completeness    : restore from the latest incremental validates
+#       the full set (full + all incrementals) and restores; deleting an
+#       intermediate incremental from S3 and retrying => gprestore reports the
+#       set incomplete and refuses (the restore Job fails; the operator emits a
+#       RestoreFailed Warning Event and records lastBackupStatus=Failed).
+#
+# KEY CONFIG NOTES
+#   * Same bucket + folder (/backups) for the full AND every incremental so
+#     gpbackup auto-base discovery reads the backup history on the destination.
+#     A different folder for incrementals breaks 78b's auto-base.
+#   * The live data load MUST create >=1 append-optimized (AO) table in `mydb`
+#     (e.g. public.events_ao WITH (appendonly=true, orientation=row)); 78b/78c
+#     modify THAT table to yield real incremental deltas. Incremental deltas are
+#     only meaningful for AO tables.
+#   * retention.incrementalCount caps the number of retained incrementals.
+#   * Multipart 10MB/4 (carried from scenario76/77) for MinIO emulation.
+#   * No `schedule` is set: Scenario 78 drives on-demand backups so each step is a
+#     discrete reconciled Job (mirrors scenario77).
+#
+# Credential source: Kubernetes Secret `backup-s3-credentials`
+#   (created by test/docker-compose/scripts/setup-minio.sh).
+# In-cluster MinIO reachability: the CR endpoint `http://minio:9000` resolves via
+# the `minio` ExternalName Service (also created by setup-minio.sh).
+#
+# Live test: test/e2e/scripts/scenario78-incremental-backup.sh --cluster scenario78-s3
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario78-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "78"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario78-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario78-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination, Secret credential source,
+  # INCREMENTAL backups enabled. No schedule is set: Scenario 78 triggers
+  # on-demand backups so each full/incremental/restore step surfaces on a
+  # discrete Job the operator reconciles.
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+      # 78a: forces --incremental (+ forced --leaf-partition-data via the builder).
+      incremental: true
+      # explicit; the builder de-duplicates so --leaf-partition-data appears once.
+      leafPartitionData: true
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        # SAME folder for full + ALL incrementals so gpbackup auto-base discovery
+        # (78b) can locate the most-recent compatible backup on the destination.
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Delete

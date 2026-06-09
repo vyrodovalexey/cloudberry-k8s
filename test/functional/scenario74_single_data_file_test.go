@@ -13,6 +13,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 	"github.com/cloudberry-contrib/cloudberry-k8s/test/testutil"
 )
 
@@ -191,7 +192,7 @@ func (s *Scenario74Suite) TestFunctional_Scenario74_RestoreAllOptions() {
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:            4,
 			CreateDb:        true,
-			WithStats:       true,
+			WithStats:       util.Ptr(true),
 			RunAnalyze:      true,
 			OnErrorContinue: true,
 			WithGlobals:     false,
@@ -238,7 +239,7 @@ func (s *Scenario74Suite) TestFunctional_Scenario74_RestoreWithStatsOnly() {
 		Databases: []string{"mydb"},
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:       4,
-			WithStats:  true,
+			WithStats:  util.Ptr(true),
 			RunAnalyze: false,
 		},
 	})
@@ -269,7 +270,7 @@ func (s *Scenario74Suite) TestFunctional_Scenario74_RestoreSchemaOnly() {
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:            4,
 			CreateDb:        true,
-			WithStats:       true,
+			WithStats:       util.Ptr(true),
 			RunAnalyze:      true,
 			OnErrorContinue: true,
 		},

@@ -169,7 +169,7 @@ func s74E2ERestoreJob(cluster *cbv1alpha1.CloudberryCluster) *batchv1.Job {
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:            4,
 			CreateDb:        true,
-			WithStats:       true,
+			WithStats:       util.Ptr(true),
 			RunAnalyze:      true,
 			OnErrorContinue: true,
 			WithGlobals:     false,

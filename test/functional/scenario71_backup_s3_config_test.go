@@ -261,7 +261,13 @@ func (s *Scenario71Suite) TestFunctional_Scenario71_Secret_RestoreJobEnv() {
 	script := joinArgs(container.Args)
 	assert.Contains(s.T(), script, "gprestore")
 	assert.Contains(s.T(), script, "'--timestamp' '20260602020000'")
-	assert.Contains(s.T(), script, "'--plugin-config' '/tmp/s3-config.yaml'")
+	// Coordinator-exec model (spec 11 §MPP Dispatch): gprestore runs INSIDE the
+	// coordinator pod against the coordinator-side plugin config (${COORD_CFG}).
+	// The Job pod still RENDERS /tmp/s3-config.yaml and stages it into the
+	// coordinator before exec'ing the tool there.
+	assert.Contains(s.T(), script, "gprestore --plugin-config \"${COORD_CFG}\"")
+	assert.Contains(s.T(), script, "> /tmp/s3-config.yaml")
+	assert.Contains(s.T(), script, "exec -i")
 }
 
 // --- Variant 2: credentials from Vault (materialized secret) ---

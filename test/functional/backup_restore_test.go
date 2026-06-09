@@ -76,7 +76,7 @@ func newS3BackupSpec() *cbv1alpha1.BackupSpec {
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 		},
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:     4,
@@ -276,13 +276,22 @@ func (s *BackupRestoreSuite) TestFunctional_BackupRetentionPolicy_Applied() {
 	assert.Equal(s.T(), int32(5), updated.Spec.Backup.Retention.FullCount)
 	assert.Equal(s.T(), "90d", updated.Spec.Backup.Retention.MaxAge)
 
-	// The retention cleanup Job applies the retention policy via gpbackman args.
+	// The retention cleanup Job applies the retention policy via the REAL gpbackman
+	// CLI: time-based retention uses `backup-clean --older-than-days <N>` and
+	// count-based retention enumerates with `backup-info` + deletes the oldest
+	// excess with `backup-delete --timestamp <ts> --cascade` (the older drafts'
+	// `--older-than`/`--keep-full` flags do not exist in gpbackman — see spec 11
+	// §Retention). maxAge="90d" -> --older-than-days 90; fullCount=5 -> the
+	// count-based backup-info/backup-delete loop.
 	cleanup := builder.NewBuilder().BuildRetentionCleanupJob(cluster, "20260519020000")
 	require.NotNil(s.T(), cleanup)
 	assert.Equal(s.T(), util.BackupOperationCleanup, cleanup.Labels[util.LabelBackupOperation])
 	script := strings.Join(cleanup.Spec.Template.Spec.Containers[0].Args, " ")
-	assert.Contains(s.T(), script, "'--older-than' '90d'")
-	assert.Contains(s.T(), script, "'--keep-full' '5'")
+	assert.Contains(s.T(), script, "backup-clean")
+	assert.Contains(s.T(), script, "--older-than-days")
+	assert.Contains(s.T(), script, "90")
+	assert.Contains(s.T(), script, "backup-delete")
+	assert.Contains(s.T(), script, "--cascade")
 }
 
 // TestFunctional_PostRestoreValidationJob_Built verifies the post-restore

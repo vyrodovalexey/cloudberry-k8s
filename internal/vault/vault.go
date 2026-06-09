@@ -9,8 +9,11 @@ import (
 	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -29,6 +32,9 @@ const (
 	// for Vault operation metrics.
 	metricResultSuccess = "success"
 	metricResultError   = "error"
+
+	// vaultTracerName is the tracer name used for Vault operation spans.
+	vaultTracerName = "vault-client"
 )
 
 // kubeTokenPath is the path to the Kubernetes service account token file.
@@ -165,6 +171,10 @@ func NewClient(
 
 // authenticate performs Vault authentication based on the configured method.
 func (v *vaultClient) authenticate(ctx context.Context) error {
+	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.authenticate",
+		trace.WithAttributes(attribute.String("vault.operation", vaultOpAuth)))
+	defer span.End()
+
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		switch v.config.AuthMethod {
@@ -179,6 +189,7 @@ func (v *vaultClient) authenticate(ctx context.Context) error {
 		}
 	})
 	v.recordVaultOp(vaultOpAuth, start, err)
+	telemetry.SetSpanError(span, err)
 	return err
 }
 
@@ -257,6 +268,13 @@ func (v *vaultClient) authenticateAppRole(ctx context.Context) error {
 func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]interface{}, error) {
 	var result map[string]interface{}
 
+	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.ReadSecret",
+		trace.WithAttributes(
+			attribute.String("vault.operation", vaultOpRead),
+			attribute.String("vault.path", path),
+		))
+	defer span.End()
+
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		secret, readErr := v.client.Logical().ReadWithContext(ctx, path)
@@ -277,6 +295,7 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 		return nil
 	})
 	v.recordVaultOp(vaultOpRead, start, err)
+	telemetry.SetSpanError(span, err)
 
 	if err != nil {
 		return nil, err
@@ -288,6 +307,13 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 
 // WriteSecret writes a secret to Vault KV v2.
 func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[string]interface{}) error {
+	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.WriteSecret",
+		trace.WithAttributes(
+			attribute.String("vault.operation", vaultOpWrite),
+			attribute.String("vault.path", path),
+		))
+	defer span.End()
+
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		// KV v2 expects data wrapped in a "data" key.
@@ -301,6 +327,7 @@ func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[str
 		return nil
 	})
 	v.recordVaultOp(vaultOpWrite, start, err)
+	telemetry.SetSpanError(span, err)
 
 	if err != nil {
 		return err
@@ -318,6 +345,13 @@ func (v *vaultClient) WriteSecretWithResponse(
 ) (map[string]interface{}, error) {
 	var result map[string]interface{}
 
+	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.WriteSecretWithResponse",
+		trace.WithAttributes(
+			attribute.String("vault.operation", vaultOpWrite),
+			attribute.String("vault.path", path),
+		))
+	defer span.End()
+
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		secret, writeErr := v.client.Logical().WriteWithContext(ctx, path, data)
@@ -331,6 +365,7 @@ func (v *vaultClient) WriteSecretWithResponse(
 		return nil
 	})
 	v.recordVaultOp(vaultOpWrite, start, err)
+	telemetry.SetSpanError(span, err)
 
 	if err != nil {
 		return nil, err

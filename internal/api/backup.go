@@ -39,7 +39,7 @@ type GpbackupOptionsRequest struct {
 	IncludeSchemas    []string `json:"includeSchemas,omitempty"`
 	ExcludeTables     []string `json:"excludeTables,omitempty"`
 	LeafPartitionData bool     `json:"leafPartitionData,omitempty"`
-	WithStats         bool     `json:"withStats,omitempty"`
+	WithStats         *bool    `json:"withStats,omitempty"`
 	WithoutGlobals    bool     `json:"withoutGlobals,omitempty"`
 	NoCompression     bool     `json:"noCompression,omitempty"`
 }
@@ -61,7 +61,7 @@ type GprestoreOptionsRequest struct {
 	IncludeTables   []string `json:"includeTables,omitempty"`
 	ExcludeTables   []string `json:"excludeTables,omitempty"`
 	WithGlobals     bool     `json:"withGlobals,omitempty"`
-	WithStats       bool     `json:"withStats,omitempty"`
+	WithStats       *bool    `json:"withStats,omitempty"`
 	RunAnalyze      bool     `json:"runAnalyze,omitempty"`
 	OnErrorContinue bool     `json:"onErrorContinue,omitempty"`
 	DataOnly        bool     `json:"dataOnly,omitempty"`
@@ -191,7 +191,11 @@ func mergeGpbackupOptions(
 	out.SingleDataFile = gp.SingleDataFile
 	out.Incremental = gp.Incremental
 	out.LeafPartitionData = gp.LeafPartitionData
-	out.WithStats = gp.WithStats
+	// WithStats is a *bool: overlay only when the request explicitly set it so an
+	// omitted withStats preserves the cluster's configured (webhook-defaulted) value.
+	if gp.WithStats != nil {
+		out.WithStats = gp.WithStats
+	}
 	out.WithoutGlobals = gp.WithoutGlobals
 	out.NoCompression = gp.NoCompression
 	return out
@@ -231,7 +235,11 @@ func mergeGprestoreOptions(
 	out.Jobs = orInt32(gr.Jobs, out.Jobs)
 	out.CreateDb = gr.CreateDb
 	out.WithGlobals = gr.WithGlobals
-	out.WithStats = gr.WithStats
+	// WithStats is a *bool: overlay only when the request explicitly set it so an
+	// omitted withStats preserves the cluster's configured (webhook-defaulted) value.
+	if gr.WithStats != nil {
+		out.WithStats = gr.WithStats
+	}
 	out.RunAnalyze = gr.RunAnalyze
 	out.OnErrorContinue = gr.OnErrorContinue
 	out.TruncateTable = gr.TruncateTable

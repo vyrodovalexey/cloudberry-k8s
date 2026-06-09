@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 )
 
 func TestGroupVersion(t *testing.T) {
@@ -549,7 +550,7 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 					},
 				},
 				Gpbackup:    &GpbackupOptions{CompressionLevel: 6, CompressionType: "zstd", Jobs: 4, Incremental: true},
-				Gprestore:   &GprestoreOptions{Jobs: 4, WithStats: true},
+				Gprestore:   &GprestoreOptions{Jobs: 4, WithStats: ptr.To(true)},
 				JobTemplate: &BackupJobTemplate{ServiceAccountName: "cloudberry-backup-sa"},
 				Image:       "cloudberry-backup:2.1.0",
 			},

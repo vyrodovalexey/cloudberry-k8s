@@ -1807,8 +1807,8 @@ I.7 ──> J.1..J.3
 
 **Test Cases — Detection Phase (probeSegmentConfigWithRetries)**:
 - FTS probe succeeds on first attempt → segments returned, no failure metric incremented
-- FTS probe fails once then succeeds on retry → `fts_probe_failures_total` incremented once, success logged with attempt number
-- FTS probe fails all `ftsProbeRetries` attempts → error returned with "after N retries" message, `fts_probe_failures_total` incremented N times
+- FTS probe fails once then succeeds on retry → success logged with attempt number, no failure metric incremented (the retry loop no longer records per-attempt failures)
+- FTS probe fails all `ftsProbeRetries` attempts → error returned with "after N retries" message; `fts_probe_failures_total` incremented **once** for the failed probe cycle (recorded by `runFTSProbe`, not per attempt)
 - Each retry attempt uses a fresh context with `ftsProbeTimeout` deadline (default 20s)
 - Custom `ftsProbeTimeout` from HASpec is respected (e.g., 10s)
 - Custom `ftsProbeRetries` from HASpec is respected (e.g., 3)

@@ -64,24 +64,35 @@ func NewHAReconciler(
 }
 
 // Reconcile handles the HA reconciliation for CloudberryCluster resources.
-func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	startTime := time.Now()
 	logger := r.logger.With("cluster", req.Name, "namespace", req.Namespace)
 	ctx = util.WithLogger(ctx, logger)
 
 	ctx, span := telemetry.StartSpan(ctx, haControllerName, "Reconcile")
 	defer span.End()
 
+	// Record the reconcile outcome/duration and mark the span on error exactly
+	// once on return. The deferred closure captures the named error so both
+	// success and error paths are recorded (recorder is nil-guarded).
+	defer func() {
+		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime, err)
+		telemetry.SetSpanError(span, err)
+	}()
+
 	logger.Debug("starting HA reconciliation",
 		"name", req.Name, "namespace", req.Namespace)
 
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
-	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
+	if err = r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug("cluster not found, skipping HA reconciliation")
+			err = nil
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
+		err = fmt.Errorf("fetching cluster: %w", err)
+		return ctrl.Result{}, err
 	}
 
 	logger.Debug("cluster fetched for HA",
@@ -97,9 +108,10 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	}
 
 	// Handle annotation-based actions first.
-	if result, handled, err := r.handleAnnotations(ctx, cluster); handled {
+	if annResult, handled, annErr := r.handleAnnotations(ctx, cluster); handled {
 		logger.Debug("HA annotation action handled")
-		return result, err
+		err = annErr
+		return annResult, annErr
 	}
 
 	// Run periodic health checks.
@@ -185,7 +197,6 @@ func (r *HAReconciler) probeSegmentConfigWithRetries(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	dbClient db.Client,
-	startTime time.Time,
 ) ([]db.SegmentInfo, error) {
 	logger := util.LoggerFromContext(ctx)
 	maxRetries := r.probeRetries(cluster)
@@ -208,7 +219,11 @@ func (r *HAReconciler) probeSegmentConfigWithRetries(
 		}
 
 		lastErr = err
-		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
+		// Do NOT record the fts_probe metric here: this loop runs up to maxRetries
+		// times per probe, so recording per-attempt would inflate
+		// fts_probe_total{result="failure"} and the duration histogram by the retry
+		// count. The terminal probe outcome (success/degraded/failure) is recorded
+		// exactly once by the caller (runFTSProbe).
 		logger.Warn("FTS probe attempt failed",
 			"attempt", attempt,
 			"maxRetries", maxRetries,
@@ -269,24 +284,37 @@ func (r *HAReconciler) analyzeSegments(
 }
 
 // runFTSProbe performs FTS health checks on all primary segments with retry support.
-func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) (err error) {
 	logger := util.LoggerFromContext(ctx)
 	startTime := time.Now()
 
+	// Child span under the HA Reconcile span so a slow FTS probe (DB connect,
+	// segment scan, failover, status patch) is visible in traces. No-op when
+	// telemetry is disabled; SetSpanError is applied once via the named error.
+	ctx, span := telemetry.StartSpan(ctx, haControllerName, "runFTSProbe")
+	defer span.End()
+	defer func() { telemetry.SetSpanError(span, err) }()
+
 	if r.dbFactory == nil {
 		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
-		return fmt.Errorf("database client factory is not configured")
+		err = fmt.Errorf("database client factory is not configured")
+		return err
 	}
 
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
+	dbClient, newErr := r.dbFactory.NewClient(ctx, cluster)
+	if newErr != nil {
 		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
-		return fmt.Errorf("creating db client for FTS probe: %w", err)
+		err = fmt.Errorf("creating db client for FTS probe: %w", newErr)
+		return err
 	}
 	defer dbClient.Close()
 
-	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, startTime)
-	if err != nil {
+	segments, probeErr := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient)
+	if probeErr != nil {
+		// Record the terminal probe outcome exactly once here (the retry loop no
+		// longer records per-attempt failures, which previously over-counted).
+		r.metrics.RecordFTSProbe(cluster.Name, cluster.Namespace, "failure", time.Since(startTime))
+		err = probeErr
 		return err
 	}
 
@@ -314,8 +342,9 @@ func (r *HAReconciler) runFTSProbe(ctx context.Context, cluster *cbv1alpha1.Clou
 	// Report replication lag for mirror segments.
 	r.reportMirrorReplicationLag(ctx, cluster, dbClient)
 
-	if err := patchFTSStatus(ctx, r.client, cluster, analysis.failedSegments); err != nil {
-		return fmt.Errorf("updating cluster status after FTS probe: %w", err)
+	if patchErr := patchFTSStatus(ctx, r.client, cluster, analysis.failedSegments); patchErr != nil {
+		err = fmt.Errorf("updating cluster status after FTS probe: %w", patchErr)
+		return err
 	}
 
 	result := "success"
@@ -354,22 +383,29 @@ func (r *HAReconciler) handleFailover(
 	cluster *cbv1alpha1.CloudberryCluster,
 	dbClient db.Client,
 	failedPrimaries []db.SegmentInfo,
-) error {
+) (err error) {
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("initiating failover for failed primary segments",
 		"failedPrimaryCount", len(failedPrimaries),
 	)
 
+	// Child span under runFTSProbe so the failover sequence (FTS trigger,
+	// segment re-read, verification) is visible in traces. No-op when telemetry
+	// is disabled; SetSpanError is applied once via the named error.
+	ctx, span := telemetry.StartSpan(ctx, haControllerName, "handleFailover")
+	defer span.End()
+	defer func() { telemetry.SetSpanError(span, err) }()
+
 	// Trigger Cloudberry's internal FTS scan to promote mirrors.
-	if err := dbClient.TriggerFTSProbe(ctx); err != nil {
-		logger.Error("failed to trigger FTS probe scan for failover", "error", err)
+	if triggerErr := dbClient.TriggerFTSProbe(ctx); triggerErr != nil {
+		logger.Error("failed to trigger FTS probe scan for failover", "error", triggerErr)
 		// Continue with status update even if trigger fails — report what we know.
 	}
 
 	// Re-read segment configuration to verify failover result.
-	updatedSegments, err := dbClient.GetSegmentConfiguration(ctx)
-	if err != nil {
-		logger.Error("failed to re-read segment configuration after failover trigger", "error", err)
+	updatedSegments, readErr := dbClient.GetSegmentConfiguration(ctx)
+	if readErr != nil {
+		logger.Error("failed to re-read segment configuration after failover trigger", "error", readErr)
 		// Emit events for the originally detected failures even without re-read.
 		for _, fp := range failedPrimaries {
 			r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonSegmentFailover,
@@ -377,7 +413,8 @@ func (r *HAReconciler) handleFailover(
 					fp.ContentID, fp.Hostname))
 		}
 		r.metrics.RecordFTSFailover(cluster.Name, cluster.Namespace)
-		return fmt.Errorf("re-reading segment configuration after failover: %w", err)
+		err = fmt.Errorf("re-reading segment configuration after failover: %w", readErr)
+		return err
 	}
 
 	// Build a lookup of updated segments by contentID and role for verification.

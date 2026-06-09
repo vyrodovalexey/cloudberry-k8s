@@ -48,6 +48,7 @@ func TestBackupSpec_DeepCopy_FullyPopulated(t *testing.T) {
 			BackoffLimit:            &backoff,
 			ActiveDeadlineSeconds:   &deadline,
 			TTLSecondsAfterFinished: &ttl,
+			ImagePullSecrets:        []ImagePullSecret{{Name: "reg-a"}, {Name: "reg-b"}},
 		},
 	}
 
@@ -60,16 +61,22 @@ func TestBackupSpec_DeepCopy_FullyPopulated(t *testing.T) {
 	assert.NotSame(t, src.Gpbackup, copied.Gpbackup)
 	assert.NotSame(t, src.Gprestore, copied.Gprestore)
 	assert.NotSame(t, src.JobTemplate, copied.JobTemplate)
+	// The ImagePullSecrets slice must be deep-copied (distinct backing array,
+	// equal contents) so mutating the copy never affects the source (82e).
+	require.Len(t, copied.JobTemplate.ImagePullSecrets, 2)
+	assert.NotSame(t, &src.JobTemplate.ImagePullSecrets[0], &copied.JobTemplate.ImagePullSecrets[0])
 
 	// Mutate the copy and ensure the source is untouched.
 	copied.Destination.S3.Bucket = "changed"
 	copied.Gpbackup.Jobs = 99
 	copied.JobTemplate.NodeSelector["disk"] = "hdd"
 	*copied.JobTemplate.BackoffLimit = 9
+	copied.JobTemplate.ImagePullSecrets[0].Name = "reg-changed"
 	assert.Equal(t, "my-bucket", src.Destination.S3.Bucket)
 	assert.Equal(t, int32(4), src.Gpbackup.Jobs)
 	assert.Equal(t, "ssd", src.JobTemplate.NodeSelector["disk"])
 	assert.Equal(t, int32(3), *src.JobTemplate.BackoffLimit)
+	assert.Equal(t, "reg-a", src.JobTemplate.ImagePullSecrets[0].Name)
 }
 
 // TestBackupDestination_DeepCopy_Local exercises the Local (non-S3) branch of

@@ -21,14 +21,23 @@ metadata:
     {{- include "cloudberry-operator.labels" . | nindent 4 }}
     app.kubernetes.io/component: backup
 rules:
-  # The credential Secret name is dynamic (per-cluster), so the Secret get
-  # permission is scoped to the namespace rather than to a fixed resourceName.
+  # Secret get permission. When backup.rbac.scopeSecrets is enabled and a
+  # secretNames allow-list is provided, the rule is scoped to those
+  # resourceNames so the SA cannot read unrelated Secrets. Otherwise the
+  # permission stays namespace-wide for backwards compatibility (the
+  # credential Secret name is dynamic per-cluster).
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
       - get
+    {{- if and .Values.backup.rbac.scopeSecrets .Values.backup.rbac.secretNames }}
+    resourceNames:
+      {{- range .Values.backup.rbac.secretNames }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- end }}
   - apiGroups:
       - ""
     resources:
@@ -42,6 +51,25 @@ rules:
     verbs:
       - create
       - patch
+  # Coordinator-exec model (spec 11 §MPP Dispatch): gpbackup/gprestore are MPP
+  # orchestrators that MUST run inside the coordinator pod (segment -1) so they
+  # can write the catalog coordinator data directory + history DB and dispatch to
+  # every segment over SSH. The backup/restore Jobs therefore `kubectl exec` into
+  # <cluster>-coordinator-0, which requires pods (get/list, to resolve the pod)
+  # and pods/exec (create). Scoped to pods in the cluster namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
+      - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -210,6 +210,55 @@ create_client() {
 }
 
 # ---------------------------------------------------------------------------
+# Add an "Audience" protocol mapper to a client so its access tokens carry the
+# given audience in the aud claim. The cloudberry-operator OIDC verifier checks
+# aud == clientID, so without this Keycloak's default aud=account is rejected.
+# Args: <realm> <client_id> <audience>
+# ---------------------------------------------------------------------------
+add_audience_mapper() {
+    local realm="$1"
+    local client_id="$2"
+    local audience="$3"
+
+    # Resolve the client's internal UUID.
+    local client_uuid
+    client_uuid=$(curl -s \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H "X-Forwarded-Proto: https" \
+        "${KEYCLOAK_ADDR}/admin/realms/${realm}/clients?clientId=${client_id}" \
+        | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+    if [ -z "${client_uuid}" ]; then
+        log_warn "  Could not resolve UUID for client '${client_id}'; skipping audience mapper"
+        return 0
+    fi
+
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -H "X-Forwarded-Proto: https" \
+        "${KEYCLOAK_ADDR}/admin/realms/${realm}/clients/${client_uuid}/protocol-mappers/models" \
+        -d "{
+            \"name\": \"audience-${audience}\",
+            \"protocol\": \"openid-connect\",
+            \"protocolMapper\": \"oidc-audience-mapper\",
+            \"config\": {
+                \"included.client.audience\": \"${audience}\",
+                \"id.token.claim\": \"true\",
+                \"access.token.claim\": \"true\"
+            }
+        }")
+    if [ "$status" = "201" ]; then
+        log_info "  Audience mapper added to '${client_id}' (aud=${audience})"
+    elif [ "$status" = "409" ]; then
+        log_info "  Audience mapper already exists on '${client_id}'"
+    else
+        log_warn "  Audience mapper creation returned status ${status}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Create realm role
 # ---------------------------------------------------------------------------
 create_realm_role() {
@@ -274,6 +323,56 @@ create_user() {
 }
 
 # ---------------------------------------------------------------------------
+# Assign a realm role to a user so its tokens carry the role in
+# realm_access.roles (the operator maps these to Basic/Operator/Admin via the
+# CR's oidc.roleMapping). Args: <realm> <username> <role>
+# ---------------------------------------------------------------------------
+assign_realm_role() {
+    local realm="$1"
+    local username="$2"
+    local role="$3"
+
+    local user_uuid
+    user_uuid=$(curl -s \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H "X-Forwarded-Proto: https" \
+        "${KEYCLOAK_ADDR}/admin/realms/${realm}/users?username=${username}&exact=true" \
+        | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+    if [ -z "${user_uuid}" ]; then
+        log_warn "  Could not resolve UUID for user '${username}'; skipping role '${role}'"
+        return 0
+    fi
+
+    # Fetch the realm role representation (id + name) to POST to the user's
+    # realm-level role mappings.
+    local role_json
+    role_json=$(curl -s \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H "X-Forwarded-Proto: https" \
+        "${KEYCLOAK_ADDR}/admin/realms/${realm}/roles/${role}")
+    local role_id
+    role_id=$(printf '%s' "${role_json}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+    if [ -z "${role_id}" ]; then
+        log_warn "  Could not resolve realm role '${role}'; skipping for '${username}'"
+        return 0
+    fi
+
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -H "X-Forwarded-Proto: https" \
+        "${KEYCLOAK_ADDR}/admin/realms/${realm}/users/${user_uuid}/role-mappings/realm" \
+        -d "[{\"id\":\"${role_id}\",\"name\":\"${role}\"}]")
+    if [ "$status" = "204" ] || [ "$status" = "201" ]; then
+        log_info "  Assigned realm role '${role}' to user '${username}'"
+    else
+        log_warn "  Role assignment '${role}'->'${username}' returned status ${status}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Setup backend-test realm (service-to-service OIDC)
 # ---------------------------------------------------------------------------
 setup_realm() {
@@ -283,6 +382,12 @@ setup_realm() {
 
     # Gateway service account client (uses this to obtain tokens via client_credentials)
     create_client "${REALM}" "${CLOUDBERRY_OPERATOR_CLIENT_ID}" "${CLOUDBERRY_OPERATOR_CLIENT_SECRET}" "true" "true" "false"
+
+    # The operator's OIDC verifier requires the token audience to equal the
+    # clientID (cloudberry-operator). By default Keycloak issues tokens with
+    # aud=account, so add an audience protocol-mapper that injects
+    # aud=cloudberry-operator into access tokens for this client.
+    add_audience_mapper "${REALM}" "${CLOUDBERRY_OPERATOR_CLIENT_ID}" "${CLOUDBERRY_OPERATOR_CLIENT_ID}"
 
     log_info "Backend realm setup complete"
     log_info "  Gateway can obtain tokens via:"
@@ -300,6 +405,13 @@ setup_realm() {
     create_user "${REALM}" "testuser" "testpass"
     create_user "${REALM}" "adminuser" "adminpass"
     create_user "${REALM}" "reader" "readerpass"
+
+    # Assign realm roles so the users' tokens carry realm_access.roles that the
+    # operator maps (oidc.roleMapping) to Basic/Operator/Admin permissions:
+    #   adminuser -> admin (Admin), testuser -> user (Basic), reader -> reader.
+    assign_realm_role "${REALM}" "adminuser" "admin"
+    assign_realm_role "${REALM}" "testuser" "user"
+    assign_realm_role "${REALM}" "reader" "reader"
 
 }
 

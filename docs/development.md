@@ -2630,6 +2630,581 @@ go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario76
 go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario76
 ```
 
+#### Scenario 77 — Pre-Backup Health Checks
+
+Every backup Job carries a `pre-backup-check` **init container** that validates cluster + destination health **before** the backup proceeds. Init-container semantics make it blocking: a non-zero exit means the `gpbackup` container never starts and the Job fails. On a backup-Job failure the operator records `status.backup.lastBackupStatus=Failed` and emits a de-duplicated **Warning** Event (reason `BackupFailed`); healing the fault lets a fresh backup reach `Success`.
+
+- **Where the checks live** — `internal/builder/backup_builder.go`:
+  - `addPreBackupCheckInitContainer` prepends the `pre-backup-check` init container (shares the backup image, env, and volume mounts with the `gpbackup` container) to the backup Job/CronJob pod spec.
+  - `preBackupCheckScript` runs under `set -euo pipefail` and performs **77a** segments-up (`SELECT count(*) FROM gp_segment_configuration WHERE status='d'` → `exit 1` if `> 0`) and **77b** long-running txn (`pg_stat_activity` where `state <> 'idle'` and `now() - xact_start > interval`, threshold `longRunningTxnThresholdSeconds = 3600` → `exit 1` if `> 0`).
+  - `preBackupDestinationCheck` appends the destination check: **77d** local (`df -Pk <path>` free KB `< minBackupDiskFreeKB = 1048576` KiB / 1 GiB → `exit 1`); **77c** S3 → `s3ReachabilityCheckScript`.
+  - `s3ReachabilityCheckScript` builds a **fail-closed** SigV4-signed `curl -I` HEAD against `${S3_ENDPOINT}/${S3_BUCKET}` (path-style), region `${S3_REGION:-us-east-1}`, signing with the injected `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` and the `openssl`-HMAC chain mirroring `test/docker-compose/scripts/setup-minio.sh`; non-2xx/3xx (or a `--max-time 15` timeout → `000`) → `exit 1`. This replaces the prior best-effort `aws s3 ls` that never failed.
+
+- **Where the event lives** — `internal/controller/admin_controller.go`:
+  - `applyBackupJobToStatus` captures the previous `lastBackupStatus`/`lastBackupJobName` **before** overwriting, then calls `emitBackupFailureEvent`.
+  - `emitBackupFailureEvent` emits `EventTypeWarning` / `EventReasonBackupFailed` (`api/v1alpha1.EventReasonBackupFailed = "BackupFailed"`) only on a real **transition into Failed** for a given Job name (de-dup), and only for **backup**-operation Jobs (restore failures are excluded).
+
+- **Sample CRs**: `deploy/helm/cloudberry-operator/config/samples/scenario77-s3-prebackup.yaml` (S3 dest — 77a/77b/77c) and `scenario77-local-prebackup.yaml` (local dest + small `scenario77-backup-pvc` — 77d)
+- **Functional tests**: `test/functional/scenario77_prebackup_checks_test.go` (`TestFunctional_Scenario77`)
+- **Controller event/status tests**: `internal/controller/backup_event_scenario77_test.go` (`TestEmitBackupFailureEvent_Scenario77`, `TestApplyBackupJobToStatus_*_Scenario77`)
+- **E2E tests**: `test/e2e/scenario77_prebackup_checks_e2e_test.go` (`TestE2E_Scenario77`)
+- **Live script**: `test/e2e/scripts/scenario77-prebackup-checks.sh`
+
+```bash
+# Run Scenario 77 pre-backup-check functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario77
+
+# Run Scenario 77 controller event/status tests
+go test ./internal/controller/... -v -run Scenario77
+
+# Run Scenario 77 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario77
+
+# Run the live fault -> block -> heal -> success cycle against deployed clusters
+bash test/e2e/scripts/scenario77-prebackup-checks.sh \
+  --cluster scenario77-s3 --local-cluster scenario77-local
+```
+
+#### Scenario 78 — Incremental Backup Lifecycle
+
+Exercises the incremental backup lifecycle: forced `--incremental --leaf-partition-data` flag wiring (78a), auto-base discovery vs. a pinned `--from-timestamp` base (78b/78c), deriving `status.lastBackupType`/`backupHistory[].type` from the Job's `avsoft.io/backup-type` label, and incremental-restore completeness with a `RestoreFailed` Warning on the refuse-on-missing-intermediate path (78d).
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `appendIncrementalArgs(args, opts, jobOpts)` — when an incremental is effective (`opts.Incremental` **or** `jobOpts.Type=="incremental"`), it **always** appends `--incremental --leaf-partition-data` (exactly once each, regardless of `opts.LeafPartitionData` — gpbackup requires leaf-partition-data for incrementals), and appends `--from-timestamp <ts>` when `jobOpts.FromTimestamp` is set (the 78c pin). Both `BuildBackupJob` and `BuildBackupCronJob` route through `buildGpbackupArgs` → `appendIncrementalArgs`, so on-demand Jobs and CronJobs render identical incremental args.
+  - `effectiveBackupType(cluster, opts)` — resolves `incremental` vs `full` from the spec (`Gpbackup.Incremental`) plus per-request overrides (`opts.Type=="incremental"` or `opts.Gpbackup.Incremental`); `opts` may be nil (the CronJob `jobTemplate` path consults the spec only).
+  - **`avsoft.io/backup-type` labeling** — `BuildBackupJob` sets `labels[util.LabelBackupType] = effectiveBackupType(cluster, opts)`; `BuildBackupCronJob` sets it from `effectiveBackupType(cluster, nil)` and stamps it on the CronJob, its `jobTemplate`, and the pod template. The constant is `util.LabelBackupType = "avsoft.io/backup-type"` (`internal/util/constants.go`), valued `util.BackupTypeFull`/`util.BackupTypeIncremental`.
+
+- **Where the controller logic lives** — `internal/controller/admin_controller.go`:
+  - `backupTypeFromJob(job, cluster)` — reads the Job's `avsoft.io/backup-type` label; falls back to `backupTypeFromLabels(cluster)` (spec-derived) only when the label is absent. `applyBackupJobToStatus` uses it for **both** `LastBackupType` **and** the appended `BackupHistoryEntry.Type`, so per-Job incrementals (even against a `full` spec) and CronJob-spawned Jobs report the right type.
+  - `emitRestoreFailureEvent(cluster, job, status, prevStatus, prevJobName)` — for a **restore**-operation Job that transitions into `Failed`, emits a de-duplicated `EventTypeWarning`/`EventReasonRestoreFailed` (`api/v1alpha1.EventReasonRestoreFailed = "RestoreFailed"`). It is called from `applyBackupJobToStatus` for restore Jobs (after `RecordRestore(…, failed)`), mirrors `emitBackupFailureEvent`'s transition-only de-dup, and is intentionally **separate** from `BackupFailed` so Scenario 77's backup-only semantics stay intact. gprestore's native incomplete-set refusal needs no operator change.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario78-incremental-backup.yaml` (single S3 dest, `incremental: true`, same `folder: /backups` for the whole chain, `retention.incrementalCount: 10`, AO-table load)
+- **Functional tests**: `test/functional/scenario78_incremental_backup_test.go` (`TestFunctional_Scenario78`)
+- **Integration tests**: `test/integration/scenario78_incremental_backup_integration_test.go`
+- **Builder/controller unit tests**: `internal/builder/backup_builder_scenario78_test.go`, `internal/controller/backup_event_scenario78_test.go`
+- **E2E tests**: `test/e2e/scenario78_incremental_backup_e2e_test.go` (`TestE2E_Scenario78`)
+- **Live script**: `test/e2e/scripts/scenario78-incremental-backup.sh`
+
+```bash
+# Run Scenario 78 incremental-backup functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario78
+
+# Run Scenario 78 integration tests
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario78
+
+# Run Scenario 78 builder + controller unit tests (args, labels, status, RestoreFailed)
+go test ./internal/builder/... -v -run Scenario78
+go test ./internal/controller/... -v -run Scenario78
+
+# Run Scenario 78 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario78
+
+# Run the live full -> incremental (auto-base) -> incremental (pinned) -> restore cycle
+bash test/e2e/scripts/scenario78-incremental-backup.sh --cluster scenario78-s3
+```
+
+#### Scenario 79 — Retention Cleanup, All Policies
+
+Exercises the gpbackman-driven retention cleanup lifecycle: after each successful backup the operator creates a single idempotent cleanup Job that enforces **all three** retention policies (`fullCount`, `incrementalCount`, `maxAge`) via the **real** `gpbackman` CLI, then feeds the cleanup Job's deletion count into `cloudberry_backup_retention_deleted_total`.
+
+> **Real gpbackman CLI.** `gpbackman` (`woblerr/gpbackman`) has **no** `delete` subcommand and **no** count flags (`--keep-full`/`--older-than`). The cleanup script uses `backup-info` (list), `backup-delete --timestamp <ts> --cascade` (delete one), and `backup-clean --older-than-days <N> --cascade` (time-based). Count-based retention (`fullCount`/`incrementalCount`) is implemented by enumerating with `backup-info` and deleting the oldest excess with `backup-delete`.
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `BuildRetentionCleanupJob(cluster, timestamp)` — builds the cleanup Job (label `avsoft.io/backup-operation=cleanup` via `util.BackupOperationCleanup`, owner-ref'd to the cluster, name `util.RetentionCleanupJobName(cluster, ts)` = `<cluster>-cleanup-<ts>`). Its container runs `buildGpbackmanRetentionScript(cluster)` as `args[0]` with `terminationMessagePolicy: FallbackToLogsOnError`.
+  - `buildGpbackmanRetentionScript(cluster)` — renders the self-contained POSIX-sh / bash-3.2-safe script (no `declare -A`; every interpolated value `shellQuote`d — no injection surface). It renders the S3 plugin config, sets `HISTORY_DB` to the coordinator `gpbackup_history.db`, emits one `retentionCountBlock("full", FullCount)` / `retentionCountBlock("incremental", IncrementalCount)` per set count policy (each a re-enumerating delete loop using the `_gpbackman_timestamps` / `_gpbackman_delete` helpers), plus `retentionMaxAgeBlock(days)` for `maxAge`. It maintains a `DELETED` counter, prints `RETENTION_DELETED=<n>` to stdout, and writes `<n>` to `/dev/termination-log`. The marker prefix is the `retentionDeletedMarker` constant.
+  - `parseMaxAgeDays(maxAge)` — converts the `maxAge` expression to whole days for `backup-clean --older-than-days` (`"30d"`→30, `"4w"`→28 via `parseDaysSuffix`, Go duration `"720h"`→30 / `"25h"`→1, bare `"30"`→30; positive sub-day → 1; empty/unparseable → `(0, false)` so the time-based step is skipped).
+
+- **Where the controller logic lives** — `internal/controller/admin_controller.go`:
+  - `ensureRetentionCleanup(ctx, cluster)` — called from `reconcileBackup` after the status refresh. No-op when backup is disabled or no retention policy is active (`retentionPolicyActive`). Finds the newest **Succeeded** backup-operation Job (`latestSucceededBackupJob`), derives its 14-digit timestamp, and calls `createRetentionCleanupJob` (Get-before-Create on `<cluster>-cleanup-<ts>` → idempotent, one cleanup per successful backup), then `reconcileRetentionCleanupAnnotations`.
+  - `reconcileRetentionCleanupAnnotations(ctx, cluster, jobs)` — for each **Succeeded** cleanup Job missing the annotation, reads the deletion count from the terminated pod (`readRetentionDeletedCount` parses the `RETENTION_DELETED=<n>` marker) and patches `avsoft.io/backup-retention-deleted=<n>` once (`patchRetentionDeletedAnnotation`, `util.AnnotationBackupRetentionDeleted`). The existing `recordBackupJobMetrics` loop then calls `metrics.RecordBackupRetentionDeleted` → `cloudberry_backup_retention_deleted_total`. Non-fatal: parse/permission issues are logged and retried on a later reconcile.
+
+- **gpbackman in the image** — `Dockerfile.cloudberry-backup` builds `gpbackman` from `woblerr/gpbackman` (pinned `GPBACKMAN_VERSION`, default `v0.8.1`; CGO build because it links `mattn/go-sqlite3`) into `/usr/local/bin/gpbackman`, `COPY`'d into the runtime stage and smoke-tested with `gpbackman --version`. The cleanup Job uses `cloudberry-backup:2.1.0`, so its `gpbackman` invocations resolve at runtime.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario79-retention.yaml` (single S3 dest, `retention.{fullCount:3, incrementalCount:10, maxAge:"30d"}`, same `folder: /backups`, `gpbackup.incremental: true`, no schedule)
+- **Functional tests**: `test/functional/scenario79_retention_test.go` (`TestFunctional_Scenario79`)
+- **Integration tests**: `test/integration/scenario79_retention_integration_test.go` (`TestIntegration_Scenario79`)
+- **E2E tests**: `test/e2e/scenario79_retention_e2e_test.go` (`TestE2E_Scenario79`)
+- **Live script**: `test/e2e/scripts/scenario79-retention.sh`
+
+```bash
+# Run Scenario 79 retention functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario79
+
+# Run Scenario 79 integration tests
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario79
+
+# Run Scenario 79 builder + controller unit tests (script args, idempotent cleanup, annotation→metric)
+go test ./internal/builder/... -v -run RetentionCleanup
+go test ./internal/controller/... -v -run RetentionCleanup
+
+# Run Scenario 79 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario79
+
+# Run the live 79a-d retention cleanup cycle against the deployed cluster
+bash test/e2e/scripts/scenario79-retention.sh --cluster scenario79-s3
+```
+
+#### Scenario 80 — Post-Restore Validation
+
+Exercises the post-restore validation lifecycle: after each Succeeded restore the operator creates one idempotent validation Job whose script runs four checks (optional `ANALYZE` → row-count compare vs gpbackup history → invalid-index scan → health-check), and the operator records the validation Job's terminal status as a metric + de-duplicated Warning Event **without** failing the restore.
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `ValidationJobOptions{Timestamp, Database, HealthCheckQuery, ExpectedRowCounts, RunAnalyze}` — per-request inputs. `ExpectedRowCounts` (`map[string]int64`, key `schema.table`) is the EXPECTED per-table counts from gpbackup history; `RunAnalyze` toggles the `ANALYZE` step; `HealthCheckQuery` defaults to `SELECT 1`.
+  - `BuildPostRestoreValidationJob(cluster, opts)` — builds the validation Job (label `avsoft.io/backup-operation=validate` via `util.BackupOperationValidate`, container `post-restore-validate`, name `util.PostRestoreValidationJobName(cluster, ts)` = `<cluster>-validate-<ts>`, owner-ref'd to the cluster). It sets `PGDATABASE` from `opts.Database` and runs `postRestoreValidationScript(opts)` as `args[0]`.
+  - `postRestoreValidationScript(opts)` — renders the bash script (`set -euo pipefail`): `writeAnalyzeStep` (database-wide `ANALYZE` + `ANALYZE_OK` only when `RunAnalyze`), `writeRowCountStep` (per-table compare loop emitting `ROW_COUNT_MATCH`/`ROW_COUNT_MISMATCH` and `exit 1` on any mismatch when `ExpectedRowCounts` is non-empty; else a best-effort `ROW_COUNT_PROBE_SKIPPED` probe that never fails), `writeInvalidIndexStep` (must-pass `relkind='i' AND NOT indisvalid` → `exit 1`), then the health-check query and the `validation passed` marker. Every interpolated table name / expected count is `shellQuote`d (no injection surface) and the expected map is iterated in sorted order so the rendered script is deterministic.
+
+- **Where the controller logic lives** — `internal/controller/admin_controller.go`:
+  - `ensurePostRestoreValidation(ctx, cluster)` — called from `reconcileBackup`; no-op when `validationEnabled(cluster)` is false (`backup.validation.enabled: false`). For each **Succeeded** restore-operation Job it calls `createValidationJob` (Get-before-Create on `<cluster>-validate-<ts>` → idempotent, one validation Job per Succeeded restore).
+  - `createValidationJob(ctx, cluster, ts, restoreJob)` — populates `ValidationJobOptions` from the cluster + restore Job: `expectedRowCountsFromJob` reads the restore Job's `avsoft.io/expected-row-counts` annotation (`util.AnnotationExpectedRowCounts`, JSON `table → count`; nil/unparsable → best-effort probe), `validationHealthCheckQuery` reads `backup.validation.healthCheckQuery`, and `validationRunAnalyze` honors `backup.validation.runAnalyze` then falls back to `gprestore.runAnalyze`.
+  - `observeValidationJobs(ctx, cluster)` — called from `reconcileBackup` after `ensurePostRestoreValidation`. For each terminal validation-operation Job not yet recorded (gated on the `avsoft.io/validation-recorded` annotation, `util.AnnotationValidationRecorded`), `recordValidationOutcome` patches the de-dup annotation **first** (the commit point — avoids double-counting), then calls `metrics.RecordRestoreValidation(cluster, namespace, result)` (`result ∈ {success, failed}` via `validationJobResult`) and, on `failed`, `emitValidationFailureEvent`. The restore status is never altered by the validation outcome.
+  - `emitValidationFailureEvent(cluster, job)` — emits the `EventTypeWarning`/`EventReasonValidationFailed` (`api/v1alpha1.EventReasonValidationFailed = "ValidationFailed"`) Event once per Job (`recordValidationOutcome` invokes it only after the de-dup annotation is committed, mirroring `emitRestoreFailureEvent`'s transition de-dup).
+
+- **Where the metric lives** — `internal/metrics/metrics.go`: `RecordRestoreValidation(cluster, namespace, result)` on the `Recorder` interface increments `cloudberry_restore_validation_total{cluster,namespace,result}` (`PrometheusRecorder` impl; `NoopRecorder` no-op), registered in `MustRegister` alongside `restore_total`.
+
+- **CRD config** — `api/v1alpha1/types.go`: `BackupSpec.Validation *BackupValidation` with `BackupValidation{Enabled *bool, HealthCheckQuery string, RunAnalyze bool}` (deepcopy regenerated in `zz_generated.deepcopy.go`). Defaults: validation enabled, `SELECT 1`, run-analyze inherited from `gprestore.runAnalyze`.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario80-post-restore-validation.yaml`
+- **Functional tests**: `test/functional/scenario80_post_restore_validation_test.go` (`TestFunctional_Scenario80`)
+- **Integration tests**: `test/integration/scenario80_post_restore_validation_integration_test.go` (`TestIntegration_Scenario80`)
+- **E2E tests**: `test/e2e/scenario80_post_restore_validation_e2e_test.go` (`TestE2E_Scenario80`)
+- **Builder + controller unit tests**: `internal/builder/backup_builder_scenario80_test.go`, `internal/controller/validation_scenario80_test.go`, `internal/metrics/metrics_test.go` (`TestRecordRestoreValidation_Scenario80`)
+- **Live script**: `test/e2e/scripts/scenario80-post-restore-validation.sh`
+
+```bash
+# Run Scenario 80 post-restore-validation functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario80
+
+# Run Scenario 80 integration tests
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario80
+
+# Run Scenario 80 builder + controller + metrics unit tests (compare script, ROW_COUNT markers, ANALYZE_OK, metric+ValidationFailed event)
+go test ./internal/builder/... -v -run Scenario80
+go test ./internal/controller/... -v -run Scenario80
+go test ./internal/metrics/... -v -run Scenario80
+
+# Run Scenario 80 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario80
+
+# Run the live 80a-e validation cycle (success + deliberate-mismatch paths) against the deployed cluster
+bash test/e2e/scripts/scenario80-post-restore-validation.sh --cluster scenario80-s3 --namespace cloudberry-test
+```
+
+#### Scenario 81 — Local Destination Backup/Restore
+
+Exercises the **local** (PVC-backed) backup/restore destination end-to-end: with `destination.type: local` the operator wires `gpbackup`/`gprestore` to a `--backup-dir` on a mounted PVC instead of the S3 plugin — no `--plugin-config`, no S3 ConfigMap, no Vault/Secret S3 credentials. The three destination-blind builder functions were made destination-aware via a small helper; nil/empty/unknown destinations default to the S3 leading args so every existing S3 caller and test stays byte-identical.
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `isLocalDestination(cluster)` — `cluster.Spec.Backup != nil && Destination.Type == destinationTypeLocal`. The single predicate gating every local branch.
+  - `localBackupDir(cluster)` — resolves the on-pod backup dir: `Destination.Local.Path` when set, else `localBackupMountPath` (`/backups`). The single source of truth shared by the args, the volume mount, and the retention script.
+  - `backupDestinationArgs(cluster)` — returns the leading args: local → `["--backup-dir", localBackupDir(cluster)]`; s3 (and nil/unknown, to preserve current behavior) → `["--plugin-config", "/tmp/s3-config.yaml"]`.
+  - `buildGpbackupArgs(cluster, opts, jobOpts)` / `buildGprestoreArgs(cluster, opts, jobOpts)` — both take the `cluster` and seed `args` from `backupDestinationArgs(cluster)` (instead of a hardcoded `--plugin-config` slice), so local renders `--backup-dir <path>` and **never** `--plugin-config` / `/tmp/s3-config.yaml`. The 3 call sites (`buildBackupPodSpec` / the restore + CronJob paths) all have `cluster` in scope.
+  - `renderToolScript(cluster, tool, args)` — for a local destination **skips** the `envsubst` block that renders `/etc/gpbackup/s3-plugin-config.yaml.tpl` → `/tmp/s3-config.yaml` (gated on `!isLocalDestination(cluster)`). A local Job has no S3 ConfigMap at `/etc/gpbackup`, so reading the missing template under `set -euo pipefail` would otherwise abort the Job before `gpbackup` runs. The `gpEnvPreamble`/`sshSetupPreamble`/plugin-path preambles are kept for both destinations (harmless; SSH is still needed to reach segments).
+  - `buildBackupVolumes(cluster)` / `buildBackupVolumeMounts(cluster)` — for `destinationTypeLocal` with a non-empty `Local.PersistentVolumeClaim`, append a `PersistentVolumeClaim` volume named `localBackupVolumeName` (`"backup-data"`, `ClaimName: <Local.PersistentVolumeClaim>`) and mount it at `localBackupDir(cluster)` (default `/backups`). No `s3-plugin-config` ConfigMap volume / no `/etc/gpbackup` mount for local.
+  - `buildBackupEnv(cluster)` — emits only `PG*`/database env for non-S3 (the `S3_*`/`AWS_*` append is guarded on `Destination.Type == destinationTypeS3`), so local pods carry no S3 env.
+  - `preBackupDestinationCheck(cluster)` — for local runs the `df -Pk <backup-dir>` free-space check (`< minBackupDiskFreeKB = 1048576` KiB / 1 GiB → `exit 1`, Scenario 77d); s3 → the SigV4 HEAD reachability check (77c).
+  - `buildGpbackmanRetentionScript(cluster)` — for local sets `DEST_FLAGS=--backup-dir <path>` and **skips** the S3 plugin-config render; s3 renders the config and uses `--plugin-config <rendered>`. So local retention (`gpbackman backup-delete`/`backup-clean`) targets the local dir.
+
+- **Where the controller logic lives** — `internal/controller/admin_controller.go`:
+  - `ensureBackupS3ConfigMap(ctx, cluster)` — no-op for local: `BuildBackupS3ConfigMap` returns nil for a non-S3 destination, so **no** `<cluster>-backup-s3-config` ConfigMap is created.
+  - `ensureBackupS3VaultCredentials(ctx, cluster)` — no-op for local: `backupS3VaultSpec(cluster)` returns nil when `Destination.S3 == nil`, so **no** `<cluster>-backup-s3-vault-creds` Secret is created and no Vault read is attempted. (Asserted by the Scenario 81 integration test as a regression guard.)
+
+- **MPP / live model note** — `gpbackup --backup-dir <dir>` writes per-segment backup sets on the coordinator **and every segment host**. A single RWO PVC mounted on one Job pod holds **one** set, not the cluster-wide fan-out. The Job-spec assertions (81a/81b) prove the operator wiring (PVC at `local.path`, `--backup-dir`, no plugin); the real `gpbackup`/`gprestore` data cycle (81c/81d) runs via the coordinator-exec path into a segment-visible `--backup-dir` (e.g. `/tmp/scenario81-backups`).
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario81-local-destination.yaml` (declares the `backup-pvc` PVC + a cluster with `destination.type: local`, `local.path: /backups`, `local.persistentVolumeClaim: backup-pvc`, no schedule)
+- **Functional tests**: `test/functional/scenario81_local_destination_test.go` (`TestFunctional_Scenario81`)
+- **Integration tests**: `test/integration/scenario81_local_destination_integration_test.go` (`TestIntegration_Scenario81`)
+- **E2E tests**: `test/e2e/scenario81_local_destination_e2e_test.go` (`TestE2E_Scenario81`)
+- **Live script**: `test/e2e/scripts/scenario81-local-destination.sh`
+
+```bash
+# Run Scenario 81 local-destination functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario81
+
+# Run Scenario 81 integration tests (no S3 ConfigMap/Vault creds for local; PVC volume + --backup-dir)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario81
+
+# Run Scenario 81 builder unit tests (--backup-dir args, no /etc/gpbackup render, PVC mount)
+go test ./internal/builder/... -v -run Scenario81
+
+# Run Scenario 81 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario81
+
+# Run the live local backup -> restore cycle (Job-spec + coordinator-exec --backup-dir) against the deployed cluster
+bash test/e2e/scripts/scenario81-local-destination.sh --cluster scenario81-local
+```
+
+#### Scenario 82 — Security and Encryption
+
+Verifies the backup security posture: S3 credentials never on disk/ConfigMap (placeholders +
+env-from-Secret), ephemeral `envsubst` rendering of `/tmp/s3-config.yaml`, the dedicated
+`cloudberry-backup-sa` with scoped minimal RBAC, the `encryption` on/off plugin option, and
+`jobTemplate.imagePullSecrets`. **82a/82b/82d** need no operator code change (already
+satisfied — covered by tests + live); **82c** is a Helm RBAC change; **82e** adds a CRD field
+wired through the existing helper.
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `BuildBackupS3ConfigMap(cluster)` — emits the `<cluster>-backup-s3-config` ConfigMap whose
+    `s3-plugin-config.yaml.tpl` `options:` values are **all** `${...}` placeholders
+    (`${S3_REGION}`/`${S3_ENDPOINT}`/`${AWS_ACCESS_KEY_ID}`/`${AWS_SECRET_ACCESS_KEY}`/
+    `${S3_BUCKET}`/`${S3_FOLDER}`/`${S3_ENCRYPTION}` + multipart). **No** literal credential
+    material (82a). Returns nil for non-S3.
+  - `buildBackupEnv(cluster)` / `buildS3CredentialEnv(...)` — inject `AWS_ACCESS_KEY_ID` /
+    `AWS_SECRET_ACCESS_KEY` as `valueFrom.secretKeyRef` (never literal `value:`) (82a).
+  - `renderToolScript(cluster, tool, args)` — for an S3 destination emits the runtime
+    `envsubst < /etc/gpbackup/s3-plugin-config.yaml.tpl > /tmp/s3-config.yaml` line (with a
+    POSIX `eval`+heredoc fallback), so the resolved config lands only in the ephemeral pod
+    filesystem (82b); skipped for local.
+  - `buildS3Env(cluster, s3)` — sets `S3_ENCRYPTION` from `s3.Encryption` (default `on`); the
+    ConfigMap template line `encryption: ${S3_ENCRYPTION}` flips with it (82d). The enum
+    `on|off` is enforced on `S3Destination.Encryption` (`api/v1alpha1/types.go`,
+    `+kubebuilder:validation:Enum=on;off`) and in the generated CRD.
+  - `applyJobTemplatePod(cluster, podSpec)` — after the nil-guard, calls
+    `addImagePullSecrets(podSpec, tmpl.ImagePullSecrets)` (the reusable helper in
+    `internal/builder/builder.go`, also used by the StatefulSets) so the backup Job pod —
+    and the restore / post-restore-validation / cleanup / CronJob pods — carry
+    `spec.backup.jobTemplate.imagePullSecrets` (82e). The field
+    `ImagePullSecrets []ImagePullSecret` lives on `BackupJobTemplate`
+    (`api/v1alpha1/types.go`); `zz_generated.deepcopy.go` and the CRD were regenerated
+    (`make manifests`/`make generate`) to expose `spec.backup.jobTemplate.imagePullSecrets`.
+
+- **Where the RBAC scoping lives** — `deploy/helm/cloudberry-operator/templates/backup-rbac.yaml`
+  + `deploy/helm/cloudberry-operator/values.yaml`:
+  - The `cloudberry-backup-role` `secrets: [get]` rule renders `resourceNames` from
+    `.Values.backup.rbac.secretNames` **only when**
+    `and .Values.backup.rbac.scopeSecrets .Values.backup.rbac.secretNames` is true; otherwise
+    it stays namespace-wide (backward compatible). `configmaps: [get]` and
+    `events: [create,patch]` are unchanged (82c).
+  - `values.yaml` adds `backup.rbac.scopeSecrets` (default `false`) and
+    `backup.rbac.secretNames` (default `[backup-s3-credentials]`), documenting the
+    per-cluster Secrets the Jobs consume (`<cluster>-admin-password`, `<cluster>-ssh-keys`,
+    `<cluster>-backup-s3-vault-creds`, + the user S3 credential Secret). The SA + Role are
+    **namespace-fixed**, the consumed Secret names **per-cluster** — union them for multiple
+    clusters in one namespace. Scoping the SA's API `get` does **not** break the Job's
+    `secretKeyRef`/volume injection (kubelet-driven).
+  - **CRD re-apply**: the regenerated CRD must be `kubectl apply`-ed after a Helm install —
+    Helm does not upgrade `crds/`.
+
+- **Builder unit tests**: `internal/builder/backup_builder_scenario82_test.go`
+  (`TestBuildBackupS3ConfigMapPlaceholdersOnlyScenario82`,
+  `TestBuildBackupS3ConfigMapEncryptionLineScenario82`, `applyJobTemplatePod` imagePullSecrets).
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario82-security-encryption.yaml`
+  (S3 cluster `scenario82-s3`, `encryption: on`, `jobTemplate.imagePullSecrets: [{name: regcred}]`,
+  plus the `s3-credentials` and `unrelated-secret` Secrets and the scoped-RBAC values note).
+- **Functional tests**: `test/functional/scenario82_security_encryption_test.go` (`TestFunctional_Scenario82`)
+- **Integration tests**: `test/integration/scenario82_security_encryption_integration_test.go` (`TestIntegration_Scenario82`)
+- **E2E tests**: `test/e2e/scenario82_security_encryption_e2e_test.go` (`TestE2E_Scenario82`)
+- **Live script**: `test/e2e/scripts/scenario82-security-encryption.sh`
+
+```bash
+# Run Scenario 82 security/encryption functional tests (ConfigMap placeholders, secretKeyRef env, encryption flip, imagePullSecrets)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario82
+
+# Run Scenario 82 integration tests (envtest: ConfigMap placeholders, pod env secretKeyRef, imagePullSecrets, envsubst line)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario82
+
+# Run Scenario 82 builder unit tests (placeholder-only ConfigMap, encryption line, applyJobTemplatePod imagePullSecrets)
+go test ./internal/builder/... -v -run Scenario82
+
+# Run Scenario 82 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario82
+
+# Run the live security/encryption checks (82a-e) against the deployed cluster
+bash test/e2e/scripts/scenario82-security-encryption.sh --cluster scenario82-s3 \
+  [--namespace cloudberry-test] [--checks 82a,82b,82c,82d,82e]
+```
+
+#### Scenario 83 — Backup Failure Handling
+
+Exercises the backup **failure** path: a backup that cannot succeed retries up to
+`backoffLimit` (default `2`) and ends `Failed`, a backup that outlives
+`activeDeadlineSeconds` (default `7200`) is **killed** by Kubernetes at the deadline, and
+both record `status.backup.lastBackupStatus=Failed`, `cloudberry_backup_last_status=1`, and
+a de-duplicated `Warning`/`BackupFailed` Event. The only production change was making the
+status mappings classify a Job with a terminal **Failed condition** (e.g.
+`DeadlineExceeded`/`BackoffLimitExceeded`) as failed even when the failed-pod count is `0`;
+the metric/status/event wiring downstream was already correct.
+
+- **Where the builder logic lives** — `internal/builder/backup_builder.go`:
+  - `buildJobSpec(cluster, labels, podSpec)` — seeds `backoff = defaultBackoffLimit`
+    (`int32 2`) and `deadline = defaultActiveDeadlineSeconds` (`int64 7200`); when
+    `jobTemplate(cluster) != nil` overrides each from `tmpl.BackoffLimit` /
+    `tmpl.ActiveDeadlineSeconds` (a nil field keeps the default), and sets
+    `JobSpec.BackoffLimit=&backoff` / `JobSpec.ActiveDeadlineSeconds=&deadline`. Every
+    backup/restore/cleanup/validation Job **and** the backup CronJob's `jobTemplate` route
+    through `buildJobSpec`, so the `spec.backup.jobTemplate.{backoffLimit,activeDeadlineSeconds}`
+    override propagates to every Job spec uniformly. `defaultBackoffLimit` /
+    `defaultActiveDeadlineSeconds` are unchanged (Scenario 83 must **not** change them).
+  - The `*int32 BackoffLimit` / `*int64 ActiveDeadlineSeconds` fields live on
+    `BackupJobTemplate` (`api/v1alpha1/types.go`).
+
+- **Where the controller logic lives** — `internal/controller/admin_controller.go`:
+  - `jobHasFailedCondition(job *batchv1.Job) bool` — iterates `job.Status.Conditions` and
+    returns true when any condition has `Type == batchv1.JobFailed && Status ==
+    corev1.ConditionTrue` (e.g. `reason=DeadlineExceeded` or `BackoffLimitExceeded`).
+    Authoritative even when `Status.Failed == 0`.
+  - `backupJobStatus(job)` (→ `"Failed"`) and `backupJobStatusCode(job)` (→ `3`) — after
+    the `Succeeded > 0` precedence branch, the Failed arm is
+    `case job.Status.Failed > 0 || jobHasFailedCondition(job):`. `validationJobResult(job)`
+    uses the same combined check. Succeeded precedence is preserved; in-progress/pending
+    are unchanged when no failure signal is present.
+  - `recordLatestBackupMetrics(...)` — `Failed → SetBackupLastStatus(name, namespace,
+    backupLastStatusFailed)` (`=1` → `cloudberry_backup_last_status=1`), `Success → 0`,
+    otherwise `2`. Unchanged; the GAP-1 status arm now reaches it for deadline/backoff
+    terminal Jobs. `applyBackupJobToStatus` still sets `lastBackupStatus` from
+    `backupJobStatus` and calls `emitBackupFailureEvent` (de-duplicated `BackupFailed`
+    Warning on a real transition into `Failed`).
+
+- **Metric** — `internal/metrics/metrics.go`: `cloudberry_backup_last_status{cluster,namespace}`
+  gauge (`0=success, 1=failed, 2=in-progress`), `SetBackupLastStatus`. No change; the
+  existing Grafana panel renders `1` on failure / `0` on success.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario83-backup-failure.yaml`
+  (S3 cluster `scenario83-s3`, explicit `jobTemplate.backoffLimit: 2`, production-safe
+  default `activeDeadlineSeconds`; the deadline sub-test uses a per-run Job so the
+  cluster's deadline stays safe)
+- **Functional tests**: `test/functional/scenario83_backup_failure_test.go` (`TestFunctional_Scenario83`)
+- **Integration tests**: `test/integration/scenario83_backup_failure_integration_test.go` (`TestIntegration_Scenario83`)
+- **E2E tests**: `test/e2e/scenario83_backup_failure_e2e_test.go` (`TestE2E_Scenario83`)
+- **Live script**: `test/e2e/scripts/scenario83-backup-failure.sh`
+
+```bash
+# Run Scenario 83 backup-failure functional tests
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario83
+
+# Run Scenario 83 integration tests (jobTemplate backoffLimit/activeDeadlineSeconds override reaches the jobspec; status-transition metric)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario83
+
+# Run Scenario 83 unit tests (jobHasFailedCondition truth-table; backupJobStatus/Code Failed for DeadlineExceeded/BackoffLimitExceeded; builder defaults/override)
+go test ./internal/builder/... -v -run Scenario83
+go test ./internal/controller/... -v -run Scenario83
+
+# Run Scenario 83 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario83
+
+# Run the live force-failure (backoffLimit) + deadline-kill checks against the deployed cluster
+bash test/e2e/scripts/scenario83-backup-failure.sh --cluster scenario83-s3
+```
+
+#### Scenario 84 — Prometheus Metrics / `gpbackup_exporter`
+
+Verifies the **nine** backup/restore metrics end-to-end. This is a **verification +
+documentation + dashboard** scenario — all nine metrics were already defined and wired
+incrementally across Scenarios 76–83, so **no operator code change** is required. The
+`gpbackup_exporter` is implemented as the **operator metric endpoint**: the operator
+derives the metrics from the Kubernetes Jobs it observes (backup-/restore-/cleanup-operation
+Jobs) plus their `avsoft.io/*` annotations and history outcomes, and exposes them on its own
+Prometheus `/metrics` endpoint — there is no separate exporter sidecar binary. vmagent
+scrapes the operator `/metrics` (via the `prometheus.io/scrape` annotations on the operator
+Deployment/Service) into VictoriaMetrics.
+
+- **Where the metric definitions live** — `internal/metrics/metrics.go`:
+  - `initBackupMetrics()` defines all nine under namespace `cloudberry` and registers them.
+    The outcome label on `backup_total` / `restore_total` is **`labelResult`** (`result`,
+    values `success`|`failed`) — **not** `status`. Recorder methods: `RecordBackup`,
+    `ObserveBackupDuration`, `SetBackupSizeBytes`, `SetBackupLastSuccessTimestamp`,
+    `SetBackupLastStatus`, `ObserveRestoreDuration`, `RecordBackupRetentionDeleted`,
+    `SetBackupJobStatus`, `RecordRestore`. `RecordBackup`/`RecordRestore` lower-case the Job
+    status (`Success → "success"`, `Failed → "failed"`).
+
+- **Where the metrics are recorded** — `internal/controller/admin_controller.go`:
+  - `refreshBackupStatus` calls `recordBackupJobMetrics(...)` for **every** observed
+    backup/restore/cleanup Job, then `applyBackupJobToStatus(...)` on the latest Job.
+  - `recordBackupJobMetrics(...)` — `SetBackupJobStatus` for each Job (code from
+    `backupJobStatusCode`: `0=pending, 1=running, 2=succeeded, 3=failed`); on a Succeeded
+    restore Job → `ObserveRestoreDuration`; on a Succeeded cleanup Job → 
+    `RecordBackupRetentionDeleted` (from the `avsoft.io/backup-retention-deleted` annotation).
+  - `applyBackupJobToStatus(...)` — restore Jobs → `RecordRestore`; backup Jobs →
+    `recordLatestBackupMetrics`.
+  - `recordLatestBackupMetrics(...)` — `RecordBackup` always; on Success →
+    `SetBackupLastStatus(0)`, `SetBackupLastSuccessTimestamp`, `ObserveBackupDuration`
+    (when both `startTime`+`completionTime` set), `SetBackupSizeBytes` (when the
+    `avsoft.io/backup-size-bytes` annotation + a 14-digit timestamp are present); on Failed
+    → `SetBackupLastStatus(1)`; otherwise (in-progress) → `SetBackupLastStatus(2)`.
+    `type` (`full`|`incremental`) comes from `backupTypeFromJob` (the Job's
+    `avsoft.io/backup-type` label, spec fallback).
+
+- **`result` (not `status`) — doc alignment (GAP-A).** Scenario 84's wording said
+  `cloudberry_backup_total{type,status}`; the implemented outcome label is **`result`**.
+  The label is **not** renamed (dashboards/PromQL across 76–83 query `result`); the
+  functional `…_ResultLabelContract` test guards that `backup_total`/`restore_total` expose
+  `result` and emit **no** `status` label. Query with `{result="success"}` /
+  `{result="failed"}`.
+
+- **Dashboard** — `monitoring/grafana/cloudberry-operator.json` already has a panel for each
+  of the nine metrics (queries use `result`); publish with `make grafana-publish`.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`
+  (single S3 cluster `scenario84-s3` exercising full + incremental + restore + cleanup +
+  failure so every metric is populated)
+- **Functional tests**: `test/functional/scenario84_metrics_test.go` (`TestFunctional_Scenario84`)
+- **Integration tests**: `test/integration/scenario84_metrics_integration_test.go` (`TestIntegration_Scenario84`)
+- **E2E tests**: `test/e2e/scenario84_metrics_e2e_test.go` (`TestE2E_Scenario84`)
+- **Test-case catalog**: `Scenario84MetricCases` in `test/cases/test_cases.go`
+- **Live script**: `test/e2e/scripts/scenario84-metrics.sh` (drives the full lifecycle and
+  asserts all nine metrics in VictoriaMetrics)
+
+```bash
+# Run Scenario 84 metrics functional tests (full-lifecycle recorder sweep, forced-failure last_status, job-status lifecycle, restore metrics, result-label contract)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario84
+
+# Run Scenario 84 integration tests (envtest: full/incremental backup, restore, cleanup, failed backup record the metrics)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario84
+
+# Run Scenario 84 metrics unit tests (registry round-trip confirms the `result` label; recorder invocations)
+go test ./internal/metrics/... -v -run Backup
+go test ./internal/controller/... -v -run Scenario84
+
+# Run Scenario 84 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario84
+
+# Run the live full-lifecycle metric verification against the deployed cluster + VictoriaMetrics
+bash test/e2e/scripts/scenario84-metrics.sh --cluster scenario84-s3
+```
+
+#### Scenario 85 — All Backup API Endpoints
+
+Verifies the **seven** backup/restore REST API endpoints under
+`/api/v1alpha1/clusters/{name}/backups` end-to-end: routing, per-endpoint OIDC/JWT auth +
+RBAC, the request schemas, the option → `gpbackup`/`gprestore` flag mapping, and the
+negative/mutual-exclusivity responses. It is mostly **verification + comprehensive tests**
+plus **one** code fix (`leafPartitionData` on full backups).
+
+- **Where the routes + RBAC live** — `internal/api/server.go` (registration `~297–312`):
+  - `GET /backups` → `handleListBackups` (`PermissionBasic`)
+  - `POST /backups` → `handleCreateBackup` (`PermissionOperator`)
+  - `GET /backups/{timestamp}` → `handleGetBackup` (`PermissionBasic`)
+  - `DELETE /backups/{timestamp}` → `handleDeleteBackup` (`PermissionAdmin`)
+  - `POST /backups/{timestamp}/restore` → `handleRestoreBackup` (`PermissionAdmin`)
+  - `GET /backups/jobs` → `handleListBackupJobs` (`PermissionBasic`)
+  - `GET /backups/schedule` → `handleGetBackupSchedule` (`PermissionBasic`)
+  - (`PATCH /backups/schedule` → `handleUpdateBackupSchedule`, `PermissionOperator` — outside
+    the Scenario 85 seven). A missing cluster returns `404` via `writeClusterNotFound`.
+
+- **Where the DTOs + option mapping live** — `internal/api/backup.go`:
+  - `CreateBackupRequest` / `GpbackupOptionsRequest` and `RestoreRequest` /
+    `GprestoreOptionsRequest` are the request bodies.
+  - `buildBackupJobOptions` → `mergeGpbackupOptions` overlays the request `gpbackupOptions`
+    over the cluster's `backup.gpbackup` defaults; `buildRestoreJobOptions` →
+    `mergeGprestoreOptions` does the same for restore.
+  - `restoreOptionsConflict` rejects `dataOnly`+`metadataOnly` with `400` **before** the Job
+    is built. `backupScheduleResponse` / `nextScheduleTime` compute the 85g `nextScheduleTime`.
+  - The merged options are rendered into CLI args by `buildGpbackupArgs` /
+    `buildGprestoreArgs` in `internal/builder/backup_builder.go`.
+
+- **The 85b fix — `leafPartitionData` on full backups.** `buildGpbackupArgs` calls
+  `appendLeafPartitionDataArgs(args, opts, jobOpts)`, which emits `--leaf-partition-data`
+  for a **full** backup when `opts.LeafPartitionData` is set, guarded on
+  `!isEffectivelyIncremental(...)` so it never duplicates the `--leaf-partition-data` that
+  `appendIncrementalArgs` force-pairs with `--incremental`. Previously the option was
+  silently dropped on full backups. `isEffectivelyIncremental` is the single source of truth
+  shared by both helpers so the flag is emitted **exactly once** in every case.
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`
+  (single S3 cluster `scenario85-s3` with a `backup.schedule` so all seven endpoints have data)
+- **Functional tests**: `test/functional/scenario85_api_endpoints_test.go` (`TestFunctional_Scenario85`)
+- **Integration tests**: `test/integration/scenario85_api_endpoints_integration_test.go` (`TestIntegration_Scenario85`)
+- **E2E tests**: `test/e2e/scenario85_api_endpoints_e2e_test.go` (`TestE2E_Scenario85`)
+- **Handler/builder unit tests**: `internal/api/backup_scenario85_test.go`,
+  `internal/builder/backup_builder_scenario85_test.go`
+- **Test-case catalog**: `test/cases/scenario85_api_endpoints_cases.go`
+- **Live script**: `test/e2e/scripts/scenario85-api-endpoints.sh` (obtains an OIDC token,
+  port-forwards the operator REST API, and exercises all seven endpoints — asserting the
+  created Job args via `kubectl get job -o jsonpath`)
+
+```bash
+# Run Scenario 85 API-endpoints functional tests (all 7 endpoints: status + response shape + created Job args)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario85
+
+# Run Scenario 85 integration tests (envtest: RBAC 403, 404, 400 paths through the real router + auth; Job not CronJob)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario85
+
+# Run Scenario 85 handler + builder unit tests (option->flag matrices, leafPartitionData-on-full, RBAC, exclusivity)
+go test ./internal/api/... -v -run Scenario85
+go test ./internal/builder/... -v -run Scenario85
+
+# Run Scenario 85 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario85
+
+# Run the live OIDC-authed exercise of all 7 endpoints against the deployed cluster
+bash test/e2e/scripts/scenario85-api-endpoints.sh --cluster scenario85-s3
+```
+
+#### Scenario 86 — All Backup CLI Commands
+
+Verifies **all eleven** `cloudberry-ctl backup …` CLI commands (86a–k): each command builds the
+right operator REST request, and `backup jobs logs` (86k) **streams** the Job's pod logs. Ten
+commands reuse the Scenario 85 endpoints; the only code addition is the 86k streaming path — a
+new operator endpoint, a new CLI streaming client method, and the rewired `backup jobs logs`
+command.
+
+- **Where the CLI backup commands live** — `cmd/cloudberry-ctl/main.go`:
+  - `newBackupCmd` builds the tree: `newBackupCreateCmd` (→ `buildCreateBackupRequest`,
+    `POST /backups`), `newBackupListCmd` (`GET /backups`), `newBackupStatusCmd`
+    (`GET /backups/{ts}`), `newBackupDeleteCmd` (`DELETE /backups/{ts}`), `newBackupRestoreCmd`
+    (→ `buildRestoreRequest`, `POST /backups/{ts}/restore` — incl. `--resize-cluster`),
+    `newBackupScheduleCmd` (`GET /backups/schedule`) with `newBackupScheduleSetCmd`
+    (`PATCH {schedule}`) and `newBackupScheduleSuspendCmd("suspend"|"resume", …)`
+    (`PATCH {suspend}`), and `newBackupJobsCmd` (`GET /backups/jobs`).
+  - **86k** — `newBackupJobsLogsCmd` (`--job`/`--follow`/`--tail`) → `runBackupJobsLogs` builds
+    the path with `buildBackupJobLogsPath` (adds `?follow=true`/`?tailLines=N`) and calls
+    `client.GetStream(ctx, path, cmd.OutOrStdout())`. On a stream error it calls
+    `printBackupJobLogsFallback`, which prints the `kubectl logs -n <ns> job/<job>` instruction
+    rather than failing silently.
+
+- **The new operator logs endpoint** — `internal/api/server.go`:
+  - Registered as `GET /clusters/{name}/backups/jobs/{job}/logs` with `PermissionBasic`
+    (after `GET /backups/jobs`; the literal route wins over `/backups/{timestamp}`).
+  - `handleBackupJobLogs` validates the job name, requires the typed clientset (`501` when nil),
+    resolves the cluster (`404`), finds the Job's most-recent pod via `findJobPod` /
+    `mostRecentPodName` (`404 JOB_NOT_FOUND` when none), then `streamPodLogs` opens
+    `clientset.CoreV1().Pods(ns).GetLogs(pod, buildPodLogOptions(query))` and copies the stream
+    as `text/plain` (flushing for `--follow` via `copyLogStream`).
+  - **Clientset wiring** — the controller-runtime `client.Client` cannot stream pod logs, so the
+    `Server` now holds a typed `kubernetes.Interface`, injected by `Server.WithClientset(...)`
+    (wired from `mgr.GetConfig()` → `kubernetes.NewForConfig` in `cmd/operator/main.go`).
+
+- **The CLI streaming client** — `internal/ctl/client.go`:
+  - `OperatorClient.GetStream(ctx, path, out io.Writer)` applies auth, does **not** buffer or
+    JSON-parse the body, and `io.Copy`s the `text/plain` stream to `out`; a non-2xx status is
+    read (bounded) and returned as an `*APIError` via `streamError`. (The normal `do()` path
+    buffers and JSON-parses, so it is unsuitable for streaming.)
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`
+  (single S3 cluster `scenario86-s3`: backup enabled + schedule + incremental)
+- **Functional tests**: `test/functional/scenario86_cli_commands_test.go` (`TestFunctional_Scenario86`)
+- **Integration tests**: `test/integration/scenario86_cli_commands_integration_test.go` (`TestIntegration_Scenario86`)
+- **E2E tests**: `test/e2e/scenario86_cli_commands_e2e_test.go` (`TestE2E_Scenario86`)
+- **CLI unit tests**: `cmd/cloudberry-ctl/backup_scenario86_test.go` (build-request +
+  cobra method/path/body assertions, 86k streaming + fallback)
+- **Endpoint/handler unit tests**: `internal/api/backup_joblogs_test.go`,
+  `internal/api/backup_joblogs_scenario86_test.go`; client unit tests in
+  `internal/ctl/client_test.go` (`TestOperatorClient_GetStream_*`)
+- **Test-case catalog**: `test/cases/scenario86_cli_commands_cases.go`
+- **Live script**: `test/e2e/scripts/scenario86-cli-commands.sh` (builds the CLI, obtains an
+  OIDC token, port-forwards the operator API, runs every backup command 86a–k, and asserts the
+  created Job args, the CronJob schedule/suspend changes, and the streamed Job logs)
+
+```bash
+# Run Scenario 86 CLI-commands functional tests (all 11 commands: request mapping + 86k stream/fallback)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario86
+
+# Run Scenario 86 integration tests (envtest: real router + auth; logs endpoint stream/404)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario86
+
+# Run Scenario 86 CLI unit tests (buildCreate/Restore requests, method/path/body, GetStream stream+fallback)
+go test ./cmd/cloudberry-ctl/... -v -run 'Backup|Scenario86'
+
+# Run Scenario 86 logs-endpoint + GetStream unit tests
+go test ./internal/api/... -v -run 'BackupJobLogs|PodLogOptions|CopyLogStream'
+go test ./internal/ctl/... -v -run TestOperatorClient_GetStream
+
+# Run Scenario 86 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario86
+
+# Run the live OIDC-authed exercise of all 11 backup CLI commands against the deployed cluster
+bash test/e2e/scripts/scenario86-cli-commands.sh --cluster scenario86-s3
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

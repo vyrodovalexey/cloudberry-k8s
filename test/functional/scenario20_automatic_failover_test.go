@@ -300,15 +300,21 @@ func (s *Scenario20AutomaticFailoverSuite) TestDetection_RetriesOccurUpToFTSProb
 	assert.Empty(s.T(), updated.Status.FailedSegments,
 		"failedSegments should be empty when all healthy")
 
-	// Verify failure metrics were recorded for the failed attempts.
+	// The probe is recorded EXACTLY ONCE per probe with the terminal result. The
+	// two intermediate failed attempts are retried internally and must NOT each
+	// emit a metric (that was the over-counting bug). Since the 3rd attempt
+	// succeeded, the single terminal result is "success", not "failure".
 	failureCount := 0
 	for _, call := range mockMetrics.FTSProbeCalls {
 		if call.Result == "failure" {
 			failureCount++
 		}
 	}
-	assert.Equal(s.T(), 2, failureCount,
-		"fts_probe_failures_total should have been incremented twice for 2 failed attempts")
+	assert.Equal(s.T(), 0, failureCount,
+		"no failure metric should be recorded when the probe ultimately succeeds")
+	require.Len(s.T(), mockMetrics.FTSProbeCalls, 1,
+		"fts_probe must be recorded exactly once per probe, not once per retry")
+	assert.Equal(s.T(), "success", mockMetrics.FTSProbeCalls[0].Result)
 }
 
 // TestDetection_AllRetriesExhausted_ProbeFailureRecorded verifies that when all
@@ -346,15 +352,19 @@ func (s *Scenario20AutomaticFailoverSuite) TestDetection_AllRetriesExhausted_Pro
 	require.NoError(s.T(), err)
 	assert.NotZero(s.T(), result.RequeueAfter)
 
-	// Verify failure metrics were recorded for all 3 attempts.
+	// The probe is recorded EXACTLY ONCE per probe with the terminal result. All 3
+	// attempts failed, so the single terminal record is "failure" (the previous
+	// behavior recorded one per attempt, over-counting the failure rate).
 	failureCount := 0
 	for _, call := range mockMetrics.FTSProbeCalls {
 		if call.Result == "failure" {
 			failureCount++
 		}
 	}
-	assert.Equal(s.T(), 3, failureCount,
-		"fts_probe_failures_total should have been incremented 3 times for all exhausted retries")
+	assert.Equal(s.T(), 1, failureCount,
+		"fts_probe failure must be recorded exactly once for the exhausted-retries probe")
+	require.Len(s.T(), mockMetrics.FTSProbeCalls, 1,
+		"fts_probe must be recorded exactly once per probe, not once per retry")
 }
 
 // TestDetection_ProbeTimeoutRespected verifies that the probe timeout is applied
@@ -400,15 +410,19 @@ func (s *Scenario20AutomaticFailoverSuite) TestDetection_ProbeTimeoutRespected()
 	assert.Less(s.T(), elapsed, 10*time.Second,
 		"probe should complete within bounded time (retries * timeout)")
 
-	// Verify failure metrics were recorded.
+	// The probe is recorded EXACTLY ONCE per probe with the terminal result. Both
+	// attempts timed out, so the single terminal record is "failure" (previously
+	// each timed-out attempt was recorded, over-counting).
 	failureCount := 0
 	for _, call := range mockMetrics.FTSProbeCalls {
 		if call.Result == "failure" {
 			failureCount++
 		}
 	}
-	assert.Equal(s.T(), 2, failureCount,
-		"fts_probe_failures_total should have been incremented for each timed-out attempt")
+	assert.Equal(s.T(), 1, failureCount,
+		"fts_probe failure must be recorded exactly once for the timed-out probe")
+	require.Len(s.T(), mockMetrics.FTSProbeCalls, 1,
+		"fts_probe must be recorded exactly once per probe, not once per retry")
 }
 
 // ============================================================================

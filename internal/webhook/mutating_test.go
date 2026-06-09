@@ -31,6 +31,22 @@ func TestNewCloudberryClusterDefaulter(t *testing.T) {
 	require.NotNil(t, d)
 }
 
+// TestDefault_RecordsAdmissionWhenRecorderConfigured verifies that when a
+// metrics recorder is supplied via NewCloudberryClusterDefaulter, Default records
+// a mutating-webhook admission with result "allowed" (defaulting never denies).
+func TestDefault_RecordsAdmissionWhenRecorderConfigured(t *testing.T) {
+	rec := newCapturingRecorder()
+	d := NewCloudberryClusterDefaulter(rec)
+	cluster := newMinimalCluster()
+
+	require.NoError(t, d.Default(context.Background(), cluster))
+
+	assert.Equal(t, 1, rec.admissions)
+	assert.Equal(t, webhookMutating, rec.lastWebhook)
+	assert.Equal(t, admissionOpCreate, rec.lastOperation)
+	assert.Equal(t, admissionAllowed, rec.lastResult)
+}
+
 func TestDefault(t *testing.T) {
 	d := NewCloudberryClusterDefaulter()
 	cluster := newMinimalCluster()
@@ -313,12 +329,14 @@ func TestSetBackupDefaults(t *testing.T) {
 		assert.Equal(t, "gzip", gp.CompressionType)
 		assert.Equal(t, int32(1), gp.Jobs)
 		assert.False(t, gp.SingleDataFile)
-		assert.True(t, gp.WithStats)
+		require.NotNil(t, gp.WithStats)
+		assert.True(t, *gp.WithStats)
 
 		gr := cluster.Spec.Backup.Gprestore
 		require.NotNil(t, gr)
 		assert.Equal(t, int32(1), gr.Jobs)
-		assert.True(t, gr.WithStats)
+		require.NotNil(t, gr.WithStats)
+		assert.True(t, *gr.WithStats)
 
 		assert.Equal(t, int32(3), cluster.Spec.Backup.Retention.FullCount)
 		assert.Equal(t, "30d", cluster.Spec.Backup.Retention.MaxAge)
@@ -369,6 +387,73 @@ func TestSetBackupDefaults(t *testing.T) {
 		assert.Equal(t, int32(7), *cluster.Spec.Backup.JobTemplate.BackoffLimit)
 		require.NotNil(t, cluster.Spec.Backup.JobTemplate.ActiveDeadlineSeconds)
 		assert.Equal(t, int64(7200), *cluster.Spec.Backup.JobTemplate.ActiveDeadlineSeconds)
+	})
+}
+
+// backupClusterForDefaults returns a minimal backup-enabled cluster whose
+// Gpbackup/Gprestore options can be tuned per-test before defaulting.
+func backupClusterForDefaults(
+	gp *cbv1alpha1.GpbackupOptions,
+	gr *cbv1alpha1.GprestoreOptions,
+) *cbv1alpha1.CloudberryCluster {
+	cluster := newMinimalCluster()
+	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
+		Enabled: true,
+		Destination: cbv1alpha1.BackupDestination{
+			Type: "s3",
+			S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
+		},
+		Gpbackup:  gp,
+		Gprestore: gr,
+	}
+	return cluster
+}
+
+// TestSetBackupDefaults_WithStatsPointer verifies the *bool defaulting contract
+// for WithStats: an UNSET (nil) value is defaulted to true, while an EXPLICIT
+// false set by the user is preserved (never silently forced back to true). This
+// guards the regression where WithStats was a plain bool and withStats:false was
+// reverted to true on every admission.
+func TestSetBackupDefaults_WithStatsPointer(t *testing.T) {
+	t.Run("unset withStats defaults to true", func(t *testing.T) {
+		cluster := backupClusterForDefaults(
+			&cbv1alpha1.GpbackupOptions{},
+			&cbv1alpha1.GprestoreOptions{},
+		)
+		setBackupDefaults(cluster)
+
+		require.NotNil(t, cluster.Spec.Backup.Gpbackup.WithStats)
+		assert.True(t, *cluster.Spec.Backup.Gpbackup.WithStats, "unset gpbackup.withStats defaults true")
+		require.NotNil(t, cluster.Spec.Backup.Gprestore.WithStats)
+		assert.True(t, *cluster.Spec.Backup.Gprestore.WithStats, "unset gprestore.withStats defaults true")
+	})
+
+	t.Run("explicit false is preserved", func(t *testing.T) {
+		cluster := backupClusterForDefaults(
+			&cbv1alpha1.GpbackupOptions{WithStats: util.Ptr(false)},
+			&cbv1alpha1.GprestoreOptions{WithStats: util.Ptr(false)},
+		)
+		setBackupDefaults(cluster)
+
+		require.NotNil(t, cluster.Spec.Backup.Gpbackup.WithStats)
+		assert.False(t, *cluster.Spec.Backup.Gpbackup.WithStats,
+			"explicit gpbackup.withStats:false must NOT be forced to true")
+		require.NotNil(t, cluster.Spec.Backup.Gprestore.WithStats)
+		assert.False(t, *cluster.Spec.Backup.Gprestore.WithStats,
+			"explicit gprestore.withStats:false must NOT be forced to true")
+	})
+
+	t.Run("explicit true is preserved", func(t *testing.T) {
+		cluster := backupClusterForDefaults(
+			&cbv1alpha1.GpbackupOptions{WithStats: util.Ptr(true)},
+			&cbv1alpha1.GprestoreOptions{WithStats: util.Ptr(true)},
+		)
+		setBackupDefaults(cluster)
+
+		require.NotNil(t, cluster.Spec.Backup.Gpbackup.WithStats)
+		assert.True(t, *cluster.Spec.Backup.Gpbackup.WithStats)
+		require.NotNil(t, cluster.Spec.Backup.Gprestore.WithStats)
+		assert.True(t, *cluster.Spec.Backup.Gprestore.WithStats)
 	})
 }
 

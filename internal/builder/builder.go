@@ -45,6 +45,10 @@ const (
 	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
 	secretKeyPassword = "password"
 
+	// envPGPassword is the libpq PGPASSWORD env var name. It is sourced from a
+	// Secret (never embedded as plaintext) on the backup/restore/migration pods.
+	envPGPassword = "PGPASSWORD" //nolint:gosec // env var NAME, not a credential
+
 	// maintenanceContainerName is the container name for maintenance jobs.
 	maintenanceContainerName = "maintenance"
 
@@ -160,6 +164,10 @@ type ResourceBuilder interface {
 	// BuildPostRestoreValidationJob builds a post-restore validation Job.
 	BuildPostRestoreValidationJob(
 		cluster *cbv1alpha1.CloudberryCluster, opts *ValidationJobOptions) *batchv1.Job
+	// BuildMigrationJob builds the single coordinated cross-cluster migration Job
+	// that captures the real gpbackup timestamp and feeds it to gprestore (spec 11
+	// §Cross-Cluster Migration).
+	BuildMigrationJob(opts *MigrationJobOptions) *batchv1.Job
 }
 
 // DefaultBuilder implements ResourceBuilder.
@@ -826,7 +834,7 @@ func (b *DefaultBuilder) BuildMaintenanceJob(
 							},
 							Env: []corev1.EnvVar{
 								{
-									Name: "PGPASSWORD",
+									Name: envPGPassword,
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
 											LocalObjectReference: corev1.LocalObjectReference{

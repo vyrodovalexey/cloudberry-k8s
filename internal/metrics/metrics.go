@@ -10,16 +10,21 @@ import (
 const (
 	metricsNamespace = "cloudberry"
 
-	labelCluster    = "cluster"
-	labelNamespace  = "namespace"
-	labelPhase      = "phase"
-	labelVersion    = "version"
-	labelSegment    = "segment"
-	labelComponent  = "component"
-	labelOperation  = "operation"
-	labelResult     = "result"
-	labelType       = "type"
-	labelJob        = "job"
+	labelCluster   = "cluster"
+	labelNamespace = "namespace"
+	labelPhase     = "phase"
+	labelVersion   = "version"
+	labelSegment   = "segment"
+	labelComponent = "component"
+	labelOperation = "operation"
+	labelResult    = "result"
+	labelType      = "type"
+	labelJob       = "job"
+	// labelJobName is the non-reserved label carrying the Kubernetes Job name
+	// for backup_job_status. The reserved Prometheus label `job` is overwritten
+	// by the scrape config's job_name during scrape, so a dedicated label is
+	// required to preserve the per-Job identity in VictoriaMetrics.
+	labelJobName    = "job_name"
 	labelSourceType = "source_type"
 	labelSource     = "source"
 	labelWebhook    = "webhook"
@@ -97,6 +102,9 @@ type Recorder interface {
 	SetBackupJobStatus(cluster, namespace, job, operation string, status float64)
 	// RecordRestore records a restore event.
 	RecordRestore(cluster, namespace, status string)
+	// RecordRestoreValidation records a post-restore validation outcome
+	// (result is "success" or "failed").
+	RecordRestoreValidation(cluster, namespace, result string)
 	// SetDataLoadingJobsActive sets the number of active data loading jobs.
 	SetDataLoadingJobsActive(cluster, namespace string, count float64)
 	// RecordDataLoadingRows records the number of rows loaded by a job.
@@ -230,6 +238,7 @@ type PrometheusRecorder struct {
 	backupRetentionDeleted     *prometheus.CounterVec
 	backupJobStatus            *prometheus.GaugeVec
 	restoreTotal               *prometheus.CounterVec
+	restoreValidationTotal     *prometheus.CounterVec
 	dataLoadingJobsGauge       *prometheus.GaugeVec
 	dataLoadingRows            *prometheus.CounterVec
 
@@ -491,11 +500,16 @@ func (r *PrometheusRecorder) initBackupMetrics() {
 		Namespace: metricsNamespace,
 		Name:      "backup_job_status",
 		Help:      "Kubernetes backup Job status (0=pending, 1=running, 2=succeeded, 3=failed).",
-	}, []string{labelCluster, labelNamespace, labelJob, labelOperation})
+	}, []string{labelCluster, labelNamespace, labelJobName, labelOperation})
 	r.restoreTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "restore_total",
 		Help:      "Total number of restore operations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.restoreValidationTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "restore_validation_total",
+		Help:      "Total number of post-restore validation outcomes.",
 	}, []string{labelCluster, labelNamespace, labelResult})
 	r.dataLoadingJobsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
@@ -746,7 +760,8 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.backupTotal, r.backupDuration, r.backupSizeBytes,
 		r.backupLastSuccessTimestamp, r.backupLastStatus, r.restoreDuration,
 		r.backupRetentionDeleted, r.backupJobStatus,
-		r.restoreTotal, r.dataLoadingJobsGauge, r.dataLoadingRows,
+		r.restoreTotal, r.restoreValidationTotal,
+		r.dataLoadingJobsGauge, r.dataLoadingRows,
 		r.diskUsagePercent, r.recommendationsTotal,
 		r.recommendationScanDur, r.tableBloatRatio,
 		r.scaleOperationsTotal, r.redistributionProgressVec,
@@ -950,6 +965,12 @@ func (r *PrometheusRecorder) SetBackupJobStatus(cluster, namespace, job, operati
 // RecordRestore records a restore event.
 func (r *PrometheusRecorder) RecordRestore(cluster, namespace, status string) {
 	r.restoreTotal.WithLabelValues(cluster, namespace, status).Inc()
+}
+
+// RecordRestoreValidation records a post-restore validation outcome
+// (result is "success" or "failed").
+func (r *PrometheusRecorder) RecordRestoreValidation(cluster, namespace, result string) {
+	r.restoreValidationTotal.WithLabelValues(cluster, namespace, result).Inc()
 }
 
 // SetDataLoadingJobsActive sets the number of active data loading jobs.
@@ -1270,6 +1291,9 @@ func (n *NoopRecorder) SetBackupJobStatus(_, _, _, _ string, _ float64) {}
 
 // RecordRestore is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRestore(_, _, _ string) {}
+
+// RecordRestoreValidation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRestoreValidation(_, _, _ string) {}
 
 // SetDataLoadingJobsActive is a no-op implementation for testing.
 func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64) {}

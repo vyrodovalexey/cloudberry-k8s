@@ -117,6 +117,11 @@ spec:
             - name: health
               containerPort: 8081
               protocol: TCP
+            {{- if .Values.api.enabled }}
+            - name: api
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook
               containerPort: {{ .Values.operator.webhookPort }}

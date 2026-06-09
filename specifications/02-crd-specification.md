@@ -359,7 +359,7 @@ spec:
                     ftsProbeRetries:
                       type: integer
                       default: 5
-                      description: "Maximum number of retry attempts for GetSegmentConfiguration during FTS probe. Each failed attempt increments fts_probe_failures_total. After all retries are exhausted, the probe cycle fails."
+                      description: "Maximum number of retry attempts for GetSegmentConfiguration during FTS probe. After all retries are exhausted, the probe cycle fails and fts_probe_failures_total is incremented once for the cycle (not per attempt)."
                     checksums:
                       type: boolean
                       default: true

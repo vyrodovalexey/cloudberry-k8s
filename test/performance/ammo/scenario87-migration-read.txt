@@ -1,0 +1,14 @@
+[Host: localhost:8190]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest]
+[Accept: application/json]
+/api/v1alpha1/clusters/scenario87-src
+/api/v1alpha1/clusters/scenario87-src/backups
+/api/v1alpha1/clusters/scenario87-src/backups/jobs
+/api/v1alpha1/clusters/scenario87-dst
+/api/v1alpha1/clusters/scenario87-dst/backups
+/api/v1alpha1/clusters/scenario87-dst/backups/jobs
+/api/v1alpha1/clusters/scenario87-src
+/api/v1alpha1/clusters/scenario87-dst
+/api/v1alpha1/clusters/scenario87-src/backups/jobs
+/api/v1alpha1/clusters/scenario87-dst/backups/jobs

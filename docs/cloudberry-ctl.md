@@ -24,6 +24,7 @@ All commands communicate with the operator via HTTP calls to the REST API server
   - [auth](#auth)
   - [inspect](#inspect)
   - [resource-group](#resource-group)
+  - [migrate](#migrate)
 - [Output Formats](#output-formats)
 - [Exit Codes](#exit-codes)
 - [Shell Completion](#shell-completion)
@@ -1767,6 +1768,41 @@ node-exporter                node_exporter               9100  true     2026-05-
 | `healthyCount` | int | Number of healthy exporters |
 
 This command calls `GET /clusters/{name}/metrics/exporters` on the operator REST API.
+
+---
+
+### migrate
+
+Migrate a database between two clusters. The operator creates a **single coordinated migration Job** that runs the whole backup → restore → validate sequence and validates row counts on the target on success.
+
+```bash
+cloudberry-ctl migrate --source-cluster src --target-cluster dst \
+  --database mydb \
+  --tables "public.users,public.orders" \
+  --truncate
+```
+
+Internally the operator creates **one** Job `<source>-migration-<ts>` (label `avsoft.io/backup-operation=migrate`) that, under the coordinator-exec model:
+
+1. Execs `gpbackup` inside the **source** coordinator and **captures the real gpbackup timestamp** from its output.
+2. Prepares the target DB on the **target** coordinator: with `--truncate` it DROPs+recreates the target DB (clean target); without `--truncate` it CREATEs the DB if absent.
+3. Execs `gprestore --timestamp <captured>` inside the **target** coordinator (it does **not** pass `--truncate-table`).
+4. Runs post-migration validation (row-count probe + invalid-index scan + health check) on the target, emitting `post-restore-validate: passed`.
+
+**Flags:**
+
+| Flag | Type | Required | Description |
+|------|------|----------|-------------|
+| `--source-cluster` | string | Yes | Source cluster name |
+| `--target-cluster` | string | Yes | Target cluster name |
+| `--database` | string | No | Database to migrate (`gpbackup --dbname`) |
+| `--tables` | string | No | Comma-separated tables → repeated `--include-table` on both tools |
+| `--truncate` | bool | No | Clean target: DROP+recreate the target DB empty before restore |
+| `--redirect-db` | string | No | `gprestore --redirect-db` on the target |
+| `--redirect-schema` | string | No | `gprestore --redirect-schema` on the target |
+| `--jobs` | int | No | `gprestore --jobs` (restore parallelism) on the target |
+
+Both clusters must be backup-enabled with an **S3** destination sharing the **same bucket** (else `400`); the migration reads the **source** cluster's S3 folder for both phases. This command calls `POST /clusters/{source}/migrate` (**Admin** permission) on the operator REST API.
 
 ---
 

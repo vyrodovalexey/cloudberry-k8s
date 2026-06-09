@@ -1,0 +1,274 @@
+# =============================================================================
+# Scenario 82 — Security and Encryption (S3/MinIO destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus an S3 (MinIO) backup destination with
+# encryption ON and a jobTemplate.imagePullSecrets entry.
+#
+# Scenario 82 exercises the backup security + encryption surface:
+#   82a Credentials never on disk/ConfigMap: the S3 ConfigMap
+#       (scenario82-s3-backup-s3-config) carries ONLY ${...} placeholders; the
+#       real credentials live ONLY in the s3-credentials Secret and enter the
+#       running pod solely as env via SecretKeyRef.
+#   82b Ephemeral render: /tmp/s3-config.yaml is rendered IN-POD at runtime
+#       (envsubst < /etc/gpbackup/s3-plugin-config.yaml.tpl > /tmp/s3-config.yaml);
+#       the resolved file (with creds) exists ONLY in the ephemeral pod fs.
+#   82c Dedicated SA / minimal RBAC: backup Jobs run as cloudberry-backup-sa,
+#       which CANNOT get the unrelated-secret Secret but CAN get the
+#       backup-relevant Secrets (admin-password, ssh-keys, vault-creds,
+#       s3-credentials). Requires the operator chart installed with
+#       backup.rbac.scopeSecrets=true + backup.rbac.secretNames (see below).
+#   82d TLS with encryption: with encryption: "on" the S3 plugin encryption
+#       option is on (rendered config encryption: on / S3_ENCRYPTION env on);
+#       patching the CR to encryption: "off" flips it. The test-env MinIO is
+#       HTTP-only, so 82d is verified via the PLUGIN encryption option (the
+#       scenario explicitly allows "plugin SSL option set"), NOT literal HTTPS.
+#   82e imagePullSecrets: spec.backup.jobTemplate.imagePullSecrets [{name: regcred}]
+#       appears in the backup Job pod spec.
+#
+# SECURITY MODEL NOTE
+# -------------------
+# The real S3 credentials are stored ONLY in the s3-credentials Secret (below).
+# The operator's BuildBackupS3ConfigMap renders a placeholders-only template; the
+# backup Job's container env injects AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY via
+# SecretKeyRef (kubelet, not the SA). The tool script then envsubst-renders the
+# resolved config to the ephemeral /tmp/s3-config.yaml at runtime. The credential
+# values are therefore never persisted in a ConfigMap or on any host disk.
+#
+# SCOPED RBAC (82c) — install/upgrade the operator chart with:
+#   backup:
+#     rbac:
+#       create: true
+#       scopeSecrets: true
+#       secretNames:
+#         - scenario82-s3-admin-password
+#         - scenario82-s3-ssh-keys
+#         - scenario82-s3-backup-s3-vault-creds   # harmless if Vault S3 unused
+#         - s3-credentials                         # the user credential Secret
+# The default chart keeps scopeSecrets:false (namespace-wide get, backward
+# compatible); Scenario 82 opts in so the "unrelated Secret denied" check passes
+# WITHOUT breaking the named backups.
+#
+# Live test: test/e2e/scripts/scenario82-security-encryption.sh \
+#   --cluster scenario82-s3
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "82"
+type: Opaque
+stringData:
+  # The real S3/MinIO credentials live ONLY here. They NEVER appear in the
+  # rendered ConfigMap (82a) — only as SecretKeyRef env in the running pod.
+  aws_access_key_id: minioadmin
+  aws_secret_access_key: minioadmin
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: unrelated-secret
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "82"
+type: Opaque
+stringData:
+  # An UNRELATED Secret used by the 82c deny test: cloudberry-backup-sa must NOT
+  # be able to get this Secret (scoped RBAC excludes it from resourceNames).
+  token: do-not-read-me
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: regcred
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "82"
+type: kubernetes.io/dockerconfigjson
+stringData:
+  # A docker-registry-style imagePullSecret (82e). The value is a placeholder
+  # empty auths object so the manifest applies cleanly in test environments; the
+  # scenario asserts the SECRET NAME propagates into the Job pod spec (a real
+  # private-registry pull is environment-dependent / best-effort).
+  .dockerconfigjson: '{"auths":{}}'
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario82-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "82"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario82-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario82-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination with encryption ON. The S3
+  # ConfigMap is placeholders-only (82a); /tmp/s3-config.yaml is rendered in-pod
+  # at runtime (82b); the backup Job runs as cloudberry-backup-sa (82c) and
+  # carries imagePullSecrets [regcred] (82e). No schedule is set: Scenario 82
+  # drives on-demand backup Jobs so each surfaces on a discrete reconciled
+  # resource. Encryption is flipped to "off" live by patching the CR (82d).
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: s3
+      s3:
+        endpoint: "http://host.docker.internal:9000"   # HTTP test MinIO
+        region: "us-east-1"
+        bucket: "cloudberry-backups"
+        folder: "scenario82"
+        encryption: "on"                                # 82d: flip to off live
+        forcePathStyle: true
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+        credentialSecret:
+          name: s3-credentials                          # 82a: creds only here
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+    jobTemplate:
+      serviceAccountName: cloudberry-backup-sa          # 82c
+      imagePullSecrets:                                 # 82e
+        - name: regcred
+
+  deletionPolicy: Delete

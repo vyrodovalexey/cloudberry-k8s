@@ -1,0 +1,343 @@
+# =============================================================================
+# Scenario 87 — Cross-Cluster Migration (source + target clusters)
+# =============================================================================
+# Two CloudberryClusters that share the SAME S3 bucket (cloudberry-backups) with
+# DIFFERENT folders. `cloudberry-ctl migrate` runs a gpbackup Job on the source
+# and a gprestore Job on the target referencing the shared bucket, plus a
+# post-migration validation Job on the target.
+#
+# Both clusters:
+#   - HA coordinator + standby
+#   - Segment mirroring (group layout, 2 primary + 2 mirror)
+#   - TLS certificates from Vault PKI (scenario87-src-tls / scenario87-dst-tls)
+#   - postgres-exporter on coordinator + segments + mirrors, cloudberry-query-exporter
+#   - S3 (MinIO) backup destination, shared bucket "cloudberry-backups"
+#   - OIDC auth via Keycloak, Vault KV for secrets
+#
+# Prereqs (created by the env setup / live script):
+#   - Secret backup-s3-credentials (MinIO creds) in cloudberry-test
+#   - Secret oidc-client-secret in cloudberry-test
+#   - Secrets scenario87-src-tls / scenario87-dst-tls (Vault PKI issued)
+#   - ExternalName Service "minio" -> host.docker.internal:9000
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario87-src
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "87"
+    role: source
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: scenario87-src-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    gpbackup:
+      compressionType: zstd
+      compressionLevel: 1
+      jobs: 4
+    destination:
+      type: s3
+      s3:
+        endpoint: "http://host.docker.internal:9000"
+        region: "us-east-1"
+        bucket: "cloudberry-backups"
+        folder: "scenario87-src"
+        encryption: "off"
+        forcePathStyle: true
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+
+  deletionPolicy: Delete
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario87-dst
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "87"
+    role: target
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: scenario87-dst-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    gpbackup:
+      compressionType: zstd
+      compressionLevel: 1
+      jobs: 4
+    destination:
+      type: s3
+      s3:
+        endpoint: "http://host.docker.internal:9000"
+        region: "us-east-1"
+        bucket: "cloudberry-backups"
+        folder: "scenario87-dst"
+        encryption: "off"
+        forcePathStyle: true
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+
+  deletionPolicy: Delete

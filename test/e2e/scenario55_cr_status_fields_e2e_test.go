@@ -402,6 +402,7 @@ func (m *scenario55E2EMetricsRecorder) ObserveRestoreDuration(_, _ string, _ tim
 func (m *scenario55E2EMetricsRecorder) RecordBackupRetentionDeleted(_, _ string, _ int)       {}
 func (m *scenario55E2EMetricsRecorder) SetBackupJobStatus(_, _, _, _ string, _ float64)       {}
 func (m *scenario55E2EMetricsRecorder) RecordRestore(_, _, _ string)                          {}
+func (m *scenario55E2EMetricsRecorder) RecordRestoreValidation(_, _, _ string)                {}
 func (m *scenario55E2EMetricsRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)       {}
 func (m *scenario55E2EMetricsRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)    {}
 func (m *scenario55E2EMetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64)            {}

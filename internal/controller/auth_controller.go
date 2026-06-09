@@ -59,20 +59,31 @@ func NewAuthReconciler(
 }
 
 // Reconcile handles the auth reconciliation for CloudberryCluster resources.
-func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	startTime := time.Now()
 	logger := r.logger.With("cluster", req.Name, "namespace", req.Namespace)
 	ctx = util.WithLogger(ctx, logger)
 
 	ctx, span := telemetry.StartSpan(ctx, authControllerName, "Reconcile")
 	defer span.End()
 
+	// Record the reconcile outcome and duration exactly once on return. Using a
+	// deferred closure over the named error captures both success and error
+	// paths so cloudberry_reconcile_total / _errors_total / _duration_seconds
+	// cover the auth controller (recorder is nil-guarded).
+	defer func() {
+		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime, err)
+	}()
+
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
-	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
-		if apierrors.IsNotFound(err) {
+	if getErr := r.client.Get(ctx, req.NamespacedName, cluster); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
+		err = fmt.Errorf("fetching cluster: %w", getErr)
+		telemetry.SetSpanError(span, err)
+		return ctrl.Result{}, err
 	}
 
 	// Skip if cluster is not running or initializing.
@@ -88,18 +99,20 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Reconcile pg_hba.conf.
-	if err := r.reconcileHBA(ctx, cluster); err != nil {
-		logger.Error("failed to reconcile HBA", "error", err)
+	if hbaErr := r.reconcileHBA(ctx, cluster); hbaErr != nil {
+		logger.Error("failed to reconcile HBA", "error", hbaErr)
 		cluster.Status.Conditions = util.SetCondition(
 			cluster.Status.Conditions,
 			string(cbv1alpha1.ConditionAuthConfigured),
 			metav1.ConditionFalse,
 			"HBAReconcileFailed",
-			fmt.Sprintf("Failed to reconcile pg_hba.conf: %v", err),
+			fmt.Sprintf("Failed to reconcile pg_hba.conf: %v", hbaErr),
 		)
 		if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
 			logger.Error("failed to update status", "error", statusErr)
 		}
+		err = hbaErr
+		telemetry.SetSpanError(span, err)
 		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
@@ -129,8 +142,10 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	// Use Status().Patch() with MergePatch to prevent clobbering status changes
 	// from other controllers.
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating auth status: %w", err)
+	if patchErr := patchStatus(ctx, r.client, cluster); patchErr != nil {
+		err = fmt.Errorf("updating auth status: %w", patchErr)
+		telemetry.SetSpanError(span, err)
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: authReconcileInterval}, nil

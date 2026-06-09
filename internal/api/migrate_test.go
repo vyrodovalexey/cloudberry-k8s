@@ -34,6 +34,25 @@ func migrateCluster(name, bucket string) *cbv1alpha1.CloudberryCluster {
 	return cluster
 }
 
+// migrateClusterWithFolder returns a backup-enabled S3 cluster with an explicit
+// S3 folder, used to reproduce the Scenario 87 cross-cluster folder mismatch.
+func migrateClusterWithFolder(name, bucket, folder string) *cbv1alpha1.CloudberryCluster {
+	cluster := migrateCluster(name, bucket)
+	cluster.Spec.Backup.Destination.S3.Folder = folder
+	return cluster
+}
+
+// jobS3Folder returns the S3_FOLDER env value on the first container of the Job,
+// or "" when absent.
+func jobS3Folder(job *batchv1.Job) string {
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "S3_FOLDER" {
+			return env.Value
+		}
+	}
+	return ""
+}
+
 func postMigrateRequest(source, body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost,
 		apiPrefix+"/clusters/"+source+"/migrate?namespace=default", strings.NewReader(body))
@@ -41,7 +60,11 @@ func postMigrateRequest(source, body string) *http.Request {
 	return req
 }
 
-func TestHandleMigrate_CreatesTwoJobsSharedTimestamp(t *testing.T) {
+// TestHandleMigrate_CreatesSingleCoordinatedJob asserts the FINAL cross-cluster
+// fix: the migration runs as ONE coordinated Job that captures the real gpbackup
+// timestamp and feeds it to gprestore. The 202 envelope's backupJob/restoreJob/
+// validationJob fields all reference that single migration Job.
+func TestHandleMigrate_CreatesSingleCoordinatedJob(t *testing.T) {
 	source := migrateCluster("src", "shared-bucket")
 	target := migrateCluster("dst", "shared-bucket")
 	s := newTestServerWithBatch(source, target)
@@ -59,32 +82,44 @@ func TestHandleMigrate_CreatesTwoJobsSharedTimestamp(t *testing.T) {
 	assert.Equal(t, "src", resp["sourceCluster"])
 	assert.Equal(t, "dst", resp["targetCluster"])
 
-	backupJobName, _ := resp["backupJob"].(string)
-	restoreJobName, _ := resp["restoreJob"].(string)
-	assert.Equal(t, util.BackupJobName("src", timestamp), backupJobName)
-	assert.Equal(t, util.RestoreJobName("dst", timestamp), restoreJobName)
+	// The migration is a single Job; all phase fields reference it.
+	migrationJobName, _ := resp["migrationJob"].(string)
+	assert.Equal(t, util.MigrationJobName("src", timestamp), migrationJobName)
+	assert.Equal(t, migrationJobName, resp["backupJob"])
+	assert.Equal(t, migrationJobName, resp["restoreJob"])
+	assert.Equal(t, migrationJobName, resp["validationJob"])
 
-	// Both Jobs must actually exist in their respective clusters.
+	// The single migration Job must exist and carry the migrate operation label.
 	ctx := context.Background()
-	backupJob := &batchv1.Job{}
+	migrationJob := &batchv1.Job{}
 	require.NoError(t, s.k8sClient.Get(ctx,
-		client.ObjectKey{Name: backupJobName, Namespace: "default"}, backupJob))
-	restoreJob := &batchv1.Job{}
-	require.NoError(t, s.k8sClient.Get(ctx,
-		client.ObjectKey{Name: restoreJobName, Namespace: "default"}, restoreJob))
+		client.ObjectKey{Name: migrationJobName, Namespace: "default"}, migrationJob))
+	assert.Equal(t, util.BackupOperationMigrate,
+		migrationJob.Labels[util.LabelBackupOperation])
 
-	// The backup Job must include the requested table and single-data-file.
-	backupScript := backupJob.Spec.Template.Spec.Containers[0].Args[0]
-	assert.Contains(t, backupScript, "--include-table")
-	assert.Contains(t, backupScript, "public.users")
-	assert.Contains(t, backupScript, "--single-data-file")
-
-	// The restore Job must share the timestamp and truncate (args are shell-quoted).
-	restoreScript := restoreJob.Spec.Template.Spec.Containers[0].Args[0]
-	assert.Contains(t, restoreScript, timestamp)
-	assert.Contains(t, restoreScript, "--truncate-table")
-	assert.Contains(t, restoreScript, "--redirect-db")
-	assert.Contains(t, restoreScript, "mydb")
+	script := migrationJob.Spec.Template.Spec.Containers[0].Args[0]
+	// Backup phase: requested table + single-data-file + dbname, and the REAL
+	// gpbackup timestamp capture (the fix) — NOT the operator timestamp.
+	assert.Contains(t, script, "--include-table")
+	assert.Contains(t, script, "public.users")
+	assert.Contains(t, script, "--single-data-file")
+	assert.Contains(t, script, "--dbname")
+	assert.Contains(t, script, "grep -oE 'Backup Timestamp = [0-9]{14}'")
+	// Restore phase: fed the CAPTURED gpbackup timestamp ($7), redirect. It must
+	// NOT use --truncate-table: the migration restores into a fresh empty target
+	// DB (metadata + data), where --truncate-table would TRUNCATE not-yet-existing
+	// objects during the pre-data metadata phase and abort with 42P01.
+	assert.Contains(t, script, "gprestore --plugin-config")
+	assert.Contains(t, script, "--timestamp \"$7\"")
+	assert.NotContains(t, script, "--truncate-table",
+		"migration restore must NOT use --truncate-table (fresh-DB restore)")
+	assert.Contains(t, script, "--redirect-db")
+	assert.Contains(t, script, "mydb")
+	// truncate=true => clean target: the target DB is DROPped+recreated empty.
+	assert.Contains(t, script, "clean+recreate target database (target coordinator)")
+	assert.Contains(t, script, "DROP DATABASE IF EXISTS")
+	// The restore must NOT pin the operator-chosen timestamp anywhere (the bug).
+	assert.NotContains(t, script, "--timestamp '"+timestamp+"'")
 }
 
 func TestHandleMigrate_DifferentBuckets(t *testing.T) {
@@ -180,10 +215,10 @@ func TestHandleMigrate_RedirectDb(t *testing.T) {
 	var resp map[string]interface{}
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	timestamp, _ := resp[responseKeyTimestamp].(string)
-	restoreJob := &batchv1.Job{}
+	migrationJob := &batchv1.Job{}
 	require.NoError(t, s.k8sClient.Get(context.Background(),
-		client.ObjectKey{Name: util.RestoreJobName("dst", timestamp), Namespace: "default"}, restoreJob))
-	script := restoreJob.Spec.Template.Spec.Containers[0].Args[0]
+		client.ObjectKey{Name: util.MigrationJobName("src", timestamp), Namespace: "default"}, migrationJob))
+	script := migrationJob.Spec.Template.Spec.Containers[0].Args[0]
 	assert.Contains(t, script, "otherdb")
 }
 
@@ -193,6 +228,37 @@ func TestHandleMigrate_InvalidBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.handleMigrate(rec, postMigrateRequest("src", `{bad`))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestHandleMigrate_RestoreUsesSourceFolder reproduces Scenario 87: the source
+// cluster backs up to folder "scenario87-src" while the target's own folder is
+// "scenario87-dst". The single migration Job's S3 plugin config "folder:" must
+// point at the SOURCE folder for BOTH the backup and the (target) restore,
+// otherwise gprestore looks under the target folder and fails with NotFound.
+// This is the regression guard for the cross-cluster migration folder fix (spec
+// 11 §Cross-Cluster Migration), preserved under the single-Job topology.
+func TestHandleMigrate_RestoreUsesSourceFolder(t *testing.T) {
+	source := migrateClusterWithFolder("src", "cloudberry-backups", "scenario87-src")
+	target := migrateClusterWithFolder("dst", "cloudberry-backups", "scenario87-dst")
+	s := newTestServerWithBatch(source, target)
+
+	rec := httptest.NewRecorder()
+	s.handleMigrate(rec, postMigrateRequest("src",
+		`{"targetCluster":"dst","database":"mydb","tables":["public.users"]}`))
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	timestamp, _ := resp[responseKeyTimestamp].(string)
+	require.NotEmpty(t, timestamp)
+
+	// The single migration Job must use the SOURCE folder (where gpbackup wrote)
+	// for both the backup and the restore phases, NOT the target's own folder.
+	migrationJob := &batchv1.Job{}
+	require.NoError(t, s.k8sClient.Get(context.Background(),
+		client.ObjectKey{Name: util.MigrationJobName("src", timestamp), Namespace: "default"}, migrationJob))
+	assert.Equal(t, "scenario87-src", jobS3Folder(migrationJob),
+		"migration Job must read/write the source folder, not the target folder")
 }
 
 func TestHandleCreateBackup_IncrementalArgs(t *testing.T) {

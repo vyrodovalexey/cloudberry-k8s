@@ -1,0 +1,235 @@
+# =============================================================================
+# Scenario 83 — Backup Failure Handling (S3/MinIO destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus an S3 (MinIO) backup destination with an
+# explicit jobTemplate.backoffLimit: 2 (so a failed backup retries up to
+# backoffLimit before ending terminal Failed).
+#
+# Scenario 83 exercises the backup FAILURE-handling surface:
+#   83-healthy : a real healthy gpbackup of mydb against the GOOD S3 endpoint
+#       succeeds ("Backup completed successfully"); a Succeeded backup Job +
+#       reconcile => status.lastBackupStatus=Success and
+#       cloudberry_backup_last_status=0.
+#   83a force-failure : a backup Job (backoffLimit: 2) whose S3 destination is
+#       unreachable / has bad credentials fails fast on the pre-backup S3
+#       reachability check; the Job RETRIES up to backoffLimit (2) and ends
+#       terminal Failed with a JobFailed condition reason=BackoffLimitExceeded.
+#       The operator observes the latest backup Job and records
+#       status.lastBackupStatus=Failed and cloudberry_backup_last_status=1. The
+#       standalone Job failing on bad S3 connect is the correct observable (the
+#       Job pod is not a segment host — it fails on S3 connect, deterministically).
+#   83b deadline : a per-run backup Job with a LOW activeDeadlineSeconds (5) and a
+#       long command (sleep 600) is killed by Kubernetes at the deadline with a
+#       JobFailed condition reason=DeadlineExceeded; the operator records it as
+#       Failed and cloudberry_backup_last_status=1. The deadline sub-test uses a
+#       PER-RUN materialized Job, NOT by lowering this CR's production deadline.
+#
+# DEADLINE NOTE
+# -------------
+# This CR keeps the steady-state activeDeadlineSeconds at the SAFE default
+# (7200). The live script (test/e2e/scripts/scenario83-backup-failure.sh)
+# MATERIALIZES a per-run, operator-shaped backup Job with
+# spec.activeDeadlineSeconds: 5 + a long sleep for the deadline kill, so the
+# production cluster deadline is never lowered and the test is reversible.
+#
+# FORCE-FAILURE NOTE
+# ------------------
+# The live script materializes a per-run backup Job whose container fails fast
+# (a bad/unreachable S3 endpoint, e.g. http://minio-bad:9000, or wrong creds, or
+# simply `exit 1` to simulate the plugin failure) with backoffLimit: 2 so it
+# retries up to backoffLimit and ends BackoffLimitExceeded. The GOOD endpoint
+# below is used by the 83-healthy real gpbackup success path.
+#
+# Live test: test/e2e/scripts/scenario83-backup-failure.sh --cluster scenario83-s3
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "83"
+type: Opaque
+stringData:
+  # The GOOD S3/MinIO credentials for the healthy backup success path. The
+  # force-failure Job uses a bad/unreachable endpoint (or bad creds), injected by
+  # the live script, so it fails fast on the S3 reachability check.
+  aws_access_key_id: minioadmin
+  aws_secret_access_key: minioadmin
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario83-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "83"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario83-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario83-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination. No schedule is set: Scenario 83
+  # drives on-demand backup Jobs so each surfaces on a discrete reconciled
+  # resource. The jobTemplate sets an EXPLICIT backoffLimit: 2 (the force-failure
+  # Job retries up to backoffLimit before terminal BackoffLimitExceeded) and keeps
+  # the SAFE production activeDeadlineSeconds: 7200 (the deadline sub-test uses a
+  # per-run Job with activeDeadlineSeconds: 5, NOT this CR).
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: s3
+      s3:
+        endpoint: "http://host.docker.internal:9000"   # GOOD endpoint (healthy path)
+        region: "us-east-1"
+        bucket: "cloudberry-backups"
+        folder: "scenario83"
+        encryption: "on"
+        forcePathStyle: true
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+        credentialSecret:
+          name: s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+    jobTemplate:
+      backoffLimit: 2                                   # 83a: retries up to backoffLimit
+      activeDeadlineSeconds: 7200                       # SAFE default (83b uses a per-run Job)
+
+  deletionPolicy: Delete

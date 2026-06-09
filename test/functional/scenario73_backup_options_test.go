@@ -13,6 +13,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 	"github.com/cloudberry-contrib/cloudberry-k8s/test/testutil"
 )
 
@@ -128,7 +129,7 @@ func (s *Scenario73Suite) TestFunctional_Scenario73_StandardOptions() {
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 			WithoutGlobals:   true,
 		},
 		IncludeSchemas: []string{"public", "analytics"},

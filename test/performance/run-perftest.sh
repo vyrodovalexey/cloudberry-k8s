@@ -206,7 +206,7 @@ parse_args() {
 
 # Validate the scenario name
 validate_scenario() {
-    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "custom")
+    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "scenario87" "scenario88" "custom")
     local found=false
 
     for s in "${valid_scenarios[@]}"; do
@@ -228,6 +228,12 @@ get_config_file() {
     case "$SCENARIO" in
         smoke|baseline|stress|endurance)
             echo "scenarios/${SCENARIO}.yaml"
+            ;;
+        scenario87)
+            echo "scenarios/scenario87-migration.yaml"
+            ;;
+        scenario88)
+            echo "scenarios/scenario88-backup-status.yaml"
             ;;
         custom)
             echo "load.yaml"
@@ -432,6 +438,14 @@ print_test_summary() {
             echo -e "  ${CYAN}Endurance Test: 50 RPS sustained for 30 minutes${NC}"
             echo -e "  Expected: Stable latency, no memory leaks"
             ;;
+        scenario87)
+            echo -e "  ${CYAN}Scenario 87: Migration read-polling at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario88)
+            echo -e "  ${CYAN}Scenario 88: Backup-status read-polling at 40 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
     esac
     echo ""
 }
@@ -626,6 +640,18 @@ analyze_results() {
         endurance)
             evaluate_slo "p95 Latency" "$p95" "200000" "< 200ms"
             evaluate_slo "p99 Latency" "$p99" "500000" "< 500ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario87)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario88)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
             evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
             ;;
     esac
@@ -1069,6 +1095,16 @@ run_hey() {
         endurance)
             duration=300
             rps=50
+            concurrency=10
+            ;;
+        scenario87)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario88)
+            duration=120
+            rps=40
             concurrency=10
             ;;
         custom)

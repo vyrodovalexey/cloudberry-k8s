@@ -117,6 +117,58 @@ func (c *OperatorClient) Delete(ctx context.Context, path string) (*APIResponse,
 	return c.do(ctx, http.MethodDelete, path, nil)
 }
 
+// maxStreamErrorBody is the maximum size of an error body read from a failed
+// streaming response (errors are small JSON payloads).
+const maxStreamErrorBody = 64 << 10
+
+// GetStream performs a GET request and copies a successful (2xx) response body
+// directly to out without buffering or JSON parsing. It is intended for
+// endpoints that stream plain-text payloads such as pod logs. On a non-2xx
+// status, the (small) error body is read and returned as an *APIError.
+func (c *OperatorClient) GetStream(ctx context.Context, path string, out io.Writer) error {
+	requestURL := c.baseURL + apiPrefix + path
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", "text/plain")
+	c.applyAuth(req)
+
+	if c.verbose {
+		slog.Debug("HTTP stream request", "method", http.MethodGet, "url", requestURL)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return c.streamError(resp)
+	}
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("reading response stream: %w", err)
+	}
+	return nil
+}
+
+// streamError reads a non-2xx streaming response body (bounded) and converts it
+// into an *APIError, parsing the standard JSON error envelope when present.
+func (c *OperatorClient) streamError(resp *http.Response) error {
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxStreamErrorBody))
+	apiResp := &APIResponse{StatusCode: resp.StatusCode, RawBody: rawBody}
+	if len(rawBody) > 0 {
+		var parsed map[string]interface{}
+		if jsonErr := json.Unmarshal(rawBody, &parsed); jsonErr == nil {
+			apiResp.Body = parsed
+		}
+	}
+	return parseAPIError(apiResp)
+}
+
 // buildBodyReader marshals body to JSON and returns an io.Reader.
 // Returns nil reader when body is nil.
 func buildBodyReader(body interface{}) (io.Reader, error) {

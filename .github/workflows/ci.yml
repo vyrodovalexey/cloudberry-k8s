@@ -2,8 +2,6 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
   pull_request:
@@ -504,6 +502,7 @@ jobs:
           helm lint test/monitoring/otel-collector
           helm lint test/monitoring/vmagent
           helm lint test/monitoring/vector
+          helm lint test/monitoring/node-exporter
 
       - name: Validate monitoring chart templates
         run: |
@@ -511,6 +510,7 @@ jobs:
           helm template otel-collector test/monitoring/otel-collector > /dev/null
           helm template vmagent test/monitoring/vmagent > /dev/null
           helm template vector test/monitoring/vector > /dev/null
+          helm template node-exporter test/monitoring/node-exporter > /dev/null
           echo "Monitoring chart template validation successful!"
 
       - name: Dry-run install monitoring charts
@@ -519,6 +519,7 @@ jobs:
           helm install --dry-run --debug otel-collector test/monitoring/otel-collector
           helm install --dry-run --debug vmagent test/monitoring/vmagent
           helm install --dry-run --debug vector test/monitoring/vector
+          helm install --dry-run --debug node-exporter test/monitoring/node-exporter
 
       - name: Validate monitoring chart Kubernetes manifests
         run: |
@@ -526,6 +527,7 @@ jobs:
           helm template otel-collector test/monitoring/otel-collector | kubectl apply --dry-run=client -f -
           helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
           helm template vector test/monitoring/vector | kubectl apply --dry-run=client -f -
+          helm template node-exporter test/monitoring/node-exporter | kubectl apply --dry-run=client -f -
           echo "Monitoring chart Kubernetes manifest validation successful!"
 
 
@@ -681,14 +683,23 @@ jobs:
         include:
           - name: operator
             image_key: DOCKER_IMAGE_OPERATOR
+            skip_dirs: ''
           - name: ctl
             image_key: DOCKER_IMAGE_CTL
+            skip_dirs: ''
           - name: cloudberry
             image_key: DOCKER_IMAGE_CLOUDBERRY
+            skip_dirs: ''
           - name: query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
+            skip_dirs: ''
+          # backup: exclude /usr/local/bin from scanning. That directory holds the
+          # statically-built Go binaries (gpbackup, gprestore, gpbackup_helper,
+          # gpbackup_s3_plugin, gpbackman) whose vendored/stdlib dependencies are
+          # scanned separately at source and produce noisy unfixable findings here.
           - name: backup
             image_key: DOCKER_IMAGE_BACKUP
+            skip_dirs: '/usr/local/bin'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -702,6 +713,7 @@ jobs:
           format: 'sarif'
           output: 'trivy-${{ matrix.name }}.sarif'
           severity: 'CRITICAL,HIGH'
+          skip-dirs: ${{ matrix.skip_dirs }}
       - uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98 # v4.32.5
         with:
           sarif_file: 'trivy-${{ matrix.name }}.sarif'
@@ -711,6 +723,7 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
+          skip-dirs: ${{ matrix.skip_dirs }}
 
   # ===========================================================================
   # Tag-only: Helm Package

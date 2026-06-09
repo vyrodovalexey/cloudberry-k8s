@@ -1,0 +1,223 @@
+# =============================================================================
+# Scenario 86 — All cloudberry-ctl backup CLI commands (S3/MinIO destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on every segment +
+# mirror, cloudberry-query-exporter), the operator /metrics endpoint scraped by
+# vmagent into VictoriaMetrics, plus an S3 (MinIO) backup destination with
+# backup.enabled true, a backup.schedule (so the operator reconciles a CronJob
+# for `backup schedule`/`set`/`suspend`/`resume`) AND gpbackup.incremental true
+# (so the `backup create --incremental --from-timestamp <ts>` variant works).
+#
+# Scenario 86 drives EVERY `cloudberry-ctl backup ...` command against this
+# cluster through the operator's OIDC-authed REST API (port 8090, plain HTTP):
+#   86a backup create (full / single-data-file / incremental)
+#   86b backup list
+#   86c backup status --timestamp <ts>
+#   86d backup delete --timestamp <ts>
+#   86e backup restore --timestamp <ts> ... --resize-cluster
+#   86f backup schedule
+#   86g backup schedule set --cron "0 3 * * *"
+#   86h backup schedule suspend
+#   86i backup schedule resume
+#   86j backup jobs
+#   86k backup jobs logs --job <name>   (STREAMS the Job's pod logs)
+#
+# The live script (test/e2e/scripts/scenario86-cli-commands.sh) builds
+# cloudberry-ctl, obtains an OIDC bearer token from Keycloak (realm test, an
+# admin-role user, with the Host-header trick so the token's iss matches the
+# operator), port-forwards the operator REST API and points the CLI at it via
+# CLOUDBERRY_OPERATOR_URL + --auth-method oidc + the bearer token, then runs all
+# 86a-k commands asserting Jobs/args, CronJob schedule/suspend changes and
+# streamed Job logs.
+#
+# backup.schedule is "0 2 * * *" so the operator reconciles a CronJob; the
+# multipart config is 10MB/4 (mirrors the live script's s3 plugin config).
+#
+# Live test: test/e2e/scripts/scenario86-cli-commands.sh --cluster scenario86-s3
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-s3-credentials
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "86"
+type: Opaque
+stringData:
+  aws_access_key_id: minioadmin
+  aws_secret_access_key: minioadmin
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario86-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "86"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario86-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario86-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        operator: Operator
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination with backup.enabled true, a
+  # backup.schedule (operator reconciles a CronJob for 86f/g/h/i) AND
+  # gpbackup.incremental true (so the 86a incremental variant works). 10MB/4
+  # multipart mirrors the live script's s3 plugin config.
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"            # ships gpbackman for 86d cleanup
+    schedule: "0 2 * * *"                        # 86f/g/h/i: operator reconciles a CronJob
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      incremental: true                          # 86a incremental variant
+      leafPartitionData: true
+      compressionType: zstd
+      compressionLevel: 6
+      jobs: 4
+    destination:
+      type: s3
+      s3:
+        endpoint: "http://host.docker.internal:9000"
+        region: "us-east-1"
+        bucket: "cloudberry-backups"
+        folder: "scenario86"
+        encryption: "on"
+        forcePathStyle: true
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+
+  deletionPolicy: Delete

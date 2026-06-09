@@ -5,8 +5,10 @@ package builder
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -42,13 +44,29 @@ const (
 	// localBackupMountPath is the mount path for the local backup destination.
 	localBackupMountPath = "/backups"
 
-	// backupHistoryVolumeName is the emptyDir volume that backs the writable
-	// COORDINATOR_DATA_DIRECTORY used by gpbackup for its history database.
+	// backupHistoryVolumeName is the emptyDir volume mounted on the backup/restore
+	// Job pod at backupHistoryMountPath. It is retained for the local-destination
+	// gpbackman retention path and as an inspectable scratch COORDINATOR_DATA_DIRECTORY.
+	//
+	// NOTE: for the S3 destination the real gpbackup/gprestore run happens INSIDE
+	// the coordinator pod via kubectl exec (the coordinator-exec model, see
+	// coordinatorExecScript and spec 11 §MPP Dispatch). gpbackup, once connected
+	// to the coordinator, reads gp_segment_configuration and writes its
+	// coordinator metadata + history DB to the CATALOG coordinator data directory
+	// (/data/pgdata/gpseg-1) and dispatches to each segment to create the
+	// per-segment backup dirs — none of which exist in a standalone Job pod, so
+	// the Job delegates to the coordinator pod where they do. This emptyDir is
+	// therefore not the authoritative history-DB path for S3.
 	backupHistoryVolumeName = "backup-history"
-	// backupHistoryMountPath is where the backup-history emptyDir is mounted; it
-	// is exported as COORDINATOR_DATA_DIRECTORY so gpbackup writes its history DB
-	// to a writable path (the standalone Job pod lacks the coordinator PGDATA).
+	// backupHistoryMountPath is where the backup-history emptyDir is mounted and
+	// exported as COORDINATOR_DATA_DIRECTORY (inspectable). For the local
+	// destination it backs the gpbackman --history-db path; for S3 the real run
+	// is delegated to the coordinator pod (see coordinatorExecScript).
 	backupHistoryMountPath = "/var/lib/gpbackup"
+	// gpbackupHistoryDBPath is the SQLite history database path used by the
+	// gpbackman retention script via --history-db for
+	// backup-info/backup-delete/backup-clean.
+	gpbackupHistoryDBPath = backupHistoryMountPath + "/gpbackup_history.db"
 
 	// shellCommand is the shell used to render the plugin config and run the tool.
 	shellCommand = "/bin/bash"
@@ -83,6 +101,19 @@ const (
 
 	// pluginConfigFlag is the gpbackup/gprestore plugin-config flag.
 	pluginConfigFlag = "--plugin-config"
+	// backupDirFlag is the gpbackup/gprestore/gpbackman backup-dir flag used for
+	// the local destination (no S3 plugin).
+	backupDirFlag = "--backup-dir"
+
+	// kubectlBin is the kubectl binary used by the coordinator-exec wrapper to
+	// run gpbackup/gprestore inside the coordinator pod. The cloudberry-backup
+	// image ships kubectl on PATH; the wrapper falls back to /usr/local/bin and
+	// /usr/bin so a non-PATH install still resolves.
+	kubectlBin = "kubectl"
+	// coordExecScratchDir is the writable directory inside the COORDINATOR pod
+	// where the per-run rendered S3 plugin config is written before gpbackup is
+	// invoked there. The coordinator pod's /tmp is always writable.
+	coordExecScratchDir = "/tmp"
 
 	// destinationTypeS3 is the S3 destination type value.
 	destinationTypeS3 = "s3"
@@ -106,6 +137,13 @@ const (
 	// minBackupDiskFreeKB is the minimum free space (KiB) required on the local
 	// backup-dir mount before a backup proceeds (best-effort check).
 	minBackupDiskFreeKB = 1048576
+	// defaultS3SigningRegion is the SigV4 region used for the S3 reachability
+	// HEAD when S3_REGION is empty. MinIO accepts us-east-1 by default and it
+	// matches the signing region used in test/docker-compose/scripts/setup-minio.sh.
+	defaultS3SigningRegion = "us-east-1"
+	// s3ReachabilityMaxTimeSeconds bounds the SigV4 HEAD request so a hung/unreachable
+	// endpoint fails closed (curl --max-time) instead of stalling the init container.
+	s3ReachabilityMaxTimeSeconds = 15
 
 	// gpEnvPreamble is prepended to every backup/restore script to ensure
 	// GPHOME/bin is on PATH and LD_LIBRARY_PATH includes GPHOME/lib.  It
@@ -130,6 +168,10 @@ const (
 	validateContainerName = "post-restore-validate"
 	// defaultHealthCheckQuery is the default connectivity health-check query.
 	defaultHealthCheckQuery = "SELECT 1"
+
+	// validateMarkerPrefix prefixes every parsable marker the post-restore
+	// validation script emits so its log lines can be matched deterministically.
+	validateMarkerPrefix = "post-restore-validate: "
 
 	// sshSetupPreamble installs the cluster-wide shared gpadmin SSH identity (the
 	// operator mounts it read-only at /etc/cloudberry/ssh) into ~/.ssh with the
@@ -184,6 +226,23 @@ type BackupJobOptions struct {
 	ExcludeTables []string
 }
 
+// gpbackupOrSpec resolves the effective gpbackup options for the request: the
+// per-request override when set, else the cluster spec's gpbackup options. It is
+// the single source of truth shared by BuildBackupJob (for the rendered args) and
+// effectiveBackupType (for the backup-type label) so the label always matches the
+// args. Safe on a nil receiver.
+func (o *BackupJobOptions) gpbackupOrSpec(
+	cluster *cbv1alpha1.CloudberryCluster,
+) *cbv1alpha1.GpbackupOptions {
+	if o != nil && o.Gpbackup != nil {
+		return o.Gpbackup
+	}
+	if cluster.Spec.Backup != nil {
+		return cluster.Spec.Backup.Gpbackup
+	}
+	return nil
+}
+
 // RestoreJobOptions carries per-request parameters for a restore Job.
 type RestoreJobOptions struct {
 	// Timestamp is the gpbackup timestamp to restore from (--timestamp).
@@ -202,6 +261,14 @@ type RestoreJobOptions struct {
 	IncludeTables []string
 	// ExcludeTables maps to --exclude-table (repeated).
 	ExcludeTables []string
+	// S3FolderOverride, when non-empty, overrides the S3 plugin config "folder:"
+	// (the S3_FOLDER env) for this restore Job instead of using the cluster's own
+	// spec.backup.destination.s3.folder. This is REQUIRED for cross-cluster
+	// migration (spec 11 §Cross-Cluster Migration): the target restore Job must
+	// read the backup from the SOURCE cluster's folder, since gpbackup wrote it
+	// there. Without it the restore would look under the target's own folder and
+	// fail with a NotFound (the data is under a different folder).
+	S3FolderOverride string
 }
 
 // backupImage returns the configured backup toolchain image or the default.
@@ -219,10 +286,81 @@ func backupLabels(cluster, operation string) map[string]string {
 	return labels
 }
 
+// effectiveBackupType resolves the backup type that will actually run for a
+// backup Job: "incremental" when the cluster spec enables incremental backups OR
+// the per-request options set Type=="incremental", else "full". opts may be nil
+// (e.g. the CronJob jobTemplate path), in which case only the spec is consulted.
+func effectiveBackupType(cluster *cbv1alpha1.CloudberryCluster, opts *BackupJobOptions) string {
+	// The label MUST match the gpbackup args actually rendered (i.e. whether
+	// --incremental is emitted by isEffectivelyIncremental), so M1/M2 metric
+	// routing and the rendered Job agree. The args resolve the gpbackup options
+	// the same way BuildBackupJob does: per-request opts.Gpbackup, else the
+	// cluster spec's Gpbackup. A per-request opts.Type=="incremental" also forces
+	// incremental. A bare opts.Type=="full" does NOT suppress a cluster-level
+	// incremental default (gpbackup still runs incremental), so the label stays
+	// incremental to match the args.
+	gpOpts := opts.gpbackupOrSpec(cluster)
+	if isEffectivelyIncremental(gpOpts, opts) {
+		return util.BackupTypeIncremental
+	}
+	return util.BackupTypeFull
+}
+
+// localBackupDir resolves the on-pod backup directory for a local destination:
+// the configured Local.Path when set, otherwise the default localBackupMountPath
+// (/backups). It is the single source of truth for the local backup path shared
+// by the gpbackup/gprestore args, the volume mount and the retention script.
+func localBackupDir(cluster *cbv1alpha1.CloudberryCluster) string {
+	if cluster.Spec.Backup != nil {
+		if local := cluster.Spec.Backup.Destination.Local; local != nil && local.Path != "" {
+			return local.Path
+		}
+	}
+	return localBackupMountPath
+}
+
+// isLocalDestination reports whether the cluster's backup destination is local.
+func isLocalDestination(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.Backup != nil &&
+		cluster.Spec.Backup.Destination.Type == destinationTypeLocal
+}
+
+// backupDestinationArgs returns the leading gpbackup/gprestore args for the
+// cluster's backup destination:
+//   - local -> ["--backup-dir", <Local.Path or /backups>]
+//   - s3 (or nil/unknown, preserving existing behavior) ->
+//     ["--plugin-config", "/tmp/s3-config.yaml"]
+//
+// NOTE: gpbackup REJECTS --plugin-config together with --backup-dir ("The
+// following flags may not be specified together: plugin-config, backup-dir"), so
+// the S3 path uses ONLY --plugin-config. For the S3 plugin, the per-segment DATA
+// files are streamed to S3 by each segment's gpbackup_s3_plugin while the
+// coordinator metadata + gpbackup history database are written under the
+// coordinator data directory; the backup Job exports COORDINATOR_DATA_DIRECTORY
+// (= backupHistoryMountPath, a writable emptyDir) so gpbackup writes its history
+// DB there instead of the non-existent catalog path inside the standalone Job
+// pod. The per-segment backup-directory creation requires the backup to run with
+// coordinator+segment reachability (see addBackupSSHIdentity / the cluster image
+// SSH wiring).
+//
+// Defaulting nil/empty/unknown destinations to the S3 leading args keeps every
+// existing S3 caller's plugin wiring intact.
+func backupDestinationArgs(cluster *cbv1alpha1.CloudberryCluster) []string {
+	if isLocalDestination(cluster) {
+		return []string{backupDirFlag, localBackupDir(cluster)}
+	}
+	return []string{pluginConfigFlag, s3RenderedConfigPath}
+}
+
 // buildGpbackupArgs converts gpbackup options and per-request overrides into a
-// gpbackup CLI argument slice. It is a pure function for easy unit testing.
-func buildGpbackupArgs(opts *cbv1alpha1.GpbackupOptions, jobOpts *BackupJobOptions) []string {
-	args := []string{pluginConfigFlag, s3RenderedConfigPath}
+// gpbackup CLI argument slice. It is a pure function for easy unit testing. The
+// leading args are destination-aware (see backupDestinationArgs).
+func buildGpbackupArgs(
+	cluster *cbv1alpha1.CloudberryCluster,
+	opts *cbv1alpha1.GpbackupOptions,
+	jobOpts *BackupJobOptions,
+) []string {
+	args := backupDestinationArgs(cluster)
 
 	if jobOpts != nil && len(jobOpts.Databases) > 0 {
 		args = append(args, "--dbname", jobOpts.Databases[0])
@@ -235,8 +373,11 @@ func buildGpbackupArgs(opts *cbv1alpha1.GpbackupOptions, jobOpts *BackupJobOptio
 	args = appendCompressionArgs(args, opts)
 	args = appendDataFileArgs(args, opts)
 	args = appendIncrementalArgs(args, opts, jobOpts)
+	args = appendLeafPartitionDataArgs(args, opts, jobOpts)
 
-	if opts.WithStats {
+	// WithStats is a *bool: nil means "unset" and follows the webhook default of
+	// true; a non-nil value is honored (false => omit the flag).
+	if util.DerefOr(opts.WithStats, true) {
 		args = append(args, "--with-stats")
 	}
 	if opts.WithoutGlobals {
@@ -283,6 +424,19 @@ func appendDataFileArgs(args []string, opts *cbv1alpha1.GpbackupOptions) []strin
 	return args
 }
 
+// isEffectivelyIncremental reports whether the backup that will actually run is
+// incremental: the gpbackup options set Incremental, OR the per-request job
+// options pin Type=="incremental". It is the single source of truth shared by
+// appendIncrementalArgs and appendLeafPartitionDataArgs so the incremental vs
+// full decision (and therefore where --leaf-partition-data is emitted) stays
+// consistent and never double-emits the flag.
+func isEffectivelyIncremental(opts *cbv1alpha1.GpbackupOptions, jobOpts *BackupJobOptions) bool {
+	if opts != nil && opts.Incremental {
+		return true
+	}
+	return jobOpts != nil && jobOpts.Type == util.BackupTypeIncremental
+}
+
 // appendIncrementalArgs appends incremental-related flags, including the optional
 // per-request --from-timestamp pin.
 func appendIncrementalArgs(
@@ -290,27 +444,55 @@ func appendIncrementalArgs(
 	opts *cbv1alpha1.GpbackupOptions,
 	jobOpts *BackupJobOptions,
 ) []string {
-	incremental := opts.Incremental
-	if jobOpts != nil && jobOpts.Type == "incremental" {
-		incremental = true
-	}
-	if !incremental {
+	if !isEffectivelyIncremental(opts, jobOpts) {
 		return args
 	}
-	args = append(args, "--incremental")
-	if opts.LeafPartitionData {
-		args = append(args, "--leaf-partition-data")
-	}
+	// gpbackup REQUIRES --leaf-partition-data for incremental backups, so force
+	// it whenever an incremental is effective. opts.LeafPartitionData is already
+	// implied here; emitting it unconditionally (and only once) avoids both a
+	// missing flag when LeafPartitionData is unset and a duplicate when it is
+	// set. Full backups are handled by appendLeafPartitionDataArgs: this branch
+	// only runs for incrementals.
+	args = append(args, "--incremental", "--leaf-partition-data")
 	if jobOpts != nil && jobOpts.FromTimestamp != "" {
 		args = append(args, "--from-timestamp", jobOpts.FromTimestamp)
 	}
 	return args
 }
 
+// appendLeafPartitionDataArgs emits --leaf-partition-data for a FULL backup when
+// opts.LeafPartitionData is requested. --leaf-partition-data is valid and
+// meaningful for full backups (it backs up leaf-partition data as separate files
+// rather than the whole partitioned table), so a requested LeafPartitionData
+// must be honored even when the backup is not incremental.
+//
+// The incremental path (appendIncrementalArgs) already force-emits
+// --leaf-partition-data EXACTLY once, so this helper guards on
+// !isEffectivelyIncremental to preserve that invariant and never duplicate the
+// flag. Net behavior:
+//   - full + LeafPartitionData=false   => no --leaf-partition-data
+//   - full + LeafPartitionData=true    => exactly one --leaf-partition-data
+//   - incremental (any LeafPartitionData) => exactly one (from the incr path)
+func appendLeafPartitionDataArgs(
+	args []string,
+	opts *cbv1alpha1.GpbackupOptions,
+	jobOpts *BackupJobOptions,
+) []string {
+	if opts.LeafPartitionData && !isEffectivelyIncremental(opts, jobOpts) {
+		args = append(args, "--leaf-partition-data")
+	}
+	return args
+}
+
 // buildGprestoreArgs converts gprestore options and per-request parameters into a
-// gprestore CLI argument slice. It is a pure function for easy unit testing.
-func buildGprestoreArgs(opts *cbv1alpha1.GprestoreOptions, jobOpts *RestoreJobOptions) []string {
-	args := []string{pluginConfigFlag, s3RenderedConfigPath}
+// gprestore CLI argument slice. It is a pure function for easy unit testing. The
+// leading args are destination-aware (see backupDestinationArgs).
+func buildGprestoreArgs(
+	cluster *cbv1alpha1.CloudberryCluster,
+	opts *cbv1alpha1.GprestoreOptions,
+	jobOpts *RestoreJobOptions,
+) []string {
+	args := backupDestinationArgs(cluster)
 	if jobOpts != nil && jobOpts.Timestamp != "" {
 		args = append(args, "--timestamp", jobOpts.Timestamp)
 	}
@@ -358,7 +540,10 @@ func buildGprestoreArgs(opts *cbv1alpha1.GprestoreOptions, jobOpts *RestoreJobOp
 // OMIT --with-stats so the gprestore invocation stays valid. When only one is
 // set, that one is emitted as-is.
 func appendGprestoreBoolFlags(args []string, opts *cbv1alpha1.GprestoreOptions) []string {
-	effectiveWithStats := opts.WithStats && !opts.RunAnalyze
+	// WithStats is a *bool: nil means "unset" and follows the webhook default of
+	// true; a non-nil value is honored (false => omit the flag). run-analyze still
+	// takes precedence so the gprestore invocation stays valid.
+	effectiveWithStats := util.DerefOr(opts.WithStats, true) && !opts.RunAnalyze
 
 	flags := []struct {
 		enabled bool
@@ -393,12 +578,39 @@ func appendRepeatedFlag(args []string, flag string, values []string) []string {
 	return args
 }
 
-// renderToolScript builds the bash script that renders the S3 plugin config
-// (substituting environment variables) and then runs the given tool with its
-// arguments.  It prefers envsubst when available but falls back to a
-// POSIX-compatible eval+heredoc so the script works on minimal images that
-// lack the gettext package.
-func renderToolScript(tool string, args []string) string {
+// renderToolScript builds the bash script the backup/restore Job container runs.
+//
+// S3 destination — coordinator-exec (the real-bug fix). gpbackup/gprestore are
+// MPP orchestrators: once connected to the coordinator they read
+// gp_segment_configuration and (a) write the coordinator metadata + history DB
+// to the CATALOG coordinator data directory (/data/pgdata/gpseg-1) and (b)
+// dispatch over SSH to EVERY segment to create the per-segment backup dirs.
+// A standalone Job pod connected only via PGHOST has neither /data/pgdata/gpseg-1
+// nor the segment-local backup paths, so gpbackup fails with "Unable to create
+// backup directories on N segments" and "open .../gpbackup_history.db: no such
+// file or directory". The supported model (spec 11 §MPP Dispatch and the
+// Coordinator-Exec Data Cycle) is to run the tool INSIDE the coordinator pod.
+// For S3 the Job therefore renders the plugin config and `kubectl exec`s the
+// tool into <cluster>-coordinator-0 (see coordinatorExecScript), where the
+// catalog datadir, the writable filesystem and the segment SSH topology all
+// exist. NOTE: --backup-dir is intentionally NOT combined with --plugin-config
+// (gpbackup rejects "plugin-config, backup-dir" together); the S3 args carry
+// only --plugin-config (see backupDestinationArgs).
+//
+// LOCAL destination — standalone --backup-dir (unchanged operator behavior,
+// spec 11 §Local Backup Destination). There is no S3 ConfigMap mounted at
+// /etc/gpbackup, so the S3-config render block is skipped (reading the missing
+// template under `set -euo pipefail` would abort the Job) and the tool runs
+// in-pod with --backup-dir; the live local data cycle is exercised via the
+// coordinator-exec path by the e2e script (spec 11 §MPP per-segment note).
+//
+// An empty tool (the validate/cleanup Jobs, which overwrite Args[0] with their
+// own script afterward) renders only the preambles so no tool is invoked here.
+func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args []string) string {
+	if tool != "" && !isLocalDestination(cluster) {
+		return coordinatorExecScript(cluster, tool, args)
+	}
+
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString(gpEnvPreamble)
@@ -408,13 +620,9 @@ func renderToolScript(tool string, args []string) string {
 	// points at the real binary on either the cloudberry-backup image
 	// (/usr/local/bin) or the cloudberry-official image ($GPHOME/bin).
 	b.WriteString(gpbackupPluginPathPreamble)
-	// Render the S3 plugin config template, substituting env vars.
-	// Use envsubst if present; otherwise fall back to eval with heredoc.
-	fmt.Fprintf(&b,
-		"if command -v envsubst >/dev/null 2>&1; then "+
-			"envsubst < %[1]s/%[2]s > %[3]s; "+
-			"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
-		s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+	if tool == "" {
+		return b.String()
+	}
 	b.WriteString(tool)
 	for _, a := range args {
 		b.WriteString(" ")
@@ -422,6 +630,135 @@ func renderToolScript(tool string, args []string) string {
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// coordinatorExecScript builds the coordinator-exec wrapper the S3 backup/restore
+// Job container runs. It:
+//
+//  1. Renders the S3 plugin config from the Job container env (envsubst, with a
+//     POSIX eval+heredoc fallback) into a per-run file in the Job pod.
+//  2. base64-pipes the rendered config into the coordinator pod's /tmp via
+//     `kubectl exec` (base64 avoids any quoting/here-doc hazard over the exec
+//     boundary — the lesson from the e2e scenarios).
+//  3. base64-pipes the inner tool script (sources the Cloudberry env, exports the
+//     PG*/AWS* connection vars, then runs `<tool> --plugin-config <coord-cfg>
+//     <args>`) into a second `kubectl exec` so the MPP run happens inside the
+//     coordinator pod (segment -1) with the catalog datadir, writable filesystem
+//     and segment SSH topology all present.
+//
+// A unique per-run timestamp ($RANDOM + date) names the coordinator-side config
+// so concurrent Jobs never collide (spec 11 §38). The PG password reaches the
+// coordinator only over the in-cluster exec channel, never on its disk or in the
+// process table beyond the transient gpbackup invocation.
+func coordinatorExecScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args []string) string {
+	coordPod := util.CoordinatorPodName(cluster.Name)
+
+	// Drop the leading "--plugin-config <Job-pod path>" pair from backupDestinationArgs:
+	// the coordinator-exec run substitutes the coordinator-side ${COORD_CFG}.
+	toolArgs := dropLeadingPluginConfig(args)
+
+	// innerTool is the tool script that runs INSIDE the coordinator pod. It is
+	// emitted READABLY (via a quoted heredoc) so the gpbackup/gprestore flags
+	// stay visible in the Job container's args[0] — the e2e suites inspect
+	// `kubectl get job -o jsonpath=...args[0]` for `--include-schema`,
+	// `--incremental`, `--resize-cluster`, etc.
+	//
+	// The connection env (COORD_CFG/PG*) is delivered as base64-encoded POSITIONAL
+	// arguments to the remote bash (env-safe for any password / shell
+	// metacharacter; kubectl exec forwards argv verbatim but does NOT forward
+	// env). innerTool decodes them into $1..$6, sources the Cloudberry env so
+	// gpbackup/gprestore + the plugin are on PATH, then runs the tool against the
+	// per-run plugin config staged at ${COORD_CFG}. No secret value is embedded
+	// in this rendered Go string (the secret arrives at runtime from the Job
+	// pod's own env via the positional args).
+	var innerTool strings.Builder
+	innerTool.WriteString("set -euo pipefail\n")
+	innerTool.WriteString("export COORD_CFG=$(printf '%s' \"$1\" | base64 -d)\n")
+	innerTool.WriteString("export PGHOST=$(printf '%s' \"$2\" | base64 -d)\n")
+	innerTool.WriteString("export PGPORT=$(printf '%s' \"$3\" | base64 -d)\n")
+	innerTool.WriteString("export PGUSER=$(printf '%s' \"$4\" | base64 -d)\n")
+	innerTool.WriteString("export PGDATABASE=$(printf '%s' \"$5\" | base64 -d)\n")
+	innerTool.WriteString("export PGPASSWORD=$(printf '%s' \"$6\" | base64 -d)\n")
+	// `ls` of the (possibly missing) env file returns non-zero; with `pipefail`
+	// + `set -e` that would abort, so guard with `|| true`. Likewise the
+	// `[ -n ] && source` test must not abort when GPENV is empty.
+	innerTool.WriteString("GPENV=$(ls \"${GPHOME:-/usr/local/cloudberry-db}\"/greenplum_path.sh " +
+		"\"${GPHOME:-/usr/local/cloudberry-db}\"/cloudberry-env.sh 2>/dev/null | head -1 || true)\n")
+	innerTool.WriteString("if [ -n \"${GPENV}\" ]; then . \"${GPENV}\"; fi\n")
+	innerTool.WriteString("export PATH=\"${GPHOME:-/usr/local/cloudberry-db}/bin:${PATH}\"\n")
+	innerTool.WriteString(tool)
+	innerTool.WriteString(" " + pluginConfigFlag + " \"${COORD_CFG}\"")
+	for _, a := range toolArgs {
+		innerTool.WriteString(" ")
+		innerTool.WriteString(shellQuote(a))
+	}
+	innerTool.WriteString("\n")
+
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString(gpEnvPreamble)
+	// Render the S3 plugin config (envsubst with POSIX fallback) in the Job pod.
+	fmt.Fprintf(&b,
+		"if command -v envsubst >/dev/null 2>&1; then "+
+			"envsubst < %[1]s/%[2]s > %[3]s; "+
+			"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
+		s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+	// Resolve a kubectl binary (PATH, then common install dirs).
+	b.WriteString("KUBECTL=" + kubectlBin + "\n")
+	b.WriteString("command -v \"${KUBECTL}\" >/dev/null 2>&1 || " +
+		"{ for p in /usr/local/bin/kubectl /usr/bin/kubectl; do " +
+		"[ -x \"$p\" ] && KUBECTL=\"$p\" && break; done; }\n")
+	fmt.Fprintf(&b, "COORD_POD=%s\n", shellQuote(coordPod))
+	fmt.Fprintf(&b, "COORD_CFG=%s/cbk-$(date -u +%%Y%%m%%d%%H%%M%%S)-${RANDOM:-0}-s3-config.yaml\n",
+		coordExecScratchDir)
+	// Stage the rendered plugin config inside the coordinator pod (base64 piped
+	// so no quoting/here-doc hazard crosses the exec boundary). The remote shell
+	// reads the target path from its own argv ($0) to keep the Job pod's value.
+	fmt.Fprintf(&b,
+		"base64 < %[1]s | \"${KUBECTL}\" exec -i \"${COORD_POD}\" -- "+
+			"bash -c 'base64 -d > \"$0\"' \"${COORD_CFG}\"\n",
+		s3RenderedConfigPath)
+	// Materialize the (readable) inner tool script in the Job pod via a QUOTED
+	// heredoc (delimiter quoted => NO expansion here; ${COORD_CFG}/$1.. expand
+	// inside the coordinator at run time), keeping the gpbackup/gprestore flags
+	// visible in args[0] for the e2e Job-arg assertions.
+	b.WriteString("INNER_TOOL=$(cat <<'_CBK_INNER_EOF_'\n")
+	b.WriteString(innerTool.String())
+	b.WriteString("_CBK_INNER_EOF_\n)\n")
+	// base64-encode THIS pod's live connection values (env-safe for any password)
+	// and pass them as POSITIONAL args to the remote bash, which runs the inner
+	// tool script (itself piped on stdin as base64 so no quoting/expansion hazard
+	// crosses the exec boundary).
+	b.WriteString("CFG_B64=$(printf '%s' \"${COORD_CFG}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("HOST_B64=$(printf '%s' \"${PGHOST:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("PORT_B64=$(printf '%s' \"${PGPORT:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("USER_B64=$(printf '%s' \"${PGUSER:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("DB_B64=$(printf '%s' \"${PGDATABASE:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("PASS_B64=$(printf '%s' \"${PGPASSWORD:-}\" | base64 | tr -d '\\n')\n")
+	// The remote bootstrap decodes the inner tool script from stdin and runs it
+	// with `bash -c <inner> _ <cfg> <host> <port> <user> <db> <pass>` so the
+	// base64 values land as $1..$6 inside innerTool.
+	b.WriteString("printf '%s' \"${INNER_TOOL}\" | base64 | " +
+		"\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- bash -c '" +
+		"INNER=$(base64 -d); " +
+		"bash -c \"${INNER}\" _ \"$0\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"' " +
+		"\"${CFG_B64}\" \"${HOST_B64}\" \"${PORT_B64}\" " +
+		"\"${USER_B64}\" \"${DB_B64}\" \"${PASS_B64}\"\n")
+	// Best-effort cleanup of the staged config inside the coordinator pod.
+	b.WriteString("\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- " +
+		"bash -c 'rm -f \"$0\"' \"${COORD_CFG}\" 2>/dev/null || true\n")
+	return b.String()
+}
+
+// dropLeadingPluginConfig returns args with a leading
+// "--plugin-config <path>" pair removed (the S3 destination's leading pair from
+// backupDestinationArgs). The coordinator-exec run substitutes the
+// coordinator-side plugin config, so the Job-pod path must not be re-emitted.
+func dropLeadingPluginConfig(args []string) []string {
+	if len(args) >= 2 && args[0] == pluginConfigFlag {
+		return args[2:]
+	}
+	return args
 }
 
 // shellQuote single-quotes an argument for safe inclusion in a bash command.
@@ -494,7 +831,10 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	}
 
 	labels := backupLabels(cluster.Name, util.BackupOperationBackup)
-	args := buildGpbackupArgs(cluster.Spec.Backup.Gpbackup, nil)
+	// Record the effective backup type so the controller can derive status from
+	// the spawned Job's label (spec-driven for the CronJob path; nil opts).
+	labels[util.LabelBackupType] = effectiveBackupType(cluster, nil)
+	args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, nil)
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
 	// The CronJob's backup target databases are resolved at runtime, so
 	// CBDB_DATABASE is emitted empty (still inspectable) per spec 11.
@@ -533,12 +873,12 @@ func (b *DefaultBuilder) BuildBackupJob(
 		opts = &BackupJobOptions{}
 	}
 	labels := backupLabels(cluster.Name, util.BackupOperationBackup)
+	// Record the effective backup type (per-request Type/Gpbackup override or the
+	// cluster spec) so the controller derives status from THIS Job's label.
+	labels[util.LabelBackupType] = effectiveBackupType(cluster, opts)
 
-	gpOpts := opts.Gpbackup
-	if gpOpts == nil && cluster.Spec.Backup != nil {
-		gpOpts = cluster.Spec.Backup.Gpbackup
-	}
-	args := buildGpbackupArgs(gpOpts, opts)
+	gpOpts := opts.gpbackupOrSpec(cluster)
+	args := buildGpbackupArgs(cluster, gpOpts, opts)
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
 	addPreBackupCheckInitContainer(cluster, &podSpec)
@@ -568,7 +908,7 @@ func (b *DefaultBuilder) BuildRestoreJob(
 	if grOpts == nil && cluster.Spec.Backup != nil {
 		grOpts = cluster.Spec.Backup.Gprestore
 	}
-	args := buildGprestoreArgs(grOpts, opts)
+	args := buildGprestoreArgs(cluster, grOpts, opts)
 	podSpec := b.buildBackupPodSpec(cluster, restoreContainerName, "gprestore", args)
 	// The restore Job carries the same informational gpbackup env (spec 11) so
 	// the container env is inspectable; compression/jobs come from the cluster's
@@ -578,6 +918,11 @@ func (b *DefaultBuilder) BuildRestoreJob(
 		gpOpts = cluster.Spec.Backup.Gpbackup
 	}
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
+	// For a cross-cluster migration the backup lives under the SOURCE cluster's
+	// S3 folder; point this target restore Job at that folder so gprestore finds
+	// it (spec 11 §Cross-Cluster Migration: "Both reference the same S3
+	// bucket/folder"). No-op for ordinary restores where the override is empty.
+	applyS3FolderOverride(&podSpec, opts.S3FolderOverride)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -600,11 +945,35 @@ type ValidationJobOptions struct {
 	// HealthCheckQuery is the configurable connectivity health-check query.
 	// When empty it defaults to "SELECT 1".
 	HealthCheckQuery string
+	// ExpectedRowCounts maps a fully-qualified table (schema.table) to the row
+	// count recorded for it in the gpbackup history metadata of the restored
+	// timestamp. When non-empty the validation script compares the actual
+	// restored per-table count against the expected count and FAILS (exit 1) on
+	// any mismatch (the headline row-count-vs-history check). When empty the
+	// script falls back to a best-effort total-table probe that never fails (no
+	// expected data to compare).
+	ExpectedRowCounts map[string]int64
+	// RunAnalyze, when true, makes the validation script run a database-wide
+	// ANALYZE to refresh planner statistics before the row-count compare. It is
+	// driven from the cluster's gprestore run-analyze intent (or the optional
+	// validation config) so post-restore planner stats are confirmed fresh.
+	RunAnalyze bool
+	// S3FolderOverride, when non-empty, overrides the S3 plugin config "folder:"
+	// (the S3_FOLDER env) for this validation Job, mirroring the restore Job. For
+	// a cross-cluster migration (spec 11 §Cross-Cluster Migration) the validation
+	// Job runs on the TARGET cluster but inspects the backup written under the
+	// SOURCE folder, so its S3 env must point at the source folder to stay
+	// consistent with the restore it validates.
+	S3FolderOverride string
 }
 
 // BuildPostRestoreValidationJob builds a validation Job that runs after a restore
-// completes (spec 11 §Post-Restore Validation). It performs a best-effort
-// row-count probe, an invalid-index scan and a configurable health-check query.
+// completes (spec 11 §Post-Restore Validation). It optionally refreshes planner
+// stats (ANALYZE when RunAnalyze is set), compares actual restored per-table row
+// counts against the expected counts captured from the gpbackup history metadata
+// (failing on any mismatch when ExpectedRowCounts is non-empty, or a best-effort
+// total-table probe otherwise), runs an invalid-index scan (must-pass) and a
+// configurable health-check query.
 func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 	cluster *cbv1alpha1.CloudberryCluster,
 	opts *ValidationJobOptions,
@@ -620,6 +989,10 @@ func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 	if opts.Database != "" {
 		setEnvVar(&podSpec.Containers[0], "PGDATABASE", opts.Database)
 	}
+	// Mirror the restore Job's S3 folder for a cross-cluster migration so this
+	// validation Job's S3 env points at the SOURCE folder it inspects. No-op when
+	// the override is empty (ordinary single-cluster validation).
+	applyS3FolderOverride(&podSpec, opts.S3FolderOverride)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -630,6 +1003,29 @@ func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 		},
 		Spec: b.buildJobSpec(cluster, labels, &podSpec),
 	}
+}
+
+// applyS3FolderOverride overrides the S3_FOLDER env (and thus the rendered S3
+// plugin config "folder:") on every container and init container of the pod
+// spec. It only acts when an override is set AND the container already carries an
+// S3_FOLDER env (i.e. the cluster uses an S3 destination); it does not introduce
+// S3 env onto a non-S3 (local) pod. Used by the migration restore/validation
+// path so the target Job reads the backup from the source cluster's folder.
+func applyS3FolderOverride(podSpec *corev1.PodSpec, folder string) {
+	if folder == "" {
+		return
+	}
+	overrideContainerS3Folder := func(containers []corev1.Container) {
+		for i := range containers {
+			for j := range containers[i].Env {
+				if containers[i].Env[j].Name == "S3_FOLDER" {
+					containers[i].Env[j].Value = folder
+				}
+			}
+		}
+	}
+	overrideContainerS3Folder(podSpec.Containers)
+	overrideContainerS3Folder(podSpec.InitContainers)
 }
 
 // setEnvVar sets (or replaces) an environment variable on the container.
@@ -644,8 +1040,13 @@ func setEnvVar(container *corev1.Container, name, value string) {
 }
 
 // postRestoreValidationScript builds the bash script for the post-restore
-// validation Job. The invalid-index scan is must-pass; the row-count probe and
-// health-check query are best-effort so transient issues do not fail validation.
+// validation Job. The ordering is: env preamble -> optional ANALYZE (when
+// RunAnalyze) -> row-count compare -> invalid-index scan -> health-check ->
+// "passed". The invalid-index scan and a non-empty row-count compare are
+// must-pass (exit 1 on failure); the health-check query and the empty-map
+// best-effort total probe never fail so transient/absent data does not break
+// validation. psql connects via the Job's buildBackupEnv PGHOST and the
+// PGDATABASE set from opts.Database.
 func postRestoreValidationScript(opts *ValidationJobOptions) string {
 	healthQuery := opts.HealthCheckQuery
 	if healthQuery == "" {
@@ -655,33 +1056,128 @@ func postRestoreValidationScript(opts *ValidationJobOptions) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString(gpEnvPreamble)
-	b.WriteString("echo 'post-restore-validate: row-count probe (best-effort)'\n")
-	b.WriteString("psql -tA -c \"SELECT count(*) FROM pg_class WHERE relkind='r'\" || " +
-		"echo 'post-restore-validate: row-count probe skipped'\n")
 
-	b.WriteString("echo 'post-restore-validate: scanning for invalid indexes'\n")
+	writeAnalyzeStep(&b, opts.RunAnalyze)
+	writeRowCountStep(&b, opts.ExpectedRowCounts)
+	writeInvalidIndexStep(&b)
+
+	fmt.Fprintf(&b, "echo %s\n", shellQuote(validateMarkerPrefix+"health-check query"))
+	fmt.Fprintf(&b, "psql -tA -c %s\n", shellQuote(healthQuery))
+	fmt.Fprintf(&b, "echo %s\n", shellQuote(validateMarkerPrefix+"passed"))
+	return b.String()
+}
+
+// writeAnalyzeStep appends the optional GAP-B ANALYZE step. When runAnalyze is
+// set it runs a database-wide ANALYZE to refresh planner statistics and emits the
+// ANALYZE_OK marker. ANALYZE failure must not pass silently: the explicit
+// `set -euo pipefail` makes a failing psql abort the Job (the user explicitly
+// asked for fresh stats), and stderr carries the psql error.
+func writeAnalyzeStep(b *strings.Builder, runAnalyze bool) {
+	if !runAnalyze {
+		return
+	}
+	fmt.Fprintf(b, "echo %s\n", shellQuote(validateMarkerPrefix+"run-analyze (refreshing planner stats)"))
+	b.WriteString("psql -c \"ANALYZE\"\n")
+	fmt.Fprintf(b, "echo %s\n", shellQuote(validateMarkerPrefix+"ANALYZE_OK"))
+}
+
+// writeInvalidIndexStep appends the must-pass invalid-index scan. It is kept
+// AS-IS (relkind='i' AND NOT indisvalid -> exit 1) so a restored database with
+// any invalid index fails validation.
+func writeInvalidIndexStep(b *strings.Builder) {
+	fmt.Fprintf(b, "echo %s\n", shellQuote(validateMarkerPrefix+"scanning for invalid indexes"))
 	b.WriteString("invalid=$(psql -tA -c \"SELECT count(*) FROM pg_catalog.pg_class c " +
 		"JOIN pg_catalog.pg_index i ON c.oid = i.indexrelid " +
 		"WHERE c.relkind='i' AND NOT i.indisvalid\")\n")
 	b.WriteString("if [ \"${invalid:-0}\" -gt 0 ]; then " +
-		"echo \"post-restore-validate: ${invalid} invalid index(es)\" >&2; exit 1; fi\n")
+		"echo \"" + validateMarkerPrefix + "${invalid} invalid index(es)\" >&2; exit 1; fi\n")
+}
 
-	b.WriteString("echo 'post-restore-validate: health-check query'\n")
-	fmt.Fprintf(&b, "psql -tA -c %s\n", shellQuote(healthQuery))
-	b.WriteString("echo 'post-restore-validate: passed'\n")
-	return b.String()
+// writeRowCountStep appends the GAP-A row-count step. When expected is non-empty
+// it renders a deterministic per-table compare loop: for each table it runs
+// `psql -tA -c "SELECT count(*) FROM <table>"`, compares the actual count to the
+// expected one, emits a parsable ROW_COUNT_MATCH/ROW_COUNT_MISMATCH marker and,
+// if ANY table mismatched, exits 1 (the headline failing check; this also catches
+// the data-only-into-prepopulated case where actual > expected). When expected is
+// empty it keeps the legacy best-effort total-table probe which never fails (no
+// expected data to compare).
+func writeRowCountStep(b *strings.Builder, expected map[string]int64) {
+	if len(expected) == 0 {
+		fmt.Fprintf(b, "echo %s\n",
+			shellQuote(validateMarkerPrefix+"row-count probe (best-effort, no expected counts)"))
+		b.WriteString("psql -tA -c \"SELECT count(*) FROM pg_class WHERE relkind='r'\" || " +
+			"echo \"" + validateMarkerPrefix + "ROW_COUNT_PROBE_SKIPPED\"\n")
+		return
+	}
+
+	fmt.Fprintf(b, "echo %s\n", shellQuote(validateMarkerPrefix+"row-count compare vs gpbackup history"))
+	b.WriteString("rowcount_mismatch=0\n")
+
+	// Iterate the expected map in a stable (sorted) order so the rendered script
+	// is deterministic for the same input (testable, reproducible Jobs).
+	tables := make([]string, 0, len(expected))
+	for table := range expected {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
+
+	for _, table := range tables {
+		writeRowCountTableCompare(b, table, expected[table])
+	}
+
+	b.WriteString("if [ \"${rowcount_mismatch}\" -gt 0 ]; then " +
+		"echo \"" + validateMarkerPrefix + "${rowcount_mismatch} table(s) with row-count mismatch\" >&2; " +
+		"exit 1; fi\n")
+}
+
+// writeRowCountTableCompare appends the compare block for a single expected
+// table. The table identifier and the expected count are shell-quoted, so there
+// is no injection surface, and the actual count is read with psql -tA. On
+// mismatch it prints ROW_COUNT_MISMATCH (to stderr) and bumps rowcount_mismatch;
+// on match it prints ROW_COUNT_MATCH.
+func writeRowCountTableCompare(b *strings.Builder, table string, expectedCount int64) {
+	expectedStr := strconv.FormatInt(expectedCount, 10)
+	// The SELECT references the table with its schema-qualified identifier. The
+	// identifier is single-quoted for the shell (psql receives it inside the
+	// double-quoted -c string); operator-supplied table names are not
+	// user-controlled free text (they come from gpbackup history keys).
+	query := fmt.Sprintf("SELECT count(*) FROM %s", table)
+	fmt.Fprintf(b, "actual=$(psql -tA -c %s)\n", shellQuote(query))
+	fmt.Fprintf(b, "expected=%s\n", shellQuote(expectedStr))
+	fmt.Fprintf(b, "table=%s\n", shellQuote(table))
+	b.WriteString("if [ \"${actual:-}\" != \"${expected}\" ]; then\n")
+	b.WriteString("  echo \"" + validateMarkerPrefix +
+		"ROW_COUNT_MISMATCH table=${table} expected=${expected} actual=${actual:-0}\" >&2\n")
+	b.WriteString("  rowcount_mismatch=$((rowcount_mismatch + 1))\n")
+	b.WriteString("else\n")
+	b.WriteString("  echo \"" + validateMarkerPrefix +
+		"ROW_COUNT_MATCH table=${table} count=${actual}\"\n")
+	b.WriteString("fi\n")
 }
 
 // BuildRetentionCleanupJob builds a gpbackman retention cleanup Job enforcing the
-// configured retention policy.
+// configured retention policy (count-based via backup-info/backup-delete and
+// time-based via backup-clean). The cleanup container runs a self-contained POSIX
+// sh script (see buildGpbackmanRetentionScript) and reports the number of deleted
+// backups both on stdout (the "RETENTION_DELETED=<n>" marker) and via the
+// container terminationMessagePath, so the controller can patch the
+// avsoft.io/backup-retention-deleted annotation that drives the retention metric.
 func (b *DefaultBuilder) BuildRetentionCleanupJob(
 	cluster *cbv1alpha1.CloudberryCluster,
 	timestamp string,
 ) *batchv1.Job {
 	labels := backupLabels(cluster.Name, util.BackupOperationCleanup)
 
-	args := buildGpbackmanArgs(cluster)
-	podSpec := b.buildBackupPodSpec(cluster, cleanupContainerName, "gpbackman", args)
+	// The cleanup container runs the retention script directly (like the
+	// post-restore validation Job) rather than a single tool invocation, so it
+	// can enumerate, delete the oldest-excess backups and emit the deletion count.
+	podSpec := b.buildBackupPodSpec(cluster, cleanupContainerName, "", nil)
+	container := &podSpec.Containers[0]
+	container.Args = []string{buildGpbackmanRetentionScript(cluster)}
+	// FallbackToLogsOnError makes the deletion count recoverable from the pod log
+	// (the "RETENTION_DELETED=<n>" marker) if the /dev/termination-log write is
+	// missed; the script writes the count to the termination message directly.
+	container.TerminationMessagePolicy = corev1.TerminationMessageFallbackToLogsOnError
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -694,20 +1190,204 @@ func (b *DefaultBuilder) BuildRetentionCleanupJob(
 	}
 }
 
-// buildGpbackmanArgs builds the gpbackman cleanup arguments from the retention policy.
-func buildGpbackmanArgs(cluster *cbv1alpha1.CloudberryCluster) []string {
-	args := []string{"delete", pluginConfigFlag, s3RenderedConfigPath, "--cascade"}
-	if cluster.Spec.Backup == nil {
-		return args
+// retentionDeletedMarker is the stdout/termination-message prefix the cleanup
+// script emits with the total number of deleted backups; the controller parses it.
+const retentionDeletedMarker = "RETENTION_DELETED="
+
+// parseMaxAgeDays converts a retention MaxAge expression into a whole number of
+// days for gpbackman's backup-clean --older-than-days. It accepts a "Nd" day
+// form ("30d" -> 30), a "Nw" week form ("4w" -> 28), a Go duration ("720h" ->
+// 30, "25h" -> 1), and a bare integer number of days ("30" -> 30). Sub-day
+// durations truncate toward zero (a positive duration under 24h yields 1 day so
+// it still enforces some retention; exactly zero yields 0). It returns (0,
+// false) when the value is empty or unparseable so the caller can skip the
+// time-based step.
+func parseMaxAgeDays(maxAge string) (int, bool) {
+	s := strings.TrimSpace(maxAge)
+	if s == "" {
+		return 0, false
 	}
-	retention := cluster.Spec.Backup.Retention
-	if retention.MaxAge != "" {
-		args = append(args, "--older-than", retention.MaxAge)
+	// Bare integer number of days.
+	if n, err := strconv.Atoi(s); err == nil {
+		if n < 0 {
+			return 0, false
+		}
+		return n, true
 	}
+	// "Nd" (days) and "Nw" (weeks) shorthands are not Go durations.
+	if days, ok := parseDaysSuffix(s); ok {
+		return days, true
+	}
+	// Go duration (e.g. "720h", "25h", "43200m").
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		days := int(d / (24 * time.Hour))
+		if days == 0 {
+			// A positive sub-day duration still implies retention; round up to 1
+			// so backup-clean removes anything older than a day.
+			days = 1
+		}
+		return days, true
+	}
+	return 0, false
+}
+
+// parseDaysSuffix parses the "Nd" (days) and "Nw" (weeks) retention shorthands
+// that are not valid Go durations, returning the equivalent whole days.
+func parseDaysSuffix(s string) (int, bool) {
+	if len(s) < 2 {
+		return 0, false
+	}
+	unit := s[len(s)-1]
+	num, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil || num < 0 {
+		return 0, false
+	}
+	switch unit {
+	case 'd', 'D':
+		return num, true
+	case 'w', 'W':
+		return num * 7, true
+	default:
+		return 0, false
+	}
+}
+
+// buildGpbackmanRetentionScript renders the POSIX sh script that enforces all
+// retention policies for the cleanup Job using the real gpbackman CLI:
+//   - count-based full retention: backup-info --type full lists the Success
+//     full timestamps (newest first); the oldest excess beyond FullCount are
+//     removed with backup-delete --timestamp <ts> --cascade.
+//   - count-based incremental retention: same with --type incremental, guarding
+//     against rows already removed by a cascaded full delete (re-checks the
+//     current backup-info output before each delete).
+//   - time-based retention (maxAge): backup-clean --older-than-days N --cascade.
+//
+// All interpolated values are single-quoted (shellQuote) so there is no
+// injection surface, and the script is bash-3.2 / POSIX-sh safe (no associative
+// arrays). It maintains a DELETED counter, prints the "RETENTION_DELETED=<n>"
+// marker to stdout and writes <n> to the container terminationMessagePath so the
+// operator can recover the count and patch the retention annotation.
+func buildGpbackmanRetentionScript(cluster *cbv1alpha1.CloudberryCluster) string {
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString(gpEnvPreamble)
+	b.WriteString(sshSetupPreamble)
+	b.WriteString(gpbackupPluginPathPreamble)
+	// DEST_FLAGS carries the destination selector passed to every gpbackman
+	// command: for a LOCAL destination there is no S3 ConfigMap mounted at
+	// /etc/gpbackup, so we use `--backup-dir <path>` and skip the S3 render
+	// (reading the missing template under `set -euo pipefail` would abort the
+	// Job). For S3 we render the plugin config (same preamble as
+	// renderToolScript) and use `--plugin-config <rendered>`.
+	if isLocalDestination(cluster) {
+		fmt.Fprintf(&b, "DEST_FLAGS=%s\n",
+			shellQuote(backupDirFlag+" "+localBackupDir(cluster)))
+	} else {
+		fmt.Fprintf(&b,
+			"if command -v envsubst >/dev/null 2>&1; then "+
+				"envsubst < %[1]s/%[2]s > %[3]s; "+
+				"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
+			s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+		fmt.Fprintf(&b, "DEST_FLAGS=%s\n",
+			shellQuote(pluginConfigFlag+" "+s3RenderedConfigPath))
+	}
+
+	fmt.Fprintf(&b, "HISTORY_DB=%s\n", shellQuote(gpbackupHistoryDBPath))
+	b.WriteString("DELETED=0\n")
+	b.WriteString(retentionScriptHelpers())
+
+	retention := retentionPolicy(cluster)
 	if retention.FullCount > 0 {
-		args = append(args, "--keep-full", strconv.Itoa(int(retention.FullCount)))
+		b.WriteString(retentionCountBlock("full", retention.FullCount))
 	}
-	return args
+	if retention.IncrementalCount > 0 {
+		b.WriteString(retentionCountBlock("incremental", retention.IncrementalCount))
+	}
+	if days, ok := parseMaxAgeDays(retention.MaxAge); ok {
+		b.WriteString(retentionMaxAgeBlock(days))
+	}
+
+	// Report the total deletions on stdout and via the termination message.
+	fmt.Fprintf(&b, "echo \"%s${DELETED}\"\n", retentionDeletedMarker)
+	b.WriteString("printf '%s' \"${DELETED}\" > /dev/termination-log 2>/dev/null || true\n")
+	b.WriteString("exit 0\n")
+	return b.String()
+}
+
+// retentionPolicy returns the cluster's retention policy, or a zero policy when
+// no backup is configured.
+func retentionPolicy(cluster *cbv1alpha1.CloudberryCluster) cbv1alpha1.BackupRetention {
+	if cluster.Spec.Backup == nil {
+		return cbv1alpha1.BackupRetention{}
+	}
+	return cluster.Spec.Backup.Retention
+}
+
+// retentionScriptHelpers emits shell helper functions shared by the retention
+// blocks: _gpbackman_timestamps lists Success backup timestamps (newest first)
+// for a given --type, and _gpbackman_delete deletes one timestamp (cascade) and
+// increments DELETED on success.
+//
+// _gpbackman_timestamps parses gpbackman backup-info output: it keeps only rows
+// whose first field is a 14-digit timestamp AND whose row reports STATUS=Success
+// (gpbackman renders a "Success" status column for completed backups; rows that
+// are deleted/failed are skipped). The result is emitted newest-first because
+// gpbackman backup-info already orders newest first; the helper preserves order.
+func retentionScriptHelpers() string {
+	return "_gpbackman_timestamps() {\n" +
+		"  gpbackman backup-info --type \"$1\" --history-db \"${HISTORY_DB}\" 2>/dev/null | " +
+		"awk '/[Ss]uccess/ { for (i = 1; i <= NF; i++) " +
+		"if ($i ~ /^[0-9]{14}$/) { print $i; break } }' || true\n" +
+		"}\n" +
+		"_gpbackman_delete() {\n" +
+		"  if gpbackman backup-delete --timestamp \"$1\" --cascade " +
+		"${DEST_FLAGS} --history-db \"${HISTORY_DB}\"; then\n" +
+		"    DELETED=$((DELETED + 1))\n" +
+		"  fi\n" +
+		"}\n"
+}
+
+// retentionCountBlock emits a shell block that enforces count-based retention for
+// the given backup type. It re-enumerates the current Success timestamps before
+// each delete so cascaded removals (a deleted full taking its incrementals with
+// it) do not cause under/over-deletion: the loop deletes the oldest backup while
+// the count exceeds keep, re-listing after every delete and stopping once the
+// retained set is within the limit.
+func retentionCountBlock(backupType string, keep int32) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# count-based retention for %s backups (keep newest %d)\n",
+		backupType, keep)
+	fmt.Fprintf(&b, "KEEP=%d\n", keep)
+	b.WriteString("while :; do\n")
+	fmt.Fprintf(&b, "  TS_LIST=\"$(_gpbackman_timestamps %s)\"\n", shellQuote(backupType))
+	b.WriteString("  COUNT=$(printf '%s\\n' \"${TS_LIST}\" | grep -c '[0-9]' || true)\n")
+	b.WriteString("  if [ \"${COUNT:-0}\" -le \"${KEEP}\" ]; then break; fi\n")
+	// backup-info is newest-first, so the oldest Success timestamp is the last line.
+	b.WriteString("  OLDEST=$(printf '%s\\n' \"${TS_LIST}\" | grep '[0-9]' | tail -n 1)\n")
+	b.WriteString("  if [ -z \"${OLDEST}\" ]; then break; fi\n")
+	b.WriteString("  _gpbackman_delete \"${OLDEST}\"\n")
+	b.WriteString("done\n")
+	return b.String()
+}
+
+// retentionMaxAgeBlock emits the time-based retention step: gpbackman backup-clean
+// --older-than-days <days> removes every backup older than the window (cascade so
+// dependent incrementals go with their full). The deleted count for this step is
+// approximated by re-counting the total Success backups before and after so the
+// reported DELETED stays accurate even though backup-clean removes many at once.
+func retentionMaxAgeBlock(days int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# time-based retention (older than %d day(s))\n", days)
+	b.WriteString("BEFORE_CLEAN=$(( $(_gpbackman_timestamps full | grep -c '[0-9]' || true) + " +
+		"$(_gpbackman_timestamps incremental | grep -c '[0-9]' || true) ))\n")
+	fmt.Fprintf(&b,
+		"gpbackman backup-clean --older-than-days %d ${DEST_FLAGS} "+
+			"--cascade --history-db \"${HISTORY_DB}\" || true\n", days)
+	b.WriteString("AFTER_CLEAN=$(( $(_gpbackman_timestamps full | grep -c '[0-9]' || true) + " +
+		"$(_gpbackman_timestamps incremental | grep -c '[0-9]' || true) ))\n")
+	b.WriteString("if [ \"${BEFORE_CLEAN}\" -gt \"${AFTER_CLEAN}\" ]; then " +
+		"DELETED=$((DELETED + BEFORE_CLEAN - AFTER_CLEAN)); fi\n")
+	return b.String()
 }
 
 // buildBackupPodSpec builds the pod spec shared by backup/restore/cleanup Jobs.
@@ -720,7 +1400,7 @@ func (b *DefaultBuilder) buildBackupPodSpec(
 		Name:         containerName,
 		Image:        backupImage(cluster),
 		Command:      []string{shellCommand, shellFlag},
-		Args:         []string{renderToolScript(tool, args)},
+		Args:         []string{renderToolScript(cluster, tool, args)},
 		Env:          buildBackupEnv(cluster),
 		VolumeMounts: buildBackupVolumeMounts(cluster),
 	}
@@ -813,9 +1493,11 @@ func preBackupCheckScript(cluster *cbv1alpha1.CloudberryCluster) string {
 	return b.String()
 }
 
-// preBackupDestinationCheck returns the best-effort destination-readiness portion
-// of the pre-backup script. For local destinations it verifies free disk space on
-// the backup mount; for S3 it performs a lightweight, non-fatal connectivity probe.
+// preBackupDestinationCheck returns the destination-readiness portion of the
+// pre-backup script. For local destinations it verifies free disk space on the
+// backup mount (fail-closed below minBackupDiskFreeKB). For S3 it performs a
+// real, fail-closed SigV4-signed HEAD request against the bucket so wrong
+// credentials, a missing bucket or an unreachable endpoint block the backup.
 func preBackupDestinationCheck(cluster *cbv1alpha1.CloudberryCluster) string {
 	if cluster.Spec.Backup == nil {
 		return ""
@@ -833,14 +1515,73 @@ func preBackupDestinationCheck(cluster *cbv1alpha1.CloudberryCluster) string {
 				"echo \"pre-backup-check: insufficient free space ${free}KB\" >&2; exit 1; fi\n",
 			shellQuote(path), minBackupDiskFreeKB)
 	case destinationTypeS3:
-		// Best-effort: the s3 plugin/aws cli may be absent, so never fail here.
-		return "echo 'pre-backup-check: s3 bucket connectivity (best-effort)'\n" +
-			"command -v aws >/dev/null 2>&1 && " +
-			"aws s3 ls \"s3://${S3_BUCKET}\" >/dev/null 2>&1 || " +
-			"echo 'pre-backup-check: skipping s3 connectivity probe'\n"
+		return s3ReachabilityCheckScript()
 	default:
 		return ""
 	}
+}
+
+// s3ReachabilityCheckScript builds a self-contained POSIX-sh snippet that
+// performs a fail-closed S3 bucket reachability check. It issues a SigV4-signed
+// HTTP HEAD request (path-style, e.g. MinIO) against ${S3_ENDPOINT}/${S3_BUCKET}
+// using the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY already injected into the
+// init container, mirroring the openssl-HMAC SigV4 signing used in
+// test/docker-compose/scripts/setup-minio.sh. A 2xx/3xx response means the
+// bucket is reachable; any other response (403/404/000/connection refused)
+// causes "exit 1" so the backup is blocked. The request is bounded by
+// curl --max-time so an unreachable endpoint fails closed instead of hanging.
+//
+// The snippet is built from constant pieces only (no untrusted interpolation):
+// all S3 values are read at runtime from the container env vars, so there is no
+// shell-injection surface. The few %-format verbs below substitute the
+// signing region default and the curl timeout constants.
+func s3ReachabilityCheckScript() string {
+	return fmt.Sprintf(`echo 'pre-backup-check: verifying s3 bucket reachability'
+_s3_region="${S3_REGION:-%[1]s}"
+_s3_service="s3"
+# Strip a trailing slash from the endpoint so ${endpoint}/${bucket} is clean.
+_s3_endpoint="${S3_ENDPOINT%%/}"
+# Derive host[:port] from the endpoint for the canonical Host header.
+_s3_hostport="${_s3_endpoint#*://}"
+_s3_hostport="${_s3_hostport%%/*}"
+# openssl-based SigV4 helpers (mirror setup-minio.sh).
+_hmac_hex() { printf '%%s' "$2" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$1" | sed 's/^.*= //'; }
+_sha256_hex() { printf '%%s' "$1" | openssl dgst -sha256 | sed 's/^.*= //'; }
+_amzdate="$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"
+_datestamp="$(date -u +%%Y%%m%%d)"
+_payload_hash="$(_sha256_hex '')"
+# Canonical request for HEAD /<bucket> (path-style, empty query, empty body).
+_canonical_headers="host:${_s3_hostport}
+x-amz-content-sha256:${_payload_hash}
+x-amz-date:${_amzdate}
+"
+_signed_headers="host;x-amz-content-sha256;x-amz-date"
+_canonical_request="$(printf '%%s\n%%s\n%%s\n%%s\n%%s\n%%s' \
+  "HEAD" "/${S3_BUCKET}" "" "${_canonical_headers}" "${_signed_headers}" "${_payload_hash}")"
+_scope="${_datestamp}/${_s3_region}/${_s3_service}/aws4_request"
+_string_to_sign="$(printf '%%s\n%%s\n%%s\n%%s' \
+  "AWS4-HMAC-SHA256" "${_amzdate}" "${_scope}" "$(_sha256_hex "${_canonical_request}")")"
+# Derive the SigV4 signing key (HMAC chain seeded with "AWS4"+secret).
+_k_secret_hex="$(printf 'AWS4%%s' "${AWS_SECRET_ACCESS_KEY}" | od -An -tx1 | tr -d ' \n')"
+_k_date="$(_hmac_hex "${_k_secret_hex}" "${_datestamp}")"
+_k_region="$(_hmac_hex "${_k_date}" "${_s3_region}")"
+_k_service="$(_hmac_hex "${_k_region}" "${_s3_service}")"
+_k_signing="$(_hmac_hex "${_k_service}" "aws4_request")"
+_signature="$(_hmac_hex "${_k_signing}" "${_string_to_sign}")"
+_authz="AWS4-HMAC-SHA256 Credential=${AWS_ACCESS_KEY_ID}/${_scope}, "
+_authz="${_authz}SignedHeaders=${_signed_headers}, Signature=${_signature}"
+# Fail closed: any curl error yields code 000 (-> exit 1 below).
+_code="$(curl -s -o /dev/null -w '%%{http_code}' --max-time %[2]d \
+  -I -X HEAD "${_s3_endpoint}/${S3_BUCKET}" \
+  -H "Host: ${_s3_hostport}" \
+  -H "x-amz-content-sha256: ${_payload_hash}" \
+  -H "x-amz-date: ${_amzdate}" \
+  -H "Authorization: ${_authz}" 2>/dev/null || echo 000)"
+case "${_code}" in
+  2??|3??) echo "pre-backup-check: s3 bucket reachable (http ${_code})" ;;
+  *) echo "pre-backup-check: s3 bucket unreachable (http ${_code})" >&2; exit 1 ;;
+esac
+`, defaultS3SigningRegion, s3ReachabilityMaxTimeSeconds)
 }
 
 // buildJobSpec builds the JobSpec with template overrides applied.
@@ -941,7 +1682,7 @@ func buildBackupEnv(cluster *cbv1alpha1.CloudberryCluster) []corev1.EnvVar {
 		{Name: "PGUSER", Value: util.DefaultAdminUser},
 		{Name: "PGDATABASE", Value: defaultCoordinatorDatabase},
 		{
-			Name: "PGPASSWORD",
+			Name: envPGPassword,
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{
@@ -1172,6 +1913,9 @@ func applyJobTemplatePod(cluster *cbv1alpha1.CloudberryCluster, podSpec *corev1.
 	}
 	if len(tmpl.Tolerations) > 0 {
 		podSpec.Tolerations = toTolerations(tmpl.Tolerations)
+	}
+	if len(tmpl.ImagePullSecrets) > 0 {
+		addImagePullSecrets(podSpec, tmpl.ImagePullSecrets)
 	}
 }
 

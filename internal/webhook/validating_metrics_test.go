@@ -2,11 +2,15 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
@@ -112,6 +116,33 @@ func TestRecordAdmission_OnDelete(t *testing.T) {
 	assert.Equal(t, 1, rec.admissions)
 	assert.Equal(t, admissionOpDelete, rec.lastOperation)
 	assert.Equal(t, admissionAllowed, rec.lastResult)
+}
+
+func TestRecordAdmission_Error_OnInternalFailure(t *testing.T) {
+	// A List failure during the duplicate-name check is an internal error, not a
+	// validation rejection, so it must record the distinct "error" result.
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(
+				_ context.Context, _ client.WithWatch, _ client.ObjectList,
+				_ ...client.ListOption,
+			) error {
+				return fmt.Errorf("api server unavailable")
+			},
+		}).
+		Build()
+
+	rec := newCapturingRecorder()
+	v := NewCloudberryClusterValidator(k8sClient, rec)
+
+	_, err := v.ValidateCreate(context.Background(), newValidCluster())
+	require.Error(t, err)
+
+	assert.Equal(t, 1, rec.admissions)
+	assert.Equal(t, admissionOpCreate, rec.lastOperation)
+	assert.Equal(t, admissionError, rec.lastResult)
 }
 
 // ============================================================================

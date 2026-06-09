@@ -1,0 +1,225 @@
+# =============================================================================
+# Scenario 81 — Local Destination Backup/Restore (PVC-backed, --backup-dir)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus a LOCAL (PVC-backed) backup destination.
+#
+# Scenario 81 exercises the local destination backup/restore path. With
+# destination.type=local the operator wires gpbackup/gprestore to a
+# `--backup-dir` on the mounted PVC instead of the S3 plugin:
+#   81a backup Job spec : the backup Job mounts the named PVC (backup-pvc) at
+#       local.path (/backups), the gpbackup container args carry
+#       --backup-dir /backups and NOT --plugin-config, and there is NO
+#       s3-plugin-config ConfigMap volume / no /etc/gpbackup mount / no S3 env.
+#       The operator creates NO S3 ConfigMap/Secret for a local destination.
+#   81b PVC writable    : the backup-pvc PVC mounts read-write at /backups (a
+#       small write/ls probe).
+#   81c real local backup: a real gpbackup with --backup-dir (NO S3 plugin)
+#       completes and lands per-segment backup files.
+#   81d real local restore: a real gprestore --backup-dir into a fresh db
+#       completes with a row-count match against the source baseline.
+#
+# MPP / LIVE MODEL NOTE
+# ---------------------
+# gpbackup --backup-dir writes per-segment backup sets on the COORDINATOR and
+# EVERY SEGMENT host. The standalone backup Job pod mounting the single RWO
+# backup-pvc is NOT a segment host, so a real cluster-wide gpbackup cannot land
+# all per-segment sets on that one PVC. The live test therefore SPLITS the proof:
+#   (a) Job-SPEC assertions (PVC mounted at /backups, --backup-dir in args, no
+#       --plugin-config, no s3-config ConfigMap volume) prove the operator's PVC
+#       wiring; (b) a REAL local gpbackup+gprestore via coordinator-exec into a
+#       --backup-dir present on ALL cluster pods (e.g. /tmp/scenario81-backups)
+#       proves the toolchain end-to-end and that per-segment files land.
+#
+# KEY CONFIG NOTES
+#   * destination.type=local; local.path=/backups; local.persistentVolumeClaim=
+#     backup-pvc. No S3 block (no plugin, no ConfigMap, no Vault S3 creds).
+#   * The backup PVC is declared below (---) so a single
+#     `kubectl apply -f scenario81-local-destination.yaml` creates both the PVC
+#     and the cluster. The PVC is sized ~5Gi (Scenario 78 lesson: do NOT FILL
+#     hostpath PVCs) — big enough for a modest backup set + headroom.
+#   * No `schedule` is set: Scenario 81 drives an on-demand backup/restore so each
+#     Job surfaces on a discrete reconciled resource.
+#   * The backup image MUST ship gpbackup/gprestore (cloudberry-backup:2.1.0) —
+#     the live test runs real gpbackup/gprestore --backup-dir via coordinator-exec.
+#
+# Live test: test/e2e/scripts/scenario81-local-destination.sh \
+#   --cluster scenario81-local
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-pvc
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "81"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # ~5Gi: big enough for a modest backup set + headroom. Scenario 78 lesson:
+      # do NOT fill hostpath PVCs (no quota -> DiskPressure). The live script
+      # only probes write+ls on the PVC; the real per-segment backup uses a
+      # segment-visible --backup-dir under /tmp, not this single RWO PVC.
+      storage: "5Gi"
+---
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario81-local
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "81"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      # Room for the modest mydb + per-segment backup set under the
+      # segment-visible --backup-dir used by the live test.
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario81-local-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario81-local-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — LOCAL (PVC-backed) destination. No S3 plugin, no S3
+  # ConfigMap, no Vault S3 creds. No schedule is set: Scenario 81 drives an
+  # on-demand backup + restore so each Job surfaces on a discrete reconciled
+  # resource. gpbackup runs with --backup-dir <local.path> (no --plugin-config).
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+    destination:
+      type: local
+      local:
+        path: /backups
+        persistentVolumeClaim: backup-pvc
+
+  deletionPolicy: Delete

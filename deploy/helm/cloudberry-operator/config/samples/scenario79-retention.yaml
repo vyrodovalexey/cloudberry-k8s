@@ -1,0 +1,223 @@
+# =============================================================================
+# Scenario 79 — Retention Cleanup, All Policies (S3 destination)
+# =============================================================================
+# HA coordinator + standby, segment mirroring (group layout), Vault-PKI TLS,
+# Keycloak OIDC, full query monitoring (postgres-exporter on segments + mirrors,
+# cloudberry-query-exporter), plus the full backup block targeting an
+# S3-compatible (MinIO) destination with ALL THREE retention policies enabled.
+#
+# Scenario 79 exercises the gpbackman-driven retention cleanup lifecycle. After
+# each successful backup the operator creates a single retention cleanup Job
+# (<cluster>-cleanup-<latest-backup-ts>, idempotent) that enforces every policy
+# and feeds its deletion count into cloudberry_backup_retention_deleted_total:
+#   79a fullCount=3        : 4 full backups => the cleanup Job deletes the OLDEST
+#       full (gpbackman backup-delete --timestamp <oldest> --cascade), keeping 3.
+#   79b incrementalCount=10: a full + 11 incrementals => the oldest incremental
+#       beyond 10 is deleted (the script re-enumerates Success timestamps after
+#       each delete so a cascaded full-delete neither over- nor under-counts).
+#   79c maxAge="30d"       : a backup whose gpbackup_history.db timestamp is older
+#       than 30 days is removed by gpbackman backup-clean --older-than-days 30
+#       --cascade (the live test ages a history row in SQLite to trigger this).
+#   79d cleanup placement   : the operator creates the cleanup Job after the
+#       newest Succeeded backup and patches avsoft.io/backup-retention-deleted=<n>
+#       from the cleanup pod's RETENTION_DELETED terminated message; the metrics
+#       loop turns that annotation into the retention counter.
+#
+# KEY CONFIG NOTES
+#   * Same bucket + folder (/backups) for fulls AND incrementals so gpbackman
+#     reads ONE backup history on the destination (gpbackup_history.db on the
+#     coordinator) — a split folder would break the count/age enumeration.
+#   * retention.{fullCount,incrementalCount,maxAge} are ALL set so a single
+#     cleanup Job enforces every policy (the rendered script renders one
+#     count-loop per type plus a backup-clean --older-than-days step).
+#   * The backup image MUST include gpbackman (cloudberry-backup:2.1.0 ships
+#     gpbackman v0.8.1) — the cleanup Job invokes gpbackman backup-info /
+#     backup-delete / backup-clean.
+#   * Multipart 10MB/4 (carried from scenario76/77/78) for MinIO emulation.
+#   * No `schedule` is set: Scenario 79 drives on-demand backups so each backup +
+#     its retention cleanup Job surfaces on a discrete reconciled Job.
+#
+# Credential source: Kubernetes Secret `backup-s3-credentials`
+#   (created by test/docker-compose/scripts/setup-minio.sh).
+# In-cluster MinIO reachability: the CR endpoint `http://minio:9000` resolves via
+# the `minio` ExternalName Service (also created by setup-minio.sh).
+#
+# Live test: test/e2e/scripts/scenario79-retention.sh --cluster scenario79-s3
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: scenario79-s3
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "79"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    storage:
+      size: "1Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in the scenario79-s3-tls secret).
+      enabled: true
+      certSecret:
+        name: scenario79-s3-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # Full backup block — S3 (MinIO) destination, Secret credential source, ALL
+  # retention policies enabled. No schedule is set: Scenario 79 triggers
+  # on-demand backups so each backup + its retention cleanup Job surfaces on a
+  # discrete Job the operator reconciles.
+  backup:
+    enabled: true
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      # 79a: keep the newest 3 full backups (oldest excess deleted, cascade).
+      fullCount: 3
+      # 79b: keep the newest 10 incrementals (oldest excess beyond 10 deleted).
+      incrementalCount: 10
+      # 79c: delete any backup whose history timestamp is older than 30 days
+      # (gpbackman backup-clean --older-than-days 30 --cascade).
+      maxAge: "30d"
+    gpbackup:
+      compressionLevel: 1
+      compressionType: gzip
+      jobs: 1
+      # Incremental enabled so 79b can chain a full + 11 incrementals.
+      incremental: true
+      leafPartitionData: true
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        # SAME folder for full + ALL incrementals so gpbackman enumerates a single
+        # backup history on the destination for count/age retention.
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        credentialSecret:
+          name: backup-s3-credentials
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Delete

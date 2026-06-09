@@ -1,11 +1,13 @@
 package builder
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -39,11 +41,11 @@ func newBackupCluster() *cbv1alpha1.CloudberryCluster {
 			CompressionLevel: 6,
 			CompressionType:  "gzip",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 		},
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:      4,
-			WithStats: true,
+			WithStats: util.Ptr(true),
 		},
 	}
 	return cluster
@@ -51,11 +53,11 @@ func newBackupCluster() *cbv1alpha1.CloudberryCluster {
 
 func TestBuildGpbackupArgs(t *testing.T) {
 	t.Run("compression level and jobs", func(t *testing.T) {
-		args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{
+		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 		}, nil)
 		joined := strings.Join(args, " ")
 		assert.Contains(t, joined, "--compression-level 6")
@@ -66,7 +68,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("single data file excludes jobs and includes copy queue", func(t *testing.T) {
-		args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{
+		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			SingleDataFile: true,
 			CopyQueueSize:  4,
 			Jobs:           4,
@@ -78,7 +80,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("no compression overrides level", func(t *testing.T) {
-		args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{
+		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			NoCompression:    true,
 			CompressionLevel: 9,
 		}, nil)
@@ -88,7 +90,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("incremental with leaf partition and from timestamp", func(t *testing.T) {
-		args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{
+		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			Incremental:       true,
 			LeafPartitionData: true,
 		}, &BackupJobOptions{FromTimestamp: "20260518020000"})
@@ -99,7 +101,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("include schema and exclude table and dbname", func(t *testing.T) {
-		args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{}, &BackupJobOptions{
+		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{}, &BackupJobOptions{
 			Databases:      []string{"mydb"},
 			IncludeSchemas: []string{"public", "analytics"},
 			ExcludeTables:  []string{"public.temp_data"},
@@ -112,7 +114,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("nil options does not panic", func(t *testing.T) {
-		args := buildGpbackupArgs(nil, nil)
+		args := buildGpbackupArgs(newBackupCluster(), nil, nil)
 		assert.Contains(t, strings.Join(args, " "), pluginConfigFlag)
 	})
 }
@@ -122,10 +124,10 @@ func TestBuildGprestoreArgs(t *testing.T) {
 	// BOTH filters are supplied the builder emits --include-table (table-level
 	// precedence) and OMITS --include-schema.
 	t.Run("both filters: include-table wins, include-schema omitted", func(t *testing.T) {
-		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
+		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{
 			Jobs:            4,
 			CreateDb:        true,
-			WithStats:       true,
+			WithStats:       util.Ptr(true),
 			RunAnalyze:      true,
 			OnErrorContinue: true,
 			TruncateTable:   true,
@@ -155,7 +157,7 @@ func TestBuildGprestoreArgs(t *testing.T) {
 
 	// When ONLY includeSchemas is set, --include-schema is emitted per schema.
 	t.Run("schema-only: include-schema emitted, no include-table", func(t *testing.T) {
-		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{Jobs: 4}, &RestoreJobOptions{
+		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{Jobs: 4}, &RestoreJobOptions{
 			Timestamp:      "20260519020000",
 			IncludeSchemas: []string{"public", "analytics"},
 		})
@@ -168,9 +170,9 @@ func TestBuildGprestoreArgs(t *testing.T) {
 	// When ONLY withStats is set (runAnalyze=false), --with-stats is emitted and
 	// --run-analyze is absent (complementary to the mutual-exclusivity rule).
 	t.Run("with-stats only: with-stats emitted, no run-analyze", func(t *testing.T) {
-		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
+		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{
 			Jobs:      4,
-			WithStats: true,
+			WithStats: util.Ptr(true),
 		}, &RestoreJobOptions{Timestamp: "20260519020000"})
 		joined := strings.Join(args, " ")
 		assert.Contains(t, joined, "--with-stats")
@@ -369,12 +371,281 @@ func TestBuildRestoreJob(t *testing.T) {
 	assert.Equal(t, restoreContainerName, job.Spec.Template.Spec.Containers[0].Name)
 }
 
+// containerEnvValue returns the value of the named env var on the container, or
+// "" when absent.
+func containerEnvValue(c corev1.Container, name string) string {
+	for _, env := range c.Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+// TestBuildRestoreJobS3FolderOverride asserts that S3FolderOverride redirects the
+// restore Job's S3_FOLDER env (and thus the rendered plugin config "folder:") to
+// the override, which is the cross-cluster migration fix. Without an override the
+// cluster's own folder is used (regression guard).
+func TestBuildRestoreJobS3FolderOverride(t *testing.T) {
+	b := NewBuilder()
+
+	t.Run("override redirects S3_FOLDER", func(t *testing.T) {
+		job := b.BuildRestoreJob(newBackupCluster(), &RestoreJobOptions{
+			Timestamp:        "20260519020000",
+			S3FolderOverride: "scenario87-src",
+		})
+		require.NotNil(t, job)
+		assert.Equal(t, "scenario87-src",
+			containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+	})
+
+	t.Run("no override keeps cluster folder", func(t *testing.T) {
+		job := b.BuildRestoreJob(newBackupCluster(), &RestoreJobOptions{
+			Timestamp: "20260519020000",
+		})
+		require.NotNil(t, job)
+		// newBackupCluster configures folder "/backups".
+		assert.Equal(t, "/backups",
+			containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+	})
+}
+
+// TestBuildPostRestoreValidationJobS3FolderOverride asserts the validation Job
+// mirrors the restore Job's S3 folder override.
+func TestBuildPostRestoreValidationJobS3FolderOverride(t *testing.T) {
+	b := NewBuilder()
+
+	job := b.BuildPostRestoreValidationJob(newBackupCluster(), &ValidationJobOptions{
+		Timestamp:        "20260519020000",
+		Database:         "mydb",
+		S3FolderOverride: "scenario87-src",
+	})
+	require.NotNil(t, job)
+	assert.Equal(t, "scenario87-src",
+		containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+
+	// Without the override the validation Job uses the cluster's own folder.
+	jobNoOverride := b.BuildPostRestoreValidationJob(newBackupCluster(), &ValidationJobOptions{
+		Timestamp: "20260519020000",
+		Database:  "mydb",
+	})
+	require.NotNil(t, jobNoOverride)
+	assert.Equal(t, "/backups",
+		containerEnvValue(jobNoOverride.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+}
+
 func TestBuildRetentionCleanupJob(t *testing.T) {
 	b := NewBuilder()
-	job := b.BuildRetentionCleanupJob(newBackupCluster(), "20260519020000")
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{
+		FullCount:        3,
+		IncrementalCount: 10,
+		MaxAge:           "30d",
+	}
+	job := b.BuildRetentionCleanupJob(cluster, "20260519020000")
 	require.NotNil(t, job)
 	assert.Equal(t, util.RetentionCleanupJobName("test-cluster", "20260519020000"), job.Name)
 	assert.Equal(t, util.BackupOperationCleanup, job.Labels[util.LabelBackupOperation])
+
+	container := job.Spec.Template.Spec.Containers[0]
+	require.Len(t, container.Args, 1)
+	script := container.Args[0]
+
+	// Real gpbackman commands only — no legacy/invalid tokens.
+	assert.NotContains(t, script, "gpbackman delete")
+	assert.NotContains(t, script, "--keep-full")
+	assert.NotContains(t, script, "--older-than ")
+	// Count-based enforcement enumerates and deletes the oldest excess.
+	assert.Contains(t, script, "backup-info --type \"$1\"")
+	assert.Contains(t, script, "_gpbackman_timestamps 'full'")
+	assert.Contains(t, script, "_gpbackman_timestamps 'incremental'")
+	assert.Contains(t, script, "backup-delete --timestamp \"$1\" --cascade")
+	// Time-based enforcement uses backup-clean --older-than-days.
+	assert.Contains(t, script, "backup-clean --older-than-days 30")
+	// Deletion-count marker + termination-message write.
+	assert.Contains(t, script, "RETENTION_DELETED=")
+	assert.Contains(t, script, "/dev/termination-log")
+	// Recoverable count via the pod log fallback.
+	assert.Equal(t, corev1.TerminationMessageFallbackToLogsOnError,
+		container.TerminationMessagePolicy)
+}
+
+func TestBuildRetentionCleanupJobMaxAgeOnly(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{MaxAge: "720h"}
+	job := b.BuildRetentionCleanupJob(cluster, "20260519020000")
+	require.NotNil(t, job)
+	script := job.Spec.Template.Spec.Containers[0].Args[0]
+	assert.Contains(t, script, "backup-clean --older-than-days 30")
+	// No count-based enumeration when only maxAge is set.
+	assert.NotContains(t, script, "_gpbackman_timestamps 'full'")
+	assert.NotContains(t, script, "_gpbackman_timestamps 'incremental'")
+}
+
+func TestParseMaxAgeDays(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		days  int
+		ok    bool
+	}{
+		{"days suffix", "30d", 30, true},
+		{"weeks suffix", "4w", 28, true},
+		{"hours duration", "720h", 30, true},
+		{"sub-day duration rounds up", "25h", 1, true},
+		{"bare integer days", "30", 30, true},
+		{"minutes duration", "43200m", 30, true},
+		{"empty", "", 0, false},
+		{"junk", "notaduration", 0, false},
+		{"negative days suffix", "-5d", 0, false},
+		{"zero days suffix", "0d", 0, true},
+		{"bare negative integer", "-5", 0, false},
+		{"sub-day duration rounds up to 1", "5h", 1, true},
+		{"single char no number", "d", 0, false},
+		{"weeks uppercase", "2W", 14, true},
+		{"days uppercase", "10D", 10, true},
+		{"unknown suffix", "30y", 0, false},
+		{"zero duration", "0s", 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			days, ok := parseMaxAgeDays(tc.input)
+			assert.Equal(t, tc.ok, ok)
+			if tc.ok {
+				assert.Equal(t, tc.days, days)
+			}
+		})
+	}
+}
+
+// TestRetentionPolicy verifies retentionPolicy returns the configured policy and
+// a zero policy when backup is not configured.
+func TestRetentionPolicy(t *testing.T) {
+	t.Run("nil backup returns zero policy", func(t *testing.T) {
+		cluster := newTestCluster()
+		cluster.Spec.Backup = nil
+		got := retentionPolicy(cluster)
+		assert.Equal(t, cbv1alpha1.BackupRetention{}, got)
+	})
+
+	t.Run("configured backup returns policy", func(t *testing.T) {
+		cluster := newBackupCluster()
+		cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{
+			FullCount:        3,
+			IncrementalCount: 10,
+			MaxAge:           "30d",
+		}
+		got := retentionPolicy(cluster)
+		assert.Equal(t, int32(3), got.FullCount)
+		assert.Equal(t, int32(10), got.IncrementalCount)
+		assert.Equal(t, "30d", got.MaxAge)
+	})
+}
+
+// TestBuildRetentionCleanupJobFullCountOnly verifies a fullCount-only policy
+// renders the full count block and omits the incremental block and backup-clean.
+func TestBuildRetentionCleanupJobFullCountOnly(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{FullCount: 3}
+	job := b.BuildRetentionCleanupJob(cluster, "20260519020000")
+	require.NotNil(t, job)
+	script := job.Spec.Template.Spec.Containers[0].Args[0]
+
+	assert.Contains(t, script, "backup-info --type \"$1\"")
+	assert.Contains(t, script, "_gpbackman_timestamps 'full'")
+	assert.Contains(t, script, "backup-delete --timestamp \"$1\" --cascade")
+	assert.Contains(t, script, "KEEP=3")
+	// No incremental count block and no time-based backup-clean.
+	assert.NotContains(t, script, "_gpbackman_timestamps 'incremental'")
+	assert.NotContains(t, script, "backup-clean --older-than-days")
+}
+
+// TestBuildRetentionCleanupJobIncrementalCountOnly verifies an incrementalCount-
+// only policy renders the incremental block and omits the full block and clean.
+func TestBuildRetentionCleanupJobIncrementalCountOnly(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{IncrementalCount: 10}
+	job := b.BuildRetentionCleanupJob(cluster, "20260519020000")
+	require.NotNil(t, job)
+	script := job.Spec.Template.Spec.Containers[0].Args[0]
+
+	assert.Contains(t, script, "_gpbackman_timestamps 'incremental'")
+	assert.Contains(t, script, "KEEP=10")
+	// No full count block and no time-based backup-clean.
+	assert.NotContains(t, script, "_gpbackman_timestamps 'full'")
+	assert.NotContains(t, script, "backup-clean --older-than-days")
+}
+
+// TestBuildRetentionCleanupJobNoPolicy verifies the cleanup Job still builds a
+// valid Job (safe no-op script) when no retention policy is configured.
+func TestBuildRetentionCleanupJobNoPolicy(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{}
+	var job *batchv1.Job
+	require.NotPanics(t, func() {
+		job = b.BuildRetentionCleanupJob(cluster, "20260519020000")
+	})
+	require.NotNil(t, job)
+	assert.Equal(t, util.BackupOperationCleanup, job.Labels[util.LabelBackupOperation])
+
+	container := job.Spec.Template.Spec.Containers[0]
+	require.Len(t, container.Args, 1)
+	script := container.Args[0]
+	// No-op: no count loops and no backup-clean, but the marker still emitted.
+	assert.NotContains(t, script, "_gpbackman_timestamps 'full'")
+	assert.NotContains(t, script, "_gpbackman_timestamps 'incremental'")
+	assert.NotContains(t, script, "backup-clean --older-than-days")
+	assert.Contains(t, script, retentionDeletedMarker)
+	assert.Contains(t, script, "/dev/termination-log")
+	// The cleanup container runs the script via sh -c.
+	assert.Equal(t, []string{shellCommand, shellFlag}, container.Command)
+}
+
+// TestBuildRetentionCleanupJobAllPolicies verifies all three blocks plus the
+// deletion-count marker and termination-log write render when every policy is set.
+func TestBuildRetentionCleanupJobAllPolicies(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{
+		FullCount:        3,
+		IncrementalCount: 10,
+		MaxAge:           "30d",
+	}
+	job := b.BuildRetentionCleanupJob(cluster, "20260519020000")
+	require.NotNil(t, job)
+	script := job.Spec.Template.Spec.Containers[0].Args[0]
+
+	assert.Contains(t, script, "_gpbackman_timestamps 'full'")
+	assert.Contains(t, script, "_gpbackman_timestamps 'incremental'")
+	assert.Contains(t, script, "backup-clean --older-than-days 30")
+	assert.Contains(t, script, "--cascade")
+	assert.Contains(t, script, retentionDeletedMarker)
+	assert.Contains(t, script, "/dev/termination-log")
+}
+
+// TestBuildRetentionCleanupScriptValidShell verifies the rendered cleanup script
+// is valid POSIX/bash syntax via `sh -n` when a shell is available.
+func TestBuildRetentionCleanupScriptValidShell(t *testing.T) {
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.Retention = cbv1alpha1.BackupRetention{
+		FullCount:        3,
+		IncrementalCount: 10,
+		MaxAge:           "30d",
+	}
+	script := buildGpbackmanRetentionScript(cluster)
+
+	cmd := exec.Command(shell, "-n") //nolint:gosec // fixed shell, script via stdin
+	cmd.Stdin = strings.NewReader(script)
+	out, runErr := cmd.CombinedOutput()
+	require.NoError(t, runErr, "sh -n reported a syntax error: %s", string(out))
 }
 
 func TestBuildBackupJobTemplateOverrides(t *testing.T) {
@@ -412,7 +683,7 @@ func TestBuildBackupEnvS3Credentials(t *testing.T) {
 
 func TestBuildGprestoreArgsDataMetadataResize(t *testing.T) {
 	t.Run("data-only and resize-cluster", func(t *testing.T) {
-		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{
+		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{
 			DataOnly:      true,
 			ResizeCluster: true,
 		}, nil)
@@ -423,7 +694,7 @@ func TestBuildGprestoreArgsDataMetadataResize(t *testing.T) {
 	})
 
 	t.Run("metadata-only", func(t *testing.T) {
-		args := buildGprestoreArgs(&cbv1alpha1.GprestoreOptions{MetadataOnly: true}, nil)
+		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{MetadataOnly: true}, nil)
 		joined := strings.Join(args, " ")
 		assert.Contains(t, joined, "--metadata-only")
 		assert.NotContains(t, joined, "--data-only")
@@ -433,7 +704,7 @@ func TestBuildGprestoreArgsDataMetadataResize(t *testing.T) {
 func TestBuildGpbackupArgsIncrementalFromTimestamp(t *testing.T) {
 	// An incremental request type alone (no explicit Incremental flag) must still
 	// emit the incremental flags plus the pinned base timestamp.
-	args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{
+	args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 		Incremental:       true,
 		LeafPartitionData: true,
 	}, &BackupJobOptions{
@@ -447,7 +718,7 @@ func TestBuildGpbackupArgsIncrementalFromTimestamp(t *testing.T) {
 }
 
 func TestBuildGpbackupArgsIncludeTable(t *testing.T) {
-	args := buildGpbackupArgs(&cbv1alpha1.GpbackupOptions{SingleDataFile: true}, &BackupJobOptions{
+	args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{SingleDataFile: true}, &BackupJobOptions{
 		IncludeTables: []string{"public.users", "public.orders"},
 	})
 	joined := strings.Join(args, " ")
@@ -532,8 +803,19 @@ func TestBuildPostRestoreValidationJobDefaultQuery(t *testing.T) {
 
 func TestPreBackupDestinationCheckS3(t *testing.T) {
 	script := preBackupCheckScript(newBackupCluster())
-	assert.Contains(t, script, "s3 bucket connectivity")
+	// The S3 branch performs a real, fail-closed SigV4 HEAD reachability check.
+	assert.Contains(t, script, "verifying s3 bucket reachability")
+	assert.Contains(t, script, "${S3_ENDPOINT")
 	assert.Contains(t, script, "${S3_BUCKET}")
+	assert.Contains(t, script, "${S3_REGION:-us-east-1}")
+	assert.Contains(t, script, "${AWS_ACCESS_KEY_ID}")
+	assert.Contains(t, script, "${AWS_SECRET_ACCESS_KEY}")
+	assert.Contains(t, script, "AWS4-HMAC-SHA256")
+	assert.Contains(t, script, "-X HEAD")
+	assert.Contains(t, script, "--max-time")
+	// Fail-closed: non-2xx/3xx must exit 1.
+	assert.Contains(t, script, "s3 bucket unreachable")
+	assert.Contains(t, script, "exit 1")
 }
 
 func TestPreBackupDestinationCheckNoBackup(t *testing.T) {
@@ -580,4 +862,127 @@ func TestJobTemplateOverridesResourcesAndTolerations(t *testing.T) {
 	assert.False(t, container.Resources.Limits.Memory().IsZero())
 	require.Len(t, job.Spec.Template.Spec.Tolerations, 1)
 	assert.Equal(t, "dedicated", job.Spec.Template.Spec.Tolerations[0].Key)
+}
+
+// TestBuildBackupJob_DefaultBackoffAndDeadline_Scenario83 asserts the Scenario 83
+// builder defaults: with NO jobTemplate the on-demand backup Job carries
+// BackoffLimit==2 (defaultBackoffLimit) and ActiveDeadlineSeconds==7200
+// (defaultActiveDeadlineSeconds).
+func TestBuildBackupJob_DefaultBackoffAndDeadline_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.JobTemplate = nil
+
+	job := b.BuildBackupJob(cluster, &BackupJobOptions{Timestamp: "20260519020000"})
+	require.NotNil(t, job)
+	require.NotNil(t, job.Spec.BackoffLimit)
+	assert.Equal(t, int32(2), *job.Spec.BackoffLimit)
+	require.NotNil(t, job.Spec.ActiveDeadlineSeconds)
+	assert.Equal(t, int64(7200), *job.Spec.ActiveDeadlineSeconds)
+}
+
+// TestBuildBackupCronJob_DefaultBackoffAndDeadline_Scenario83 asserts the same
+// defaults reach the CronJob's JobTemplate spec when no jobTemplate is set.
+func TestBuildBackupCronJob_DefaultBackoffAndDeadline_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.JobTemplate = nil
+
+	cj := b.BuildBackupCronJob(cluster)
+	require.NotNil(t, cj)
+	spec := cj.Spec.JobTemplate.Spec
+	require.NotNil(t, spec.BackoffLimit)
+	assert.Equal(t, int32(2), *spec.BackoffLimit)
+	require.NotNil(t, spec.ActiveDeadlineSeconds)
+	assert.Equal(t, int64(7200), *spec.ActiveDeadlineSeconds)
+}
+
+// TestBuildBackupJob_JobTemplateBackoffAndDeadlineOverride_Scenario83 asserts a
+// jobTemplate setting BackoffLimit=5 and ActiveDeadlineSeconds=5 reaches the
+// on-demand backup Job spec verbatim (the deadline/force-failure knobs).
+func TestBuildBackupJob_JobTemplateBackoffAndDeadlineOverride_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	backoff := int32(5)
+	deadline := int64(5)
+	cluster.Spec.Backup.JobTemplate = &cbv1alpha1.BackupJobTemplate{
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
+	}
+
+	job := b.BuildBackupJob(cluster, &BackupJobOptions{Timestamp: "20260519020000"})
+	require.NotNil(t, job)
+	require.NotNil(t, job.Spec.BackoffLimit)
+	assert.Equal(t, int32(5), *job.Spec.BackoffLimit)
+	require.NotNil(t, job.Spec.ActiveDeadlineSeconds)
+	assert.Equal(t, int64(5), *job.Spec.ActiveDeadlineSeconds)
+}
+
+// TestBuildBackupCronJob_JobTemplateBackoffAndDeadlineOverride_Scenario83 asserts
+// the same override reaches the CronJob's JobTemplate spec.
+func TestBuildBackupCronJob_JobTemplateBackoffAndDeadlineOverride_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	backoff := int32(5)
+	deadline := int64(5)
+	cluster.Spec.Backup.JobTemplate = &cbv1alpha1.BackupJobTemplate{
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
+	}
+
+	cj := b.BuildBackupCronJob(cluster)
+	require.NotNil(t, cj)
+	spec := cj.Spec.JobTemplate.Spec
+	require.NotNil(t, spec.BackoffLimit)
+	assert.Equal(t, int32(5), *spec.BackoffLimit)
+	require.NotNil(t, spec.ActiveDeadlineSeconds)
+	assert.Equal(t, int64(5), *spec.ActiveDeadlineSeconds)
+}
+
+// TestBuildJobSpec_OverridePropagatesToAllJobs_Scenario83 confirms the
+// jobTemplate override routes through buildJobSpec uniformly: restore, validation
+// and retention-cleanup Jobs all carry the overridden BackoffLimit==5 and
+// ActiveDeadlineSeconds==5.
+func TestBuildJobSpec_OverridePropagatesToAllJobs_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	backoff := int32(5)
+	deadline := int64(5)
+	cluster.Spec.Backup.JobTemplate = &cbv1alpha1.BackupJobTemplate{
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
+	}
+
+	restore := b.BuildRestoreJob(cluster, &RestoreJobOptions{Timestamp: "20260519020000"})
+	validate := b.BuildPostRestoreValidationJob(cluster, &ValidationJobOptions{Timestamp: "20260519020000"})
+	cleanup := b.BuildRetentionCleanupJob(cluster, "20260519020000")
+
+	for name, spec := range map[string]batchv1.JobSpec{
+		"restore":  restore.Spec,
+		"validate": validate.Spec,
+		"cleanup":  cleanup.Spec,
+	} {
+		require.NotNilf(t, spec.BackoffLimit, "%s BackoffLimit", name)
+		assert.Equalf(t, int32(5), *spec.BackoffLimit, "%s BackoffLimit", name)
+		require.NotNilf(t, spec.ActiveDeadlineSeconds, "%s ActiveDeadlineSeconds", name)
+		assert.Equalf(t, int64(5), *spec.ActiveDeadlineSeconds, "%s ActiveDeadlineSeconds", name)
+	}
+}
+
+// TestBuildJobSpec_NilTemplateFieldsRetainDefaults_Scenario83 verifies that a
+// jobTemplate present but with nil BackoffLimit/ActiveDeadlineSeconds retains the
+// Scenario 83 defaults (2 / 7200).
+func TestBuildJobSpec_NilTemplateFieldsRetainDefaults_Scenario83(t *testing.T) {
+	b := NewBuilder()
+	cluster := newBackupCluster()
+	cluster.Spec.Backup.JobTemplate = &cbv1alpha1.BackupJobTemplate{
+		ServiceAccountName: "custom-sa",
+	}
+
+	job := b.BuildBackupJob(cluster, &BackupJobOptions{Timestamp: "20260519020000"})
+	require.NotNil(t, job)
+	require.NotNil(t, job.Spec.BackoffLimit)
+	assert.Equal(t, int32(2), *job.Spec.BackoffLimit)
+	require.NotNil(t, job.Spec.ActiveDeadlineSeconds)
+	assert.Equal(t, int64(7200), *job.Spec.ActiveDeadlineSeconds)
 }

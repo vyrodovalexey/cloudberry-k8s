@@ -330,11 +330,14 @@ func (s *Scenario72Suite) TestFunctional_Scenario72_JobEnvAndEnvsubst() {
 	s.s72AssertSecretRef(container, "AWS_SECRET_ACCESS_KEY", "backup-s3-credentials", "aws_secret_access_key")
 
 	// The container args run envsubst and produce /tmp/s3-config.yaml; the
-	// existing gpbackup CLI args remain unchanged (Scenario 71 parity).
+	// gpbackup CLI args stay VISIBLE (coordinator-exec model — spec 11 §MPP
+	// Dispatch: the real gpbackup runs inside the coordinator pod against the
+	// coordinator-side ${COORD_CFG}, but the flags remain inspectable in args[0]).
 	script := strings.Join(container.Args, " ")
 	assert.Contains(s.T(), script, "envsubst")
 	assert.Contains(s.T(), script, "/tmp/s3-config.yaml")
-	assert.Contains(s.T(), script, "'--plugin-config' '/tmp/s3-config.yaml'")
+	assert.Contains(s.T(), script, "gpbackup --plugin-config \"${COORD_CFG}\"")
+	assert.Contains(s.T(), script, "exec -i")
 	assert.Contains(s.T(), script, "'--dbname' 'mydb'")
 	assert.Contains(s.T(), script, "'--compression-level' '5'")
 	assert.Contains(s.T(), script, "'--compression-type' 'gzip'")
