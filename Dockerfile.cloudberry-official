@@ -173,7 +173,6 @@ LABEL org.opencontainers.image.title="cloudberry-database-official" \
 # command-line tool the pipe breaks ("could not write to COPY program: Broken
 # pipe") and zstd backups fail. gzip is already provided by the base image.
 ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
-RUN dnf -y update && \
 RUN dnf -y install \
         apr bash bzip2 ca-certificates glibc-langpack-en hostname iproute \
         keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
