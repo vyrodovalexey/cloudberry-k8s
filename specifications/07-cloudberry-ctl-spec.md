@@ -97,6 +97,19 @@ cloudberry-ctl
 │   ├── reindex                   # Run reindex
 │   ├── check-catalog             # Run catalog check
 │   └── jobs                      # List maintenance jobs
+├── backup                        # Backup and restore (Scenario 86)
+│   ├── create                    # Create a backup
+│   ├── list                      # List backups
+│   ├── status                    # Show one backup's detail
+│   ├── delete                    # Delete a backup
+│   ├── restore                   # Restore from a backup
+│   ├── schedule                  # Show the backup schedule
+│   │   ├── set                   # Set the cron schedule
+│   │   ├── suspend               # Suspend the schedule
+│   │   └── resume                # Resume the schedule
+│   └── jobs                      # List backup/restore Jobs
+│       └── logs                  # Stream a backup Job's logs
+├── migrate                       # Cross-cluster database migration (Scenario 87)
 ├── inspect                       # Inspection commands
 │   ├── disk-usage                # Show disk usage
 │   ├── skew                      # Show data distribution skew
@@ -253,7 +266,165 @@ cloudberry-ctl maintenance reindex --cluster my-cluster --table public.large_tab
 cloudberry-ctl maintenance check-catalog --cluster my-cluster --database mydb
 ```
 
-### 5.6 Authentication
+### 5.6 Backup and Restore
+
+All `backup` subcommands talk to the operator's backup/restore REST API (see
+[API Specification §4.9](06-api-specification.md#49-backup-and-restore)) over an
+OIDC bearer token. Point the CLI at the operator API and authenticate first
+(`--operator-url` / `CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + a token via
+`--password` / `CLOUDBERRY_PASSWORD`; see [§5.6.1](#561-pointing-the-cli-at-the-operator-api)).
+
+```bash
+# Create a backup (all gpbackup flags) -> POST /backups
+cloudberry-ctl backup create --cluster my-cluster --database mydb \
+  --type full --compression-level 6 --compression-type zstd --jobs 4 \
+  --include-schema public --exclude-table public.temp \
+  --with-stats --without-globals
+
+# Single-data-file variant (queue size needs single-data-file; --jobs is dropped)
+cloudberry-ctl backup create --cluster my-cluster --database mydb \
+  --type full --single-data-file --copy-queue-size 4
+
+# Incremental variant against an explicit base timestamp
+cloudberry-ctl backup create --cluster my-cluster --database mydb \
+  --type incremental --incremental --from-timestamp 20260601020000 \
+  --leaf-partition-data
+
+# List backups -> GET /backups
+cloudberry-ctl backup list --cluster my-cluster
+
+# Show one backup's detail -> GET /backups/{ts}
+cloudberry-ctl backup status --cluster my-cluster --timestamp 20260601020000
+
+# Delete a backup -> DELETE /backups/{ts} (creates a gpbackman cleanup Job)
+cloudberry-ctl backup delete --cluster my-cluster --timestamp 20260601020000
+
+# Restore (all gprestore flags incl. --resize-cluster) -> POST /backups/{ts}/restore
+cloudberry-ctl backup restore --cluster my-cluster --timestamp 20260601020000 \
+  --redirect-db mydb_restored --redirect-schema restored --create-db \
+  --include-schema public --include-table public.users --jobs 4 \
+  --with-stats --run-analyze --on-error-continue --truncate-table --resize-cluster
+
+# Schedule -> GET /backups/schedule ; set/suspend/resume -> PATCH /backups/schedule
+cloudberry-ctl backup schedule --cluster my-cluster
+cloudberry-ctl backup schedule set --cluster my-cluster --cron "0 3 * * *"
+cloudberry-ctl backup schedule suspend --cluster my-cluster
+cloudberry-ctl backup schedule resume --cluster my-cluster
+
+# List backup/restore/cleanup Jobs -> GET /backups/jobs
+cloudberry-ctl backup jobs --cluster my-cluster
+
+# Stream a backup Job's logs -> GET /backups/jobs/{job}/logs (streams text/plain)
+cloudberry-ctl backup jobs logs --cluster my-cluster --job my-cluster-backup-1
+cloudberry-ctl backup jobs logs --cluster my-cluster --job my-cluster-backup-1 \
+  --follow --tail 200
+```
+
+**`backup create` flags** (`buildCreateBackupRequest` → `gpbackupOptions`): `--type`
+(`full`|`incremental`), `--database` (repeatable / comma-separated), `--compression-level`,
+`--compression-type`, `--jobs`, `--single-data-file`, `--copy-queue-size`, `--include-schema`
+(repeatable), `--exclude-table` (repeatable), `--incremental`, `--from-timestamp`,
+`--leaf-partition-data`, `--with-stats`, `--without-globals`.
+
+**`backup restore` flags** (`buildRestoreRequest` → `gprestoreOptions`): `--timestamp`
+(required), `--redirect-db`, `--redirect-schema`, `--create-db`, `--include-schema`
+(repeatable), `--include-table` (repeatable), `--jobs`, `--with-stats`, `--run-analyze`,
+`--on-error-continue`, `--truncate-table`, **`--resize-cluster`**. `--resize-cluster` maps to
+`gprestoreOptions.resizeCluster` → the restore Job's `--resize-cluster` flag — it is what
+enables restoring a backup into a cluster with a **different segment count**.
+
+#### 5.6.1 Pointing the CLI at the operator API
+
+The `backup` commands call the operator REST API (not `kubectl`). Configure two things:
+
+1. **API URL** — `--operator-url` (or `CLOUDBERRY_OPERATOR_URL`). When the operator API
+   Service is not directly reachable, port-forward it:
+   ```bash
+   kubectl -n cloudberry-test port-forward svc/<operator-api-service> 8090:8090
+   export CLOUDBERRY_OPERATOR_URL=http://127.0.0.1:8090
+   ```
+2. **OIDC token** — `--auth-method oidc` (or `CLOUDBERRY_AUTH_METHOD=oidc`) with the bearer
+   token passed via `--password` (or `CLOUDBERRY_PASSWORD`). With `--auth-method oidc` the CLI
+   sends `Authorization: Bearer <token>` on every request:
+   ```bash
+   TOKEN=$(curl -s -X POST \
+     'http://keycloak:8090/realms/cloudberry/protocol/openid-connect/token' \
+     -d grant_type=password -d client_id=cloudberry-ctl \
+     -d username=adminuser -d password=adminpass | jq -r .access_token)
+   export CLOUDBERRY_AUTH_METHOD=oidc
+   export CLOUDBERRY_PASSWORD="$TOKEN"
+   export CLOUDBERRY_CLUSTER=my-cluster
+   export CLOUDBERRY_NAMESPACE=cloudberry-test
+   ```
+
+The endpoint permissions still apply: `create` needs **Operator**, `delete`/`restore` need
+**Admin**, and the read-only commands (`list`/`status`/`schedule`/`jobs`/`jobs logs`) need
+**Basic** (see [API Specification §4.9](06-api-specification.md#49-backup-and-restore)).
+
+#### 5.6.2 Streaming backup Job logs (`backup jobs logs`)
+
+`backup jobs logs --job <name>` **streams** the selected backup Job's pod logs to stdout by
+calling `GET /clusters/{cluster}/backups/jobs/{job}/logs` (the new Scenario 86k endpoint, see
+[API Specification §11.1](06-api-specification.md#111-get-clustersnamebackupsjobsjoblogs)).
+The CLI uses a dedicated streaming client method (`OperatorClient.GetStream`) that copies the
+`text/plain` body straight to stdout without buffering or JSON-parsing.
+
+| Flag | Description |
+|------|-------------|
+| `--job` | Backup Job name (**required**) |
+| `--follow` | Stream logs as they are produced → `?follow=true` |
+| `--tail` | Number of recent log lines to show (`-1` = all) → `?tailLines=N` |
+
+**kubectl fallback.** If the streaming endpoint is unavailable (e.g. an older operator
+without the endpoint, a `404`/`405`, or a connection error), the CLI does **not** fail
+silently — it prints the equivalent instruction:
+
+```
+unable to stream logs from the operator API (<cause>); run:
+  kubectl logs -n <namespace> job/<job>
+```
+
+> **Note.** A finished Job's pod can be garbage-collected by `ttlSecondsAfterFinished`; in
+> that case the endpoint returns `404 JOB_NOT_FOUND` and the CLI prints the kubectl fallback.
+> Stream from a recently created Job, or use `--tail` while the pod still exists.
+
+#### 5.6.3 Cross-cluster migration (`migrate`, Scenario 87)
+
+`migrate` performs a cross-cluster database migration by POSTing to
+`/clusters/{source}/migrate` (**Admin**). The operator creates **one coordinated
+Job** `<source>-migration-<ts>` (label `avsoft.io/backup-operation=migrate`) that,
+under the coordinator-exec model, execs `gpbackup` inside the **source**
+coordinator and **captures the real gpbackup timestamp**, prepares the target DB
+on the **target** coordinator, execs `gprestore --timestamp <captured>` inside the
+target, and runs post-migration validation (row-count probe + invalid-index scan +
+health check) — emitting `post-restore-validate: passed` on success.
+
+```bash
+cloudberry-ctl migrate --source-cluster src --target-cluster dst \
+  --database mydb \
+  --tables "public.users,public.orders" \
+  --truncate
+```
+
+| Flag | Description |
+|------|-------------|
+| `--source-cluster` | Source cluster name (**required**) |
+| `--target-cluster` | Target cluster name (**required**) |
+| `--database` | Database to migrate (`gpbackup --dbname`) |
+| `--tables` | Comma-separated tables → repeated `--include-table` on both tools |
+| `--truncate` | Clean target: DROP+recreate the target DB empty before restore |
+| `--redirect-db` | `gprestore --redirect-db` on the target |
+| `--redirect-schema` | `gprestore --redirect-schema` on the target |
+| `--jobs` | `gprestore --jobs` (restore parallelism) on the target |
+
+> **Requirements.** Both clusters must be backup-enabled with an **S3** destination
+> sharing the **same bucket** (else `400`); the migration reads the **source**
+> cluster's S3 folder for both the backup and the (target) restore. `--truncate`
+> requests a clean target DB — it does **not** pass `gprestore --truncate-table`
+> (which would abort a fresh-DB metadata restore). The backup ServiceAccount needs
+> `pods` + `pods/exec` RBAC (coordinator-exec model).
+
+### 5.7 Authentication
 
 ```bash
 # Login
@@ -275,7 +446,7 @@ cloudberry-ctl auth roles update --cluster my-cluster \
 cloudberry-ctl auth roles delete --cluster my-cluster --name analyst
 ```
 
-### 5.7 Inspection
+### 5.8 Inspection
 
 ```bash
 # Disk usage
@@ -295,7 +466,7 @@ cloudberry-ctl inspect missing-stats --cluster my-cluster
 cloudberry-ctl inspect logs --cluster my-cluster --severity ERROR --last 1h
 ```
 
-### 5.8 Workload Management
+### 5.9 Workload Management
 
 ```bash
 # Show workload status
@@ -505,3 +676,69 @@ cloudberry-ctl completion zsh > "${fpath[1]}/_cloudberry-ctl"
 # Fish
 cloudberry-ctl completion fish > ~/.config/fish/completions/cloudberry-ctl.fish
 ```
+
+## 12. Scenario 86 — All Backup CLI Commands
+
+**Scenario 86** verifies **all eleven** `cloudberry-ctl backup …` CLI commands end-to-end:
+each command builds the right operator REST request (method/path/body), the responses are
+rendered correctly, and the one new behavior — `backup jobs logs` log **streaming** — works
+with a kubectl fallback. Ten of the eleven commands reuse the Scenario 85 backup/restore
+endpoints; the single code addition is the `backup jobs logs` streaming path (sub-case 86k) and
+its operator endpoint (see [API Specification §11.1](06-api-specification.md#111-get-clustersnamebackupsjobsjoblogs)).
+
+All commands inherit the global flags (`--cluster`, `--namespace` default `cloudberry-test`,
+`--operator-url`/`CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + token via
+`--password`/`CLOUDBERRY_PASSWORD`); the CLI prefixes every path with the API prefix
+(`/api/v1alpha1`). Acceptance per sub-case (86a–86k):
+
+| Sub-case | Command (cobra path) | REST request | Builder / notes |
+|----------|----------------------|--------------|-----------------|
+| **86a** | `backup create …` (3 variants) | `POST /clusters/{cluster}/backups` | `buildCreateBackupRequest` → `gpbackupOptions` (full/single-data-file/incremental variants) |
+| **86b** | `backup list` | `GET /clusters/{cluster}/backups` | lists recorded history |
+| **86c** | `backup status --timestamp <ts>` | `GET /clusters/{cluster}/backups/{ts}` | empty `--timestamp` → list fallback |
+| **86d** | `backup delete --timestamp <ts>` | `DELETE /clusters/{cluster}/backups/{ts}` | `--timestamp` required; creates a cleanup Job |
+| **86e** | `backup restore --timestamp <ts> …` | `POST /clusters/{cluster}/backups/{ts}/restore` | `buildRestoreRequest` → `gprestoreOptions`, incl. `--resize-cluster` |
+| **86f** | `backup schedule` | `GET /clusters/{cluster}/backups/schedule` | shows CronJob status + `nextScheduleTime` |
+| **86g** | `backup schedule set --cron …` | `PATCH /clusters/{cluster}/backups/schedule` `{"schedule":"…"}` | `--cron` required |
+| **86h** | `backup schedule suspend` | `PATCH /clusters/{cluster}/backups/schedule` `{"suspend":true}` | sets CronJob `.spec.suspend=true` |
+| **86i** | `backup schedule resume` | `PATCH /clusters/{cluster}/backups/schedule` `{"suspend":false}` | sets CronJob `.spec.suspend=false` |
+| **86j** | `backup jobs` | `GET /clusters/{cluster}/backups/jobs` | lists backup/restore/cleanup Job statuses |
+| **86k** | `backup jobs logs --job <name>` | `GET /clusters/{cluster}/backups/jobs/{job}/logs` | **streams** pod logs (`--follow`/`--tail`); kubectl fallback |
+
+- **86a — `backup create`.** `buildCreateBackupRequest` maps the flags listed in
+  [§5.6](#56-backup-and-restore) to `gpbackupOptions`. Three variants are exercised: the full
+  flag set; a `--single-data-file --copy-queue-size 4` variant (mutually exclusive with
+  `--jobs`); and an `--incremental --from-timestamp <ts> --leaf-partition-data` variant.
+
+- **86e — `backup restore` (incl. `--resize-cluster`).** `buildRestoreRequest` maps the
+  restore flags to `gprestoreOptions`; `--resize-cluster` → `resizeCluster: true` → the restore
+  Job's `--resize-cluster` flag, which is required to restore into a cluster with a different
+  segment count. Mutual-exclusivity resolution (include-table over include-schema, run-analyze
+  over with-stats) is performed operator-side.
+
+- **86k — `backup jobs logs` (streaming + fallback).** The CLI streams the response of the new
+  `GET …/backups/jobs/{job}/logs` endpoint to stdout via `OperatorClient.GetStream` (no
+  buffering, no JSON parse). `--follow` → `?follow=true`; `--tail N` → `?tailLines=N`. Missing
+  `--job` errors before any request. When the endpoint is unavailable (older operator, `404`,
+  connection error) the CLI prints the kubectl fallback (see
+  [§5.6.2](#562-streaming-backup-job-logs-backup-jobs-logs)).
+
+**Implementation.** The command tree lives in `cmd/cloudberry-ctl/main.go`
+(`newBackupCmd` → `newBackupCreateCmd`/`newBackupListCmd`/`newBackupStatusCmd`/
+`newBackupDeleteCmd`/`newBackupRestoreCmd`/`newBackupScheduleCmd`(+`set`/`suspend`/`resume`)/
+`newBackupJobsCmd` → `newBackupJobsLogsCmd`), with `buildCreateBackupRequest`,
+`buildRestoreRequest`, `buildBackupJobLogsPath`, `runBackupJobsLogs`, and
+`printBackupJobLogsFallback`. The streaming client method is `OperatorClient.GetStream`
+(`internal/ctl/client.go`); the operator endpoint is `handleBackupJobLogs`
+(`internal/api/server.go`).
+
+**Verification.** Sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`
+(single S3 cluster `scenario86-s3`: backup enabled + schedule + incremental). Tests:
+`test/functional/scenario86_cli_commands_test.go`,
+`test/integration/scenario86_cli_commands_integration_test.go`,
+`test/e2e/scenario86_cli_commands_e2e_test.go`, the test-case catalog
+`test/cases/scenario86_cli_commands_cases.go`, and the live OIDC-authed exercise script
+`test/e2e/scripts/scenario86-cli-commands.sh` (builds the CLI, obtains an OIDC token,
+port-forwards the operator API, runs every backup command 86a–k, and asserts the created
+Jobs/args, the CronJob schedule/suspend changes, and the streamed Job logs).

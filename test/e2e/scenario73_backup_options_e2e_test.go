@@ -141,7 +141,7 @@ func s73E2EStandardJob(cluster *cbv1alpha1.CloudberryCluster) *batchv1.Job {
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 			WithoutGlobals:   true,
 		},
 		IncludeSchemas: []string{"public", "analytics"},

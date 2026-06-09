@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -53,6 +55,7 @@ const (
 	responseKeyTotal   = "total"
 	responseKeyJob     = "job"
 	responseKeyCluster = "cluster"
+	responseKeyEnabled = "enabled"
 	responseKeyPID     = "pid"
 	responseKeyMessage = "message"
 	responseKeyItems   = "items"
@@ -88,6 +91,18 @@ const (
 
 	// errCodeClusterNotFound is the error code for cluster-not-found responses.
 	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
+
+	// errCodeInternal is the generic internal-error code.
+	errCodeInternal = "INTERNAL_ERROR"
+
+	// jobLogsFlushInterval is how often streamed log output is flushed to the
+	// client when following a Job's logs.
+	jobLogsFlushInterval = 500 * time.Millisecond
+
+	// labelJobName is the legacy label set by the Job controller on its pods.
+	labelJobName = "job-name"
+	// labelJobNameBatch is the current label set by the Job controller on its pods.
+	labelJobNameBatch = "batch.kubernetes.io/job-name"
 
 	// adminUsername is the default admin username for the credential store.
 	adminUsername = "admin"
@@ -138,7 +153,11 @@ type monitorState struct {
 
 // Server is the REST API server for the cloudberry operator.
 type Server struct {
-	k8sClient     client.Client
+	k8sClient client.Client
+	// clientset is the typed Kubernetes clientset used for operations that the
+	// controller-runtime client cannot perform, such as streaming pod logs.
+	// It may be nil in test/non-live setups; handlers must guard against nil.
+	clientset     kubernetes.Interface
 	authMW        *auth.AuthMiddleware
 	rateLimiter   *RateLimiter
 	dbFactory     db.DBClientFactory
@@ -149,6 +168,18 @@ type Server struct {
 	mux           *http.ServeMux
 	monitorStates map[string]*monitorState // key: "namespace/cluster"
 	monitorMu     sync.RWMutex
+}
+
+// WithClientset injects a typed Kubernetes clientset into the Server and returns
+// the same Server for fluent configuration. The clientset is required for
+// endpoints that stream pod logs; when it is not provided, those endpoints
+// return a clear "not available" error instead of panicking. A nil clientset is
+// ignored so existing call sites that do not stream logs remain unaffected.
+func (s *Server) WithClientset(clientset kubernetes.Interface) *Server {
+	if clientset != nil {
+		s.clientset = clientset
+	}
+	return s
 }
 
 // NewServer creates a new API server.
@@ -201,8 +232,10 @@ func (s *Server) Close() {
 
 // Handler returns the HTTP handler for the API server.
 func (s *Server) Handler() http.Handler {
-	// Apply security headers to all requests.
-	return auth.SecurityHeaders()(s.mux)
+	// Apply security headers to all requests, then wrap with the tracing
+	// middleware so every request gets a root span (no-op when telemetry is
+	// disabled) that handler-level child spans can nest underneath.
+	return s.tracingMiddleware(auth.SecurityHeaders()(s.mux))
 }
 
 // registerRoutes registers all API routes.
@@ -300,6 +333,8 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreateBackup)))
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/jobs",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListBackupJobs)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/jobs/{job}/logs",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleBackupJobLogs)))
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/backups/schedule",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetBackupSchedule)))
 	s.mux.Handle("PATCH "+apiPrefix+"/clusters/{name}/backups/schedule",
@@ -3118,6 +3153,13 @@ func parseSinceTime(s string) time.Time {
 	return time.Time{}
 }
 
+// backupEnabled reports whether backup is enabled for the cluster. It mirrors
+// the gating used by handleCreateBackup (BACKUP_NOT_ENABLED) so the list and
+// schedule endpoints surface the same disabled state.
+func backupEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	return cluster.Spec.Backup != nil && cluster.Spec.Backup.Enabled
+}
+
 // handleListBackups lists backups for a cluster from its status backup history.
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -3132,7 +3174,11 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	backups = append(backups, history...)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		responseKeyCluster:    cluster.Name,
+		responseKeyCluster: cluster.Name,
+		// "enabled" surfaces whether backup is enabled for the cluster so clients
+		// can detect the disabled state from the list endpoint (Scenario 88a).
+		// Existing keys are preserved for back-compat and the status stays 200.
+		responseKeyEnabled:    backupEnabled(cluster),
 		"backups":             backups,
 		responseKeyTotal:      len(backups),
 		"lastBackupTime":      cluster.Status.LastBackupTime,
@@ -3350,6 +3396,162 @@ func (s *Server) handleListBackupJobs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBackupJobLogs streams the container logs of the pod backing a backup
+// Job. It resolves the cluster, locates the Job's most recent pod via the
+// job-name label, and copies the pod log stream to the response as plain text.
+// Supported query parameters: ?follow=true and ?tailLines=N.
+func (s *Server) handleBackupJobLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	job := r.PathValue("job")
+
+	if !isValidDNS1123Name(job) {
+		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("invalid job name %q", job))
+		return
+	}
+
+	if s.clientset == nil {
+		writeErrorJSON(w, http.StatusNotImplemented, "LOGS_NOT_AVAILABLE",
+			"log streaming is not available: the operator API has no Kubernetes clientset configured")
+		return
+	}
+
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get(responseKeyNamespace))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return
+	}
+
+	podName, found, listErr := s.findJobPod(r.Context(), cluster.Namespace, job)
+	if listErr != nil {
+		s.logger.Error("failed to list job pods", "cluster", name, "job", job, "error", listErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to list job pods")
+		return
+	}
+	if !found {
+		writeErrorJSON(w, http.StatusNotFound, "JOB_NOT_FOUND",
+			fmt.Sprintf("no pods found for job %q", job))
+		return
+	}
+
+	s.streamPodLogs(w, r, cluster.Namespace, podName, job)
+}
+
+// findJobPod returns the name of the most recently created pod owned by the
+// given Job in the namespace. It tries the current and legacy job-name labels.
+// The second return value is false when no pod is found.
+func (s *Server) findJobPod(
+	ctx context.Context,
+	namespace, job string,
+) (podName string, found bool, err error) {
+	for _, labelKey := range []string{labelJobNameBatch, labelJobName} {
+		podList := &corev1.PodList{}
+		if listErr := s.k8sClient.List(ctx, podList,
+			client.InNamespace(namespace),
+			client.MatchingLabels{labelKey: job},
+		); listErr != nil {
+			return "", false, listErr
+		}
+		if name := mostRecentPodName(podList.Items); name != "" {
+			return name, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// mostRecentPodName returns the name of the pod with the latest creation
+// timestamp, or an empty string when the slice is empty.
+func mostRecentPodName(pods []corev1.Pod) string {
+	var (
+		latest    *corev1.Pod
+		latestIdx int
+	)
+	for i := range pods {
+		if latest == nil || pods[i].CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = &pods[i]
+			latestIdx = i
+		}
+	}
+	if latest == nil {
+		return ""
+	}
+	return pods[latestIdx].Name
+}
+
+// streamPodLogs opens the pod log stream and copies it to the response writer as
+// plain text, flushing periodically when the client supports it (for --follow).
+func (s *Server) streamPodLogs(
+	w http.ResponseWriter,
+	r *http.Request,
+	namespace, podName, job string,
+) {
+	opts := buildPodLogOptions(r.URL.Query())
+	req := s.clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
+	stream, err := req.Stream(r.Context())
+	if err != nil {
+		s.logger.Error("failed to open pod log stream",
+			"namespace", namespace, "pod", podName, "job", job, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to stream job logs")
+		return
+	}
+	defer func() {
+		if cErr := stream.Close(); cErr != nil {
+			s.logger.Warn("failed to close pod log stream", "pod", podName, "error", cErr)
+		}
+	}()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	copyLogStream(r.Context(), w, stream, opts.Follow)
+}
+
+// buildPodLogOptions builds the pod log options from the request query
+// parameters: ?follow=true and ?tailLines=N (only applied when valid).
+func buildPodLogOptions(query url.Values) *corev1.PodLogOptions {
+	opts := &corev1.PodLogOptions{}
+	if follow, err := strconv.ParseBool(query.Get("follow")); err == nil {
+		opts.Follow = follow
+	}
+	if raw := query.Get("tailLines"); raw != "" {
+		if tail, err := strconv.ParseInt(raw, 10, 64); err == nil && tail >= 0 {
+			opts.TailLines = &tail
+		}
+	}
+	return opts
+}
+
+// copyLogStream copies the pod log stream to the writer. When following, it
+// flushes periodically so the client receives output incrementally.
+func copyLogStream(ctx context.Context, w io.Writer, stream io.Reader, follow bool) {
+	flusher, canFlush := w.(http.Flusher)
+	if !follow || !canFlush {
+		_, _ = io.Copy(w, stream)
+		return
+	}
+
+	buf := make([]byte, 4096)
+	lastFlush := time.Now()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		n, err := stream.Read(buf)
+		if n > 0 {
+			if _, wErr := w.Write(buf[:n]); wErr != nil {
+				return
+			}
+			if time.Since(lastFlush) >= jobLogsFlushInterval {
+				flusher.Flush()
+				lastFlush = time.Now()
+			}
+		}
+		if err != nil {
+			flusher.Flush()
+			return
+		}
+	}
+}
+
 // handleGetBackupSchedule returns the backup CronJob status and next run time.
 func (s *Server) handleGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -3365,6 +3567,9 @@ func (s *Server) handleGetBackupSchedule(w http.ResponseWriter, r *http.Request)
 		if apierrors.IsNotFound(getErr) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				responseKeyCluster: cluster.Name,
+				// "enabled" lets the schedule endpoint also report the disabled
+				// state when no CronJob exists (Scenario 88a).
+				responseKeyEnabled: backupEnabled(cluster),
 				"scheduled":        false,
 			})
 			return
@@ -3374,7 +3579,11 @@ func (s *Server) handleGetBackupSchedule(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, backupScheduleResponse(cluster.Name, cronJob))
+	// Add "enabled" to the response without changing the shared helper's
+	// signature, keeping backupScheduleResponse back-compatible.
+	resp := backupScheduleResponse(cluster.Name, cronJob)
+	resp[responseKeyEnabled] = backupEnabled(cluster)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleUpdateBackupSchedule sets the backup schedule and/or suspends/resumes the
@@ -3573,6 +3782,15 @@ func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Reque
 }
 
 // handleStartDataLoadingJob starts a data loading job.
+//
+// NOTE: this is currently an acknowledgement stub — it validates the cluster and
+// returns 202 Accepted without creating a Job or loading any rows. The
+// cloudberry_data_loading_rows_total metric (Recorder.RecordDataLoadingRows) is
+// therefore intentionally NOT recorded here: there is no rows-loaded signal
+// available at this stub. The recorder call must be wired at the point where a
+// data-loading Job actually completes and reports its loaded-row count (e.g.
+// from the Job's status/result), which does not exist yet. Recording a value
+// here would fabricate data, so it is deliberately omitted.
 func (s *Server) handleStartDataLoadingJob(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	jobName := r.PathValue("job")

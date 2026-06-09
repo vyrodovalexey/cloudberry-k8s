@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // newLocalBackupCluster returns a test cluster with a LOCAL backup destination
@@ -134,9 +135,16 @@ func TestIsLocalDestinationScenario81(t *testing.T) {
 
 // TestBackupDestinationArgsScenario81 is a table-driven test (Scenario 81 §A)
 // for backupDestinationArgs: local destinations seed `--backup-dir <path>`
-// while s3/nil/unknown destinations preserve the existing
-// `--plugin-config /tmp/s3-config.yaml` leading args.
+// while s3/nil/unknown destinations seed ONLY `--plugin-config /tmp/s3-config.yaml`.
+// gpbackup REJECTS `--plugin-config` together with `--backup-dir`, so the S3 path
+// must NOT carry `--backup-dir`; the per-segment backup dirs + history DB are
+// handled by running gpbackup inside the coordinator pod (the coordinator-exec
+// model, see renderToolScript/coordinatorExecScript and spec 11 §MPP Dispatch).
 func TestBackupDestinationArgsScenario81(t *testing.T) {
+	// s3Args is the expected S3 leading-arg slice: plugin-config ONLY (DATA → S3
+	// via the plugin; gpbackup runs inside the coordinator pod for the segment
+	// dirs + history DB).
+	s3Args := []string{pluginConfigFlag, s3RenderedConfigPath}
 	tests := []struct {
 		name   string
 		mutate func(c *cbv1alpha1.CloudberryCluster)
@@ -158,32 +166,32 @@ func TestBackupDestinationArgsScenario81(t *testing.T) {
 			want:   []string{backupDirFlag, "/data/bk"},
 		},
 		{
-			name:   "s3 destination uses plugin-config",
+			name:   "s3 destination uses plugin-config only (no --backup-dir)",
 			mutate: func(_ *cbv1alpha1.CloudberryCluster) {}, // default S3 cluster.
-			want:   []string{pluginConfigFlag, s3RenderedConfigPath},
+			want:   s3Args,
 		},
 		{
-			name: "nil backup defaults to s3 plugin-config",
+			name: "nil backup defaults to s3 plugin-config only",
 			mutate: func(c *cbv1alpha1.CloudberryCluster) {
 				c.Spec.Backup = nil
 			},
-			want: []string{pluginConfigFlag, s3RenderedConfigPath},
+			want: s3Args,
 		},
 		{
-			name: "unknown destination type defaults to s3 plugin-config",
+			name: "unknown destination type defaults to s3 plugin-config only",
 			mutate: func(c *cbv1alpha1.CloudberryCluster) {
 				c.Spec.Backup.Destination.Type = "gcs"
 				c.Spec.Backup.Destination.S3 = nil
 			},
-			want: []string{pluginConfigFlag, s3RenderedConfigPath},
+			want: s3Args,
 		},
 		{
-			name: "empty destination type defaults to s3 plugin-config",
+			name: "empty destination type defaults to s3 plugin-config only",
 			mutate: func(c *cbv1alpha1.CloudberryCluster) {
 				c.Spec.Backup.Destination.Type = ""
 				c.Spec.Backup.Destination.S3 = nil
 			},
-			want: []string{pluginConfigFlag, s3RenderedConfigPath},
+			want: s3Args,
 		},
 	}
 
@@ -210,9 +218,11 @@ func setLocalDestination(c *cbv1alpha1.CloudberryCluster, path string) {
 }
 
 // TestBuildGpbackupArgsScenario81 (Scenario 81 §B) asserts the destination-aware
-// leading args for gpbackup: local emits `--backup-dir <path>` (no plugin),
-// s3 keeps `--plugin-config /tmp/s3-config.yaml` (no --backup-dir, regression
-// guard). The non-destination flags (dbname/compression/jobs) are unaffected.
+// leading args for gpbackup: local emits `--backup-dir <local.path>` and NO
+// plugin; s3 emits ONLY `--plugin-config /tmp/s3-config.yaml` (gpbackup rejects
+// --plugin-config together with --backup-dir; the segment dirs + history DB are
+// handled by the coordinator-exec model). The non-destination flags
+// (dbname/compression/jobs) are unaffected.
 func TestBuildGpbackupArgsScenario81(t *testing.T) {
 	gpOpts := &cbv1alpha1.GpbackupOptions{
 		CompressionLevel: 6,
@@ -252,7 +262,7 @@ func TestBuildGpbackupArgsScenario81(t *testing.T) {
 			wantNotContain: []string{pluginConfigFlag},
 		},
 		{
-			name:    "s3 cluster keeps --plugin-config and not --backup-dir",
+			name:    "s3 cluster keeps --plugin-config only (no --backup-dir, which gpbackup rejects)",
 			cluster: newBackupCluster(),
 			wantContains: []string{
 				pluginConfigFlag + " " + s3RenderedConfigPath,
@@ -260,6 +270,8 @@ func TestBuildGpbackupArgsScenario81(t *testing.T) {
 				"--compression-level 6",
 				"--jobs 4",
 			},
+			// gpbackup REJECTS --plugin-config together with --backup-dir, so the
+			// S3 args must NOT carry --backup-dir at all.
 			wantNotContain: []string{
 				backupDirFlag,
 			},
@@ -281,9 +293,10 @@ func TestBuildGpbackupArgsScenario81(t *testing.T) {
 }
 
 // TestBuildGprestoreArgsScenario81 (Scenario 81 §C) asserts the destination-aware
-// leading args for gprestore: local emits `--backup-dir <path>` (no plugin),
-// s3 keeps `--plugin-config /tmp/s3-config.yaml` (no --backup-dir). The
-// timestamp/jobs/create-db flags are unaffected.
+// leading args for gprestore: local emits `--backup-dir <local.path>` and NO
+// plugin; s3 emits ONLY `--plugin-config /tmp/s3-config.yaml` (gprestore rejects
+// --plugin-config together with --backup-dir; the run happens inside the
+// coordinator pod). The timestamp/jobs/create-db flags are unaffected.
 func TestBuildGprestoreArgsScenario81(t *testing.T) {
 	grOpts := &cbv1alpha1.GprestoreOptions{
 		Jobs:     4,
@@ -315,7 +328,7 @@ func TestBuildGprestoreArgsScenario81(t *testing.T) {
 			},
 		},
 		{
-			name:    "s3 cluster keeps --plugin-config and not --backup-dir",
+			name:    "s3 cluster keeps --plugin-config only (no --backup-dir, which gprestore rejects)",
 			cluster: newBackupCluster(),
 			wantContains: []string{
 				pluginConfigFlag + " " + s3RenderedConfigPath,
@@ -373,7 +386,7 @@ func TestRenderToolScriptScenario81(t *testing.T) {
 		assert.Contains(t, script, shellQuote("/backups"))
 	})
 
-	t.Run("s3 destination renders the s3 plugin config", func(t *testing.T) {
+	t.Run("s3 destination renders the s3 plugin config and execs in the coordinator", func(t *testing.T) {
 		cluster := newBackupCluster()
 		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
@@ -381,12 +394,21 @@ func TestRenderToolScriptScenario81(t *testing.T) {
 		script := renderToolScript(cluster, "gpbackup", args)
 
 		// Regression guard: the S3 render of /etc/gpbackup -> /tmp/s3-config.yaml
-		// must be present for the S3 destination.
+		// must be present for the S3 destination (rendered in the Job pod, then
+		// staged into the coordinator pod).
 		assert.Contains(t, script, s3ConfigMountPath)
 		assert.Contains(t, script, s3ConfigTemplateKey)
 		assert.Contains(t, script, "> "+s3RenderedConfigPath)
 		assert.Contains(t, script, "envsubst <")
-		assert.Contains(t, script, shellQuote(s3RenderedConfigPath))
+
+		// Coordinator-exec model: the real gpbackup runs INSIDE the coordinator
+		// pod via kubectl exec (spec 11 §MPP Dispatch). The S3 args carry only
+		// --plugin-config (never --backup-dir, which gpbackup rejects together).
+		assert.Contains(t, script, "\"${KUBECTL}\" exec")
+		assert.Contains(t, script, "KUBECTL="+kubectlBin)
+		assert.Contains(t, script, util.CoordinatorPodName(cluster.Name))
+		assert.Contains(t, script, "gpbackup --plugin-config")
+		assert.NotContains(t, script, backupDirFlag)
 	})
 
 	t.Run("local rendered script is valid bash", func(t *testing.T) {

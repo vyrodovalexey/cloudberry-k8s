@@ -496,6 +496,78 @@ func TestHAReconciler_RunFTSProbe_DBClientError(t *testing.T) {
 	assert.Contains(t, err.Error(), "creating db client")
 }
 
+// TestHAReconciler_RunFTSProbe_RetriesRecordMetricOnce verifies the FTS probe
+// metric is recorded EXACTLY ONCE per probe with the terminal result, even when
+// the segment-config query fails on every retry attempt. This guards the
+// over-counting regression where RecordFTSProbe was invoked inside the retry
+// loop (up to FTSProbeRetries times), inflating fts_probe_total{result="failure"}
+// and the duration histogram.
+func TestHAReconciler_RunFTSProbe_RetriesRecordMetricOnce(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	// 5 retries with a short timeout: GetSegmentConfiguration fails on every
+	// attempt, so the probe exhausts all retries and terminates with "failure".
+	cluster.Spec.HA = &cbv1alpha1.HASpec{FTSProbeRetries: 5, FTSProbeTimeout: 5}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	tracker := &trackingMetricsRecorder{}
+
+	dbClient := &mockDBClient{segErr: fmt.Errorf("segment query failed")}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, tracker, nil)
+
+	err := r.runFTSProbe(context.Background(), cluster)
+	require.Error(t, err)
+
+	// Despite 5 failed retry attempts, the metric must be recorded exactly once
+	// with the terminal "failure" result.
+	require.Len(t, tracker.ftsProbeResults, 1,
+		"fts_probe metric must be recorded exactly once per probe, not per retry")
+	assert.Equal(t, "failure", tracker.ftsProbeResults[0])
+}
+
+// TestHAReconciler_RunFTSProbe_SuccessRecordsMetricOnce verifies the success
+// path also records the probe metric exactly once.
+func TestHAReconciler_RunFTSProbe_SuccessRecordsMetricOnce(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	cluster.Spec.HA = &cbv1alpha1.HASpec{FTSProbeRetries: 5, FTSProbeTimeout: 5}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	tracker := &trackingMetricsRecorder{}
+
+	dbClient := &mockDBClient{
+		segments: []db.SegmentInfo{
+			{ContentID: 0, Status: "u", Role: "p", Hostname: "host1"},
+			{ContentID: 0, Status: "u", Role: "m", Hostname: "host2"},
+		},
+	}
+	dbFactory := &mockDBClientFactory{client: dbClient}
+
+	r := NewHAReconciler(k8sClient, scheme, recorder, dbFactory, nil, tracker, nil)
+
+	err := r.runFTSProbe(context.Background(), cluster)
+	require.NoError(t, err)
+
+	require.Len(t, tracker.ftsProbeResults, 1,
+		"fts_probe metric must be recorded exactly once per probe")
+	assert.Equal(t, "success", tracker.ftsProbeResults[0])
+}
+
 func TestHAReconciler_MonitorStandby_DBClientError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -1345,12 +1417,13 @@ func TestHAReconciler_ProbeSegmentConfigWithRetries_SucceedsFirstAttempt(t *test
 	ctx := util.WithLogger(context.Background(), r.logger)
 
 	// Act
-	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, time.Now())
+	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient)
 
 	// Assert
 	require.NoError(t, err)
 	assert.Equal(t, expectedSegments, segments)
-	// No failure metrics should be recorded on first success.
+	// The retry helper never records the FTS probe metric (the caller records the
+	// terminal outcome exactly once), so nothing is recorded here.
 	assert.Empty(t, tracker.ftsProbeResults)
 }
 
@@ -1376,15 +1449,15 @@ func TestHAReconciler_ProbeSegmentConfigWithRetries_SucceedsAfterRetry(t *testin
 	ctx := util.WithLogger(context.Background(), r.logger)
 
 	// Act
-	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, time.Now())
+	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient)
 
 	// Assert
 	require.NoError(t, err)
 	assert.Equal(t, expectedSegments, segments)
 	assert.Equal(t, 2, dbClient.segmentCallCount)
-	// One failure metric recorded for the first failed attempt.
-	assert.Len(t, tracker.ftsProbeResults, 1)
-	assert.Equal(t, "failure", tracker.ftsProbeResults[0])
+	// The retry helper no longer records a per-attempt failure metric; the caller
+	// (runFTSProbe) records the single terminal outcome instead.
+	assert.Empty(t, tracker.ftsProbeResults)
 }
 
 func TestHAReconciler_ProbeSegmentConfigWithRetries_AllRetriesExhausted(t *testing.T) {
@@ -1407,7 +1480,7 @@ func TestHAReconciler_ProbeSegmentConfigWithRetries_AllRetriesExhausted(t *testi
 	ctx := util.WithLogger(context.Background(), r.logger)
 
 	// Act
-	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, time.Now())
+	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient)
 
 	// Assert
 	require.Error(t, err)
@@ -1415,8 +1488,10 @@ func TestHAReconciler_ProbeSegmentConfigWithRetries_AllRetriesExhausted(t *testi
 	assert.Contains(t, err.Error(), "getting segment configuration after 3 retries")
 	assert.Contains(t, err.Error(), "fail 3")
 	assert.Equal(t, 3, dbClient.segmentCallCount)
-	// Three failure metrics recorded.
-	assert.Len(t, tracker.ftsProbeResults, 3)
+	// The retry helper records NO per-attempt metrics (previously it recorded one
+	// per attempt, over-counting). The terminal failure is recorded once by the
+	// caller (covered by TestHAReconciler_RunFTSProbe_RetriesRecordMetricOnce).
+	assert.Empty(t, tracker.ftsProbeResults)
 }
 
 func TestHAReconciler_ProbeSegmentConfigWithRetries_ContextCancelled(t *testing.T) {
@@ -1437,7 +1512,7 @@ func TestHAReconciler_ProbeSegmentConfigWithRetries_ContextCancelled(t *testing.
 	ctx = util.WithLogger(ctx, r.logger)
 
 	// Act
-	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient, time.Now())
+	segments, err := r.probeSegmentConfigWithRetries(ctx, cluster, dbClient)
 
 	// Assert: should fail (context cancelled propagates through timeout context).
 	require.Error(t, err)

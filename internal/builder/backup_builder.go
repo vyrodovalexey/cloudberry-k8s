@@ -44,16 +44,28 @@ const (
 	// localBackupMountPath is the mount path for the local backup destination.
 	localBackupMountPath = "/backups"
 
-	// backupHistoryVolumeName is the emptyDir volume that backs the writable
-	// COORDINATOR_DATA_DIRECTORY used by gpbackup for its history database.
+	// backupHistoryVolumeName is the emptyDir volume mounted on the backup/restore
+	// Job pod at backupHistoryMountPath. It is retained for the local-destination
+	// gpbackman retention path and as an inspectable scratch COORDINATOR_DATA_DIRECTORY.
+	//
+	// NOTE: for the S3 destination the real gpbackup/gprestore run happens INSIDE
+	// the coordinator pod via kubectl exec (the coordinator-exec model, see
+	// coordinatorExecScript and spec 11 §MPP Dispatch). gpbackup, once connected
+	// to the coordinator, reads gp_segment_configuration and writes its
+	// coordinator metadata + history DB to the CATALOG coordinator data directory
+	// (/data/pgdata/gpseg-1) and dispatches to each segment to create the
+	// per-segment backup dirs — none of which exist in a standalone Job pod, so
+	// the Job delegates to the coordinator pod where they do. This emptyDir is
+	// therefore not the authoritative history-DB path for S3.
 	backupHistoryVolumeName = "backup-history"
-	// backupHistoryMountPath is where the backup-history emptyDir is mounted; it
-	// is exported as COORDINATOR_DATA_DIRECTORY so gpbackup writes its history DB
-	// to a writable path (the standalone Job pod lacks the coordinator PGDATA).
+	// backupHistoryMountPath is where the backup-history emptyDir is mounted and
+	// exported as COORDINATOR_DATA_DIRECTORY (inspectable). For the local
+	// destination it backs the gpbackman --history-db path; for S3 the real run
+	// is delegated to the coordinator pod (see coordinatorExecScript).
 	backupHistoryMountPath = "/var/lib/gpbackup"
-	// gpbackupHistoryDBPath is the SQLite history database gpbackup writes under
-	// COORDINATOR_DATA_DIRECTORY (backupHistoryMountPath). gpbackman consumes it
-	// via --history-db for backup-info/backup-delete/backup-clean.
+	// gpbackupHistoryDBPath is the SQLite history database path used by the
+	// gpbackman retention script via --history-db for
+	// backup-info/backup-delete/backup-clean.
 	gpbackupHistoryDBPath = backupHistoryMountPath + "/gpbackup_history.db"
 
 	// shellCommand is the shell used to render the plugin config and run the tool.
@@ -92,6 +104,16 @@ const (
 	// backupDirFlag is the gpbackup/gprestore/gpbackman backup-dir flag used for
 	// the local destination (no S3 plugin).
 	backupDirFlag = "--backup-dir"
+
+	// kubectlBin is the kubectl binary used by the coordinator-exec wrapper to
+	// run gpbackup/gprestore inside the coordinator pod. The cloudberry-backup
+	// image ships kubectl on PATH; the wrapper falls back to /usr/local/bin and
+	// /usr/bin so a non-PATH install still resolves.
+	kubectlBin = "kubectl"
+	// coordExecScratchDir is the writable directory inside the COORDINATOR pod
+	// where the per-run rendered S3 plugin config is written before gpbackup is
+	// invoked there. The coordinator pod's /tmp is always writable.
+	coordExecScratchDir = "/tmp"
 
 	// destinationTypeS3 is the S3 destination type value.
 	destinationTypeS3 = "s3"
@@ -204,6 +226,23 @@ type BackupJobOptions struct {
 	ExcludeTables []string
 }
 
+// gpbackupOrSpec resolves the effective gpbackup options for the request: the
+// per-request override when set, else the cluster spec's gpbackup options. It is
+// the single source of truth shared by BuildBackupJob (for the rendered args) and
+// effectiveBackupType (for the backup-type label) so the label always matches the
+// args. Safe on a nil receiver.
+func (o *BackupJobOptions) gpbackupOrSpec(
+	cluster *cbv1alpha1.CloudberryCluster,
+) *cbv1alpha1.GpbackupOptions {
+	if o != nil && o.Gpbackup != nil {
+		return o.Gpbackup
+	}
+	if cluster.Spec.Backup != nil {
+		return cluster.Spec.Backup.Gpbackup
+	}
+	return nil
+}
+
 // RestoreJobOptions carries per-request parameters for a restore Job.
 type RestoreJobOptions struct {
 	// Timestamp is the gpbackup timestamp to restore from (--timestamp).
@@ -222,6 +261,14 @@ type RestoreJobOptions struct {
 	IncludeTables []string
 	// ExcludeTables maps to --exclude-table (repeated).
 	ExcludeTables []string
+	// S3FolderOverride, when non-empty, overrides the S3 plugin config "folder:"
+	// (the S3_FOLDER env) for this restore Job instead of using the cluster's own
+	// spec.backup.destination.s3.folder. This is REQUIRED for cross-cluster
+	// migration (spec 11 §Cross-Cluster Migration): the target restore Job must
+	// read the backup from the SOURCE cluster's folder, since gpbackup wrote it
+	// there. Without it the restore would look under the target's own folder and
+	// fail with a NotFound (the data is under a different folder).
+	S3FolderOverride string
 }
 
 // backupImage returns the configured backup toolchain image or the default.
@@ -244,17 +291,16 @@ func backupLabels(cluster, operation string) map[string]string {
 // the per-request options set Type=="incremental", else "full". opts may be nil
 // (e.g. the CronJob jobTemplate path), in which case only the spec is consulted.
 func effectiveBackupType(cluster *cbv1alpha1.CloudberryCluster, opts *BackupJobOptions) string {
-	incremental := cluster.Spec.Backup != nil && cluster.Spec.Backup.Gpbackup != nil &&
-		cluster.Spec.Backup.Gpbackup.Incremental
-	if opts != nil {
-		if opts.Type == util.BackupTypeIncremental {
-			incremental = true
-		}
-		if opts.Gpbackup != nil && opts.Gpbackup.Incremental {
-			incremental = true
-		}
-	}
-	if incremental {
+	// The label MUST match the gpbackup args actually rendered (i.e. whether
+	// --incremental is emitted by isEffectivelyIncremental), so M1/M2 metric
+	// routing and the rendered Job agree. The args resolve the gpbackup options
+	// the same way BuildBackupJob does: per-request opts.Gpbackup, else the
+	// cluster spec's Gpbackup. A per-request opts.Type=="incremental" also forces
+	// incremental. A bare opts.Type=="full" does NOT suppress a cluster-level
+	// incremental default (gpbackup still runs incremental), so the label stays
+	// incremental to match the args.
+	gpOpts := opts.gpbackupOrSpec(cluster)
+	if isEffectivelyIncremental(gpOpts, opts) {
 		return util.BackupTypeIncremental
 	}
 	return util.BackupTypeFull
@@ -285,8 +331,20 @@ func isLocalDestination(cluster *cbv1alpha1.CloudberryCluster) bool {
 //   - s3 (or nil/unknown, preserving existing behavior) ->
 //     ["--plugin-config", "/tmp/s3-config.yaml"]
 //
+// NOTE: gpbackup REJECTS --plugin-config together with --backup-dir ("The
+// following flags may not be specified together: plugin-config, backup-dir"), so
+// the S3 path uses ONLY --plugin-config. For the S3 plugin, the per-segment DATA
+// files are streamed to S3 by each segment's gpbackup_s3_plugin while the
+// coordinator metadata + gpbackup history database are written under the
+// coordinator data directory; the backup Job exports COORDINATOR_DATA_DIRECTORY
+// (= backupHistoryMountPath, a writable emptyDir) so gpbackup writes its history
+// DB there instead of the non-existent catalog path inside the standalone Job
+// pod. The per-segment backup-directory creation requires the backup to run with
+// coordinator+segment reachability (see addBackupSSHIdentity / the cluster image
+// SSH wiring).
+//
 // Defaulting nil/empty/unknown destinations to the S3 leading args keeps every
-// existing S3 caller and test byte-identical.
+// existing S3 caller's plugin wiring intact.
 func backupDestinationArgs(cluster *cbv1alpha1.CloudberryCluster) []string {
 	if isLocalDestination(cluster) {
 		return []string{backupDirFlag, localBackupDir(cluster)}
@@ -317,7 +375,9 @@ func buildGpbackupArgs(
 	args = appendIncrementalArgs(args, opts, jobOpts)
 	args = appendLeafPartitionDataArgs(args, opts, jobOpts)
 
-	if opts.WithStats {
+	// WithStats is a *bool: nil means "unset" and follows the webhook default of
+	// true; a non-nil value is honored (false => omit the flag).
+	if util.DerefOr(opts.WithStats, true) {
 		args = append(args, "--with-stats")
 	}
 	if opts.WithoutGlobals {
@@ -480,7 +540,10 @@ func buildGprestoreArgs(
 // OMIT --with-stats so the gprestore invocation stays valid. When only one is
 // set, that one is emitted as-is.
 func appendGprestoreBoolFlags(args []string, opts *cbv1alpha1.GprestoreOptions) []string {
-	effectiveWithStats := opts.WithStats && !opts.RunAnalyze
+	// WithStats is a *bool: nil means "unset" and follows the webhook default of
+	// true; a non-nil value is honored (false => omit the flag). run-analyze still
+	// takes precedence so the gprestore invocation stays valid.
+	effectiveWithStats := util.DerefOr(opts.WithStats, true) && !opts.RunAnalyze
 
 	flags := []struct {
 		enabled bool
@@ -515,18 +578,39 @@ func appendRepeatedFlag(args []string, flag string, values []string) []string {
 	return args
 }
 
-// renderToolScript builds the bash script that (for an S3 destination) renders
-// the S3 plugin config (substituting environment variables) and then runs the
-// given tool with its arguments. It prefers envsubst when available but falls
-// back to a POSIX-compatible eval+heredoc so the script works on minimal images
-// that lack the gettext package.
+// renderToolScript builds the bash script the backup/restore Job container runs.
 //
-// For a LOCAL destination there is no S3 ConfigMap mounted at /etc/gpbackup, so
-// the S3-config render block is skipped entirely: reading the missing template
-// under `set -euo pipefail` would otherwise abort the Job before the tool runs.
-// The gpEnv/ssh/plugin-path preambles are retained for both destinations
-// (harmless and still required: segments are reached over SSH).
+// S3 destination — coordinator-exec (the real-bug fix). gpbackup/gprestore are
+// MPP orchestrators: once connected to the coordinator they read
+// gp_segment_configuration and (a) write the coordinator metadata + history DB
+// to the CATALOG coordinator data directory (/data/pgdata/gpseg-1) and (b)
+// dispatch over SSH to EVERY segment to create the per-segment backup dirs.
+// A standalone Job pod connected only via PGHOST has neither /data/pgdata/gpseg-1
+// nor the segment-local backup paths, so gpbackup fails with "Unable to create
+// backup directories on N segments" and "open .../gpbackup_history.db: no such
+// file or directory". The supported model (spec 11 §MPP Dispatch and the
+// Coordinator-Exec Data Cycle) is to run the tool INSIDE the coordinator pod.
+// For S3 the Job therefore renders the plugin config and `kubectl exec`s the
+// tool into <cluster>-coordinator-0 (see coordinatorExecScript), where the
+// catalog datadir, the writable filesystem and the segment SSH topology all
+// exist. NOTE: --backup-dir is intentionally NOT combined with --plugin-config
+// (gpbackup rejects "plugin-config, backup-dir" together); the S3 args carry
+// only --plugin-config (see backupDestinationArgs).
+//
+// LOCAL destination — standalone --backup-dir (unchanged operator behavior,
+// spec 11 §Local Backup Destination). There is no S3 ConfigMap mounted at
+// /etc/gpbackup, so the S3-config render block is skipped (reading the missing
+// template under `set -euo pipefail` would abort the Job) and the tool runs
+// in-pod with --backup-dir; the live local data cycle is exercised via the
+// coordinator-exec path by the e2e script (spec 11 §MPP per-segment note).
+//
+// An empty tool (the validate/cleanup Jobs, which overwrite Args[0] with their
+// own script afterward) renders only the preambles so no tool is invoked here.
 func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args []string) string {
+	if tool != "" && !isLocalDestination(cluster) {
+		return coordinatorExecScript(cluster, tool, args)
+	}
+
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString(gpEnvPreamble)
@@ -536,14 +620,8 @@ func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args [
 	// points at the real binary on either the cloudberry-backup image
 	// (/usr/local/bin) or the cloudberry-official image ($GPHOME/bin).
 	b.WriteString(gpbackupPluginPathPreamble)
-	if !isLocalDestination(cluster) {
-		// Render the S3 plugin config template, substituting env vars.
-		// Use envsubst if present; otherwise fall back to eval with heredoc.
-		fmt.Fprintf(&b,
-			"if command -v envsubst >/dev/null 2>&1; then "+
-				"envsubst < %[1]s/%[2]s > %[3]s; "+
-				"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
-			s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+	if tool == "" {
+		return b.String()
 	}
 	b.WriteString(tool)
 	for _, a := range args {
@@ -552,6 +630,135 @@ func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args [
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// coordinatorExecScript builds the coordinator-exec wrapper the S3 backup/restore
+// Job container runs. It:
+//
+//  1. Renders the S3 plugin config from the Job container env (envsubst, with a
+//     POSIX eval+heredoc fallback) into a per-run file in the Job pod.
+//  2. base64-pipes the rendered config into the coordinator pod's /tmp via
+//     `kubectl exec` (base64 avoids any quoting/here-doc hazard over the exec
+//     boundary — the lesson from the e2e scenarios).
+//  3. base64-pipes the inner tool script (sources the Cloudberry env, exports the
+//     PG*/AWS* connection vars, then runs `<tool> --plugin-config <coord-cfg>
+//     <args>`) into a second `kubectl exec` so the MPP run happens inside the
+//     coordinator pod (segment -1) with the catalog datadir, writable filesystem
+//     and segment SSH topology all present.
+//
+// A unique per-run timestamp ($RANDOM + date) names the coordinator-side config
+// so concurrent Jobs never collide (spec 11 §38). The PG password reaches the
+// coordinator only over the in-cluster exec channel, never on its disk or in the
+// process table beyond the transient gpbackup invocation.
+func coordinatorExecScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args []string) string {
+	coordPod := util.CoordinatorPodName(cluster.Name)
+
+	// Drop the leading "--plugin-config <Job-pod path>" pair from backupDestinationArgs:
+	// the coordinator-exec run substitutes the coordinator-side ${COORD_CFG}.
+	toolArgs := dropLeadingPluginConfig(args)
+
+	// innerTool is the tool script that runs INSIDE the coordinator pod. It is
+	// emitted READABLY (via a quoted heredoc) so the gpbackup/gprestore flags
+	// stay visible in the Job container's args[0] — the e2e suites inspect
+	// `kubectl get job -o jsonpath=...args[0]` for `--include-schema`,
+	// `--incremental`, `--resize-cluster`, etc.
+	//
+	// The connection env (COORD_CFG/PG*) is delivered as base64-encoded POSITIONAL
+	// arguments to the remote bash (env-safe for any password / shell
+	// metacharacter; kubectl exec forwards argv verbatim but does NOT forward
+	// env). innerTool decodes them into $1..$6, sources the Cloudberry env so
+	// gpbackup/gprestore + the plugin are on PATH, then runs the tool against the
+	// per-run plugin config staged at ${COORD_CFG}. No secret value is embedded
+	// in this rendered Go string (the secret arrives at runtime from the Job
+	// pod's own env via the positional args).
+	var innerTool strings.Builder
+	innerTool.WriteString("set -euo pipefail\n")
+	innerTool.WriteString("export COORD_CFG=$(printf '%s' \"$1\" | base64 -d)\n")
+	innerTool.WriteString("export PGHOST=$(printf '%s' \"$2\" | base64 -d)\n")
+	innerTool.WriteString("export PGPORT=$(printf '%s' \"$3\" | base64 -d)\n")
+	innerTool.WriteString("export PGUSER=$(printf '%s' \"$4\" | base64 -d)\n")
+	innerTool.WriteString("export PGDATABASE=$(printf '%s' \"$5\" | base64 -d)\n")
+	innerTool.WriteString("export PGPASSWORD=$(printf '%s' \"$6\" | base64 -d)\n")
+	// `ls` of the (possibly missing) env file returns non-zero; with `pipefail`
+	// + `set -e` that would abort, so guard with `|| true`. Likewise the
+	// `[ -n ] && source` test must not abort when GPENV is empty.
+	innerTool.WriteString("GPENV=$(ls \"${GPHOME:-/usr/local/cloudberry-db}\"/greenplum_path.sh " +
+		"\"${GPHOME:-/usr/local/cloudberry-db}\"/cloudberry-env.sh 2>/dev/null | head -1 || true)\n")
+	innerTool.WriteString("if [ -n \"${GPENV}\" ]; then . \"${GPENV}\"; fi\n")
+	innerTool.WriteString("export PATH=\"${GPHOME:-/usr/local/cloudberry-db}/bin:${PATH}\"\n")
+	innerTool.WriteString(tool)
+	innerTool.WriteString(" " + pluginConfigFlag + " \"${COORD_CFG}\"")
+	for _, a := range toolArgs {
+		innerTool.WriteString(" ")
+		innerTool.WriteString(shellQuote(a))
+	}
+	innerTool.WriteString("\n")
+
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString(gpEnvPreamble)
+	// Render the S3 plugin config (envsubst with POSIX fallback) in the Job pod.
+	fmt.Fprintf(&b,
+		"if command -v envsubst >/dev/null 2>&1; then "+
+			"envsubst < %[1]s/%[2]s > %[3]s; "+
+			"else eval \"cat <<_ENVSUBST_EOF_\n$(cat %[1]s/%[2]s)\n_ENVSUBST_EOF_\" > %[3]s; fi\n",
+		s3ConfigMountPath, s3ConfigTemplateKey, s3RenderedConfigPath)
+	// Resolve a kubectl binary (PATH, then common install dirs).
+	b.WriteString("KUBECTL=" + kubectlBin + "\n")
+	b.WriteString("command -v \"${KUBECTL}\" >/dev/null 2>&1 || " +
+		"{ for p in /usr/local/bin/kubectl /usr/bin/kubectl; do " +
+		"[ -x \"$p\" ] && KUBECTL=\"$p\" && break; done; }\n")
+	fmt.Fprintf(&b, "COORD_POD=%s\n", shellQuote(coordPod))
+	fmt.Fprintf(&b, "COORD_CFG=%s/cbk-$(date -u +%%Y%%m%%d%%H%%M%%S)-${RANDOM:-0}-s3-config.yaml\n",
+		coordExecScratchDir)
+	// Stage the rendered plugin config inside the coordinator pod (base64 piped
+	// so no quoting/here-doc hazard crosses the exec boundary). The remote shell
+	// reads the target path from its own argv ($0) to keep the Job pod's value.
+	fmt.Fprintf(&b,
+		"base64 < %[1]s | \"${KUBECTL}\" exec -i \"${COORD_POD}\" -- "+
+			"bash -c 'base64 -d > \"$0\"' \"${COORD_CFG}\"\n",
+		s3RenderedConfigPath)
+	// Materialize the (readable) inner tool script in the Job pod via a QUOTED
+	// heredoc (delimiter quoted => NO expansion here; ${COORD_CFG}/$1.. expand
+	// inside the coordinator at run time), keeping the gpbackup/gprestore flags
+	// visible in args[0] for the e2e Job-arg assertions.
+	b.WriteString("INNER_TOOL=$(cat <<'_CBK_INNER_EOF_'\n")
+	b.WriteString(innerTool.String())
+	b.WriteString("_CBK_INNER_EOF_\n)\n")
+	// base64-encode THIS pod's live connection values (env-safe for any password)
+	// and pass them as POSITIONAL args to the remote bash, which runs the inner
+	// tool script (itself piped on stdin as base64 so no quoting/expansion hazard
+	// crosses the exec boundary).
+	b.WriteString("CFG_B64=$(printf '%s' \"${COORD_CFG}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("HOST_B64=$(printf '%s' \"${PGHOST:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("PORT_B64=$(printf '%s' \"${PGPORT:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("USER_B64=$(printf '%s' \"${PGUSER:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("DB_B64=$(printf '%s' \"${PGDATABASE:-}\" | base64 | tr -d '\\n')\n")
+	b.WriteString("PASS_B64=$(printf '%s' \"${PGPASSWORD:-}\" | base64 | tr -d '\\n')\n")
+	// The remote bootstrap decodes the inner tool script from stdin and runs it
+	// with `bash -c <inner> _ <cfg> <host> <port> <user> <db> <pass>` so the
+	// base64 values land as $1..$6 inside innerTool.
+	b.WriteString("printf '%s' \"${INNER_TOOL}\" | base64 | " +
+		"\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- bash -c '" +
+		"INNER=$(base64 -d); " +
+		"bash -c \"${INNER}\" _ \"$0\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"' " +
+		"\"${CFG_B64}\" \"${HOST_B64}\" \"${PORT_B64}\" " +
+		"\"${USER_B64}\" \"${DB_B64}\" \"${PASS_B64}\"\n")
+	// Best-effort cleanup of the staged config inside the coordinator pod.
+	b.WriteString("\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- " +
+		"bash -c 'rm -f \"$0\"' \"${COORD_CFG}\" 2>/dev/null || true\n")
+	return b.String()
+}
+
+// dropLeadingPluginConfig returns args with a leading
+// "--plugin-config <path>" pair removed (the S3 destination's leading pair from
+// backupDestinationArgs). The coordinator-exec run substitutes the
+// coordinator-side plugin config, so the Job-pod path must not be re-emitted.
+func dropLeadingPluginConfig(args []string) []string {
+	if len(args) >= 2 && args[0] == pluginConfigFlag {
+		return args[2:]
+	}
+	return args
 }
 
 // shellQuote single-quotes an argument for safe inclusion in a bash command.
@@ -670,10 +877,7 @@ func (b *DefaultBuilder) BuildBackupJob(
 	// cluster spec) so the controller derives status from THIS Job's label.
 	labels[util.LabelBackupType] = effectiveBackupType(cluster, opts)
 
-	gpOpts := opts.Gpbackup
-	if gpOpts == nil && cluster.Spec.Backup != nil {
-		gpOpts = cluster.Spec.Backup.Gpbackup
-	}
+	gpOpts := opts.gpbackupOrSpec(cluster)
 	args := buildGpbackupArgs(cluster, gpOpts, opts)
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
@@ -714,6 +918,11 @@ func (b *DefaultBuilder) BuildRestoreJob(
 		gpOpts = cluster.Spec.Backup.Gpbackup
 	}
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
+	// For a cross-cluster migration the backup lives under the SOURCE cluster's
+	// S3 folder; point this target restore Job at that folder so gprestore finds
+	// it (spec 11 §Cross-Cluster Migration: "Both reference the same S3
+	// bucket/folder"). No-op for ordinary restores where the override is empty.
+	applyS3FolderOverride(&podSpec, opts.S3FolderOverride)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -749,6 +958,13 @@ type ValidationJobOptions struct {
 	// driven from the cluster's gprestore run-analyze intent (or the optional
 	// validation config) so post-restore planner stats are confirmed fresh.
 	RunAnalyze bool
+	// S3FolderOverride, when non-empty, overrides the S3 plugin config "folder:"
+	// (the S3_FOLDER env) for this validation Job, mirroring the restore Job. For
+	// a cross-cluster migration (spec 11 §Cross-Cluster Migration) the validation
+	// Job runs on the TARGET cluster but inspects the backup written under the
+	// SOURCE folder, so its S3 env must point at the source folder to stay
+	// consistent with the restore it validates.
+	S3FolderOverride string
 }
 
 // BuildPostRestoreValidationJob builds a validation Job that runs after a restore
@@ -773,6 +989,10 @@ func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 	if opts.Database != "" {
 		setEnvVar(&podSpec.Containers[0], "PGDATABASE", opts.Database)
 	}
+	// Mirror the restore Job's S3 folder for a cross-cluster migration so this
+	// validation Job's S3 env points at the SOURCE folder it inspects. No-op when
+	// the override is empty (ordinary single-cluster validation).
+	applyS3FolderOverride(&podSpec, opts.S3FolderOverride)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -783,6 +1003,29 @@ func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 		},
 		Spec: b.buildJobSpec(cluster, labels, &podSpec),
 	}
+}
+
+// applyS3FolderOverride overrides the S3_FOLDER env (and thus the rendered S3
+// plugin config "folder:") on every container and init container of the pod
+// spec. It only acts when an override is set AND the container already carries an
+// S3_FOLDER env (i.e. the cluster uses an S3 destination); it does not introduce
+// S3 env onto a non-S3 (local) pod. Used by the migration restore/validation
+// path so the target Job reads the backup from the source cluster's folder.
+func applyS3FolderOverride(podSpec *corev1.PodSpec, folder string) {
+	if folder == "" {
+		return
+	}
+	overrideContainerS3Folder := func(containers []corev1.Container) {
+		for i := range containers {
+			for j := range containers[i].Env {
+				if containers[i].Env[j].Name == "S3_FOLDER" {
+					containers[i].Env[j].Value = folder
+				}
+			}
+		}
+	}
+	overrideContainerS3Folder(podSpec.Containers)
+	overrideContainerS3Folder(podSpec.InitContainers)
 }
 
 // setEnvVar sets (or replaces) an environment variable on the container.
@@ -1439,7 +1682,7 @@ func buildBackupEnv(cluster *cbv1alpha1.CloudberryCluster) []corev1.EnvVar {
 		{Name: "PGUSER", Value: util.DefaultAdminUser},
 		{Name: "PGDATABASE", Value: defaultCoordinatorDatabase},
 		{
-			Name: "PGPASSWORD",
+			Name: envPGPassword,
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{

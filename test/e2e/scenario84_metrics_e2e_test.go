@@ -133,10 +133,16 @@ func (s *Scenario84MetricsE2ESuite) TestE2E_Scenario84_BackupTypeLabelParity() {
 	cluster := scenario84E2ECluster("test-s84e2e-type")
 	b := builder.NewBuilder()
 
+	// The backup-type label MUST match the gpbackup args actually rendered. The
+	// scenario84 cluster defaults to incremental (Gpbackup.Incremental=true), so a
+	// FULL Job must override that default with opts.Gpbackup{Incremental:false}
+	// (otherwise gpbackup still runs incremental and the label stays incremental
+	// to match the args). This mirrors how an explicit full request is issued.
 	full := b.BuildBackupJob(cluster, &builder.BackupJobOptions{
 		Timestamp: scenario84E2EFullTS,
 		Type:      "full",
 		Databases: []string{"metdb84"},
+		Gpbackup:  &cbv1alpha1.GpbackupOptions{Incremental: false},
 	})
 	require.NotNil(s.T(), full)
 	assert.Equal(s.T(), "full", full.Labels[util.LabelBackupType],

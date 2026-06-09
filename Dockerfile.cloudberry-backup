@@ -297,6 +297,7 @@ RUN microdnf -y update && \
     microdnf -y install \
       bash \
       ca-certificates \
+      curl \
       gettext \
       postgresql \
       shadow-utils \
@@ -325,6 +326,23 @@ COPY --from=builder /usr/local/bin/gprestore /usr/local/bin/gprestore
 COPY --from=builder /usr/local/bin/gpbackup_helper /usr/local/bin/gpbackup_helper
 COPY --from=builder /usr/local/bin/gpbackup_s3_plugin /usr/local/bin/gpbackup_s3_plugin
 COPY --from=builder /usr/local/bin/gpbackman /usr/local/bin/gpbackman
+
+# ---------------------------------------------------------------------------
+# kubectl — required by the operator's coordinator-exec backup/restore model.
+# gpbackup/gprestore are MPP orchestrators that must run inside the coordinator
+# pod (the only context with the catalog datadir + SSH-to-segments topology).
+# The backup Job's rendered script therefore `kubectl exec`s into
+# <cluster>-coordinator-0 to run the tool there. The Job's ServiceAccount is
+# granted pods/exec via the cloudberry-backup-role (Helm backup-rbac.yaml).
+# Pinned to a stable upstream release for the target architecture.
+# ---------------------------------------------------------------------------
+ARG KUBECTL_VERSION=v1.31.4
+ARG TARGETARCH
+RUN KUBECTL_ARCH="${TARGETARCH:-amd64}" && \
+    curl -fSL -o /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" && \
+    chmod 0755 /usr/local/bin/kubectl && \
+    /usr/local/bin/kubectl version --client=true 2>/dev/null | head -1 || true
 
 # Create directories for backup operations
 RUN mkdir -p /tmp/gpbackup /etc/gpbackup && \

@@ -44,7 +44,36 @@ const (
 
 	// annotationValueTrue is the canonical string value for boolean-true annotations.
 	annotationValueTrue = "true"
+
+	// reconcileResultSuccess and reconcileResultError are the `result` label
+	// values recorded for the cloudberry_reconcile_total / _errors_total /
+	// _duration_seconds metrics across all controllers.
+	reconcileResultSuccess = "success"
+	reconcileResultError   = "error"
 )
+
+// recordReconcileOutcome records the reconcile outcome and duration for a
+// controller in a single, nil-safe call. It is shared by the admin, HA and
+// auth controllers (and mirrors recordReconcileResult used by the cluster
+// controller) so that cloudberry_reconcile_total / _errors_total /
+// _duration_seconds cover all four controllers. The result label is derived
+// from err: "error" when non-nil, "success" otherwise. The recorder may be nil
+// (e.g. in some test constructions), in which case this is a no-op.
+func recordReconcileOutcome(
+	rec metrics.Recorder,
+	name, namespace string,
+	startTime time.Time,
+	err error,
+) {
+	if rec == nil {
+		return
+	}
+	result := reconcileResultSuccess
+	if err != nil {
+		result = reconcileResultError
+	}
+	rec.RecordReconcile(name, namespace, result, time.Since(startTime))
+}
 
 // ClusterReconciler reconciles a CloudberryCluster object.
 type ClusterReconciler struct {
@@ -1431,12 +1460,14 @@ func (r *ClusterReconciler) handleStop(
 		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 	}
 
-	// All stopped — update status using patch to avoid conflicts.
+	// All stopped — update status using an explicit-value patch to avoid conflicts
+	// and to actually persist the cleared readiness fields (omitempty would
+	// otherwise drop the zero values from a generic MergePatch).
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
+	if err := patchClearReadinessStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
 	}
 
@@ -1617,12 +1648,14 @@ func (r *ClusterReconciler) completeRestart(
 		return ctrl.Result{}, fmt.Errorf("removing restart-pending annotation: %w", err)
 	}
 
-	// Reset phase to Initializing using status patch to avoid conflicts.
+	// Reset phase to Initializing using an explicit-value status patch to avoid
+	// conflicts and to actually persist the cleared readiness fields (omitempty
+	// would otherwise drop the zero values from a generic MergePatch).
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
+	if err := patchClearReadinessStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("resetting phase for restart: %w", err)
 	}
 
@@ -1657,12 +1690,14 @@ func (r *ClusterReconciler) checkStopProgress(
 		return r.completeRestart(ctx, cluster)
 	}
 
-	// All stopped — use status patch to avoid conflicts.
+	// All stopped — use an explicit-value status patch to avoid conflicts and to
+	// actually persist the cleared readiness fields (omitempty would otherwise drop
+	// the zero values from a generic MergePatch).
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseStopped
 	cluster.Status.CoordinatorReady = false
 	cluster.Status.StandbyReady = false
 	cluster.Status.SegmentsReady = 0
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
+	if err := patchClearReadinessStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting stopped phase: %w", err)
 	}
 
@@ -3793,6 +3828,40 @@ func patchStatus(
 	})
 	if err != nil {
 		return fmt.Errorf("marshaling status patch: %w", err)
+	}
+
+	return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))
+}
+
+// patchClearReadinessStatus explicitly clears the persisted readiness status
+// fields (coordinatorReady, standbyReady, segmentsReady) together with the phase
+// when a cluster is Stopped or restarted. A plain patchStatus cannot clear these
+// fields because they are tagged with omitempty (api/v1alpha1/types.go): when they
+// hold their zero value (false / 0), json.Marshal drops them, and a MergePatch only
+// changes keys that are present — leaving the previously-persisted
+// coordinatorReady=true / standbyReady=true / segmentsReady=N intact. We therefore
+// build a raw MergePatch map with EXPLICIT zero values (mirroring patchClearCronJobName
+// / patchFTSStatus) so the fields are actually reset in the CR. The phase is included
+// because it is the authoritative transition driving this clear, so the cleared
+// readiness and the new phase are persisted atomically in a single patch.
+func patchClearReadinessStatus(
+	ctx context.Context,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	// Build the patch manually so the zero values are explicitly present and the
+	// omitempty struct tags are bypassed. Mirrors the in-memory zeroing already
+	// done by the callers so the live object and the persisted object agree.
+	statusPatch, err := json.Marshal(map[string]interface{}{
+		patchKeyStatus: map[string]interface{}{
+			"phase":            cluster.Status.Phase,
+			"coordinatorReady": false,
+			"standbyReady":     false,
+			"segmentsReady":    0,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling readiness clear patch: %w", err)
 	}
 
 	return c.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, statusPatch))

@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // TestGpEnvPreambleSetUSafe verifies the gpEnvPreamble is safe under `set -u`:
@@ -121,24 +123,27 @@ func TestBuildRestoreJobSSHAndHistoryWiring(t *testing.T) {
 	assertBackupSSHWiring(t, job.Spec.Template.Spec)
 }
 
-// TestRenderToolScriptSSHPreamble verifies the rendered tool script includes the
-// SSH-setup preamble (installing the shared keys into ~/.ssh and a silent ssh
-// config) and the gpbackup plugin-path preamble/symlink, and that it references
-// the canonical /usr/local/bin/gpbackup_s3_plugin path.
+// TestRenderToolScriptSSHPreamble verifies the S3 rendered tool script uses the
+// coordinator-exec model: the real gpbackup runs INSIDE the coordinator pod via
+// kubectl exec (where the shared SSH identity, the catalog coordinator datadir
+// and the gpbackup_s3_plugin all already live), so the Job-pod script does NOT
+// carry the SSH-setup / plugin-path preambles. The Job pod only renders the S3
+// plugin config and stages+execs the tool into the coordinator pod.
 func TestRenderToolScriptSSHPreamble(t *testing.T) {
-	script := renderToolScript(newBackupCluster(), "gpbackup", []string{"--dbname", "mydb"})
+	cluster := newBackupCluster()
+	script := renderToolScript(cluster, "gpbackup", []string{"--dbname", "mydb"})
 
-	// SSH setup preamble.
-	assert.Contains(t, script, "/etc/cloudberry/ssh/id_ed25519")
-	assert.Contains(t, script, `mkdir -p "${HOME}/.ssh"`)
-	assert.Contains(t, script, "StrictHostKeyChecking no")
-	assert.Contains(t, script, "UserKnownHostsFile /dev/null")
-
-	// gpbackup plugin path preamble / symlink.
-	assert.Contains(t, script, "/usr/local/bin/gpbackup_s3_plugin")
-	assert.Contains(t, script, "ln -sf")
-
-	// gpEnvPreamble carried into the script and still set-u safe.
+	// Coordinator-exec wiring.
+	assert.Contains(t, script, "\"${KUBECTL}\" exec")
+	assert.Contains(t, script, "KUBECTL="+kubectlBin)
+	assert.Contains(t, script, util.CoordinatorPodName(cluster.Name))
+	// The gpbackup invocation (with its flags) stays visible in args[0] for the
+	// e2e Job-arg assertions.
+	assert.Contains(t, script, "gpbackup --plugin-config")
+	assert.Contains(t, script, "--dbname")
+	// gpEnvPreamble carried into the Job-pod script and still set-u safe.
 	assert.Contains(t, script, `if [ -n "${GPHOME:-}" ]`)
 	assert.True(t, strings.HasPrefix(script, "set -euo pipefail"))
+	// The S3 path must NOT carry --backup-dir (gpbackup rejects it with --plugin-config).
+	assert.NotContains(t, script, backupDirFlag)
 }

@@ -445,6 +445,314 @@ func TestReconcileBackup_ScheduleCreatesCronJob(t *testing.T) {
 	assert.Equal(t, util.BackupCronJobName(cluster.Name), cluster.Status.CronJobName)
 }
 
+// TestReconcileBackup_DisabledRemovesCronJob is the GAP-3 regression guard:
+// disabling backup must delete a pre-existing CronJob and clear
+// Status.CronJobName so no stale schedule is left behind (Scenario 88a).
+func TestReconcileBackup_DisabledRemovesCronJob(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cluster.Status.CronJobName = util.BackupCronJobName(cluster.Name)
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.BackupCronJobName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Spec: batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+
+	cron := &batchv1.CronJob{}
+	err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, cron)
+	assert.True(t, apierrors.IsNotFound(err), "cronjob should be deleted when backup disabled")
+	assert.Empty(t, cluster.Status.CronJobName)
+}
+
+// TestReconcileBackup_NilSpecRemovesCronJob verifies a nil Backup spec also
+// removes a stale CronJob and clears Status.CronJobName.
+func TestReconcileBackup_NilSpecRemovesCronJob(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup = nil
+	cluster.Status.CronJobName = util.BackupCronJobName(cluster.Name)
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.BackupCronJobName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Spec: batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+
+	cron := &batchv1.CronJob{}
+	err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, cron)
+	assert.True(t, apierrors.IsNotFound(err), "cronjob should be deleted when backup spec nil")
+	assert.Empty(t, cluster.Status.CronJobName)
+}
+
+// TestReconcileBackup_DisabledNoCronJob verifies disabling backup with no
+// existing CronJob is an idempotent no-op that clears Status.CronJobName.
+func TestReconcileBackup_DisabledNoCronJob(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cluster.Status.CronJobName = "leftover"
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+	assert.Empty(t, cluster.Status.CronJobName)
+}
+
+// TestReconcileBackup_ReEnableRecreatesCronJob verifies the disabled-branch
+// cleanup does not break the re-enable transition: re-enabling with a schedule
+// recreates the CronJob (Scenario 88a re-enable).
+func TestReconcileBackup_ReEnableRecreatesCronJob(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cluster.Status.CronJobName = util.BackupCronJobName(cluster.Name)
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.BackupCronJobName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Spec: batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	// Disable: CronJob removed.
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+	assert.Empty(t, cluster.Status.CronJobName)
+
+	// Re-enable with a schedule: CronJob recreated.
+	cluster.Spec.Backup.Enabled = true
+	cluster.Spec.Backup.Schedule = "0 3 * * *"
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+
+	cron := &batchv1.CronJob{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, cron))
+	assert.Equal(t, util.BackupCronJobName(cluster.Name), cluster.Status.CronJobName)
+	assert.Equal(t, "0 3 * * *", cron.Spec.Schedule)
+}
+
+// readPersistedCronJobName reads the cluster back from the (fake) API server and
+// returns the PERSISTED status.cronJobName. This proves the value was actually
+// written to the status subresource, not just mutated in memory.
+func readPersistedCronJobName(
+	t *testing.T,
+	c client.Client,
+	cluster *cbv1alpha1.CloudberryCluster,
+) string {
+	t.Helper()
+	persisted := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, persisted))
+	return persisted.Status.CronJobName
+}
+
+// TestReconcileBackup_DisabledClearsPersistedCronJobName is the status-persistence
+// regression guard: disabling backup must clear the PERSISTED status.cronJobName,
+// not merely the in-memory copy. Because the field is json:"cronJobName,omitempty",
+// the standard MergePatch would drop the empty string and leave the stale value;
+// the explicit clear-patch must overwrite it on the API server.
+func TestReconcileBackup_DisabledClearsPersistedCronJobName(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cronName := util.BackupCronJobName(cluster.Name)
+	cluster.Status.CronJobName = cronName
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: cronName, Namespace: cluster.Namespace},
+		Spec:       batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	// Seed the persisted status so we can prove the stale value gets cleared.
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cluster))
+	require.Equal(t, cronName, readPersistedCronJobName(t, k8sClient, cluster))
+
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+
+	assert.Empty(t, cluster.Status.CronJobName, "in-memory status should be cleared")
+	assert.Empty(t, readPersistedCronJobName(t, k8sClient, cluster),
+		"persisted status.cronJobName must be cleared after disabling backup")
+}
+
+// TestEnsureBackupCronJob_EmptyScheduleClearsPersistedCronJobName verifies the
+// empty-schedule reconcile path (ensureBackupCronJob -> removeBackupCronJob) also
+// clears the PERSISTED status.cronJobName.
+func TestEnsureBackupCronJob_EmptyScheduleClearsPersistedCronJobName(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Schedule = "" // empty schedule => CronJob removed
+	cronName := util.BackupCronJobName(cluster.Name)
+	cluster.Status.CronJobName = cronName
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: cronName, Namespace: cluster.Namespace},
+		Spec:       batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cluster))
+	require.Equal(t, cronName, readPersistedCronJobName(t, k8sClient, cluster))
+
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.ensureBackupCronJob(context.Background(), cluster))
+
+	assert.Empty(t, cluster.Status.CronJobName, "in-memory status should be cleared")
+	assert.Empty(t, readPersistedCronJobName(t, k8sClient, cluster),
+		"persisted status.cronJobName must be cleared on empty schedule")
+}
+
+// TestReconcileBackup_ReEnablePersistsCronJobName verifies the disable -> clear
+// -> re-enable round trip: after disabling, the persisted name is empty; after
+// re-enabling with a schedule, the normal patchStatus persists the non-empty
+// name (omitempty is harmless for non-empty values).
+func TestReconcileBackup_ReEnablePersistsCronJobName(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cronName := util.BackupCronJobName(cluster.Name)
+	cluster.Status.CronJobName = cronName
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: cronName, Namespace: cluster.Namespace},
+		Spec:       batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cluster))
+
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	// Disable: persisted name cleared.
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+	assert.Empty(t, readPersistedCronJobName(t, k8sClient, cluster))
+
+	// Re-enable with a schedule: CronJob recreated and name persisted again.
+	cluster.Spec.Backup.Enabled = true
+	cluster.Spec.Backup.Schedule = "0 3 * * *"
+	require.NoError(t, r.reconcileBackup(context.Background(), cluster))
+	require.NoError(t, patchStatus(context.Background(), k8sClient, cluster))
+
+	assert.Equal(t, cronName, cluster.Status.CronJobName)
+	assert.Equal(t, cronName, readPersistedCronJobName(t, k8sClient, cluster),
+		"persisted status.cronJobName must be restored after re-enable")
+}
+
+// TestRefreshBackupStatusOnSteadyState_DisabledClearsPersistedCronJobName is the
+// LIVE-bug regression guard (Scenario 88a, steady-state path): once the cluster
+// settles and the cluster-controller advances ObservedGeneration to match
+// Generation, a "disable backup" change is observed through the generation-gated
+// steady-state path (handleAdminEarlyReturns -> refreshBackupStatusOnSteadyState),
+// NOT the spec-driven reconcileBackup. This test simulates that path directly and
+// asserts the PERSISTED status.cronJobName is cleared and the stale CronJob is
+// deleted, exactly as on the spec-driven disable path.
+func TestRefreshBackupStatusOnSteadyState_DisabledClearsPersistedCronJobName(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	// Steady state: generation already observed, so the admin generation gate would
+	// route this through refreshBackupStatusOnSteadyState rather than reconcileBackup.
+	cluster.Generation = 7
+	cluster.Status.ObservedGeneration = 7
+	cronName := util.BackupCronJobName(cluster.Name)
+	cluster.Status.CronJobName = cronName
+	existing := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: cronName, Namespace: cluster.Namespace},
+		Spec:       batchv1.CronJobSpec{Schedule: "0 2 * * *"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster, existing).WithStatusSubresource(cluster).Build()
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cluster))
+	require.Equal(t, cronName, readPersistedCronJobName(t, k8sClient, cluster))
+
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	// Drive the steady-state (generation-gated) path directly.
+	r.refreshBackupStatusOnSteadyState(context.Background(), cluster)
+
+	assert.Empty(t, cluster.Status.CronJobName, "in-memory status should be cleared")
+	assert.Empty(t, readPersistedCronJobName(t, k8sClient, cluster),
+		"persisted status.cronJobName must be cleared on the steady-state disabled path")
+
+	// The stale CronJob must be deleted as well.
+	cj := &batchv1.CronJob{}
+	err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cronName, Namespace: cluster.Namespace}, cj)
+	assert.True(t, apierrors.IsNotFound(err),
+		"stale backup CronJob must be deleted on the steady-state disabled path")
+}
+
+// TestRefreshBackupStatusOnSteadyState_ClobberThenReclear simulates the live
+// two-controller TOCTOU clobber: after the disabled steady-state path clears the
+// persisted name, a concurrent full status patch (as the cluster-controller would
+// do, carrying a stale in-memory cronJobName) re-sets it. The NEXT steady-state
+// admin requeue must re-clear it, proving convergence to "".
+func TestRefreshBackupStatusOnSteadyState_ClobberThenReclear(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := backupTestCluster()
+	cluster.Spec.Backup.Enabled = false
+	cluster.Generation = 9
+	cluster.Status.ObservedGeneration = 9
+	cronName := util.BackupCronJobName(cluster.Name)
+	cluster.Status.CronJobName = cronName
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).WithStatusSubresource(cluster).Build()
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cluster))
+
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), nil, &metrics.NoopRecorder{}, nil)
+
+	// First steady-state pass clears it.
+	r.refreshBackupStatusOnSteadyState(context.Background(), cluster)
+	require.Empty(t, readPersistedCronJobName(t, k8sClient, cluster))
+
+	// Simulate a concurrent cluster-controller patchStatus that carries a stale
+	// non-empty cronJobName (omitempty does NOT drop a non-empty value), clobbering
+	// the just-cleared field on the API server.
+	stale := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, stale))
+	stale.Status.CronJobName = cronName
+	require.NoError(t, patchStatus(context.Background(), k8sClient, stale))
+	require.Equal(t, cronName, readPersistedCronJobName(t, k8sClient, cluster),
+		"sanity: clobber must re-set the stale value")
+
+	// The NEXT steady-state admin requeue must re-clear it (convergence).
+	fresh := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, fresh))
+	r.refreshBackupStatusOnSteadyState(context.Background(), fresh)
+	assert.Empty(t, readPersistedCronJobName(t, k8sClient, cluster),
+		"steady-state requeue must re-clear a clobbered cronJobName (convergence)")
+}
+
 // TestAppendBackupHistory_TrimAndDedup verifies appendBackupHistory dedups by
 // timestamp and trims to the limit.
 func TestAppendBackupHistory_TrimAndDedup(t *testing.T) {

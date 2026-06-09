@@ -34,9 +34,11 @@ Jobs run in the same namespace as the `CloudberryCluster` and are labelled with 
 
 `gpbackup` is a Massively Parallel Processing (MPP) tool. The coordinator dispatches to **every** segment over SSH (port 22) to create per-segment backup directories and run `gpbackup_helper`/`gpbackup_s3_plugin`. With the S3 plugin, only the **DATA** files are streamed to S3 by each segment's `gpbackup_s3_plugin`, while the **metadata** files and the `gpbackup` **history database** are written to the coordinator data directory.
 
-A standalone backup Job pod is **not** a real segment host in `gp_segment_configuration`. Its plugin-config distribution (the per-run `/tmp/<ts>_s3-config.yaml`) therefore never reaches the segments, so a live data cycle cannot complete from an isolated Job pod alone. The supported live backup/restore **data cycle** runs `gpbackup`/`gprestore` **inside the coordinator pod** (the *coordinator-exec* model). The coordinator pod is segment `-1`: it has the `GPHOME` toolchain, the coordinator data directory, and the shared SSH identity required to dispatch to the segments.
+A standalone backup Job pod is **not** a real segment host in `gp_segment_configuration`. Once `gpbackup`/`gprestore` connect to the coordinator they read `gp_segment_configuration` and use the **catalog's** coordinator data directory (`/data/pgdata/gpseg-1`) to write the coordinator metadata + the `gpbackup` history database, and they dispatch over SSH to **every** segment to create each segment's `<datadir>/backups` directory. None of those paths exist inside an isolated Job pod connected only via `PGHOST`, so a standalone Job fails with *"Unable to create backup directories on N segments"* and *"open .../gpbackup_history.db: no such file or directory"*. (Note `gpbackup` also **rejects** `--plugin-config` together with `--backup-dir`, so the per-segment paths cannot be relocated for the S3 plugin path.) The supported backup/restore **data cycle** therefore runs `gpbackup`/`gprestore` **inside the coordinator pod** (the *coordinator-exec* model). The coordinator pod is segment `-1`: it has the `GPHOME` toolchain, the coordinator data directory, and the shared SSH identity required to dispatch to the segments.
 
-The operator still builds backup/restore Jobs and CronJobs for scheduling (the resources documented below). The live data cycle is exercised by the Scenario 71 orchestration script `test/e2e/scripts/scenario71-backup-restore.sh`, which supports `EXEC_MODE=coordinator` (default — runs `gpbackup`/`gprestore` inside the coordinator pod) and `EXEC_MODE=rest` (creates a standalone backup Job via the operator REST API, kept for reference/compat).
+**Operator implementation (S3).** For an S3 destination the operator-built backup/restore **Job** is a thin coordinator-exec wrapper (`internal/builder/backup_builder.go` `coordinatorExecScript`): the Job pod (1) renders the per-run S3 plugin config from its env (`envsubst`), (2) stages it into the coordinator pod's `/tmp` via a base64-piped `kubectl exec`, and (3) runs `gpbackup`/`gprestore --plugin-config <coordinator-cfg> …` **inside `<cluster>-coordinator-0`** via a second `kubectl exec` (the PG connection env, including the password, is passed as base64 positional args so it is metacharacter-safe and never written to disk). The `gpbackup`/`gprestore` flags stay visible in the Job's `args[0]` for inspection. This requires the backup ServiceAccount to hold `pods` (get/list) and `pods/exec` (create) in the cluster namespace — see the backup RBAC in `deploy/helm/cloudberry-operator/templates/backup-rbac.yaml`.
+
+The operator still builds backup/restore Jobs and CronJobs for scheduling (the resources documented below). The live data cycle is also exercised by the Scenario 71 orchestration script `test/e2e/scripts/scenario71-backup-restore.sh`, which supports `EXEC_MODE=coordinator` (default — runs `gpbackup`/`gprestore` inside the coordinator pod) and `EXEC_MODE=rest` (the operator REST API path, which now itself uses the coordinator-exec wrapper above).
 
 #### Passwordless Inter-Pod SSH
 
@@ -438,7 +440,7 @@ and is covered by `test/functional/scenario82_security_encryption_test.go`,
 **Scenario 72** verifies the backup **infrastructure** the operator deploys for a cluster with backups enabled — the toolchain image, the backup RBAC, the S3 plugin ConfigMap, the Job labels/namespace, the Job container env, and the `jobTemplate` pod-template overrides. Six verifications are covered by tests plus live checks:
 
 1. **Image binaries** — the `gpbackup`, `gprestore`, and `gpbackup_s3_plugin` binaries are present in the `cloudberry-backup:2.1.0` toolchain image (verified live via `docker run`; the Job container uses the configured image).
-2. **RBAC** — the `cloudberry-backup-sa` ServiceAccount and the `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch) plus the RoleBinding. The backup Job references `cloudberry-backup-sa`.
+2. **RBAC** — the `cloudberry-backup-sa` ServiceAccount and the `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch, plus `pods` get/list and `pods/exec` create for the coordinator-exec model) plus the RoleBinding. The backup Job references `cloudberry-backup-sa`.
 3. **S3 ConfigMap** — the generated `{cluster}-backup-s3-config` ConfigMap carries `executablepath: /usr/local/bin/gpbackup_s3_plugin` plus the region/endpoint/credentials/bucket/folder/encryption placeholders and the four multipart placeholders, and **no** `aws_signature_version` key.
 4. **Job labels/namespace** — the Job lives in the cluster namespace and carries `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster>`, `avsoft.io/component: backup`, and `avsoft.io/backup-operation: backup`.
 5. **Job env + envsubst** — the container carries `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` (AWS creds via `SecretKeyRef` to `backup-s3-credentials`) and runs `envsubst` to render `/tmp/s3-config.yaml`.
@@ -630,6 +632,8 @@ The `gpbackupOptions` fields map to `gpbackup` flags as follows:
 | `withStats` | `--with-stats` |
 | `withoutGlobals` | `--without-globals` |
 | `noCompression` | `--no-compression` |
+
+**`withStats` is a pointer (`*bool`).** `gpbackup.withStats` (and `gprestore.withStats`) is an explicit three-state pointer: **unset** (nil) defaults to `true` (statistics are backed up), while an explicit `withStats: false` is now **honored** and skips statistics — the mutating webhook no longer forces it back to `true`. This is useful because `gpbackup` statistics can fail on some column types; on the restore path, `--run-analyze` is the alternative that recomputes planner statistics instead of restoring the backed-up ones (see the run-analyze/with-stats mutual-exclusivity rule below).
 
 **`noCompression` override semantics.** When `noCompression: true`, the operator invokes `gpbackup` with `--no-compression` and the compression level/type are **ignored**: it emits `--no-compression` and does **not** emit `--compression-level` / `--compression-type`, producing an uncompressed backup — even if `compressionLevel` (or `compressionType`) is also set in the same request. `--no-compression` therefore takes precedence over the compression options.
 
@@ -1247,7 +1251,8 @@ stay intact while the 78d refuse-on-incomplete case is surfaced.
 
 ## Cross-Cluster Migration
 
-The operator supports parallel database migration between clusters by creating a coordinated pair of Jobs:
+The operator supports database migration between clusters by creating a **single
+coordinated Job** that runs the whole backup → restore → validate sequence:
 
 ```bash
 cloudberry-ctl migrate --source-cluster src --target-cluster dst \
@@ -1256,12 +1261,59 @@ cloudberry-ctl migrate --source-cluster src --target-cluster dst \
   --truncate
 ```
 
-This internally:
+This internally creates ONE Job `<source>-migration-<ts>` (label
+`avsoft.io/backup-operation=migrate`) whose script, under the coordinator-exec
+model (§MPP Dispatch):
 
-1. Creates a backup Job on the source cluster using `gpbackup --include-table ... --single-data-file --plugin-config ...`
-2. Creates a restore Job on the target cluster using `gprestore --timestamp ... --redirect-db ... --plugin-config ... --truncate-table`
-3. Both Jobs share the same S3 destination.
-4. Post-migration validation Job runs row-count and checksum verification.
+1. **Backup phase** — execs `gpbackup --include-table ... --single-data-file
+   --plugin-config <coord-cfg> --dbname ...` INSIDE the SOURCE coordinator pod and
+   **CAPTURES the real gpbackup timestamp** from gpbackup's stdout
+   (`grep -oE 'Backup Timestamp = [0-9]{14}'`).
+2. **Target-DB prepare** — before gprestore, the script prepares the target DB on
+   the TARGET coordinator via psql (gprestore 2.1.0 refuses a table-filtered /
+   data-only restore into a non-existent DB, and `--create-db` is insufficient for
+   that class). Without `--truncate` it CREATEs the DB if absent (idempotent). With
+   `--truncate` ("clean target") it terminates any open backends, then
+   `DROP DATABASE IF EXISTS "<db>"; CREATE DATABASE "<db>";` so the migration starts
+   from a freshly-created EMPTY DB.
+3. **Restore phase** — execs `gprestore --timestamp <captured> --redirect-db ...
+   --plugin-config <coord-cfg> --include-table ...` INSIDE the TARGET coordinator
+   pod, using the captured timestamp. It performs a FULL **metadata + data** restore
+   and deliberately does **NOT** pass `--truncate-table`: a fresh-DB restore creates
+   the schema (pre-data metadata: tables, sequences, indexes) AND loads the data, so
+   `--truncate-table` (which only "removes data of the tables getting restored" and
+   assumes those objects already exist) would try to TRUNCATE not-yet-existing
+   objects in the pre-data phase and abort with
+   `pq: relation "..." does not exist (42P01)`. The `--truncate` "clean target"
+   intent is honoured at the DB level (step 2: DROP+recreate the empty DB) instead.
+4. **Validation phase** — runs a row-count probe, an invalid-index scan and a
+   health-check query against the target, emitting `post-restore-validate: passed`.
+
+### Why a single Job (the timestamp-capture fix)
+
+`gpbackup` **generates its own** `YYYYMMDDHHMMSS` timestamp at runtime and exposes
+**no flag to pin it** (only `--from-timestamp` for incrementals). A previous
+two-Job topology named both the backup and the restore with ONE *operator-chosen*
+timestamp and passed that to `gprestore --timestamp`. Because the backup actually
+landed in S3 under gpbackup's own (different) timestamp, the restore failed with
+a `NotFound` (`gpbackup_..._config.yaml ... NotFound 404`). Running both phases in
+**one Job** lets the captured gpbackup timestamp propagate in-process to the
+restore, so backup and restore always reference the **same S3 object**. The
+operator-chosen timestamp is used **only to NAME the Job**.
+
+### Shared S3 bucket/folder
+
+Both clusters must share the same S3 bucket (enforced with a `400` otherwise).
+gpbackup writes under the **source** cluster's S3 `folder:`, so the migration
+Job's rendered S3 plugin config pins the **source** folder for BOTH the backup and
+the (target) restore — otherwise gprestore would look under the target's own
+folder and fail with `NotFound`.
+
+### 202 envelope
+
+The accepted response carries `migrationJob` (the single Job's name); the
+`backupJob`/`restoreJob`/`validationJob` fields all reference that same Job (it
+performs all three phases) for client back-compat.
 ## Pre-Backup Health Checks
 
 Every backup Job (on-demand and CronJob-spawned) carries a `pre-backup-check`
@@ -1740,6 +1792,83 @@ and is covered by `test/functional/scenario83_backup_failure_test.go`,
 `test/integration/scenario83_backup_failure_integration_test.go`,
 `test/e2e/scenario83_backup_failure_e2e_test.go`, and the live verification script
 `test/e2e/scripts/scenario83-backup-failure.sh`.
+
+### Scenario 88 — Backup Disabled / No Schedule
+
+**Scenario 88** verifies the operator's behavior when backup is **disabled**
+(`spec.backup.enabled: false`) or **enabled with an empty schedule**
+(`spec.backup.schedule: ""`): the per-cluster CronJob is absent (or removed),
+`status.cronJobName` is cleared, the API reports the disabled/unscheduled state, and
+on-demand backups still work when backup is enabled. The backup ServiceAccount/Role are
+**chart-level and shared**, not per-cluster, so they are never created or removed by this
+scenario.
+
+#### 88a — `backup.enabled: false` (disabled)
+
+When `spec.backup` is nil or `spec.backup.enabled: false`, the operator:
+
+- **Removes the per-cluster CronJob** `<cluster>-backup-schedule`
+  (`util.BackupCronJobName`) if it exists, via `removeBackupCronJob`
+  (`internal/controller/admin_controller.go`). Removal is **idempotent** — a missing
+  CronJob is a no-op.
+- **Clears `status.cronJobName`.** Because the field is tagged
+  `json:"cronJobName,omitempty"`, a plain status patch cannot reset it (`json.Marshal`
+  drops the empty string and a MergePatch only touches present keys). The operator
+  therefore clears it with `patchClearCronJobName`, which builds a raw MergePatch carrying
+  an **explicit empty string** so the **persisted** `status.cronJobName` is actually reset
+  (not just the in-memory copy).
+- **Runs the cleanup on BOTH reconcile paths (convergence).** The disabled-backup cleanup
+  runs on the **spec-driven** `reconcileBackup` **and** on the **steady-state** periodic
+  requeue (`refreshBackupStatusOnSteadyState`). Running it on every steady-state requeue
+  guarantees convergence to `cronJobName: ""` even when (1) the disable is only observed
+  after the generation has caught up (the spec-driven path is short-circuited by the
+  generation gate), or (2) a concurrent full `patchStatus` from the cluster-controller
+  re-marshals a stale non-empty `cronJobName` in the same window (the two-controller status
+  clobber). The next steady-state requeue re-clears it.
+- **No retention/backup Jobs.** No backup or retention-cleanup Jobs are created while
+  disabled (`ensureRetentionCleanup` is a no-op when backup is disabled).
+
+**API while disabled.** `POST /clusters/{name}/backups` → `400 BACKUP_NOT_ENABLED`;
+`GET /clusters/{name}/backups` → `200` with a new `"enabled": false` field;
+`GET /clusters/{name}/backups/schedule` → `200 { cluster, enabled:false, scheduled:false }`.
+See [API Specification §10.1 — Scenario 88](06-api-specification.md#101-scenario-88--backup-disabled--no-schedule-api-surface).
+
+**Re-enable (transition).** Setting `enabled: true` together with a valid `schedule`
+**recreates** the CronJob and **re-sets** `status.cronJobName` to
+`<cluster>-backup-schedule` (`ensureBackupCronJob` on the next reconcile).
+
+#### 88b — `enabled: true` + `schedule: ""` (no schedule, on-demand only)
+
+When backup is **enabled** but `schedule` is empty, the operator builds **no** CronJob
+(`BuildBackupCronJob` returns nil, so `ensureBackupCronJob` calls `removeBackupCronJob`)
+and `status.cronJobName` stays empty. **On-demand backups still work**: the API
+`POST /clusters/{name}/backups` and the CLI `cloudberry-ctl backup create` both create a
+backup **Job directly** (`202`), which runs to completion via the coordinator-exec model.
+`GET /clusters/{name}/backups/schedule` → `200 { cluster, enabled:true, scheduled:false }`
+— the `enabled:true` distinguishes this "unscheduled" state from the disabled state, since
+both report `scheduled:false`.
+
+#### Backup ServiceAccount/Role are chart-level (shared, not per-cluster)
+
+The backup `ServiceAccount` (`cloudberry-backup-sa`) and `Role`
+(`cloudberry-backup-role`) are created by the **Helm chart** in the operator namespace,
+gated by `backup.rbac.create`, and **shared across all clusters** in that namespace (see
+[RBAC Requirements](#rbac-requirements)). They are **not** created or removed per-cluster,
+so disabling backup on one cluster (88a) or clearing its schedule (88b) **never** touches
+the shared SA/Role/RoleBinding. The disabled/empty-schedule cleanup is strictly a
+**per-cluster** effect (CronJob removed, `status.cronJobName` cleared, no per-cluster
+Jobs).
+
+The scenario is covered by `internal/controller/backup_status_test.go`
+(`TestReconcileBackup_DisabledClearsPersistedCronJobName`,
+`TestEnsureBackupCronJob_EmptyScheduleClearsPersistedCronJobName`,
+`TestReconcileBackup_ReEnablePersistsCronJobName`,
+`TestRefreshBackupStatusOnSteadyState_DisabledClearsPersistedCronJobName`, and the
+steady-state convergence guard), `internal/api/backup_test.go`
+(`TestHandleListBackups_EnabledField` + the schedule-endpoint cases),
+`test/functional/scenario88_backup_disabled_test.go`,
+`test/cases/scenario88_backup_disabled_cases.go`, and
+`test/e2e/scenario88_backup_disabled_e2e_test.go`.
 
 ## RBAC Requirements
 

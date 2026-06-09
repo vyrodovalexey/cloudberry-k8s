@@ -432,6 +432,8 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set telemetry.otlpInsecure=true
 ```
 
+Tracing is disabled by default — it activates only when `telemetry.enabled=true` and an `otlpEndpoint` are set. Point the endpoint at the in-cluster `otel-collector` (which forwards to Tempo) or directly at Tempo on `:4317`. Once traces are flowing, the **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) shows Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs.
+
 For local development, the Docker Compose test environment includes VictoriaMetrics (port 8428), Grafana (port 3000), and Tempo (ports 3200/4317/4318) pre-configured for metrics and tracing.
 
 #### Kubernetes Monitoring Stack (Makefile Targets)
@@ -462,7 +464,7 @@ make grafana-publish
 
 **`monitoring-undeploy`** removes all four Helm releases from the namespace.
 
-The Grafana dashboards in `monitoring/grafana/` cover all exported metrics — operator metrics, the cloudberry-query-exporter resource-group/IO/spill/skew metrics, and the postgres-exporter custom SQL metrics — and are published with `make grafana-publish`.
+There are four Grafana dashboards in `monitoring/grafana/` — `cloudberry-operator.json` (operator metrics), `cloudberry-exporters.json` (cloudberry-query-exporter resource-group/IO/spill/skew and postgres-exporter custom SQL metrics), `cloudberry-node-metrics.json` (node-exporter metrics), and `cloudberry-otel.json` (Tempo traces, otel-collector health, and operator logs) — all published with `make grafana-publish` (which runs `test/monitoring/scripts/publish-dashboards.sh`).
 
 #### Manual Monitoring Deployment
 

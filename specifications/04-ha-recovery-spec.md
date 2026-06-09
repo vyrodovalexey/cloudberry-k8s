@@ -178,7 +178,7 @@ The operator implements FTS probing via `runFTSProbe()` in the HA controller:
 
 1. **Probe Loop**: Every `ftsProbeInterval` seconds (default: 60s), the HA controller runs a probe cycle for clusters with mirroring enabled.
 2. **Segment Configuration Read**: The probe calls `GetSegmentConfiguration()` to read `gp_segment_configuration` from the coordinator, wrapped in a retry loop (`probeSegmentConfigWithRetries`).
-3. **Retry Logic**: Each probe attempt uses a dedicated context with `ftsProbeTimeout` deadline (default: 20s). If the attempt fails, the `fts_probe_failures_total` metric is incremented and the next attempt begins. Up to `ftsProbeRetries` attempts (default: 5) are made before the probe is considered failed.
+3. **Retry Logic**: Each probe attempt uses a dedicated context with `ftsProbeTimeout` deadline (default: 20s). If an attempt fails it is logged and the next attempt begins. Up to `ftsProbeRetries` attempts (default: 5) are made before the probe is considered failed. The retry loop does **not** record per-attempt failure metrics — the terminal probe outcome is recorded **exactly once per probe cycle** by `runFTSProbe` (which calls `RecordFTSProbe(..., "failure", ...)` when the retries are exhausted), so `fts_probe_failures_total` (and `fts_probe_total{result="failure"}`) is incremented once per failed probe rather than once per retry.
 4. **Segment Analysis**: On successful read, `analyzeSegments()` evaluates each segment's health. Segments with `status != "u"` are marked as failed. Per-segment status is reported via `cloudberry_segment_status` (1=up, 0=down).
 5. **Failover Trigger**: If any primary segments (role="p") are failed and mirroring is enabled, `handleFailover()` is called (see Section 3.3).
 6. **Status Update**: `updateFTSProbeStatus()` updates the cluster's `mirroringStatus` (`InSync` or `Degraded`), `failedSegments` list, and related metrics (`cloudberry_segments_failed`, `cloudberry_mirroring_in_sync`).
@@ -246,7 +246,7 @@ sequenceDiagram
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `cloudberry_fts_probe_total` | Counter | cluster, namespace | Total FTS probes (recorded with result label: "success", "degraded", or "failure") |
-| `cloudberry_fts_probe_failures_total` | Counter | cluster, namespace | Failed FTS probe attempts. Incremented per retry failure in `probeSegmentConfigWithRetries` — a single probe cycle with 3 failed attempts before success increments this counter by 3. |
+| `cloudberry_fts_probe_failures_total` | Counter | cluster, namespace | Failed FTS probes. Incremented **once per failed probe cycle** by `runFTSProbe` when all retries are exhausted (not once per retry attempt). A probe that fails 3 attempts before giving up increments this counter by 1, not 3. |
 | `cloudberry_fts_probe_duration_seconds` | Histogram | cluster, namespace | Probe duration |
 | `cloudberry_fts_failover_total` | Counter | cluster, namespace | Total failover events. Incremented once per `handleFailover()` invocation (not per failed segment). Triggered when failed primaries are detected and mirroring is enabled. |
 | `cloudberry_segment_status` | Gauge | cluster, namespace, segment | Per-segment status (1=up, 0=down). Updated by `analyzeSegments()` for all segments and set to 0 for failed primaries during `handleFailover()`. |

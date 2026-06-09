@@ -41,11 +41,11 @@ func newBackupCluster() *cbv1alpha1.CloudberryCluster {
 			CompressionLevel: 6,
 			CompressionType:  "gzip",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 		},
 		Gprestore: &cbv1alpha1.GprestoreOptions{
 			Jobs:      4,
-			WithStats: true,
+			WithStats: util.Ptr(true),
 		},
 	}
 	return cluster
@@ -57,7 +57,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
-			WithStats:        true,
+			WithStats:        util.Ptr(true),
 		}, nil)
 		joined := strings.Join(args, " ")
 		assert.Contains(t, joined, "--compression-level 6")
@@ -127,7 +127,7 @@ func TestBuildGprestoreArgs(t *testing.T) {
 		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{
 			Jobs:            4,
 			CreateDb:        true,
-			WithStats:       true,
+			WithStats:       util.Ptr(true),
 			RunAnalyze:      true,
 			OnErrorContinue: true,
 			TruncateTable:   true,
@@ -172,7 +172,7 @@ func TestBuildGprestoreArgs(t *testing.T) {
 	t.Run("with-stats only: with-stats emitted, no run-analyze", func(t *testing.T) {
 		args := buildGprestoreArgs(newBackupCluster(), &cbv1alpha1.GprestoreOptions{
 			Jobs:      4,
-			WithStats: true,
+			WithStats: util.Ptr(true),
 		}, &RestoreJobOptions{Timestamp: "20260519020000"})
 		joined := strings.Join(args, " ")
 		assert.Contains(t, joined, "--with-stats")
@@ -369,6 +369,69 @@ func TestBuildRestoreJob(t *testing.T) {
 	assert.Equal(t, util.RestoreJobName("test-cluster", "20260519020000"), job.Name)
 	assert.Equal(t, util.BackupOperationRestore, job.Labels[util.LabelBackupOperation])
 	assert.Equal(t, restoreContainerName, job.Spec.Template.Spec.Containers[0].Name)
+}
+
+// containerEnvValue returns the value of the named env var on the container, or
+// "" when absent.
+func containerEnvValue(c corev1.Container, name string) string {
+	for _, env := range c.Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+// TestBuildRestoreJobS3FolderOverride asserts that S3FolderOverride redirects the
+// restore Job's S3_FOLDER env (and thus the rendered plugin config "folder:") to
+// the override, which is the cross-cluster migration fix. Without an override the
+// cluster's own folder is used (regression guard).
+func TestBuildRestoreJobS3FolderOverride(t *testing.T) {
+	b := NewBuilder()
+
+	t.Run("override redirects S3_FOLDER", func(t *testing.T) {
+		job := b.BuildRestoreJob(newBackupCluster(), &RestoreJobOptions{
+			Timestamp:        "20260519020000",
+			S3FolderOverride: "scenario87-src",
+		})
+		require.NotNil(t, job)
+		assert.Equal(t, "scenario87-src",
+			containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+	})
+
+	t.Run("no override keeps cluster folder", func(t *testing.T) {
+		job := b.BuildRestoreJob(newBackupCluster(), &RestoreJobOptions{
+			Timestamp: "20260519020000",
+		})
+		require.NotNil(t, job)
+		// newBackupCluster configures folder "/backups".
+		assert.Equal(t, "/backups",
+			containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+	})
+}
+
+// TestBuildPostRestoreValidationJobS3FolderOverride asserts the validation Job
+// mirrors the restore Job's S3 folder override.
+func TestBuildPostRestoreValidationJobS3FolderOverride(t *testing.T) {
+	b := NewBuilder()
+
+	job := b.BuildPostRestoreValidationJob(newBackupCluster(), &ValidationJobOptions{
+		Timestamp:        "20260519020000",
+		Database:         "mydb",
+		S3FolderOverride: "scenario87-src",
+	})
+	require.NotNil(t, job)
+	assert.Equal(t, "scenario87-src",
+		containerEnvValue(job.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
+
+	// Without the override the validation Job uses the cluster's own folder.
+	jobNoOverride := b.BuildPostRestoreValidationJob(newBackupCluster(), &ValidationJobOptions{
+		Timestamp: "20260519020000",
+		Database:  "mydb",
+	})
+	require.NotNil(t, jobNoOverride)
+	assert.Equal(t, "/backups",
+		containerEnvValue(jobNoOverride.Spec.Template.Spec.Containers[0], "S3_FOLDER"))
 }
 
 func TestBuildRetentionCleanupJob(t *testing.T) {

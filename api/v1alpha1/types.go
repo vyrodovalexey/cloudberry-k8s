@@ -1408,9 +1408,11 @@ type GpbackupOptions struct {
 	// +optional
 	LeafPartitionData bool `json:"leafPartitionData,omitempty"`
 
-	// WithStats maps to --with-stats.
+	// WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
+	// to true by the mutating webhook; an explicit false is honored (the flag is
+	// not emitted). Using a pointer distinguishes "unset" from "explicitly false".
 	// +optional
-	WithStats bool `json:"withStats,omitempty"`
+	WithStats *bool `json:"withStats,omitempty"`
 
 	// WithoutGlobals maps to --without-globals.
 	// +kubebuilder:default=false
@@ -1439,9 +1441,11 @@ type GprestoreOptions struct {
 	// +optional
 	WithGlobals bool `json:"withGlobals,omitempty"`
 
-	// WithStats maps to --with-stats.
+	// WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
+	// to true by the mutating webhook; an explicit false is honored (the flag is
+	// not emitted). Using a pointer distinguishes "unset" from "explicitly false".
 	// +optional
-	WithStats bool `json:"withStats,omitempty"`
+	WithStats *bool `json:"withStats,omitempty"`
 
 	// RunAnalyze maps to --run-analyze.
 	// +kubebuilder:default=false

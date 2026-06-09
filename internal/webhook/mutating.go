@@ -285,8 +285,10 @@ func setGpbackupDefaults(backup *cbv1alpha1.BackupSpec) {
 	}
 	// gp.SingleDataFile defaults to false; the zero value already matches the
 	// spec default, so no explicit assignment is required here.
-	if !gp.WithStats {
-		gp.WithStats = true
+	// WithStats is a *bool: default to true only when unset (nil) so an explicit
+	// withStats:false set by the user is preserved rather than silently reverted.
+	if gp.WithStats == nil {
+		gp.WithStats = util.Ptr(true)
 	}
 }
 
@@ -299,8 +301,10 @@ func setGprestoreDefaults(backup *cbv1alpha1.BackupSpec) {
 	if gr.Jobs == 0 {
 		gr.Jobs = defaultBackupJobs
 	}
-	if !gr.WithStats {
-		gr.WithStats = true
+	// WithStats is a *bool: default to true only when unset (nil) so an explicit
+	// withStats:false set by the user is preserved rather than silently reverted.
+	if gr.WithStats == nil {
+		gr.WithStats = util.Ptr(true)
 	}
 }
 

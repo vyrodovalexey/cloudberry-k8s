@@ -3,8 +3,10 @@ package ctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -621,4 +623,91 @@ func TestOperatorClient_RedirectPrevention(t *testing.T) {
 	// Should get the redirect response, not follow it
 	require.NoError(t, err) // 302 < 400, so no API error
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
+}
+
+func TestOperatorClient_GetStream_Success(t *testing.T) {
+	const body = "line one\nline two\nBackup completed successfully\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, apiPrefix+"/clusters/c/backups/jobs/j/logs", r.URL.Path)
+		assert.Equal(t, "text/plain", r.Header.Get("Accept"))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := NewOperatorClient(ClientConfig{BaseURL: server.URL})
+	var buf strings.Builder
+	err := client.GetStream(context.Background(), "/clusters/c/backups/jobs/j/logs", &buf)
+	require.NoError(t, err)
+	assert.Equal(t, body, buf.String())
+}
+
+func TestOperatorClient_GetStream_Auth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer tok", r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	client := NewOperatorClient(ClientConfig{
+		BaseURL: server.URL, AuthMethod: "oidc", Password: "tok",
+	})
+	var buf strings.Builder
+	require.NoError(t, client.GetStream(context.Background(), "/logs", &buf))
+	assert.Equal(t, "ok", buf.String())
+}
+
+func TestOperatorClient_GetStream_APIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{"code": "JOB_NOT_FOUND", "message": "no pods found"},
+		})
+	}))
+	defer server.Close()
+
+	client := NewOperatorClient(ClientConfig{BaseURL: server.URL})
+	var buf strings.Builder
+	err := client.GetStream(context.Background(), "/logs", &buf)
+	require.Error(t, err)
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusNotFound, apiErr.StatusCode)
+	assert.Equal(t, "JOB_NOT_FOUND", apiErr.Code)
+	assert.Empty(t, buf.String())
+}
+
+func TestOperatorClient_GetStream_ConnectionError(t *testing.T) {
+	client := NewOperatorClient(ClientConfig{BaseURL: "http://127.0.0.1:0"})
+	var buf strings.Builder
+	err := client.GetStream(context.Background(), "/logs", &buf)
+	require.Error(t, err)
+}
+
+// errWriter always fails on Write to exercise GetStream's io.Copy error branch.
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestOperatorClient_GetStream_BadRequest(t *testing.T) {
+	// A control character in the path makes http.NewRequestWithContext fail.
+	client := NewOperatorClient(ClientConfig{BaseURL: "http://example.com"})
+	var buf strings.Builder
+	err := client.GetStream(context.Background(), "/logs\x7f", &buf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating request")
+}
+
+func TestOperatorClient_GetStream_CopyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("some log output that cannot be copied"))
+	}))
+	defer server.Close()
+
+	client := NewOperatorClient(ClientConfig{BaseURL: server.URL})
+	err := client.GetStream(context.Background(), "/logs", errWriter{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading response stream")
 }

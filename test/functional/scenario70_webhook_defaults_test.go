@@ -87,11 +87,13 @@ func (s *Scenario70Suite) assertScenario70Defaults(backup *cbv1alpha1.BackupSpec
 	assert.Equal(t, "gzip", backup.Gpbackup.CompressionType, "gpbackup.compressionType")
 	assert.Equal(t, int32(1), backup.Gpbackup.Jobs, "gpbackup.jobs")
 	assert.False(t, backup.Gpbackup.SingleDataFile, "gpbackup.singleDataFile")
-	assert.True(t, backup.Gpbackup.WithStats, "gpbackup.withStats")
+	require.NotNil(t, backup.Gpbackup.WithStats, "gpbackup.withStats defaulted (non-nil)")
+	assert.True(t, *backup.Gpbackup.WithStats, "gpbackup.withStats")
 
 	require.NotNil(t, backup.Gprestore, "gprestore must be allocated by defaulter")
 	assert.Equal(t, int32(1), backup.Gprestore.Jobs, "gprestore.jobs")
-	assert.True(t, backup.Gprestore.WithStats, "gprestore.withStats")
+	require.NotNil(t, backup.Gprestore.WithStats, "gprestore.withStats defaulted (non-nil)")
+	assert.True(t, *backup.Gprestore.WithStats, "gprestore.withStats")
 
 	assert.Equal(t, int32(3), backup.Retention.FullCount, "retention.fullCount")
 	assert.Equal(t, "30d", backup.Retention.MaxAge, "retention.maxAge")
@@ -163,7 +165,8 @@ func (s *Scenario70Suite) TestFunctional_Scenario70_ExplicitValuesPreserved() {
 
 	// Other unset fields still defaulted.
 	assert.Equal(t, "gzip", backup.Gpbackup.CompressionType, "unset compressionType still defaulted")
-	assert.True(t, backup.Gpbackup.WithStats, "unset withStats still defaulted")
+	require.NotNil(t, backup.Gpbackup.WithStats, "unset withStats still defaulted (non-nil)")
+	assert.True(t, *backup.Gpbackup.WithStats, "unset withStats still defaulted")
 	require.NotNil(t, backup.Gprestore)
 	assert.Equal(t, int32(1), backup.Gprestore.Jobs, "unset gprestore.jobs still defaulted")
 	require.NotNil(t, backup.JobTemplate.ActiveDeadlineSeconds)

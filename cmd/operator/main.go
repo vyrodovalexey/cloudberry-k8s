@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -397,6 +398,15 @@ func startAPIServer(
 	// Create and start the API server.
 	apiServer := api.NewServer(mgr.GetClient(), authMW, dbFactory, metricsRecorder, logger, cfg.APIRateLimit, credStore)
 	defer apiServer.Close()
+
+	// Inject a typed Kubernetes clientset so endpoints that stream pod logs
+	// (e.g. backup Job logs) work; the controller-runtime client cannot stream.
+	if clientset, csErr := kubernetes.NewForConfig(mgr.GetConfig()); csErr != nil {
+		logger.Warn("failed to build Kubernetes clientset; Job log streaming will be unavailable",
+			"error", csErr)
+	} else {
+		apiServer.WithClientset(clientset)
+	}
 
 	logger.Info("starting REST API server", "address", cfg.APIAddress, "rateLimit", cfg.APIRateLimit)
 	return api.StartServer(ctx, cfg.APIAddress, apiServer.Handler(), logger)

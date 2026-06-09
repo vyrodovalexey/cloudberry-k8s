@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 )
 
@@ -50,6 +51,9 @@ const (
 	// resultSuccess and resultError are the result label values for cert metrics.
 	resultSuccess = "success"
 	resultError   = "error"
+
+	// certTracerName is the tracer name used for certificate-management spans.
+	certTracerName = "certmanager"
 )
 
 // CertManager manages webhook TLS certificates.
@@ -153,7 +157,13 @@ func (m *certManager) setCertExpiry(certPEM []byte) {
 }
 
 // EnsureCertificates ensures webhook TLS certificates exist and are valid.
-func (m *certManager) EnsureCertificates(ctx context.Context) ([]byte, error) {
+func (m *certManager) EnsureCertificates(ctx context.Context) (caBundle []byte, err error) {
+	ctx, span := telemetry.StartSpan(ctx, certTracerName, "EnsureCertificates")
+	defer span.End()
+	// Mark the span on any error path (get/rotation/generation failures) exactly
+	// once via the named return error. No-op when telemetry is disabled.
+	defer func() { telemetry.SetSpanError(span, err) }()
+
 	m.logger.Info("ensuring webhook certificates",
 		"certSource", m.config.CertSource,
 		"secretName", m.config.SecretName,
@@ -162,12 +172,12 @@ func (m *certManager) EnsureCertificates(ctx context.Context) ([]byte, error) {
 
 	// Check if the secret already exists with valid certificates.
 	existing := &corev1.Secret{}
-	err := m.client.Get(ctx, types.NamespacedName{
+	getErr := m.client.Get(ctx, types.NamespacedName{
 		Name:      m.config.SecretName,
 		Namespace: m.config.SecretNamespace,
 	}, existing)
 
-	if err == nil {
+	if getErr == nil {
 		// Secret exists; check if certificates are still valid.
 		needsRotation, rotErr := m.checkCertRotation(existing)
 		if rotErr != nil {
@@ -179,15 +189,17 @@ func (m *certManager) EnsureCertificates(ctx context.Context) ([]byte, error) {
 			return existing.Data[secretKeyCACert], nil
 		}
 		m.logger.Info("certificates need rotation, regenerating")
-	} else if !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("getting cert secret: %w", err)
+	} else if !apierrors.IsNotFound(getErr) {
+		err = fmt.Errorf("getting cert secret: %w", getErr)
+		return nil, err
 	}
 
 	// Generate or issue new certificates.
-	caBundle, err := m.generateCertificates(ctx, existing, apierrors.IsNotFound(err))
+	caBundle, err = m.generateCertificates(ctx, existing, apierrors.IsNotFound(getErr))
 	if err != nil {
 		m.recordCertRotation(resultError)
-		return nil, fmt.Errorf("generating certificates: %w", err)
+		err = fmt.Errorf("generating certificates: %w", err)
+		return nil, err
 	}
 
 	return caBundle, nil

@@ -502,6 +502,7 @@ jobs:
           helm lint test/monitoring/otel-collector
           helm lint test/monitoring/vmagent
           helm lint test/monitoring/vector
+          helm lint test/monitoring/node-exporter
 
       - name: Validate monitoring chart templates
         run: |
@@ -509,6 +510,7 @@ jobs:
           helm template otel-collector test/monitoring/otel-collector > /dev/null
           helm template vmagent test/monitoring/vmagent > /dev/null
           helm template vector test/monitoring/vector > /dev/null
+          helm template node-exporter test/monitoring/node-exporter > /dev/null
           echo "Monitoring chart template validation successful!"
 
       - name: Dry-run install monitoring charts
@@ -517,6 +519,7 @@ jobs:
           helm install --dry-run --debug otel-collector test/monitoring/otel-collector
           helm install --dry-run --debug vmagent test/monitoring/vmagent
           helm install --dry-run --debug vector test/monitoring/vector
+          helm install --dry-run --debug node-exporter test/monitoring/node-exporter
 
       - name: Validate monitoring chart Kubernetes manifests
         run: |
@@ -524,6 +527,7 @@ jobs:
           helm template otel-collector test/monitoring/otel-collector | kubectl apply --dry-run=client -f -
           helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
           helm template vector test/monitoring/vector | kubectl apply --dry-run=client -f -
+          helm template node-exporter test/monitoring/node-exporter | kubectl apply --dry-run=client -f -
           echo "Monitoring chart Kubernetes manifest validation successful!"
 
 

@@ -51,6 +51,25 @@ rules:
     verbs:
       - create
       - patch
+  # Coordinator-exec model (spec 11 §MPP Dispatch): gpbackup/gprestore are MPP
+  # orchestrators that MUST run inside the coordinator pod (segment -1) so they
+  # can write the catalog coordinator data directory + history DB and dispatch to
+  # every segment over SSH. The backup/restore Jobs therefore `kubectl exec` into
+  # <cluster>-coordinator-0, which requires pods (get/list, to resolve the pod)
+  # and pods/exec (create). Scoped to pods in the cluster namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
+      - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

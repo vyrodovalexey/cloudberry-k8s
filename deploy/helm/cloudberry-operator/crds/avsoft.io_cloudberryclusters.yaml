@@ -385,7 +385,10 @@ spec:
                         description: SingleDataFile maps to --single-data-file.
                         type: boolean
                       withStats:
-                        description: WithStats maps to --with-stats.
+                        description: |-
+                          WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
+                          to true by the mutating webhook; an explicit false is honored (the flag is
+                          not emitted). Using a pointer distinguishes "unset" from "explicitly false".
                         type: boolean
                       withoutGlobals:
                         default: false
@@ -438,7 +441,10 @@ spec:
                         description: WithGlobals maps to --with-globals.
                         type: boolean
                       withStats:
-                        description: WithStats maps to --with-stats.
+                        description: |-
+                          WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
+                          to true by the mutating webhook; an explicit false is honored (the flag is
+                          not emitted). Using a pointer distinguishes "unset" from "explicitly false".
                         type: boolean
                     type: object
                   image:

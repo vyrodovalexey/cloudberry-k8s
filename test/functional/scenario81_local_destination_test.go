@@ -13,6 +13,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 	"github.com/cloudberry-contrib/cloudberry-k8s/test/testutil"
 )
 
@@ -35,9 +36,10 @@ import (
 //	    render the S3 plugin config (no `cat /etc/gpbackup/...`, no envsubst, no
 //	    > /tmp/s3-config.yaml) so the Job does not crash under set -euo pipefail
 //	    reading a missing S3 ConfigMap.
-//	81d S3 regression   : an S3 cluster still carries --plugin-config (no
-//	    --backup-dir), the s3-plugin-config ConfigMap volume and the
-//	    /etc/gpbackup render — byte-compatible with the existing behaviour.
+//	81d S3 regression   : an S3 cluster still carries --plugin-config (and NEVER
+//	    --backup-dir, which gpbackup rejects together with --plugin-config), the
+//	    s3-plugin-config ConfigMap volume and the /etc/gpbackup render, and runs
+//	    the tool inside the coordinator pod via kubectl exec (coordinator-exec).
 //
 // These tests black-box the operator through the public builder (BuildBackupJob /
 // BuildRestoreJob rendered spec + script). They are deterministic and
@@ -64,6 +66,12 @@ const (
 	scenario81S3ConfigMount  = "/etc/gpbackup"
 	scenario81LocalVolume    = "backup-data"
 )
+
+// scenario81CoordPod returns the coordinator pod name the S3 coordinator-exec
+// backup/restore Jobs kubectl-exec into.
+func scenario81CoordPod(cluster *cbv1alpha1.CloudberryCluster) string {
+	return util.CoordinatorPodName(cluster.Name)
+}
 
 // Scenario81Suite exercises the local-destination backup/restore Job spec and the
 // rendered tool script, plus the S3 regression guard.
@@ -310,9 +318,12 @@ func (s *Scenario81Suite) TestFunctional_Scenario81_BackupScriptOmitsS3Render() 
 // --- 81d: S3 cluster regression — plugin-config + s3 volume + s3 render ---
 
 // TestFunctional_Scenario81_S3RegressionBackup asserts an S3 cluster's backup Job
-// still carries --plugin-config (no --backup-dir), the s3-plugin-config ConfigMap
-// volume mounted at /etc/gpbackup, and renders the S3 config — and does NOT carry
-// the local PVC volume. Guards against S3 regressions from the local wiring.
+// still carries --plugin-config, the s3-plugin-config ConfigMap volume mounted at
+// /etc/gpbackup, and renders the S3 config — and does NOT carry the local PVC
+// volume. It also asserts the S3 backup uses the coordinator-exec model (kubectl
+// exec into the coordinator pod) and that it NEVER combines --plugin-config with
+// --backup-dir (gpbackup rejects that pairing). See backupDestinationArgs /
+// coordinatorExecScript and spec 11 §MPP Dispatch.
 func (s *Scenario81Suite) TestFunctional_Scenario81_S3RegressionBackup() {
 	cluster := scenario81Cluster("s81-s3", scenario81S3BackupSpec())
 	job := builder.NewBuilder().BuildBackupJob(cluster, &builder.BackupJobOptions{
@@ -339,12 +350,19 @@ func (s *Scenario81Suite) TestFunctional_Scenario81_S3RegressionBackup() {
 	assert.Contains(s.T(), script, scenario81S3ConfigMount,
 		"s3 backup script must render the S3 config from /etc/gpbackup")
 	assert.Contains(s.T(), script, "envsubst <")
+	// Coordinator-exec: the real gpbackup runs INSIDE the coordinator pod.
+	assert.Contains(s.T(), script, "exec -i",
+		"s3 backup must kubectl-exec into the coordinator pod")
+	assert.Contains(s.T(), script, scenario81CoordPod(cluster),
+		"s3 backup must target the coordinator pod")
+	// gpbackup REJECTS --plugin-config together with --backup-dir.
 	assert.NotContains(s.T(), script, scenario81BackupDirFlag,
 		"s3 gpbackup invocation must NOT carry --backup-dir")
 }
 
 // TestFunctional_Scenario81_S3RegressionRestore asserts an S3 restore Job still
-// carries --plugin-config (no --backup-dir) and the s3-plugin-config volume.
+// carries --plugin-config and the s3-plugin-config volume, uses the
+// coordinator-exec model, and never carries --backup-dir.
 func (s *Scenario81Suite) TestFunctional_Scenario81_S3RegressionRestore() {
 	cluster := scenario81Cluster("s81-s3-restore", scenario81S3BackupSpec())
 	job := builder.NewBuilder().BuildRestoreJob(cluster, &builder.RestoreJobOptions{
@@ -361,5 +379,10 @@ func (s *Scenario81Suite) TestFunctional_Scenario81_S3RegressionRestore() {
 
 	script := podSpec.Containers[0].Args[0]
 	assert.Contains(s.T(), script, scenario81PluginCfgFlag)
-	assert.NotContains(s.T(), script, scenario81BackupDirFlag)
+	assert.Contains(s.T(), script, "exec -i",
+		"s3 restore must kubectl-exec into the coordinator pod")
+	assert.Contains(s.T(), script, scenario81CoordPod(cluster),
+		"s3 restore must target the coordinator pod")
+	assert.NotContains(s.T(), script, scenario81BackupDirFlag,
+		"s3 gprestore invocation must NOT carry --backup-dir")
 }

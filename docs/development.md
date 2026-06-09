@@ -3129,6 +3129,82 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario85
 bash test/e2e/scripts/scenario85-api-endpoints.sh --cluster scenario85-s3
 ```
 
+#### Scenario 86 — All Backup CLI Commands
+
+Verifies **all eleven** `cloudberry-ctl backup …` CLI commands (86a–k): each command builds the
+right operator REST request, and `backup jobs logs` (86k) **streams** the Job's pod logs. Ten
+commands reuse the Scenario 85 endpoints; the only code addition is the 86k streaming path — a
+new operator endpoint, a new CLI streaming client method, and the rewired `backup jobs logs`
+command.
+
+- **Where the CLI backup commands live** — `cmd/cloudberry-ctl/main.go`:
+  - `newBackupCmd` builds the tree: `newBackupCreateCmd` (→ `buildCreateBackupRequest`,
+    `POST /backups`), `newBackupListCmd` (`GET /backups`), `newBackupStatusCmd`
+    (`GET /backups/{ts}`), `newBackupDeleteCmd` (`DELETE /backups/{ts}`), `newBackupRestoreCmd`
+    (→ `buildRestoreRequest`, `POST /backups/{ts}/restore` — incl. `--resize-cluster`),
+    `newBackupScheduleCmd` (`GET /backups/schedule`) with `newBackupScheduleSetCmd`
+    (`PATCH {schedule}`) and `newBackupScheduleSuspendCmd("suspend"|"resume", …)`
+    (`PATCH {suspend}`), and `newBackupJobsCmd` (`GET /backups/jobs`).
+  - **86k** — `newBackupJobsLogsCmd` (`--job`/`--follow`/`--tail`) → `runBackupJobsLogs` builds
+    the path with `buildBackupJobLogsPath` (adds `?follow=true`/`?tailLines=N`) and calls
+    `client.GetStream(ctx, path, cmd.OutOrStdout())`. On a stream error it calls
+    `printBackupJobLogsFallback`, which prints the `kubectl logs -n <ns> job/<job>` instruction
+    rather than failing silently.
+
+- **The new operator logs endpoint** — `internal/api/server.go`:
+  - Registered as `GET /clusters/{name}/backups/jobs/{job}/logs` with `PermissionBasic`
+    (after `GET /backups/jobs`; the literal route wins over `/backups/{timestamp}`).
+  - `handleBackupJobLogs` validates the job name, requires the typed clientset (`501` when nil),
+    resolves the cluster (`404`), finds the Job's most-recent pod via `findJobPod` /
+    `mostRecentPodName` (`404 JOB_NOT_FOUND` when none), then `streamPodLogs` opens
+    `clientset.CoreV1().Pods(ns).GetLogs(pod, buildPodLogOptions(query))` and copies the stream
+    as `text/plain` (flushing for `--follow` via `copyLogStream`).
+  - **Clientset wiring** — the controller-runtime `client.Client` cannot stream pod logs, so the
+    `Server` now holds a typed `kubernetes.Interface`, injected by `Server.WithClientset(...)`
+    (wired from `mgr.GetConfig()` → `kubernetes.NewForConfig` in `cmd/operator/main.go`).
+
+- **The CLI streaming client** — `internal/ctl/client.go`:
+  - `OperatorClient.GetStream(ctx, path, out io.Writer)` applies auth, does **not** buffer or
+    JSON-parse the body, and `io.Copy`s the `text/plain` stream to `out`; a non-2xx status is
+    read (bounded) and returned as an `*APIError` via `streamError`. (The normal `do()` path
+    buffers and JSON-parses, so it is unsuitable for streaming.)
+
+- **Sample CR**: `deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`
+  (single S3 cluster `scenario86-s3`: backup enabled + schedule + incremental)
+- **Functional tests**: `test/functional/scenario86_cli_commands_test.go` (`TestFunctional_Scenario86`)
+- **Integration tests**: `test/integration/scenario86_cli_commands_integration_test.go` (`TestIntegration_Scenario86`)
+- **E2E tests**: `test/e2e/scenario86_cli_commands_e2e_test.go` (`TestE2E_Scenario86`)
+- **CLI unit tests**: `cmd/cloudberry-ctl/backup_scenario86_test.go` (build-request +
+  cobra method/path/body assertions, 86k streaming + fallback)
+- **Endpoint/handler unit tests**: `internal/api/backup_joblogs_test.go`,
+  `internal/api/backup_joblogs_scenario86_test.go`; client unit tests in
+  `internal/ctl/client_test.go` (`TestOperatorClient_GetStream_*`)
+- **Test-case catalog**: `test/cases/scenario86_cli_commands_cases.go`
+- **Live script**: `test/e2e/scripts/scenario86-cli-commands.sh` (builds the CLI, obtains an
+  OIDC token, port-forwards the operator API, runs every backup command 86a–k, and asserts the
+  created Job args, the CronJob schedule/suspend changes, and the streamed Job logs)
+
+```bash
+# Run Scenario 86 CLI-commands functional tests (all 11 commands: request mapping + 86k stream/fallback)
+go test ./test/functional/... -v -tags functional -run TestFunctional_Scenario86
+
+# Run Scenario 86 integration tests (envtest: real router + auth; logs endpoint stream/404)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario86
+
+# Run Scenario 86 CLI unit tests (buildCreate/Restore requests, method/path/body, GetStream stream+fallback)
+go test ./cmd/cloudberry-ctl/... -v -run 'Backup|Scenario86'
+
+# Run Scenario 86 logs-endpoint + GetStream unit tests
+go test ./internal/api/... -v -run 'BackupJobLogs|PodLogOptions|CopyLogStream'
+go test ./internal/ctl/... -v -run TestOperatorClient_GetStream
+
+# Run Scenario 86 E2E tests (live portion gated on KUBECONFIG)
+go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario86
+
+# Run the live OIDC-authed exercise of all 11 backup CLI commands against the deployed cluster
+bash test/e2e/scripts/scenario86-cli-commands.sh --cluster scenario86-s3
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v

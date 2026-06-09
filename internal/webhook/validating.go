@@ -3,6 +3,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -11,6 +12,13 @@ import (
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 )
+
+// errAdmissionInternal classifies an internal (non-validation) admission
+// failure — e.g. the cluster List in checkDuplicateName failing — so the
+// webhook can record the distinct "error" result instead of bucketing it as a
+// legitimate validation "denied". Validation rejections are NOT wrapped with
+// this sentinel and therefore continue to record "denied".
+var errAdmissionInternal = errors.New("admission internal error")
 
 // Webhook admission metric label values.
 const (
@@ -55,13 +63,20 @@ func NewCloudberryClusterValidator(
 
 // recordAdmission records a validating-webhook admission decision when a
 // recorder is configured. It is nil-safe and derives the result from the error
-// and warnings returned by the validation.
+// returned by the validation: a nil error records "allowed", an internal
+// (non-validation) failure flagged with errAdmissionInternal records "error",
+// and any other error records "denied" (a legitimate validation rejection).
 func (v *CloudberryClusterValidator) recordAdmission(operation string, err error) {
 	if v.recorder == nil {
 		return
 	}
-	result := admissionAllowed
-	if err != nil {
+	var result string
+	switch {
+	case err == nil:
+		result = admissionAllowed
+	case errors.Is(err, errAdmissionInternal):
+		result = admissionError
+	default:
 		result = admissionDenied
 	}
 	v.recorder.RecordWebhookAdmission(webhookValidating, operation, result)
@@ -99,7 +114,10 @@ func (v *CloudberryClusterValidator) checkDuplicateName(
 ) error {
 	clusterList := &cbv1alpha1.CloudberryClusterList{}
 	if err := v.reader.List(ctx, clusterList); err != nil {
-		return fmt.Errorf("listing clusters for duplicate check: %w", err)
+		// A List failure is an internal/infrastructure error, not a validation
+		// rejection — flag it with errAdmissionInternal so recordAdmission emits
+		// the distinct "error" result instead of "denied".
+		return fmt.Errorf("%w: listing clusters for duplicate check: %w", errAdmissionInternal, err)
 	}
 
 	for i := range clusterList.Items {

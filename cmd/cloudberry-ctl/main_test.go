@@ -2076,26 +2076,76 @@ func TestBackupScheduleSetCmd_MissingCron(t *testing.T) {
 	assert.Contains(t, err.Error(), "--cron is required")
 }
 
-func TestBackupJobsLogsCmd(t *testing.T) {
+func TestBackupJobsLogsCmd_MissingJob(t *testing.T) {
 	saved := globals
 	defer func() { globals = saved }()
 	globals.cluster = "test-cluster"
 	globals.namespace = "test-ns"
 
-	cmd := newBackupCmd()
-	jobsCmd := findSubcommand(cmd, "jobs")
-	logsCmd := findSubcommand(jobsCmd, "logs")
+	logsCmd := findSubcommand(findSubcommand(newBackupCmd(), "jobs"), "logs")
+	require.NotNil(t, logsCmd)
+
+	// Missing --job is an error.
+	require.Error(t, logsCmd.RunE(logsCmd, nil))
+}
+
+func TestBackupJobsLogsCmd_Stream(t *testing.T) {
+	const logBody = "gpbackup started\nBackup completed successfully\n"
+	var gotPath string
+	server := setupMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(logBody))
+	})
+
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+	globals.namespace = "test-ns"
+	globals.operatorURL = server.URL
+	globals.timeout = "5s"
+	globals.authMethod = "basic"
+
+	logsCmd := findSubcommand(findSubcommand(newBackupCmd(), "jobs"), "logs")
 	require.NotNil(t, logsCmd)
 
 	var buf bytes.Buffer
 	logsCmd.SetOut(&buf)
-
-	// Missing --job is an error.
-	require.Error(t, logsCmd.RunE(logsCmd, nil))
-
 	require.NoError(t, logsCmd.Flags().Set("job", "test-cluster-backup-1"))
 	require.NoError(t, logsCmd.RunE(logsCmd, nil))
+
+	assert.Equal(t, logBody, buf.String())
+	assert.Equal(t,
+		"/api/v1alpha1/clusters/test-cluster/backups/jobs/test-cluster-backup-1/logs",
+		gotPath)
+}
+
+func TestBackupJobsLogsCmd_Fallback(t *testing.T) {
+	server := setupMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{"code": "NOT_FOUND", "message": "no route"},
+		})
+	})
+
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = "test-cluster"
+	globals.namespace = "test-ns"
+	globals.operatorURL = server.URL
+	globals.timeout = "5s"
+	globals.authMethod = "basic"
+
+	logsCmd := findSubcommand(findSubcommand(newBackupCmd(), "jobs"), "logs")
+	require.NotNil(t, logsCmd)
+
+	var buf bytes.Buffer
+	logsCmd.SetOut(&buf)
+	require.NoError(t, logsCmd.Flags().Set("job", "test-cluster-backup-1"))
+	require.NoError(t, logsCmd.RunE(logsCmd, nil))
+
 	assert.Contains(t, buf.String(), "kubectl logs")
+	assert.Contains(t, buf.String(), "job/test-cluster-backup-1")
 }
 
 // ---------------------------------------------------------------------------

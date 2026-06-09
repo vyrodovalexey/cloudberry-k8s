@@ -452,6 +452,13 @@ type Recommendation struct {
 	Description string `json:"description"`
 	Severity    string `json:"severity"`
 	Value       int64  `json:"value"`
+	// Ratio is an optional 0-100 percentage associated with the recommendation
+	// (e.g. the dead-tuple bloat percentage for "bloat" recommendations). It is
+	// omitempty so existing consumers and the on-wire JSON shape are unaffected;
+	// it is populated where the underlying query already computes it so callers
+	// (e.g. the storage reconciler's cloudberry_table_bloat_ratio metric) can
+	// use a numeric value without re-parsing Description.
+	Ratio float64 `json:"ratio,omitempty"`
 }
 
 // TableDetail represents detailed information about a database table.
@@ -1559,6 +1566,9 @@ func (c *pgxClient) GetBloatRecommendations(ctx context.Context) ([]Recommendati
 		r.Type = "bloat"
 		r.Severity = classifySeverity(deadPct, 20, 50)
 		r.Description = fmt.Sprintf("Table has %d dead tuples (%d%% dead)", r.Value, deadPct)
+		// Expose the dead-tuple percentage numerically so callers can record it
+		// (e.g. cloudberry_table_bloat_ratio) without parsing Description.
+		r.Ratio = float64(deadPct)
 		recs = append(recs, r)
 	}
 

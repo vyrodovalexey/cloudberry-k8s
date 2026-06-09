@@ -158,10 +158,12 @@ All backup/restore endpoints are namespaced under `/clusters/{name}/backups`, ar
 | DELETE | /clusters/{name}/backups/{timestamp} | Admin | Delete a backup (creates a `gpbackman` cleanup Job) |
 | POST | /clusters/{name}/backups/{timestamp}/restore | Admin | Restore from a backup (creates a restore Job) |
 | GET | /clusters/{name}/backups/jobs | Basic | List backup/restore/cleanup Job statuses |
+| GET | /clusters/{name}/backups/jobs/{job}/logs | Basic | **Stream** the backup Job's pod logs as `text/plain` (Scenario 86k; `?follow`, `?tailLines`) |
 | GET | /clusters/{name}/backups/schedule | Basic | Get CronJob status + computed `nextScheduleTime` |
 | PATCH | /clusters/{name}/backups/schedule | Operator | Update `spec.backup.schedule` / suspend the CronJob (outside the Scenario 85 set) |
+| POST | /clusters/{name}/migrate | Admin | Cross-cluster database migration (Scenario 87); creates a **single** coordinated migration Job — see §5.19 |
 
-The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest.gprestoreOptions`), the option → `gpbackup`/`gprestore` flag mapping, and the mutual-exclusivity rules are documented in §5.15–§5.18.
+The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest.gprestoreOptions`), the option → `gpbackup`/`gprestore` flag mapping, and the mutual-exclusivity rules are documented in §5.15–§5.18. The cross-cluster migration request/response is documented in §5.19.
 
 ### 4.10 Health and Metrics
 
@@ -473,6 +475,54 @@ The leading args are destination-aware (S3 → `--plugin-config /tmp/s3-config.y
 2. **`includeSchemas` vs `includeTables`** — when both are supplied the operator emits the more specific `--include-table` (table-level precedence) and **omits** `--include-schema`, keeping the `gprestore` invocation valid (no 400).
 3. **`runAnalyze` vs `withStats`** — when both are supplied the operator emits `--run-analyze` and **omits** `--with-stats` (run-analyze precedence; no 400).
 
+### 5.19 Cross-Cluster Migration Request (`POST /clusters/{name}/migrate`)
+
+Migrates a database from a **source** cluster to a **target** cluster (Scenario 87, **Admin**). The path `{name}` identifies the source cluster (or set `sourceCluster` in the body). The operator creates a **single coordinated migration Job** `<source>-migration-<ts>` (label `avsoft.io/backup-operation=migrate`) that, under the coordinator-exec model: (1) execs `gpbackup` inside the **source** coordinator and **captures the real gpbackup timestamp**; (2) prepares the target DB on the **target** coordinator (`--truncate` → DROP+recreate empty; otherwise CREATE-if-absent); (3) execs `gprestore --timestamp <captured>` inside the **target** coordinator — it does **not** pass `--truncate-table`; and (4) runs post-migration validation (row-count probe + invalid-index scan + health check) on the target.
+
+```json
+POST /api/v1alpha1/clusters/src/migrate
+{
+  "sourceCluster": "src",
+  "targetCluster": "dst",
+  "database": "mydb",
+  "tables": ["public.users", "public.orders"],
+  "truncate": true,
+  "redirectDb": "mydb",
+  "redirectSchema": "",
+  "jobs": 4
+}
+```
+
+| Request field | Type | Description |
+|---|---|---|
+| `sourceCluster` | string | Source cluster name (defaults to the path `{name}`) |
+| `targetCluster` | string | Target cluster name (**required**; must differ from source) |
+| `database` | string | Source database to back up (`gpbackup --dbname`) |
+| `tables[]` | string[] | Tables → repeated `--include-table` on both `gpbackup` and `gprestore` |
+| `truncate` | bool | Clean target: DROP+recreate the target DB empty before restore (does **not** map to `--truncate-table`) |
+| `redirectDb` | string | `gprestore --redirect-db` on the target |
+| `redirectSchema` | string | `gprestore --redirect-schema` on the target |
+| `jobs` | int32 | `gprestore --jobs` (restore parallelism) on the target |
+
+**Requirements.** Both clusters must be backup-enabled with an **S3** destination sharing the **same bucket** (else `400 INVALID_REQUEST`); the migration backup and restore reference the **same bucket and folder** (the target reads the **source** cluster's S3 folder). A missing cluster returns `404 CLUSTER_NOT_FOUND`. The backup ServiceAccount needs `pods` + `pods/exec` RBAC (coordinator-exec model).
+
+**202 Accepted response.** Because the migration runs as a **single** Job that performs all phases, the `backupJob`/`restoreJob`/`validationJob` fields all reference that one Job; `migrationJob` names it unambiguously:
+
+```json
+{
+  "status": "migration started",
+  "sourceCluster": "src",
+  "targetCluster": "dst",
+  "timestamp": "20260601020000",
+  "migrationJob": "src-migration-20260601020000",
+  "backupJob": "src-migration-20260601020000",
+  "restoreJob": "src-migration-20260601020000",
+  "validationJob": "src-migration-20260601020000"
+}
+```
+
+> **Note.** `timestamp` is the operator-chosen value used **only to NAME the Job**; the actual `gpbackup`/`gprestore` timestamp is the one `gpbackup` generates at runtime and the Job captures (see [Backup & Restore Spec §Cross-Cluster Migration](11-backup-restore-spec.md#cross-cluster-migration)).
+
 ## 6. Error Handling
 
 ### 6.1 Error Response Format
@@ -563,7 +613,7 @@ GET /openapi/v3
 
 **Scenario 85** verifies the **seven** backup/restore REST API endpoints end-to-end: routing, per-endpoint RBAC, the full request schemas, the option → `gpbackup`/`gprestore` flag mapping (§5.16, §5.18), and the negative/mutual-exclusivity responses. Every endpoint is OIDC/JWT-authenticated and a missing cluster returns `404 CLUSTER_NOT_FOUND`. The acceptance contract per sub-case (85a–85g):
 
-- **85a — `GET /backups` (Basic).** Returns the operator's recorded backup history (`status.backup.backupHistory` — the operator's view of `gpbackup` outcomes derived from observed Jobs), **not** a live `gpbackman` query. Response `200`: `{ cluster, backups:[...], total, lastBackupTime, lastBackupTimestamp, lastBackupStatus }`.
+- **85a — `GET /backups` (Basic).** Returns the operator's recorded backup history (`status.backup.backupHistory` — the operator's view of `gpbackup` outcomes derived from observed Jobs), **not** a live `gpbackman` query. Response `200`: `{ cluster, enabled, backups:[...], total, lastBackupTime, lastBackupTimestamp, lastBackupStatus }`. The boolean **`enabled`** field (`spec.backup != nil && spec.backup.enabled`) lets clients detect the backup-disabled state from the list endpoint without a `POST` probe (Scenario 88a — see §10.1); the status stays `200` and the pre-existing keys are unchanged for back-compat.
 
 - **85b — `POST /backups` (Operator).** Creates a backup **Job** (label `avsoft.io/backup-operation=backup`) whose `gpbackup` args match the `CreateBackupRequest.gpbackupOptions` per §5.16, including `--leaf-partition-data` on a **full** backup when `leafPartitionData: true` (emitted exactly once). Negatives: invalid `type` / DB identifier / malformed JSON → `400`; backup not enabled → `400 BACKUP_NOT_ENABLED`; a Basic identity → `403`.
 
@@ -575,8 +625,59 @@ GET /openapi/v3
 
 - **85f — `GET /backups/jobs` (Basic).** Lists backup/restore/cleanup Job statuses for the cluster (status ∈ `succeeded|failed|running|pending`); unrelated Jobs are excluded. Response `200`: `{ cluster, jobs:[{ name, operation, status, startTime?, completionTime? }], total }`.
 
-- **85g — `GET /backups/schedule` (Basic).** Returns the backup CronJob status with a **computed** `nextScheduleTime`. No CronJob → `200 { cluster, scheduled:false }`; CronJob present → `200 { cluster, scheduled:true, schedule, suspend, activeJobs, lastScheduleTime?, nextScheduleTime? }`.
+- **85g — `GET /backups/schedule` (Basic).** Returns the backup CronJob status with a **computed** `nextScheduleTime`, plus the boolean **`enabled`** field (`spec.backup != nil && spec.backup.enabled`). No CronJob → `200 { cluster, enabled, scheduled:false }`; CronJob present → `200 { cluster, enabled, scheduled:true, schedule, suspend, activeJobs, lastScheduleTime?, nextScheduleTime? }`. `enabled` distinguishes "backup disabled" from "enabled but no schedule" — both report `scheduled:false` (Scenario 88 — see §10.1).
 
 The handlers live in `internal/api/server.go` (`handleListBackups`, `handleCreateBackup`, `handleGetBackup`, `handleDeleteBackup`, `handleRestoreBackup`, `handleListBackupJobs`, `handleGetBackupSchedule`); the DTOs and option mapping live in `internal/api/backup.go` (`buildBackupJobOptions`/`mergeGpbackupOptions`, `buildRestoreJobOptions`/`mergeGprestoreOptions`, `restoreOptionsConflict`); the args are rendered by `buildGpbackupArgs`/`buildGprestoreArgs` in `internal/builder/backup_builder.go`.
 
 The scenario is driven by the sample CR `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml` and is covered by `test/functional/scenario85_api_endpoints_test.go`, `test/integration/scenario85_api_endpoints_integration_test.go`, `test/e2e/scenario85_api_endpoints_e2e_test.go`, the test-case catalog in `test/cases/scenario85_api_endpoints_cases.go`, and the live OIDC-authed verification script `test/e2e/scripts/scenario85-api-endpoints.sh`.
+
+### 10.1 Scenario 88 — Backup Disabled / No Schedule (API surface)
+
+**Scenario 88** covers how the backup API behaves when backup is **disabled** (`spec.backup.enabled: false`) or **enabled with an empty schedule** (`spec.backup.schedule: ""`). The behavior is detailed in the [Backup & Restore spec — Backup Disabled / No Schedule](11-backup-restore-spec.md#scenario-88--backup-disabled--no-schedule); the API contract is:
+
+- **`POST /clusters/{name}/backups`** → `400 BACKUP_NOT_ENABLED` when `spec.backup` is nil or `spec.backup.enabled` is `false` (`handleCreateBackup` gating; see the error table in §6). When backup is enabled the request creates a Job directly (`202`) regardless of whether a schedule is set.
+
+- **`GET /clusters/{name}/backups`** → `200` with a new boolean **`enabled`** field (`backupEnabled(cluster)` = `spec.backup != nil && spec.backup.enabled`). The field is added alongside the existing `cluster`, `backups`, `total`, `lastBackupTime`, `lastBackupTimestamp`, and `lastBackupStatus` keys — the status and existing keys are unchanged for back-compat. `enabled:false` surfaces the disabled state without needing a `POST` probe.
+
+- **`GET /clusters/{name}/backups/schedule`** → `200` with both **`enabled`** and `scheduled`. When backup is **disabled** → `{ cluster, enabled:false, scheduled:false }`. When backup is **enabled with an empty schedule** → `{ cluster, enabled:true, scheduled:false }` (no CronJob, so on-demand-only). When a schedule is set and the CronJob exists → `{ cluster, enabled:true, scheduled:true, schedule, suspend, activeJobs, … }`. `enabled` is the field that distinguishes "disabled" from "enabled but unscheduled" since both report `scheduled:false`.
+
+The `enabled` field is computed by the shared `backupEnabled` helper in `internal/api/server.go` (mirroring the `handleCreateBackup` `BACKUP_NOT_ENABLED` gate) and is keyed `responseKeyEnabled` (`"enabled"`) in both `handleListBackups` and `handleGetBackupSchedule`. The API behavior is covered by `internal/api/backup_test.go` (`TestHandleListBackups_EnabledField` and the schedule-endpoint cases) and the Scenario 88 functional/e2e suites.
+
+## 11. Scenario 86 — Backup Job Log Streaming Endpoint
+
+**Scenario 86** verifies that all eleven `cloudberry-ctl backup …` CLI commands map to the operator REST API (see [cloudberry-ctl §12](07-cloudberry-ctl-spec.md#12-scenario-86--all-backup-cli-commands)). Ten of the commands reuse the Scenario 85 endpoints above; the one **new** operator endpoint introduced by Scenario 86 (for `backup jobs logs --job <name>`, sub-case 86k) is documented here.
+
+### 11.1 `GET /clusters/{name}/backups/jobs/{job}/logs`
+
+Streams the logs of the pod backing a backup/restore/cleanup **Job** as plain text, so the CLI (and any client) can read backup output without `kubectl`.
+
+| Property | Value |
+|----------|-------|
+| Method / Path | `GET /clusters/{name}/backups/jobs/{job}/logs` |
+| Permission | **Basic** (`auth.PermissionBasic` — consistent with the other read-only backup endpoints) |
+| Auth | OIDC/JWT bearer token (`withAuth`) |
+| Success response | `200` with `Content-Type: text/plain; charset=utf-8`; the body **streams** the pod's container logs |
+| Query params | `?follow=true` → stream as produced (flushed incrementally); `?tailLines=N` → only the last `N` lines; `?namespace=<ns>` → target namespace |
+
+**Behavior.** `handleBackupJobLogs` (`internal/api/server.go`):
+
+1. Validates the `{job}` path segment is a DNS-1123 name (else `400 INVALID_REQUEST`).
+2. Requires a typed Kubernetes **clientset** (injected via `Server.WithClientset`, wired from `mgr.GetConfig()` in `cmd/operator/main.go`); when absent → `501 LOGS_NOT_AVAILABLE`. The controller-runtime `client.Client` cannot stream pod logs — only the typed clientset's `CoreV1().Pods(ns).GetLogs(...).Stream(ctx)` can.
+3. Resolves the cluster (missing → `404 CLUSTER_NOT_FOUND`).
+4. Finds the Job's most-recently-created pod via the `job-name` / `batch.kubernetes.io/job-name` label (`findJobPod` → `mostRecentPodName`). No pod found → `404 JOB_NOT_FOUND`.
+5. Opens `clientset.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{Follow, TailLines})` (`buildPodLogOptions` parses `?follow`/`?tailLines`), sets `Content-Type: text/plain; charset=utf-8`, writes `200`, and copies the stream to the response (flushing for `--follow`). A stream-open failure → `500 INTERNAL_ERROR`.
+
+| Status | Condition |
+|--------|-----------|
+| `200` | Logs streamed (`text/plain`) |
+| `400 INVALID_REQUEST` | Invalid job name |
+| `404 CLUSTER_NOT_FOUND` | Cluster does not exist |
+| `404 JOB_NOT_FOUND` | No pod found for the Job (e.g. already GC'd by `ttlSecondsAfterFinished`) |
+| `500 INTERNAL_ERROR` | Failed to list pods or open the log stream |
+| `501 LOGS_NOT_AVAILABLE` | Operator API has no Kubernetes clientset configured |
+
+> **Route precedence.** The literal `/backups/jobs/{job}/logs` does not collide with `/backups/{timestamp}`: the `jobs` literal wins over the `{timestamp}` wildcard, and `{job}/logs` is a deeper path.
+
+> **Finished-Job pod GC caveat.** Backup Jobs carry `ttlSecondsAfterFinished`; once a finished Job's pod is garbage-collected the endpoint returns `404 JOB_NOT_FOUND`. Stream from a recently created Job, or use `?tailLines` while the pod is still present.
+
+The handler lives in `internal/api/server.go` (`handleBackupJobLogs`, `findJobPod`, `mostRecentPodName`, `streamPodLogs`, `buildPodLogOptions`); the clientset is injected by `Server.WithClientset`. The endpoint is covered by `internal/api/backup_joblogs_test.go`, `internal/api/backup_joblogs_scenario86_test.go`, `test/functional/scenario86_cli_commands_test.go`, `test/integration/scenario86_cli_commands_integration_test.go`, `test/e2e/scenario86_cli_commands_e2e_test.go`, and the live script `test/e2e/scripts/scenario86-cli-commands.sh`.

@@ -39,6 +39,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore](#scenario-74--single-data-file--copy-queue--gpbackup_helper--full-option-restore)
   - [Scenario 75 — Compression Matrix (gzip vs zstd)](#scenario-75--compression-matrix-gzip-vs-zstd)
   - [Scenario 76 — Scheduled Backup via CronJob + Status Population](#scenario-76--scheduled-backup-via-cronjob--status-population)
+    - [Disabling backups / no schedule (Scenario 88)](#disabling-backups--no-schedule-scenario-88)
   - [Pre-Backup Health Checks (Scenario 77)](#pre-backup-health-checks-scenario-77)
   - [Incremental Backups (Scenario 78)](#incremental-backups-scenario-78)
   - [Backup Retention (Scenario 79)](#backup-retention-scenario-79)
@@ -48,6 +49,8 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Backup Failure Handling & Retries (Scenario 83)](#backup-failure-handling--retries-scenario-83)
   - [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84)
   - [Backup REST API (Scenario 85)](#backup-rest-api-scenario-85)
+  - [Backup CLI (cloudberry-ctl) (Scenario 86)](#backup-cli-cloudberry-ctl-scenario-86)
+  - [Cross-Cluster Migration (Scenario 87)](#cross-cluster-migration-scenario-87)
 - [Configuration Management](#configuration-management)
   - [Hot-Reload vs Rolling Restart](#hot-reload-vs-rolling-restart)
   - [Restart-Required Parameters](#restart-required-parameters)
@@ -488,7 +491,7 @@ kubectl annotate cloudberrycluster my-cluster -n cloudberry-test \
   avsoft.io/action=stop-immediate
 ```
 
-The operator scales down StatefulSets in a safe order: **mirrors → primaries → standby → coordinator**. The phase transitions through `Stopping` → `Stopped` (0 pods).
+The operator scales down StatefulSets in a safe order: **mirrors → primaries → standby → coordinator**. The phase transitions through `Stopping` → `Stopped` (0 pods). When stopping (and on restart), the operator now **persists the cleared readiness status** — `coordinatorReady=false`, `standbyReady=false`, and `segmentsReady=0` — so the reported status no longer shows stale `true`/non-zero values after the pods are gone.
 
 The operator emits the following events during stop:
 - `Stopping` — scale-down initiated
@@ -1030,6 +1033,20 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario76-sched
 **Verified outcome:** the scheduled backup completes and the operator populates the status — `lastBackupTimestamp=20260607224409` (14-digit), `lastBackupStatus=Success`, `lastBackupType=full`, and `backupHistory[0]={timestamp, type:full, status:Success, size:4204206, duration:4s}`; `cronJobName=scenario76-backup-schedule` and `lastBackupJobName` matches the Job.
 
 The live data cycle is driven by `test/e2e/scripts/scenario76-scheduled-backup.sh` and is covered by `test/functional/scenario76_scheduled_backup_test.go` and `test/e2e/scenario76_scheduled_backup_e2e_test.go`.
+
+#### Disabling backups / no schedule (Scenario 88)
+
+You can turn scheduled backups off in two ways:
+
+- **Disable backup entirely** — set `backup.enabled: false`. The operator **removes** the per-cluster CronJob `{cluster}-backup-schedule` and **clears** `status.cronJobName`. The API then reports the disabled state: `GET /clusters/{name}/backups` returns `"enabled": false`, `GET /clusters/{name}/backups/schedule` returns `{ enabled:false, scheduled:false }`, and `POST /clusters/{name}/backups` (or `cloudberry-ctl backup create`) is rejected with `400 BACKUP_NOT_ENABLED`. This cleanup runs on **both** the spec-driven reconcile and the steady-state periodic reconcile, so it converges to `cronJobName: ""` even after the cluster settles. Re-enabling (`enabled: true` **plus** a valid `schedule`) recreates the CronJob and re-sets `status.cronJobName`.
+
+  ```bash
+  kubectl patch cloudberrycluster mycluster --type=merge -p '{"spec":{"backup":{"enabled":false}}}'
+  ```
+
+- **Keep backup enabled but drop the schedule** — set `backup.enabled: true` with `schedule: ""`. No CronJob is created and `status.cronJobName` stays empty, but **on-demand backups still work**: `cloudberry-ctl backup create` (and `POST /clusters/{name}/backups`) create a backup Job directly (`202`) that runs to completion. `GET /clusters/{name}/backups/schedule` returns `{ enabled:true, scheduled:false }` — the `enabled:true` distinguishes this unscheduled-but-on-demand mode from a fully disabled cluster.
+
+> **Backup RBAC is chart-level, not per-cluster.** The backup `ServiceAccount` (`cloudberry-backup-sa`) and `Role` (`cloudberry-backup-role`) are created by the Helm chart (gated by `backup.rbac.create`) and **shared** across all clusters in the operator namespace. Disabling backup or clearing a schedule on one cluster only affects that cluster's CronJob/status — it never creates or removes the shared SA/Role.
 
 ### Pre-Backup Health Checks (Scenario 77)
 
@@ -2094,6 +2111,177 @@ seven endpoints is driven by `test/e2e/scripts/scenario85-api-endpoints.sh`:
 ```bash
 bash test/e2e/scripts/scenario85-api-endpoints.sh --cluster scenario85-s3
 ```
+
+### Backup CLI (cloudberry-ctl) (Scenario 86)
+
+`cloudberry-ctl backup …` gives you the full backup/restore workflow from the command line —
+no `kubectl` and no hand-written `curl` calls. Every `backup` subcommand talks to the operator
+backup REST API ([Scenario 85](#backup-rest-api-scenario-85)) over an OIDC bearer token, so the
+same permission levels apply (`create` → Operator, `delete`/`restore` → Admin, the read-only
+commands → Basic).
+
+#### Configure the CLI (operator URL + OIDC token)
+
+Point the CLI at the operator API and authenticate once via environment variables (or the
+equivalent flags `--operator-url`, `--auth-method`, `--password`, `--cluster`, `--namespace`):
+
+```bash
+# 1. Port-forward the operator REST API if it is not directly reachable
+kubectl -n cloudberry-test port-forward svc/<operator-api-service> 8090:8090
+
+# 2. Obtain an OIDC token from Keycloak (Admin/Operator role for create/delete/restore)
+TOKEN=$(curl -s -X POST \
+  'http://keycloak:8090/realms/cloudberry/protocol/openid-connect/token' \
+  -d grant_type=password -d client_id=cloudberry-ctl \
+  -d username=adminuser -d password=adminpass | jq -r .access_token)
+
+# 3. Point the CLI at the API and pass the token as the OIDC bearer
+export CLOUDBERRY_OPERATOR_URL=http://127.0.0.1:8090
+export CLOUDBERRY_AUTH_METHOD=oidc
+export CLOUDBERRY_PASSWORD="$TOKEN"      # sent as "Authorization: Bearer <token>"
+export CLOUDBERRY_CLUSTER=scenario86-s3
+export CLOUDBERRY_NAMESPACE=cloudberry-test
+```
+
+#### Create, list, inspect, and delete backups
+
+```bash
+# Create a backup (all gpbackup options)
+cloudberry-ctl backup create --database mydb \
+  --type full --compression-level 6 --compression-type zstd --jobs 4 \
+  --include-schema public --exclude-table public.temp \
+  --with-stats --without-globals
+
+# Single-data-file variant (--copy-queue-size needs --single-data-file; --jobs is dropped)
+cloudberry-ctl backup create --database mydb --type full \
+  --single-data-file --copy-queue-size 4
+
+# Incremental against an explicit base timestamp
+cloudberry-ctl backup create --database mydb --type incremental \
+  --incremental --from-timestamp 20260601020000 --leaf-partition-data
+
+# List backups, then inspect one by timestamp
+cloudberry-ctl backup list
+cloudberry-ctl backup status --timestamp 20260601020000
+
+# Delete a backup (creates a gpbackman cleanup Job)
+cloudberry-ctl backup delete --timestamp 20260601020000
+```
+
+#### Restore (including `--resize-cluster`)
+
+`--resize-cluster` is what lets you restore a backup into a cluster with a **different segment
+count**:
+
+```bash
+cloudberry-ctl backup restore --timestamp 20260601020000 \
+  --redirect-db mydb_restored --redirect-schema restored --create-db \
+  --include-schema public --include-table public.users --jobs 4 \
+  --with-stats --run-analyze --on-error-continue --truncate-table --resize-cluster
+```
+
+#### Manage the schedule and watch Jobs
+
+```bash
+# Show the schedule (CronJob status + next run time)
+cloudberry-ctl backup schedule
+
+# Set / suspend / resume the schedule
+cloudberry-ctl backup schedule set --cron "0 3 * * *"
+cloudberry-ctl backup schedule suspend
+cloudberry-ctl backup schedule resume
+
+# List backup/restore/cleanup Jobs and their statuses
+cloudberry-ctl backup jobs
+```
+
+#### Stream a backup Job's logs
+
+`backup jobs logs --job <name>` **streams** the selected Job's pod logs straight to your
+terminal (the new Scenario 86k endpoint), so you can watch `gpbackup`/`gprestore` output
+without `kubectl`:
+
+```bash
+# Stream the full log of a Job (use `backup jobs` to find the name)
+cloudberry-ctl backup jobs logs --job scenario86-s3-backup-1
+
+# Follow live output and limit to the last 200 lines
+cloudberry-ctl backup jobs logs --job scenario86-s3-backup-1 --follow --tail 200
+```
+
+| Flag | Effect |
+|------|--------|
+| `--job` | Backup Job name (**required**) |
+| `--follow` | Stream logs as they are produced |
+| `--tail N` | Show only the last `N` lines (`-1` = all) |
+
+> **kubectl fallback.** If the operator does not expose the log-streaming endpoint (e.g. an
+> older operator), or the Job's pod has already been garbage-collected, the CLI prints the
+> equivalent command instead of failing silently:
+> ```
+> unable to stream logs from the operator API (<cause>); run:
+>   kubectl logs -n cloudberry-test job/<job>
+> ```
+
+#### Sample CR and verification
+
+The sample CR
+`deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml` ships a single S3
+cluster (`scenario86-s3`) with backup enabled, a schedule, and incremental enabled so every
+backup command has data. The live OIDC-authed exercise of all eleven commands (86a–k) is driven
+by `test/e2e/scripts/scenario86-cli-commands.sh`:
+
+```bash
+bash test/e2e/scripts/scenario86-cli-commands.sh --cluster scenario86-s3
+```
+
+### Cross-Cluster Migration (Scenario 87)
+
+`cloudberry-ctl migrate` migrates a database between two clusters. The operator
+creates a **single coordinated migration Job** that runs the whole backup →
+restore → validate sequence and validates row counts on the target:
+
+```bash
+cloudberry-ctl migrate --source-cluster src --target-cluster dst \
+  --database mydb \
+  --tables "public.users,public.orders" \
+  --truncate
+```
+
+This POSTs to `POST /clusters/{source}/migrate` (**Admin**), which creates **one**
+Job `<source>-migration-<ts>` (label `avsoft.io/backup-operation=migrate`) that,
+under the coordinator-exec model:
+
+1. Execs `gpbackup --include-table public.users --include-table public.orders
+   --single-data-file --plugin-config … --dbname mydb` inside the **source**
+   coordinator and **captures the real gpbackup timestamp** from its output.
+2. Prepares the target DB on the **target** coordinator: with `--truncate` it
+   DROPs+recreates the target DB (clean target); without `--truncate` it CREATEs
+   the DB if absent.
+3. Execs `gprestore --plugin-config … --timestamp <captured> --redirect-db mydb
+   --include-table public.users --include-table public.orders` inside the
+   **target** coordinator. It does **not** pass `--truncate-table` — the clean
+   target DB makes it unnecessary, and it would break the table-filtered metadata
+   restore into a fresh DB.
+4. Runs post-migration validation (row-count probe + invalid-index scan + health
+   check) on the target, emitting `post-restore-validate: passed` on success.
+
+| Flag | Effect |
+|------|--------|
+| `--source-cluster` | Source cluster name (**required**) |
+| `--target-cluster` | Target cluster name (**required**) |
+| `--database` | Database to migrate (`gpbackup --dbname`) |
+| `--tables` | Comma-separated tables → repeated `--include-table` on both tools |
+| `--truncate` | Clean target: DROP+recreate the target DB empty before restore |
+| `--redirect-db` | `gprestore --redirect-db` on the target |
+| `--redirect-schema` | `gprestore --redirect-schema` on the target |
+| `--jobs` | `gprestore --jobs` (restore parallelism) on the target |
+
+> **Requirements.** Both clusters must be backup-enabled with an **S3** destination
+> sharing the **same bucket** (else `400`). The source backup and target restore
+> reference the **same S3 bucket and folder** — the target reads the **source**
+> cluster's folder. The backup ServiceAccount needs `pods` + `pods/exec` RBAC for
+> the coordinator-exec model.
 
 ## Configuration Management
 
@@ -5870,7 +6058,7 @@ Attempt 6: ~16s wait
 
 ### Reconciliation Metrics
 
-The operator records metrics for every reconciliation cycle, providing visibility into operator health and performance.
+The operator records metrics for every reconciliation cycle, providing visibility into operator health and performance. These reconcile metrics are emitted by **all four controllers** (cluster, admin, HA, and auth) — every controller's `Reconcile` records the outcome and duration through a shared helper, so the counters and histogram cover the whole operator, not just the cluster controller.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -5895,20 +6083,22 @@ sum(rate(cloudberry_reconcile_total{result="success"}[5m]))
 
 ### Telemetry Spans
 
-When OpenTelemetry tracing is enabled, the operator creates spans for reconciliation loops and records errors on those spans. This provides distributed tracing visibility into operator behavior.
+When OpenTelemetry tracing is enabled, the operator creates spans across its important code paths and records errors on those spans. This provides distributed tracing visibility into operator behavior. Tracing is **disabled by default** and is a no-op (the global no-op tracer) until enabled — see [OpenTelemetry Tracing](#opentelemetry-tracing) below for configuration.
+
+**Spans emitted:**
+
+- **Reconciliation loops** — one `Reconcile` span per controller (cluster, admin, HA, auth); `SetSpanError` is recorded on the admin/HA/auth error paths in addition to the cluster controller.
+- **Sub-reconcilers** — `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), and `recordTableBloatRatios` (admin).
+- **API requests** — the request tracing middleware opens a server span per request named `<METHOD> <path>` (e.g. `POST /clusters/foo/migrate`). The span status is set to `Error` on responses with HTTP status `>= 400`, and inbound trace context is propagated so cross-service traces continue.
+- **Migration** — `handleMigrate` with `migrate.validate` and `migrate.create` child spans.
+- **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, and `vault.WriteSecret`.
+- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning).
 
 **Error recording on spans:**
 
 - `SetSpanError(span, err)` sets the span status to `codes.Error` and records an `exception` event with the error message
 - Safe to call with `nil` error — no status change occurs
 - Error spans appear in your tracing backend (Jaeger, Tempo, etc.) with error indicators
-
-**Span attributes include:**
-
-- Cluster name and namespace
-- Reconciliation result (success/error)
-- Duration
-- Error details (when applicable)
 
 ### Structured Logging
 
@@ -6134,6 +6324,7 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_backup_job_status` | Gauge | Per-Job backup status: `0`=pending, `1`=running, `2`=succeeded, `3`=failed (labels: `cluster`, `namespace`, `job`, `operation` = `backup`/`restore`/`cleanup`) |
 | `cloudberry_recommendations_total` | Gauge | Storage recommendations by type, set during a recommendation scan (labels: `cluster`, `namespace`, `type`) |
 | `cloudberry_recommendation_scan_duration_seconds` | Histogram | Recommendation scan duration in seconds (labels: `cluster`, `namespace`) |
+| `cloudberry_table_bloat_ratio` | Gauge | Dead-tuple bloat ratio for the top-N most-bloated tables, populated from storage recommendation scans (labels: `cluster`, `namespace`, `table`) |
 | `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |
 
 ### Security and Lifecycle Metrics
@@ -6146,7 +6337,7 @@ The operator records dedicated metrics for webhook/certificate rotation, Vault o
 | `cloudberry_cert_expiry_seconds` | Gauge | `component` | Seconds until the certificate expires per component |
 | `cloudberry_vault_operations_total` | Counter | `operation`, `result` | Vault auth/read/write operations. `operation` is `auth`, `read`, or `write`; `result` is `success` or `error` |
 | `cloudberry_vault_operation_duration_seconds` | Histogram | `operation` | Duration of Vault operations in seconds |
-| `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error` |
+| `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error`. Internal (non-validation) admission failures record the distinct `error` result instead of being bucketed as `denied` |
 | `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
 | `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
 | `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; `result` is `started`, `completed`, or `failed` |
@@ -6181,7 +6372,7 @@ serviceMonitor:
 
 ### OpenTelemetry Tracing
 
-Enable OTLP tracing in the CRD:
+OpenTelemetry (OTLP) tracing is **disabled by default**. Enable it by setting `telemetry.enabled=true` and pointing it at an OTLP endpoint — for example the in-cluster `otel-collector` or a Tempo instance on port `4317`:
 
 ```yaml
 spec:
@@ -6192,7 +6383,20 @@ spec:
     samplingRate: 0.5
 ```
 
-Traces include spans for reconciliation loops, API requests, database operations, and Vault interactions.
+The operator reads its telemetry configuration from `TelemetryConfig` (config keys under `telemetry.*`, also settable via `CLOUDBERRY_TELEMETRY_*` environment variables):
+
+| Config key | Env var | Default | Description |
+|------------|---------|---------|-------------|
+| `telemetry.enabled` | `CLOUDBERRY_TELEMETRY_ENABLED` | `false` | Master switch — tracing is a no-op until enabled |
+| `telemetry.otlp-endpoint` | `CLOUDBERRY_TELEMETRY_OTLP_ENDPOINT` | `""` | OTLP collector endpoint (required when enabled), e.g. `otel-collector:4317` or `tempo:4317` |
+| `telemetry.otlp-protocol` | `CLOUDBERRY_TELEMETRY_OTLP_PROTOCOL` | `grpc` | Exporter protocol: `grpc` or `http` |
+| `telemetry.otlp-insecure` | `CLOUDBERRY_TELEMETRY_OTLP_INSECURE` | `false` | Disable TLS for the OTLP connection |
+| `telemetry.sampling-rate` | `CLOUDBERRY_TELEMETRY_SAMPLING_RATE` | `1.0` | Trace sampling rate (0.0–1.0) |
+| `telemetry.service-name` | `CLOUDBERRY_TELEMETRY_SERVICE_NAME` | `cloudberry-operator` | `service.name` resource attribute applied to all spans |
+
+Traces include spans for reconciliation loops (all four controllers), sub-reconcilers (`reconcileBackup`, `runFTSProbe`, `handleFailover`), API requests (`<METHOD> <path>` server spans), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret`), and certificate provisioning (`EnsureCertificates`). See [Telemetry Spans](#telemetry-spans) for the full list.
+
+The **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) visualizes Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs. It is one of four dashboards (operator, exporters, node-metrics, otel) published by `test/monitoring/scripts/publish-dashboards.sh`.
 
 ### Query Monitoring
 

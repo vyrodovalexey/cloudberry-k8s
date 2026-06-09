@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.opentelemetry.io/otel/attribute"
 	batchv1 "k8s.io/api/batch/v1"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -45,36 +47,77 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	limitBody(w, r)
 	defer r.Body.Close()
 
+	// Root span for the migration orchestration. It nests under the per-request
+	// span created by the tracing middleware so the multi-phase flow (validate,
+	// build, create) is visible as child spans. No-op when telemetry is disabled.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "handleMigrate")
+	defer span.End()
+
 	req, ok := s.decodeMigrateRequest(w, r)
 	if !ok {
 		return
 	}
+	span.SetAttributes(
+		attribute.String("migrate.source", req.SourceCluster),
+		attribute.String("migrate.target", req.TargetCluster),
+	)
 
-	clusters, ok := s.resolveMigrateClusters(w, r.Context(), req)
+	// Phase: resolve + validate both clusters.
+	validateCtx, validateSpan := telemetry.StartSpan(ctx, apiTracerName, "migrate.validate")
+	clusters, ok := s.resolveMigrateClusters(w, validateCtx, req)
 	if !ok {
+		validateSpan.End()
 		return
 	}
+	validateSpan.End()
 
+	// timestamp NAMES the migration Job (and its per-run scratch files). It is NOT
+	// used as the gpbackup/gprestore timestamp: gpbackup generates its OWN
+	// timestamp at runtime and exposes no flag to pin it, so the single migration
+	// Job CAPTURES gpbackup's real "Backup Timestamp" and feeds it to gprestore
+	// (spec 11 §Cross-Cluster Migration). This is the fix for the prior two-Job
+	// topology, whose restore used the operator timestamp and failed with a
+	// NotFound because the backup landed under gpbackup's own timestamp.
 	timestamp := newBackupTimestamp()
-	backupJob := s.builder.BuildBackupJob(clusters.source, migrateBackupOptions(req, timestamp))
-	restoreJob := s.builder.BuildRestoreJob(clusters.target, migrateRestoreOptions(req, timestamp))
+	migrationJob := s.builder.BuildMigrationJob(migrateJobOptions(req, timestamp, clusters))
+	span.SetAttributes(attribute.String("migrate.timestamp", timestamp))
 
-	if !s.createMigrateJob(w, r.Context(), backupJob, "migration backup") {
+	// Phase: create the coordinated migration Job.
+	createCtx, createSpan := telemetry.StartSpan(ctx, apiTracerName, "migrate.create")
+	if !s.createMigrateJob(w, createCtx, migrationJob, "migration") {
+		telemetry.SetSpanError(createSpan, fmt.Errorf("creating migration job %q", migrationJob.Name))
+		createSpan.End()
+		telemetry.SetSpanError(span, fmt.Errorf("migration job creation failed"))
 		return
 	}
-	if !s.createMigrateJob(w, r.Context(), restoreJob, "migration restore") {
-		return
-	}
+	createSpan.End()
 
-	validationJob := s.builder.BuildPostRestoreValidationJob(clusters.target,
-		&builder.ValidationJobOptions{Timestamp: timestamp, Database: migrateTargetDatabase(req)})
-	// Validation is best-effort: a failure to create it must not fail the migration.
-	if createErr := s.k8sClient.Create(r.Context(), validationJob); createErr != nil {
-		s.logger.Warn("failed to create migration validation job",
-			"target", clusters.target.Name, "error", createErr)
-	}
+	s.writeMigrateAccepted(w, clusters, timestamp, migrationJob)
+}
 
-	s.writeMigrateAccepted(w, clusters, timestamp, backupJob, restoreJob, validationJob)
+// migrateJobOptions builds the single coordinated migration Job options. The
+// backup writes under the SOURCE cluster's S3 folder and the (target) restore +
+// validation read from that same folder (spec 11 §Cross-Cluster Migration: both
+// reference the same S3 bucket/folder); BuildMigrationJob applies the source
+// folder to the rendered plugin config for both phases.
+func migrateJobOptions(
+	req *MigrateRequest,
+	timestamp string,
+	clusters *migrateClusters,
+) *builder.MigrationJobOptions {
+	return &builder.MigrationJobOptions{
+		Timestamp:          timestamp,
+		Source:             clusters.source,
+		Target:             clusters.target,
+		Database:           req.Database,
+		RedirectDb:         req.RedirectDb,
+		RedirectSchema:     req.RedirectSchema,
+		IncludeTables:      req.Tables,
+		SingleDataFile:     true,
+		Truncate:           req.Truncate,
+		Jobs:               req.Jobs,
+		ValidationDatabase: migrateTargetDatabase(req),
+	}
 }
 
 // decodeMigrateRequest decodes and structurally validates the migrate request.
@@ -169,35 +212,6 @@ func s3Bucket(cluster *cbv1alpha1.CloudberryCluster) (string, bool) {
 	return b.Destination.S3.Bucket, true
 }
 
-// migrateBackupOptions builds the source-side gpbackup options for a migration.
-func migrateBackupOptions(req *MigrateRequest, timestamp string) *builder.BackupJobOptions {
-	opts := &builder.BackupJobOptions{
-		Timestamp:     timestamp,
-		Type:          util.BackupTypeFull,
-		IncludeTables: req.Tables,
-		Gpbackup:      &cbv1alpha1.GpbackupOptions{SingleDataFile: true},
-	}
-	if req.Database != "" {
-		opts.Databases = []string{req.Database}
-	}
-	return opts
-}
-
-// migrateRestoreOptions builds the target-side gprestore options for a migration.
-func migrateRestoreOptions(req *MigrateRequest, timestamp string) *builder.RestoreJobOptions {
-	redirectDb := req.RedirectDb
-	if redirectDb == "" {
-		redirectDb = req.Database
-	}
-	return &builder.RestoreJobOptions{
-		Timestamp:      timestamp,
-		RedirectDb:     redirectDb,
-		RedirectSchema: req.RedirectSchema,
-		IncludeTables:  req.Tables,
-		Gprestore:      &cbv1alpha1.GprestoreOptions{Jobs: req.Jobs, TruncateTable: req.Truncate},
-	}
-}
-
 // migrateTargetDatabase returns the database the validation Job should target.
 func migrateTargetDatabase(req *MigrateRequest) string {
 	if req.RedirectDb != "" {
@@ -223,12 +237,17 @@ func (s *Server) createMigrateJob(
 	return true
 }
 
-// writeMigrateAccepted writes the 202 response describing the created Jobs.
+// writeMigrateAccepted writes the 202 response describing the created migration
+// Job. The migration runs as a SINGLE coordinated Job (it captures the real
+// gpbackup timestamp and feeds it to gprestore, then validates), so the
+// backupJob/restoreJob/validationJob envelope fields all reference that one Job —
+// it performs all three phases. The explicit migrationJob field names it
+// unambiguously for clients that understand the single-Job topology.
 func (s *Server) writeMigrateAccepted(
 	w http.ResponseWriter,
 	clusters *migrateClusters,
 	timestamp string,
-	backupJob, restoreJob, validationJob *batchv1.Job,
+	migrationJob *batchv1.Job,
 ) {
 	if s.metrics != nil {
 		s.metrics.RecordBackup(clusters.source.Name, clusters.source.Namespace,
@@ -241,8 +260,12 @@ func (s *Server) writeMigrateAccepted(
 		"sourceCluster":      clusters.source.Name,
 		"targetCluster":      clusters.target.Name,
 		responseKeyTimestamp: timestamp,
-		"backupJob":          backupJob.Name,
-		"restoreJob":         restoreJob.Name,
-		"validationJob":      validationJob.Name,
+		"migrationJob":       migrationJob.Name,
+		// The single migration Job performs the backup, restore and validation
+		// phases; these fields reference it so existing clients still resolve a
+		// meaningful Job name for each phase.
+		"backupJob":     migrationJob.Name,
+		"restoreJob":    migrationJob.Name,
+		"validationJob": migrationJob.Name,
 	})
 }

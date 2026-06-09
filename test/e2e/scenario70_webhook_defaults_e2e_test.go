@@ -88,11 +88,13 @@ func (s *Scenario70WebhookDefaultsE2ESuite) assertScenario70E2EDefaults(backup *
 	assert.Equal(t, "gzip", backup.Gpbackup.CompressionType, "gpbackup.compressionType")
 	assert.Equal(t, int32(1), backup.Gpbackup.Jobs, "gpbackup.jobs")
 	assert.False(t, backup.Gpbackup.SingleDataFile, "gpbackup.singleDataFile")
-	assert.True(t, backup.Gpbackup.WithStats, "gpbackup.withStats")
+	require.NotNil(t, backup.Gpbackup.WithStats, "gpbackup.withStats defaulted (non-nil)")
+	assert.True(t, *backup.Gpbackup.WithStats, "gpbackup.withStats")
 
 	require.NotNil(t, backup.Gprestore, "gprestore must be allocated by defaulter")
 	assert.Equal(t, int32(1), backup.Gprestore.Jobs, "gprestore.jobs")
-	assert.True(t, backup.Gprestore.WithStats, "gprestore.withStats")
+	require.NotNil(t, backup.Gprestore.WithStats, "gprestore.withStats defaulted (non-nil)")
+	assert.True(t, *backup.Gprestore.WithStats, "gprestore.withStats")
 
 	assert.Equal(t, int32(3), backup.Retention.FullCount, "retention.fullCount")
 	assert.Equal(t, "30d", backup.Retention.MaxAge, "retention.maxAge")

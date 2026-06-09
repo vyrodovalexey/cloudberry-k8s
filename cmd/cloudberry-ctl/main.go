@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -2696,33 +2697,88 @@ func newBackupJobsCmd() *cobra.Command {
 	return cmd
 }
 
-// newBackupJobsLogsCmd creates the `backup jobs logs` subcommand. The operator API
-// does not expose a pod-log streaming endpoint, so this prints the equivalent
-// kubectl command for the selected Job rather than silently failing.
+// backupJobsLogsFlags holds the flags for `backup jobs logs`.
+type backupJobsLogsFlags struct {
+	job    string
+	follow bool
+	tail   int64
+}
+
+// newBackupJobsLogsCmd creates the `backup jobs logs` subcommand. It streams the
+// selected backup Job's pod logs from the operator API. When the streaming
+// endpoint is unavailable (e.g. an older operator), it falls back to printing
+// the equivalent kubectl command rather than failing silently.
 func newBackupJobsLogsCmd() *cobra.Command {
-	var job string
+	f := &backupJobsLogsFlags{tail: -1}
 	cmd := &cobra.Command{
 		Use:   "logs",
-		Short: "Show how to fetch logs for a backup Job",
+		Short: "Stream logs for a backup Job",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := requireCluster(); err != nil {
 				return err
 			}
-			if job == "" {
+			if f.job == "" {
 				return fmt.Errorf("--job is required")
 			}
-			ns := globals.namespace
-			if ns == "" {
-				ns = "default"
-			}
-			fmt.Fprintf(cmd.OutOrStdout(),
-				"log streaming is not exposed by the operator API; run:\n  kubectl logs -n %s job/%s\n",
-				ns, job)
-			return nil
+			return runBackupJobsLogs(cmd, f)
 		},
 	}
-	cmd.Flags().StringVar(&job, "job", "", "Backup Job name")
+	fl := cmd.Flags()
+	fl.StringVar(&f.job, "job", "", "Backup Job name")
+	fl.BoolVar(&f.follow, "follow", false, "Stream logs as they are produced")
+	fl.Int64Var(&f.tail, "tail", -1, "Number of recent log lines to show (-1 for all)")
 	return cmd
+}
+
+// runBackupJobsLogs streams the Job's pod logs to stdout, falling back to the
+// kubectl instruction when the operator streaming endpoint is unavailable.
+func runBackupJobsLogs(cmd *cobra.Command, f *backupJobsLogsFlags) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	path := buildBackupJobLogsPath(f)
+	if streamErr := client.GetStream(ctx, path, cmd.OutOrStdout()); streamErr != nil {
+		printBackupJobLogsFallback(cmd, f.job, streamErr)
+	}
+	return nil
+}
+
+// buildBackupJobLogsPath builds the namespace-qualified logs endpoint path,
+// including the optional follow/tail query parameters.
+func buildBackupJobLogsPath(f *backupJobsLogsFlags) string {
+	path := fmt.Sprintf("/clusters/%s/backups/jobs/%s/logs",
+		url.PathEscape(globals.cluster), url.PathEscape(f.job))
+
+	query := url.Values{}
+	if globals.namespace != "" {
+		query.Set("namespace", globals.namespace)
+	}
+	if f.follow {
+		query.Set("follow", "true")
+	}
+	if f.tail >= 0 {
+		query.Set("tailLines", strconv.FormatInt(f.tail, 10))
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return path
+}
+
+// printBackupJobLogsFallback prints the kubectl instruction used when the
+// operator log-streaming endpoint cannot be reached.
+func printBackupJobLogsFallback(cmd *cobra.Command, job string, cause error) {
+	ns := globals.namespace
+	if ns == "" {
+		ns = "default"
+	}
+	fmt.Fprintf(cmd.OutOrStdout(),
+		"unable to stream logs from the operator API (%v); run:\n  kubectl logs -n %s job/%s\n",
+		cause, ns, job)
 }
 
 // newStorageCmd creates the storage management command group.

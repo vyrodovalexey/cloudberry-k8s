@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // Scenario 74: gprestore mutual-exclusivity precedence.
@@ -118,7 +119,9 @@ func TestAppendGprestoreBoolFlagsRunAnalyzePrecedence(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			args := appendGprestoreBoolFlags(nil, &cbv1alpha1.GprestoreOptions{
-				WithStats:  tc.withStats,
+				// Pass an explicit *bool so withStats:false is honored (a nil
+				// pointer would default to true per the webhook semantics).
+				WithStats:  util.Ptr(tc.withStats),
 				RunAnalyze: tc.runAnalyze,
 			})
 			joined := strings.Join(args, " ")

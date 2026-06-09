@@ -127,6 +127,106 @@ func TestHandleGetBackupSchedule_NoCronJob(t *testing.T) {
 	assert.Equal(t, false, resp["scheduled"])
 }
 
+// TestHandleListBackups_EnabledField verifies the list endpoint surfaces the
+// "enabled" flag for both enabled and disabled backup configs (Scenario 88a)
+// while keeping HTTP 200 and the existing back-compat keys.
+func TestHandleListBackups_EnabledField(t *testing.T) {
+	t.Run("enabled true", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListBackups(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["enabled"])
+		// Back-compat keys must still be present.
+		assert.Contains(t, resp, "cluster")
+		assert.Contains(t, resp, "backups")
+		assert.Contains(t, resp, "total")
+	})
+
+	t.Run("enabled false when disabled", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		cluster.Spec.Backup.Enabled = false
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListBackups(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["enabled"])
+	})
+
+	t.Run("enabled false when backup spec nil", func(t *testing.T) {
+		cluster := newTestCluster("test-cluster", "default")
+		s := newTestServer(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleListBackups(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["enabled"])
+	})
+}
+
+// TestHandleGetBackupSchedule_EnabledField verifies the schedule endpoint
+// surfaces the "enabled" flag in both the present-CronJob and no-CronJob
+// branches (Scenario 88a).
+func TestHandleGetBackupSchedule_EnabledField(t *testing.T) {
+	t.Run("present cronjob includes enabled", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		cronJob := &batchv1.CronJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.BackupCronJobName("test-cluster"),
+				Namespace: "default",
+			},
+			Spec: batchv1.CronJobSpec{Schedule: "0 3 * * *"},
+		}
+		s := newTestServerWithBatch(cluster, cronJob)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups/schedule?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetBackupSchedule(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["enabled"])
+		assert.Equal(t, true, resp["scheduled"])
+	})
+
+	t.Run("no cronjob disabled includes enabled false", func(t *testing.T) {
+		cluster := newBackupEnabledCluster()
+		cluster.Spec.Backup.Enabled = false
+		s := newTestServerWithBatch(cluster)
+		req := httptest.NewRequest(http.MethodGet,
+			apiPrefix+"/clusters/test-cluster/backups/schedule?namespace=default", nil)
+		req.SetPathValue("name", "test-cluster")
+		rec := httptest.NewRecorder()
+		s.handleGetBackupSchedule(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, false, resp["enabled"])
+		assert.Equal(t, false, resp["scheduled"])
+	})
+}
+
 func TestHandleGetBackupSchedule_ClusterNotFound(t *testing.T) {
 	s := newTestServerWithBatch()
 	req := httptest.NewRequest(http.MethodGet,
@@ -264,13 +364,13 @@ func TestMergeGpbackupOptions(t *testing.T) {
 	}
 	out := mergeGpbackupOptions(cluster, &GpbackupOptionsRequest{
 		Jobs:      4,
-		WithStats: true,
+		WithStats: util.Ptr(true),
 	})
 	// Defaults preserved when request leaves them zero.
 	assert.Equal(t, int32(3), out.CompressionLevel)
 	assert.Equal(t, "gzip", out.CompressionType)
 	assert.Equal(t, int32(4), out.Jobs)
-	assert.True(t, out.WithStats)
+	assert.True(t, util.Deref(out.WithStats))
 }
 
 func TestMergeGprestoreOptions(t *testing.T) {

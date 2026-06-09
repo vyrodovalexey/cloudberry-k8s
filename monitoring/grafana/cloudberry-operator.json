@@ -3705,6 +3705,83 @@
             "legend": { "displayMode": "list", "placement": "bottom" },
             "tooltip": { "mode": "multi", "sort": "desc" }
           }
+        },
+        {
+          "id": 135,
+          "type": "timeseries",
+          "title": "Restore/Migration Outcomes Rate (success vs failed)",
+          "description": "Rate of restore outcomes by result (cloudberry_restore_total{result}). Scenario 87 cross-cluster migration runs gprestore on the target as a restore; a rising failed series indicates the migration restore step is failing.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 0, "y": 244, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (cluster, result) (rate(cloudberry_restore_total[5m]))",
+              "legendFormat": "{{cluster}} {{result}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 10,
+                "pointSize": 5,
+                "showPoints": "auto"
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byRegexp", "options": ".*failed.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              },
+              {
+                "matcher": { "id": "byRegexp", "options": ".*success.*" },
+                "properties": [
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "id": 136,
+          "type": "timeseries",
+          "title": "Restore Duration p95 (Migration)",
+          "description": "95th percentile restore (gprestore) duration from cloudberry_restore_duration_seconds_bucket. Tracks how long the Scenario 87 migration restore step takes on the target cluster.",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "gridPos": { "x": 12, "y": 244, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(cloudberry_restore_duration_seconds_bucket[5m])))",
+              "legendFormat": "p95",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 10,
+                "pointSize": 5,
+                "showPoints": "auto"
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
         }
       ]
     }

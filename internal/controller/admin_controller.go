@@ -196,24 +196,35 @@ func NewAdminReconciler(
 }
 
 // Reconcile handles the admin reconciliation for CloudberryCluster resources.
-func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	startTime := time.Now()
 	logger := r.logger.With("cluster", req.Name, "namespace", req.Namespace)
 	ctx = util.WithLogger(ctx, logger)
 
 	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "Reconcile")
 	defer span.End()
 
+	// Record the reconcile outcome/duration and mark the span on error exactly
+	// once on return. The deferred closure captures the named error so both
+	// success and error paths are recorded (recorder is nil-guarded).
+	defer func() {
+		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime, err)
+		telemetry.SetSpanError(span, err)
+	}()
+
 	logger.Debug("starting admin reconciliation",
 		"name", req.Name, "namespace", req.Namespace)
 
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
-	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
+	if err = r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug("cluster not found, skipping reconciliation")
+			err = nil
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching cluster: %w", err)
+		err = fmt.Errorf("fetching cluster: %w", err)
+		return ctrl.Result{}, err
 	}
 
 	logger.Debug("cluster fetched",
@@ -222,14 +233,16 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"observedGeneration", cluster.Status.ObservedGeneration)
 
 	// Handle early-return cases: rolling restart, pending reload, not-running, unchanged generation.
-	if result, handled, err := r.handleAdminEarlyReturns(ctx, cluster); handled {
-		return result, err
+	if earlyResult, handled, earlyErr := r.handleAdminEarlyReturns(ctx, cluster); handled {
+		err = earlyErr
+		return earlyResult, earlyErr
 	}
 
 	// Reconcile configuration parameters.
 	logger.Debug("reconciling configuration parameters")
-	if err := r.reconcileConfig(ctx, cluster); err != nil {
-		return r.handleConfigError(ctx, logger, cluster, err)
+	if cfgErr := r.reconcileConfig(ctx, cluster); cfgErr != nil {
+		result, err = r.handleConfigError(ctx, logger, cluster, cfgErr)
+		return result, err
 	}
 
 	// Reconcile all sub-components and patch status.
@@ -249,9 +262,10 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	// Perform a single status patch for all sub-reconciler changes.
 	// Using MergePatch prevents clobbering status changes from other controllers.
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		logger.Error("failed to update cluster status", "error", err)
-		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating cluster status: %w", err)
+	if patchErr := patchStatus(ctx, r.client, cluster); patchErr != nil {
+		logger.Error("failed to update cluster status", "error", patchErr)
+		err = fmt.Errorf("updating cluster status: %w", patchErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
 	logger.Debug("admin reconciliation completed successfully")
@@ -341,11 +355,49 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) {
+	logger := util.LoggerFromContext(ctx)
+
 	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		// Disabled-backup cleanup must ALSO run on the steady-state path, not just
+		// on the spec-driven reconcile. Once the cluster settles and the
+		// cluster-controller advances ObservedGeneration to match Generation, the
+		// generation gate in handleAdminEarlyReturns short-circuits the spec-driven
+		// reconcileBackup (which is what normally removes the CronJob and clears
+		// status.cronJobName). Without this branch, a "disable backup" change that
+		// is observed only after the generation has caught up — or whose clear was
+		// clobbered by a concurrent full patchStatus from the cluster-controller —
+		// would leave a stale persisted status.cronJobName forever (Scenario 88a,
+		// live). removeBackupCronJob is idempotent and clears the persisted value
+		// via an explicit-empty MergePatch (patchClearCronJobName), so running it on
+		// every steady-state requeue guarantees convergence to "" even if another
+		// controller re-marshaled the stale value in the same window.
+		//
+		// NOTE: removeBackupCronJob now early-returns nil when there is genuinely
+		// nothing to clean up (no CronJob exists AND Status.CronJobName == ""), so
+		// this call is a no-op for clusters that never had backup configured. That
+		// guard (the single source of truth) avoids an unnecessary status patch on
+		// the steady-state path, which previously regressed the Scenario 25/26 +
+		// workload functional tests.
+		if err := r.removeBackupCronJob(ctx, cluster); err != nil {
+			logger.Warn("failed to remove backup cronjob on steady-state reconcile", "error", err)
+		}
 		return
 	}
 
-	logger := util.LoggerFromContext(ctx)
+	// Reconcile the backup CronJob against the current schedule on the steady-state
+	// path too. ensureBackupCronJob creates/updates the CronJob when a schedule is
+	// set and removes it (clearing status.cronJobName via the explicit-empty
+	// MergePatch) when the schedule is empty. This is required for the
+	// enabled-but-empty-schedule case (Scenario 88b): once the generation settles,
+	// the spec-driven reconcileBackup is gated out, so without this a schedule that
+	// was cleared to "" — or whose status.cronJobName was re-set by a concurrent
+	// full patchStatus from the cluster-controller — would leave a stale CronJob /
+	// persisted cronJobName forever. ensureBackupCronJob/removeBackupCronJob are
+	// idempotent (and a no-op when there is genuinely nothing to do), so running on
+	// every steady-state requeue converges both the CronJob and the status.
+	if err := r.ensureBackupCronJob(ctx, cluster); err != nil {
+		logger.Warn("failed to ensure backup cronjob on steady-state reconcile", "error", err)
+	}
 
 	if err := r.refreshBackupStatus(ctx, cluster); err != nil {
 		logger.Warn("failed to refresh backup status on steady-state reconcile", "error", err)
@@ -1527,12 +1579,34 @@ const backupHistoryLimit = 10
 // enabled, it ensures the gpbackup_s3_plugin ConfigMap, the scheduled-backup
 // CronJob (when a schedule is set) and refreshes the backup status from the most
 // recent backup/restore Jobs owned by the cluster.
+// reconcileBackup wraps the backup reconciliation in a child span (under the
+// admin Reconcile span) so a slow backup reconcile (ConfigMap/Secret/CronJob
+// ensure, status refresh, retention, validation) is visible in traces. The
+// actual work is in doReconcileBackup; this thin wrapper keeps the span/error
+// handling in one place. No-op when telemetry is disabled.
 func (r *AdminReconciler) reconcileBackup(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
+	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "reconcileBackup")
+	defer span.End()
+
+	err := r.doReconcileBackup(ctx, cluster)
+	telemetry.SetSpanError(span, err)
+	return err
+}
+
+// doReconcileBackup performs the backup reconciliation work.
+func (r *AdminReconciler) doReconcileBackup(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
 	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
-		return nil
+		// Backup disabled (or unconfigured): ensure no stale per-cluster CronJob
+		// is left behind and clear its recorded name from status (Scenario 88a).
+		// This is idempotent — a no-op when no CronJob exists. Retention cleanup
+		// and other backup resources are intentionally not reconciled here.
+		return r.removeBackupCronJob(ctx, cluster)
 	}
 
 	logger := util.LoggerFromContext(ctx)
@@ -1766,31 +1840,90 @@ func backupS3VaultSpec(cluster *cbv1alpha1.CloudberryCluster) *cbv1alpha1.S3Dest
 	return dest.S3
 }
 
+// removeBackupCronJob deletes the per-cluster backup CronJob if it exists and
+// clears cluster.Status.CronJobName. It is idempotent: a missing CronJob is a
+// no-op. Used both when backup is disabled (Scenario 88a) and when the schedule
+// has been cleared (on-demand-only backups, Scenario 88b).
+func (r *AdminReconciler) removeBackupCronJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	cronName := util.BackupCronJobName(cluster.Name)
+	existing := &batchv1.CronJob{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: cronName, Namespace: cluster.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		// No CronJob exists. If there is also no persisted name to clear, there is
+		// genuinely nothing to clean up — return early WITHOUT issuing a status
+		// patch. This guard is the single source of truth that keeps both callers
+		// (the spec-driven reconcileBackup and the steady-state
+		// refreshBackupStatusOnSteadyState) a no-op for clusters that never had
+		// backup configured. Without it, the steady-state path performed an
+		// unnecessary explicit-empty Status().Patch on every requeue, perturbing
+		// the reconcile/status flow and regressing the Scenario 25/26 + workload
+		// functional tests. When a stale name IS persisted (Scenario 88a: backup
+		// disabled after having had a schedule), we still clear it below.
+		if cluster.Status.CronJobName == "" {
+			return nil
+		}
+		// A stale name is still persisted in the CR status (e.g. the CronJob was
+		// deleted out-of-band). Clear it explicitly so the persisted status
+		// reflects the absence of a scheduled backup.
+		return r.patchClearCronJobName(ctx, cluster)
+	}
+	if err != nil {
+		return fmt.Errorf("getting backup cronjob %s: %w", cronName, err)
+	}
+	if delErr := r.client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
+		return fmt.Errorf("deleting backup cronjob %s: %w", cronName, delErr)
+	}
+	return r.patchClearCronJobName(ctx, cluster)
+}
+
+// patchClearCronJobName explicitly clears the persisted status.cronJobName field
+// and the in-memory value. A plain patchStatus cannot clear it because the field
+// is tagged json:"cronJobName,omitempty": json.Marshal drops the empty string, and
+// a MergePatch only changes keys that are present, leaving the previously-persisted
+// value intact. We therefore build a raw MergePatch map with an EXPLICIT empty
+// string (mirroring patchQueryStatus / patchFTSStatus) so the field is actually
+// reset in the CR. NotFound and conflict errors are tolerated so disabled-backup
+// reconcile paths do not fail on transient/stale-object conditions.
+func (r *AdminReconciler) patchClearCronJobName(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	// Keep the live object consistent within this reconcile.
+	cluster.Status.CronJobName = ""
+
+	patch, err := json.Marshal(map[string]interface{}{
+		patchKeyStatus: map[string]interface{}{
+			// Explicit empty string bypasses the struct's omitempty so the
+			// MergePatch actually clears the persisted value.
+			"cronJobName": "",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling cronJobName clear patch: %w", err)
+	}
+
+	if patchErr := r.client.Status().Patch(
+		ctx, cluster, client.RawPatch(types.MergePatchType, patch),
+	); patchErr != nil && !apierrors.IsNotFound(patchErr) && !apierrors.IsConflict(patchErr) {
+		return fmt.Errorf("clearing status.cronJobName: %w", patchErr)
+	}
+	return nil
+}
+
 // ensureBackupCronJob creates/updates the scheduled backup CronJob when a
 // schedule is set, or deletes it when the schedule has been cleared.
 func (r *AdminReconciler) ensureBackupCronJob(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
-	cronName := util.BackupCronJobName(cluster.Name)
 	desired := r.builder.BuildBackupCronJob(cluster)
 
 	if desired == nil {
 		// No schedule configured: delete the CronJob if it exists.
-		existing := &batchv1.CronJob{}
-		err := r.client.Get(ctx, types.NamespacedName{Name: cronName, Namespace: cluster.Namespace}, existing)
-		if apierrors.IsNotFound(err) {
-			cluster.Status.CronJobName = ""
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("getting backup cronjob %s: %w", cronName, err)
-		}
-		if delErr := r.client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return fmt.Errorf("deleting backup cronjob %s: %w", cronName, delErr)
-		}
-		cluster.Status.CronJobName = ""
-		return nil
+		return r.removeBackupCronJob(ctx, cluster)
 	}
 
 	existing := &batchv1.CronJob{}
@@ -2794,6 +2927,10 @@ func (r *AdminReconciler) reconcileStorage(
 			"skewThreshold", cluster.Spec.Storage.RecommendationScan.SkewThreshold,
 		)
 		recommendationCount = cluster.Status.RecommendationCount
+		// Publish per-table bloat ratios for the top-N most-bloated tables so the
+		// cloudberry_table_bloat_ratio gauge is populated. Best-effort and
+		// non-fatal: a DB/connection failure only skips this scan.
+		r.recordTableBloatRatios(ctx, cluster, logger)
 	}
 
 	// Update status fields.
@@ -2812,6 +2949,62 @@ func (r *AdminReconciler) reconcileStorage(
 			cluster.Spec.Storage.DiskMonitoring, recommendationCount))
 
 	return nil
+}
+
+// maxBloatRatioTables bounds the number of per-table bloat ratios published to
+// the cloudberry_table_bloat_ratio gauge, keeping metric cardinality in check.
+const maxBloatRatioTables = 20
+
+// recordTableBloatRatios queries the most-bloated tables and publishes their
+// dead-tuple bloat ratio to the cloudberry_table_bloat_ratio gauge for the
+// top-N tables (capped by maxBloatRatioTables to bound cardinality). It is
+// best-effort and non-fatal: a missing dbFactory or any DB error simply skips
+// the scan. A child span is created so a slow bloat scan is visible in traces.
+func (r *AdminReconciler) recordTableBloatRatios(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) {
+	if r.dbFactory == nil {
+		logger.Debug("skipping table bloat ratio scan, no DB factory configured")
+		return
+	}
+
+	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "recordTableBloatRatios")
+	defer span.End()
+
+	// Use a short timeout so DB connection issues don't block the reconcile.
+	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	if err != nil {
+		logger.Debug("skipping table bloat ratio scan, DB not available", "error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	recs, err := dbClient.GetBloatRecommendations(dbCtx)
+	if err != nil {
+		telemetry.SetSpanError(span, err)
+		logger.Warn("failed to fetch bloat recommendations for metrics", "error", err)
+		return
+	}
+
+	// recs are ordered by dead tuples DESC by the query; publish the top-N.
+	limit := len(recs)
+	if limit > maxBloatRatioTables {
+		limit = maxBloatRatioTables
+	}
+	for i := 0; i < limit; i++ {
+		rec := recs[i]
+		table := rec.Table
+		if rec.Schema != "" {
+			table = rec.Schema + "." + rec.Table
+		}
+		r.metrics.SetTableBloatRatio(cluster.Name, cluster.Namespace, table, rec.Ratio)
+	}
+	logger.Debug("published table bloat ratios", "tables", limit)
 }
 
 // configChanges holds the classified parameter changes.

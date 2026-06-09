@@ -22,6 +22,17 @@ func SegmentMirrorName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-segment-mirror", cluster))
 }
 
+// CoordinatorPodName returns the name of the active coordinator pod (ordinal 0
+// of the coordinator StatefulSet). gpbackup/gprestore are MPP orchestrators that
+// must run inside the coordinator pod (segment -1) so they can write the
+// catalog-derived coordinator data directory + history DB and dispatch to every
+// segment over SSH; the backup/restore Jobs `kubectl exec` into this pod (the
+// coordinator-exec model, spec 11 §MPP Dispatch and the Coordinator-Exec Data
+// Cycle).
+func CoordinatorPodName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-coordinator-0", cluster))
+}
+
 // CoordinatorServiceName returns the coordinator headless service name.
 // Short name ensures pod FQDN (<pod>.<svc>) stays within Cloudberry's 64-char hostname limit.
 func CoordinatorServiceName(cluster string) string {
@@ -155,6 +166,19 @@ func MigrateBackupJobName(cluster, timestamp string) string {
 // MigrateRestoreJobName returns the migration restore Job name on the target cluster.
 func MigrateRestoreJobName(cluster, timestamp string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-migrate-restore-%s", cluster, timestamp))
+}
+
+// MigrationJobName returns the name of the SINGLE coordinated cross-cluster
+// migration Job (spec 11 §Cross-Cluster Migration). The Job runs the whole
+// migration sequence — gpbackup on the source coordinator, gprestore on the
+// target coordinator and post-restore validation — inside one Job so the REAL
+// gpbackup-generated timestamp can be captured and fed verbatim to gprestore
+// (gpbackup chooses its own timestamp at runtime and offers no flag to pin it,
+// so the operator's pre-chosen timestamp cannot be used for the restore). The
+// operator-chosen timestamp is still used only to NAME the Job. It is suffixed
+// with the source cluster so concurrent migrations never collide.
+func MigrationJobName(sourceCluster, timestamp string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-migration-%s", sourceCluster, timestamp))
 }
 
 // BackupServiceAccountName returns the ServiceAccount name used by backup/restore Jobs.

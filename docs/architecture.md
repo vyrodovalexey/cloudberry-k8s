@@ -1007,7 +1007,7 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Cluster metrics**: `cloudberry_cluster_info`, `cloudberry_coordinator_up`, `cloudberry_standby_up`
 - **Segment metrics**: `cloudberry_segments_ready`, `cloudberry_segments_total`, `cloudberry_segments_failed`
 - **Mirroring metrics**: `cloudberry_mirroring_in_sync`
-- **Reconciliation metrics**: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds`
+- **Reconciliation metrics**: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` — emitted by **all four controllers** (cluster, admin, HA, auth) via a shared `recordReconcileOutcome` helper, not just the cluster controller
 - **Configuration metrics**: `cloudberry_config_reload_total`
 - **FTS metrics**: `cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`, `cloudberry_replication_lag_bytes`
 - **Connection metrics**: `cloudberry_connections_active`, `cloudberry_connections_max`
@@ -1017,23 +1017,28 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Storage metrics**: `cloudberry_pvc_size_bytes` (set on PVC expansion), `cloudberry_disk_usage_bytes` (per-database, set on the disk-usage API)
 - **Backup/restore metrics**: `cloudberry_backup_total` (labels `cluster`, `namespace`, `type`, `result`; recorded on backup reconcile with `result=started`), `cloudberry_restore_total` (labels `cluster`, `namespace`, `result`; recorded on the restore API)
 - **Recommendation metrics**: `cloudberry_recommendations_total` (gauge, labels `cluster`, `namespace`, `type`) and `cloudberry_recommendation_scan_duration_seconds` (histogram), set during a recommendation scan
+- **Bloat metrics**: `cloudberry_table_bloat_ratio` (gauge, labels `cluster`, `namespace`, `table`) — populated from storage recommendation scans for the top-N most-bloated tables
 - **Auth metrics**: `cloudberry_auth_attempts_total` (labels `method`, `result`). A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}`
 - **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`, `cloudberry_slow_queries_total`, `cloudberry_workload_rule_actions_total`
 - **Query history metrics**: `cloudberry_query_history_total`, `cloudberry_query_history_retention_deleted_total`, `cloudberry_query_history_size_bytes`
 - **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`)
-- **Admission metrics**: `cloudberry_webhook_admission_total` (labels `webhook`, `operation`, `result`)
+- **Admission metrics**: `cloudberry_webhook_admission_total` (labels `webhook`, `operation`, `result`). Internal (non-validation) admission failures record the distinct `result=error` instead of being bucketed as `denied`
 - **Lifecycle metrics**: `cloudberry_upgrade_operations_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `rollback`, `failed`}), `cloudberry_rolling_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `failed`}), `cloudberry_recovery_operations_total` (labels `cluster`, `namespace`, `type`, `result`)
 
 ### Tracing (OpenTelemetry)
 
-When telemetry is enabled, the operator emits OTLP traces for:
+Tracing is **disabled by default**. When telemetry is enabled (`telemetry.enabled=true` plus an `telemetry.otlp-endpoint`, e.g. the in-cluster `otel-collector` or Tempo on `:4317`), the operator emits OTLP traces for:
 
-- Reconciliation loops (one span per reconciliation)
-- API request handling
-- Database operations
-- Vault operations
+- Reconciliation loops — one `Reconcile` span per controller (cluster, admin, HA, auth), with `SetSpanError` recorded on the error paths of all four
+- Sub-reconcilers — `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)
+- API request handling — a server span per request named `<METHOD> <path>`, marked `Error` on HTTP status `>= 400`, with inbound trace-context propagation
+- Migrations — `handleMigrate` with `migrate.validate` / `migrate.create` child spans
+- Vault operations — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`
+- Certificate provisioning — `EnsureCertificates`
 
-Supports both gRPC and HTTP OTLP exporters with configurable sampling rate.
+Configured via `TelemetryConfig` (config keys `telemetry.enabled`, `telemetry.otlp-endpoint`, `telemetry.otlp-protocol` (`grpc`|`http`), `telemetry.otlp-insecure`, `telemetry.sampling-rate`, `telemetry.service-name`; also via `CLOUDBERRY_TELEMETRY_*` environment variables). Supports both gRPC and HTTP OTLP exporters with a configurable sampling rate.
+
+The **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) renders Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs. It is one of four dashboards (operator, exporters, node-metrics, otel) published by `test/monitoring/scripts/publish-dashboards.sh`.
 
 ### Structured Logging
 
