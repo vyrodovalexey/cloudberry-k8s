@@ -408,9 +408,13 @@ func (d *Daemon) scanAndEnforce(ctx context.Context) (evaluated, terminated int,
 				continue
 			}
 
-			// Session is idle beyond timeout — terminate it.
+			// Session is idle beyond timeout — terminate it. A session can
+			// die only once: stop evaluating further rules for it after a
+			// successful termination (L-6) so overlapping rules do not issue
+			// redundant terminate calls (and inflate the metric/log noise).
 			if d.terminateSession(ctx, sessions[i], rules[j]) {
 				terminated++
+				break
 			}
 		}
 	}

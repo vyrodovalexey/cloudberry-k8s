@@ -3,6 +3,9 @@ package webhook
 import (
 	"context"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -74,15 +77,39 @@ func NewCloudberryClusterDefaulter(recorder ...metrics.Recorder) *CloudberryClus
 
 // Default sets defaults on a CloudberryCluster.
 func (d *CloudberryClusterDefaulter) Default(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
-	_, end := startAdmissionSpan(ctx, "webhook.mutate", admissionOpCreate)
+	// Record the ACTUAL admission operation (create/update, L-8) resolved
+	// from the admission request in the context, instead of bucketing every
+	// defaulting pass as a create. Defaulting never denies admission.
+	operation := admissionOperationFromContext(ctx)
+	_, end := startAdmissionSpan(ctx, "webhook.mutate", operation)
 	setClusterDefaults(cluster)
-	// The mutating webhook applies defaults on both create and update; record it
-	// as a create admission for consistency. Defaulting never denies admission.
 	if d.recorder != nil {
-		d.recorder.RecordWebhookAdmission(webhookMutating, admissionOpCreate, admissionAllowed)
+		d.recorder.RecordWebhookAdmission(webhookMutating, operation, admissionAllowed)
 	}
 	end(nil)
 	return nil
+}
+
+// admissionOperationFromContext maps the admission request operation from the
+// webhook context onto the bounded operation label enum. When no admission
+// request is present (e.g. direct unit-test invocation) or the operation is
+// unrecognized, it falls back to "create" — the historical label value — so
+// the metric cardinality stays bounded.
+func admissionOperationFromContext(ctx context.Context) string {
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return admissionOpCreate
+	}
+	switch req.Operation {
+	case admissionv1.Update:
+		return admissionOpUpdate
+	case admissionv1.Delete:
+		return admissionOpDelete
+	case admissionv1.Create, admissionv1.Connect:
+		return admissionOpCreate
+	default:
+		return admissionOpCreate
+	}
 }
 
 // setClusterDefaults applies default values to a CloudberryCluster.

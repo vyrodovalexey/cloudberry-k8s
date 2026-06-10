@@ -138,6 +138,23 @@ func validateBackupDatabases(w http.ResponseWriter, databases []string) bool {
 	return true
 }
 
+// requireBackupDatabase ensures the create-backup request names at least one
+// target database, writing a 400 envelope and returning false otherwise.
+// gpbackup hard-requires --dbname and the cluster CRD declares no
+// default-database field, so a database-less request can only produce a Job
+// that fails at runtime (`required flag(s) "dbname" not set`) — reject it
+// up front with an actionable message instead.
+func requireBackupDatabase(w http.ResponseWriter, databases []string) bool {
+	if len(databases) == 0 {
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
+			"at least one database must be specified in \"databases\": "+
+				"gpbackup requires a target database (--dbname) and the "+
+				"cluster defines no default backup database")
+		return false
+	}
+	return true
+}
+
 // isBackupOperation reports whether operation is a recognized backup operation.
 func isBackupOperation(operation string) bool {
 	switch operation {

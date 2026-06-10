@@ -378,16 +378,28 @@ func backupDestinationArgs(cluster *cbv1alpha1.CloudberryCluster) []string {
 // buildGpbackupArgs converts gpbackup options and per-request overrides into a
 // gpbackup CLI argument slice. It is a pure function for easy unit testing. The
 // leading args are destination-aware (see backupDestinationArgs).
+//
+// gpbackup hard-requires --dbname (it aborts with `required flag(s) "dbname"
+// not set`), so an empty target database is a build-time ERROR here instead of
+// a silently broken command that only fails when the Job pod runs. Callers
+// resolve the database first (see withDefaultBackupDatabase); the REST API
+// additionally rejects database-less create-backup requests with 400.
 func buildGpbackupArgs(
 	cluster *cbv1alpha1.CloudberryCluster,
 	opts *cbv1alpha1.GpbackupOptions,
 	jobOpts *BackupJobOptions,
-) []string {
-	args := backupDestinationArgs(cluster)
-
-	if jobOpts != nil && len(jobOpts.Databases) > 0 {
-		args = append(args, "--dbname", jobOpts.Databases[0])
+) ([]string, error) {
+	var dbname string
+	if jobOpts != nil {
+		dbname = firstDatabase(jobOpts.Databases)
 	}
+	if dbname == "" {
+		return nil, fmt.Errorf(
+			"building gpbackup args: no target database specified (gpbackup requires --dbname)")
+	}
+
+	args := backupDestinationArgs(cluster)
+	args = append(args, "--dbname", dbname)
 
 	if opts == nil {
 		opts = &cbv1alpha1.GpbackupOptions{}
@@ -413,7 +425,31 @@ func buildGpbackupArgs(
 		args = appendRepeatedFlag(args, "--exclude-table", jobOpts.ExcludeTables)
 	}
 
-	return args
+	return args, nil
+}
+
+// withDefaultBackupDatabase returns opts with Databases defaulted to the
+// coordinator maintenance database (postgres, matching the Job's PGDATABASE
+// connection default) when none is specified, without mutating the caller's
+// value. It is nil-safe.
+//
+// Rationale (documented behavior): gpbackup hard-requires --dbname and the
+// CRD's BackupSpec declares NO databases/defaultDatabase field, so the
+// scheduled CronJob path has no user-supplied database to render — defaulting
+// here keeps every rendered gpbackup command valid. User-facing on-demand
+// requests are stricter: the REST API rejects an empty databases list with
+// 400, so this fallback only serves the CronJob path and direct builder
+// callers.
+func withDefaultBackupDatabase(opts *BackupJobOptions) *BackupJobOptions {
+	if opts == nil {
+		opts = &BackupJobOptions{}
+	}
+	if len(opts.Databases) > 0 {
+		return opts
+	}
+	out := *opts
+	out.Databases = []string{defaultCoordinatorDatabase}
+	return &out
 }
 
 // appendCompressionArgs appends compression-related flags. NoCompression takes
@@ -906,11 +942,21 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	// Record the effective backup type so the controller can derive status from
 	// the spawned Job's label (spec-driven for the CronJob path; nil opts).
 	labels[util.LabelBackupType] = effectiveBackupType(cluster, nil)
-	args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, nil)
+	// The CRD declares no per-schedule database list, so scheduled backups
+	// target the coordinator maintenance database (postgres): gpbackup
+	// hard-requires --dbname, and rendering the CronJob without it produced
+	// Jobs that always failed at runtime (`required flag(s) "dbname" not set`).
+	jobOpts := withDefaultBackupDatabase(nil)
+	args, err := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, jobOpts)
+	if err != nil {
+		// Defense in depth: unreachable — withDefaultBackupDatabase always
+		// resolves a database — but no CronJob is safer than a broken one.
+		return nil
+	}
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
-	// The CronJob's backup target databases are resolved at runtime, so
-	// CBDB_DATABASE is emitted empty (still inspectable) per spec 11.
-	applyBackupGpbackupEnv(&podSpec, "", cluster.Spec.Backup.Gpbackup)
+	// CBDB_DATABASE mirrors the rendered --dbname (spec 11: the env stays
+	// informational/inspectable and must match the CLI args).
+	applyBackupGpbackupEnv(&podSpec, firstDatabase(jobOpts.Databases), cluster.Spec.Backup.Gpbackup)
 	addPreBackupCheckInitContainer(cluster, &podSpec)
 
 	historyLimit := int32(3)
@@ -936,21 +982,28 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	}
 }
 
-// BuildBackupJob builds an on-demand gpbackup Job.
+// BuildBackupJob builds an on-demand gpbackup Job. When opts carries no
+// database the backup targets the coordinator maintenance database (see
+// withDefaultBackupDatabase) so the rendered gpbackup command is always valid;
+// the REST API layer additionally rejects database-less requests with 400, so
+// user-facing requests are always explicit.
 func (b *DefaultBuilder) BuildBackupJob(
 	cluster *cbv1alpha1.CloudberryCluster,
 	opts *BackupJobOptions,
 ) *batchv1.Job {
-	if opts == nil {
-		opts = &BackupJobOptions{}
-	}
+	opts = withDefaultBackupDatabase(opts)
 	labels := backupLabels(cluster.Name, util.BackupOperationBackup)
 	// Record the effective backup type (per-request Type/Gpbackup override or the
 	// cluster spec) so the controller derives status from THIS Job's label.
 	labels[util.LabelBackupType] = effectiveBackupType(cluster, opts)
 
 	gpOpts := opts.gpbackupOrSpec(cluster)
-	args := buildGpbackupArgs(cluster, gpOpts, opts)
+	args, err := buildGpbackupArgs(cluster, gpOpts, opts)
+	if err != nil {
+		// Defense in depth: unreachable — withDefaultBackupDatabase always
+		// resolves a database — but no Job is safer than a broken one.
+		return nil
+	}
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
 	addPreBackupCheckInitContainer(cluster, &podSpec)

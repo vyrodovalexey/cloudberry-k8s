@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -108,6 +109,12 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
+	// Derive a cancellable run context: essential components (the REST API
+	// server, M-4) cancel it on failure so the manager stops and the operator
+	// exits non-zero instead of running degraded.
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
 	// Define and parse the operator command-line flags, then bind them into
 	// the config loader so the documented precedence holds:
 	// ENV > flag > config file > default.
@@ -181,9 +188,12 @@ func run(ctx context.Context, args []string) error {
 	// they complete before the process exits.
 	var backgroundWg sync.WaitGroup
 
-	// Register admission webhooks when enabled.
+	// Register admission webhooks when enabled. The shared admin Vault client
+	// is passed in so the vault-pki cert source reuses ONE client (single
+	// token lifecycle watcher; no leaked second client, L-2).
 	if cfg.WebhookEnabled {
-		if err := setupWebhookCerts(ctx, mgr, cfg, logger, &backgroundWg, metricsRecorder); err != nil {
+		if err := setupWebhookCerts(ctx, mgr, cfg, logger, &backgroundWg, metricsRecorder,
+			adminVaultClient); err != nil {
 			return fmt.Errorf("setting up webhook certificates: %w", err)
 		}
 		if err := registerWebhooks(mgr, logger, metricsRecorder); err != nil {
@@ -193,10 +203,15 @@ func run(ctx context.Context, args []string) error {
 		logger.Info("admission webhooks disabled")
 	}
 
-	// Start the REST API server in a background goroutine.
+	// Start the REST API server in a background goroutine. The API is an
+	// essential component: a startup failure is logged immediately and
+	// cancels the run context so the operator shuts down (and run() returns
+	// the API error from apiErrCh) instead of running without its API.
 	apiErrCh := make(chan error, 1)
 	go func() {
-		apiErrCh <- startAPIServer(ctx, cfg, mgr, metricsRecorder, logger)
+		apiErr := startAPIServer(ctx, cfg, mgr, metricsRecorder, logger)
+		handleAPIServerExit(apiErr, cancelRun, logger)
+		apiErrCh <- apiErr
 	}()
 
 	logger.Info("starting cloudberry-operator",
@@ -489,6 +504,19 @@ func startAPIServer(
 	return api.StartServer(ctx, cfg.APIAddress, apiServer.Handler(), logger)
 }
 
+// handleAPIServerExit reacts to the API server goroutine terminating (M-4).
+// The REST API is an essential operator component: any startup or runtime
+// failure is logged immediately and cancels the run context so the manager
+// stops and the operator exits non-zero, instead of silently running without
+// its API. A nil error or http.ErrServerClosed (clean shutdown) is a no-op.
+func handleAPIServerExit(err error, cancel context.CancelFunc, logger *slog.Logger) {
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return
+	}
+	logger.Error("REST API server failed; shutting down operator", "error", err)
+	cancel()
+}
+
 // seedTestUsers registers the well-known test users (one per permission
 // level) in the credential store, ONLY when explicitly enabled via
 // CLOUDBERRY_ENABLE_TEST_USERS=true (Config.EnableTestUsers, default false).
@@ -666,7 +694,11 @@ func resolveAdminPassword(ctx context.Context, k8sClient client.Client, logger *
 // operatorTracerName is the tracer name for operator startup spans.
 const operatorTracerName = "cloudberry-operator"
 
-// setupWebhookCerts creates and manages webhook TLS certificates.
+// setupWebhookCerts creates and manages webhook TLS certificates. The
+// optional adminVaultClient (nil when operator-level Vault is disabled) is
+// REUSED for the vault-pki cert source so only one Vault client (and one
+// token lifecycle watcher) exists; a dedicated client is created — and closed
+// when rotation stops — only when no shared client is available (L-2).
 func setupWebhookCerts(
 	ctx context.Context,
 	mgr ctrl.Manager,
@@ -674,6 +706,7 @@ func setupWebhookCerts(
 	logger *slog.Logger,
 	wg *sync.WaitGroup,
 	metricsRecorder metrics.Recorder,
+	adminVaultClient vault.Client,
 ) (err error) {
 	// Startup span for certificate provisioning (D-7); records the error
 	// status on failure. No-op when telemetry is disabled.
@@ -710,20 +743,26 @@ func setupWebhookCerts(
 		return fmt.Errorf("creating direct API client for cert management: %w", err)
 	}
 
-	// Create a vault client when the cert source is vault-pki so that the
-	// certmanager can issue certificates via the Vault PKI engine.
+	// Resolve the vault client when the cert source is vault-pki so that the
+	// certmanager can issue certificates via the Vault PKI engine. ownedVault
+	// is non-nil only when a DEDICATED client was created here; it is closed
+	// when cert rotation stops (or on an error return below).
 	var vaultClient vault.Client
+	var ownedVault vault.Closer
 	if cfg.WebhookCertSource == certmanager.CertSourceVaultPKI {
-		vc, vaultErr := vault.NewClient(ctx, buildVaultClientConfig(cfg), logger, metricsRecorder)
-		if vaultErr != nil {
-			return fmt.Errorf("creating vault client for webhook cert management: %w", vaultErr)
+		vaultClient, ownedVault, err = resolveWebhookPKIVaultClient(
+			ctx, cfg, adminVaultClient, logger, metricsRecorder)
+		if err != nil {
+			return fmt.Errorf("creating vault client for webhook cert management: %w", err)
 		}
-		vaultClient = vc
-		logger.Info("vault client created for webhook PKI certificate management",
-			"address", cfg.Vault.Address,
-			"authMethod", cfg.Vault.AuthMethod,
-		)
 	}
+	defer func() {
+		// Error exit before the rotation goroutine took ownership: close the
+		// dedicated client so its token lifecycle watcher is not leaked.
+		if err != nil && ownedVault != nil {
+			ownedVault.Close()
+		}
+	}()
 
 	cm := certmanager.New(directClient, vaultClient, certCfg, logger, metricsRecorder)
 
@@ -759,14 +798,53 @@ func setupWebhookCerts(
 		return fmt.Errorf("injecting CA bundle into webhook configurations: %w", err)
 	}
 
-	// Start background goroutine for certificate rotation.
+	// Start background goroutine for certificate rotation. It owns the
+	// dedicated Vault client (if any) and closes it when rotation stops.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		if ownedVault != nil {
+			defer ownedVault.Close()
+		}
 		runCertRotation(ctx, cm, logger)
 	}()
 
 	return nil
+}
+
+// resolveWebhookPKIVaultClient returns the Vault client used for webhook PKI
+// certificate management (certSource=vault-pki). It reuses the shared admin
+// Vault client when one is wired (operator-level Vault enabled), so a single
+// client instance — and a single token lifecycle watcher — serves both the
+// admin controller and the cert manager. Only when operator-level Vault is
+// disabled (adminVaultClient nil) is a dedicated client constructed; the
+// returned Closer is non-nil exactly in that case and the caller must close
+// it when cert rotation stops.
+func resolveWebhookPKIVaultClient(
+	ctx context.Context,
+	cfg *config.OperatorConfig,
+	adminVaultClient vault.Client,
+	logger *slog.Logger,
+	metricsRecorder metrics.Recorder,
+) (vault.Client, vault.Closer, error) {
+	if adminVaultClient != nil && adminVaultClient.IsEnabled() {
+		logger.Info("reusing shared vault client for webhook PKI certificate management",
+			"address", cfg.Vault.Address,
+			"authMethod", cfg.Vault.AuthMethod,
+		)
+		return adminVaultClient, nil, nil
+	}
+
+	vc, err := vault.NewClient(ctx, buildVaultClientConfig(cfg), logger, metricsRecorder)
+	if err != nil {
+		return nil, nil, err
+	}
+	logger.Info("vault client created for webhook PKI certificate management",
+		"address", cfg.Vault.Address,
+		"authMethod", cfg.Vault.AuthMethod,
+	)
+	closer, _ := vc.(vault.Closer)
+	return vc, closer, nil
 }
 
 // injectCABundle patches ValidatingWebhookConfiguration and MutatingWebhookConfiguration

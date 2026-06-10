@@ -55,15 +55,20 @@ func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 
 		s.metrics.AddAPIRequestsInFlight(1)
 		start := time.Now()
+		// Deferred so the in-flight gauge is decremented and the request is
+		// recorded even when the handler panics (M-3): without the defer, a
+		// panic would leak the gauge upward forever. The recovered panic (if
+		// any) is re-raised by net/http's own recovery after this defer runs;
+		// the status recorded is the one captured before the panic.
+		defer func() {
+			s.metrics.AddAPIRequestsInFlight(-1)
+			s.metrics.RecordAPIRequest(
+				s.routePattern(r),
+				r.Method,
+				strconv.Itoa(rec.status),
+				time.Since(start),
+			)
+		}()
 		next.ServeHTTP(rec, r)
-		duration := time.Since(start)
-		s.metrics.AddAPIRequestsInFlight(-1)
-
-		s.metrics.RecordAPIRequest(
-			s.routePattern(r),
-			r.Method,
-			strconv.Itoa(rec.status),
-			duration,
-		)
 	})
 }

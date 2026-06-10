@@ -29,14 +29,10 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// Write ensures a status is recorded for handlers that write a body without an
-// explicit WriteHeader call (implicit 200 OK).
-func (s *statusRecorder) Write(b []byte) (int, error) {
-	if s.status == 0 {
-		s.status = http.StatusOK
-	}
-	return s.ResponseWriter.Write(b)
-}
+// NOTE: no Write override is needed (L-8): every statusRecorder is
+// constructed with status initialized to http.StatusOK (net/http's implicit
+// default for handlers that write a body without WriteHeader), so the former
+// "status == 0" normalization in Write was dead code.
 
 // Unwrap returns the wrapped ResponseWriter so http.NewResponseController can
 // reach the underlying writer's optional interfaces (Flusher, deadline

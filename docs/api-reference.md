@@ -75,6 +75,10 @@ Authorization: Bearer <JWT token>
 
 The OIDC provider's HTTP client enforces a maximum of 5 redirects during OIDC discovery and token validation. This prevents infinite redirect loops when the identity provider misconfigures its endpoints. If the redirect limit is exceeded, the authentication attempt fails with a `401 UNAUTHORIZED` response.
 
+### OIDC Lazy Discovery
+
+If OIDC discovery fails at operator startup (e.g. the identity provider is briefly unavailable), Bearer authentication is not permanently disabled: the first Bearer request after the IdP recovers re-runs discovery, subject to a 30-second cooldown. Concurrent Bearer requests share a **single** in-flight discovery (singleflight), and each attempt is bounded by a **10-second timeout**, so a burst of requests against an unavailable IdP fails fast together instead of piling up. Successful per-request identity details (username/email/roles) are logged at **Debug** level only.
+
 ### Obtaining a JWT Token
 
 **Via Keycloak (password grant — for testing only):**
@@ -2670,7 +2674,7 @@ The `cloudberry-ctl` CLI enforces a maximum response body size of **10 MiB** (10
 
 Every API request is instrumented:
 
-- **Metrics** — `cloudberry_api_requests_total{route,method,code}`, `cloudberry_api_request_duration_seconds{route,method}`, `cloudberry_api_requests_in_flight`, and `cloudberry_api_rate_limit_rejections_total{route}`. The `route` label is always the matched route **template** (e.g. `/api/v1alpha1/clusters/{name}`), never the raw path, so label cardinality stays bounded.
+- **Metrics** — `cloudberry_api_requests_total{route,method,code}`, `cloudberry_api_request_duration_seconds{route,method}`, `cloudberry_api_requests_in_flight`, and `cloudberry_api_rate_limit_rejections_total{route}`. The `route` label is always the matched route **template** (e.g. `/api/v1alpha1/clusters/{name}`), never the raw path, so label cardinality stays bounded. Recording is **panic-safe**: the in-flight gauge is decremented and the request recorded via `defer`, so a panicking handler can never leak the gauge upward.
 - **Tracing** — when telemetry is enabled, a server span is opened per request and renamed after routing to `<METHOD> <route template>` (raw path preserved in the `http.target` attribute); the span is marked `Error` on HTTP status `>= 400` and inbound W3C trace context is propagated. Handler-level child spans (`auth.*`, `db.*`) nest underneath.
 
 See the [User Guide — Monitoring and Observability](user-guide.md#monitoring-and-observability) for the full metric and span reference.
@@ -2796,6 +2800,7 @@ The annotation is set when an upgrade begins and removed when the upgrade comple
 | `avsoft.io/confirm-scale-in` | Set to `"true"` to confirm a scale-in of more than 50% of segments |
 | `avsoft.io/scale-started` | Managed by operator — RFC 3339 timestamp tracking when a scale operation started. Used for timeout detection (10 minutes). Removed on success or failure |
 | `avsoft.io/upgrade` | Managed by operator — JSON state tracking an in-progress cluster upgrade. Contains previousImage, previousVersion, phase, startedAt, and phaseStartedAt. Used for phase-by-phase upgrade progression and rollback. Removed on success or rollback |
+| `avsoft.io/tls-cert-checksum` | Managed by operator — pod-template annotation on the coordinator/standby/segment StatefulSets carrying a checksum of the cluster TLS certificate Secret data (`auth.ssl.certSecret`). A certificate rotation changes the checksum and rolls the cluster pods exactly once; identical Secret data never triggers a rollout |
 
 ### Status Phases
 
@@ -2836,6 +2841,7 @@ Validates `CloudberryCluster` resources before admission. Enforces:
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
 - `deletionPolicy` is `Retain` or `Delete`
+- `backup.destination.s3.vaultSecret.path` (when set) must be non-empty and must not start with `/`; the explicit KV-v2 request form (`<mount>/data/<rest>`) is accepted with an admission **warning** suggesting the logical path — the operator injects the `data/` segment automatically for KV-v2 mounts
 
 **Duplicate name rejection example:**
 

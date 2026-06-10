@@ -345,8 +345,10 @@ func (s *Scenario72Suite) TestFunctional_Scenario72_JobEnvAndEnvsubst() {
 }
 
 // TestFunctional_Scenario72_JobEnvDefaults asserts the env defaults (1/gzip/1)
-// apply when no gpbackupOptions are configured, and CBDB_DATABASE is empty when
-// no database is requested.
+// apply when no gpbackupOptions are configured, and CBDB_DATABASE defaults to
+// the coordinator maintenance database (postgres) when no database is
+// requested — gpbackup hard-requires --dbname, so the builder always resolves
+// one and the env mirrors the rendered CLI args.
 func (s *Scenario72Suite) TestFunctional_Scenario72_JobEnvDefaults() {
 	cluster := scenario72Cluster("s72-env-default", false)
 	cluster.Spec.Backup.Gpbackup = nil
@@ -357,15 +359,17 @@ func (s *Scenario72Suite) TestFunctional_Scenario72_JobEnvDefaults() {
 	require.NotNil(s.T(), job)
 	container := job.Spec.Template.Spec.Containers[0]
 
-	s.s72AssertPlainEnv(container, "CBDB_DATABASE", "")
+	s.s72AssertPlainEnv(container, "CBDB_DATABASE", "postgres")
 	s.s72AssertPlainEnv(container, "COMPRESSION_LEVEL", "1")
 	s.s72AssertPlainEnv(container, "COMPRESSION_TYPE", "gzip")
 	s.s72AssertPlainEnv(container, "BACKUP_JOBS", "1")
 }
 
 // TestFunctional_Scenario72_CronJobEnv asserts the scheduled CronJob's backup
-// container carries the same informational env, with CBDB_DATABASE empty (the
-// CronJob's databases are resolved at runtime).
+// container carries the same informational env, with CBDB_DATABASE defaulted
+// to the coordinator maintenance database (postgres): the CRD declares no
+// per-schedule database list and gpbackup hard-requires --dbname, so the
+// CronJob renders --dbname postgres and the env mirrors it.
 func (s *Scenario72Suite) TestFunctional_Scenario72_CronJobEnv() {
 	cluster := scenario72Cluster("s72-cron-env", true)
 
@@ -373,7 +377,7 @@ func (s *Scenario72Suite) TestFunctional_Scenario72_CronJobEnv() {
 	require.NotNil(s.T(), cron, "CronJob must be built when a schedule is set")
 	container := cron.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
 
-	s.s72AssertPlainEnv(container, "CBDB_DATABASE", "")
+	s.s72AssertPlainEnv(container, "CBDB_DATABASE", "postgres")
 	s.s72AssertPlainEnv(container, "COMPRESSION_LEVEL", "5")
 	s.s72AssertPlainEnv(container, "COMPRESSION_TYPE", "gzip")
 	s.s72AssertPlainEnv(container, "BACKUP_JOBS", "4")

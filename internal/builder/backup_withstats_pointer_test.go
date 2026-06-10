@@ -30,7 +30,7 @@ func TestBuildGpbackupArgs_WithStatsPointer(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+			args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 				WithStats: tc.withStats,
 			}, nil)
 			joined := strings.Join(args, " ")

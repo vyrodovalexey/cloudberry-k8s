@@ -846,7 +846,7 @@ func TestSetupWebhookCerts_SecretAbsent_GeneratesAndInjects(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{})
+	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 	require.NoError(t, err)
 
 	secret := &corev1.Secret{}
@@ -886,7 +886,7 @@ func TestSetupWebhookCerts_InvalidSecretRegenerated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{})
+	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 	require.NoError(t, err)
 
 	secret := &corev1.Secret{}
@@ -904,7 +904,7 @@ func TestSetupWebhookCerts_DirectClientError(t *testing.T) {
 
 	var wg sync.WaitGroup
 	err := setupWebhookCerts(context.Background(), mgr, webhookCertsConfig(),
-		testLogger(), &wg, &metrics.NoopRecorder{})
+		testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating direct API client")
@@ -926,7 +926,7 @@ func TestSetupWebhookCerts_EnsureCertificatesError(t *testing.T) {
 
 	var wg sync.WaitGroup
 	err := setupWebhookCerts(context.Background(), mgr, webhookCertsConfig(),
-		testLogger(), &wg, &metrics.NoopRecorder{})
+		testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ensuring webhook certificates")
@@ -942,7 +942,7 @@ func TestSetupWebhookCerts_VaultPKIClientError(t *testing.T) {
 	cfg.Vault.Address = "" // enabled-by-source without address → fast failure
 
 	var wg sync.WaitGroup
-	err := setupWebhookCerts(context.Background(), mgr, cfg, testLogger(), &wg, &metrics.NoopRecorder{})
+	err := setupWebhookCerts(context.Background(), mgr, cfg, testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating vault client for webhook cert management")
@@ -961,7 +961,7 @@ func TestSetupWebhookCerts_NamespaceFallsBackToConfigThenDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	err := setupWebhookCerts(ctx, mgr, cfg, testLogger(), &wg, &metrics.NoopRecorder{})
+	err := setupWebhookCerts(ctx, mgr, cfg, testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 	require.NoError(t, err)
 
 	secret := &corev1.Secret{}
@@ -997,7 +997,7 @@ func TestSetupWebhookCerts_InjectCABundleConflictRetried(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{})
+	err := setupWebhookCerts(ctx, mgr, webhookCertsConfig(), testLogger(), &wg, &metrics.NoopRecorder{}, nil)
 
 	require.NoError(t, err, "a single transient CA-injection failure must be retried away")
 	assert.GreaterOrEqual(t, updateCalls, 2, "the failed update must have been retried")

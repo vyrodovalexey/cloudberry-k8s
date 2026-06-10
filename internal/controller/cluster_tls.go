@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -271,6 +272,82 @@ func clusterTLSSecretData(caCert, tlsCert, tlsKey []byte) map[string][]byte {
 		secretKeyTLSCert: tlsCert,
 		secretKeyTLSKey:  tlsKey,
 	}
+}
+
+// clusterPodsMountTLS reports whether the cluster pods mount the TLS cert
+// Secret (auth.ssl enabled with a named certSecret) — the same condition the
+// builder uses to add the TLS volume and init container.
+func clusterPodsMountTLS(cluster *cbv1alpha1.CloudberryCluster) bool {
+	auth := cluster.Spec.Auth
+	return auth != nil && auth.SSL != nil && auth.SSL.Enabled &&
+		auth.SSL.CertSecret != nil && auth.SSL.CertSecret.Name != ""
+}
+
+// tlsSecretChecksum returns the deterministic checksum of the TLS Secret data
+// used for the pod-template rotation annotation. Identical data always yields
+// the identical checksum, so no-op reconciles never change the annotation.
+func tlsSecretChecksum(secret *corev1.Secret) string {
+	strData := make(map[string]string, len(secret.Data))
+	for k, v := range secret.Data {
+		strData[k] = string(v)
+	}
+	return util.ComputeHash(strData)
+}
+
+// applyClusterTLSChecksum stamps the checksum of the cluster TLS certificate
+// Secret onto the StatefulSet pod template (L-5) so the pods roll exactly
+// once per certificate rotation and PostgreSQL reloads the renewed
+// certificate. It is a no-op when SSL is disabled or the Secret does not
+// exist yet (nothing to mount); a transient read error is returned so the
+// reconcile retries instead of silently stripping the annotation.
+func (r *ClusterReconciler) applyClusterTLSChecksum(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	sts *appsv1.StatefulSet,
+) error {
+	if sts == nil || !clusterPodsMountTLS(cluster) {
+		return nil
+	}
+
+	secretName := cluster.Spec.Auth.SSL.CertSecret.Name
+	secret := &corev1.Secret{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: cluster.Namespace,
+	}, secret)
+	switch {
+	case apierrors.IsNotFound(err):
+		// Not issued/provided yet: nothing to stamp (the pods cannot start
+		// without the Secret anyway).
+		return nil
+	case err != nil:
+		return fmt.Errorf("reading cluster TLS secret %s for checksum annotation: %w",
+			secretName, err)
+	}
+
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = make(map[string]string)
+	}
+	sts.Spec.Template.Annotations[util.AnnotationTLSCertChecksum] = tlsSecretChecksum(secret)
+	return nil
+}
+
+// preserveTLSChecksumAnnotation carries a previously stamped TLS cert
+// checksum annotation over to a desired StatefulSet built by a path that does
+// not stamp it (scale-out, mirroring enable): without this, the template
+// comparison would strip the annotation and needlessly roll the pods (L-5).
+func preserveTLSChecksumAnnotation(existing, desired *appsv1.StatefulSet) {
+	if _, stamped := desired.Spec.Template.Annotations[util.AnnotationTLSCertChecksum]; stamped {
+		return
+	}
+	prev, ok := existing.Spec.Template.Annotations[util.AnnotationTLSCertChecksum]
+	if !ok {
+		return
+	}
+	if desired.Spec.Template.Annotations == nil {
+		desired.Spec.Template.Annotations = make(map[string]string)
+	}
+	desired.Spec.Template.Annotations[util.AnnotationTLSCertChecksum] = prev
 }
 
 // recordClusterCertIssuance records the cluster cert issuance metric nil-safely.

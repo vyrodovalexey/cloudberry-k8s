@@ -145,6 +145,12 @@ const (
 	// the Job has not finished, so cluster/namespace deletion can never be
 	// wedged forever by a stuck backup.
 	AnnotationDeletionBackupDeadline = "avsoft.io/deletion-backup-deadline"
+	// AnnotationTLSCertChecksum is the pod-template annotation carrying a
+	// checksum of the cluster TLS certificate Secret data. Stamping it on the
+	// StatefulSet pod templates makes the cluster pods roll exactly once when
+	// the certificate rotates (so PostgreSQL serves the renewed certificate),
+	// while staying stable across no-op reconciles (L-5).
+	AnnotationTLSCertChecksum = "avsoft.io/tls-cert-checksum"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"

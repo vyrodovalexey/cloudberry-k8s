@@ -207,8 +207,13 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 	// Record the reconcile outcome/duration and mark the span on error exactly
 	// once on return. The deferred closure captures the named error so both
 	// success and error paths are recorded (recorder is nil-guarded).
+	// subComponentsErr carries sub-component failures that intentionally do
+	// NOT abort the reconcile (existing aggregation style) but must still be
+	// recorded as result="error" on the reconcile outcome metric (M-2).
+	var subComponentsErr error
 	defer func() {
-		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime, err)
+		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime,
+			errors.Join(err, subComponentsErr))
 		telemetry.SetSpanError(span, err)
 	}()
 
@@ -251,9 +256,12 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 	// Reconcile all sub-components and patch status.
 	// Sub-component errors are non-fatal: they are logged individually and
 	// aggregated here for observability, but do not block the reconcile loop.
+	// The aggregated error IS surfaced on the reconcile outcome metric
+	// (result="error") via subComponentsErr so partial failures are visible.
 	logger.Debug("reconciling sub-components")
 	if subErr := r.reconcileSubComponents(ctx, logger, cluster); subErr != nil {
 		logger.Warn("some sub-components failed to reconcile", "error", subErr)
+		subComponentsErr = subErr
 	}
 
 	// Re-read the current phase from the API server to avoid overwriting phase changes
@@ -1784,8 +1792,10 @@ func s3VaultCredentialFields(vs *cbv1alpha1.S3VaultSecret) (accessKeyField, secr
 // backup/restore Jobs reference a Secret uniformly without embedding plaintext.
 //
 // It is a no-op unless the destination is S3 with a vaultSecret configured. When
-// no Vault client is wired (r.vault == nil) it logs a clear warning and skips,
-// so existing construction with a nil Vault client never panics.
+// no Vault client is wired (r.vault == nil) it emits a Warning Event, logs a
+// clear warning and skips, so existing construction with a nil Vault client
+// never panics. Every failure path emits the BackupVaultCredentialsFailed
+// Warning Event so silently-missing backup credentials are observable (M-2).
 func (r *AdminReconciler) ensureBackupS3VaultCredentials(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -1801,9 +1811,33 @@ func (r *AdminReconciler) ensureBackupS3VaultCredentials(
 			"skipping vault credential materialization",
 			"path", s3.VaultSecret.Path,
 		)
+		r.recorder.Event(cluster, corev1.EventTypeWarning,
+			cbv1alpha1.EventReasonBackupVaultCredentialsFailed,
+			fmt.Sprintf("Backup S3 credentials are configured from Vault path %s but the operator "+
+				"has no enabled Vault client; credential materialization skipped", s3.VaultSecret.Path))
 		return nil
 	}
 
+	if err := r.readAndMaterializeBackupS3VaultCredentials(ctx, cluster, s3, logger); err != nil {
+		r.recorder.Event(cluster, corev1.EventTypeWarning,
+			cbv1alpha1.EventReasonBackupVaultCredentialsFailed,
+			fmt.Sprintf("Failed to materialize backup S3 credentials from Vault: %v", err))
+		return err
+	}
+	return nil
+}
+
+// readAndMaterializeBackupS3VaultCredentials reads the configured Vault path
+// and materializes the credentials Secret. Split out of
+// ensureBackupS3VaultCredentials so the caller can emit the
+// BackupVaultCredentialsFailed Warning Event for every failure path in one
+// place.
+func (r *AdminReconciler) readAndMaterializeBackupS3VaultCredentials(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	s3 *cbv1alpha1.S3Destination,
+	logger *slog.Logger,
+) error {
 	accessKeyField, secretKeyField := s3VaultCredentialFields(s3.VaultSecret)
 	data, err := r.vault.ReadSecret(ctx, s3.VaultSecret.Path)
 	if err != nil {
@@ -2675,9 +2709,19 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 		Duration:  duration,
 	})
 
+	// transitioned mirrors the event gate below (M-1): the backup/restore
+	// COUNTERS increment only when this Job's observed status actually
+	// changed (new Job name or new status), so periodic no-op reconciles of
+	// an unchanged Job do not inflate cloudberry_backup_total /
+	// cloudberry_restore_total. Gauges remain recorded unconditionally — they
+	// are idempotent by definition.
+	transitioned := job.Name != prevJobName || status != prevStatus
+
 	operation := job.Labels[util.LabelBackupOperation]
 	if operation == util.BackupOperationRestore {
-		r.metrics.RecordRestore(cluster.Name, cluster.Namespace, restoreMetricStatus(job, status))
+		if transitioned {
+			r.metrics.RecordRestore(cluster.Name, cluster.Namespace, restoreMetricStatus(job, status))
+		}
 		// Restore failures (e.g. gprestore refusing an incomplete incremental
 		// set, Scenario 78d) are surfaced as a distinct RestoreFailed Warning so
 		// they are observable. The backup-only BackupFailed event semantics
@@ -2686,7 +2730,7 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 		return
 	}
 
-	r.recordLatestBackupMetrics(cluster, job, backupType, timestamp, status)
+	r.recordLatestBackupMetrics(cluster, job, backupType, timestamp, status, transitioned)
 	r.emitBackupFailureEvent(cluster, job, status, prevStatus, prevJobName)
 }
 
@@ -2740,15 +2784,19 @@ func (r *AdminReconciler) emitRestoreFailureEvent(
 }
 
 // recordLatestBackupMetrics wires the spec-11 backup metrics for the latest
-// backup Job: the aggregate backup counter, the last-status gauge, and (on
-// success) the last-success timestamp, typed duration histogram and size gauge.
+// backup Job: the aggregate backup counter (transition-gated, M-1), the
+// last-status gauge, and (on success) the last-success timestamp, typed
+// duration histogram and size gauge.
 func (r *AdminReconciler) recordLatestBackupMetrics(
 	cluster *cbv1alpha1.CloudberryCluster,
 	job *batchv1.Job,
 	backupType, timestamp, status string,
+	transitioned bool,
 ) {
 	name, namespace := cluster.Name, cluster.Namespace
-	r.metrics.RecordBackup(name, namespace, backupType, strings.ToLower(status))
+	if transitioned {
+		r.metrics.RecordBackup(name, namespace, backupType, strings.ToLower(status))
+	}
 
 	switch status {
 	case backupStatusSuccess:

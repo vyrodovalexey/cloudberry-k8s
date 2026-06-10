@@ -260,6 +260,12 @@ const (
 	// execution). It is emitted as an EventTypeWarning, de-duplicated per failed
 	// Job name so periodic reconciles do not re-emit for the same failure.
 	EventReasonBackupFailed = "BackupFailed"
+	// EventReasonBackupVaultCredentialsFailed indicates the operator could not
+	// materialize the backup S3 credentials from the configured Vault path
+	// (Vault read failure, missing fields, or no Vault client wired while
+	// spec.backup.destination.s3.vaultSecret is configured). Emitted as an
+	// EventTypeWarning so silently-skipped backups are observable (M-2).
+	EventReasonBackupVaultCredentialsFailed = "BackupVaultCredentialsFailed"
 	// EventReasonClusterTLSIssued indicates a cluster server certificate was
 	// auto-issued from Vault PKI into the auth.ssl certSecret.
 	EventReasonClusterTLSIssued = "ClusterTLSIssued"
@@ -1344,7 +1350,11 @@ type S3Destination struct {
 
 // S3VaultSecret references a Vault KV path holding S3 credentials.
 type S3VaultSecret struct {
-	// Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+	// Path is the LOGICAL Vault secret path (e.g. secret/cloudberry/backup-s3).
+	// For KV-v2 mounts the operator injects the "data/" request segment
+	// automatically, so the same logical path works for KV-v1 and KV-v2; an
+	// explicit KV-v2 request path (secret/data/cloudberry/backup-s3) is also
+	// accepted for backward compatibility. The path must not start with "/".
 	Path string `json:"path"`
 
 	// AccessKeyField is the Vault key holding the access key id (default aws_access_key_id).

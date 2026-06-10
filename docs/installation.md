@@ -201,7 +201,7 @@ kubectl get mutatingwebhookconfigurations | grep cloudberry
 | `vault.secretPath` | Vault secret path | `secret/data/cloudberry` |
 | `vault.tlsSecretName` | Vault TLS secret name | `""` |
 
-> **Vault token lifecycle**: token renewal and re-authentication are automatic. The operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates (with backoff) when the token reaches the end of its renewable lifetime; a failed background re-auth is additionally recovered reactively on the next Vault read/write. Renewals and re-auths are observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`.
+> **Vault token lifecycle**: token renewal and re-authentication are automatic. The operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates (with backoff) when the token reaches the end of its renewable lifetime; a failed background re-auth is additionally recovered reactively on the next Vault read/write. Re-authentication is **generation-gated**: when a reactive re-login (after a 401/403) already acquired a fresh token, the lifecycle path skips its redundant login — a re-auth storm produces a single re-login. Renewals and re-auths are observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`.
 >
 > **AppRole auth**: with `vault.authMethod=approle`, the operator logs in with `role_id`/`secret_id` (`vault.roleID`/`vault.secretID`, or the `CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID` environment variables). For backward compatibility, an empty `roleID` falls back to `vault.role` and an empty `secretID` falls back to `vault.token`.
 

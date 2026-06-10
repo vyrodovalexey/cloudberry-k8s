@@ -597,6 +597,9 @@ func (r *ClusterReconciler) reconcileCoordinator(
 	if err != nil {
 		return fmt.Errorf("building coordinator StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+		return err
+	}
 	return r.createOrUpdateStatefulSet(ctx, desired)
 }
 
@@ -611,6 +614,9 @@ func (r *ClusterReconciler) reconcileStandby(
 	}
 	if desired == nil {
 		return nil
+	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+		return err
 	}
 	return r.createOrUpdateStatefulSet(ctx, desired)
 }
@@ -650,6 +656,9 @@ func (r *ClusterReconciler) reconcileSegments(
 	if err != nil {
 		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, primarySts); err != nil {
+		return err
+	}
 	// Safety: never scale down replicas via the normal path — scale-in must go
 	// through handleScaleIn to ensure data redistribution and segment deregistration.
 	if getErr == nil && existingSts.Spec.Replicas != nil && primarySts.Spec.Replicas != nil {
@@ -670,6 +679,9 @@ func (r *ClusterReconciler) reconcileSegments(
 	}
 	if mirrorSts == nil {
 		return nil
+	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, mirrorSts); err != nil {
+		return err
 	}
 	r.preserveMirrorReplicasIfNeeded(ctx, mirrorSts, getErr)
 	if err := r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
@@ -1254,6 +1266,11 @@ func (r *ClusterReconciler) createOrUpdateStatefulSet(ctx context.Context, desir
 		return fmt.Errorf("getting statefulset %s: %w", desired.Name, err)
 	}
 
+	// Keep a previously stamped TLS cert checksum annotation when this
+	// desired template was built by a path that does not stamp it, so those
+	// paths never strip the annotation and roll the pods (L-5).
+	preserveTLSChecksumAnnotation(existing, desired)
+
 	// Update if spec changed.
 	if !equality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) ||
 		!equality.Semantic.DeepEqual(existing.Spec.Replicas, desired.Spec.Replicas) {
@@ -1437,7 +1454,10 @@ func (r *ClusterReconciler) triggerBestEffortDeletionBackup(
 ) {
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("triggering best-effort backup before deletion (deletionPolicy: Retain)")
-	timestamp := time.Now().Format(util.BackupTimestampLayout)
+	// Deterministic per-deletion timestamp (L-7): a re-reconcile of the
+	// deletion flow re-derives the same Job name, so the AlreadyExists check
+	// below prevents duplicate best-effort backup Jobs.
+	timestamp := deletionBackupTimestamp(cluster)
 	backupJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceBackupOnDelete, timestamp)
 	if err := r.client.Create(ctx, backupJob); err != nil && !apierrors.IsAlreadyExists(err) {
 		logger.Error("failed to create backup-on-delete job", "error", err)
@@ -1517,8 +1537,22 @@ func (r *ClusterReconciler) ensureDeletionBackupComplete(
 	}
 }
 
+// deletionBackupTimestamp derives the deletion-backup Job timestamp from the
+// cluster's deletionTimestamp (L-7): the value is FIXED once deletion starts,
+// so a re-reconcile after a failed annotation patch derives the SAME Job name
+// and the AlreadyExists-tolerant Create stays idempotent (no duplicate Jobs).
+// The wall clock is only a fallback for the impossible nil case.
+func deletionBackupTimestamp(cluster *cbv1alpha1.CloudberryCluster) string {
+	if ts := cluster.GetDeletionTimestamp(); ts != nil {
+		return ts.UTC().Format(util.BackupTimestampLayout)
+	}
+	return time.Now().UTC().Format(util.BackupTimestampLayout)
+}
+
 // startDeletionBackup creates the deletion-backup Job and stamps the tracking
-// annotations (Job name + RFC3339 deadline) in a single MergePatch.
+// annotations (Job name + RFC3339 deadline) in a single MergePatch. The Job
+// name is deterministic per deletion (derived from deletionTimestamp, L-7) so
+// retries after a failed annotation patch re-adopt the same Job.
 func (r *ClusterReconciler) startDeletionBackup(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -1526,7 +1560,7 @@ func (r *ClusterReconciler) startDeletionBackup(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("creating backup before deletion (deletionPolicy: Delete)")
 
-	timestamp := time.Now().Format(util.BackupTimestampLayout)
+	timestamp := deletionBackupTimestamp(cluster)
 	backupJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceBackupOnDelete, timestamp)
 	if createErr := r.client.Create(ctx, backupJob); createErr != nil &&
 		!apierrors.IsAlreadyExists(createErr) {

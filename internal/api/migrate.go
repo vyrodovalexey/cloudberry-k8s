@@ -151,7 +151,16 @@ func (s *Server) decodeMigrateRequest(w http.ResponseWriter, r *http.Request) (*
 			"sourceCluster and targetCluster must differ")
 		return nil, false
 	}
-	if req.Database != "" && !isValidIdentifier(req.Database) {
+	// The migration backup phase runs gpbackup, which hard-requires --dbname
+	// (`required flag(s) "dbname" not set`): a database-less migration could
+	// only produce a Job that fails at runtime, so reject it up front.
+	if req.Database == "" {
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
+			"database is required: the migration backup phase runs gpbackup, "+
+				"which requires a target database (--dbname)")
+		return nil, false
+	}
+	if !isValidIdentifier(req.Database) {
 		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid database identifier: "+req.Database)
 		return nil, false

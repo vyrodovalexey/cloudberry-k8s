@@ -389,7 +389,7 @@ The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest
 ```
 
 - `type` — `full` (default) or `incremental`; any other value → `400 INVALID_REQUEST`.
-- `databases` — each entry must be a valid identifier (else `400 INVALID_REQUEST`); the first DB drives `--dbname`.
+- `databases` — **required and non-empty** (else `400 INVALID_REQUEST`): `gpbackup` hard-requires a target database (`--dbname`) and the cluster CRD defines no default backup database, so a database-less request could only produce a Job that fails at runtime (`required flag(s) "dbname" not set`). Each entry must be a valid identifier (else `400 INVALID_REQUEST`); the first DB drives `--dbname`. (Scheduled **CronJob** backups, which carry no request body, default the target to the coordinator maintenance database `postgres` — see [Backup & Restore Spec](11-backup-restore-spec.md).)
 - `gpbackupOptions` (`GpbackupOptionsRequest`) — the full field list is mapped in §5.16.
 
 **Response `202`**: `{ "status": "backup started", "cluster": "...", "job": "...", "timestamp": "...", "type": "full" }`.
@@ -398,7 +398,7 @@ The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest
 
 | Request field | gpbackup flag | Notes |
 |---|---|---|
-| `databases[0]` | `--dbname <db>` | First database only |
+| `databases[0]` | `--dbname <db>` | First database only; the request must name at least one database (`400 INVALID_REQUEST` otherwise) |
 | `compressionLevel` (> 0) | `--compression-level <n>` | Skipped when `noCompression` |
 | `compressionType` (`gzip`\|`zstd`) | `--compression-type <t>` | Skipped when `noCompression` |
 | `noCompression` | `--no-compression` | **Precedence** over level/type |
@@ -497,7 +497,7 @@ POST /api/v1alpha1/clusters/src/migrate
 |---|---|---|
 | `sourceCluster` | string | Source cluster name (defaults to the path `{name}`) |
 | `targetCluster` | string | Target cluster name (**required**; must differ from source) |
-| `database` | string | Source database to back up (`gpbackup --dbname`) |
+| `database` | string | Source database to back up (`gpbackup --dbname`) — **required**; an empty value is rejected with `400 INVALID_REQUEST` (the migration backup phase runs `gpbackup`, which hard-requires `--dbname`) |
 | `tables[]` | string[] | Tables → repeated `--include-table` on both `gpbackup` and `gprestore` |
 | `truncate` | bool | Clean target: DROP+recreate the target DB empty before restore (does **not** map to `--truncate-table`) |
 | `redirectDb` | string | `gprestore --redirect-db` on the target |

@@ -280,7 +280,7 @@ func TestBuildGpbackupArgsScenario81(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildGpbackupArgs(tc.cluster, gpOpts, jobOpts)
+			args := mustGpbackupArgs(t, tc.cluster, gpOpts, jobOpts)
 			joined := strings.Join(args, " ")
 			for _, want := range tc.wantContains {
 				assert.Contains(t, joined, want, "args must contain %q", want)
@@ -365,7 +365,7 @@ func TestBuildGprestoreArgsScenario81(t *testing.T) {
 func TestRenderToolScriptScenario81(t *testing.T) {
 	t.Run("local destination skips s3-config render", func(t *testing.T) {
 		cluster := newLocalBackupCluster("/backups", "backup-pvc")
-		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
+		args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
 		})
 		script := renderToolScript(cluster, "gpbackup", args)
@@ -388,7 +388,7 @@ func TestRenderToolScriptScenario81(t *testing.T) {
 
 	t.Run("s3 destination renders the s3 plugin config and execs in the coordinator", func(t *testing.T) {
 		cluster := newBackupCluster()
-		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
+		args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
 		})
 		script := renderToolScript(cluster, "gpbackup", args)
@@ -414,7 +414,7 @@ func TestRenderToolScriptScenario81(t *testing.T) {
 	t.Run("local rendered script is valid bash", func(t *testing.T) {
 		shell := lookupShellScenario81(t)
 		cluster := newLocalBackupCluster("/backups", "backup-pvc")
-		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
+		args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
 		})
 		script := renderToolScript(cluster, "gpbackup", args)

@@ -57,7 +57,7 @@ func TestDropLeadingPluginConfig(t *testing.T) {
 //   - never re-emits the Job-pod /tmp/s3-config.yaml as a tool arg.
 func TestCoordinatorExecScriptShape(t *testing.T) {
 	cluster := newBackupCluster()
-	args := buildGpbackupArgs(cluster, &cbv1alpha1.GpbackupOptions{
+	args := mustGpbackupArgs(t, cluster, &cbv1alpha1.GpbackupOptions{
 		CompressionLevel: 6,
 		Jobs:             4,
 	}, &BackupJobOptions{Databases: []string{"mydb"}})
@@ -115,7 +115,7 @@ func TestCoordinatorExecScriptIsValidBash(t *testing.T) {
 		t.Skip("bash not available; skipping syntax check")
 	}
 	cluster := newBackupCluster()
-	args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup,
+	args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup,
 		&BackupJobOptions{Databases: []string{"my db'with$pecial"}})
 	script := renderToolScript(cluster, "gpbackup", args)
 
@@ -130,7 +130,7 @@ func TestCoordinatorExecScriptIsValidBash(t *testing.T) {
 // spec 11 §Local Backup Destination.
 func TestLocalDestinationStaysInPod(t *testing.T) {
 	cluster := newLocalBackupCluster("/backups", "backup-pvc")
-	args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup,
+	args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup,
 		&BackupJobOptions{Databases: []string{"mydb"}})
 	script := renderToolScript(cluster, "gpbackup", args)
 

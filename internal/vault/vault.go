@@ -328,7 +328,7 @@ func (v *vaultClient) runTokenLifecycle(ctx context.Context) {
 	defer v.watcherWG.Done()
 
 	for {
-		secret, _ := v.currentAuthState()
+		secret, gen := v.currentAuthState()
 		if secret == nil || secret.Auth == nil || !secret.Auth.Renewable {
 			// Nothing to renew: token auth performs no login (the token is
 			// managed externally) and non-renewable leases cannot be extended.
@@ -350,7 +350,17 @@ func (v *vaultClient) runTokenLifecycle(ctx context.Context) {
 		}
 
 		// The token can no longer be renewed — re-authenticate with backoff.
+		// Generation gate (L-1): when a reactive re-auth (maybeReauthOnAuthError
+		// during a Read/Write storm) already acquired a fresh token while the
+		// watcher was draining, skip the redundant lifecycle login and start a
+		// new watcher for the already-current token.
 		v.authMu.Lock()
+		if _, currentGen := v.currentAuthState(); currentGen != gen {
+			v.authMu.Unlock()
+			v.logger.Debug("vault token already re-acquired by reactive re-authentication; " +
+				"skipping redundant lifecycle re-login")
+			continue
+		}
 		reauthErr := v.authenticate(ctx)
 		v.authMu.Unlock()
 		if reauthErr != nil {
@@ -496,7 +506,86 @@ func (v *vaultClient) authenticateAppRole(ctx context.Context) error {
 	return nil
 }
 
-// ReadSecret reads a secret from Vault KV v2.
+// kvV2FallbackPath returns the KV-v2 request path ("<mount>/data/<rest>") for
+// a logical secret path that lacks the "data/" segment after its mount
+// segment, and ok=false when no fallback applies: single-segment paths and
+// paths that already address the KV-v2 data endpoint (no double-injection).
+// Multi-segment secret paths below the mount (e.g. "secret/a/b/c") are
+// preserved verbatim after the injected "data" segment.
+func kvV2FallbackPath(path string) (fallback string, ok bool) {
+	mount, rest, found := strings.Cut(strings.Trim(path, "/"), "/")
+	if !found || mount == "" || rest == "" {
+		return "", false
+	}
+	if rest == "data" || strings.HasPrefix(rest, "data/") {
+		return "", false
+	}
+	return mount + "/data/" + rest, true
+}
+
+// kvV2FallbackApplies reports whether the path is eligible for the KV-v2
+// "data/" injection fallback (see kvV2FallbackPath).
+func kvV2FallbackApplies(path string) bool {
+	_, ok := kvV2FallbackPath(path)
+	return ok
+}
+
+// secretHasData reports whether a logical read returned secret data (Vault
+// answers a 404 with a nil secret and nil error).
+func secretHasData(secret *vaultapi.Secret) bool {
+	return secret != nil && secret.Data != nil
+}
+
+// extractKVData unwraps the KV-v2 "data" envelope, falling back to the raw
+// data map for KV-v1 secrets.
+func extractKVData(secret *vaultapi.Secret) map[string]interface{} {
+	if data, ok := secret.Data["data"].(map[string]interface{}); ok {
+		return data
+	}
+	return secret.Data
+}
+
+// readKVv2Fallback performs the single KV-v2 normalization retry for a
+// not-found OR permission-denied logical read: when the original path lacks
+// the "data/" segment after its mount, the read is retried once against
+// "<mount>/data/<rest>". It returns (nil, nil) when no fallback path applies,
+// so the caller reports the original outcome. The heuristic avoids requiring
+// sys/mounts read permission for real KV-v2 mount detection (R1).
+//
+// Re-authentication semantics: a 401/403 from the FALLBACK read triggers the
+// single generation-gated re-login here — at that point both the verbatim and
+// the normalized path failed, so the 403 is a genuine token problem rather
+// than a path-shape artifact of a least-privilege "<mount>/data/*" policy.
+func (v *vaultClient) readKVv2Fallback(
+	ctx context.Context, path string, observedGen uint64,
+) (*vaultapi.Secret, error) {
+	fallback, ok := kvV2FallbackPath(path)
+	if !ok {
+		return nil, nil
+	}
+	secret, readErr := v.client.Logical().ReadWithContext(ctx, fallback)
+	if readErr != nil {
+		// On 401/403 re-authenticate once (mutex-guarded, generation-gated)
+		// so the next backoff retry uses a fresh token.
+		v.maybeReauthOnAuthError(ctx, observedGen, readErr)
+		return nil, fmt.Errorf("reading secret at %s: %w", fallback, readErr)
+	}
+	if secretHasData(secret) {
+		v.logger.Debug("read KV-v2 secret via normalized data path",
+			"path", path, "requestPath", fallback)
+	}
+	return secret, nil
+}
+
+// ReadSecret reads a secret from Vault. The logical path is read verbatim
+// first (KV-v1 and explicit KV-v2 "data/" paths keep working unchanged); when
+// that read finds nothing — OR is DENIED with 403 — AND the path lacks the
+// "data/" segment after its mount, ONE normalized KV-v2 retry against
+// "<mount>/data/<rest>" is issued, so callers may configure the logical KV-v2
+// path (e.g. "secret/foo") without knowing the engine's request-path layout
+// (H-1a). The 403 case matters under least-privilege policies granting only
+// "<mount>/data/*": the verbatim logical read is denied even though the
+// secret is perfectly readable at the data path (H-1b).
 func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]interface{}, error) {
 	var result map[string]interface{}
 
@@ -511,23 +600,37 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
 		_, gen := v.currentAuthState()
 		secret, readErr := v.client.Logical().ReadWithContext(ctx, path)
-		if readErr != nil {
+		switch {
+		case readErr != nil && isVaultAuthError(readErr) && kvV2FallbackApplies(path):
+			// H-1b: a 403 on the verbatim logical path can be caused purely
+			// by the path SHAPE under a least-privilege KV-v2 policy that
+			// grants only "<mount>/data/*" — not by a bad token. Attempt the
+			// normalized data path BEFORE concluding failure; no re-auth is
+			// issued here (avoiding a re-auth storm for path-shape 403s).
+			// readKVv2Fallback re-authenticates (generation-gated) only when
+			// the fallback read fails too, i.e. when BOTH paths fail and the
+			// 403 is a genuine auth problem.
+			secret, readErr = v.readKVv2Fallback(ctx, path, gen)
+			if readErr != nil {
+				return fmt.Errorf("reading secret at %s: %w", path, readErr)
+			}
+		case readErr != nil:
 			// On 401/403 re-authenticate once (mutex-guarded, generation-
 			// gated) so the next backoff retry uses a fresh token.
 			v.maybeReauthOnAuthError(ctx, gen, readErr)
 			return fmt.Errorf("reading secret at %s: %w", path, readErr)
+		case !secretHasData(secret):
+			// Not found at the verbatim path: try the KV-v2 data path once.
+			secret, readErr = v.readKVv2Fallback(ctx, path, gen)
+			if readErr != nil {
+				return readErr
+			}
 		}
-
-		if secret == nil || secret.Data == nil {
+		if !secretHasData(secret) {
 			return fmt.Errorf("secret not found at path %s", path)
 		}
 
-		// KV v2 wraps data in a "data" key.
-		if data, ok := secret.Data["data"].(map[string]interface{}); ok {
-			result = data
-		} else {
-			result = secret.Data
-		}
+		result = extractKVData(secret)
 		return nil
 	})
 	v.recordVaultOp(vaultOpRead, start, err)

@@ -1799,7 +1799,7 @@ Internally the operator creates **one** Job `<source>-migration-<ts>` (label `av
 |------|------|----------|-------------|
 | `--source-cluster` | string | Yes | Source cluster name |
 | `--target-cluster` | string | Yes | Target cluster name |
-| `--database` | string | No | Database to migrate (`gpbackup --dbname`) |
+| `--database` | string | Yes (server-enforced) | Database to migrate (`gpbackup --dbname`). The migration backup phase runs `gpbackup`, which hard-requires `--dbname`, so the API rejects a database-less request with `400 INVALID_REQUEST` |
 | `--tables` | string | No | Comma-separated tables → repeated `--include-table` on both tools |
 | `--truncate` | bool | No | Clean target: DROP+recreate the target DB empty before restore |
 | `--redirect-db` | string | No | `gprestore --redirect-db` on the target |

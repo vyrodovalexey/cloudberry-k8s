@@ -262,11 +262,14 @@ func (s *Scenario88BackupDisabledIntegrationSuite) TestIntegration_Scenario88_Di
 // TestIntegration_Scenario88_EnabledEmptyScheduleCreate202 proves on-demand
 // backup works WITHOUT a schedule: the create returns 202 and the named backup
 // Job (read FROM the envelope's "job" field) actually exists in the fake client
-// with the operation=backup label.
+// with the operation=backup label. The request must name at least one target
+// database: gpbackup hard-requires --dbname, and a database-less request is
+// now rejected up front with 400 INVALID_REQUEST (see
+// TestIntegration_Scenario88_EnabledCreateNoDatabases400).
 func (s *Scenario88BackupDisabledIntegrationSuite) TestIntegration_Scenario88_EnabledEmptyScheduleCreate202() {
 	s.boot(scenario88IntBuildCluster(scenario88IntCluster, false, true, ""))
 	resp, err := s.cli.Post(s.ctx, scenario88IntPath(scenario88IntCluster, "/backups"),
-		map[string]interface{}{})
+		map[string]interface{}{"databases": []string{"postgres"}})
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 202, resp.StatusCode)
 	assert.Equal(s.T(), "backup started", resp.Body["status"])
@@ -277,6 +280,20 @@ func (s *Scenario88BackupDisabledIntegrationSuite) TestIntegration_Scenario88_En
 	job := s.getJob(jobName)
 	assert.Equal(s.T(), util.BackupOperationBackup, job.Labels[util.LabelBackupOperation],
 		"the on-demand Job must carry the operation=backup label")
+}
+
+// --- 88b-2 guard: enabled POST /backups without databases => 400 INVALID_REQUEST ---
+
+// TestIntegration_Scenario88_EnabledCreateNoDatabases400 pins the cycle-2
+// validation: an enabled cluster still rejects a database-less create request
+// with 400 INVALID_REQUEST because gpbackup hard-requires --dbname and the
+// cluster defines no default backup database.
+func (s *Scenario88BackupDisabledIntegrationSuite) TestIntegration_Scenario88_EnabledCreateNoDatabases400() {
+	s.boot(scenario88IntBuildCluster(scenario88IntCluster, false, true, ""))
+	code, body := s.rawRequest(http.MethodPost, scenario88IntCluster, "/backups", `{}`)
+	assert.Equal(s.T(), 400, code)
+	assert.Contains(s.T(), body, "INVALID_REQUEST")
+	assert.Contains(s.T(), body, "at least one database must be specified")
 }
 
 // --- 88b-4: enabled + empty schedule GET /backups/schedule => scheduled:false, enabled:true ---

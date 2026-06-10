@@ -12,6 +12,7 @@ import (
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
@@ -197,7 +198,9 @@ func (p *OIDCProvider) Authenticate(ctx context.Context, r *http.Request) (*Iden
 	// Map roles to permission level.
 	identity.Permission = p.resolvePermission(roles)
 
-	p.logger.Info("OIDC auth succeeded",
+	// Debug level (L-4): per-request identity details (username/email/roles)
+	// are PII and high-volume; they must not land in production Info logs.
+	p.logger.Debug("OIDC auth succeeded",
 		"username", identity.Username,
 		"email", identity.Email,
 		"roles", roles,
@@ -366,12 +369,20 @@ func (p *OIDCProvider) GetOAuth2Config() *oauth2.Config {
 // IdP while it is unavailable.
 const defaultOIDCInitCooldown = 30 * time.Second
 
+// defaultOIDCDiscoveryTimeout bounds a single lazy discovery attempt so
+// request-path callers waiting on the shared singleflight discovery are never
+// blocked behind the HTTP client's full 30s dial budget (L-3).
+const defaultOIDCDiscoveryTimeout = 10 * time.Second
+
 // LazyOIDCProvider is an auth.Provider that initializes the underlying
 // OIDCProvider lazily. When discovery fails at operator startup (e.g.
 // Keycloak is briefly unavailable), Bearer auth is NOT permanently disabled:
 // the first Bearer request after the IdP recovers re-runs discovery (subject
 // to a cooldown) and authentication starts working without a pod restart.
-// Concurrent first requests trigger a single in-flight discovery (mutex).
+// Concurrent first requests share a SINGLE in-flight discovery (singleflight,
+// L-3): the mutex guards state only and is never held during the network
+// call, and every waiter fails fast together when the bounded discovery
+// (discoveryTimeout) errors or times out.
 type LazyOIDCProvider struct {
 	cfg    OIDCConfig
 	logger *slog.Logger
@@ -379,6 +390,12 @@ type LazyOIDCProvider struct {
 	// token-verification latency (propagated to the inner provider). Nil-safe.
 	recorder metrics.Recorder
 
+	// sf collapses concurrent discovery attempts into one upstream call.
+	sf singleflight.Group
+	// discoveryTimeout bounds a single discovery attempt.
+	discoveryTimeout time.Duration
+
+	// mu guards provider/lastAttempt only; it is NOT held across network I/O.
 	mu          sync.Mutex
 	provider    *OIDCProvider
 	lastAttempt time.Time
@@ -398,9 +415,10 @@ func NewLazyOIDCProvider(
 		logger = slog.Default()
 	}
 	p := &LazyOIDCProvider{
-		cfg:      cfg,
-		logger:   logger,
-		cooldown: defaultOIDCInitCooldown,
+		cfg:              cfg,
+		logger:           logger,
+		cooldown:         defaultOIDCInitCooldown,
+		discoveryTimeout: defaultOIDCDiscoveryTimeout,
 	}
 	if len(recorder) > 0 {
 		p.recorder = recorder[0]
@@ -424,21 +442,56 @@ func (p *LazyOIDCProvider) Initialized() bool {
 }
 
 // getProvider returns the initialized provider, performing discovery when
-// needed. The mutex guarantees a single in-flight discovery; the cooldown
-// (skipped when ignoreCooldown is set) prevents hammering an unavailable IdP.
+// needed. State checks happen under the mutex; the discovery network call
+// itself runs OUTSIDE the lock inside a singleflight group, so concurrent
+// callers share one bounded upstream attempt instead of serializing behind
+// it (L-3). The cooldown (skipped when ignoreCooldown is set) prevents
+// hammering an unavailable IdP.
 func (p *LazyOIDCProvider) getProvider(ctx context.Context, ignoreCooldown bool) (*OIDCProvider, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.provider != nil {
-		return p.provider, nil
+		provider := p.provider
+		p.mu.Unlock()
+		return provider, nil
 	}
 	if !ignoreCooldown && time.Since(p.lastAttempt) < p.cooldown {
+		p.mu.Unlock()
 		return nil, fmt.Errorf("OIDC provider initialization is cooling down after a recent failure")
 	}
+	p.mu.Unlock()
 
+	v, err, _ := p.sf.Do("oidc-discovery", func() (interface{}, error) {
+		return p.discoverProvider(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	provider, ok := v.(*OIDCProvider)
+	if !ok || provider == nil {
+		return nil, fmt.Errorf("OIDC discovery returned no provider")
+	}
+	return provider, nil
+}
+
+// discoverProvider performs one bounded OIDC discovery attempt and publishes
+// the result. It runs inside the singleflight group: exactly one goroutine
+// executes it per burst of concurrent callers. A successful concurrent
+// initialization is re-checked first so a duplicate discovery is never
+// issued.
+func (p *LazyOIDCProvider) discoverProvider(ctx context.Context) (*OIDCProvider, error) {
+	p.mu.Lock()
+	if p.provider != nil {
+		provider := p.provider
+		p.mu.Unlock()
+		return provider, nil
+	}
 	p.lastAttempt = time.Now()
-	provider, err := NewOIDCProvider(ctx, p.cfg, p.logger)
+	p.mu.Unlock()
+
+	discoveryCtx, cancel := context.WithTimeout(ctx, p.discoveryTimeout)
+	defer cancel()
+
+	provider, err := NewOIDCProvider(discoveryCtx, p.cfg, p.logger)
 	p.recordDiscovery(err)
 	if err != nil {
 		p.logger.Warn("lazy OIDC provider initialization failed; will retry after cooldown",
@@ -447,7 +500,9 @@ func (p *LazyOIDCProvider) getProvider(ctx context.Context, ignoreCooldown bool)
 	}
 
 	provider.SetRecorder(p.recorder)
+	p.mu.Lock()
 	p.provider = provider
+	p.mu.Unlock()
 	p.logger.Info("OIDC provider initialized lazily", "issuer", p.cfg.IssuerURL)
 	return provider, nil
 }

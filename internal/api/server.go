@@ -180,13 +180,16 @@ type Server struct {
 	// clientset is the typed Kubernetes clientset used for operations that the
 	// controller-runtime client cannot perform, such as streaming pod logs.
 	// It may be nil in test/non-live setups; handlers must guard against nil.
-	clientset     kubernetes.Interface
-	authMW        *auth.AuthMiddleware
-	rateLimiter   *RateLimiter
-	dbFactory     db.DBClientFactory
-	credStore     *auth.InMemoryCredentialStore
-	metrics       metrics.Recorder
-	builder       *builder.DefaultBuilder
+	clientset   kubernetes.Interface
+	authMW      *auth.AuthMiddleware
+	rateLimiter *RateLimiter
+	dbFactory   db.DBClientFactory
+	credStore   *auth.InMemoryCredentialStore
+	metrics     metrics.Recorder
+	// builder is the ResourceBuilder interface (not the concrete
+	// DefaultBuilder) so handler-level guards (e.g. a nil backup Job from a
+	// builder that refuses to render a broken command) stay testable.
+	builder       builder.ResourceBuilder
 	logger        *slog.Logger
 	mux           *http.ServeMux
 	monitorStates map[string]*monitorState // key: "namespace/cluster"
@@ -3367,6 +3370,9 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
+	if !requireBackupDatabase(w, req.Databases) {
+		return
+	}
 	if !validateBackupDatabases(w, req.Databases) {
 		return
 	}
@@ -3382,6 +3388,15 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	opts := buildBackupJobOptions(cluster, &req, backupType, timestamp)
 
 	job := s.builder.BuildBackupJob(cluster, opts)
+	if job == nil {
+		// Defense in depth: the builder refuses to render a broken gpbackup
+		// command (e.g. no resolvable --dbname) instead of returning a Job
+		// that fails at runtime.
+		s.logger.Error("builder returned no backup job", "cluster", name)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to build backup job")
+		return
+	}
 	if createErr := s.k8sClient.Create(ctx, job); createErr != nil {
 		s.logger.Error("failed to create backup job", "cluster", name, "error", createErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create backup job")

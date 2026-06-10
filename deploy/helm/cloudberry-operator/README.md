@@ -159,7 +159,7 @@ The following configuration options were added or updated in the latest release:
 
 **Configuration precedence** (highest wins): environment variable > command-line flag > config file > default. The environment always wins, even over an explicitly set flag.
 
-**Vault token lifecycle**: Vault token renewal and re-authentication are automatic — the operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates when the token can no longer be renewed (observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`). No manual token rotation is required for `kubernetes` or `approle` auth.
+**Vault token lifecycle**: Vault token renewal and re-authentication are automatic — the operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates when the token can no longer be renewed (observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`). Re-authentication is **generation-gated**: when a reactive re-login (after a 401/403 burst) already acquired a fresh token, the lifecycle path skips its redundant login — a re-auth storm produces one re-login, not many. When both `vault.enabled=true` and `webhook.certSource=vault-pki` are set, the webhook PKI cert manager **reuses the shared Vault client** (one client, one token lifecycle). No manual token rotation is required for `kubernetes` or `approle` auth.
 
 ### Webhook Configuration Notes
 
@@ -437,7 +437,10 @@ When a `CloudberryCluster` enables both `spec.vault.enabled: true` and `spec.aut
 - The Secret is **generic (Opaque)** with `tls.crt`, `tls.key`, **and** `ca.crt` (the cluster's `init-tls` container requires the CA)
 - Operator-issued certificates are renewed in place once 2/3 of their lifetime has elapsed
 - A pre-existing (user-provided) Secret is **never modified**
+- Certificate rotation stamps the **`avsoft.io/tls-cert-checksum`** annotation on the cluster pod templates, so TLS-enabled cluster pods **roll automatically exactly once** per rotation (PostgreSQL serves the renewed certificate without manual restarts)
 - Events `ClusterTLSIssued`/`ClusterTLSRenewed`/`ClusterTLSFailed` and the metric `cloudberry_cluster_cert_issuance_total{cluster,namespace,result}` report the outcomes
+
+> **Upgrade note (one-time rollout)**: the first reconcile after upgrading to an operator version that stamps `avsoft.io/tls-cert-checksum` adds the annotation to existing TLS-enabled pod templates, triggering a **one-time rolling restart** of those cluster pods. Subsequent reconciles do not roll pods until the certificate actually changes.
 
 See the [User Guide](../../docs/user-guide.md#automatic-cluster-tls-issuance-from-vault-pki) for details.
 

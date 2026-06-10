@@ -737,7 +737,7 @@ spec:
 ```
 
 The backup Job:
-- **Name**: `{cluster}-maintenance-{timestamp}` with `backup-on-delete` in the name
+- **Name**: `{cluster}-maintenance-{timestamp}` with `backup-on-delete` in the name. The timestamp is **deterministic** — derived from the cluster's `deletionTimestamp` (UTC), not the wall clock — so a re-reconcile of the deletion flow derives the **same** Job name and the create is idempotent (no duplicate deletion-backup Jobs)
 - **Operation**: `backup-on-delete` (maps to `gpbackup` in production Cloudberry)
 - **Labels**: `avsoft.io/cluster={cluster}`, `avsoft.io/operation=backup-on-delete`
 - **Properties**: Same as other maintenance Jobs (`BackoffLimit=1`, `TTLSecondsAfterFinished=3600`)
@@ -820,6 +820,8 @@ The test environment setup scripts create everything needed:
 - **Vault S3 credentials** — `test/docker-compose/scripts/setup-vault-k8s-auth.sh` seeds the S3 credentials at the Vault KV path `secret/data/cloudberry/backup-s3`. At reconcile time the operator reads this path and materializes the Secret `<cluster>-backup-s3-vault-creds` for the Vault variant.
 
 These run as part of `make test-env-setup`.
+
+> **Vault path forms (KV-v2 logical paths).** `vaultSecret.path` takes the **logical** KV path (e.g. `secret/cloudberry/backup-s3`) — for KV-v2 mounts the operator injects the `data/` request segment automatically, including under **least-privilege policies** that grant only `secret/data/*` (a 403 on the verbatim logical path triggers a single fallback read of the `data/` path, with no re-authentication storm). The explicit `secret/data/...` form used by the test environment above is still accepted for backward compatibility; the validating webhook responds with a **warning** suggesting the logical form. An empty path or a leading `/` is rejected at admission. If the operator cannot materialize the credentials (Vault read failure, missing fields, or no enabled Vault client), it emits a **Warning** Event with reason **`BackupVaultCredentialsFailed`** on the cluster and the reconcile outcome metric records `result="error"`.
 
 ### Apply the Cluster CR
 
@@ -1019,6 +1021,8 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario76-sched
 
 **CronJob spec.** The operator creates `{cluster}-backup-schedule` (here `scenario76-backup-schedule`) with `ownerReferences` → the `CloudberryCluster`, `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit: 3`, `failedJobsHistoryLimit: 3`, and a `jobTemplate` whose pod `restartPolicy` is `Never`. When the CronJob fires, Kubernetes spawns a Job `{cluster}-backup-schedule-<hash>`.
 
+> **Scheduled-backup target database.** `gpbackup` hard-requires `--dbname` and the CRD declares no per-schedule database field, so scheduled (CronJob) backups target the **coordinator maintenance database (`postgres`)** by default; the `CBDB_DATABASE` env on the CronJob container mirrors the rendered `--dbname`. On-demand backups are stricter: `POST /clusters/{name}/backups` **requires** a non-empty `databases` array (`400 INVALID_REQUEST` otherwise), so user-facing requests are always explicit.
+
 > **Near-future schedule for testing.** The sample CR ships the production schedule `0 2 * * *` (daily at 02:00). The live test (`test/e2e/scripts/scenario76-scheduled-backup.sh`) overrides it to `*/2 * * * *` via `kubectl patch --type=merge` so the CronJob fires within ~2 minutes; the operator then reconciles the CronJob's schedule accordingly.
 
 **Status populated after a successful backup.** After the backup Job succeeds, the operator populates `status.backup`:
@@ -1214,7 +1218,8 @@ supply the full backup's 14-digit timestamp. On-demand via the API/CLI:
 ```bash
 # API: pin this incremental to the full backup at 20260518020000
 curl -X POST .../clusters/scenario78-s3/backups \
-  -d '{"type":"incremental","gpbackupOptions":{"fromTimestamp":"20260518020000"}}'
+  -d '{"type":"incremental","databases":["mydb"],
+       "gpbackupOptions":{"fromTimestamp":"20260518020000"}}'
 ```
 
 The incremental is then based on `20260518020000` **even if** a more-recent compatible
@@ -1890,12 +1895,12 @@ metric. All nine metrics share the `cluster` and `namespace` labels.
 
 | Metric | Type | Extra labels | Meaning |
 |--------|------|--------------|---------|
-| `cloudberry_backup_total` | Counter | `type`, `result` | Total backups. `type` is `full` or `incremental`; **`result`** is `success` or `failed`. |
+| `cloudberry_backup_total` | Counter | `type`, `result` | Total backups. `type` is `full` or `incremental`; **`result`** is `success` or `failed`. Transition-gated: one increment per observed Job state change. |
 | `cloudberry_backup_duration_seconds` | Histogram | `type` | Backup duration per `type` (use the `_count`/`_bucket`/`_sum` series). |
 | `cloudberry_backup_size_bytes` | Gauge | `timestamp` | Size in bytes of the backup with that 14-digit `YYYYMMDDHHMMSS` timestamp. |
 | `cloudberry_backup_last_success_timestamp` | Gauge | — | Unix time of the last successful backup (alert when `time() - <value>` grows too large). |
 | `cloudberry_backup_last_status` | Gauge | — | Latest backup status: **`0`=success, `1`=failed, `2`=in-progress**. |
-| `cloudberry_restore_total` | Counter | `result` | Total restores. **`result`** is `success` or `failed`. |
+| `cloudberry_restore_total` | Counter | `result` | Total restores. **`result`** is `success` or `failed`. Transition-gated: one increment per observed Job state change. |
 | `cloudberry_restore_duration_seconds` | Histogram | — | Restore duration distribution. |
 | `cloudberry_backup_retention_deleted_total` | Counter | — | Backups deleted by retention cleanup (read as a monotonic increase). |
 | `cloudberry_backup_job_status` | Gauge | `job`, `operation` | Per-Job status: **`0`=pending, `1`=running, `2`=succeeded, `3`=failed**. `operation` is `backup`, `restore`, or `cleanup`. |
@@ -1905,6 +1910,13 @@ metric. All nine metrics share the `cluster` and `namespace` labels.
 > with `{result="success"}` / `{result="failed"}`. (The `cloudberry_backup_last_status` and
 > `cloudberry_backup_job_status` gauges encode their outcome as a numeric **value** — the
 > `0/1/2` and `0/1/2/3` codes above — not as a label.)
+
+> **Counters are transition-gated.** `cloudberry_backup_total` and
+> `cloudberry_restore_total` increment **once per actual state change** of the observed
+> backup/restore Job (a new Job name or a new Job status) — periodic no-op reconciles of
+> an unchanged Job do not re-increment them. `rate()`/`increase()` queries and alerts on
+> these counters therefore count real operations, not reconcile passes. The gauges remain
+> recorded on every reconcile (idempotent).
 
 #### Label and code reference
 
@@ -2009,8 +2021,10 @@ curl -sk -H "Authorization: Bearer $TOKEN" "$API/backups$NS"
 #### Create a backup
 
 `POST /backups` (Operator). The request merges per-request `gpbackupOptions` over the
-cluster defaults and creates a Job directly. `type` is `full` (default) or `incremental`;
-`databases[0]` drives `--dbname`.
+cluster defaults and creates a Job directly. `type` is `full` (default) or `incremental`.
+`databases` is **required and must be non-empty** (`400 INVALID_REQUEST` otherwise) —
+`gpbackup` hard-requires a target database (`--dbname`) and the cluster defines no default
+backup database; `databases[0]` drives `--dbname`.
 
 ```bash
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" \
@@ -2279,7 +2293,7 @@ under the coordinator-exec model:
 |------|--------|
 | `--source-cluster` | Source cluster name (**required**) |
 | `--target-cluster` | Target cluster name (**required**) |
-| `--database` | Database to migrate (`gpbackup --dbname`) |
+| `--database` | Database to migrate (`gpbackup --dbname`) — **required**; the API rejects a database-less migration with `400 INVALID_REQUEST` (the backup phase runs `gpbackup`, which hard-requires `--dbname`) |
 | `--tables` | Comma-separated tables → repeated `--include-table` on both tools |
 | `--truncate` | Clean target: DROP+recreate the target DB empty before restore |
 | `--redirect-db` | `gprestore --redirect-db` on the target |
@@ -3041,9 +3055,12 @@ When a cluster CR has **both** `vault.enabled: true` and `auth.ssl.enabled: true
 - The certificate Common Name is `<cluster>.<namespace>.svc.cluster.local`, with DNS SANs covering the coordinator/standby/segment headless Services (including `*.<svc>` wildcards for per-pod FQDNs) and the client Service.
 - Operator-issued certificates are **renewed during reconcile** once 2/3 of their lifetime has elapsed (the same rotation policy as webhook certs).
 - A Secret that **already exists** (user-provided) is **never modified** by the operator.
+- **Pods roll automatically on rotation.** For every TLS-enabled cluster (`auth.ssl.enabled` with a named `certSecret`), the coordinator/standby/segment StatefulSet pod templates carry the **`avsoft.io/tls-cert-checksum`** annotation — a checksum of the TLS Secret data. When the certificate rotates (operator renewal or a user update to the Secret), the checksum changes and the cluster pods **roll exactly once**, so PostgreSQL serves the renewed certificate without manual restarts. The checksum is stable across no-op reconciles, and reconcile paths that don't recompute it preserve the existing annotation (no spurious rollouts).
 - Observability: `cloudberry_cluster_cert_issuance_total{cluster,namespace,result}` counts issuances/renewals, the `controller.clusterTLS` span traces the reconcile step, and `ClusterTLSIssued` / `ClusterTLSRenewed` / `ClusterTLSFailed` Events are emitted on the cluster.
 
 The Vault PKI role must permit the cluster DNS SANs (including wildcard subdomains, e.g. `allowed_domains="svc.cluster.local" allow_subdomains=true allow_glob_domains=true`).
+
+> **Upgrade note (one-time rollout).** The first reconcile after upgrading to an operator version that stamps `avsoft.io/tls-cert-checksum` adds the annotation to existing TLS-enabled pod templates, triggering a **one-time rolling restart** of those cluster pods. Subsequent reconciles are no-ops until the certificate actually changes.
 
 #### Issuing the cluster TLS Secret from Vault PKI
 
@@ -6349,12 +6366,12 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_workload_rule_actions_total` | Counter | Workload rule actions applied (labels: `cluster`, `namespace`, `rule`, `action`) |
 | `cloudberry_maintenance_operations_total` | Counter | Maintenance operations (vacuum, analyze, reindex, log-rotate). Labels: `cluster`, `namespace`, `operation`, `result` (`started`, `success`, `failed`) |
 | `cloudberry_disk_usage_bytes` | Gauge | Per-database disk usage in bytes, set on the disk-usage API (labels: `cluster`, `namespace`, `database`) |
-| `cloudberry_backup_total` | Counter | Backup operations by type and outcome (labels: `cluster`, `namespace`, `type` = `full`/`incremental`, `result` = `success`/`failed`). See [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84) |
+| `cloudberry_backup_total` | Counter | Backup operations by type and outcome (labels: `cluster`, `namespace`, `type` = `full`/`incremental`, `result` = `success`/`failed`). Transition-gated: one increment per observed Job state change, so `rate()` and alerts count real operations. See [Backup/Restore Metrics (Scenario 84)](#backuprestore-metrics-scenario-84) |
 | `cloudberry_backup_duration_seconds` | Histogram | Backup duration per `type` (labels: `cluster`, `namespace`, `type`) |
 | `cloudberry_backup_size_bytes` | Gauge | Backup size in bytes per 14-digit timestamp (labels: `cluster`, `namespace`, `timestamp`) |
 | `cloudberry_backup_last_success_timestamp` | Gauge | Unix time of the last successful backup (labels: `cluster`, `namespace`) |
 | `cloudberry_backup_last_status` | Gauge | Latest backup status: `0`=success, `1`=failed, `2`=in-progress (labels: `cluster`, `namespace`) |
-| `cloudberry_restore_total` | Counter | Restore operations by outcome (labels: `cluster`, `namespace`, `result` = `success`/`failed`) |
+| `cloudberry_restore_total` | Counter | Restore operations by outcome (labels: `cluster`, `namespace`, `result` = `success`/`failed`). Transition-gated: one increment per observed Job state change |
 | `cloudberry_restore_duration_seconds` | Histogram | Restore duration distribution (labels: `cluster`, `namespace`) |
 | `cloudberry_backup_retention_deleted_total` | Counter | Backups deleted by retention cleanup (labels: `cluster`, `namespace`) |
 | `cloudberry_backup_job_status` | Gauge | Per-Job backup status: `0`=pending, `1`=running, `2`=succeeded, `3`=failed (labels: `cluster`, `namespace`, `job`, `operation` = `backup`/`restore`/`cleanup`) |
@@ -6371,7 +6388,7 @@ Every REST API request is recorded by a metrics middleware. The `route` label is
 |--------|------|--------|-------------|
 | `cloudberry_api_requests_total` | Counter | `route`, `method`, `code` | REST API requests by route template, method, and HTTP status code |
 | `cloudberry_api_request_duration_seconds` | Histogram | `route`, `method` | REST API request duration |
-| `cloudberry_api_requests_in_flight` | Gauge | — | Requests currently being served |
+| `cloudberry_api_requests_in_flight` | Gauge | — | Requests currently being served. Panic-safe: the gauge is decremented (and the request recorded) even when a handler panics, so it can never leak upward |
 | `cloudberry_api_rate_limit_rejections_total` | Counter | `route` | Requests rejected by the per-IP rate limiter (HTTP 429) |
 | `cloudberry_migrate_operations_total` | Counter | `result` | Cross-cluster migrate operations (`started`/`error`) |
 | `cloudberry_api_cluster_operations_total` | Counter | `operation`, `result` | Cluster create/delete operations via the API |
