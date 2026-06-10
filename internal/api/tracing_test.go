@@ -39,7 +39,10 @@ func TestTracingMiddleware_CreatesSpan(t *testing.T) {
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	span := spans[0]
-	assert.Equal(t, "GET /api/v1alpha1/clusters/foo", span.Name())
+	// D-1: the span is named by the matched ROUTE TEMPLATE, not the raw path,
+	// so two different cluster names produce one span name (bounded
+	// cardinality). The raw path remains in http.target.
+	assert.Equal(t, "GET /api/v1alpha1/clusters/{name}", span.Name())
 	// A 404 response must mark the span as an error.
 	assert.Equal(t, "Error", span.Status().Code.String())
 }

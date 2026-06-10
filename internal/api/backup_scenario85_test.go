@@ -36,7 +36,7 @@ func newTestServerWithInterceptor(funcs interceptor.Funcs, objs ...client.Object
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 }
 
 // fetchJobScript fetches the named Job from the server's fake client and returns

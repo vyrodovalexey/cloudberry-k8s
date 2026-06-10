@@ -3992,8 +3992,8 @@ func Scenario70DefaultsCases() []Scenario70DefaultsCase {
 		{
 			ID: "70g", Name: "gprestore_with_stats",
 			Field:       "backup.gprestore.withStats",
-			Expected:    "true",
-			Description: "gprestore.withStats defaults to true when unset",
+			Expected:    "false",
+			Description: "gprestore.withStats defaults to false when unset (statistics restore is opt-in: gprestore exits 2 on the upstream statistics.sql bug)",
 		},
 		{
 			ID: "70h", Name: "retention_full_count",

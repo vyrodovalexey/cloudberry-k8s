@@ -86,6 +86,7 @@ func (m *mockDBClient) GetDiskUsage(_ context.Context, _ string) ([]db.DiskUsage
 }
 func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) { return 0, nil }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error             { return nil }
+func (m *mockDBClient) GetMaxConnections(_ context.Context) (int32, error) { return 100, nil }
 func (m *mockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return 0, 0, 0, nil
 }
@@ -738,7 +739,7 @@ func TestScanAndEnforce_TerminatesIdleSession(t *testing.T) {
 		{Name: "etl-idle", Enabled: true, ResourceGroup: "etl_group", IdleTimeout: time.Minute},
 	})
 
-	err := d.scanAndEnforce(context.Background())
+	_, _, err := d.scanAndEnforce(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -783,7 +784,7 @@ func TestScanAndEnforce_SkipsActiveSession(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -818,7 +819,7 @@ func TestScanAndEnforce_ExcludesInTransaction(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute, ExcludeInTransaction: true},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -853,7 +854,7 @@ func TestScanAndEnforce_TerminatesInTransactionWhenNotExcluded(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute, ExcludeInTransaction: false},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -889,7 +890,7 @@ func TestScanAndEnforce_MatchesResourceGroup(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "target_group", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -921,7 +922,7 @@ func TestScanAndEnforce_SkipsDisabledRule(t *testing.T) {
 		{Name: "disabled-rule", Enabled: false, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -961,7 +962,7 @@ func TestScanAndEnforce_MultipleRulesMultipleSessions(t *testing.T) {
 		{Name: "rule-b", Enabled: true, ResourceGroup: "group_b", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1000,7 +1001,7 @@ func TestScanAndEnforce_DBListError(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	err := d.scanAndEnforce(context.Background())
+	_, _, err := d.scanAndEnforce(context.Background())
 	if err == nil {
 		t.Fatal("expected error from DB list failure")
 	}
@@ -1033,7 +1034,7 @@ func TestScanAndEnforce_DBTerminateError(t *testing.T) {
 	})
 
 	// Should not return error — terminate errors are logged but don't stop the scan.
-	err := d.scanAndEnforce(context.Background())
+	_, _, err := d.scanAndEnforce(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1060,7 +1061,7 @@ func TestScanAndEnforce_NoRules(t *testing.T) {
 	})
 	// No rules set.
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1082,7 +1083,7 @@ func TestScanAndEnforce_NoSessions(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1115,7 +1116,7 @@ func TestScanAndEnforce_RecordsMetric(t *testing.T) {
 		{Name: "idle-rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1156,7 +1157,7 @@ func TestScanAndEnforce_EmptyResourceGroupSession(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "specific_group", IdleTimeout: time.Minute},
 	})
 
-	if err := d.scanAndEnforce(context.Background()); err != nil {
+	if _, _, err := d.scanAndEnforce(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1501,7 +1502,7 @@ func TestScanAndEnforce_TerminateReturnsFalse(t *testing.T) {
 		{Name: "rule", Enabled: true, ResourceGroup: "grp", IdleTimeout: time.Minute},
 	})
 
-	err := d.scanAndEnforce(context.Background())
+	_, _, err := d.scanAndEnforce(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1535,7 +1536,7 @@ func TestScanAndEnforce_NilMetrics(t *testing.T) {
 	})
 
 	// Should not panic with nil metrics.
-	err := d.scanAndEnforce(context.Background())
+	_, _, err := d.scanAndEnforce(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

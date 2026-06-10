@@ -10,10 +10,18 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
+
+// idleTracerName is the tracer name for idle daemon spans.
+const idleTracerName = "idle-daemon"
 
 // DefaultScanInterval is the default interval between idle session scans.
 const DefaultScanInterval = 30 * time.Second
@@ -169,6 +177,10 @@ func (d *Daemon) scanLoop(ctx context.Context) {
 	healthTicker := time.NewTicker(healthCheckInterval)
 	defer healthTicker.Stop()
 
+	d.setUpMetric(true)
+	// The daemon liveness gauge drops to 0 on ANY loop exit (Stop or fatal).
+	defer d.setUpMetric(false)
+
 	d.config.Logger.Info("idle session daemon started",
 		"cluster", d.config.ClusterName,
 		"namespace", d.config.Namespace,
@@ -186,22 +198,55 @@ func (d *Daemon) scanLoop(ctx context.Context) {
 		case <-healthTicker.C:
 			d.healthCheck(ctx)
 		case <-ticker.C:
-			if err := d.scanAndEnforce(ctx); err != nil {
-				d.consecutiveFails++
-				d.config.Logger.Error("idle session scan failed",
-					"cluster", d.config.ClusterName,
-					"namespace", d.config.Namespace,
-					"consecutiveFailures", d.consecutiveFails,
-					"error", err,
-				)
-				// Attempt reconnection after consecutive failures.
-				if d.consecutiveFails >= 3 {
-					d.attemptReconnect(ctx)
-				}
-			} else {
-				d.consecutiveFails = 0
-			}
+			d.runScanCycle(ctx)
 		}
+	}
+}
+
+// setUpMetric publishes the daemon liveness gauge (nil-safe).
+func (d *Daemon) setUpMetric(up bool) {
+	if d.config.Metrics != nil {
+		d.config.Metrics.SetIdleDaemonUp(d.config.ClusterName, d.config.Namespace, up)
+	}
+}
+
+// runScanCycle executes one scan cycle inside an "idle.scan" span (D-3).
+// Scan failures increment the failure counter and — after 3 consecutive
+// failures — trigger a reconnect WITHIN the span context, so reconnect
+// attempts appear as span events on the failing scan.
+func (d *Daemon) runScanCycle(ctx context.Context) {
+	ctx, span := telemetry.StartSpan(ctx, idleTracerName, "idle.scan",
+		trace.WithAttributes(
+			attribute.String("k8s.cluster", d.config.ClusterName),
+			attribute.String("k8s.namespace", d.config.Namespace),
+		),
+	)
+	defer span.End()
+
+	evaluated, terminated, err := d.scanAndEnforce(ctx)
+	span.SetAttributes(
+		attribute.Int("idle.sessions_evaluated", evaluated),
+		attribute.Int("idle.sessions_terminated", terminated),
+	)
+	if err == nil {
+		d.consecutiveFails = 0
+		return
+	}
+
+	telemetry.SetSpanError(span, err)
+	d.consecutiveFails++
+	if d.config.Metrics != nil {
+		d.config.Metrics.RecordIdleScanFailure(d.config.ClusterName, d.config.Namespace)
+	}
+	d.config.Logger.Error("idle session scan failed",
+		"cluster", d.config.ClusterName,
+		"namespace", d.config.Namespace,
+		"consecutiveFailures", d.consecutiveFails,
+		"error", err,
+	)
+	// Attempt reconnection after consecutive failures.
+	if d.consecutiveFails >= 3 {
+		d.attemptReconnect(ctx)
 	}
 }
 
@@ -221,8 +266,15 @@ func (d *Daemon) healthCheck(ctx context.Context) {
 	}
 }
 
-// attemptReconnect tries to create a new DB client using the factory with
-// exponential backoff. If the factory is not configured, reconnection is skipped.
+// reconnectMaxAttempts bounds one reconnect cycle (initial try + retries).
+const reconnectMaxAttempts = 5
+
+// attemptReconnect tries to create a new DB client using the factory via the
+// shared util.RetryWithBackoff helper (exponential backoff WITH jitter —
+// thundering-herd safe, L-10). Each attempt is recorded on the
+// cloudberry_idle_reconnect_attempts_total counter and as a span event on the
+// active span (reconnects are events, not separate spans — D-3). If the
+// factory is not configured, reconnection is skipped.
 func (d *Daemon) attemptReconnect(ctx context.Context) {
 	if d.config.DBClientFactory == nil {
 		d.config.Logger.Debug("no DB client factory configured, skipping reconnect",
@@ -232,45 +284,35 @@ func (d *Daemon) attemptReconnect(ctx context.Context) {
 		return
 	}
 
-	backoff := reconnectInitialBackoff
-	const maxAttempts = 5
+	span := trace.SpanFromContext(ctx)
+	retryOpts := util.RetryOptions{
+		MaxRetries:     reconnectMaxAttempts - 1,
+		InitialBackoff: reconnectInitialBackoff,
+		MaxBackoff:     reconnectMaxBackoff,
+		Multiplier:     reconnectMultiplier,
+		JitterFraction: 0.1,
+	}
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			// Proceed with reconnection attempt.
-		}
-
+	attempt := 0
+	err := util.RetryWithBackoff(ctx, retryOpts, func(retryCtx context.Context) error {
+		attempt++
 		d.config.Logger.Info("attempting DB reconnection",
 			"cluster", d.config.ClusterName,
 			"namespace", d.config.Namespace,
 			"attempt", attempt,
-			"maxAttempts", maxAttempts,
+			"maxAttempts", reconnectMaxAttempts,
 		)
 
-		newClient, err := d.config.DBClientFactory.NewClient(ctx)
-		if err != nil {
+		newClient, connErr := d.config.DBClientFactory.NewClient(retryCtx)
+		d.recordReconnectAttempt(span, attempt, connErr)
+		if connErr != nil {
 			d.config.Logger.Warn("DB reconnection attempt failed",
 				"cluster", d.config.ClusterName,
 				"namespace", d.config.Namespace,
 				"attempt", attempt,
-				"error", err,
+				"error", connErr,
 			)
-
-			// Wait with exponential backoff before retrying.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-				// Continue to next attempt.
-			}
-			backoff *= reconnectMultiplier
-			if backoff > reconnectMaxBackoff {
-				backoff = reconnectMaxBackoff
-			}
-			continue
+			return connErr
 		}
 
 		// Close the old client and replace with the new one.
@@ -280,19 +322,39 @@ func (d *Daemon) attemptReconnect(ctx context.Context) {
 			oldClient.Close()
 		}
 		d.consecutiveFails = 0
-
-		d.config.Logger.Info("DB reconnection successful",
+		return nil
+	})
+	if err != nil {
+		d.config.Logger.Error("DB reconnection failed after all attempts",
 			"cluster", d.config.ClusterName,
 			"namespace", d.config.Namespace,
-			"attempt", attempt,
+			"maxAttempts", reconnectMaxAttempts,
+			"error", err,
 		)
 		return
 	}
 
-	d.config.Logger.Error("DB reconnection failed after all attempts",
+	d.config.Logger.Info("DB reconnection successful",
 		"cluster", d.config.ClusterName,
 		"namespace", d.config.Namespace,
-		"maxAttempts", maxAttempts,
+		"attempt", attempt,
+	)
+}
+
+// recordReconnectAttempt records one reconnect attempt on the metrics counter
+// and as a span event (nil-safe for both).
+func (d *Daemon) recordReconnectAttempt(span trace.Span, attempt int, connErr error) {
+	result := "success"
+	if connErr != nil {
+		result = "error"
+	}
+	if d.config.Metrics != nil {
+		d.config.Metrics.RecordIdleReconnectAttempt(
+			d.config.ClusterName, d.config.Namespace, result)
+	}
+	telemetry.AddSpanEvent(span, "idle.reconnect",
+		attribute.Int("attempt", attempt),
+		attribute.String("result", result),
 	)
 }
 
@@ -302,7 +364,10 @@ func (d *Daemon) attemptReconnect(ctx context.Context) {
 //  3. For each session, check each enabled rule.
 //  4. If session matches rule's resource group AND is idle beyond timeout, terminate.
 //  5. Record metric and log.
-func (d *Daemon) scanAndEnforce(ctx context.Context) error {
+//
+// It returns the number of sessions evaluated and terminated (idle.scan span
+// attributes) plus the scan error, if any.
+func (d *Daemon) scanAndEnforce(ctx context.Context) (evaluated, terminated int, err error) {
 	// Get a snapshot of current rules under read lock.
 	d.mu.RLock()
 	rules := make([]IdleRule, len(d.rules))
@@ -310,7 +375,7 @@ func (d *Daemon) scanAndEnforce(ctx context.Context) error {
 	d.mu.RUnlock()
 
 	if len(rules) == 0 {
-		return nil
+		return 0, 0, nil
 	}
 
 	// Check if any rule is enabled before querying the database.
@@ -322,15 +387,16 @@ func (d *Daemon) scanAndEnforce(ctx context.Context) error {
 		}
 	}
 	if !hasEnabled {
-		return nil
+		return 0, 0, nil
 	}
 
 	sessions, err := d.config.DBClient.ListSessionsWithResourceGroup(ctx)
 	if err != nil {
-		return fmt.Errorf("listing sessions with resource group: %w", err)
+		return 0, 0, fmt.Errorf("listing sessions with resource group: %w", err)
 	}
 
 	now := time.Now()
+	evaluated = len(sessions)
 
 	for i := range sessions {
 		for j := range rules {
@@ -343,19 +409,34 @@ func (d *Daemon) scanAndEnforce(ctx context.Context) error {
 			}
 
 			// Session is idle beyond timeout — terminate it.
-			d.terminateSession(ctx, sessions[i], rules[j])
+			if d.terminateSession(ctx, sessions[i], rules[j]) {
+				terminated++
+			}
 		}
 	}
 
-	return nil
+	return evaluated, terminated, nil
 }
 
-// terminateSession terminates an idle session and records the event.
-func (d *Daemon) terminateSession(ctx context.Context, session db.SessionWithGroup, rule IdleRule) {
+// terminateSession terminates an idle session inside an "idle.terminate"
+// child span (D-3) and records the event. It returns true when the session
+// was actually terminated.
+func (d *Daemon) terminateSession(ctx context.Context, session db.SessionWithGroup, rule IdleRule) bool {
 	idleDuration := time.Since(session.QueryStart)
+
+	// PID and rule name are bounded attributes (PIDs recycle; rule names come
+	// from the CR spec). Usernames are NOT recorded on the span.
+	ctx, span := telemetry.StartSpan(ctx, idleTracerName, "idle.terminate",
+		trace.WithAttributes(
+			attribute.Int("idle.pid", int(session.PID)),
+			attribute.String("idle.rule", rule.Name),
+		),
+	)
+	defer span.End()
 
 	terminated, err := d.config.DBClient.TerminateSession(ctx, session.PID)
 	if err != nil {
+		telemetry.SetSpanError(span, err)
 		d.config.Logger.Error("failed to terminate idle session",
 			"pid", session.PID,
 			"username", session.Username,
@@ -364,7 +445,7 @@ func (d *Daemon) terminateSession(ctx context.Context, session db.SessionWithGro
 			"idleDuration", idleDuration.Round(time.Second),
 			"error", err,
 		)
-		return
+		return false
 	}
 
 	if !terminated {
@@ -373,7 +454,7 @@ func (d *Daemon) terminateSession(ctx context.Context, session db.SessionWithGro
 			"username", session.Username,
 			"rule", rule.Name,
 		)
-		return
+		return false
 	}
 
 	// Record metric.
@@ -402,6 +483,7 @@ func (d *Daemon) terminateSession(ctx context.Context, session db.SessionWithGro
 		"cluster", d.config.ClusterName,
 		"namespace", d.config.Namespace,
 	)
+	return true
 }
 
 // isSessionIdle determines if a session should be terminated based on the rule.

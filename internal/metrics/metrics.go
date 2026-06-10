@@ -29,6 +29,9 @@ const (
 	labelSource     = "source"
 	labelWebhook    = "webhook"
 	labelTimestamp  = "timestamp"
+	labelRoute      = "route"
+	labelMethod     = "method"
+	labelCode       = "code"
 )
 
 // Recorder defines the interface for recording metrics.
@@ -108,6 +111,15 @@ type Recorder interface {
 	// SetDataLoadingJobsActive sets the number of active data loading jobs.
 	SetDataLoadingJobsActive(cluster, namespace string, count float64)
 	// RecordDataLoadingRows records the number of rows loaded by a job.
+	//
+	// DOCUMENTED NO-OP IN PRODUCTION (C-6): this method currently has ZERO
+	// production call sites — intentionally. The data-loading job mutation
+	// endpoints return 501 NOT_IMPLEMENTED (see internal/api
+	// msgDataLoadingNotImplemented), so there is no real row count to record
+	// and faking one would violate the metrics-honesty rule. The method (and
+	// its registered cloudberry_data_loading_rows_total family) is kept and
+	// test-covered so the wiring lands together with the data-loading Job
+	// feature (rows will come from Job status/completion records).
 	RecordDataLoadingRows(cluster, namespace, job, sourceType string, count float64)
 	// SetDiskUsagePercent sets the disk usage percentage for a cluster.
 	SetDiskUsagePercent(cluster, namespace string, percent float64)
@@ -170,8 +182,14 @@ type Recorder interface {
 	RecordCertRotation(component, source, result string)
 	// SetCertExpirySeconds sets the seconds until the certificate expires for a component.
 	SetCertExpirySeconds(component string, seconds float64)
+	// RecordClusterCertIssuance records an auto-issuance (or renewal) of a
+	// CloudberryCluster server certificate from Vault PKI (spec.auth.ssl).
+	// result is "success" or "error".
+	RecordClusterCertIssuance(cluster, namespace, result string)
 	// RecordVaultOperation records a Vault operation event.
-	// operation is "auth", "read", or "write"; result is "success" or "error".
+	// operation is "auth", "read", "write", "renew" (background token
+	// renewal), or "reauth" (re-login after a 401/403 or token expiry);
+	// result is "success" or "error".
 	RecordVaultOperation(operation, result string)
 	// ObserveVaultOperationDuration records the duration of a Vault operation.
 	ObserveVaultOperationDuration(operation string, d time.Duration)
@@ -189,7 +207,76 @@ type Recorder interface {
 	// recoveryType is "incremental", "full", or "differential";
 	// result is "started", "completed", or "failed".
 	RecordRecoveryOperation(cluster, namespace, recoveryType, result string)
+
+	// RecordAPIRequest records a completed REST API request. route is the
+	// matched route TEMPLATE (e.g. "/api/v1alpha1/clusters/{name}"), never the
+	// raw path, to keep label cardinality bounded; code is the HTTP status.
+	RecordAPIRequest(route, method, code string, duration time.Duration)
+	// AddAPIRequestsInFlight adjusts the in-flight REST API request gauge
+	// (+1 on request start, -1 on completion).
+	AddAPIRequestsInFlight(delta float64)
+	// RecordRateLimitRejection records a request rejected (429) by the API
+	// rate limiter for the given route template.
+	RecordRateLimitRejection(route string)
+
+	// RecordDBConnect records a database connection attempt for a cluster.
+	// result is "success" or "error"; duration is the connect (incl. retry) time.
+	RecordDBConnect(cluster, namespace, result string, duration time.Duration)
+	// ObserveDBQueryDuration records the duration of a database operation.
+	// operation is the db.Client method name (bounded set).
+	ObserveDBQueryDuration(operation string, d time.Duration)
+	// RegisterDBPoolStats registers a per-cluster connection-pool stats
+	// provider sampled on every Prometheus scrape (pgxpool.Stat()). The
+	// returned function unregisters the provider and MUST be called when the
+	// client is closed.
+	RegisterDBPoolStats(cluster, namespace string, stats DBPoolStatsFunc) (unregister func())
+
+	// SetIdleDaemonUp sets the idle-session daemon liveness gauge
+	// (1 while the daemon scan loop runs, 0 after Stop or a fatal exit).
+	SetIdleDaemonUp(cluster, namespace string, up bool)
+	// RecordIdleScanFailure records a failed idle-session scan cycle.
+	RecordIdleScanFailure(cluster, namespace string)
+	// RecordIdleReconnectAttempt records an idle-daemon DB reconnect attempt.
+	// result is "success" or "error".
+	RecordIdleReconnectAttempt(cluster, namespace, result string)
+
+	// RecordSessionTermination records a session termination via the API
+	// (pg_terminate_backend). result is "success" or "error".
+	RecordSessionTermination(cluster, namespace, result string)
+
+	// RecordStorageExpansion records a PVC storage expansion attempt.
+	// result is "success" or "error".
+	RecordStorageExpansion(cluster, namespace, result string)
+	// RecordBackupOnDelete records the terminal outcome of a backup-on-delete
+	// Job ("completed" or "failed").
+	RecordBackupOnDelete(cluster, namespace, result string)
+	// ObserveScalePhaseDuration records the duration of one scale state-machine
+	// phase. direction is "out" or "in"; phase is from the bounded phase enum.
+	ObserveScalePhaseDuration(direction, phase string, d time.Duration)
+
+	// RecordMigrateOperation records a cross-cluster migrate API operation.
+	// result is "started" or "error".
+	RecordMigrateOperation(result string)
+	// RecordAPIClusterOperation records a cluster CRUD operation via the API.
+	// operation is "create" or "delete"; result is "success" or "error".
+	RecordAPIClusterOperation(operation, result string)
+	// RecordLogStreamSession records a completed backup-Job log stream session.
+	// result is "success" or "error".
+	RecordLogStreamSession(result string)
+	// AddLogStreamBytes adds the number of bytes delivered to log stream clients.
+	AddLogStreamBytes(n float64)
+	// RecordOIDCDiscovery records an OIDC provider discovery attempt.
+	// result is "success" or "error".
+	RecordOIDCDiscovery(result string)
+	// ObserveAuthTokenVerifyDuration records the latency of a Bearer token
+	// verification (JWKS fetch + signature check).
+	ObserveAuthTokenVerifyDuration(d time.Duration)
 }
+
+// DBPoolStatsFunc returns a point-in-time snapshot of a database connection
+// pool: acquired (in-use) connections, idle connections, and the pool's
+// configured maximum. It is invoked on every Prometheus scrape.
+type DBPoolStatsFunc func() (acquired, idle, maxConns float64)
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
 type PrometheusRecorder struct {
@@ -276,12 +363,40 @@ type PrometheusRecorder struct {
 
 	certRotationTotal       *prometheus.CounterVec
 	certExpirySeconds       *prometheus.GaugeVec
+	clusterCertIssuance     *prometheus.CounterVec
 	vaultOperationsTotal    *prometheus.CounterVec
 	vaultOperationDuration  *prometheus.HistogramVec
 	webhookAdmissionTotal   *prometheus.CounterVec
 	upgradeOperationsTotal  *prometheus.CounterVec
 	rollingRestartTotal     *prometheus.CounterVec
 	recoveryOperationsTotal *prometheus.CounterVec
+
+	apiRequestsTotal        *prometheus.CounterVec
+	apiRequestDuration      *prometheus.HistogramVec
+	apiRequestsInFlight     prometheus.Gauge
+	rateLimitRejectionTotal *prometheus.CounterVec
+
+	dbConnectTotal    *prometheus.CounterVec
+	dbConnectDuration *prometheus.HistogramVec
+	dbQueryDuration   *prometheus.HistogramVec
+	dbPoolCollector   *dbPoolStatsCollector
+
+	idleDaemonUp              *prometheus.GaugeVec
+	idleScanFailuresTotal     *prometheus.CounterVec
+	idleReconnectAttemptTotal *prometheus.CounterVec
+
+	sessionTerminationsTotal *prometheus.CounterVec
+
+	storageExpansionsTotal *prometheus.CounterVec
+	backupOnDeleteTotal    *prometheus.CounterVec
+	scalePhaseDuration     *prometheus.HistogramVec
+
+	migrateOperationsTotal    *prometheus.CounterVec
+	apiClusterOperationsTotal *prometheus.CounterVec
+	logStreamSessionsTotal    *prometheus.CounterVec
+	logStreamBytesTotal       prometheus.Counter
+	oidcDiscoveryTotal        *prometheus.CounterVec
+	authTokenVerifyDuration   prometheus.Histogram
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -684,6 +799,12 @@ func (r *PrometheusRecorder) initSecurityMetrics() {
 		Name:      "cert_expiry_seconds",
 		Help:      "Seconds until the certificate expires per component.",
 	}, []string{labelComponent})
+	r.clusterCertIssuance = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "cluster_cert_issuance_total",
+		Help: "Total number of CloudberryCluster server certificate issuances " +
+			"(and renewals) from Vault PKI.",
+	}, []string{labelCluster, labelNamespace, labelResult})
 	r.vaultOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "vault_operations_total",
@@ -725,6 +846,134 @@ func (r *PrometheusRecorder) initLifecycleMetrics() {
 	}, []string{labelCluster, labelNamespace, labelType, labelResult})
 }
 
+// initAPIServerMetrics initializes the generic REST API server metrics.
+func (r *PrometheusRecorder) initAPIServerMetrics() {
+	r.apiRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_requests_total",
+		Help:      "Total number of REST API requests by route template, method and status code.",
+	}, []string{labelRoute, labelMethod, labelCode})
+	r.apiRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_request_duration_seconds",
+		Help:      "Duration of REST API requests in seconds by route template and method.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{labelRoute, labelMethod})
+	r.apiRequestsInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_requests_in_flight",
+		Help:      "Number of REST API requests currently being served.",
+	})
+	r.rateLimitRejectionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_rate_limit_rejections_total",
+		Help:      "Total number of REST API requests rejected by the rate limiter (429).",
+	}, []string{labelRoute})
+}
+
+// initDBMetrics initializes database connection, pool and query metrics.
+func (r *PrometheusRecorder) initDBMetrics() {
+	r.dbConnectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "db_connect_total",
+		Help:      "Total number of database connection attempts per cluster.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.dbConnectDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "db_connect_duration_seconds",
+		Help:      "Duration of database connection establishment in seconds.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{labelCluster, labelNamespace})
+	r.dbQueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "db_query_duration_seconds",
+		Help:      "Duration of database operations in seconds by operation name.",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 15, 60, 300},
+	}, []string{labelOperation})
+	r.dbPoolCollector = newDBPoolStatsCollector()
+}
+
+// initIdleDaemonMetrics initializes idle-session daemon health metrics.
+func (r *PrometheusRecorder) initIdleDaemonMetrics() {
+	r.idleDaemonUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "idle_daemon_up",
+		Help:      "Idle session daemon liveness per cluster (1=running, 0=stopped).",
+	}, []string{labelCluster, labelNamespace})
+	r.idleScanFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "idle_scan_failures_total",
+		Help:      "Total number of failed idle session scan cycles.",
+	}, []string{labelCluster, labelNamespace})
+	r.idleReconnectAttemptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "idle_reconnect_attempts_total",
+		Help:      "Total number of idle daemon database reconnect attempts.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.sessionTerminationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "session_terminations_total",
+		Help:      "Total number of session terminations requested via the API.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+}
+
+// initControllerOperationMetrics initializes storage expansion, backup-on-delete
+// and scale phase metrics.
+func (r *PrometheusRecorder) initControllerOperationMetrics() {
+	r.storageExpansionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "storage_expansions_total",
+		Help:      "Total number of PVC storage expansion attempts.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.backupOnDeleteTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "backup_on_delete_total",
+		Help:      "Total number of backup-on-delete terminal outcomes.",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.scalePhaseDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "scale_phase_duration_seconds",
+		Help:      "Duration of scale operation phases in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 14),
+	}, []string{"direction", labelPhase})
+}
+
+// initAPIBusinessMetrics initializes migrate, cluster CRUD, log stream and
+// auth/OIDC metrics.
+func (r *PrometheusRecorder) initAPIBusinessMetrics() {
+	r.migrateOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "migrate_operations_total",
+		Help:      "Total number of cross-cluster migrate operations via the API.",
+	}, []string{labelResult})
+	r.apiClusterOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_cluster_operations_total",
+		Help:      "Total number of cluster create/delete operations via the API.",
+	}, []string{labelOperation, labelResult})
+	r.logStreamSessionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "log_stream_sessions_total",
+		Help:      "Total number of backup Job log streaming sessions.",
+	}, []string{labelResult})
+	r.logStreamBytesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "log_stream_bytes_total",
+		Help:      "Total number of bytes streamed to log stream clients.",
+	})
+	r.oidcDiscoveryTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "oidc_discovery_total",
+		Help:      "Total number of OIDC provider discovery attempts.",
+	}, []string{labelResult})
+	r.authTokenVerifyDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "auth_token_verify_duration_seconds",
+		Help:      "Duration of Bearer token verification in seconds.",
+		Buckets:   prometheus.DefBuckets,
+	})
+}
+
 // NewPrometheusRecorder creates a new PrometheusRecorder and registers all metrics.
 func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 	r := &PrometheusRecorder{}
@@ -740,6 +989,11 @@ func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 	r.initSecurityMetrics()
 	r.initAdmissionMetrics()
 	r.initLifecycleMetrics()
+	r.initAPIServerMetrics()
+	r.initDBMetrics()
+	r.initIdleDaemonMetrics()
+	r.initControllerOperationMetrics()
+	r.initAPIBusinessMetrics()
 	r.register(reg)
 	return r
 }
@@ -776,11 +1030,21 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.activeQueryExportTotal, r.guestAccessTotal,
 		r.monitorPauseTotal, r.monitorResumeTotal,
 		r.monitoringDisabledAccessTotal,
-		r.certRotationTotal, r.certExpirySeconds,
+		r.certRotationTotal, r.certExpirySeconds, r.clusterCertIssuance,
 		r.vaultOperationsTotal, r.vaultOperationDuration,
 		r.webhookAdmissionTotal,
 		r.upgradeOperationsTotal, r.rollingRestartTotal,
 		r.recoveryOperationsTotal,
+		r.apiRequestsTotal, r.apiRequestDuration,
+		r.apiRequestsInFlight, r.rateLimitRejectionTotal,
+		r.dbConnectTotal, r.dbConnectDuration, r.dbQueryDuration,
+		r.dbPoolCollector,
+		r.idleDaemonUp, r.idleScanFailuresTotal, r.idleReconnectAttemptTotal,
+		r.sessionTerminationsTotal,
+		r.storageExpansionsTotal, r.backupOnDeleteTotal, r.scalePhaseDuration,
+		r.migrateOperationsTotal, r.apiClusterOperationsTotal,
+		r.logStreamSessionsTotal, r.logStreamBytesTotal,
+		r.oidcDiscoveryTotal, r.authTokenVerifyDuration,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -1142,6 +1406,12 @@ func (r *PrometheusRecorder) SetCertExpirySeconds(component string, seconds floa
 	r.certExpirySeconds.WithLabelValues(component).Set(seconds)
 }
 
+// RecordClusterCertIssuance records an auto-issuance (or renewal) of a
+// CloudberryCluster server certificate from Vault PKI.
+func (r *PrometheusRecorder) RecordClusterCertIssuance(cluster, namespace, result string) {
+	r.clusterCertIssuance.WithLabelValues(cluster, namespace, result).Inc()
+}
+
 // RecordVaultOperation records a Vault operation event.
 func (r *PrometheusRecorder) RecordVaultOperation(operation, result string) {
 	r.vaultOperationsTotal.WithLabelValues(operation, result).Inc()
@@ -1170,6 +1440,107 @@ func (r *PrometheusRecorder) RecordRollingRestart(cluster, namespace, result str
 // RecordRecoveryOperation records a recovery operation event.
 func (r *PrometheusRecorder) RecordRecoveryOperation(cluster, namespace, recoveryType, result string) {
 	r.recoveryOperationsTotal.WithLabelValues(cluster, namespace, recoveryType, result).Inc()
+}
+
+// RecordAPIRequest records a completed REST API request.
+func (r *PrometheusRecorder) RecordAPIRequest(route, method, code string, duration time.Duration) {
+	r.apiRequestsTotal.WithLabelValues(route, method, code).Inc()
+	r.apiRequestDuration.WithLabelValues(route, method).Observe(duration.Seconds())
+}
+
+// AddAPIRequestsInFlight adjusts the in-flight REST API request gauge.
+func (r *PrometheusRecorder) AddAPIRequestsInFlight(delta float64) {
+	r.apiRequestsInFlight.Add(delta)
+}
+
+// RecordRateLimitRejection records a request rejected (429) by the API rate limiter.
+func (r *PrometheusRecorder) RecordRateLimitRejection(route string) {
+	r.rateLimitRejectionTotal.WithLabelValues(route).Inc()
+}
+
+// RecordDBConnect records a database connection attempt for a cluster.
+func (r *PrometheusRecorder) RecordDBConnect(cluster, namespace, result string, duration time.Duration) {
+	r.dbConnectTotal.WithLabelValues(cluster, namespace, result).Inc()
+	r.dbConnectDuration.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
+}
+
+// ObserveDBQueryDuration records the duration of a database operation.
+func (r *PrometheusRecorder) ObserveDBQueryDuration(operation string, d time.Duration) {
+	r.dbQueryDuration.WithLabelValues(operation).Observe(d.Seconds())
+}
+
+// RegisterDBPoolStats registers a per-cluster connection-pool stats provider
+// sampled on every Prometheus scrape. The returned function unregisters it.
+func (r *PrometheusRecorder) RegisterDBPoolStats(
+	cluster, namespace string,
+	stats DBPoolStatsFunc,
+) func() {
+	return r.dbPoolCollector.add(cluster, namespace, stats)
+}
+
+// SetIdleDaemonUp sets the idle-session daemon liveness gauge.
+func (r *PrometheusRecorder) SetIdleDaemonUp(cluster, namespace string, up bool) {
+	r.idleDaemonUp.WithLabelValues(cluster, namespace).Set(boolToFloat64(up))
+}
+
+// RecordIdleScanFailure records a failed idle-session scan cycle.
+func (r *PrometheusRecorder) RecordIdleScanFailure(cluster, namespace string) {
+	r.idleScanFailuresTotal.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordIdleReconnectAttempt records an idle-daemon DB reconnect attempt.
+func (r *PrometheusRecorder) RecordIdleReconnectAttempt(cluster, namespace, result string) {
+	r.idleReconnectAttemptTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordSessionTermination records a session termination via the API.
+func (r *PrometheusRecorder) RecordSessionTermination(cluster, namespace, result string) {
+	r.sessionTerminationsTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordStorageExpansion records a PVC storage expansion attempt.
+func (r *PrometheusRecorder) RecordStorageExpansion(cluster, namespace, result string) {
+	r.storageExpansionsTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordBackupOnDelete records the terminal outcome of a backup-on-delete Job.
+func (r *PrometheusRecorder) RecordBackupOnDelete(cluster, namespace, result string) {
+	r.backupOnDeleteTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// ObserveScalePhaseDuration records the duration of one scale state-machine phase.
+func (r *PrometheusRecorder) ObserveScalePhaseDuration(direction, phase string, d time.Duration) {
+	r.scalePhaseDuration.WithLabelValues(direction, phase).Observe(d.Seconds())
+}
+
+// RecordMigrateOperation records a cross-cluster migrate API operation.
+func (r *PrometheusRecorder) RecordMigrateOperation(result string) {
+	r.migrateOperationsTotal.WithLabelValues(result).Inc()
+}
+
+// RecordAPIClusterOperation records a cluster CRUD operation via the API.
+func (r *PrometheusRecorder) RecordAPIClusterOperation(operation, result string) {
+	r.apiClusterOperationsTotal.WithLabelValues(operation, result).Inc()
+}
+
+// RecordLogStreamSession records a completed backup-Job log stream session.
+func (r *PrometheusRecorder) RecordLogStreamSession(result string) {
+	r.logStreamSessionsTotal.WithLabelValues(result).Inc()
+}
+
+// AddLogStreamBytes adds the number of bytes delivered to log stream clients.
+func (r *PrometheusRecorder) AddLogStreamBytes(n float64) {
+	r.logStreamBytesTotal.Add(n)
+}
+
+// RecordOIDCDiscovery records an OIDC provider discovery attempt.
+func (r *PrometheusRecorder) RecordOIDCDiscovery(result string) {
+	r.oidcDiscoveryTotal.WithLabelValues(result).Inc()
+}
+
+// ObserveAuthTokenVerifyDuration records the latency of a Bearer token verification.
+func (r *PrometheusRecorder) ObserveAuthTokenVerifyDuration(d time.Duration) {
+	r.authTokenVerifyDuration.Observe(d.Seconds())
 }
 
 // boolToFloat64 converts a boolean to a float64 (1.0 for true, 0.0 for false).
@@ -1388,6 +1759,9 @@ func (n *NoopRecorder) RecordCertRotation(_, _, _ string) {}
 // SetCertExpirySeconds is a no-op implementation for testing.
 func (n *NoopRecorder) SetCertExpirySeconds(_ string, _ float64) {}
 
+// RecordClusterCertIssuance is a no-op implementation for testing.
+func (n *NoopRecorder) RecordClusterCertIssuance(_, _, _ string) {}
+
 // RecordVaultOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordVaultOperation(_, _ string) {}
 
@@ -1405,3 +1779,66 @@ func (n *NoopRecorder) RecordRollingRestart(_, _, _ string) {}
 
 // RecordRecoveryOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRecoveryOperation(_, _, _, _ string) {}
+
+// RecordAPIRequest is a no-op implementation for testing.
+func (n *NoopRecorder) RecordAPIRequest(_, _, _ string, _ time.Duration) {}
+
+// AddAPIRequestsInFlight is a no-op implementation for testing.
+func (n *NoopRecorder) AddAPIRequestsInFlight(_ float64) {}
+
+// RecordRateLimitRejection is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRateLimitRejection(_ string) {}
+
+// RecordDBConnect is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDBConnect(_, _, _ string, _ time.Duration) {}
+
+// ObserveDBQueryDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveDBQueryDuration(_ string, _ time.Duration) {}
+
+// RegisterDBPoolStats is a no-op implementation for testing. The returned
+// unregister function is itself a no-op (nothing was registered).
+func (n *NoopRecorder) RegisterDBPoolStats(_, _ string, _ DBPoolStatsFunc) func() {
+	return func() {
+		// Nothing to unregister: the no-op recorder never registered the
+		// pool stats provider in the first place.
+	}
+}
+
+// SetIdleDaemonUp is a no-op implementation for testing.
+func (n *NoopRecorder) SetIdleDaemonUp(_, _ string, _ bool) {}
+
+// RecordIdleScanFailure is a no-op implementation for testing.
+func (n *NoopRecorder) RecordIdleScanFailure(_, _ string) {}
+
+// RecordIdleReconnectAttempt is a no-op implementation for testing.
+func (n *NoopRecorder) RecordIdleReconnectAttempt(_, _, _ string) {}
+
+// RecordSessionTermination is a no-op implementation for testing.
+func (n *NoopRecorder) RecordSessionTermination(_, _, _ string) {}
+
+// RecordStorageExpansion is a no-op implementation for testing.
+func (n *NoopRecorder) RecordStorageExpansion(_, _, _ string) {}
+
+// RecordBackupOnDelete is a no-op implementation for testing.
+func (n *NoopRecorder) RecordBackupOnDelete(_, _, _ string) {}
+
+// ObserveScalePhaseDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveScalePhaseDuration(_, _ string, _ time.Duration) {}
+
+// RecordMigrateOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordMigrateOperation(_ string) {}
+
+// RecordAPIClusterOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordAPIClusterOperation(_, _ string) {}
+
+// RecordLogStreamSession is a no-op implementation for testing.
+func (n *NoopRecorder) RecordLogStreamSession(_ string) {}
+
+// AddLogStreamBytes is a no-op implementation for testing.
+func (n *NoopRecorder) AddLogStreamBytes(_ float64) {}
+
+// RecordOIDCDiscovery is a no-op implementation for testing.
+func (n *NoopRecorder) RecordOIDCDiscovery(_ string) {}
+
+// ObserveAuthTokenVerifyDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveAuthTokenVerifyDuration(_ time.Duration) {}

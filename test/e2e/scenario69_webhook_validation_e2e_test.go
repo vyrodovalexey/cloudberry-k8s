@@ -96,6 +96,11 @@ type scenario69Case struct {
 	name    string
 	mutate  func(*cbv1alpha1.BackupSpec)
 	substrs []string
+	// liveSkip marks a rule that a LIVE API server no longer rejects because
+	// the mutating webhook runs first and repairs the field (e.g. 69j: an
+	// empty backup.image is defaulted to the official backup image before
+	// validation). The direct-validator tests still exercise the rule.
+	liveSkip bool
 }
 
 // scenario69Cases returns the 10 negative rules 69a..69j.
@@ -167,6 +172,9 @@ func scenario69Cases() []scenario69Case {
 			id: "69j", name: "missing image",
 			mutate:  func(b *cbv1alpha1.BackupSpec) { b.Image = "" },
 			substrs: []string{"backup.image"},
+			// The mutating webhook defaults backup.image, so a live API server
+			// accepts (and repairs) this CR; only the direct validator rejects.
+			liveSkip: true,
 		},
 	}
 }
@@ -227,6 +235,10 @@ func (s *Scenario69WebhookValidationE2ESuite) TestE2E_Scenario69_LiveAPIServerRe
 	const ns = "default"
 	for _, tc := range scenario69Cases() {
 		s.Run("live_"+tc.id+"_"+tc.name, func() {
+			if tc.liveSkip {
+				s.T().Skip("mutating webhook repairs this field before validation; " +
+					"live API server accepts the CR")
+			}
 			cluster := scenario69E2ECluster("live-s69-"+tc.id, tc.mutate)
 			cluster.Namespace = ns
 

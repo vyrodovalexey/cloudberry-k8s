@@ -359,5 +359,5 @@ func (s *HAOperationsSuite) TestFunctional_HAReconcile_ClusterNotFound() {
 
 	// Assert
 	require.NoError(s.T(), err)
-	assert.False(s.T(), result.Requeue)
+	assert.Zero(s.T(), result.RequeueAfter)
 }

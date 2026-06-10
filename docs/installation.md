@@ -168,9 +168,9 @@ kubectl get mutatingwebhookconfigurations | grep cloudberry
 | `operator.logLevel` | Log level (debug, info, warn, error) | `info` |
 | `operator.logFormat` | Log format (json, text) | `json` |
 | `operator.leaderElection` | Enable leader election for HA | `true` |
-| `operator.reconcileInterval` | Reconciliation interval | `30s` |
-| `operator.operationTimeout` | Operation timeout | `5m` |
-| `operator.watchNamespace` | Namespace to watch (empty = all) | `""` |
+| `operator.reconcileInterval` | Periodic reconciliation requeue interval for all controllers | `30s` |
+| `operator.operationTimeout` | Long-operation deadline override (scale, upgrade phases). When left at the default, the built-in per-operation deadlines apply (10m scale/upgrade, 30m mirroring) | `5m` |
+| `operator.watchNamespace` | Namespace to watch — restricts the operator cache to a single namespace (empty = all namespaces) | `""` |
 | `operator.metricsAddress` | Metrics bind address | `:8080` |
 | `operator.healthProbeAddress` | Health probe bind address | `:8081` |
 | `operator.apiAddress` | REST API server bind address | `:8090` |
@@ -195,8 +195,15 @@ kubectl get mutatingwebhookconfigurations | grep cloudberry
 | `vault.authMethod` | Auth method (token, kubernetes, approle) | `kubernetes` |
 | `vault.authPath` | Vault auth mount path | `auth/kubernetes` |
 | `vault.role` | Vault role name | `cloudberry-operator` |
+| `vault.token` | Vault token (token auth method only; prefer a Secret in production) | `""` |
+| `vault.roleID` | AppRole `role_id` (approle auth method; sets `CLOUDBERRY_VAULT_ROLE_ID`) | `""` |
+| `vault.secretID` | AppRole `secret_id` (approle auth method; sets `CLOUDBERRY_VAULT_SECRET_ID` — prefer a Secret in production) | `""` |
 | `vault.secretPath` | Vault secret path | `secret/data/cloudberry` |
 | `vault.tlsSecretName` | Vault TLS secret name | `""` |
+
+> **Vault token lifecycle**: token renewal and re-authentication are automatic. The operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates (with backoff) when the token reaches the end of its renewable lifetime; a failed background re-auth is additionally recovered reactively on the next Vault read/write. Renewals and re-auths are observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`.
+>
+> **AppRole auth**: with `vault.authMethod=approle`, the operator logs in with `role_id`/`secret_id` (`vault.roleID`/`vault.secretID`, or the `CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID` environment variables). For backward compatibility, an empty `roleID` falls back to `vault.role` and an empty `secretID` falls back to `vault.token`.
 
 #### OIDC Configuration
 
@@ -389,7 +396,11 @@ env:
 
 ### Environment Variable Configuration
 
-All operator settings can be configured via environment variables with the `CLOUDBERRY_` prefix. Nested keys use underscores as separators:
+All operator settings can be configured via environment variables with the `CLOUDBERRY_` prefix. Nested keys use underscores as separators.
+
+Configuration precedence (highest wins): **environment variable > command-line flag > config file > default**. The environment always wins, even over an explicitly set flag. Command-line flags are bound into the configuration loader, so a flag such as `--api-rate-limit` participates in the same precedence chain as its config key and environment variable.
+
+> **Removed configuration fields**: the unused operator config fields `listen-address` (the API server binds `api-address`), `oidc.pkce`, and `oidc.allow-local-sign-in` were removed. PKCE is a client-side concern of the authorization-code flow (implemented by `cloudberry-ctl auth login`); the operator only verifies Bearer tokens. Unsupported values for `oidc.role-claim-source` / `oidc.role-match-mode` are now rejected at startup instead of being silently ignored. (The `CloudberryCluster` CRD's `auth.oidc.pkce`/`allowLocalSignIn` fields are unrelated and remain.)
 
 | Environment Variable | Config Key | Description |
 |---------------------|------------|-------------|
@@ -399,6 +410,10 @@ All operator settings can be configured via environment variables with the `CLOU
 | `CLOUDBERRY_TELEMETRY_OTLP_INSECURE` | `telemetry.otlp-insecure` | Disable TLS for OTLP |
 | `CLOUDBERRY_LOG_LEVEL` | `log-level` | Log level |
 | `CLOUDBERRY_NAMESPACE` | `namespace` | Namespace to watch |
+| `CLOUDBERRY_API_RATE_LIMIT` | `api-rate-limit` | Maximum API requests per minute per IP (`0` disables rate limiting; default `10`) |
+| `CLOUDBERRY_VAULT_ROLE_ID` | `vault.role-id` | Vault AppRole `role_id` (approle auth method) |
+| `CLOUDBERRY_VAULT_SECRET_ID` | `vault.secret-id` | Vault AppRole `secret_id` (approle auth method; value is redacted in logs) |
+| `CLOUDBERRY_ENABLE_TEST_USERS` | `enable-test-users` | Seed well-known TEST users (`basic_user`, `opbasic_user`, `operator_user`) into the API credential store. The operator logs a WARN when enabled. **Test suites only — never enable in production** (default `false`) |
 
 ### Monitoring Stack Setup
 

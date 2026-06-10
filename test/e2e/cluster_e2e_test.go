@@ -75,7 +75,7 @@ func (s *ClusterE2ESuite) TestE2E_FullClusterLifecycle_CreateToDelete() {
 	// First reconcile: add finalizer
 	result, err := reconciler.Reconcile(s.ctx, req)
 	require.NoError(s.T(), err)
-	assert.True(s.T(), result.Requeue)
+	assert.Positive(s.T(), result.RequeueAfter)
 
 	// Verify finalizer
 	updated := &cbv1alpha1.CloudberryCluster{}
@@ -87,7 +87,7 @@ func (s *ClusterE2ESuite) TestE2E_FullClusterLifecycle_CreateToDelete() {
 	// Second reconcile: set initial phase
 	result, err = reconciler.Reconcile(s.ctx, req)
 	require.NoError(s.T(), err)
-	assert.True(s.T(), result.Requeue)
+	assert.Positive(s.T(), result.RequeueAfter)
 
 	err = s.client.Get(s.ctx, req.NamespacedName, updated)
 	require.NoError(s.T(), err)

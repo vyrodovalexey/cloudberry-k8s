@@ -3,9 +3,13 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -22,11 +26,13 @@ const (
 	authMethodKubernetes = "kubernetes"
 	authMethodAppRole    = "approle"
 
-	// vaultOpAuth, vaultOpRead, and vaultOpWrite are the operation label values
-	// used for Vault operation metrics.
-	vaultOpAuth  = "auth"
-	vaultOpRead  = "read"
-	vaultOpWrite = "write"
+	// vaultOpAuth, vaultOpRead, vaultOpWrite, vaultOpRenew, and vaultOpReauth
+	// are the operation label values used for Vault operation metrics.
+	vaultOpAuth   = "auth"
+	vaultOpRead   = "read"
+	vaultOpWrite  = "write"
+	vaultOpRenew  = "renew"
+	vaultOpReauth = "reauth"
 
 	// metricResultSuccess and metricResultError are the result label values used
 	// for Vault operation metrics.
@@ -40,6 +46,13 @@ const (
 // kubeTokenPath is the path to the Kubernetes service account token file.
 // It is a variable so that tests can override it.
 var kubeTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // not a credential
+
+// newLifetimeWatcher constructs the token lifetime watcher. It is a variable
+// so that tests can inject construction failures (the real constructor only
+// fails on nil input, which the caller's guards make unreachable).
+var newLifetimeWatcher = func(c *vaultapi.Client, secret *vaultapi.Secret) (*vaultapi.LifetimeWatcher, error) {
+	return c.NewLifetimeWatcher(&vaultapi.LifetimeWatcherInput{Secret: secret})
+}
 
 // Client defines the interface for Vault operations.
 type Client interface {
@@ -57,6 +70,16 @@ type Client interface {
 	IsEnabled() bool
 }
 
+// Closer is implemented by Vault clients that own background goroutines
+// (token lifetime watcher) and must be closed on operator shutdown. It is a
+// separate interface so existing Client mocks remain compatible; callers
+// type-assert: `if c, ok := vc.(vault.Closer); ok { c.Close() }`.
+type Closer interface {
+	// Close stops the background token lifetime watcher and waits for it to
+	// terminate. Safe to call multiple times.
+	Close()
+}
+
 // Config holds Vault client configuration.
 type Config struct {
 	// Enabled controls whether Vault integration is active.
@@ -71,6 +94,14 @@ type Config struct {
 	Role string
 	// Token is the Vault token (for token auth).
 	Token string
+	// RoleID is the AppRole role_id (approle auth method). When empty, Role
+	// is used for backward compatibility with configurations that overloaded
+	// the generic fields (L-12).
+	RoleID string
+	// SecretID is the AppRole secret_id (approle auth method). When empty,
+	// Token is used for backward compatibility. Treat as a credential: never
+	// log it.
+	SecretID string
 	// SecretPath is the base secret path.
 	SecretPath string
 	// TLSCACert is the path to the CA certificate for TLS.
@@ -88,6 +119,27 @@ type vaultClient struct {
 	// recorder records Vault operation metrics. It is optional and may be nil;
 	// all metric recording is guarded with a nil check.
 	recorder metrics.Recorder
+
+	// authMu serializes (re-)authentication so concurrent operations that hit
+	// an expired/revoked token trigger exactly ONE re-login (no stampede).
+	authMu sync.Mutex
+	// stateMu guards lastAuthSecret and authGeneration.
+	stateMu sync.RWMutex
+	// lastAuthSecret is the most recent login response (nil for token auth,
+	// which performs no login call and has no lease to renew).
+	lastAuthSecret *vaultapi.Secret
+	// authGeneration increments on every successful login. Operations record
+	// the generation before a request; on an auth error they only trigger a
+	// re-login when the generation is unchanged (someone else may have
+	// already re-authenticated).
+	authGeneration uint64
+
+	// watcherCancel stops the background token lifetime watcher.
+	watcherCancel context.CancelFunc
+	// watcherWG tracks the lifetime-watcher goroutine for Close().
+	watcherWG sync.WaitGroup
+	// closeOnce makes Close idempotent.
+	closeOnce sync.Once
 }
 
 // SetRecorder sets an optional metrics recorder for Vault operations.
@@ -166,31 +218,195 @@ func NewClient(
 		return nil, fmt.Errorf("authenticating with vault: %w", err)
 	}
 
+	// Start the background token lifetime watcher so renewable login tokens
+	// (kubernetes/approle) are renewed before expiry and re-authenticated when
+	// renewal is no longer possible. The watcher lifecycle is bound to the
+	// provided context AND to Close() (whichever happens first).
+	watcherCtx, watcherCancel := context.WithCancel(ctx)
+	vc.watcherCancel = watcherCancel
+	vc.watcherWG.Add(1)
+	go vc.runTokenLifecycle(watcherCtx)
+
 	return vc, nil
 }
 
-// authenticate performs Vault authentication based on the configured method.
+// authenticate performs Vault authentication based on the configured method,
+// retrying with exponential backoff.
 func (v *vaultClient) authenticate(ctx context.Context) error {
 	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.authenticate",
 		trace.WithAttributes(attribute.String("vault.operation", vaultOpAuth)))
 	defer span.End()
 
 	start := time.Now()
-	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
-		switch v.config.AuthMethod {
-		case authMethodToken:
-			return v.authenticateToken()
-		case authMethodKubernetes:
-			return v.authenticateKubernetes(ctx)
-		case authMethodAppRole:
-			return v.authenticateAppRole(ctx)
-		default:
-			return fmt.Errorf("unsupported vault auth method: %s", v.config.AuthMethod)
-		}
-	})
+	err := util.RetryWithBackoff(ctx, v.retryOpts, v.loginOnce)
 	v.recordVaultOp(vaultOpAuth, start, err)
 	telemetry.SetSpanError(span, err)
 	return err
+}
+
+// loginOnce performs a single authentication attempt (no retry) based on the
+// configured method. On success the new auth secret and generation are stored.
+func (v *vaultClient) loginOnce(ctx context.Context) error {
+	switch v.config.AuthMethod {
+	case authMethodToken:
+		return v.authenticateToken()
+	case authMethodKubernetes:
+		return v.authenticateKubernetes(ctx)
+	case authMethodAppRole:
+		return v.authenticateAppRole(ctx)
+	default:
+		return fmt.Errorf("unsupported vault auth method: %s", v.config.AuthMethod)
+	}
+}
+
+// storeAuthSecret records the latest login response and bumps the auth
+// generation so in-flight operations know a re-login already happened.
+func (v *vaultClient) storeAuthSecret(secret *vaultapi.Secret) {
+	v.stateMu.Lock()
+	defer v.stateMu.Unlock()
+	v.lastAuthSecret = secret
+	v.authGeneration++
+}
+
+// currentAuthState returns the latest auth secret and generation.
+func (v *vaultClient) currentAuthState() (secret *vaultapi.Secret, generation uint64) {
+	v.stateMu.RLock()
+	defer v.stateMu.RUnlock()
+	return v.lastAuthSecret, v.authGeneration
+}
+
+// isVaultAuthError reports whether the error indicates an authentication /
+// authorization failure (expired or revoked token): HTTP 401/403 from Vault.
+func isVaultAuthError(err error) bool {
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == http.StatusUnauthorized ||
+			respErr.StatusCode == http.StatusForbidden
+	}
+	// Fallback for wrapped errors that lost the typed response error.
+	msg := err.Error()
+	return strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "Code: 403") ||
+		strings.Contains(msg, "Code: 401")
+}
+
+// maybeReauthOnAuthError performs a single re-login when opErr is a Vault
+// auth error (401/403), so the caller's retry loop (RetryWithBackoff) can
+// retry the operation with a fresh token. observedGen is the auth generation
+// read BEFORE the failing request: when it no longer matches, another
+// goroutine already re-authenticated and no additional login is issued —
+// concurrent operations during a token expiry produce exactly one re-login.
+func (v *vaultClient) maybeReauthOnAuthError(ctx context.Context, observedGen uint64, opErr error) {
+	if opErr == nil || !isVaultAuthError(opErr) {
+		return
+	}
+
+	v.authMu.Lock()
+	defer v.authMu.Unlock()
+
+	if _, gen := v.currentAuthState(); gen != observedGen {
+		// A concurrent operation already re-authenticated.
+		return
+	}
+
+	v.logger.Warn("vault operation failed with auth error, re-authenticating",
+		"error", opErr)
+	start := time.Now()
+	loginErr := v.loginOnce(ctx)
+	v.recordVaultOp(vaultOpReauth, start, loginErr)
+	if loginErr != nil {
+		v.logger.Error("vault re-authentication failed", "error", loginErr)
+	}
+}
+
+// runTokenLifecycle renews the login token via vaultapi's LifetimeWatcher
+// until it can no longer be renewed, then re-authenticates (with backoff) and
+// starts a fresh watcher. It exits when the context is canceled, when Close
+// is called, or when re-authentication exhausts its retry budget (reactive
+// re-auth in Read/Write still recovers later in that case).
+func (v *vaultClient) runTokenLifecycle(ctx context.Context) {
+	defer v.watcherWG.Done()
+
+	for {
+		secret, _ := v.currentAuthState()
+		if secret == nil || secret.Auth == nil || !secret.Auth.Renewable {
+			// Nothing to renew: token auth performs no login (the token is
+			// managed externally) and non-renewable leases cannot be extended.
+			// Reactive re-auth in ReadSecret/WriteSecret covers expiry.
+			v.logger.Debug("vault token is not renewable; lifetime watcher not started")
+			return
+		}
+
+		watcher, err := newLifetimeWatcher(v.client, secret)
+		if err != nil {
+			v.logger.Error("failed to create vault token lifetime watcher", "error", err)
+			return
+		}
+
+		go watcher.Start()
+		if expired := v.watchRenewals(ctx, watcher); !expired {
+			// Context canceled / Close called.
+			return
+		}
+
+		// The token can no longer be renewed — re-authenticate with backoff.
+		v.authMu.Lock()
+		reauthErr := v.authenticate(ctx)
+		v.authMu.Unlock()
+		if reauthErr != nil {
+			v.logger.Error("vault re-authentication after token expiry failed; "+
+				"reactive re-auth on the next operation will retry", "error", reauthErr)
+			return
+		}
+		v.logger.Info("vault token re-acquired after expiry")
+	}
+}
+
+// watchRenewals consumes the watcher's renewal/done channels, recording
+// renewal outcomes. It returns true when the token reached the end of its
+// renewable lifetime (caller should re-authenticate) and false when the
+// context was canceled.
+func (v *vaultClient) watchRenewals(ctx context.Context, watcher *vaultapi.LifetimeWatcher) bool {
+	defer watcher.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case err := <-watcher.DoneCh():
+			v.recordRenewalDone(err)
+			return true
+		case renewal := <-watcher.RenewCh():
+			if v.recorder != nil {
+				v.recorder.RecordVaultOperation(vaultOpRenew, metricResultSuccess)
+			}
+			v.logger.Debug("vault token renewed",
+				"renewedAt", renewal.RenewedAt)
+		}
+	}
+}
+
+// recordRenewalDone logs and records the end of a renewal cycle. The watcher
+// reports a nil error for expected end-of-life (e.g. an expired token falls
+// back to the non-renewable path), and a non-nil error for hard failures.
+func (v *vaultClient) recordRenewalDone(err error) {
+	if err == nil {
+		return
+	}
+	v.logger.Warn("vault token renewal stopped", "error", err)
+	if v.recorder != nil {
+		v.recorder.RecordVaultOperation(vaultOpRenew, metricResultError)
+	}
+}
+
+// Close stops the background token lifetime watcher and waits for it to
+// terminate. It is safe to call multiple times and implements vault.Closer.
+func (v *vaultClient) Close() {
+	v.closeOnce.Do(func() {
+		if v.watcherCancel != nil {
+			v.watcherCancel()
+		}
+		v.watcherWG.Wait()
+	})
 }
 
 // authenticateToken sets the Vault token directly.
@@ -199,6 +415,8 @@ func (v *vaultClient) authenticateToken() error {
 		return fmt.Errorf("vault token is required for token auth method")
 	}
 	v.client.SetToken(v.config.Token)
+	// No login response: the externally managed token has no lease to renew.
+	v.storeAuthSecret(nil)
 	v.logger.Info("authenticated with vault using token method")
 	return nil
 }
@@ -231,6 +449,7 @@ func (v *vaultClient) authenticateKubernetes(ctx context.Context) error {
 	}
 
 	v.client.SetToken(secret.Auth.ClientToken)
+	v.storeAuthSecret(secret)
 	v.logger.Info("authenticated with vault using kubernetes method",
 		"role", v.config.Role,
 	)
@@ -244,10 +463,22 @@ func (v *vaultClient) authenticateAppRole(ctx context.Context) error {
 		authPath = "auth/approle"
 	}
 
+	// Prefer the dedicated AppRole credential fields; fall back to the
+	// historically overloaded Role/Token fields so existing configurations
+	// keep working (L-12).
+	roleID := v.config.RoleID
+	if roleID == "" {
+		roleID = v.config.Role
+	}
+	secretID := v.config.SecretID
+	if secretID == "" {
+		secretID = v.config.Token
+	}
+
 	loginPath := fmt.Sprintf("%s/login", authPath)
 	data := map[string]interface{}{
-		"role_id":   v.config.Role,
-		"secret_id": v.config.Token,
+		"role_id":   roleID,
+		"secret_id": secretID,
 	}
 
 	secret, err := v.client.Logical().WriteWithContext(ctx, loginPath, data)
@@ -260,6 +491,7 @@ func (v *vaultClient) authenticateAppRole(ctx context.Context) error {
 	}
 
 	v.client.SetToken(secret.Auth.ClientToken)
+	v.storeAuthSecret(secret)
 	v.logger.Info("authenticated with vault using approle method")
 	return nil
 }
@@ -277,8 +509,12 @@ func (v *vaultClient) ReadSecret(ctx context.Context, path string) (map[string]i
 
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
+		_, gen := v.currentAuthState()
 		secret, readErr := v.client.Logical().ReadWithContext(ctx, path)
 		if readErr != nil {
+			// On 401/403 re-authenticate once (mutex-guarded, generation-
+			// gated) so the next backoff retry uses a fresh token.
+			v.maybeReauthOnAuthError(ctx, gen, readErr)
 			return fmt.Errorf("reading secret at %s: %w", path, readErr)
 		}
 
@@ -320,8 +556,12 @@ func (v *vaultClient) WriteSecret(ctx context.Context, path string, data map[str
 		wrappedData := map[string]interface{}{
 			"data": data,
 		}
+		_, gen := v.currentAuthState()
 		_, writeErr := v.client.Logical().WriteWithContext(ctx, path, wrappedData)
 		if writeErr != nil {
+			// On 401/403 re-authenticate once (mutex-guarded, generation-
+			// gated) so the next backoff retry uses a fresh token.
+			v.maybeReauthOnAuthError(ctx, gen, writeErr)
 			return fmt.Errorf("writing secret at %s: %w", path, writeErr)
 		}
 		return nil
@@ -354,8 +594,12 @@ func (v *vaultClient) WriteSecretWithResponse(
 
 	start := time.Now()
 	err := util.RetryWithBackoff(ctx, v.retryOpts, func(ctx context.Context) error {
+		_, gen := v.currentAuthState()
 		secret, writeErr := v.client.Logical().WriteWithContext(ctx, path, data)
 		if writeErr != nil {
+			// On 401/403 re-authenticate once (mutex-guarded, generation-
+			// gated) so the next backoff retry uses a fresh token.
+			v.maybeReauthOnAuthError(ctx, gen, writeErr)
 			return fmt.Errorf("writing to %s: %w", path, writeErr)
 		}
 		if secret == nil || secret.Data == nil {

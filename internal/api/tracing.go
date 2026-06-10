@@ -38,11 +38,36 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// tracingMiddleware opens a server span for every API request, named by the
-// matched method+route pattern, and records the response status. On a non-2xx
-// response the span is marked as an error. The span context is propagated into
-// the request so handler-level child spans nest underneath it. Tracing is a
-// no-op when telemetry is disabled (the global no-op tracer is used).
+// Unwrap returns the wrapped ResponseWriter so http.NewResponseController can
+// reach the underlying writer's optional interfaces (Flusher, deadline
+// control) through this wrapper. Required for streaming endpoints (log
+// follow mode, CSV exports).
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
+// Flush delegates to the wrapped writer when it supports http.Flusher so
+// streaming handlers that type-assert on http.Flusher keep working through
+// this wrapper. It is a safe no-op when the underlying writer does not
+// support flushing (nothing to flush in that case).
+func (s *statusRecorder) Flush() {
+	if flusher, ok := s.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// tracingMiddleware opens a server span for every API request and records
+// the response status. On a non-2xx response the span is marked as an error.
+// The span context is propagated into the request so handler-level child
+// spans nest underneath it. Tracing is a no-op when telemetry is disabled
+// (the global no-op tracer is used).
+//
+// Span naming (D-1/M-11): the span starts with a provisional low-cardinality
+// name and is RENAMED after the handler runs to "METHOD <route template>"
+// (e.g. "GET /api/v1alpha1/clusters/{name}") — never the raw URL path, whose
+// cluster names/PIDs would explode span-name cardinality. The raw path stays
+// available on the http.target attribute. Unmatched requests get the
+// "METHOD unmatched" fallback.
 func (s *Server) tracingMiddleware(next http.Handler) http.Handler {
 	propagator := propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, propagation.Baggage{},
@@ -51,8 +76,7 @@ func (s *Server) tracingMiddleware(next http.Handler) http.Handler {
 		// Extract any inbound trace context so cross-service traces continue.
 		ctx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 
-		spanName := r.Method + " " + r.URL.Path
-		ctx, span := telemetry.StartSpan(ctx, apiTracerName, spanName,
+		ctx, span := telemetry.StartSpan(ctx, apiTracerName, r.Method,
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(
 				attribute.String("http.method", r.Method),
@@ -64,6 +88,7 @@ func (s *Server) tracingMiddleware(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r.WithContext(ctx))
 
+		span.SetName(r.Method + " " + s.routePattern(r))
 		span.SetAttributes(attribute.Int("http.status_code", rec.status))
 		if rec.status >= http.StatusBadRequest {
 			span.SetStatus(codes.Error, http.StatusText(rec.status))

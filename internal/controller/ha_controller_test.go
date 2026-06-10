@@ -42,6 +42,8 @@ type mockDBClient struct {
 	replicationLag     int64
 	repLagErr          error
 	triggerFTSProbeErr error
+	maxConnections     int32
+	maxConnectionsErr  error
 }
 
 func (m *mockDBClient) Ping(_ context.Context) error { return nil }
@@ -73,6 +75,9 @@ func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) {
 	return m.replicationLag, m.repLagErr
 }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error { return nil }
+func (m *mockDBClient) GetMaxConnections(_ context.Context) (int32, error) {
+	return m.maxConnections, m.maxConnectionsErr
+}
 func (m *mockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return 0, 0, 0, nil
 }

@@ -1145,6 +1145,39 @@ func TestRecordCertRotation(t *testing.T) {
 	}
 }
 
+func TestRecordClusterCertIssuance(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"issuance success", "success"},
+		{"issuance error", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordClusterCertIssuance("test-cluster", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_cluster_cert_issuance_total")
+			assert.True(t, found, "cloudberry_cluster_cert_issuance_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordClusterCertIssuance_MultipleIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordClusterCertIssuance("test-cluster", "default", "success")
+	recorder.RecordClusterCertIssuance("test-cluster", "default", "success")
+
+	v, found := counterValue(t, reg, "cloudberry_cluster_cert_issuance_total")
+	require.True(t, found)
+	assert.InDelta(t, 2.0, v, 0.001)
+}
+
 func TestRecordCertRotation_MultipleIncrements(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
@@ -1357,6 +1390,7 @@ func TestNoopRecorder_NewMethods(t *testing.T) {
 	// None of these should panic; they are intentional no-ops.
 	r.RecordCertRotation("webhook", "self-signed", "success")
 	r.SetCertExpirySeconds("webhook", 3600)
+	r.RecordClusterCertIssuance("c", "n", "success")
 	r.RecordVaultOperation("read", "success")
 	r.ObserveVaultOperationDuration("read", time.Second)
 	r.RecordWebhookAdmission("validating", "create", "allowed")

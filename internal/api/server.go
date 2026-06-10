@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,14 +23,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/db"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/httpjson"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/planchecker"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -89,11 +93,22 @@ const (
 	statusPaused  = "paused"
 	statusResumed = "resumed"
 
+	// resultSuccess / resultError are the shared metric result label values.
+	resultSuccess = "success"
+	resultError   = "error"
+
 	// errCodeClusterNotFound is the error code for cluster-not-found responses.
 	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
 
 	// errCodeInternal is the generic internal-error code.
 	errCodeInternal = "INTERNAL_ERROR"
+
+	// errCodeInvalidRequest is the error code for malformed/invalid requests.
+	errCodeInvalidRequest = "INVALID_REQUEST"
+
+	// errCodeNotImplemented is the error code for endpoints that are not
+	// implemented yet (HTTP 501 responses).
+	errCodeNotImplemented = "NOT_IMPLEMENTED"
 
 	// jobLogsFlushInterval is how often streamed log output is flushed to the
 	// client when following a Job's logs.
@@ -145,6 +160,14 @@ func limitBody(w http.ResponseWriter, r *http.Request) {
 }
 
 // monitorState tracks the pause/resume state for a cluster's query monitor.
+//
+// VOLATILITY (L-13, documented limitation): this state is held IN MEMORY
+// only. It is lost on pod restart and is NOT shared between operator
+// replicas (the API server runs on every replica regardless of leader
+// election), so a pause issued against one replica is invisible to the
+// others. Persisting the state via a cluster annotation is tracked as a
+// follow-up feature; operators should treat monitor pause as a best-effort,
+// single-replica convenience.
 type monitorState struct {
 	Paused   bool                   `json:"paused"`
 	PausedAt *time.Time             `json:"pausedAt,omitempty"`
@@ -206,7 +229,6 @@ func NewServer(
 	s := &Server{
 		k8sClient:     k8sClient,
 		authMW:        authMW,
-		rateLimiter:   NewRateLimiter(rateLimit, defaultRateInterval, logger),
 		dbFactory:     dbFactory,
 		metrics:       metricsRecorder,
 		builder:       builder.NewBuilder(),
@@ -214,6 +236,14 @@ func NewServer(
 		mux:           http.NewServeMux(),
 		monitorStates: make(map[string]*monitorState),
 	}
+	// The rejection callback records the 429 counter with the matched route
+	// template (bounded label cardinality).
+	s.rateLimiter = NewRateLimiter(rateLimit, defaultRateInterval, logger,
+		WithRejectionCallback(func(r *http.Request) {
+			if s.metrics != nil {
+				s.metrics.RecordRateLimitRejection(s.routePattern(r))
+			}
+		}))
 
 	if len(credStore) > 0 && credStore[0] != nil {
 		s.credStore = credStore[0]
@@ -232,10 +262,12 @@ func (s *Server) Close() {
 
 // Handler returns the HTTP handler for the API server.
 func (s *Server) Handler() http.Handler {
-	// Apply security headers to all requests, then wrap with the tracing
-	// middleware so every request gets a root span (no-op when telemetry is
-	// disabled) that handler-level child spans can nest underneath.
-	return s.tracingMiddleware(auth.SecurityHeaders()(s.mux))
+	// Middleware order (outermost first): tracing opens the root span and
+	// installs the shared statusRecorder; the metrics middleware reuses that
+	// recorder for the status-code label; security headers apply to every
+	// response. Both observability middlewares are no-ops when telemetry /
+	// metrics are not configured.
+	return s.tracingMiddleware(s.metricsMiddleware(auth.SecurityHeaders()(s.mux)))
 }
 
 // registerRoutes registers all API routes.
@@ -539,6 +571,7 @@ func (s *Server) withGuestAuth(handler http.Handler) http.Handler {
 }
 
 // handleHealthz handles the health check endpoint.
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{responseKeyStatus: "ok"})
 }
@@ -558,7 +591,7 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 	// Verify the credential store is available for in-memory rotation.
 	if s.credStore == nil {
 		s.logger.Error("password rotation requested but credential store not available")
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"credential store not configured")
 		return
 	}
@@ -567,7 +600,7 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 	newPassword, err := util.GenerateRandomPassword()
 	if err != nil {
 		s.logger.Error("failed to generate new password", "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to generate new password")
 		return
 	}
@@ -584,40 +617,31 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 		Namespace: operatorNS,
 	}
 	existing := &corev1.Secret{}
-	if err := s.k8sClient.Get(ctx, secretKey, existing); err != nil {
-		// Secret does not exist — create it.
-		s.logger.Info("admin password secret not found, creating new secret",
-			"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS)
-		newSecret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      util.OperatorAdminPasswordSecretName,
-				Namespace: operatorNS,
-				Labels: map[string]string{
-					util.LabelManagedBy: util.LabelManagedByValue,
-				},
-			},
-			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{
-				util.PasswordSecretKey: []byte(newPassword),
-			},
-		}
-		if createErr := s.k8sClient.Create(ctx, newSecret); createErr != nil {
-			s.logger.Error("failed to create admin password secret",
-				"error", createErr)
-			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-				"failed to create admin password secret")
-			return
-		}
-	} else {
+	getErr := s.k8sClient.Get(ctx, secretKey, existing)
+	switch {
+	case getErr == nil:
 		// Secret exists — update it with the new password.
 		existing.Data[util.PasswordSecretKey] = []byte(newPassword)
 		if updateErr := s.k8sClient.Update(ctx, existing); updateErr != nil {
 			s.logger.Error("failed to update admin password secret",
 				"error", updateErr)
-			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 				"failed to update admin password secret")
 			return
 		}
+	case apierrors.IsNotFound(getErr):
+		// Secret genuinely does not exist — create it.
+		if !s.createAdminPasswordSecret(ctx, w, operatorNS, newPassword) {
+			return
+		}
+	default:
+		// Transient API-server error: do NOT attempt Create (it would fail
+		// with AlreadyExists and mask the real cause, mirroring
+		// resolveAdminPassword's discrimination).
+		s.logger.Error("failed to read admin password secret", "error", getErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			fmt.Sprintf("failed to read admin password secret: %v", getErr))
+		return
 	}
 
 	// Update the in-memory credential store so the new password works immediately.
@@ -636,12 +660,64 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createAdminPasswordSecret creates the admin password Secret with the given
+// password, handling the AlreadyExists race (another replica created it
+// concurrently) by updating the existing Secret instead. Returns false when an
+// error response has been written.
+func (s *Server) createAdminPasswordSecret(
+	ctx context.Context,
+	w http.ResponseWriter,
+	operatorNS, newPassword string,
+) bool {
+	s.logger.Info("admin password secret not found, creating new secret",
+		"secret", util.OperatorAdminPasswordSecretName, "namespace", operatorNS)
+	newSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.OperatorAdminPasswordSecretName,
+			Namespace: operatorNS,
+			Labels: map[string]string{
+				util.LabelManagedBy: util.LabelManagedByValue,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			util.PasswordSecretKey: []byte(newPassword),
+		},
+	}
+	createErr := s.k8sClient.Create(ctx, newSecret)
+	if createErr == nil {
+		return true
+	}
+	if apierrors.IsAlreadyExists(createErr) {
+		// Race: another replica created the Secret between Get and Create —
+		// re-read and update it with our new password.
+		raced := &corev1.Secret{}
+		key := types.NamespacedName{
+			Name:      util.OperatorAdminPasswordSecretName,
+			Namespace: operatorNS,
+		}
+		if getErr := s.k8sClient.Get(ctx, key, raced); getErr == nil {
+			if raced.Data == nil {
+				raced.Data = map[string][]byte{}
+			}
+			raced.Data[util.PasswordSecretKey] = []byte(newPassword)
+			if updateErr := s.k8sClient.Update(ctx, raced); updateErr == nil {
+				return true
+			}
+		}
+	}
+	s.logger.Error("failed to create admin password secret", "error", createErr)
+	writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+		"failed to create admin password secret")
+	return false
+}
+
 // handleListClusters lists all CloudberryCluster resources.
 func (s *Server) handleListClusters(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	clusterList := &cbv1alpha1.CloudberryClusterList{}
 	if err := s.k8sClient.List(ctx, clusterList); err != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list clusters")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to list clusters")
 		return
 	}
 
@@ -736,23 +812,38 @@ func (s *Server) handleCreateCluster(w http.ResponseWriter, r *http.Request) {
 
 	cluster := &cbv1alpha1.CloudberryCluster{}
 	if err := json.NewDecoder(r.Body).Decode(cluster); err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if !isValidDNS1123Name(cluster.Name) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"cluster name must be a valid DNS-1123 subdomain")
 		return
 	}
 
 	if err := s.k8sClient.Create(r.Context(), cluster); err != nil {
 		s.logger.Error("failed to create cluster", "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create cluster")
+		s.recordClusterOperation("create", err)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create cluster")
 		return
 	}
+	s.recordClusterOperation("create", nil)
 
 	writeJSON(w, http.StatusCreated, cluster)
+}
+
+// recordClusterOperation records a cluster CRUD attempt outcome on
+// cloudberry_api_cluster_operations_total (nil-safe).
+func (s *Server) recordClusterOperation(operation string, err error) {
+	if s.metrics == nil {
+		return
+	}
+	result := resultSuccess
+	if err != nil {
+		result = resultError
+	}
+	s.metrics.RecordAPIClusterOperation(operation, result)
 }
 
 // handleDeleteCluster deletes a CloudberryCluster.
@@ -766,9 +857,11 @@ func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.k8sClient.Delete(r.Context(), cluster); err != nil {
 		s.logger.Error("failed to delete cluster", "cluster", name, "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete cluster")
+		s.recordClusterOperation("delete", err)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to delete cluster")
 		return
 	}
+	s.recordClusterOperation("delete", nil)
 
 	writeJSON(w, http.StatusOK, map[string]string{responseKeyStatus: "deleting"})
 }
@@ -818,14 +911,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	var configUpdate cbv1alpha1.ConfigSpec
 	if decodeErr := json.NewDecoder(r.Body).Decode(&configUpdate); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
-	cluster.Spec.Config = &configUpdate
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+	if updateErr := s.updateClusterWithConflictRetry(r.Context(), cluster,
+		func(latest *cbv1alpha1.CloudberryCluster) error {
+			latest.Spec.Config = &configUpdate
+			return nil
+		}); updateErr != nil {
 		s.logger.Error("failed to update config", "cluster", name, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update config")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			fmt.Sprintf("failed to update config: %v", updateErr))
 		return
 	}
 
@@ -882,8 +979,11 @@ func (s *Server) handleGetMirroring(w http.ResponseWriter, r *http.Request) {
 //   - resource_group: filter by resource group name
 //   - since: filter by query_start within the last N minutes (e.g. "5m", "30m")
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.sessions.list")
+	defer span.End()
+
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -900,7 +1000,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
+	dbClient, err := s.dbFactory.NewClient(ctx, cluster)
 	if err != nil {
 		s.logger.Error("failed to create database client for session listing",
 			"cluster", cluster.Name, "error", err)
@@ -911,11 +1011,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	defer dbClient.Close()
 
 	// Use ListSessionsWithResourceGroup for richer data including resource group info.
-	sessions, err := dbClient.ListSessionsWithResourceGroup(r.Context())
+	sessions, err := dbClient.ListSessionsWithResourceGroup(ctx)
 	if err != nil {
 		s.logger.Error("failed to list sessions",
 			"cluster", cluster.Name, "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to list sessions")
 		return
 	}
@@ -995,141 +1095,186 @@ func matchSince(s db.SessionWithGroup, since string) bool {
 	return s.QueryStart.After(cutoff)
 }
 
-// handleCancelQuery cancels a running query by calling pg_cancel_backend
-// through a short-lived database connection created via the DBClientFactory.
-// Accepts an optional JSON body with a "reason" field for audit logging.
-func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
+// backendSignalMode selects the backend signal sent by cancelBackendByPID:
+// pg_cancel_backend ("cancel") or pg_terminate_backend ("terminate").
+type backendSignalMode string
+
+const (
+	// backendSignalCancel cancels the running query (pg_cancel_backend).
+	backendSignalCancel backendSignalMode = "cancel"
+	// backendSignalTerminate terminates the whole session (pg_terminate_backend).
+	backendSignalTerminate backendSignalMode = "terminate"
+)
+
+// cancelBackendOptions configures cancelBackendByPID per endpoint so the
+// three cancel/terminate handlers share one implementation while preserving
+// their exact response contracts.
+type cancelBackendOptions struct {
+	// mode selects cancel vs terminate.
+	mode backendSignalMode
+	// parseReason parses the optional {"reason": "..."} request body and
+	// echoes it in the response (cancel endpoints only).
+	parseReason bool
+	// includeStatus adds "status": "canceled" to the success response
+	// (queries-API cancel endpoint only).
+	includeStatus bool
+	// operation is the human-readable operation name used in log messages
+	// and error bodies (e.g. "cancel query", "terminate session").
+	operation string
+	// resultKey is the response key carrying the boolean backend result
+	// ("canceled" or "terminated").
+	resultKey string
+}
+
+// backendSpanName returns the static child-span name for the backend-signal
+// helper (bounded: two modes only).
+func backendSpanName(mode backendSignalMode) string {
+	if mode == backendSignalTerminate {
+		return "api.session.terminate"
+	}
+	return "api.query.cancel"
+}
+
+// cancelBackendByPID is the shared implementation behind the query-cancel and
+// session-terminate endpoints. It parses and validates the PID, resolves the
+// cluster, opens a short-lived DB connection, sends the requested backend
+// signal and writes the endpoint-specific response. Being the single call
+// site, it also records the cancel/termination metrics for ALL cancel and
+// terminate endpoints (C-4/M-16).
+func (s *Server) cancelBackendByPID(w http.ResponseWriter, r *http.Request, opts cancelBackendOptions) {
+	// Static span name per mode; the PID stays out of the name (cardinality).
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, backendSpanName(opts.mode))
+	defer span.End()
+
 	pidStr := r.PathValue("pid")
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid PID")
 		return
 	}
 	if pid <= 0 {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "PID must be a positive integer")
 		return
 	}
 
-	// Parse optional reason from request body.
+	// Parse optional reason from the request body when supported.
 	var cancelReq struct {
 		Reason string `json:"reason"`
 	}
-	if r.Body != nil {
+	if opts.parseReason {
 		// Ignore decode errors — reason is optional.
 		_ = json.NewDecoder(r.Body).Decode(&cancelReq)
 	}
 
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
-	if err != nil {
+	cluster, clusterErr := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
+	if clusterErr != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
 
 	if s.dbFactory == nil {
-		s.logger.Warn("cancel query requested but database factory not available",
-			"cluster", cluster.Name, responseKeyPID, pid)
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			responseKeyPID:      pid,
-			responseKeyCanceled: false,
-			responseKeyMessage:  msgDBNotAvailable,
-		})
-		return
-	}
-
-	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
-	if err != nil {
-		s.logger.Error("failed to create database client for cancel query",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
-		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
-			"cannot connect to database")
-		return
-	}
-	defer dbClient.Close()
-
-	result, err := dbClient.CancelQuery(r.Context(), int32(pid))
-	if err != nil {
-		s.logger.Error("failed to cancel query",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to cancel query")
-		return
-	}
-
-	response := map[string]interface{}{
-		responseKeyPID:      pid,
-		responseKeyCanceled: result,
-	}
-
-	if cancelReq.Reason != "" {
-		response["reason"] = cancelReq.Reason
-		s.logger.Info("query canceled with reason",
-			"cluster", cluster.Name, responseKeyPID, pid,
-			responseKeyCanceled, result, "reason", cancelReq.Reason)
-	} else {
-		s.logger.Info("query cancel requested",
-			"cluster", cluster.Name, responseKeyPID, pid, responseKeyCanceled, result)
-	}
-
-	writeJSON(w, http.StatusOK, response)
-}
-
-// handleTerminateSession terminates a session by calling pg_terminate_backend
-// through a short-lived database connection created via the DBClientFactory.
-func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) {
-	pidStr := r.PathValue("pid")
-	pid, err := strconv.ParseInt(pidStr, 10, 32)
-	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
-		return
-	}
-	if pid <= 0 {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
-		return
-	}
-
-	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
-	if err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	if s.dbFactory == nil {
-		s.logger.Warn("terminate session requested but database factory not available",
+		s.logger.Warn(opts.operation+" requested but database factory not available",
 			"cluster", cluster.Name, responseKeyPID, pid)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			responseKeyPID:     pid,
-			"terminated":       false,
+			opts.resultKey:     false,
 			responseKeyMessage: msgDBNotAvailable,
 		})
 		return
 	}
 
-	dbClient, err := s.dbFactory.NewClient(r.Context(), cluster)
-	if err != nil {
-		s.logger.Error("failed to create database client for terminate session",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for "+opts.operation,
+			"cluster", cluster.Name, responseKeyPID, pid, "error", dbErr)
 		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
 			"cannot connect to database")
 		return
 	}
 	defer dbClient.Close()
 
-	result, err := dbClient.TerminateSession(r.Context(), int32(pid))
-	if err != nil {
-		s.logger.Error("failed to terminate session",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to terminate session")
+	var result bool
+	var sigErr error
+	if opts.mode == backendSignalTerminate {
+		result, sigErr = dbClient.TerminateSession(ctx, int32(pid))
+	} else {
+		result, sigErr = dbClient.CancelQuery(ctx, int32(pid))
+	}
+	s.recordBackendSignal(cluster, opts.mode, sigErr)
+	if sigErr != nil {
+		telemetry.SetSpanError(span, sigErr)
+		s.logger.Error("failed to "+opts.operation,
+			"cluster", cluster.Name, responseKeyPID, pid, "error", sigErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to "+opts.operation)
 		return
 	}
 
-	s.logger.Info("session terminate requested",
-		"cluster", cluster.Name, responseKeyPID, pid, "terminated", result)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	response := map[string]interface{}{
 		responseKeyPID: pid,
-		"terminated":   result,
+		opts.resultKey: result,
+	}
+	if opts.includeStatus {
+		response[responseKeyStatus] = statusCanceled
+	}
+	if opts.parseReason && cancelReq.Reason != "" {
+		response["reason"] = cancelReq.Reason
+		s.logger.Info(opts.operation+" requested with reason",
+			"cluster", cluster.Name, responseKeyPID, pid,
+			opts.resultKey, result, "reason", cancelReq.Reason)
+	} else {
+		s.logger.Info(opts.operation+" requested",
+			"cluster", cluster.Name, responseKeyPID, pid, opts.resultKey, result)
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// recordBackendSignal records the cancel/terminate metrics from the single
+// shared helper: query cancels (both the queries API and the sessions API)
+// increment cloudberry_query_cancel_total on success; terminations increment
+// cloudberry_session_terminations_total with a success/error result.
+func (s *Server) recordBackendSignal(
+	cluster *cbv1alpha1.CloudberryCluster,
+	mode backendSignalMode,
+	sigErr error,
+) {
+	if s.metrics == nil {
+		return
+	}
+	if mode == backendSignalTerminate {
+		result := resultSuccess
+		if sigErr != nil {
+			result = resultError
+		}
+		s.metrics.RecordSessionTermination(cluster.Name, cluster.Namespace, result)
+		return
+	}
+	if sigErr == nil {
+		s.metrics.RecordQueryCancel(cluster.Name, cluster.Namespace)
+	}
+}
+
+// handleCancelQuery cancels a running query by calling pg_cancel_backend
+// through a short-lived database connection created via the DBClientFactory.
+// Accepts an optional JSON body with a "reason" field for audit logging.
+func (s *Server) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
+	s.cancelBackendByPID(w, r, cancelBackendOptions{
+		mode:        backendSignalCancel,
+		parseReason: true,
+		operation:   "cancel query",
+		resultKey:   responseKeyCanceled,
+	})
+}
+
+// handleTerminateSession terminates a session by calling pg_terminate_backend
+// through a short-lived database connection created via the DBClientFactory.
+func (s *Server) handleTerminateSession(w http.ResponseWriter, r *http.Request) {
+	s.cancelBackendByPID(w, r, cancelBackendOptions{
+		mode:      backendSignalTerminate,
+		operation: "terminate session",
+		resultKey: "terminated",
 	})
 }
 
@@ -1177,7 +1322,7 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 		Type string `json:"type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
@@ -1188,7 +1333,7 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 		util.RecoveryDifferential: true,
 	}
 	if !validRecoveryTypes[req.Type] {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid recovery type %q; valid types: incremental, full, differential", req.Type))
 		return
 	}
@@ -1200,13 +1345,11 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cluster.Annotations == nil {
-		cluster.Annotations = make(map[string]string)
-	}
-	cluster.Annotations[util.AnnotationRecovery] = req.Type
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		s.logger.Error("failed to start recovery", "cluster", name, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to start recovery")
+	// Annotation-only mutation: use a MergeFrom patch (conflict-safe).
+	if patchErr := s.patchClusterAnnotation(r.Context(), cluster,
+		util.AnnotationRecovery, req.Type); patchErr != nil {
+		s.logger.Error("failed to start recovery", "cluster", name, "error", patchErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to start recovery")
 		return
 	}
 
@@ -1280,8 +1423,12 @@ func (s *Server) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 // available via dbFactory, groups are queried from gp_toolkit.gp_resgroup_status.
 // Otherwise, the CRD spec is used as a fallback.
 func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request) {
+	// Static-named child span (D-6); downstream db spans nest under it.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.resourceGroups.list")
+	defer span.End()
+
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -1289,10 +1436,10 @@ func (s *Server) handleListResourceGroups(w http.ResponseWriter, r *http.Request
 
 	// Try to list from the database when dbFactory is available.
 	if s.dbFactory != nil {
-		dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+		dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
 		if dbErr == nil {
 			defer dbClient.Close()
-			dbGroups, listErr := dbClient.ListResourceGroups(r.Context())
+			dbGroups, listErr := dbClient.ListResourceGroups(ctx)
 			if listErr == nil {
 				writeJSON(w, http.StatusOK, map[string]interface{}{
 					"resourceGroups": dbGroups,
@@ -1343,17 +1490,17 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 		MinCost       int32  `json:"minCost"`
 	}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource group name is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "resource group name is required")
 		return
 	}
 
 	if !isValidIdentifier(req.Name) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource group name: must be a valid SQL identifier")
 		return
 	}
@@ -1393,7 +1540,7 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 	if createErr := dbClient.CreateResourceGroup(r.Context(), opts); createErr != nil {
 		s.logger.Error("failed to create resource group",
 			"cluster", cluster.Name, "group", req.Name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create resource group")
 		return
 	}
@@ -1415,7 +1562,7 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 	groupName := r.PathValue("groupName")
 
 	if !isValidIdentifier(groupName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource group name: must be a valid SQL identifier")
 		return
 	}
@@ -1450,7 +1597,7 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 	if dropErr := dbClient.DropResourceGroup(r.Context(), groupName); dropErr != nil {
 		s.logger.Error("failed to drop resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "error", dropErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to drop resource group")
 		return
 	}
@@ -1472,7 +1619,7 @@ func (s *Server) handleUpdateResourceGroup(w http.ResponseWriter, r *http.Reques
 	groupName := r.PathValue("groupName")
 
 	if !isValidIdentifier(groupName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource group name: must be a valid SQL identifier")
 		return
 	}
@@ -1491,7 +1638,7 @@ func (s *Server) handleUpdateResourceGroup(w http.ResponseWriter, r *http.Reques
 		MinCost       int32 `json:"minCost"`
 	}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
@@ -1530,7 +1677,7 @@ func (s *Server) handleUpdateResourceGroup(w http.ResponseWriter, r *http.Reques
 	if alterErr := dbClient.AlterResourceGroup(r.Context(), opts); alterErr != nil {
 		s.logger.Error("failed to alter resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "error", alterErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to alter resource group")
 		return
 	}
@@ -1555,7 +1702,7 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 	groupName := r.PathValue("groupName")
 
 	if !isValidIdentifier(groupName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource group name: must be a valid SQL identifier")
 		return
 	}
@@ -1570,17 +1717,17 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 		Role string `json:"role"`
 	}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if req.Role == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "role is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "role is required")
 		return
 	}
 
 	if !isValidIdentifier(req.Role) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid role name: must be a valid SQL identifier")
 		return
 	}
@@ -1610,7 +1757,7 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 	if assignErr := dbClient.AssignRoleResourceGroup(r.Context(), req.Role, groupName); assignErr != nil {
 		s.logger.Error("failed to assign role to resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role, "error", assignErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to assign role to resource group")
 		return
 	}
@@ -1672,7 +1819,7 @@ func (s *Server) handleListResourceQueues(w http.ResponseWriter, r *http.Request
 	if listErr != nil {
 		s.logger.Error("failed to list resource queues",
 			"cluster", cluster.Name, "error", listErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to list resource queues")
 		return
 	}
@@ -1704,17 +1851,17 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 		MinCost          float64 `json:"minCost"`
 	}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if req.Name == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "resource queue name is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "resource queue name is required")
 		return
 	}
 
 	if !isValidIdentifier(req.Name) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource queue name: must be a valid SQL identifier")
 		return
 	}
@@ -1753,7 +1900,7 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 	if createErr := dbClient.CreateResourceQueue(r.Context(), opts); createErr != nil {
 		s.logger.Error("failed to create resource queue",
 			"cluster", cluster.Name, "queue", req.Name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create resource queue")
 		return
 	}
@@ -1775,7 +1922,7 @@ func (s *Server) handleDeleteResourceQueue(w http.ResponseWriter, r *http.Reques
 	queueName := r.PathValue("queueName")
 
 	if !isValidIdentifier(queueName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid resource queue name: must be a valid SQL identifier")
 		return
 	}
@@ -1810,7 +1957,7 @@ func (s *Server) handleDeleteResourceQueue(w http.ResponseWriter, r *http.Reques
 	if dropErr := dbClient.DropResourceQueue(r.Context(), queueName); dropErr != nil {
 		s.logger.Error("failed to drop resource queue",
 			"cluster", cluster.Name, "queue", queueName, "error", dropErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to drop resource queue")
 		return
 	}
@@ -1859,41 +2006,56 @@ func (s *Server) handleCreateWorkloadRule(w http.ResponseWriter, r *http.Request
 
 	var rule cbv1alpha1.WorkloadRule
 	if decodeErr := json.NewDecoder(r.Body).Decode(&rule); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if rule.Name == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "rule name is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "rule name is required")
 		return
 	}
 
 	if !isValidIdentifier(rule.Name) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid rule name: must be a valid SQL identifier")
 		return
 	}
 
-	// Initialize workload spec if nil.
-	if cluster.Spec.Workload == nil {
-		cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{}
-	}
-
-	// Check for duplicate rule name.
-	for i := range cluster.Spec.Workload.Rules {
-		if cluster.Spec.Workload.Rules[i].Name == rule.Name {
-			writeErrorJSON(w, http.StatusBadRequest, "DUPLICATE_RULE",
-				fmt.Sprintf("workload rule %q already exists", rule.Name))
-			return
+	// Check for duplicate rule name on the fetched object for a fast 400.
+	if cluster.Spec.Workload != nil {
+		for i := range cluster.Spec.Workload.Rules {
+			if cluster.Spec.Workload.Rules[i].Name == rule.Name {
+				writeErrorJSON(w, http.StatusBadRequest, "DUPLICATE_RULE",
+					fmt.Sprintf("workload rule %q already exists", rule.Name))
+				return
+			}
 		}
 	}
 
-	cluster.Spec.Workload.Rules = append(cluster.Spec.Workload.Rules, rule)
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+	// Spec mutation: re-apply on a fresh object inside conflict retry.
+	updateErr := s.updateClusterWithConflictRetry(r.Context(), cluster,
+		func(latest *cbv1alpha1.CloudberryCluster) error {
+			if latest.Spec.Workload == nil {
+				latest.Spec.Workload = &cbv1alpha1.WorkloadSpec{}
+			}
+			for i := range latest.Spec.Workload.Rules {
+				if latest.Spec.Workload.Rules[i].Name == rule.Name {
+					return errDuplicateWorkloadRule
+				}
+			}
+			latest.Spec.Workload.Rules = append(latest.Spec.Workload.Rules, rule)
+			return nil
+		})
+	if errors.Is(updateErr, errDuplicateWorkloadRule) {
+		writeErrorJSON(w, http.StatusBadRequest, "DUPLICATE_RULE",
+			fmt.Sprintf("workload rule %q already exists", rule.Name))
+		return
+	}
+	if updateErr != nil {
 		s.logger.Error("failed to create workload rule",
 			"cluster", name, "rule", rule.Name, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to create workload rule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			fmt.Sprintf("failed to create workload rule: %v", updateErr))
 		return
 	}
 
@@ -1942,7 +2104,7 @@ func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request
 	ruleName := r.PathValue("ruleName")
 
 	if !isValidIdentifier(ruleName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid rule name: must be a valid SQL identifier")
 		return
 	}
@@ -1955,7 +2117,7 @@ func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request
 
 	var updates map[string]interface{}
 	if decodeErr := json.NewDecoder(r.Body).Decode(&updates); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
@@ -1979,21 +2141,39 @@ func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Apply partial updates to the existing rule.
-	rule := &cluster.Spec.Workload.Rules[ruleIdx]
-	applyWorkloadRuleUpdates(rule, updates)
-
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+	// Spec mutation: re-apply the partial update on a fresh object inside
+	// conflict retry so concurrent controller updates do not surface as 500.
+	var updated cbv1alpha1.WorkloadRule
+	updateErr := s.updateClusterWithConflictRetry(r.Context(), cluster,
+		func(latest *cbv1alpha1.CloudberryCluster) error {
+			if latest.Spec.Workload == nil {
+				return errWorkloadRuleNotFound
+			}
+			for i := range latest.Spec.Workload.Rules {
+				if latest.Spec.Workload.Rules[i].Name == ruleName {
+					applyWorkloadRuleUpdates(&latest.Spec.Workload.Rules[i], updates)
+					updated = latest.Spec.Workload.Rules[i]
+					return nil
+				}
+			}
+			return errWorkloadRuleNotFound
+		})
+	if errors.Is(updateErr, errWorkloadRuleNotFound) {
+		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
+			fmt.Sprintf("workload rule %q not found", ruleName))
+		return
+	}
+	if updateErr != nil {
 		s.logger.Error("failed to update workload rule",
 			"cluster", name, "rule", ruleName, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to update workload rule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			fmt.Sprintf("failed to update workload rule: %v", updateErr))
 		return
 	}
 
 	s.logger.Info("workload rule updated", "cluster", name, responseKeyRule, ruleName)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		responseKeyRule:   *rule,
+		responseKeyRule:   updated,
 		responseKeyStatus: statusUpdated,
 	})
 }
@@ -2004,7 +2184,7 @@ func (s *Server) handleDeleteWorkloadRule(w http.ResponseWriter, r *http.Request
 	ruleName := r.PathValue("ruleName")
 
 	if !isValidIdentifier(ruleName) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid rule name: must be a valid SQL identifier")
 		return
 	}
@@ -2035,17 +2215,30 @@ func (s *Server) handleDeleteWorkloadRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Remove the rule from the slice.
-	cluster.Spec.Workload.Rules = append(
-		cluster.Spec.Workload.Rules[:ruleIdx],
-		cluster.Spec.Workload.Rules[ruleIdx+1:]...,
-	)
-
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+	// Spec mutation: remove the rule from a fresh object inside conflict
+	// retry. A rule that disappeared concurrently is treated as deleted
+	// (idempotent delete).
+	updateErr := s.updateClusterWithConflictRetry(r.Context(), cluster,
+		func(latest *cbv1alpha1.CloudberryCluster) error {
+			if latest.Spec.Workload == nil {
+				return nil
+			}
+			for i := range latest.Spec.Workload.Rules {
+				if latest.Spec.Workload.Rules[i].Name == ruleName {
+					latest.Spec.Workload.Rules = append(
+						latest.Spec.Workload.Rules[:i],
+						latest.Spec.Workload.Rules[i+1:]...,
+					)
+					return nil
+				}
+			}
+			return nil
+		})
+	if updateErr != nil {
 		s.logger.Error("failed to delete workload rule",
 			"cluster", name, "rule", ruleName, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to delete workload rule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			fmt.Sprintf("failed to delete workload rule: %v", updateErr))
 		return
 	}
 
@@ -2328,7 +2521,7 @@ func (s *Server) handleGetQueryDetail(w http.ResponseWriter, r *http.Request) {
 
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
 	if err != nil || pid <= 0 {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid PID")
 		return
 	}
 
@@ -2369,86 +2562,15 @@ func (s *Server) handleGetQueryDetail(w http.ResponseWriter, r *http.Request) {
 // handleCancelQueryByPID cancels a running query by PID via the queries API.
 // This is the query-monitoring-specific cancel endpoint (POST /queries/{pid}/cancel)
 // that records query cancel metrics, distinct from the session cancel endpoint.
+// It shares the cancelBackendByPID implementation with the session endpoints.
 func (s *Server) handleCancelQueryByPID(w http.ResponseWriter, r *http.Request) {
-	pidStr := r.PathValue("pid")
-	pid, err := strconv.ParseInt(pidStr, 10, 32)
-	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
-		return
-	}
-	if pid <= 0 {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
-		return
-	}
-
-	// Parse optional reason from request body.
-	var cancelReq struct {
-		Reason string `json:"reason"`
-	}
-	if r.Body != nil {
-		// Ignore decode errors — reason is optional.
-		_ = json.NewDecoder(r.Body).Decode(&cancelReq)
-	}
-
-	name := r.PathValue("name")
-	cluster, clusterErr := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
-	if clusterErr != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	if s.dbFactory == nil {
-		s.logger.Warn("cancel query by PID requested but database factory not available",
-			"cluster", cluster.Name, responseKeyPID, pid)
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			responseKeyPID:     pid,
-			"canceled":         false,
-			responseKeyMessage: msgDBNotAvailable,
-		})
-		return
-	}
-
-	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
-	if dbErr != nil {
-		s.logger.Error("failed to create database client for cancel query by PID",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", dbErr)
-		writeErrorJSON(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE",
-			"cannot connect to database")
-		return
-	}
-	defer dbClient.Close()
-
-	result, cancelErr := dbClient.CancelQuery(r.Context(), int32(pid))
-	if cancelErr != nil {
-		s.logger.Error("failed to cancel query by PID",
-			"cluster", cluster.Name, responseKeyPID, pid, "error", cancelErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
-			"failed to cancel query")
-		return
-	}
-
-	// Record query cancel metric.
-	if s.metrics != nil {
-		s.metrics.RecordQueryCancel(cluster.Name, cluster.Namespace)
-	}
-
-	response := map[string]interface{}{
-		responseKeyPID:      pid,
-		responseKeyCanceled: result,
-		responseKeyStatus:   statusCanceled,
-	}
-
-	if cancelReq.Reason != "" {
-		response["reason"] = cancelReq.Reason
-		s.logger.Info("query canceled by PID with reason",
-			"cluster", cluster.Name, responseKeyPID, pid,
-			responseKeyCanceled, result, "reason", cancelReq.Reason)
-	} else {
-		s.logger.Info("query cancel by PID requested",
-			"cluster", cluster.Name, responseKeyPID, pid, responseKeyCanceled, result)
-	}
-
-	writeJSON(w, http.StatusOK, response)
+	s.cancelBackendByPID(w, r, cancelBackendOptions{
+		mode:          backendSignalCancel,
+		parseReason:   true,
+		includeStatus: true,
+		operation:     "cancel query",
+		resultKey:     responseKeyCanceled,
+	})
 }
 
 // handleMoveQuery moves a running query to a different resource group.
@@ -2457,11 +2579,11 @@ func (s *Server) handleMoveQuery(w http.ResponseWriter, r *http.Request) {
 	pidStr := r.PathValue("pid")
 	pid, err := strconv.ParseInt(pidStr, 10, 32)
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid PID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid PID")
 		return
 	}
 	if pid <= 0 {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "PID must be a positive integer")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "PID must be a positive integer")
 		return
 	}
 
@@ -2470,19 +2592,19 @@ func (s *Server) handleMoveQuery(w http.ResponseWriter, r *http.Request) {
 		TargetGroup string `json:"targetGroup"`
 	}
 	if r.Body == nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "request body is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "request body is required")
 		return
 	}
 	if decErr := json.NewDecoder(r.Body).Decode(&moveReq); decErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 	if moveReq.TargetGroup == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "targetGroup is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "targetGroup is required")
 		return
 	}
 	if !isValidIdentifier(moveReq.TargetGroup) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"targetGroup must be a valid SQL identifier (alphanumeric and underscores, max 63 chars)")
 		return
 	}
@@ -2519,7 +2641,7 @@ func (s *Server) handleMoveQuery(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("failed to move query to resource group",
 			"cluster", cluster.Name, responseKeyPID, pid,
 			"targetGroup", moveReq.TargetGroup, "error", moveErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			fmt.Sprintf("failed to move query: %s", moveErr.Error()))
 		return
 	}
@@ -2595,7 +2717,7 @@ func (s *Server) handleGetExporterHealth(w http.ResponseWriter, r *http.Request)
 	); listErr != nil {
 		s.logger.Error("failed to list coordinator pods for exporter health",
 			"cluster", name, "error", listErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to list coordinator pods")
 		return
 	}
@@ -2636,12 +2758,10 @@ func buildExporterStatuses(
 	now string,
 ) []ExporterStatus {
 	candidates := []exporterEntry{
-		{"postgres-exporter", "postgres-exporter", 9187,
-			exporterSpecOrNil(exporters.PostgresExporter)},
+		{"postgres-exporter", "postgres-exporter", 9187, exporters.PostgresExporter},
 		{"cloudberry-query-exporter", "cloudberry-query-exporter", 9188,
-			exporterSpecOrNil(exporters.CloudberryQueryExporter)},
-		{"node-exporter", "node-exporter", 9100,
-			exporterSpecOrNil(exporters.NodeExporter)},
+			exporters.CloudberryQueryExporter},
+		{"node-exporter", "node-exporter", 9100, exporters.NodeExporter},
 	}
 
 	var statuses []ExporterStatus
@@ -2666,12 +2786,6 @@ func buildExporterStatuses(
 	return statuses
 }
 
-// exporterSpecOrNil returns the ExporterSpec pointer or nil if it's nil.
-// This avoids nil pointer dereference when building exporter entries.
-func exporterSpecOrNil(spec *cbv1alpha1.ExporterSpec) *cbv1alpha1.ExporterSpec {
-	return spec
-}
-
 // exporterStatusFromReady derives the exporter status string from container readiness.
 // Returns "up" if the container is ready, "down" if the pod exists but container is not ready,
 // or "unknown" if no coordinator pod was found.
@@ -2687,8 +2801,12 @@ func exporterStatusFromReady(ready, podExists bool) string {
 
 // handleGetQueryHistory returns paginated query history with optional filters.
 func (s *Server) handleGetQueryHistory(w http.ResponseWriter, r *http.Request) {
+	// Static-named child span (D-6); downstream db spans nest under it.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.queryHistory.search")
+	defer span.End()
+
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -2713,7 +2831,7 @@ func (s *Server) handleGetQueryHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
 	if dbErr != nil {
 		s.logger.Error("failed to create database client for query history",
 			"cluster", cluster.Name, "error", dbErr)
@@ -2726,16 +2844,16 @@ func (s *Server) handleGetQueryHistory(w http.ResponseWriter, r *http.Request) {
 	// Parse query parameters into filter.
 	filter, parseErr := parseQueryHistoryFilter(r)
 	if parseErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", parseErr.Error())
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, parseErr.Error())
 		return
 	}
 
 	start := time.Now()
-	entries, total, queryErr := dbClient.GetQueryHistory(r.Context(), filter)
+	entries, total, queryErr := dbClient.GetQueryHistory(ctx, filter)
 	if queryErr != nil {
 		s.logger.Error("failed to get query history",
 			"cluster", cluster.Name, "error", queryErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to get query history")
 		return
 	}
@@ -2776,7 +2894,7 @@ func (s *Server) handleGetQueryHistoryDetail(w http.ResponseWriter, r *http.Requ
 	qid := r.PathValue("qid")
 
 	if qid == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "query ID is required")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "query ID is required")
 		return
 	}
 
@@ -2822,11 +2940,15 @@ func (s *Server) handleGetQueryHistoryDetail(w http.ResponseWriter, r *http.Requ
 
 // handleExportQueryHistory exports query history as CSV.
 func (s *Server) handleExportQueryHistory(w http.ResponseWriter, r *http.Request) {
+	// Static-named child span (D-6); downstream db spans nest under it.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.queryHistory.export")
+	defer span.End()
+
 	limitBody(w, r)
 	defer r.Body.Close()
 
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -2844,7 +2966,7 @@ func (s *Server) handleExportQueryHistory(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	dbClient, dbErr := s.dbFactory.NewClient(r.Context(), cluster)
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
 	if dbErr != nil {
 		s.logger.Error("failed to create database client for query history export",
 			"cluster", cluster.Name, "error", dbErr)
@@ -2857,12 +2979,16 @@ func (s *Server) handleExportQueryHistory(w http.ResponseWriter, r *http.Request
 	// Parse filter from request body (optional JSON).
 	filter := parseQueryHistoryExportFilter(r)
 
+	// Large CSV exports can exceed the global WriteTimeout; clear the write
+	// deadline for this response (request context still bounds the export).
+	s.clearWriteDeadline(w)
+
 	// Set CSV response headers.
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="query-history.csv"`)
 	w.WriteHeader(http.StatusOK)
 
-	if exportErr := dbClient.ExportQueryHistoryCSV(r.Context(), filter, w); exportErr != nil {
+	if exportErr := dbClient.ExportQueryHistoryCSV(ctx, filter, w); exportErr != nil {
 		s.logger.Error("failed to export query history CSV",
 			"cluster", cluster.Name, "error", exportErr)
 		// Headers already sent, cannot write error JSON.
@@ -2950,10 +3076,14 @@ func (s *Server) handleExportActiveQueries(w http.ResponseWriter, r *http.Reques
 	if listErr != nil {
 		s.logger.Error("failed to list sessions for active query export",
 			"cluster", cluster.Name, "error", listErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to list sessions")
 		return
 	}
+
+	// Large CSV exports can exceed the global WriteTimeout; clear the write
+	// deadline for this response (request context still bounds the export).
+	s.clearWriteDeadline(w)
 
 	// Set CSV response headers.
 	w.Header().Set("Content-Type", "text/csv")
@@ -2999,22 +3129,45 @@ func (s *Server) handleExportActiveQueries(w http.ResponseWriter, r *http.Reques
 // csvEscape escapes a string for safe inclusion in a CSV field.
 // It wraps the value in double quotes if it contains commas, double quotes,
 // or newlines, and doubles any internal double quotes per RFC 4180.
+//
+// Formula-injection hardening (L-8): cells beginning with '=', '+', '-' or
+// '@' are prefixed with a single quote so spreadsheet applications render
+// them as text instead of executing them as formulas (CSV injection).
 func csvEscape(s string) string {
+	s = csvGuardFormula(s)
 	if strings.ContainsAny(s, ",\"\n\r") {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}
 	return s
 }
 
+// csvGuardFormula neutralizes spreadsheet formula injection by prefixing
+// cells that start with a formula trigger character with a single quote.
+func csvGuardFormula(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@':
+		return "'" + s
+	default:
+		return s
+	}
+}
+
 // handlePlanCheck analyzes EXPLAIN ANALYZE output for performance issues.
 // It accepts a JSON body with planText, runs the plan checker, records metrics,
 // and returns the analysis result.
 func (s *Server) handlePlanCheck(w http.ResponseWriter, r *http.Request) {
+	// Static-named child span (D-6); downstream db spans nest under it.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.planCheck")
+	defer span.End()
+
 	limitBody(w, r)
 	defer r.Body.Close()
 
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -3022,12 +3175,12 @@ func (s *Server) handlePlanCheck(w http.ResponseWriter, r *http.Request) {
 
 	var req planchecker.PlanCheckRequest
 	if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
 	if strings.TrimSpace(req.PlanText) == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "planText is required and must not be empty")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "planText is required and must not be empty")
 		return
 	}
 
@@ -3038,7 +3191,7 @@ func (s *Server) handlePlanCheck(w http.ResponseWriter, r *http.Request) {
 	if checkErr != nil {
 		s.logger.Error("plan check failed",
 			"cluster", cluster.Name, "error", checkErr)
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("failed to analyze plan: %v", checkErr))
 		return
 	}
@@ -3189,11 +3342,15 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateBackup creates a new on-demand backup Job for a cluster.
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
+	// Static-named child span (D-6); downstream db spans nest under it.
+	ctx, span := telemetry.StartSpan(r.Context(), apiTracerName, "api.backup.create")
+	defer span.End()
+
 	limitBody(w, r)
 	defer r.Body.Close()
 
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	cluster, err := s.getCluster(ctx, name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
 		return
@@ -3207,7 +3364,7 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateBackupRequest
 	if decErr := decodeOptionalJSON(r, &req); decErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 	if !validateBackupDatabases(w, req.Databases) {
@@ -3216,18 +3373,18 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 
 	backupType := backupTypeOrDefault(req.Type)
 	if backupType != util.BackupTypeFull && backupType != util.BackupTypeIncremental {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid backup type %q; valid types: full, incremental", backupType))
 		return
 	}
 
-	timestamp := time.Now().UTC().Format(backupTimestampLayout)
+	timestamp := time.Now().UTC().Format(util.GpbackupTimestampLayout)
 	opts := buildBackupJobOptions(cluster, &req, backupType, timestamp)
 
 	job := s.builder.BuildBackupJob(cluster, opts)
-	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
+	if createErr := s.k8sClient.Create(ctx, job); createErr != nil {
 		s.logger.Error("failed to create backup job", "cluster", name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create backup job")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create backup job")
 		return
 	}
 
@@ -3254,7 +3411,7 @@ func (s *Server) handleGetBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isValidBackupTimestamp(timestamp) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid backup timestamp %q", timestamp))
 		return
 	}
@@ -3280,7 +3437,7 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isValidBackupTimestamp(timestamp) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid backup timestamp %q", timestamp))
 		return
 	}
@@ -3288,7 +3445,7 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	job := s.builder.BuildRetentionCleanupJob(cluster, timestamp)
 	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
 		s.logger.Error("failed to create cleanup job", "cluster", name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create cleanup job")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create cleanup job")
 		return
 	}
 
@@ -3318,7 +3475,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 
 	var req RestoreRequest
 	if decErr := decodeOptionalJSON(r, &req); decErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 
@@ -3328,7 +3485,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		timestamp = req.Timestamp
 	}
 	if !isValidBackupTimestamp(timestamp) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid backup timestamp %q", timestamp))
 		return
 	}
@@ -3336,7 +3493,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg := restoreOptionsConflict(req.GprestoreOptions); msg != "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", msg)
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, msg)
 		return
 	}
 
@@ -3344,7 +3501,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	job := s.builder.BuildRestoreJob(cluster, opts)
 	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
 		s.logger.Error("failed to create restore job", "cluster", name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create restore job")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create restore job")
 		return
 	}
 
@@ -3375,7 +3532,7 @@ func (s *Server) handleListBackupJobs(w http.ResponseWriter, r *http.Request) {
 		client.MatchingLabels{util.LabelCluster: cluster.Name},
 	); listErr != nil {
 		s.logger.Error("failed to list backup jobs", "cluster", name, "error", listErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list backup jobs")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to list backup jobs")
 		return
 	}
 
@@ -3405,7 +3562,7 @@ func (s *Server) handleBackupJobLogs(w http.ResponseWriter, r *http.Request) {
 	job := r.PathValue("job")
 
 	if !isValidDNS1123Name(job) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid job name %q", job))
 		return
 	}
@@ -3500,9 +3657,34 @@ func (s *Server) streamPodLogs(
 		}
 	}()
 
+	// Follow mode keeps the connection open indefinitely; exempt it from the
+	// global WriteTimeout (the request context still bounds the stream).
+	if opts.Follow {
+		s.clearWriteDeadline(w)
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	copyLogStream(r.Context(), w, stream, opts.Follow)
+	written, copyErr := copyLogStream(r.Context(), w, stream, opts.Follow)
+	s.recordLogStreamSession(written, copyErr)
+}
+
+// recordLogStreamSession records one completed log streaming session and the
+// bytes delivered (C-8). A session that fails mid-stream (client write error)
+// is labeled result="error"; normal termination — source EOF or client
+// disconnect via context cancellation — is "success".
+func (s *Server) recordLogStreamSession(written int64, copyErr error) {
+	if s.metrics == nil {
+		return
+	}
+	result := resultSuccess
+	if copyErr != nil {
+		result = resultError
+	}
+	s.metrics.RecordLogStreamSession(result)
+	if written > 0 {
+		s.metrics.AddLogStreamBytes(float64(written))
+	}
 }
 
 // buildPodLogOptions builds the pod log options from the request query
@@ -3520,35 +3702,72 @@ func buildPodLogOptions(query url.Values) *corev1.PodLogOptions {
 	return opts
 }
 
-// copyLogStream copies the pod log stream to the writer. When following, it
-// flushes periodically so the client receives output incrementally.
-func copyLogStream(ctx context.Context, w io.Writer, stream io.Reader, follow bool) {
-	flusher, canFlush := w.(http.Flusher)
-	if !follow || !canFlush {
-		_, _ = io.Copy(w, stream)
-		return
+// copyLogStream copies the pod log stream to the response writer. When
+// following, it flushes periodically via http.NewResponseController so the
+// client receives output incrementally. The ResponseController reaches the
+// real writer through any wrapper that implements Unwrap (statusRecorder),
+// and degrades gracefully (non-flushing copy) when the underlying writer does
+// not support flushing.
+//
+// It returns the number of bytes delivered to the client and a non-nil error
+// only when the CLIENT write failed mid-stream (the metrics hook labels such
+// sessions result="error"); source EOF and context cancellation are normal
+// session terminations.
+func copyLogStream(
+	ctx context.Context,
+	w http.ResponseWriter,
+	stream io.Reader,
+	follow bool,
+) (written int64, err error) {
+	if !follow {
+		return io.Copy(w, stream)
 	}
 
+	rc := http.NewResponseController(w)
 	buf := make([]byte, 4096)
-	lastFlush := time.Now()
+	// lastFlush starts at the zero time so the FIRST chunk is flushed
+	// immediately — follow clients see output as soon as it exists instead
+	// of waiting a full flush interval.
+	var lastFlush time.Time
 	for {
 		if ctx.Err() != nil {
-			return
+			// Client disconnect (context canceled) is a NORMAL stream
+			// termination, not a delivery failure.
+			return written, nil //nolint:nilerr // intentional: cancel == clean end
 		}
-		n, err := stream.Read(buf)
+		n, readErr := stream.Read(buf)
 		if n > 0 {
-			if _, wErr := w.Write(buf[:n]); wErr != nil {
-				return
+			wn, wErr := w.Write(buf[:n])
+			written += int64(wn)
+			if wErr != nil {
+				return written, wErr
 			}
 			if time.Since(lastFlush) >= jobLogsFlushInterval {
-				flusher.Flush()
+				// ErrNotSupported (or any other flush error) is non-fatal:
+				// the copy continues without incremental delivery.
+				_ = rc.Flush()
 				lastFlush = time.Now()
 			}
 		}
-		if err != nil {
-			flusher.Flush()
-			return
+		if readErr != nil {
+			// Source EOF (or read error after delivery) ends the session
+			// cleanly; only CLIENT write failures count as errors.
+			_ = rc.Flush()
+			return written, nil //nolint:nilerr // intentional: source EOF == clean end
 		}
+	}
+}
+
+// clearWriteDeadline exempts a streaming response (log follow mode, CSV
+// export) from the server-wide WriteTimeout by clearing the per-connection
+// write deadline. Without this, the global 60s WriteTimeout cuts long-lived
+// streams mid-flight. The request context still bounds the stream lifetime,
+// so canceled clients terminate promptly. Errors (e.g. the underlying writer
+// not supporting deadlines, as in tests) are logged at debug and ignored —
+// the stream then simply remains subject to the global timeout.
+func (s *Server) clearWriteDeadline(w http.ResponseWriter) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		s.logger.Debug("failed to clear write deadline for streaming response", "error", err)
 	}
 }
 
@@ -3575,7 +3794,7 @@ func (s *Server) handleGetBackupSchedule(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		s.logger.Error("failed to get backup schedule", "cluster", name, "error", getErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get backup schedule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to get backup schedule")
 		return
 	}
 
@@ -3603,11 +3822,11 @@ func (s *Server) handleUpdateBackupSchedule(w http.ResponseWriter, r *http.Reque
 
 	var req UpdateBackupScheduleRequest
 	if decErr := json.NewDecoder(r.Body).Decode(&req); decErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return
 	}
 	if req.Schedule != nil && *req.Schedule != "" && !isValidCronSchedule(*req.Schedule) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			fmt.Sprintf("invalid cron schedule %q", *req.Schedule))
 		return
 	}
@@ -3638,10 +3857,24 @@ func (s *Server) applyScheduleUpdate(
 				"backup is not configured for this cluster")
 			return false
 		}
-		cluster.Spec.Backup.Schedule = *req.Schedule
-		if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+		// Spec mutation: re-apply on a fresh object inside conflict retry.
+		updateErr := s.updateClusterWithConflictRetry(r.Context(), cluster,
+			func(latest *cbv1alpha1.CloudberryCluster) error {
+				if latest.Spec.Backup == nil {
+					return errBackupNotConfigured
+				}
+				latest.Spec.Backup.Schedule = *req.Schedule
+				return nil
+			})
+		if errors.Is(updateErr, errBackupNotConfigured) {
+			writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
+				"backup is not configured for this cluster")
+			return false
+		}
+		if updateErr != nil {
 			s.logger.Error("failed to update backup schedule", "cluster", cluster.Name, "error", updateErr)
-			writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update backup schedule")
+			writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+				fmt.Sprintf("failed to update backup schedule: %v", updateErr))
 			return false
 		}
 		result["schedule"] = *req.Schedule
@@ -3672,7 +3905,7 @@ func (s *Server) patchCronJobSuspend(
 			return false
 		}
 		s.logger.Error("failed to get backup schedule", "cluster", cluster.Name, "error", getErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get backup schedule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to get backup schedule")
 		return false
 	}
 
@@ -3680,7 +3913,7 @@ func (s *Server) patchCronJobSuspend(
 	cronJob.Spec.Suspend = &suspendCopy
 	if updateErr := s.k8sClient.Update(r.Context(), cronJob); updateErr != nil {
 		s.logger.Error("failed to update backup schedule suspend", "cluster", cluster.Name, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update backup schedule")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to update backup schedule")
 		return false
 	}
 	return true
@@ -3708,24 +3941,33 @@ func (s *Server) handleListDataLoadingJobs(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleCreateDataLoadingJob creates a new data loading job.
-func (s *Server) handleCreateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+// msgDataLoadingNotImplemented is the standard 501 message for the
+// data-loading job mutation endpoints. The full implementation (patching
+// spec.dataLoading.jobs, creating loader Jobs and wiring
+// RecordDataLoadingRows) is tracked as a dedicated feature; until it lands,
+// these endpoints honestly report NOT_IMPLEMENTED instead of fake successes.
+const msgDataLoadingNotImplemented = "data loading job mutations are not implemented yet; " +
+	"track the data-loading feature for availability. Read-only endpoints (list/get) remain available"
+
+// writeDataLoadingNotImplemented validates that the target cluster exists
+// (preserving the 404 contract) and then writes the standard 501
+// NOT_IMPLEMENTED error envelope shared by all five data-loading mutation
+// endpoints. No success metric or event is emitted from these stubs.
+func (s *Server) writeDataLoadingNotImplemented(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
-	if err != nil {
+	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
 
-	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
-		writeErrorJSON(w, http.StatusBadRequest, "DATA_LOADING_NOT_ENABLED",
-			"data loading is not enabled for this cluster")
-		return
-	}
+	writeErrorJSON(w, http.StatusNotImplemented, errCodeNotImplemented,
+		msgDataLoadingNotImplemented)
+}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus: "job created",
-	})
+// handleCreateDataLoadingJob is a 501 stub: data-loading job creation is not
+// implemented yet (see msgDataLoadingNotImplemented).
+func (s *Server) handleCreateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
+	s.writeDataLoadingNotImplemented(w, r)
 }
 
 // handleGetDataLoadingJob gets a specific data loading job.
@@ -3751,73 +3993,35 @@ func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request)
 		fmt.Sprintf("data loading job %q not found", jobName))
 }
 
-// handleUpdateDataLoadingJob updates a data loading job.
+// handleUpdateDataLoadingJob is a 501 stub: data-loading job updates are not
+// implemented yet (see msgDataLoadingNotImplemented).
 func (s *Server) handleUpdateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	jobName := r.PathValue("job")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: statusUpdated,
-		responseKeyJob:    jobName,
-	})
+	s.writeDataLoadingNotImplemented(w, r)
 }
 
-// handleDeleteDataLoadingJob deletes a data loading job.
+// handleDeleteDataLoadingJob is a 501 stub: data-loading job deletion is not
+// implemented yet (see msgDataLoadingNotImplemented).
 func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	jobName := r.PathValue("job")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		responseKeyStatus: statusDeleted,
-		responseKeyJob:    jobName,
-	})
+	s.writeDataLoadingNotImplemented(w, r)
 }
 
-// handleStartDataLoadingJob starts a data loading job.
+// handleStartDataLoadingJob is a 501 stub: starting data-loading jobs is not
+// implemented yet (see msgDataLoadingNotImplemented).
 //
-// NOTE: this is currently an acknowledgement stub — it validates the cluster and
-// returns 202 Accepted without creating a Job or loading any rows. The
-// cloudberry_data_loading_rows_total metric (Recorder.RecordDataLoadingRows) is
-// therefore intentionally NOT recorded here: there is no rows-loaded signal
-// available at this stub. The recorder call must be wired at the point where a
-// data-loading Job actually completes and reports its loaded-row count (e.g.
-// from the Job's status/result), which does not exist yet. Recording a value
-// here would fabricate data, so it is deliberately omitted.
+// NOTE: the cloudberry_data_loading_rows_total metric
+// (Recorder.RecordDataLoadingRows) is intentionally NOT recorded here: there
+// is no rows-loaded signal available. The recorder call must be wired at the
+// point where a data-loading Job actually completes and reports its
+// loaded-row count, which does not exist yet. Recording a value here would
+// fabricate data, so it is deliberately omitted.
 func (s *Server) handleStartDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	jobName := r.PathValue("job")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus: "started",
-		responseKeyJob:    jobName,
-	})
+	s.writeDataLoadingNotImplemented(w, r)
 }
 
-// handleStopDataLoadingJob stops a data loading job.
+// handleStopDataLoadingJob is a 501 stub: stopping data-loading jobs is not
+// implemented yet (see msgDataLoadingNotImplemented).
 func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	jobName := r.PathValue("job")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		responseKeyStatus: "stopped",
-		responseKeyJob:    jobName,
-	})
+	s.writeDataLoadingNotImplemented(w, r)
 }
 
 // handleListPVCs lists all PVCs for a cluster with their sizes.
@@ -3835,7 +4039,7 @@ func (s *Server) handleListPVCs(w http.ResponseWriter, r *http.Request) {
 		client.MatchingLabels{util.LabelCluster: cluster.Name},
 	); listErr != nil {
 		s.logger.Error("failed to list PVCs", "cluster", name, "error", listErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list PVCs")
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to list PVCs")
 		return
 	}
 
@@ -4067,13 +4271,11 @@ func (s *Server) setClusterAnnotation(w http.ResponseWriter, r *http.Request, ac
 		return
 	}
 
-	if cluster.Annotations == nil {
-		cluster.Annotations = make(map[string]string)
-	}
-	cluster.Annotations[util.AnnotationAction] = action
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
-		s.logger.Error("failed to set action annotation", "cluster", name, "action", action, "error", updateErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to set action")
+	// Annotation-only mutation: use a MergeFrom patch (conflict-safe).
+	if patchErr := s.patchClusterAnnotation(r.Context(), cluster,
+		util.AnnotationAction, action); patchErr != nil {
+		s.logger.Error("failed to set action annotation", "cluster", name, "action", action, "error", patchErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to set action")
 		return
 	}
 
@@ -4089,19 +4291,77 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if cluster.Annotations == nil {
-		cluster.Annotations = make(map[string]string)
-	}
-	cluster.Annotations[util.AnnotationMaintenance] = operation
-	if updateErr := s.k8sClient.Update(r.Context(), cluster); updateErr != nil {
+	// Annotation-only mutation: use a MergeFrom patch (conflict-safe).
+	if patchErr := s.patchClusterAnnotation(r.Context(), cluster,
+		util.AnnotationMaintenance, operation); patchErr != nil {
 		s.logger.Error("failed to set maintenance annotation",
-			"cluster", name, "operation", operation, "error", updateErr)
+			"cluster", name, "operation", operation, "error", patchErr)
 		writeErrorJSON(w, http.StatusInternalServerError,
-			"INTERNAL_ERROR", "failed to set maintenance")
+			errCodeInternal, "failed to set maintenance")
 		return
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{responseKeyStatus: operation + " initiated"})
+}
+
+// errWorkloadRuleNotFound is the sentinel returned by conflict-retry mutate
+// closures when the target workload rule disappeared between the handler's
+// pre-validation and the retried update. Handlers map it to 404.
+var errWorkloadRuleNotFound = fmt.Errorf("workload rule not found")
+
+// errDuplicateWorkloadRule is the sentinel returned by conflict-retry mutate
+// closures when a rule with the same name appeared concurrently. Handlers map
+// it to 400 DUPLICATE_RULE.
+var errDuplicateWorkloadRule = fmt.Errorf("workload rule already exists")
+
+// errBackupNotConfigured is the sentinel returned by conflict-retry mutate
+// closures when spec.backup disappeared between pre-validation and the
+// retried update. Handlers map it to 400 BACKUP_NOT_ENABLED.
+var errBackupNotConfigured = fmt.Errorf("backup is not configured")
+
+// updateClusterWithConflictRetry re-reads the cluster and applies mutate
+// inside retry.RetryOnConflict so concurrent controller updates (which patch
+// annotations/status constantly) do not surface as 409→500 to API clients.
+// The mutate closure runs against a freshly fetched object on every attempt
+// and may return a sentinel error to abort the retry loop. On success the
+// latest cluster state is copied back into cluster.
+func (s *Server) updateClusterWithConflictRetry(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	mutate func(*cbv1alpha1.CloudberryCluster) error,
+) error {
+	key := client.ObjectKey{Name: cluster.Name, Namespace: cluster.Namespace}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &cbv1alpha1.CloudberryCluster{}
+		if err := s.k8sClient.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if err := mutate(latest); err != nil {
+			return err
+		}
+		if err := s.k8sClient.Update(ctx, latest); err != nil {
+			return err
+		}
+		latest.DeepCopyInto(cluster)
+		return nil
+	})
+}
+
+// patchClusterAnnotation sets a single annotation on the cluster using a
+// MergeFrom patch (the same conflict-safe pattern the controllers use), so
+// annotation-only API mutations never fail with 409 under concurrent
+// controller updates.
+func (s *Server) patchClusterAnnotation(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	key, value string,
+) error {
+	base := cluster.DeepCopy()
+	if cluster.Annotations == nil {
+		cluster.Annotations = make(map[string]string)
+	}
+	cluster.Annotations[key] = value
+	return s.k8sClient.Patch(ctx, cluster, client.MergeFrom(base))
 }
 
 // getCluster retrieves a CloudberryCluster by name.
@@ -4139,27 +4399,22 @@ func (s *Server) getCluster(
 	return cluster, nil
 }
 
-// writeJSON writes a JSON response.
+// writeJSON writes a JSON response via the shared encoder (internal/httpjson).
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		slog.Error("failed to encode JSON response", "error", err)
-	}
+	httpjson.Write(w, status, data, apiResponseLogger())
 }
 
-// writeErrorJSON writes a JSON error response.
+// writeErrorJSON writes the unified JSON error envelope via internal/httpjson
+// so API-layer and auth-layer errors share one contract (L-9).
 func writeErrorJSON(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]string{
-			"code":             code,
-			responseKeyMessage: message,
-		},
-	}); err != nil {
-		slog.Error("failed to encode JSON error response", "error", err)
-	}
+	httpjson.WriteError(w, status, code, message, apiResponseLogger())
+}
+
+// apiResponseLogger returns the component logger used for response-encoding
+// failures. These helpers are free functions (no *Server receiver), so the
+// component attribution comes from the default logger.
+func apiResponseLogger() *slog.Logger {
+	return slog.Default().With("component", "api-server")
 }
 
 // StartServer starts the API server.

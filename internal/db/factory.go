@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -78,11 +82,30 @@ func NewClientFactory(
 
 // NewClient creates a new database client for the given cluster.
 // It resolves the coordinator service endpoint and reads the admin password
-// from the cluster's admin password Secret.
-func (f *ClientFactory) NewClient(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) (Client, error) {
+// from the cluster's admin password Secret. Every attempt is recorded on the
+// cloudberry_db_connect_* metrics and traced with a "db.connect" span.
+func (f *ClientFactory) NewClient(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (c Client, err error) {
 	if cluster == nil {
 		return nil, fmt.Errorf("cluster must not be nil")
 	}
+
+	start := time.Now()
+	ctx, span := telemetry.StartSpan(ctx, dbTracerName, "db.connect",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attrDBSystem,
+			attribute.String("k8s.cluster", cluster.Name),
+			attribute.String("k8s.namespace", cluster.Namespace),
+		),
+	)
+	defer func() {
+		f.recordConnectOutcome(cluster, start, err)
+		telemetry.SetSpanError(span, err)
+		span.End()
+	}()
 
 	// Resolve coordinator service host.
 	host := fmt.Sprintf(
@@ -157,14 +180,34 @@ func (f *ClientFactory) NewClient(ctx context.Context, cluster *cbv1alpha1.Cloud
 	}
 
 	// Propagate the optional metrics recorder (with cluster/namespace labels) so
-	// that query-history metrics are recorded by the created client.
+	// that query-history metrics are recorded by the created client, and expose
+	// the client's connection-pool statistics (unregistered again on Close).
 	if f.recorder != nil {
 		if pc, ok := dbClient.(*pgxClient); ok {
 			pc.SetRecorder(f.recorder, cluster.Name, cluster.Namespace)
+			pc.registerPoolStats()
 		}
 	}
 
 	return dbClient, nil
+}
+
+// recordConnectOutcome records a database connection attempt outcome on the
+// cloudberry_db_connect_total counter and the connect-duration histogram.
+// It is nil-safe for the optional recorder.
+func (f *ClientFactory) recordConnectOutcome(
+	cluster *cbv1alpha1.CloudberryCluster,
+	start time.Time,
+	err error,
+) {
+	if f.recorder == nil {
+		return
+	}
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+	f.recorder.RecordDBConnect(cluster.Name, cluster.Namespace, result, time.Since(start))
 }
 
 // readAdminPassword reads the admin password from the cluster's admin password Secret.

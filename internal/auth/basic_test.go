@@ -20,7 +20,8 @@ func TestNewBasicAuthProvider(t *testing.T) {
 }
 
 func TestNewBasicAuthProvider_NilLogger(t *testing.T) {
-	store := NewInMemoryCredentialStore()
+	// MinCost: hash strength is not under test here; keeps -race runs fast.
+	store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 	provider := NewBasicAuthProvider(store, nil)
 	require.NotNil(t, provider)
 	assert.NotNil(t, provider.logger)
@@ -103,7 +104,8 @@ func TestBasicAuthProvider_Authenticate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewInMemoryCredentialStore()
+			// MinCost: hash strength is not under test here; keeps -race runs fast.
+			store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 			tt.setupStore(store)
 			provider := NewBasicAuthProvider(store, nil)
 
@@ -132,7 +134,8 @@ func TestBasicAuthProvider_Authenticate(t *testing.T) {
 }
 
 func TestInMemoryCredentialStore(t *testing.T) {
-	store := NewInMemoryCredentialStore()
+	// MinCost: hash strength is not under test here; keeps -race runs fast.
+	store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 	require.NotNil(t, store)
 
 	t.Run("set and get credentials", func(t *testing.T) {
@@ -190,7 +193,8 @@ func TestBasicAuthProvider_Authenticate_EmptyCredentials(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewInMemoryCredentialStore()
+			// MinCost: hash strength is not under test here; keeps -race runs fast.
+			store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 			provider := NewBasicAuthProvider(store, nil)
 
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -219,7 +223,8 @@ func TestBasicAuthProvider_Authenticate_SpecialCharacters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewInMemoryCredentialStore()
+			// MinCost: hash strength is not under test here; keeps -race runs fast.
+			store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 			store.SetCredentials("user", tt.password, PermissionAdmin)
 			provider := NewBasicAuthProvider(store, nil)
 
@@ -300,7 +305,8 @@ func TestBasicAuthProvider_Authenticate_AllPermissionLevels(t *testing.T) {
 
 	for _, tt := range levels {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewInMemoryCredentialStore()
+			// MinCost: hash strength is not under test here; keeps -race runs fast.
+			store := NewInMemoryCredentialStoreWithCost(bcrypt.MinCost)
 			store.SetCredentials("user", "pass", tt.level)
 			provider := NewBasicAuthProvider(store, nil)
 

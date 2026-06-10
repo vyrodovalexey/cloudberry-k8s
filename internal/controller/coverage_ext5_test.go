@@ -130,7 +130,7 @@ func TestAdminReconciler_StartOrUpdateIdleDaemon_DaemonAlreadyRunning(t *testing
 	r.startOrUpdateIdleDaemon(context.Background(), cluster)
 
 	// Cleanup.
-	r.stopIdleDaemon()
+	stopAllIdleDaemonsForTest(r)
 }
 
 func TestAdminReconciler_StartOrUpdateIdleDaemon_DBClientCreationFailure(t *testing.T) {
@@ -459,7 +459,10 @@ func TestAdminReconciler_ReconcileSubComponents_AllFeaturesEnabled(t *testing.T)
 	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
 	r := NewAdminReconciler(k8sClient, scheme, recorder, b, dbFactory, m, nil)
 
-	// Should not panic even with all features enabled.
+	// Should not panic even with all features enabled. The enabled idle rule
+	// starts a daemon; stop it so its scan-loop goroutine is not leaked
+	// (goleak gate in TestMain).
+	t.Cleanup(func() { stopAllIdleDaemonsForTest(r) })
 	r.reconcileSubComponents(context.Background(), r.logger, cluster)
 }
 

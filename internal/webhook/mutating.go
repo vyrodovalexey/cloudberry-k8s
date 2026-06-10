@@ -73,13 +73,15 @@ func NewCloudberryClusterDefaulter(recorder ...metrics.Recorder) *CloudberryClus
 }
 
 // Default sets defaults on a CloudberryCluster.
-func (d *CloudberryClusterDefaulter) Default(_ context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (d *CloudberryClusterDefaulter) Default(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+	_, end := startAdmissionSpan(ctx, "webhook.mutate", admissionOpCreate)
 	setClusterDefaults(cluster)
 	// The mutating webhook applies defaults on both create and update; record it
 	// as a create admission for consistency. Defaulting never denies admission.
 	if d.recorder != nil {
 		d.recorder.RecordWebhookAdmission(webhookMutating, admissionOpCreate, admissionAllowed)
 	}
+	end(nil)
 	return nil
 }
 
@@ -262,6 +264,14 @@ func setBackupDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 		// Backup is optional; no defaults needed when not specified or disabled.
 		return
 	}
+	// Default the backup toolchain image to the official backup image when
+	// unset. A backup-capable image MUST contain kubectl (the backup/restore
+	// Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
+	// coordinator-exec model) and the gpbackup/gprestore toolchain; the base
+	// database image is NOT sufficient.
+	if cluster.Spec.Backup.Image == "" {
+		cluster.Spec.Backup.Image = util.DefaultBackupImage
+	}
 	setGpbackupDefaults(cluster.Spec.Backup)
 	setGprestoreDefaults(cluster.Spec.Backup)
 	setBackupRetentionDefaults(cluster.Spec.Backup)
@@ -301,10 +311,14 @@ func setGprestoreDefaults(backup *cbv1alpha1.BackupSpec) {
 	if gr.Jobs == 0 {
 		gr.Jobs = defaultBackupJobs
 	}
-	// WithStats is a *bool: default to true only when unset (nil) so an explicit
-	// withStats:false set by the user is preserved rather than silently reverted.
+	// WithStats is a *bool: default to FALSE only when unset (nil) so an
+	// explicit withStats:true set by the user is preserved. Restores default to
+	// NOT restoring statistics because of a known upstream gpbackup bug where
+	// statistics.sql can carry an invalid bigint, making gprestore exit with
+	// code 2 even though the data restore succeeded. Statistics restore must be
+	// requested explicitly (withStats:true) — or recomputed via runAnalyze.
 	if gr.WithStats == nil {
-		gr.WithStats = util.Ptr(true)
+		gr.WithStats = util.Ptr(false)
 	}
 }
 

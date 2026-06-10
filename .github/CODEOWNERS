@@ -8,8 +8,12 @@
 deploy/helm/ @cloudberry-contrib/devops
 
 # Dockerfiles
-Dockerfile @cloudberry-contrib/devops
+Dockerfile.operator @cloudberry-contrib/devops
 Dockerfile.ctl @cloudberry-contrib/devops
+Dockerfile.cloudberry @cloudberry-contrib/devops
+Dockerfile.cloudberry-official @cloudberry-contrib/devops
+Dockerfile.cloudberry-backup @cloudberry-contrib/devops
+Dockerfile.cloudberry-query-exporter @cloudberry-contrib/devops
 .dockerignore @cloudberry-contrib/devops
 
 # Build system

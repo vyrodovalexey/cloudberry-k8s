@@ -101,9 +101,9 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Pre-flight check blocks upgrades when cluster is not in `Running` phase
 - Online PVC storage expansion for coordinator, standby, and segments (no shrink)
 - Cluster deletion with configurable PVC policy (`Retain` or `Delete`) and event reporting
-  - Backup-on-delete: optional pre-deletion backup Job when `backupOnDelete: true`
+  - Backup-on-delete: optional pre-deletion backup Job when `backupOnDelete: true`. With `deletionPolicy: Delete`, the operator **waits for the backup Job to finish before deleting the PVCs** (bounded by a 30-minute timeout so deletion never wedges); terminal outcomes are recorded on `cloudberry_backup_on_delete_total{result="completed"|"failed"}`
   - PVC events: `PVCsRetained` for Retain policy, `PVCsDeleted` for Delete policy
-  - Deletion lifecycle events: `Deleting` → `BackupOnDelete` → `PVCsRetained`/`PVCsDeleted` → `Deleted`
+  - Deletion lifecycle events: `Deleting` → `BackupOnDelete` → `BackupOnDeleteCompleted`/`BackupOnDeleteFailed` → `PVCsRetained`/`PVCsDeleted` → `Deleted`
 
 **High Availability**
 - Segment mirroring with group and spread layouts
@@ -121,8 +121,9 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Cluster remains available during and after failover
   - Post-failover state: `MirroringDegraded` with `failedSegments` in status
 - Coordinator standby with WAL streaming replication
-- Incremental, full, and differential segment recovery
-- Manual segment rebalancing with configurable skew threshold, parallelism, and table exclusion patterns
+- Manual standby activation (`avsoft.io/action=activate-standby` or `cloudberry-ctl ha standby activate`) **actually promotes** the standby coordinator via `pg_promote()` (`PromoteStandby`), with at-most-once semantics (the annotation is removed before promotion is attempted)
+- Segment recovery (gprecoverseg-equivalent) is **not implemented yet**: the `avsoft.io/recovery` annotation is acknowledged and removed, an explicit `RecoveryNotImplemented` Warning event is emitted, and `cloudberry_recovery_operations_total` records `result="noop"` (never a fake `completed`)
+- Manual segment rebalancing with configurable skew threshold, parallelism, and table exclusion patterns; when the in-database rebalance fails, the fallback rebalance Job is tracked to its terminal state (success records `rebalance`, failure records `rebalance-failed` on `cloudberry_scale_operations_total` — no fire-and-forget successes)
 - Rebalance status API and CLI (`--status`, `--tables` flags)
 - Data skew coefficient metric (`cloudberry_data_skew_coefficient`)
 
@@ -133,7 +134,10 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - `pg_hba.conf` management via CRD
 - SSL/TLS support with configurable minimum TLS version
 - Webhook TLS certificate management (Vault PKI or self-signed with automatic rotation)
-- HashiCorp Vault integration for secrets management
+- **Cluster TLS auto-issuance from Vault PKI**: when a cluster CR enables both `vault.enabled` and `auth.ssl.enabled` with a `certSecret` that does not exist, the operator issues the server certificate from the webhook's Vault PKI mount/role, creates a generic Secret (`tls.crt`/`tls.key`/`ca.crt`), and renews it at 2/3 lifetime — user-provided Secrets are never touched (events: `ClusterTLSIssued`/`ClusterTLSRenewed`/`ClusterTLSFailed`)
+- HashiCorp Vault integration for secrets management with token, Kubernetes, and AppRole auth methods (`CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID`); Vault token renewal and re-authentication are automatic (Vault `LifetimeWatcher` renews the login token in the background and re-authenticates on expiry)
+- Test users (`basic_user`/`opbasic_user`/`operator_user`) are **disabled by default** and only seeded when `CLOUDBERRY_ENABLE_TEST_USERS=true` (a WARN log is emitted when enabled — never enable in production, the credentials are publicly known)
+- Configuration precedence (highest wins): environment variable > command-line flag > config file > default
 
 **Observability**
 - Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, mirroring operations, and PVC sizes
@@ -142,9 +146,15 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Maintenance metrics: `cloudberry_maintenance_operations_total` with cluster/namespace/operation/`result` (`started`, `success`, `failed`) labels
 - Security metrics: `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`, `cloudberry_vault_operations_total`, `cloudberry_vault_operation_duration_seconds`, and `cloudberry_auth_attempts_total` (a missing/malformed `Authorization` header increments `{method="unknown",result="failure"}`)
 - Admission and lifecycle metrics: `cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`, `cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`
+- REST API server metrics: `cloudberry_api_requests_total` / `cloudberry_api_request_duration_seconds` (labelled by low-cardinality route **template**, never the raw path), `cloudberry_api_requests_in_flight`, and `cloudberry_api_rate_limit_rejections_total`
+- Database client metrics: `cloudberry_db_connect_total` / `cloudberry_db_connect_duration_seconds`, `cloudberry_db_query_duration_seconds{operation}`, and live pool gauges sampled per scrape (`cloudberry_db_pool_acquired_conns` / `_idle_conns` / `_max_conns`)
+- Idle daemon and session metrics: `cloudberry_idle_daemon_up`, `cloudberry_idle_scan_failures_total`, `cloudberry_idle_reconnect_attempts_total`, `cloudberry_session_terminations_total`
+- Controller operation metrics: `cloudberry_storage_expansions_total`, `cloudberry_backup_on_delete_total`, `cloudberry_scale_phase_duration_seconds{direction,phase}`, `cloudberry_cluster_cert_issuance_total`
+- API business metrics: `cloudberry_migrate_operations_total`, `cloudberry_api_cluster_operations_total`, `cloudberry_log_stream_sessions_total` / `cloudberry_log_stream_bytes_total`, `cloudberry_oidc_discovery_total`, `cloudberry_auth_token_verify_duration_seconds`
+- Honest metric semantics: `cloudberry_connections_max` reports the **real** `max_connections` queried from the database; `cloudberry_pvc_size_bytes` is published in steady state on every reconcile (not only on expansion); `cloudberry_scale_operations_total` distinguishes `rebalance` from `rebalance-failed`
 - Workload and query-history metrics wired through: slow queries, workload rule actions, active connections, and query-history insert/retention/size
 - Exporter sidecars: `postgres-exporter` (port 9187) runs on both the coordinator and standby coordinator pods for monitoring continuity on promotion; `cloudberry-query-exporter` is coordinator-only (its cluster-global queries would otherwise duplicate metric series on a non-promoted standby); a per-segment `postgres-exporter` is available opt-in (default off) for both primary and mirror segments via the independent `queryMonitoring.exporters.postgresExporter.segments` and `queryMonitoring.exporters.postgresExporter.mirrors` flags for deep per-segment diagnostics; the `postgres-exporter` is Cloudberry-tailored (conditional resource-group query, disabled incompatible built-in collectors, recovery-safe WAL query) so scrapes run cleanly (`pg_exporter_last_scrape_error=0`) on coordinator, standby, and segments
-- OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters
+- OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters; spans use **low-cardinality names** across namespaced families: API server spans renamed to the route template (`GET /api/v1alpha1/clusters/{name}` — never the raw path), `db.*` (per db.Client operation), `controller.*` (per controller sub-operation, e.g. `controller.clusterTLS`), `idle.*` (`idle.scan`), `auth.*` (`auth.authenticate`, `auth.oidc.verify`, `auth.oidc.userinfo`), `webhook.*` (`webhook.validate`/`webhook.mutate`), and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`)
 - Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
 - Structured logging (slog) with JSON output including cluster, namespace, controller, and reconcileID fields
 - Structured error types with sentinel errors (`ErrNotFound`, `ErrInvalidInput`, `ErrRetryExhausted`) supporting `errors.Is()` classification
@@ -186,6 +196,8 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
   - `PGPASSWORD` sourced from admin password Secret
 - Backup and restore to S3-compatible storage (AWS S3 / MinIO) via the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`)
+  - `backup.image` is defaulted by the mutating webhook to the official backup image (`cloudberry-backup:2.1.0`) when unset; a backup-capable image **must** contain `kubectl` (coordinator-exec model) and the `gpbackup`/`gprestore` toolchain
+  - Restores default to `--with-stats=false` (statistics restore is opt-in); with `withStats: true`, a `gprestore` exit code 2 (data restored, statistics failed) is treated as success-with-warning — `RestorePartial` Warning event and `cloudberry_restore_total{result="partial"}`
   - S3 credentials from a Kubernetes Secret or HashiCorp Vault (materialized to a Secret at reconcile time)
   - Full S3 config: bucket, folder, region, encryption, `forcePathStyle`, multipart tuning, retention, schedule (CronJob)
   - Live data cycle runs `gpbackup`/`gprestore` inside the coordinator pod (MPP coordinator→segment SSH dispatch); verified end-to-end by Scenario 71 for both Secret and Vault credential variants
@@ -465,13 +477,18 @@ Key configuration options in `values.yaml`:
 | `operator.apiAddress` | REST API bind address | `:8090` |
 | `operator.webhookEnabled` | Enable admission webhooks | `false` |
 | `env.CLOUDBERRY_API_ADMIN_PASSWORD` | Admin password for the REST API (auto-generated and persisted to Secret if not set) | (generated) |
+| `operator.enableTestUsers` | Seed well-known TEST users (`basic_user`/`opbasic_user`/`operator_user`). **Test suites only — never enable in production** | `false` |
 | `vault.enabled` | Enable Vault integration | `false` |
+| `vault.authMethod` | Vault auth method (`token`, `kubernetes`, `approle`) | `kubernetes` |
+| `vault.roleID` / `vault.secretID` | AppRole credentials (`approle` auth method) | `""` |
 | `oidc.enabled` | Enable OIDC authentication | `false` |
 | `telemetry.enabled` | Enable OTLP tracing | `false` |
 | `telemetry.otlpInsecure` | Disable TLS for OTLP exporter | `false` |
 | `metrics.enabled` | Enable Prometheus metrics | `true` |
 | `webhook.enabled` | Enable admission webhooks | `true` |
 | `webhook.certSource` | Certificate source (`self-signed` or `vault-pki`) | `self-signed` |
+
+Configuration precedence (highest wins): **environment variable > command-line flag > config file > default**. The environment always wins, even over an explicitly set flag.
 
 See [docs/installation.md](docs/installation.md) for the full values reference.
 
@@ -621,7 +638,7 @@ Scenario 7 populates the `mydb` database with realistic test data including Pare
 
 **Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), automatic segment failover via FTS (20), bootstrap workload management via CRD (25), webhook validation negative tests for backup configuration (69a–69j), webhook defaults verification for backup configuration (70), full S3 backup configuration with Secret and Vault credential sources (71), backup infrastructure deployment (72), and on-demand backup with per-request gpbackup options incl. the `noCompression` override (73). See [docs/development.md](docs/development.md) for detailed test descriptions.
 
-The project targets **90%+ unit test statement coverage** per package. Total coverage: **91.4%** with all 14 internal packages at 90%+. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90.1%, `internal/auth` at ~97.6%, `internal/idle` at ~97%, `cmd/cloudberry-ctl` at ~91.6%, `cmd/operator` at ~30.0%. All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38). See [docs/development.md](docs/development.md) for the full development and testing guide.
+The project **enforces 90%+ unit test statement coverage per package**. Goroutine-heavy packages (`internal/api`, `internal/controller`, `internal/idle`, `internal/vault`) run [goleak](https://github.com/uber-go/goleak) in their `TestMain` to fail the suite on leaked goroutines. Integration Scenario 89 verifies the backup artifact round-trip (upload → byte-for-byte download → retention delete) against the **real MinIO** object store from the Docker Compose environment, using the same bucket/folder layout and credentials the backup Jobs use. Total coverage: **91.4%** with all 14 internal packages at 90%+. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90.1%, `internal/auth` at ~97.6%, `internal/idle` at ~97%, `cmd/cloudberry-ctl` at ~91.6%, `cmd/operator` at ~30.0%. All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38). See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Monitoring Quick Start
 
@@ -650,7 +667,7 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set telemetry.otlpInsecure=true
 ```
 
-Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory. The `monitoring/grafana/cloudberry-operator.json` dashboard visualizes all operator metrics, including a **Security & Lifecycle** section covering certificate rotation and expiry, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery.
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory — four dashboards: **operator** (`cloudberry-operator.json`), **exporters** (`cloudberry-exporters.json`), **node metrics** (`cloudberry-node-metrics.json`), and **OTel/telemetry** (`cloudberry-otel.json`). The operator dashboard visualizes all operator metrics — including the REST API panels (request rate/duration/in-flight/rate-limit rejections), DB connect/pool/query panels, idle-daemon health, and a **Security & Lifecycle** section covering certificate rotation and expiry, cluster TLS issuance, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery. The test monitoring stack (Helm charts under `test/monitoring/`: vmagent, vector, otel-collector, node-exporter) is deployed via `make monitoring-deploy`.
 
 ## Deployment Status
 
@@ -685,7 +702,9 @@ The operator has been verified in production-like deployments:
 
 ## Performance Characteristics
 
-Based on performance testing (2026-05-19, 287,122 total requests, zero errors):
+Current baseline (latest perf-test cycle): authenticated API throughput is **~7 RPS per client** — dominated by bcrypt password verification on every Basic-auth request — and health endpoints sustain **p99 < 10ms**. Note that the default API rate limit is **10 requests/minute per IP** (`api-rate-limit` / `CLOUDBERRY_API_RATE_LIMIT`; set `0` to disable), so performance testing requires raising or disabling the limit.
+
+Earlier full load-test results (2026-05-19, 287,122 total requests, zero errors):
 
 | Endpoint Type | p50 | p95 | p99 | Peak RPS |
 |---------------|-----|-----|-----|----------|

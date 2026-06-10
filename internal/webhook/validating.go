@@ -11,6 +11,7 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // errAdmissionInternal classifies an internal (non-validation) admission
@@ -87,8 +88,10 @@ func (v *CloudberryClusterValidator) ValidateCreate(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	ctx, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpCreate)
 	warnings, err := v.validateCreate(ctx, cluster)
 	v.recordAdmission(admissionOpCreate, err)
+	end(err)
 	return warnings, err
 }
 
@@ -135,12 +138,14 @@ func (v *CloudberryClusterValidator) checkDuplicateName(
 
 // ValidateUpdate validates a CloudberryCluster on update.
 func (v *CloudberryClusterValidator) ValidateUpdate(
-	_ context.Context,
+	ctx context.Context,
 	oldCluster *cbv1alpha1.CloudberryCluster,
 	newCluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	_, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpUpdate)
 	warnings, err := validateUpdate(oldCluster, newCluster)
 	v.recordAdmission(admissionOpUpdate, err)
+	end(err)
 	return warnings, err
 }
 
@@ -163,11 +168,13 @@ func validateUpdate(
 
 // ValidateDelete validates a CloudberryCluster on deletion.
 func (v *CloudberryClusterValidator) ValidateDelete(
-	_ context.Context,
+	ctx context.Context,
 	_ *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
 	// No validation needed on delete.
+	_, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpDelete)
 	v.recordAdmission(admissionOpDelete, nil)
+	end(nil)
 	return nil, nil
 }
 
@@ -348,8 +355,13 @@ func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
 			return fmt.Errorf("backup.schedule is not a valid cron expression: %w", err)
 		}
 	}
+	// The mutating webhook defaults backup.image to the official backup image,
+	// so an empty value here means defaulting was bypassed. The image must be
+	// backup-capable: it must contain kubectl (the Jobs `kubectl exec`
+	// gpbackup/gprestore into the coordinator pod) and the gpbackup toolchain.
 	if backup.Image == "" {
-		return fmt.Errorf("backup.image is required when backup is enabled")
+		return fmt.Errorf("backup.image is required when backup is enabled; "+
+			"the image must contain kubectl and gpbackup (e.g. %s)", util.DefaultBackupImage)
 	}
 	return nil
 }

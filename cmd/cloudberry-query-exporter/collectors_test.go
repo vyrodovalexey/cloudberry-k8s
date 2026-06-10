@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -77,7 +78,10 @@ func TestParseIntervalToSeconds(t *testing.T) {
 		{"one hour", "01:00:00.000000", 3600, false},
 		{"mixed", "00:01:30.000000", 90, false},
 		{"zero", "00:00:00.000000", 0, false},
-		{"invalid", "garbage", 0, false}, // reformat returns "0s" which parses fine
+		{"invalid", "garbage", 0, false},           // reformat returns "0s" which parses fine
+		{"day prefix", "1 day 02:03:04", 0, false}, // unsupported format degrades to 0s
+		{"negative hours", "-01:00:00.000000", -3600, false},
+		{"NaN seconds", "00:00:NaN", 0, true}, // survives Sscanf, fails ParseDuration
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -126,8 +130,66 @@ func TestCollectQueryActivity_QueryError(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
-	// Should not panic on query error.
 	mc.collectQueryActivity(context.Background(), conn, time.Second, testLogger())
+
+	// No garbage may be published on a failed scrape: gauges stay at zero and
+	// the per-query counter families gain no series.
+	assert.Zero(t, testGauge(t, mc.queriesIdleInTransaction))
+	assert.Zero(t, testGauge(t, mc.queriesBlocked))
+	assert.Zero(t, testGauge(t, mc.queryMaxDuration))
+	assert.Zero(t, testutil.CollectAndCount(mc.queriesTotal))
+	assert.Zero(t, testutil.CollectAndCount(mc.queriesSlowTotal))
+}
+
+func TestCollectQueryActivity_ScanError_RowSkipped(t *testing.T) {
+	fields := []fieldDesc{
+		textField("state"), textField("datname"), textField("usename"),
+		float8Field("duration_seconds"), textField("wait_event_type"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			// Valid row processed first.
+			{"idle in transaction", "db1", "user2", "0", ""},
+			// Malformed duration ("abc" in a float8 column) → Scan error.
+			// pgx closes the result set after a scan error, so iteration
+			// stops and rows.Err() reports the failure.
+			{"active", "db1", "user1", "abc", ""},
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectQueryActivity(context.Background(), conn, time.Second, testLogger())
+
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.queriesTotal),
+		"the row scanned before the failure must have been counted")
+	// The scan error surfaces through rows.Err(), so the aggregate gauges
+	// computed from the partial iteration must NOT be published.
+	assert.Zero(t, testGauge(t, mc.queriesIdleInTransaction))
+}
+
+func TestCollectQueryActivity_RowsErrMidStream(t *testing.T) {
+	fields := []fieldDesc{
+		textField("state"), textField("datname"), textField("usename"),
+		float8Field("duration_seconds"), textField("wait_event_type"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		// Rows start flowing, then the backend errors → rows.Err() != nil.
+		return rowsThenError(fields,
+			[][]string{{"idle in transaction", "db1", "u", "0", ""}},
+			"backend died mid-stream")
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectQueryActivity(context.Background(), conn, time.Second, testLogger())
+
+	// rows.Err() path: aggregate gauges must NOT be published from a
+	// partially iterated result set.
+	assert.Zero(t, testGauge(t, mc.queriesIdleInTransaction))
+	assert.Zero(t, testGauge(t, mc.queriesBlocked))
 }
 
 func TestCollectResgroupStatusSummary(t *testing.T) {
@@ -158,6 +220,61 @@ func TestCollectResgroupStatusSummary_Error(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
+	mc.collectResgroupStatusSummary(context.Background(), conn, testLogger())
+
+	// A failed query must not publish any resource-group series.
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupRunningQueries))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupQueuedQueries))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupExecutedTotal))
+}
+
+func TestCollectResgroupStatusSummary_ScanAndParseErrors(t *testing.T) {
+	fields := []fieldDesc{
+		textField("rsgname"), int8Field("num_running"), int8Field("num_queueing"),
+		int8Field("num_executed"), textField("total_queue_duration"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			// Fully valid row first.
+			{"good_group", "2", "1", "10", "00:00:05.000000"},
+			// Parse error: queue duration that survives Sscanf but fails
+			// ParseDuration ("0h0mNaNs") → continue, iteration goes on.
+			{"nan_group", "1", "0", "0", "00:00:NaN"},
+			// Scan error LAST: non-numeric num_running. pgx closes the
+			// result set after a scan error, so it must come last.
+			{"bad_group", "not-a-number", "0", "0", "00:00:01"},
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectResgroupStatusSummary(context.Background(), conn, testLogger())
+
+	assert.Equal(t, float64(2), testGaugeVec(t, mc.resgroupRunningQueries, "good_group"))
+	// The scan-error row must publish nothing.
+	assert.Equal(t, 2, testutil.CollectAndCount(mc.resgroupRunningQueries),
+		"only the rows that scanned cleanly may publish running-queries series")
+	// The parse-error row published its gauges but not the queue duration.
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.resgroupQueueDurationTotal),
+		"queue duration must be skipped for unparseable intervals")
+}
+
+func TestCollectResgroupStatusSummary_RowsErr(t *testing.T) {
+	fields := []fieldDesc{
+		textField("rsgname"), int8Field("num_running"), int8Field("num_queueing"),
+		int8Field("num_executed"), textField("total_queue_duration"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsThenError(fields,
+			[][]string{{"g1", "1", "0", "0", "00:00:01.000000"}}, "mid-stream failure")
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	// Must not panic; the delivered row was already published before the
+	// error was observed (documented best-effort semantics).
 	mc.collectResgroupStatusSummary(context.Background(), conn, testLogger())
 }
 
@@ -190,6 +307,31 @@ func TestCollectResgroupStatusPerHost_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectResgroupStatusPerHost(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupCPUUsagePercent))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupMemoryUsageBytes))
+}
+
+func TestCollectResgroupStatusPerHost_ScanError_RowSkipped(t *testing.T) {
+	fields := []fieldDesc{
+		textField("rsgname"), textField("hostname"), float8Field("cpu"),
+		float8Field("memory_used"), float8Field("memory_available"),
+		float8Field("memory_quota_used"), float8Field("memory_shared_used"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			{"good", "host1", "0.5", "1", "2", "3", "4"}, // valid
+			{"bad", "host1", "oops", "1", "2", "3", "4"}, // scan error (last: closes rows)
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectResgroupStatusPerHost(context.Background(), conn, testLogger())
+
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.resgroupCPUUsagePercent))
+	assert.InDelta(t, 0.5, testGaugeVec(t, mc.resgroupCPUUsagePercent, "good", "host1"), 0.001)
 }
 
 func TestCollectResgroupStatus(t *testing.T) {
@@ -217,6 +359,10 @@ func TestCollectResgroupStatus(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectResgroupStatus(context.Background(), conn, testLogger())
+
+	// Both halves of the composite collector must publish.
+	assert.Equal(t, float64(1), testGaugeVec(t, mc.resgroupRunningQueries, "default_group"))
+	assert.InDelta(t, 0.1, testGaugeVec(t, mc.resgroupCPUUsagePercent, "default_group", "host1"), 0.001)
 }
 
 func TestCollectResgroupIOStats(t *testing.T) {
@@ -248,6 +394,48 @@ func TestCollectResgroupIOStats_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectResgroupIOStats(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupIOReadBytesPerSec))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupIOWriteBytesPerSec))
+}
+
+func TestCollectResgroupIOStats_ScanError_RowSkipped(t *testing.T) {
+	fields := []fieldDesc{
+		textField("rsgname"), textField("hostname"), textField("tablespace"),
+		float8Field("rbps"), float8Field("wbps"), float8Field("riops"), float8Field("wiops"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			{"good", "h", "ts", "10", "20", "1", "2"}, // valid
+			{"bad", "h", "ts", "x", "1", "1", "1"},    // scan error (last: closes rows)
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectResgroupIOStats(context.Background(), conn, testLogger())
+
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.resgroupIOReadBytesPerSec))
+	assert.Equal(t, float64(10),
+		testGaugeVec(t, mc.resgroupIOReadBytesPerSec, "good", "h", "ts"))
+}
+
+func TestCollectResgroupIOStats_RowsErr(t *testing.T) {
+	fields := []fieldDesc{
+		textField("rsgname"), textField("hostname"), textField("tablespace"),
+		float8Field("rbps"), float8Field("wbps"), float8Field("riops"), float8Field("wiops"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsThenError(fields, nil, "stream broke")
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectResgroupIOStats(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupIOReadBytesPerSec))
 }
 
 func TestCollectSpillFiles(t *testing.T) {
@@ -282,6 +470,9 @@ func TestCollectSpillFileSummary_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectSpillFileSummary(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testGauge(t, mc.spillFilesActive))
+	assert.Zero(t, testGauge(t, mc.spillFilesBytes))
 }
 
 func TestCollectSpillFilePerSegment_Error(t *testing.T) {
@@ -293,6 +484,40 @@ func TestCollectSpillFilePerSegment_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectSpillFilePerSegment(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.spillFilesPerSegment))
+}
+
+func TestCollectSpillFilePerSegment_ScanError_RowSkipped(t *testing.T) {
+	fields := []fieldDesc{textField("segment_id"), textField("hostname"), int8Field("bytes")}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			{"1", "host2", "2048"},    // valid
+			{"0", "host1", "garbage"}, // scan error (last: closes rows)
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectSpillFilePerSegment(context.Background(), conn, testLogger())
+
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.spillFilesPerSegment))
+	assert.Equal(t, float64(2048), testGaugeVec(t, mc.spillFilesPerSegment, "1", "host2"))
+}
+
+func TestCollectSpillFilePerSegment_RowsErr(t *testing.T) {
+	fields := []fieldDesc{textField("segment_id"), textField("hostname"), int8Field("bytes")}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsThenError(fields, nil, "stream broke")
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectSpillFilePerSegment(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.spillFilesPerSegment))
 }
 
 func TestCollectSegmentHealth(t *testing.T) {
@@ -327,6 +552,10 @@ func TestCollectSegmentStatus_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectSegmentStatus(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.segmentsTotal))
+	assert.Zero(t, testGauge(t, mc.segmentsUp))
+	assert.Zero(t, testGauge(t, mc.segmentsDown))
 }
 
 func TestCollectClusterUptime_Error(t *testing.T) {
@@ -338,6 +567,9 @@ func TestCollectClusterUptime_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectClusterUptime(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testGauge(t, mc.clusterUptime),
+		"uptime must not be published from a failed query")
 }
 
 func TestCollectDistributedTransactions(t *testing.T) {
@@ -368,6 +600,10 @@ func TestCollectDistributedXacts_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectDistributedXacts(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testGauge(t, mc.distTxnActive))
+	assert.Zero(t, readMetricValue(t, mc.distTxnCommitted))
+	assert.Zero(t, readMetricValue(t, mc.distTxnAborted))
 }
 
 func TestCollectOldestTransaction_Error(t *testing.T) {
@@ -379,6 +615,8 @@ func TestCollectOldestTransaction_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectOldestTransaction(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testGauge(t, mc.oldestTxnAge))
 }
 
 func TestCollectTableSkew(t *testing.T) {
@@ -409,6 +647,44 @@ func TestCollectTableSkew_Error(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectTableSkew(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.tableSkewCoefficient))
+}
+
+func TestCollectTableSkew_ScanError_RowSkipped(t *testing.T) {
+	fields := []fieldDesc{
+		textField("schemaname"), textField("tablename"), float8Field("skew_coefficient"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsResponseTyped(fields, [][]string{
+			{"public", "orders", "0.25"},    // valid
+			{"public", "broken", "NaN-ish"}, // scan error (last: closes rows)
+		})
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectTableSkew(context.Background(), conn, testLogger())
+
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.tableSkewCoefficient))
+	assert.InDelta(t, 0.25, testGaugeVec(t, mc.tableSkewCoefficient, "public", "orders"), 0.001)
+}
+
+func TestCollectTableSkew_RowsErr(t *testing.T) {
+	fields := []fieldDesc{
+		textField("schemaname"), textField("tablename"), float8Field("skew_coefficient"),
+	}
+	conn, cleanup := newMockConn(t, func(_ string) []byte {
+		return rowsThenError(fields, nil, "stream broke")
+	})
+	defer cleanup()
+
+	reg := prometheus.NewRegistry()
+	mc := newMetricCollectors(reg)
+	mc.collectTableSkew(context.Background(), conn, testLogger())
+
+	assert.Zero(t, testutil.CollectAndCount(mc.tableSkewCoefficient))
 }
 
 func TestCollectAll(t *testing.T) {
@@ -468,6 +744,15 @@ func TestCollectAll(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
 	mc.collectAll(context.Background(), conn, time.Second, testLogger())
+
+	// Spot-check that each collector family actually published from the
+	// responder data (collectAll wired every sub-collector).
+	assert.Equal(t, 1, testutil.CollectAndCount(mc.queriesTotal))
+	assert.Equal(t, float64(1), testGaugeVec(t, mc.resgroupRunningQueries, "g"))
+	assert.Equal(t, float64(1024), testGaugeVec(t, mc.spillFilesPerSegment, "0", "h"))
+	assert.Equal(t, float64(4), testGaugeVec(t, mc.segmentsTotal, "primary"))
+	assert.Equal(t, float64(1), testGauge(t, mc.distTxnActive))
+	assert.InDelta(t, 0.1, testGaugeVec(t, mc.tableSkewCoefficient, "public", "t1"), 0.001)
 }
 
 // --- prometheus metric value helpers ---

@@ -278,6 +278,7 @@ func (m *mockDBClient) GetDiskUsage(_ context.Context, _ string) ([]DiskUsage, e
 }
 func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) { return 0, nil }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error             { return nil }
+func (m *mockDBClient) GetMaxConnections(_ context.Context) (int32, error) { return 100, nil }
 func (m *mockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return 5, 2, 1, nil
 }

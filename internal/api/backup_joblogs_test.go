@@ -22,7 +22,7 @@ import (
 func newJobLogsTestServer(objs ...runtime.Object) *Server {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	s := trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 	return s.WithClientset(k8sfake.NewSimpleClientset())
 }
 

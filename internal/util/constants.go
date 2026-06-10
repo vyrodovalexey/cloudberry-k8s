@@ -102,6 +102,13 @@ const (
 	// AnnotationBackupRetentionDeleted records the number of backups removed by a
 	// retention cleanup Job, used to drive the cloudberry_backup_retention_deleted_total counter.
 	AnnotationBackupRetentionDeleted = "avsoft.io/backup-retention-deleted"
+	// AnnotationRestorePartial marks a SUCCEEDED restore Job whose statistics
+	// restore step failed (gprestore exit code 2 — known upstream gpbackup bug:
+	// invalid bigint in statistics.sql) while the data restore succeeded. The
+	// admin controller patches it from the restore pod's termination message
+	// ("GPRESTORE_PARTIAL=stats") and reports the restore as
+	// success-with-warning (RestorePartial Event, metric result "partial").
+	AnnotationRestorePartial = "avsoft.io/restore-partial"
 	// AnnotationBackupSizeBytes records the size in bytes of a completed backup Job,
 	// used to drive the cloudberry_backup_size_bytes gauge.
 	AnnotationBackupSizeBytes = "avsoft.io/backup-size-bytes"
@@ -116,6 +123,28 @@ const (
 	// periodic reconciles of the same finished Job do not double-count or emit an
 	// event storm. Its value is the recorded result ("success" or "failed").
 	AnnotationValidationRecorded = "avsoft.io/validation-recorded"
+	// AnnotationDeletionBackupJob tracks the name of the backup Job created by
+	// the deletion flow (spec.backupOnDelete=true with deletionPolicy=Delete).
+	// While present and the Job is non-terminal, PVC deletion and finalizer
+	// removal are deferred so the backup runs against intact volumes.
+	AnnotationDeletionBackupJob = "avsoft.io/deletion-backup-job"
+	// BackupTimestampLayout is the shared Go time layout used to stamp
+	// backup/maintenance/rebalance Job names (YYYYMMDD-HHMMSS).
+	BackupTimestampLayout = "20060102-150405"
+
+	// GpbackupTimestampLayout is the gpbackup-style YYYYMMDDHHMMSS (14-digit)
+	// timestamp layout shared by the API and the admin controller (L-2).
+	GpbackupTimestampLayout = "20060102150405"
+
+	// AnnotationRebalanceJob tracks the name of the fallback rebalance Job so
+	// the HA controller observes it to a TERMINAL state across reconciles
+	// before recording rebalance completion (no fire-and-forget success).
+	AnnotationRebalanceJob = "avsoft.io/rebalance-job"
+	// AnnotationDeletionBackupDeadline is the RFC3339 deadline for the
+	// deletion backup Job. Past this deadline the deletion proceeds even if
+	// the Job has not finished, so cluster/namespace deletion can never be
+	// wedged forever by a stuck backup.
+	AnnotationDeletionBackupDeadline = "avsoft.io/deletion-backup-deadline"
 
 	// ActionStart triggers a cluster start.
 	ActionStart = "start"
@@ -172,6 +201,12 @@ const (
 	DefaultVersion = "2.1.0"
 	// DefaultImage is the default Cloudberry DB container image.
 	DefaultImage = "cloudberrydb/cloudberry:2.1.0"
+	// DefaultBackupImage is the default backup toolchain container image used
+	// for backup/restore Jobs when spec.backup.image is unset. A backup-capable
+	// image MUST contain kubectl (the Jobs `kubectl exec` gpbackup/gprestore
+	// into the coordinator pod — the coordinator-exec model) and the
+	// gpbackup/gprestore/gpbackup_s3_plugin toolchain.
+	DefaultBackupImage = "cloudberry-backup:2.1.0"
 
 	// OperatorNamespace is the default operator namespace.
 	OperatorNamespace = "cloudberry-system"

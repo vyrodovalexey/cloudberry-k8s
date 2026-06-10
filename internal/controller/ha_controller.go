@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +32,7 @@ const haControllerName = "ha-controller"
 
 // HAReconciler reconciles the high availability aspects of a CloudberryCluster.
 type HAReconciler struct {
+	reconcileIntervals
 	client    client.Client
 	scheme    *runtime.Scheme
 	recorder  record.EventRecorder
@@ -104,7 +110,7 @@ func (r *HAReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
 		logger.Debug("cluster not running, deferring HA reconciliation",
 			"phase", cluster.Status.Phase)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 	}
 
 	// Handle annotation-based actions first.
@@ -127,6 +133,14 @@ func (r *HAReconciler) handleAnnotations(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (result ctrl.Result, handled bool, err error) {
+	// Observe a tracked fallback rebalance Job FIRST: the action annotation is
+	// removed when the Job is created, so completion is detected on the
+	// periodic reconciles that follow (B-11: no fire-and-forget success).
+	if jobName := cluster.Annotations[util.AnnotationRebalanceJob]; jobName != "" {
+		result, err := r.observeRebalanceJob(ctx, cluster, jobName)
+		return result, true, err
+	}
+
 	if recoveryType, ok := cluster.Annotations[util.AnnotationRecovery]; ok {
 		result, err := r.handleRecovery(ctx, cluster, recoveryType)
 		return result, true, err
@@ -517,7 +531,20 @@ func (r *HAReconciler) monitorStandby(ctx context.Context, cluster *cbv1alpha1.C
 	return patchStatus(ctx, r.client, cluster)
 }
 
+// recoveryResultNoop is the recovery-operation metric result recorded when
+// the recovery annotation is acknowledged without executing any recovery
+// work (the gprecoverseg-equivalent is not implemented yet).
+const recoveryResultNoop = "noop"
+
 // handleRecovery processes recovery annotations.
+//
+// IMPLEMENTATION STATUS: segment recovery (gprecoverseg-equivalent) is NOT
+// implemented in this iteration. This handler only acknowledges the
+// annotation: it removes it, emits an explicit "RecoveryNotImplemented"
+// event, and records the recovery metric with result="noop" so dashboards
+// never see a "completed" sample for work that was not executed
+// (cloudberry_recovery_operations_total{result="completed"} only increments
+// when real recovery work runs).
 func (r *HAReconciler) handleRecovery(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -527,7 +554,6 @@ func (r *HAReconciler) handleRecovery(
 	logger.Info("handling recovery", "type", recoveryType)
 
 	rt := normalizeRecoveryType(recoveryType)
-	r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, "started")
 
 	// Remove the recovery annotation using MergePatch to avoid conflicts with stale objects.
 	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationRecovery); err != nil {
@@ -535,11 +561,14 @@ func (r *HAReconciler) handleRecovery(
 		return ctrl.Result{}, fmt.Errorf("removing recovery annotation: %w", err)
 	}
 
-	r.recorder.Event(cluster, corev1.EventTypeNormal, "RecoveryStarted",
-		fmt.Sprintf("Recovery type %s initiated", recoveryType))
-	r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, "completed")
+	logger.Warn("segment recovery is not implemented; annotation acknowledged without action",
+		"type", recoveryType)
+	r.recorder.Event(cluster, corev1.EventTypeWarning, "RecoveryNotImplemented",
+		fmt.Sprintf("Recovery type %s requested but segment recovery is not implemented; no action taken",
+			recoveryType))
+	r.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, rt, recoveryResultNoop)
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // normalizeRecoveryType maps an arbitrary recovery type string to one of the
@@ -624,32 +653,137 @@ func (r *HAReconciler) handleRebalance(
 			r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceCompleted,
 				"Segment rebalance completed")
 			r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance")
-			return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+			return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 		}
 	}
 
-	// Fallback: create rebalance Job.
-	timestamp := time.Now().Format("20060102-150405")
+	// Fallback: create a rebalance Job and TRACK it to a terminal state on
+	// subsequent reconciles. Completion/failure is recorded by
+	// observeRebalanceJob — never here (B-11: no fire-and-forget success).
+	return r.startRebalanceJob(ctx, cluster)
+}
+
+// requeueAfterRebalanceJob is the poll interval while a fallback rebalance
+// Job is running.
+const requeueAfterRebalanceJob = 15 * time.Second
+
+// startRebalanceJob creates the fallback rebalance Job and stamps the
+// tracking annotation so observeRebalanceJob drives the terminal-state
+// observation. Mirrors the deletion-backup Job pattern (A-5).
+func (r *HAReconciler) startRebalanceJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	timestamp := time.Now().Format(util.BackupTimestampLayout)
 	job := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceRebalance, timestamp)
-	if job != nil {
-		if err := r.client.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error("failed to create rebalance job", "error", err)
+	if job == nil {
+		// The builder produced no Job (unsupported configuration): report the
+		// failure honestly instead of pretending the rebalance completed.
+		r.recordRebalanceFailure(ctx, cluster, "RebalanceJobNotBuilt",
+			"Rebalance fallback Job could not be built")
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
+	}
+
+	if err := r.client.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+		logger.Error("failed to create rebalance job", "error", err)
+		r.recordRebalanceFailure(ctx, cluster, "RebalanceJobCreateFailed",
+			fmt.Sprintf("Failed to create rebalance Job: %v", err))
+		return ctrl.Result{}, fmt.Errorf("creating rebalance job: %w", err)
+	}
+
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		util.AnnotationRebalanceJob, job.Name); err != nil {
+		return ctrl.Result{}, fmt.Errorf("recording rebalance-job annotation: %w", err)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceStarted,
+		fmt.Sprintf("Rebalance Job %s started; completion tracked across reconciles", job.Name))
+	logger.Info("rebalance job created, tracking to terminal state", "job", job.Name)
+	return ctrl.Result{RequeueAfter: requeueAfterRebalanceJob}, nil
+}
+
+// observeRebalanceJob drives the tracked fallback rebalance Job to a terminal
+// state: Succeeded records completion (condition + event + metric exactly
+// once), a terminal failure records the failed path with a warning event, and
+// a disappeared Job is treated as failed so tracking can never wedge.
+func (r *HAReconciler) observeRebalanceJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	jobName string,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	job := &batchv1.Job{}
+	getErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      jobName,
+		Namespace: cluster.Namespace,
+	}, job)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		logger.Warn("rebalance job disappeared before completion", "job", jobName)
+		r.recordRebalanceFailure(ctx, cluster, "RebalanceJobLost",
+			fmt.Sprintf("Rebalance Job %s disappeared before completion", jobName))
+		return r.clearRebalanceJobAnnotation(ctx, cluster)
+	case getErr != nil:
+		return ctrl.Result{RequeueAfter: requeueAfterError},
+			fmt.Errorf("fetching rebalance job %s: %w", jobName, getErr)
+	}
+
+	switch {
+	case job.Status.Succeeded > 0:
+		logger.Info("rebalance job completed", "job", jobName)
+		cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+			string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "RebalanceCompleted",
+			"Rebalance completed successfully")
+		if err := patchStatus(ctx, r.client, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating rebalance completion: %w", err)
 		}
-	}
+		r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceCompleted,
+			"Segment rebalance completed")
+		r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance")
+		return r.clearRebalanceJobAnnotation(ctx, cluster)
 
-	// Set completion (Job-based rebalance is fire-and-forget at this stage).
+	case job.Status.Failed > 0 || jobHasFailedCondition(job):
+		logger.Error("rebalance job failed", "job", jobName)
+		r.recordRebalanceFailure(ctx, cluster, "RebalanceJobFailed",
+			fmt.Sprintf("Rebalance Job %s failed", jobName))
+		return r.clearRebalanceJobAnnotation(ctx, cluster)
+
+	default:
+		logger.Info("waiting for rebalance job to complete",
+			"job", jobName, "active", job.Status.Active)
+		return ctrl.Result{RequeueAfter: requeueAfterRebalanceJob}, nil
+	}
+}
+
+// recordRebalanceFailure sets the failed DataRedistribution condition, emits
+// a warning event and records the failed-rebalance metric.
+func (r *HAReconciler) recordRebalanceFailure(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	reason, message string,
+) {
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
-		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "RebalanceCompleted",
-		"Rebalance completed successfully")
+		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionFalse, reason, message)
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating rebalance completion: %w", err)
+		util.LoggerFromContext(ctx).Error("failed to update rebalance failure status", "error", err)
 	}
+	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonRebalanceFailed, message)
+	r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance-failed")
+}
 
-	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonRebalanceCompleted,
-		"Segment rebalance completed")
-	r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "rebalance")
-
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+// clearRebalanceJobAnnotation removes the rebalance-job tracking annotation
+// after a terminal state was handled.
+func (r *HAReconciler) clearRebalanceJobAnnotation(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (ctrl.Result, error) {
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationRebalanceJob); err != nil {
+		return ctrl.Result{}, fmt.Errorf("removing rebalance-job annotation: %w", err)
+	}
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // executeRebalanceViaDB performs skew analysis and redistributes skewed tables
@@ -691,6 +825,14 @@ const interTableDelay = 100 * time.Millisecond
 
 // dispatchRebalanceTables dispatches concurrent rebalance operations for the
 // given tables with bounded concurrency and inter-table rate limiting.
+//
+// Concurrency is bounded with semaphore.Weighted whose Acquire respects
+// context cancellation, and completion is tracked with a sync.WaitGroup that
+// only counts goroutines that were actually launched. This structure makes
+// the historic slot-leak/deadlock (H-1: a hand-rolled chan semaphore slot
+// acquired but never released when the inter-table delay was canceled)
+// structurally impossible: every launched worker releases its slot in a
+// defer, and Wait() never blocks on slots that were not handed out.
 func (r *HAReconciler) dispatchRebalanceTables(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -698,35 +840,37 @@ func (r *HAReconciler) dispatchRebalanceTables(
 	tablesToRebalance []db.TableSkewInfo,
 	parallelism int32,
 ) error {
-	sem := make(chan struct{}, parallelism)
-	errCh := make(chan error, len(tablesToRebalance))
+	sem := semaphore.NewWeighted(int64(parallelism))
+	var wg sync.WaitGroup
+	var rebalanceErrors atomic.Int64
 
 	var dispatched int
 	for _, info := range tablesToRebalance {
-		// Check context cancellation before acquiring the semaphore to avoid
-		// goroutine leaks when the parent context is canceled.
-		select {
-		case <-ctx.Done():
-			logger.Warn("context canceled, stopping rebalance dispatch",
-				"dispatched", dispatched, "total", len(tablesToRebalance))
-			goto waitForCompletion
-		case sem <- struct{}{}:
-			// Semaphore acquired — proceed.
-		}
-
 		// Add a small delay between dispatching goroutines to rate-limit
-		// database operations and prevent overwhelming the cluster.
+		// database operations and prevent overwhelming the cluster. The delay
+		// happens BEFORE the slot acquisition so a cancellation here cannot
+		// strand an acquired slot.
 		if dispatched > 0 {
 			if err := waitWithContext(ctx, interTableDelay); err != nil {
 				logger.Warn("context canceled during inter-table delay",
 					"dispatched", dispatched, "total", len(tablesToRebalance))
-				goto waitForCompletion
+				break
 			}
 		}
 
+		// Acquire respects context cancellation, so a canceled parent context
+		// stops the dispatch loop without leaking slots or goroutines.
+		if err := sem.Acquire(ctx, 1); err != nil {
+			logger.Warn("context canceled, stopping rebalance dispatch",
+				"dispatched", dispatched, "total", len(tablesToRebalance))
+			break
+		}
+
 		dispatched++
+		wg.Add(1)
 		go func(ti db.TableSkewInfo) {
-			defer func() { <-sem }()
+			defer wg.Done()
+			defer sem.Release(1)
 			// Check context cancellation before starting the rebalance operation.
 			if ctx.Err() != nil {
 				logger.Warn("context canceled, skipping table rebalance",
@@ -737,7 +881,7 @@ func (r *HAReconciler) dispatchRebalanceTables(
 			if rebalanceErr != nil {
 				logger.Error("failed to rebalance table",
 					"database", ti.Database, "table", ti.Schema+"."+ti.Table, "error", rebalanceErr)
-				errCh <- rebalanceErr
+				rebalanceErrors.Add(1)
 				return
 			}
 			logger.Info("table rebalanced",
@@ -746,25 +890,16 @@ func (r *HAReconciler) dispatchRebalanceTables(
 		}(info)
 	}
 
-waitForCompletion:
-	// Wait for all dispatched goroutines to finish.
-	for range cap(sem) {
-		sem <- struct{}{}
-	}
-	close(errCh)
+	// Wait for all dispatched goroutines to finish. Individual table failures
+	// don't block others, but the caller is informed so it can set the
+	// appropriate status condition.
+	wg.Wait()
 
-	// Collect errors (individual table failures don't block others, but the
-	// caller is informed so it can set the appropriate status condition).
-	var rebalanceErrors int
-	for range errCh {
-		rebalanceErrors++
-	}
-
-	if rebalanceErrors > 0 {
+	if failed := rebalanceErrors.Load(); failed > 0 {
 		logger.Warn("some tables failed to rebalance",
-			"failed", rebalanceErrors, "total", len(tablesToRebalance))
+			"failed", failed, "total", len(tablesToRebalance))
 		return fmt.Errorf("%d of %d tables failed to rebalance",
-			rebalanceErrors, len(tablesToRebalance))
+			failed, len(tablesToRebalance))
 	}
 
 	return nil
@@ -868,7 +1003,19 @@ func splitSchemaTable(name string) []string {
 	return []string{name}
 }
 
-// handleStandbyActivation processes standby activation.
+// standbyActivationMetricType is the recovery-operations metric type label
+// used for standby coordinator activation outcomes.
+const standbyActivationMetricType = "standby-activation"
+
+// handleStandbyActivation processes standby activation by actually promoting
+// the standby coordinator via dbClient.PromoteStandby.
+//
+// Safety/idempotency: PromoteStandby is a destructive operation, so it is
+// gated exclusively by the activate-standby action annotation, which is
+// removed BEFORE the promotion is attempted (at-most-once semantics: a retry
+// of the reconcile after a failed promotion does NOT re-promote; the failure
+// is surfaced via condition, event, metric and the returned error). Clusters
+// without an enabled standby skip the promotion entirely.
 func (r *HAReconciler) handleStandbyActivation(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -876,15 +1023,85 @@ func (r *HAReconciler) handleStandbyActivation(
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling standby activation")
 
-	// Remove the action annotation using MergePatch to avoid conflicts with stale objects.
+	// Remove the action annotation using MergePatch to avoid conflicts with
+	// stale objects. Removing it first guarantees at-most-once promotion.
 	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationAction); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing standby activation annotation: %w", err)
+	}
+
+	// Idempotency/safety gate: only promote when a standby is configured and
+	// enabled. Otherwise report the skip honestly instead of pretending a
+	// failover happened.
+	if cluster.Spec.Standby == nil || !cluster.Spec.Standby.Enabled {
+		logger.Warn("standby activation requested but no enabled standby is configured; skipping")
+		r.recorder.Event(cluster, corev1.EventTypeWarning, "CoordinatorFailover",
+			"Standby activation skipped: no enabled standby coordinator configured")
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
+	}
+
+	if r.dbFactory == nil {
+		err := fmt.Errorf("database client factory is not configured")
+		r.recordStandbyActivationFailure(cluster, err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}
 
 	r.recorder.Event(cluster, corev1.EventTypeWarning, "CoordinatorFailover",
 		"Standby coordinator activation initiated")
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		err = fmt.Errorf("creating db client for standby activation: %w", err)
+		r.recordStandbyActivationFailure(cluster, err)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
+	}
+	defer dbClient.Close()
+
+	if promoteErr := dbClient.PromoteStandby(ctx); promoteErr != nil {
+		err = fmt.Errorf("promoting standby coordinator: %w", promoteErr)
+		r.recordStandbyActivationFailure(cluster, err)
+		// Return the error so controller-runtime applies its backoff; the
+		// annotation gate prevents a duplicate promotion attempt.
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
+	}
+
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionStandbyReady),
+		metav1.ConditionFalse,
+		"StandbyPromoted",
+		"Standby coordinator was promoted to primary",
+	)
+	if patchErr := patchStatus(ctx, r.client, cluster); patchErr != nil {
+		logger.Warn("failed to patch status after standby promotion", "error", patchErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "CoordinatorFailover",
+		"CoordinatorFailover completed: standby promoted to primary")
+	r.metrics.RecordRecoveryOperation(
+		cluster.Name, cluster.Namespace, standbyActivationMetricType, "completed")
+	logger.Info("standby coordinator promoted successfully")
+
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
+}
+
+// recordStandbyActivationFailure records the condition, event and metric for
+// a failed standby activation in one place so all failure paths report
+// consistently.
+func (r *HAReconciler) recordStandbyActivationFailure(
+	cluster *cbv1alpha1.CloudberryCluster,
+	err error,
+) {
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionStandbyReady),
+		metav1.ConditionFalse,
+		"StandbyPromotionFailed",
+		fmt.Sprintf("Standby promotion failed: %v", err),
+	)
+	r.recorder.Event(cluster, corev1.EventTypeWarning, "CoordinatorFailover",
+		fmt.Sprintf("Standby coordinator activation failed: %v", err))
+	r.metrics.RecordRecoveryOperation(
+		cluster.Name, cluster.Namespace, standbyActivationMetricType, "error")
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/httpjson"
 )
 
 // mockProvider implements Provider for testing.
@@ -46,7 +48,7 @@ func TestAuthMiddleware_Handler_MissingAuthHeader(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 
-	var resp errorResponse
+	var resp httpjson.ErrorEnvelope
 	err := json.NewDecoder(rec.Body).Decode(&resp)
 	require.NoError(t, err)
 	assert.Equal(t, "UNAUTHORIZED", resp.Error.Code)
@@ -262,7 +264,7 @@ func TestWriteErrorResponse(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 
-	var resp errorResponse
+	var resp httpjson.ErrorEnvelope
 	err := json.NewDecoder(rec.Body).Decode(&resp)
 	require.NoError(t, err)
 	assert.Equal(t, "BAD_REQUEST", resp.Error.Code)

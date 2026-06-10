@@ -64,7 +64,7 @@ func newQueryHistoryTestServer(dbClient db.Client, clusters ...*cbv1alpha1.Cloud
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	factory := &mockDBFactory{client: dbClient}
-	return NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0))
 }
 
 // ============================================================================
@@ -882,7 +882,7 @@ func TestQueryHistoryRoutes_WithAuth(t *testing.T) {
 		identity: &auth.Identity{Username: "operator", Permission: auth.PermissionOperatorBasic},
 	}
 	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	s := NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0)
+	s := trackServer(NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0))
 	handler := s.Handler()
 
 	req := httptest.NewRequest(http.MethodGet,

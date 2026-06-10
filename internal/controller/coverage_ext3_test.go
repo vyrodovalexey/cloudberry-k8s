@@ -396,7 +396,7 @@ func TestClusterReconciler_Reconcile_ScalingPhaseWithScaleInState(t *testing.T) 
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
 	})
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================

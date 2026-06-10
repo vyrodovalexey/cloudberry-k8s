@@ -44,6 +44,11 @@ const (
 	EnvKafkaBrokers = "KAFKA_BROKERS"
 	// EnvRabbitMQAddr is the environment variable for the RabbitMQ address.
 	EnvRabbitMQAddr = "RABBITMQ_ADDR"
+	// EnvVaultPKIMount is the environment variable for the Vault PKI mount path.
+	EnvVaultPKIMount = "VAULT_PKI_MOUNT"
+	// EnvVaultPKIRole is the environment variable for the Vault PKI role used
+	// to issue test certificates.
+	EnvVaultPKIRole = "VAULT_PKI_ROLE"
 
 	// DefaultVaultAddr is the default Vault address for testing.
 	DefaultVaultAddr = "http://127.0.0.1:8200"
@@ -71,6 +76,11 @@ const (
 	DefaultKafkaBrokers = "127.0.0.1:9094"
 	// DefaultRabbitMQAddr is the default RabbitMQ address for testing.
 	DefaultRabbitMQAddr = "amqp://guest:guest@127.0.0.1:5672/"
+	// DefaultVaultPKIMount is the default Vault PKI mount path for testing.
+	DefaultVaultPKIMount = "pki"
+	// DefaultVaultPKIRole is the default Vault PKI role for testing. It
+	// matches the role provisioned by test/docker-compose/scripts/setup-vault.sh.
+	DefaultVaultPKIRole = "cloudberry-operator"
 )
 
 // TestEnv holds the test environment configuration.
@@ -89,6 +99,8 @@ type TestEnv struct {
 	MinIOSecretKey        string
 	KafkaBrokers          string
 	RabbitMQAddr          string
+	VaultPKIMount         string
+	VaultPKIRole          string
 	Logger                *slog.Logger
 }
 
@@ -109,6 +121,8 @@ func NewTestEnv() *TestEnv {
 		MinIOSecretKey:        getEnvOrDefault(EnvMinIOSecretKey, DefaultMinIOSecretKey),
 		KafkaBrokers:          getEnvOrDefault(EnvKafkaBrokers, DefaultKafkaBrokers),
 		RabbitMQAddr:          getEnvOrDefault(EnvRabbitMQAddr, DefaultRabbitMQAddr),
+		VaultPKIMount:         getEnvOrDefault(EnvVaultPKIMount, DefaultVaultPKIMount),
+		VaultPKIRole:          getEnvOrDefault(EnvVaultPKIRole, DefaultVaultPKIRole),
 		Logger:                slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
 }

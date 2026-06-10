@@ -36,6 +36,8 @@ Dockerfile.operator
 Dockerfile.ctl
 Dockerfile.cloudberry
 Dockerfile.cloudberry-backup
+Dockerfile.cloudberry-official
+Dockerfile.cloudberry-query-exporter
 
 # CI/CD
 .github/

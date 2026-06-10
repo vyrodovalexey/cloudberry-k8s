@@ -104,6 +104,8 @@ type Client interface {
 	PromoteStandby(ctx context.Context) error
 	// GetActiveQueryCount returns the number of active, queued, and blocked queries.
 	GetActiveQueryCount(ctx context.Context) (active, queued, blocked int32, err error)
+	// GetMaxConnections returns the server's max_connections setting.
+	GetMaxConnections(ctx context.Context) (int32, error)
 	// GetResourceGroupUsage returns CPU and memory usage for a resource group.
 	GetResourceGroupUsage(ctx context.Context, group string) (cpu, memory float64, err error)
 	// CreateResourceGroup creates a new resource group.
@@ -615,6 +617,11 @@ type pgxClient struct {
 	// recording query-history metrics. They are empty unless SetRecorder is used.
 	metricsCluster   string
 	metricsNamespace string
+	// unregisterPoolStats removes this client's connection-pool stats provider
+	// from the metrics registry. It is set by registerPoolStats and invoked by
+	// Close so a closed pool is never sampled on scrape. Nil when pool stats
+	// were never registered (no recorder configured).
+	unregisterPoolStats func()
 }
 
 // SetRecorder configures an optional metrics recorder and the cluster/namespace
@@ -624,6 +631,24 @@ func (c *pgxClient) SetRecorder(recorder metrics.Recorder, cluster, namespace st
 	c.recorder = recorder
 	c.metricsCluster = cluster
 	c.metricsNamespace = namespace
+}
+
+// registerPoolStats registers this client's pgxpool statistics with the
+// metrics recorder so cloudberry_db_pool_* gauges are sampled on every
+// Prometheus scrape. The provider is unregistered by Close. It is a no-op
+// when no recorder is configured.
+func (c *pgxClient) registerPoolStats() {
+	if c.recorder == nil {
+		return
+	}
+	pool := c.pool
+	c.unregisterPoolStats = c.recorder.RegisterDBPoolStats(
+		c.metricsCluster, c.metricsNamespace,
+		func() (acquired, idle, maxConns float64) {
+			st := pool.Stat()
+			return float64(st.AcquiredConns()), float64(st.IdleConns()), float64(st.MaxConns())
+		},
+	)
 }
 
 // NewClient creates a new database client with connection pooling.
@@ -654,6 +679,11 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (Client, er
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
 	}
+
+	// Install the in-house pgx query tracer so every SQL statement executed
+	// through the pool produces a child span (no-op when telemetry is
+	// disabled). No statement text is recorded (see pgxQueryTracer).
+	poolCfg.ConnConfig.Tracer = &pgxQueryTracer{database: cfg.Database}
 
 	var pool *pgxpool.Pool
 	connectErr := util.RetryWithBackoff(ctx, retryOpts, func(ctx context.Context) error {
@@ -789,8 +819,12 @@ func (c *pgxClient) Ping(ctx context.Context) error {
 	return c.pool.Ping(ctx)
 }
 
-// Close closes the database connection pool.
+// Close closes the database connection pool and unregisters the pool stats
+// provider so a closed pool is never sampled on a metrics scrape.
 func (c *pgxClient) Close() {
+	if c.unregisterPoolStats != nil {
+		c.unregisterPoolStats()
+	}
 	c.pool.Close()
 }
 
@@ -1160,12 +1194,26 @@ func (c *pgxClient) GetReplicationLag(ctx context.Context) (int64, error) {
 }
 
 // PromoteStandby promotes the standby to primary.
-func (c *pgxClient) PromoteStandby(ctx context.Context) error {
-	if _, err := c.pool.Exec(ctx, "SELECT pg_promote()"); err != nil {
+func (c *pgxClient) PromoteStandby(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "PromoteStandby")
+	defer func() { end(err) }()
+
+	if _, err = c.pool.Exec(ctx, "SELECT pg_promote()"); err != nil {
 		return fmt.Errorf("promoting standby: %w", err)
 	}
 	c.logger.Info("standby promoted to primary")
 	return nil
+}
+
+// GetMaxConnections returns the server's max_connections setting from
+// pg_settings. Used to publish the real cloudberry_connections_max gauge.
+func (c *pgxClient) GetMaxConnections(ctx context.Context) (int32, error) {
+	var maxConns int32
+	query := `SELECT setting::int FROM pg_settings WHERE name = 'max_connections'`
+	if err := c.pool.QueryRow(ctx, query).Scan(&maxConns); err != nil {
+		return 0, fmt.Errorf("querying max_connections: %w", err)
+	}
+	return maxConns, nil
 }
 
 // GetActiveQueryCount returns the number of active, queued, and blocked queries.
@@ -1784,7 +1832,10 @@ func (c *pgxClient) GetUsageReport(ctx context.Context, month string) ([]UsageRe
 // In a real Cloudberry cluster, this would invoke gpinitstandby or gpaddmirrors.
 // The current implementation logs the intent and returns nil, as the actual
 // initialization is orchestrated by the Cloudberry utilities running inside the pods.
-func (c *pgxClient) InitializeMirrors(ctx context.Context, opts MirrorInitOptions) error {
+func (c *pgxClient) InitializeMirrors(ctx context.Context, opts MirrorInitOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "InitializeMirrors")
+	defer func() { end(err) }()
+
 	c.logger.Info("initializing mirrors",
 		"layout", opts.Layout,
 		"segmentCount", opts.SegmentCount,
@@ -1931,7 +1982,10 @@ func (c *pgxClient) LogRotate(ctx context.Context) error {
 // RegisterNewSegments registers new primary and mirror segments in gp_segment_configuration.
 // It inserts entries for each new segment (from oldCount to newCount-1) with the appropriate
 // DBID, content ID, role, and FQDN derived from the headless service.
-func (c *pgxClient) RegisterNewSegments(ctx context.Context, opts SegmentRegistrationOptions) error {
+func (c *pgxClient) RegisterNewSegments(ctx context.Context, opts SegmentRegistrationOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "RegisterNewSegments")
+	defer func() { end(err) }()
+
 	c.logger.Info("registering new segments",
 		"oldCount", opts.OldCount,
 		"newCount", opts.NewCount,
@@ -2088,7 +2142,10 @@ func (c *pgxClient) propagateDatabasesToNewSegments(ctx context.Context, opts Se
 // RedistributeData redistributes existing tables across all segments (including new ones).
 // It lists all user databases and for each one, re-applies the distribution policy on all
 // user tables, which forces Cloudberry to redistribute the data across all segments.
-func (c *pgxClient) RedistributeData(ctx context.Context, opts RedistributionOptions) error {
+func (c *pgxClient) RedistributeData(ctx context.Context, opts RedistributionOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "RedistributeData")
+	defer func() { end(err) }()
+
 	c.logger.Info("starting data redistribution",
 		"database", opts.Database,
 		"excludeTables", opts.ExcludeTables,
@@ -2284,7 +2341,10 @@ func (c *pgxClient) GetRedistributionProgress(ctx context.Context) (int32, error
 // DeregisterSegments removes segment entries from gp_segment_configuration
 // for segments with content IDs >= newCount. This is called during scale-in
 // after data has been moved off the segments being removed.
-func (c *pgxClient) DeregisterSegments(ctx context.Context, newCount int32) error {
+func (c *pgxClient) DeregisterSegments(ctx context.Context, newCount int32) (err error) {
+	ctx, end := c.startOperation(ctx, "DeregisterSegments")
+	defer func() { end(err) }()
+
 	c.logger.Info("deregistering segments", "newCount", newCount)
 
 	if err := c.Ping(ctx); err != nil {
@@ -2324,7 +2384,13 @@ func (c *pgxClient) DeregisterSegments(ctx context.Context, newCount int32) erro
 //     from segments >= newCount to segments 0..newCount-1.
 //
 // After redistribution, the segments being removed will have no user data.
-func (c *pgxClient) RedistributeBeforeScaleIn(ctx context.Context, opts ScaleInRedistributionOptions) error {
+func (c *pgxClient) RedistributeBeforeScaleIn(
+	ctx context.Context,
+	opts ScaleInRedistributionOptions,
+) (err error) {
+	ctx, end := c.startOperation(ctx, "RedistributeBeforeScaleIn")
+	defer func() { end(err) }()
+
 	c.logger.Info("starting pre-scale-in redistribution",
 		"newCount", opts.NewCount,
 		"database", opts.Database,
@@ -2565,7 +2631,13 @@ func (c *pgxClient) updateNumsegments(
 // AnalyzeSkew analyzes data skew across segments for all user tables in a database.
 // It calculates the skew coefficient per table: (max_rows - avg_rows) / avg_rows * 100.
 // A coefficient of 0 means perfectly balanced; 100 means all data is on one segment.
-func (c *pgxClient) AnalyzeSkew(ctx context.Context, database string) ([]TableSkewInfo, error) {
+func (c *pgxClient) AnalyzeSkew(
+	ctx context.Context,
+	database string,
+) (result []TableSkewInfo, err error) {
+	ctx, end := c.startOperation(ctx, "AnalyzeSkew")
+	defer func() { end(err) }()
+
 	c.logger.Info("analyzing data skew", "database", database)
 
 	if err := c.Ping(ctx); err != nil {
@@ -2675,7 +2747,13 @@ func (c *pgxClient) AnalyzeSkew(ctx context.Context, database string) ([]TableSk
 
 // RebalanceTable redistributes a single table across all segments using REORGANIZE=TRUE.
 // If distKey is empty, the table is redistributed randomly.
-func (c *pgxClient) RebalanceTable(ctx context.Context, database, schema, table, distKey string) error {
+func (c *pgxClient) RebalanceTable(
+	ctx context.Context,
+	database, schema, table, distKey string,
+) (err error) {
+	ctx, end := c.startOperation(ctx, "RebalanceTable")
+	defer func() { end(err) }()
+
 	c.logger.Info("rebalancing table",
 		"database", database, "schema", schema, "table", table, "distKey", distKey)
 
@@ -2727,12 +2805,15 @@ func (c *pgxClient) RebalanceTable(ctx context.Context, database, schema, table,
 // SetupExporterRole creates the cloudberry_exporter database role with LOGIN privilege,
 // grants pg_monitor membership, and grants SELECT on monitoring views.
 // The operation is idempotent: if the role already exists, its password is updated.
-func (c *pgxClient) SetupExporterRole(ctx context.Context, password string) error {
+func (c *pgxClient) SetupExporterRole(ctx context.Context, password string) (err error) {
+	ctx, end := c.startOperation(ctx, "SetupExporterRole")
+	defer func() { end(err) }()
+
 	roleName := "cloudberry_exporter"
 
 	// Check if role exists.
 	var exists bool
-	err := c.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", roleName).Scan(&exists)
+	err = c.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", roleName).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("checking exporter role existence: %w", err)
 	}

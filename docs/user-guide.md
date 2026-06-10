@@ -145,6 +145,7 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Rebalance Configuration](#rebalance-configuration)
   - [Triggering a Rebalance](#triggering-a-rebalance)
   - [Monitoring Rebalance Status](#monitoring-rebalance-status)
+  - [Rebalance Execution and Fallback Job Tracking](#rebalance-execution-and-fallback-job-tracking)
   - [Rebalance Events and Conditions](#rebalance-events-and-conditions)
   - [Rebalance Metrics](#rebalance-metrics)
 - [Test Data Setup](#test-data-setup)
@@ -741,12 +742,14 @@ The backup Job:
 - **Labels**: `avsoft.io/cluster={cluster}`, `avsoft.io/operation=backup-on-delete`
 - **Properties**: Same as other maintenance Jobs (`BackoffLimit=1`, `TTLSecondsAfterFinished=3600`)
 
+> **Deletion waits for the backup**: with `backupOnDelete: true` **and** `deletionPolicy: Delete`, the operator does **not** delete the PVCs until the backup-on-delete Job reaches a terminal state — deleting the data volumes while the backup is still running would destroy the very recovery point being created. The wait is bounded by a **30-minute timeout** so a stuck backup Job can never wedge cluster deletion: on timeout (or a Failed Job) the operator emits a `BackupOnDeleteFailed` Warning event and proceeds with deletion anyway. Terminal outcomes are recorded on `cloudberry_backup_on_delete_total{cluster,namespace,result}` (`result=completed|failed`).
+
 #### Deletion Flow
 
 The operator processes deletion in the following order:
 
 1. **Phase transition**: Sets the cluster phase to `Deleting` and emits a `Deleting` event
-2. **Backup** (if `backupOnDelete: true`): Creates a backup maintenance Job and emits a `BackupOnDelete` event
+2. **Backup** (if `backupOnDelete: true`): Creates a backup maintenance Job and emits a `BackupOnDelete` event. With `deletionPolicy: Delete`, the operator waits (up to 30 minutes) for the Job to finish and emits `BackupOnDeleteCompleted` or `BackupOnDeleteFailed`
 3. **PVC cleanup**: Based on the `deletionPolicy`:
    - **Retain**: PVCs are preserved; emits a `PVCsRetained` event
    - **Delete**: All cluster PVCs are deleted; emits a `PVCsDeleted` event
@@ -759,6 +762,8 @@ The operator processes deletion in the following order:
 |-------|------|-------------|
 | `Deleting` | Normal | Cluster deletion initiated, phase set to `Deleting` |
 | `BackupOnDelete` | Normal | Backup triggered before deletion (when `backupOnDelete: true`) |
+| `BackupOnDeleteCompleted` | Normal | Backup-on-delete Job finished successfully (PVC deletion may proceed) |
+| `BackupOnDeleteFailed` | Warning | Backup-on-delete Job failed or timed out (30 min); deletion proceeds anyway |
 | `PVCsRetained` | Normal | PVCs preserved (when `deletionPolicy: Retain`) |
 | `PVCsDeleted` | Normal | All PVCs deleted (when `deletionPolicy: Delete`) |
 | `Deleted` | Normal | Cluster deletion completed, finalizer removed |
@@ -791,6 +796,10 @@ If the cluster does not have a finalizer (e.g., it was removed manually), Kubern
 ## Backup and Restore to S3
 
 The operator backs up Cloudberry databases to S3-compatible storage (AWS S3 or MinIO) using the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`). Enable backups by adding a `backup` block to the cluster spec; S3 credentials are sourced from either a Kubernetes Secret or HashiCorp Vault. See [Specification 11: Backup and Restore](../specifications/11-backup-restore-spec.md) for the full CRD schema and reconciliation logic.
+
+> **Backup image requirement**: `backup.image` must be a **backup-capable** image — it must contain `kubectl` (the backup/restore Jobs `kubectl exec` `gpbackup`/`gprestore` into the coordinator pod, the coordinator-exec model) **and** the `gpbackup`/`gprestore`/`gpbackup_s3_plugin` toolchain (e.g. `cloudberry-backup:2.1.0`, built from `Dockerfile.cloudberry-backup`). The base database image is NOT sufficient. When `backup.image` is unset, the mutating webhook defaults it to the official backup image.
+
+> **Restore statistics default**: restores do **not** restore planner statistics by default (`gprestore.withStats` defaults to `false`). A known upstream `gpbackup` bug (invalid `bigint` in `statistics.sql`) makes `gprestore` exit with code **2** when only the statistics restore fails while the data restore succeeded. When statistics restore **is** explicitly requested (`withStats: true`) and `gprestore` exits with code 2, the operator treats the restore as **success-with-warning**: the Job succeeds, a `RestorePartial` Warning Event is emitted, and the `cloudberry_restore_total` metric records the result label `partial`. To get fresh statistics after a restore, prefer `runAnalyze: true`.
 
 ### Scenario 71 — Enable Backup with Full S3 Configuration
 
@@ -3022,11 +3031,23 @@ Vault PKI issues certificates with the following fields:
 
 **Certificate rotation**: Certificates are automatically rotated when 2/3 of their lifetime has elapsed. The rotation check runs every 12 hours. After rotation, the new CA bundle is injected into the webhook configurations.
 
-> **Note**: `webhook.certSource: vault-pki` only governs the operator's own admission **webhook** certificate. The cluster TLS Secret referenced by `auth.ssl.certSecret` is a separate `kubernetes.io/tls`/generic Secret that you create yourself — see [Issuing the cluster TLS Secret from Vault PKI](#issuing-the-cluster-tls-secret-from-vault-pki).
+> **Note**: `webhook.certSource: vault-pki` only governs the operator's own admission **webhook** certificate. The cluster TLS Secret referenced by `auth.ssl.certSecret` is either **auto-issued by the operator** (see below) or a `kubernetes.io/tls`/generic Secret that you create yourself — see [Issuing the cluster TLS Secret from Vault PKI](#issuing-the-cluster-tls-secret-from-vault-pki).
+
+#### Automatic cluster TLS issuance from Vault PKI
+
+When a cluster CR has **both** `vault.enabled: true` and `auth.ssl.enabled: true` with a named `certSecret`, and the referenced Secret does **not** exist, the operator auto-issues a server certificate from the same Vault PKI mount/role used for its webhook certificates (`vaultPKI.mountPath`/`vaultPKI.role` in the Helm values) and creates the Secret itself:
+
+- The Secret is a **generic (Opaque)** Secret carrying `tls.crt`, `tls.key` **and** `ca.crt` (the `init-tls` container requires `ca.crt`; a bare `kubernetes.io/tls` Secret lacks it).
+- The certificate Common Name is `<cluster>.<namespace>.svc.cluster.local`, with DNS SANs covering the coordinator/standby/segment headless Services (including `*.<svc>` wildcards for per-pod FQDNs) and the client Service.
+- Operator-issued certificates are **renewed during reconcile** once 2/3 of their lifetime has elapsed (the same rotation policy as webhook certs).
+- A Secret that **already exists** (user-provided) is **never modified** by the operator.
+- Observability: `cloudberry_cluster_cert_issuance_total{cluster,namespace,result}` counts issuances/renewals, the `controller.clusterTLS` span traces the reconcile step, and `ClusterTLSIssued` / `ClusterTLSRenewed` / `ClusterTLSFailed` Events are emitted on the cluster.
+
+The Vault PKI role must permit the cluster DNS SANs (including wildcard subdomains, e.g. `allowed_domains="svc.cluster.local" allow_subdomains=true allow_glob_domains=true`).
 
 #### Issuing the cluster TLS Secret from Vault PKI
 
-The cluster TLS Secret (the one referenced by `auth.ssl.certSecret`) can be issued from the same Vault PKI role that the operator uses for its webhook certificate (`pki/roles/cloudberry-operator`). The `scenario67-ha-mirroring-vault-pki.yaml` sample uses this approach, referencing a Secret named `scenario67-tls`.
+Alternatively, the cluster TLS Secret (the one referenced by `auth.ssl.certSecret`) can be issued **manually** from the same Vault PKI role that the operator uses for its webhook certificate (`pki/roles/cloudberry-operator`). The `scenario67-ha-mirroring-vault-pki.yaml` sample uses this approach, referencing a Secret named `scenario67-tls`.
 
 1. **Issue a certificate** from the Vault PKI role and capture the PEM material:
 
@@ -3603,6 +3624,8 @@ After a successful failover:
 
 After failover, you should recover the failed segment to restore full redundancy. Use the recovery annotation or CLI:
 
+> **Note**: automated segment recovery is **not implemented yet** — the request is acknowledged (annotation removed, `RecoveryNotImplemented` Warning event, `cloudberry_recovery_operations_total{result="noop"}`) without performing recovery work. Until it lands, recover failed segments manually (e.g. `gprecoverseg` inside the coordinator pod). See [Segment Recovery](#segment-recovery).
+
 ```bash
 # Incremental recovery (preferred when data is intact)
 cloudberry-ctl ha recovery start --cluster my-cluster --type incremental
@@ -3896,7 +3919,7 @@ cloudberry-ctl ha standby status --cluster my-cluster
 cloudberry-ctl ha standby activate --cluster my-cluster --confirm
 ```
 
-This promotes the standby to primary coordinator, updates Services to point to the new coordinator, and reconstructs state from replicated WAL.
+This **actually promotes** the standby coordinator via `PromoteStandby` (`pg_promote()`), with at-most-once semantics: the `activate-standby` action annotation is removed **before** the promotion is attempted, so a failed promotion is never silently retried with a duplicate promote — the failure is surfaced via the `StandbyReady` condition, a `CoordinatorFailover` Warning event, and `cloudberry_recovery_operations_total{type="standby-activation",result="failed"}`. A successful promotion records `result="completed"` and emits the `CoordinatorFailover completed` event. Activation requested on a cluster without an enabled standby is skipped honestly (a `CoordinatorFailover` Warning event reports the skip).
 
 #### Reinitializing Standby After Failover
 
@@ -3916,7 +3939,9 @@ cloudberry-ctl ha standby restore-roles --cluster my-cluster
 
 ### Segment Recovery
 
-When a primary segment fails, the operator automatically promotes its mirror. To recover the failed segment:
+> **Implementation status — segment recovery is not implemented yet.** The recovery API and CLI validate and accept the request (`202 Accepted`), but the operator currently only **acknowledges** the `avsoft.io/recovery` annotation: it removes the annotation, emits an explicit `RecoveryNotImplemented` Warning event, and records `cloudberry_recovery_operations_total{result="noop"}` — `result="completed"` only ever increments when real recovery work runs, so dashboards stay honest. No `gprecoverseg`-equivalent work is performed. (Standby coordinator **activation** is fully implemented — see [Activating Standby (Coordinator Failover)](#activating-standby-coordinator-failover).)
+
+When a primary segment fails, the operator automatically promotes its mirror. To request recovery of the failed segment:
 
 #### Incremental Recovery
 
@@ -5842,6 +5867,10 @@ kubectl get jobs -n cloudberry-test \
   -l avsoft.io/cluster=my-cluster,avsoft.io/operation=maintenance
 ```
 
+### Rebalance Execution and Fallback Job Tracking
+
+The operator first executes the rebalance **in-database** (redistributing tables directly through the coordinator). When the in-database path fails (e.g. the coordinator is unreachable), it falls back to a **rebalance Job** — and that Job is **tracked to its terminal state** rather than fire-and-forget: the operator records the Job name in the `avsoft.io/rebalance-job` annotation and observes it on subsequent reconciles. Success is only reported (`RebalanceCompleted` event, `cloudberry_scale_operations_total{operation="rebalance"}`) when the Job actually succeeds; a failed Job emits a Warning event and records `{operation="rebalance-failed"}` instead.
+
 ### Rebalance Events and Conditions
 
 The operator emits the following events during rebalance:
@@ -5849,7 +5878,7 @@ The operator emits the following events during rebalance:
 | Event | Type | Description |
 |-------|------|-------------|
 | `RebalanceStarted` | Normal | Rebalance operation initiated with configuration details |
-| `RebalanceCompleted` | Normal | Rebalance operation completed successfully |
+| `RebalanceCompleted` | Normal | Rebalance operation completed successfully (in-database, or fallback Job reached `Succeeded`) |
 
 The `DataRedistribution` status condition tracks rebalance progress:
 
@@ -5877,6 +5906,7 @@ The operator exposes the following metrics related to rebalance operations:
 | Metric | Type | Description |
 |--------|------|-------------|
 | `cloudberry_scale_operations_total{operation="rebalance"}` | Counter | Total number of rebalance operations completed |
+| `cloudberry_scale_operations_total{operation="rebalance-failed"}` | Counter | Rebalance operations that failed (in-database failure with a failed fallback Job) |
 | `cloudberry_data_skew_coefficient` | Gauge | Current data skew coefficient across segments (labels: `cluster`, `namespace`) |
 
 ```promql
@@ -6085,14 +6115,20 @@ sum(rate(cloudberry_reconcile_total{result="success"}[5m]))
 
 When OpenTelemetry tracing is enabled, the operator creates spans across its important code paths and records errors on those spans. This provides distributed tracing visibility into operator behavior. Tracing is **disabled by default** and is a no-op (the global no-op tracer) until enabled — see [OpenTelemetry Tracing](#opentelemetry-tracing) below for configuration.
 
+**Span naming is low-cardinality by design**: span names come from bounded sets (route templates, operation names, controller sub-reconciler names) — never from raw URL paths, cluster names, or PIDs, which would explode span-name cardinality in the tracing backend. High-cardinality values stay in span attributes (e.g. `http.target`).
+
 **Spans emitted:**
 
 - **Reconciliation loops** — one `Reconcile` span per controller (cluster, admin, HA, auth); `SetSpanError` is recorded on the admin/HA/auth error paths in addition to the cluster controller.
-- **Sub-reconcilers** — `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), and `recordTableBloatRatios` (admin).
-- **API requests** — the request tracing middleware opens a server span per request named `<METHOD> <path>` (e.g. `POST /clusters/foo/migrate`). The span status is set to `Error` on responses with HTTP status `>= 400`, and inbound trace context is propagated so cross-service traces continue.
+- **Controller sub-operations** — `controller.<operation>` spans for sub-reconcilers (e.g. `controller.clusterTLS` for cluster TLS auto-issuance, `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)), parented on the controller's `Reconcile` span.
+- **API requests** — the tracing middleware opens a server span per request that is **renamed after routing** to `<METHOD> <route template>` (e.g. `GET /api/v1alpha1/clusters/{name}`) — never the raw path; unmatched requests get the `<METHOD> unmatched` fallback. The raw path remains available as the `http.target` attribute. The span status is set to `Error` on responses with HTTP status `>= 400`, and inbound trace context is propagated so cross-service traces continue.
+- **Database operations** — `db.<operation>` spans for every `db.Client` method (bounded operation set), plus `db.query` for raw query instrumentation, nested under the calling controller/API span.
+- **Authentication** — `auth.authenticate` per authenticated request, with `auth.oidc.verify` (Bearer token verification) and `auth.oidc.userinfo` (UserInfo role-claim fetch) child spans; `auth.method`/`auth.result` attributes.
+- **Admission webhooks** — `webhook.validate` and `webhook.mutate` spans with the admission operation and a `webhook.allowed` attribute.
+- **Idle daemon** — `idle.scan` per scan cycle, with `idle.reconnect` span events on reconnect attempts.
 - **Migration** — `handleMigrate` with `migrate.validate` and `migrate.create` child spans.
 - **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, and `vault.WriteSecret`.
-- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning).
+- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning) and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`).
 
 **Error recording on spans:**
 
@@ -6297,16 +6333,16 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_reconcile_errors_total` | Counter | Reconciliation error count |
 | `cloudberry_reconcile_duration_seconds` | Histogram | Reconciliation duration |
 | `cloudberry_config_reload_total` | Counter | Configuration reload count |
-| `cloudberry_connections_max` | Gauge | Maximum configured connections |
+| `cloudberry_connections_max` | Gauge | Maximum allowed connections — the **real** `max_connections` value queried from `pg_settings` (no longer a hardcoded placeholder) |
 | `cloudberry_fts_probe_total` | Counter | Total FTS probes |
 | `cloudberry_fts_failover_total` | Counter | Total failovers |
 | `cloudberry_replication_lag_bytes` | Gauge | Replication lag per segment |
 | `cloudberry_mirroring_operations_total` | Counter | Total mirroring enable/disable operations (labels: `operation` = `enable`, `disable`) |
 | `cloudberry_connections_active` | Gauge | Active database connections |
-| `cloudberry_scale_operations_total` | Counter | Total scale operations (labels: `operation` = `scale-out`, `scale-in`, `rebalance`) |
+| `cloudberry_scale_operations_total` | Counter | Total scale operations (labels: `operation` = `scale-out`, `scale-in`, `scale-out-failed`, `rebalance`, `rebalance-failed`) |
 | `cloudberry_redistribution_progress` | Gauge | Data redistribution progress (0.0–1.0) |
 | `cloudberry_data_skew_coefficient` | Gauge | Data skew coefficient across segments |
-| `cloudberry_pvc_size_bytes` | Gauge | PVC size in bytes (labels: `cluster`, `namespace`, `component`) |
+| `cloudberry_pvc_size_bytes` | Gauge | PVC size in bytes (labels: `cluster`, `namespace`, `component`). Published in **steady state** on every reconcile from the cluster spec (not only on expansion), so the gauge survives operator restarts |
 | `cloudberry_resource_group_cpu_usage` | Gauge | CPU usage per resource group (labels: `cluster`, `namespace`, `group`) |
 | `cloudberry_resource_group_memory_usage` | Gauge | Memory usage per resource group (labels: `cluster`, `namespace`, `group`) |
 | `cloudberry_slow_queries_total` | Counter | Slow queries detected (labels: `cluster`, `namespace`) |
@@ -6327,6 +6363,46 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_table_bloat_ratio` | Gauge | Dead-tuple bloat ratio for the top-N most-bloated tables, populated from storage recommendation scans (labels: `cluster`, `namespace`, `table`) |
 | `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |
 
+### REST API Server Metrics
+
+Every REST API request is recorded by a metrics middleware. The `route` label is always the matched route **template** (e.g. `/api/v1alpha1/clusters/{name}`), never the raw URL path, keeping label cardinality bounded.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_api_requests_total` | Counter | `route`, `method`, `code` | REST API requests by route template, method, and HTTP status code |
+| `cloudberry_api_request_duration_seconds` | Histogram | `route`, `method` | REST API request duration |
+| `cloudberry_api_requests_in_flight` | Gauge | — | Requests currently being served |
+| `cloudberry_api_rate_limit_rejections_total` | Counter | `route` | Requests rejected by the per-IP rate limiter (HTTP 429) |
+| `cloudberry_migrate_operations_total` | Counter | `result` | Cross-cluster migrate operations (`started`/`error`) |
+| `cloudberry_api_cluster_operations_total` | Counter | `operation`, `result` | Cluster create/delete operations via the API |
+| `cloudberry_log_stream_sessions_total` | Counter | `result` | Backup-Job log streaming sessions (`success`/`error`) |
+| `cloudberry_log_stream_bytes_total` | Counter | — | Bytes streamed to log stream clients |
+| `cloudberry_oidc_discovery_total` | Counter | `result` | OIDC provider discovery attempts |
+| `cloudberry_auth_token_verify_duration_seconds` | Histogram | — | Bearer token verification latency (JWKS fetch + signature check) |
+| `cloudberry_session_terminations_total` | Counter | `cluster`, `namespace`, `result` | Session terminations requested via the API (`pg_terminate_backend`) |
+
+### Database Client Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_db_connect_total` | Counter | `cluster`, `namespace`, `result` | Database connection attempts per cluster |
+| `cloudberry_db_connect_duration_seconds` | Histogram | `cluster`, `namespace` | Connection establishment time (including retries) |
+| `cloudberry_db_query_duration_seconds` | Histogram | `operation` | Duration of database operations by `db.Client` method name (bounded set) |
+| `cloudberry_db_pool_acquired_conns` | Gauge | `cluster`, `namespace` | In-use connections in the pgx pool, sampled live on every scrape |
+| `cloudberry_db_pool_idle_conns` | Gauge | `cluster`, `namespace` | Idle pool connections, sampled live on every scrape |
+| `cloudberry_db_pool_max_conns` | Gauge | `cluster`, `namespace` | Configured pool maximum |
+
+### Idle Daemon and Controller Operation Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_idle_daemon_up` | Gauge | `cluster`, `namespace` | Idle-session daemon liveness (1 while the scan loop runs, 0 after stop/fatal exit) |
+| `cloudberry_idle_scan_failures_total` | Counter | `cluster`, `namespace` | Failed idle-session scan cycles |
+| `cloudberry_idle_reconnect_attempts_total` | Counter | `cluster`, `namespace`, `result` | Idle-daemon database reconnect attempts |
+| `cloudberry_storage_expansions_total` | Counter | `cluster`, `namespace`, `result` | PVC storage expansion attempts |
+| `cloudberry_backup_on_delete_total` | Counter | `cluster`, `namespace`, `result` | Terminal outcomes of backup-on-delete Jobs (`completed`/`failed`) |
+| `cloudberry_scale_phase_duration_seconds` | Histogram | `direction`, `phase` | Duration of each scale state-machine phase (`direction` = `out`/`in`) |
+
 ### Security and Lifecycle Metrics
 
 The operator records dedicated metrics for webhook/certificate rotation, Vault operations, admission decisions, and cluster lifecycle workflows (upgrades, rolling restarts, and recovery).
@@ -6335,12 +6411,13 @@ The operator records dedicated metrics for webhook/certificate rotation, Vault o
 |--------|------|--------|-------------|
 | `cloudberry_cert_rotation_total` | Counter | `component`, `source`, `result` | Webhook/cert TLS rotation events. `source` is `vault-pki` or `self-signed`; `result` is `success` or `error` |
 | `cloudberry_cert_expiry_seconds` | Gauge | `component` | Seconds until the certificate expires per component |
-| `cloudberry_vault_operations_total` | Counter | `operation`, `result` | Vault auth/read/write operations. `operation` is `auth`, `read`, or `write`; `result` is `success` or `error` |
+| `cloudberry_vault_operations_total` | Counter | `operation`, `result` | Vault operations. `operation` is `auth`, `read`, `write`, `renew` (background token renewal via the `LifetimeWatcher`), or `reauth` (re-login after a 401/403 or token expiry); `result` is `success` or `error` |
+| `cloudberry_cluster_cert_issuance_total` | Counter | `cluster`, `namespace`, `result` | CloudberryCluster server certificate issuances **and renewals** from Vault PKI (cluster TLS auto-issuance). `result` is `success` or `error` |
 | `cloudberry_vault_operation_duration_seconds` | Histogram | `operation` | Duration of Vault operations in seconds |
 | `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error`. Internal (non-validation) admission failures record the distinct `error` result instead of being bucketed as `denied` |
 | `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
 | `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
-| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; `result` is `started`, `completed`, or `failed` |
+| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Recovery operations. `type` is `incremental`, `full`, `differential`, or `standby-activation`; `result` is `started`, `completed`, `failed`, or `noop`. Segment recovery is not implemented yet, so segment recovery requests record `result="noop"`; standby activation records real `completed`/`failed` outcomes |
 
 **Useful PromQL queries:**
 
@@ -6394,7 +6471,7 @@ The operator reads its telemetry configuration from `TelemetryConfig` (config ke
 | `telemetry.sampling-rate` | `CLOUDBERRY_TELEMETRY_SAMPLING_RATE` | `1.0` | Trace sampling rate (0.0–1.0) |
 | `telemetry.service-name` | `CLOUDBERRY_TELEMETRY_SERVICE_NAME` | `cloudberry-operator` | `service.name` resource attribute applied to all spans |
 
-Traces include spans for reconciliation loops (all four controllers), sub-reconcilers (`reconcileBackup`, `runFTSProbe`, `handleFailover`), API requests (`<METHOD> <path>` server spans), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret`), and certificate provisioning (`EnsureCertificates`). See [Telemetry Spans](#telemetry-spans) for the full list.
+Traces include spans for reconciliation loops (all four controllers), controller sub-operations (`controller.*`), API requests (`<METHOD> <route template>` server spans), database operations (`db.*`), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret`), certificate provisioning (`EnsureCertificates`), and operator startup (`operator.*`). All span names are low-cardinality. See [Telemetry Spans](#telemetry-spans) for the full list.
 
 The **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) visualizes Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs. It is one of four dashboards (operator, exporters, node-metrics, otel) published by `test/monitoring/scripts/publish-dashboards.sh`.
 

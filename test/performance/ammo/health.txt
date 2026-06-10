@@ -1,6 +1,7 @@
 [Host: localhost:8190]
 [Connection: keep-alive]
 [User-Agent: yandex-tank/perftest]
+[Authorization: Basic b3BlcmF0b3JfdXNlcjpvcGVyYXRvcl9wYXNz]
 /healthz
 /readyz
 /healthz

@@ -188,9 +188,9 @@ The following commands are fully implemented and communicate with the operator R
 - `inspect disk-usage`, `inspect skew`, `inspect bloat`, `inspect missing-stats`, `inspect connections`, `inspect locks`
 - `resource-group list`, `resource-group create`, `resource-group delete`, `resource-group assign`
 
-- `auth login` (basic and OIDC with credentials), `auth status`, `auth logout`
+- `auth login` (basic, OIDC with credentials, and the browser-based OIDC Authorization Code flow with PKCE), `auth status`, `auth logout`
 
-All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth login` (browser-based OIDC flow), `auth rotate-password`, `auth roles *`, `resource-group update`, `inspect logs`, and `maintenance check-catalog/jobs`.
+All other commands are **stub commands** that return a `"command %q is not yet implemented"` error with a non-zero exit code. This includes commands such as `cluster upgrade`, `config reset`, `config hba *`, `ha mirroring enable/disable`, `ha recovery cancel`, `ha standby reinitialize/restore-roles`, `ha fts *`, `auth rotate-password`, `auth roles *`, `resource-group update`, `inspect logs`, and `maintenance check-catalog/jobs`. Note also that `ha recovery start` succeeds at the API level but the operator currently acknowledges segment recovery as a no-op — see [ha recovery start](#ha-recovery-start).
 
 > **Note**: Stub commands use the `notImplemented()` helper to return a consistent error message. They exit with code `1` (general error). This behavior is intentional — it prevents silent no-ops in automation scripts.
 
@@ -520,6 +520,8 @@ cloudberry-ctl ha mirroring disable --cluster my-cluster
 
 Start segment recovery.
 
+> **Implementation status**: segment recovery is **not implemented yet** in the operator. The command succeeds (the API validates and accepts the request), but the operator acknowledges the recovery annotation without performing recovery work — it emits a `RecoveryNotImplemented` Warning event and records `cloudberry_recovery_operations_total{result="noop"}`. See the [User Guide — Segment Recovery](user-guide.md#segment-recovery).
+
 ```bash
 # Incremental recovery
 cloudberry-ctl ha recovery start --cluster my-cluster --type incremental
@@ -609,7 +611,7 @@ cloudberry-ctl ha standby status --cluster my-cluster
 
 #### ha standby activate
 
-Activate the standby coordinator (manual failover).
+Activate the standby coordinator (manual failover). This performs a **real promotion** via `pg_promote()` (`PromoteStandby`) with at-most-once semantics — a failed promotion is surfaced via events/metrics and is never silently retried with a duplicate promote.
 
 ```bash
 cloudberry-ctl ha standby activate --cluster my-cluster --confirm
@@ -1361,12 +1363,14 @@ cloudberry-ctl auth login --username admin --password secret \
   --auth-method oidc --operator-url http://localhost:8090
 ```
 
-**OIDC browser flow**: When no credentials are provided, the browser-based authorization code flow with PKCE is invoked. This flow is not yet implemented and returns an error.
+**OIDC browser flow**: When no credentials are provided, the CLI runs the full browser-based Authorization Code flow with PKCE (S256): it generates the PKCE verifier/challenge and a CSRF state, starts a local callback server on `localhost:8085/callback`, opens the browser to the IdP authorization endpoint (falling back to printing the URL), waits for the callback, and exchanges the authorization code for tokens. PKCE is a **client-side** concern — the operator itself only verifies Bearer tokens.
 
 ```bash
-# OIDC login (browser flow — not yet implemented)
-cloudberry-ctl auth login --auth-method oidc
-# Error: command "auth login (browser-based OIDC flow)" is not yet implemented
+# OIDC login (browser flow with PKCE)
+cloudberry-ctl auth login --auth-method oidc \
+  --issuer-url http://localhost:8090/realms/test \
+  --client-id cloudberry-ctl
+# --issuer-url (or CLOUDBERRY_OIDC_ISSUER_URL) is required for the browser flow
 ```
 
 **Flags:**

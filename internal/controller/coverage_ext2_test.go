@@ -438,7 +438,7 @@ func TestClusterReconciler_Reconcile_WithScaleStateAnnotation(t *testing.T) {
 		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
 	})
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================
@@ -473,7 +473,7 @@ func TestClusterReconciler_CheckScaleProgress_WithScaleInState(t *testing.T) {
 
 	result, err := r.checkScaleProgress(context.Background(), cluster)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleProgress_WithScaleOutState(t *testing.T) {
@@ -504,7 +504,7 @@ func TestClusterReconciler_CheckScaleProgress_WithScaleOutState(t *testing.T) {
 
 	result, err := r.checkScaleProgress(context.Background(), cluster)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================
@@ -745,7 +745,7 @@ func TestClusterReconciler_ProcessScaleInCleanup_RetainPolicy(t *testing.T) {
 	state := &scaleInStateData{OldCount: 4, NewCount: 2, Phase: scaleInPhaseCleanup}
 	result, err := r.processScaleInCleanup(context.Background(), cluster, state)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================

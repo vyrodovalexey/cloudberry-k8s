@@ -162,6 +162,7 @@ type MockDBClient struct {
 	GetDiskUsageFunc                  func(ctx context.Context, database string) ([]db.DiskUsage, error)
 	GetReplicationLagFunc             func(ctx context.Context) (int64, error)
 	PromoteStandbyFunc                func(ctx context.Context) error
+	GetMaxConnectionsFunc             func(ctx context.Context) (int32, error)
 	GetActiveQueryCountFunc           func(ctx context.Context) (int32, int32, int32, error)
 	GetResourceGroupUsageFunc         func(ctx context.Context, group string) (float64, float64, error)
 	CreateResourceGroupFunc           func(ctx context.Context, opts db.ResourceGroupOptions) error
@@ -365,6 +366,14 @@ func (m *MockDBClient) PromoteStandby(ctx context.Context) error {
 		return m.PromoteStandbyFunc(ctx)
 	}
 	return nil
+}
+
+// GetMaxConnections implements db.Client.
+func (m *MockDBClient) GetMaxConnections(ctx context.Context) (int32, error) {
+	if m.GetMaxConnectionsFunc != nil {
+		return m.GetMaxConnectionsFunc(ctx)
+	}
+	return 100, nil
 }
 
 // GetActiveQueryCount implements db.Client.

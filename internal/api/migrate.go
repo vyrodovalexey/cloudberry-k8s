@@ -88,11 +88,22 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		telemetry.SetSpanError(createSpan, fmt.Errorf("creating migration job %q", migrationJob.Name))
 		createSpan.End()
 		telemetry.SetSpanError(span, fmt.Errorf("migration job creation failed"))
+		s.recordMigrate("error")
 		return
 	}
 	createSpan.End()
 
+	s.recordMigrate("started")
 	s.writeMigrateAccepted(w, clusters, timestamp, migrationJob)
+}
+
+// recordMigrate records a migrate operation outcome on the dedicated
+// cloudberry_migrate_operations_total counter (in addition to the proxied
+// backup/restore records emitted by writeMigrateAccepted). Nil-safe.
+func (s *Server) recordMigrate(result string) {
+	if s.metrics != nil {
+		s.metrics.RecordMigrateOperation(result)
+	}
 }
 
 // migrateJobOptions builds the single coordinated migration Job options. The
@@ -124,24 +135,24 @@ func migrateJobOptions(
 func (s *Server) decodeMigrateRequest(w http.ResponseWriter, r *http.Request) (*MigrateRequest, bool) {
 	var req MigrateRequest
 	if decErr := decodeOptionalJSON(r, &req); decErr != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, "invalid request body")
 		return nil, false
 	}
 	if req.SourceCluster == "" {
 		req.SourceCluster = r.PathValue("name")
 	}
 	if req.SourceCluster == "" || req.TargetCluster == "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"sourceCluster and targetCluster are required")
 		return nil, false
 	}
 	if req.SourceCluster == req.TargetCluster {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"sourceCluster and targetCluster must differ")
 		return nil, false
 	}
 	if req.Database != "" && !isValidIdentifier(req.Database) {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 			"invalid database identifier: "+req.Database)
 		return nil, false
 	}
@@ -169,7 +180,7 @@ func (s *Server) resolveMigrateClusters(
 	}
 
 	if msg := validateMigrateDestinations(source, target); msg != "" {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST", msg)
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest, msg)
 		return nil, false
 	}
 	return &migrateClusters{source: source, target: target}, true
@@ -230,7 +241,7 @@ func (s *Server) createMigrateJob(
 ) bool {
 	if createErr := s.k8sClient.Create(ctx, job); createErr != nil {
 		s.logger.Error("failed to create "+what+" job", "job", job.Name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create "+what+" job")
 		return false
 	}

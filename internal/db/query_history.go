@@ -152,7 +152,13 @@ func (c *pgxClient) InsertQueryHistory(ctx context.Context, entry *QueryHistoryE
 
 // GetQueryHistory searches query history with filters and pagination.
 // Returns the matching entries, total count, and any error.
-func (c *pgxClient) GetQueryHistory(ctx context.Context, filter QueryHistoryFilter) ([]QueryHistoryEntry, int, error) {
+func (c *pgxClient) GetQueryHistory(
+	ctx context.Context,
+	filter QueryHistoryFilter,
+) (result []QueryHistoryEntry, total int, err error) {
+	ctx, end := c.startOperation(ctx, "GetQueryHistory")
+	defer func() { end(err) }()
+
 	// Normalize pagination.
 	limit, offset := normalizePagination(filter.Limit, filter.Offset)
 
@@ -169,7 +175,6 @@ func (c *pgxClient) GetQueryHistory(ctx context.Context, filter QueryHistoryFilt
 
 	// Count total matching entries.
 	countQuery := "SELECT COUNT(*) FROM cloudberry_query_history" + whereClause
-	var total int
 	if scanErr := c.pool.QueryRow(ctx, countQuery, args...).Scan(&total); scanErr != nil {
 		return nil, 0, fmt.Errorf("counting query history entries: %w", scanErr)
 	}
@@ -234,7 +239,14 @@ func (c *pgxClient) GetQueryHistoryDetail(ctx context.Context, queryID string) (
 
 // ExportQueryHistoryCSV writes query history matching the filter as CSV to the writer.
 // It streams rows directly to the writer to avoid buffering the entire result set in memory.
-func (c *pgxClient) ExportQueryHistoryCSV(ctx context.Context, filter QueryHistoryFilter, w io.Writer) error {
+func (c *pgxClient) ExportQueryHistoryCSV(
+	ctx context.Context,
+	filter QueryHistoryFilter,
+	w io.Writer,
+) (err error) {
+	ctx, end := c.startOperation(ctx, "ExportQueryHistoryCSV")
+	defer func() { end(err) }()
+
 	// Build WHERE clause (no LIMIT/OFFSET for export — export all matching).
 	conditions, args, err := buildHistoryWhereClause(filter, c.logger)
 	if err != nil {
@@ -277,11 +289,13 @@ func (c *pgxClient) ExportQueryHistoryCSV(ctx context.Context, filter QueryHisto
 			return fmt.Errorf("scanning query history row for export: %w", scanErr)
 		}
 
+		// Free-text columns are guarded against spreadsheet formula injection
+		// (L-8); numeric/timestamp columns are generated locally and safe.
 		record := []string{
-			e.QueryID,
-			e.Username,
-			e.DatabaseName,
-			e.QueryText,
+			csvGuardFormula(e.QueryID),
+			csvGuardFormula(e.Username),
+			csvGuardFormula(e.DatabaseName),
+			csvGuardFormula(e.QueryText),
 			e.QueryStart.Format(time.RFC3339),
 			e.QueryEnd.Format(time.RFC3339),
 			strconv.FormatFloat(e.DurationMs, 'f', 2, 64),
@@ -289,7 +303,7 @@ func (c *pgxClient) ExportQueryHistoryCSV(ctx context.Context, filter QueryHisto
 			strconv.FormatFloat(e.CPUTimeMs, 'f', 2, 64),
 			strconv.FormatInt(e.MemoryBytes, 10),
 			strconv.FormatInt(e.SpillBytes, 10),
-			e.State,
+			csvGuardFormula(e.State),
 		}
 
 		if writeErr := csvWriter.Write(record); writeErr != nil {
@@ -313,15 +327,21 @@ func (c *pgxClient) ExportQueryHistoryCSV(ctx context.Context, filter QueryHisto
 
 // CleanupQueryHistory deletes query history entries older than the retention period.
 // Returns the number of deleted rows.
-func (c *pgxClient) CleanupQueryHistory(ctx context.Context, retention time.Duration) (int64, error) {
+func (c *pgxClient) CleanupQueryHistory(
+	ctx context.Context,
+	retention time.Duration,
+) (deleted int64, err error) {
+	ctx, end := c.startOperation(ctx, "CleanupQueryHistory")
+	defer func() { end(err) }()
+
 	cutoff := time.Now().Add(-retention)
 
-	result, err := c.pool.Exec(ctx, "DELETE FROM cloudberry_query_history WHERE created_at < $1", cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("cleaning up query history: %w", err)
+	result, execErr := c.pool.Exec(ctx, "DELETE FROM cloudberry_query_history WHERE created_at < $1", cutoff)
+	if execErr != nil {
+		return 0, fmt.Errorf("cleaning up query history: %w", execErr)
 	}
 
-	deleted := result.RowsAffected()
+	deleted = result.RowsAffected()
 	if c.recorder != nil {
 		c.recorder.RecordQueryHistoryRetentionCleanup(c.metricsCluster, c.metricsNamespace, deleted)
 		c.recordQueryHistorySize(ctx)
@@ -329,6 +349,21 @@ func (c *pgxClient) CleanupQueryHistory(ctx context.Context, retention time.Dura
 	c.logger.Info("query history cleanup completed",
 		"deleted", deleted, "retention", retention.String(), "cutoff", cutoff)
 	return deleted, nil
+}
+
+// csvGuardFormula neutralizes spreadsheet formula injection by prefixing
+// cells that start with a formula trigger character ('=', '+', '-', '@')
+// with a single quote so they render as text (L-8).
+func csvGuardFormula(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@':
+		return "'" + s
+	default:
+		return s
+	}
 }
 
 // recordQueryHistorySize computes the current on-disk size of the query history

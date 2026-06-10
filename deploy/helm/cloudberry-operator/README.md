@@ -95,6 +95,21 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set oidc.existingSecret=oidc-client-secret
 ```
 
+**With Vault AppRole authentication:**
+
+```bash
+helm install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace cloudberry-system \
+  --create-namespace \
+  --set vault.enabled=true \
+  --set vault.address=http://vault:8200 \
+  --set vault.authMethod=approle \
+  --set vault.roleID="$VAULT_ROLE_ID" \
+  --set vault.secretID="$VAULT_SECRET_ID"
+```
+
+The AppRole credentials are passed to the operator as `CLOUDBERRY_VAULT_ROLE_ID` / `CLOUDBERRY_VAULT_SECRET_ID`. Token renewal and re-authentication are automatic (background `LifetimeWatcher`).
+
 ## Configuration
 
 See [values.yaml](values.yaml) for the full list of configurable parameters.
@@ -111,8 +126,12 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `operator.leaderElection` | Enable leader election | `true` |
 | `operator.apiAddress` | REST API server bind address | `:8090` |
 | `operator.webhookEnabled` | Enable admission webhooks (requires TLS certs) | `false` |
+| `operator.enableTestUsers` | Seed well-known TEST users (`basic_user`/`opbasic_user`/`operator_user`) into the API credential store (sets `CLOUDBERRY_ENABLE_TEST_USERS=true`; the operator logs a WARN). **Test suites only — never enable in production, the credentials are publicly known** | `false` |
 | `env.CLOUDBERRY_API_ADMIN_PASSWORD` | Admin password for the operator REST API (auto-generated if not set) | (generated) |
 | `vault.enabled` | Enable Vault integration | `false` |
+| `vault.authMethod` | Vault auth method: `token`, `kubernetes`, or `approle` | `kubernetes` |
+| `vault.roleID` | Vault AppRole `role_id` (approle auth; sets `CLOUDBERRY_VAULT_ROLE_ID`) | `""` |
+| `vault.secretID` | Vault AppRole `secret_id` (approle auth; sets `CLOUDBERRY_VAULT_SECRET_ID` — prefer a Secret in production) | `""` |
 | `oidc.enabled` | Enable OIDC authentication | `false` |
 | `telemetry.enabled` | Enable OTLP telemetry | `false` |
 | `telemetry.otlpInsecure` | Disable TLS for OTLP exporter connections | `false` |
@@ -134,7 +153,13 @@ The following configuration options were added or updated in the latest release:
 |-----------|-------------|---------|
 | `operator.apiAddress` | Bind address for the REST API server used by `cloudberry-ctl` | `:8090` |
 | `operator.webhookEnabled` | Controls whether admission webhooks are registered at startup. Disable in development environments where webhook certificates are not available. This value is now included in the ConfigMap template for runtime access | `false` |
+| `operator.enableTestUsers` | Seed the publicly known TEST users into the API credential store (`CLOUDBERRY_ENABLE_TEST_USERS`). Test suites only | `false` |
+| `vault.roleID` / `vault.secretID` | Vault AppRole credentials for `vault.authMethod=approle` (rendered as `CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID` env vars) | `""` |
 | `telemetry.otlpInsecure` | When `true`, the OTLP exporter uses plaintext (non-TLS) connections. Use for local development with collectors that do not have TLS configured | `false` |
+
+**Configuration precedence** (highest wins): environment variable > command-line flag > config file > default. The environment always wins, even over an explicitly set flag.
+
+**Vault token lifecycle**: Vault token renewal and re-authentication are automatic — the operator runs a background Vault `LifetimeWatcher` that renews the login token before expiry and re-authenticates when the token can no longer be renewed (observable via `cloudberry_vault_operations_total{operation="renew"|"reauth"}`). No manual token rotation is required for `kubernetes` or `approle` auth.
 
 ### Webhook Configuration Notes
 
@@ -378,9 +403,11 @@ To use Vault PKI for webhook certificates:
    vault write pki/root/generate/internal \
      common_name="cloudberry-operator-ca" ttl=87600h
    vault write pki/roles/cloudberry-operator \
-     allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local" \
-     allow_subdomains=true max_ttl=8760h
+     allowed_domains="cloudberry-system.svc,cloudberry-system.svc.cluster.local,svc.cluster.local" \
+     allow_subdomains=true allow_glob_domains=true max_ttl=8760h
    ```
+
+   > The same PKI mount/role also backs **cluster TLS auto-issuance** (see below), whose certificates carry wildcard SANs for per-pod FQDNs (`*.<svc>.<ns>.svc.cluster.local`) — the role therefore needs both `allow_subdomains=true` and `allow_glob_domains=true`, and `allowed_domains` must cover the cluster Service domains.
 
 2. **Deploy** with Vault PKI:
 
@@ -402,6 +429,17 @@ To use Vault PKI for webhook certificates:
    kubectl get secret -n cloudberry-system -l app.kubernetes.io/component=webhook-certs
    kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
    ```
+
+### Cluster TLS Auto-Issuance from Vault PKI
+
+When a `CloudberryCluster` enables both `spec.vault.enabled: true` and `spec.auth.ssl.enabled: true` with a named `certSecret` that does **not** exist, the operator auto-issues the cluster server certificate from the same Vault PKI mount/role configured for webhook certificates (`webhook.vaultPKI.mountPath`/`webhook.vaultPKI.role`) and creates the Secret itself:
+
+- The Secret is **generic (Opaque)** with `tls.crt`, `tls.key`, **and** `ca.crt` (the cluster's `init-tls` container requires the CA)
+- Operator-issued certificates are renewed in place once 2/3 of their lifetime has elapsed
+- A pre-existing (user-provided) Secret is **never modified**
+- Events `ClusterTLSIssued`/`ClusterTLSRenewed`/`ClusterTLSFailed` and the metric `cloudberry_cluster_cert_issuance_total{cluster,namespace,result}` report the outcomes
+
+See the [User Guide](../../docs/user-guide.md#automatic-cluster-tls-issuance-from-vault-pki) for details.
 
 > **Vault Kubernetes Auth (docker-desktop) — `kubernetes.docker.internal` gotcha**: When the operator authenticates to Vault with `vault.authMethod=kubernetes` on Docker Desktop, the Vault Kubernetes auth backend must be configured with `kubernetes_host=https://kubernetes.docker.internal:6443` — **not** `host.docker.internal`. The Docker Desktop API-server serving certificate includes only `kubernetes.docker.internal` in its SANs; using `host.docker.internal` makes Vault's `TokenReview` TLS hostname verification fail, and operator login returns `403 permission denied`. In the bundled test environment, this is handled by `test/docker-compose/scripts/setup-vault-k8s-auth.sh` (run via `make test-env-setup`); deploy the operator into `cloudberry-test` with `make helm-install-test`. See the [Installation Guide](../../docs/installation.md#vault-pki-with-kubernetes-auth-on-docker-desktop-make-targets) for the full flow.
 
@@ -465,10 +503,14 @@ The operator exposes metrics at `/metrics` on port 8080, including:
 - Cluster health (`cloudberry_cluster_info`, `cloudberry_coordinator_up`)
 - Reconciliation performance (`cloudberry_reconcile_duration_seconds`)
 - FTS probing (`cloudberry_fts_probe_total`, `cloudberry_fts_failover_total`)
-- Scale operations (`cloudberry_scale_operations_total`)
-- PVC sizes (`cloudberry_pvc_size_bytes`)
+- Scale operations (`cloudberry_scale_operations_total`, including `rebalance`/`rebalance-failed`)
+- PVC sizes (`cloudberry_pvc_size_bytes`, published in steady state on every reconcile)
+- REST API server (`cloudberry_api_requests_total`/`_duration_seconds`/`_in_flight`, `cloudberry_api_rate_limit_rejections_total` — all labelled by route template)
+- Database client (`cloudberry_db_connect_*`, `cloudberry_db_query_duration_seconds`, `cloudberry_db_pool_acquired/idle/max_conns`)
+- Idle daemon and sessions (`cloudberry_idle_daemon_up`, `cloudberry_idle_scan_failures_total`, `cloudberry_session_terminations_total`)
+- Security and lifecycle (`cloudberry_cert_rotation_total`, `cloudberry_cluster_cert_issuance_total`, `cloudberry_vault_operations_total` incl. `renew`/`reauth`, `cloudberry_backup_on_delete_total`, `cloudberry_scale_phase_duration_seconds`)
 
-Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory.
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory (operator, exporters, node-metrics, and OTel dashboards). The test monitoring stack charts (vmagent, vector, otel-collector, node-exporter) live under `test/monitoring/`.
 
 ### Distributed Tracing (OpenTelemetry)
 
@@ -484,7 +526,7 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set telemetry.otlpInsecure=true
 ```
 
-The operator emits spans for reconciliation loops, API request handling, database operations, and Vault interactions.
+The operator emits spans for reconciliation loops (`Reconcile`, `controller.*`), API request handling (server spans named by route template, e.g. `GET /api/v1alpha1/clusters/{name}`), database operations (`db.*`), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), Vault interactions (`vault.*`), and operator startup (`operator.*`). Span names are low-cardinality by design (bounded sets — never raw URL paths or cluster names).
 
 ### Monitoring Configuration Values
 

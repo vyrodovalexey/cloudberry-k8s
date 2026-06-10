@@ -397,8 +397,11 @@ func TestOperatorClient_ConnectionError(t *testing.T) {
 }
 
 func TestOperatorClient_ContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(5 * time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block on the request context instead of sleeping: the canceled
+		// client unblocks the handler instantly, so neither the test nor
+		// server.Close() waits out a fixed 5s delay.
+		<-r.Context().Done()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()

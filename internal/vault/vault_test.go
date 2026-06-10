@@ -749,13 +749,20 @@ func TestVaultClient_IsEnabled(t *testing.T) {
 }
 
 func TestVaultClient_ReadSecret_ContextCancelled(t *testing.T) {
+	// unblock releases the handler after the client has timed out, replacing
+	// the previous fixed 5s sleep: teardown is instant and deterministic.
+	unblock := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(5 * time.Second)
+	mux.HandleFunc("/v1/secret/data/test", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
+	defer close(unblock)
 
 	cfg := Config{
 		Enabled:    true,
@@ -905,13 +912,20 @@ func TestVaultClient_ReadSecret_ServerError(t *testing.T) {
 }
 
 func TestVaultClient_WriteSecret_ContextCancelled(t *testing.T) {
+	// unblock releases the handler after the client has timed out (see
+	// TestVaultClient_ReadSecret_ContextCancelled): instant teardown.
+	unblock := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/secret/data/slow", func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(5 * time.Second)
+	mux.HandleFunc("/v1/secret/data/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
+	defer close(unblock)
 
 	cfg := Config{
 		Enabled:    true,

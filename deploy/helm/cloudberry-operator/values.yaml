@@ -101,6 +101,9 @@ operator:
   healthProbeAddress: ":8081"
   # -- Webhook server port
   webhookPort: 9443
+  # -- Enable test users (basic_user, opbasic_user, operator_user) for e2e tests.
+  # -- NEVER enable in production — credentials are publicly known.
+  enableTestUsers: false
 
 # =============================================================================
 # REST API Configuration
@@ -127,6 +130,10 @@ vault:
   role: cloudberry-operator
   # -- Vault token (for token auth method only; use existingSecret in production)
   token: ""
+  # -- Vault AppRole role_id (for approle auth method)
+  roleID: ""
+  # -- Vault AppRole secret_id (for approle auth method; use existingSecret in production)
+  secretID: ""
   # -- Vault secret path
   secretPath: secret/data/cloudberry
   # -- Vault TLS secret name

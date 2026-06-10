@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -70,10 +70,6 @@ const (
 	// retentionDeletedMarker); the controller parses it to patch the
 	// avsoft.io/backup-retention-deleted annotation.
 	retentionDeletedMarkerPrefix = "RETENTION_DELETED="
-
-	// backupTimestampLayout is the gpbackup-style YYYYMMDDHHMMSS timestamp layout,
-	// used to derive a valid 14-digit timestamp for CronJob-spawned backup Jobs.
-	backupTimestampLayout = "20060102150405"
 
 	// Human-readable backup Job statuses recorded in cluster.Status.LastBackupStatus
 	// and the BackupHistory entries.
@@ -136,6 +132,7 @@ type rollingRestartState struct {
 
 // AdminReconciler reconciles the administration aspects of a CloudberryCluster.
 type AdminReconciler struct {
+	reconcileIntervals
 	client    client.Client
 	scheme    *runtime.Scheme
 	recorder  record.EventRecorder
@@ -149,9 +146,12 @@ type AdminReconciler struct {
 	// configParams tracks the last known config parameters per cluster for diff-based
 	// change classification. Keyed by "namespace/name", value is map[string]string.
 	configParams sync.Map
-	// idleDaemon is the idle session enforcement daemon, started when idle rules are present.
-	idleDaemon *idle.Daemon
-	// idleDaemonMu protects idleDaemon access.
+	// idleDaemons holds one idle-session enforcement daemon per cluster,
+	// keyed by namespace/name. A per-cluster daemon keeps rules, DB
+	// connection and metric labels correct when multiple CloudberryClusters
+	// define idle rules (a single shared daemon would mix them up).
+	idleDaemons map[types.NamespacedName]*idleDaemonEntry
+	// idleDaemonMu protects idleDaemons access.
 	idleDaemonMu sync.Mutex
 	// vault is an optional Vault client used to source backup S3 credentials from
 	// a Vault path (spec.backup.destination.s3.vaultSecret). It may be nil; when
@@ -220,6 +220,9 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 	if err = r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug("cluster not found, skipping reconciliation")
+			// The cluster was deleted: stop its idle daemon (if any) so the
+			// enforcement goroutine and its DB connection are not leaked.
+			r.stopIdleDaemonFor(req.NamespacedName)
 			err = nil
 			return ctrl.Result{}, nil
 		}
@@ -275,7 +278,7 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // isExporterRoleReady returns true if the exporter role is already set up
@@ -314,7 +317,7 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseRunning {
 		logger.Debug("cluster not running, deferring admin reconciliation",
 			"phase", cluster.Status.Phase)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, true, nil
 	}
 
 	// Skip full reconciliation if only status changed (ObservedGeneration matches),
@@ -330,7 +333,7 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 		// reaches steady state, backup status would never be populated after a
 		// scheduled/on-demand backup Job succeeds.
 		r.refreshBackupStatusOnSteadyState(ctx, cluster)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, true, nil
 	}
 
 	// Handle maintenance annotations.
@@ -500,7 +503,10 @@ func (r *AdminReconciler) reconcileSubComponents(
 func (r *AdminReconciler) reconcileWorkload(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileWorkload")
+	defer func() { end(err) }()
+
 	if cluster.Spec.Workload == nil || !cluster.Spec.Workload.Enabled {
 		return r.cleanupWorkload(ctx, cluster)
 	}
@@ -920,8 +926,9 @@ func (r *AdminReconciler) cleanupWorkload(
 		return fmt.Errorf("deleting workload-rules ConfigMap: %w", err)
 	}
 
-	// 3. Stop idle daemon if running.
-	r.stopIdleDaemon()
+	// 3. Stop this cluster's idle daemon if running (other clusters' daemons
+	// keep enforcing their own rules).
+	r.stopIdleDaemonFor(types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace})
 
 	// 4. Update condition.
 	cluster.Status.Conditions = util.SetCondition(
@@ -996,25 +1003,41 @@ func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
 	return nil
 }
 
-// stopIdleDaemon stops the idle session daemon if it is running.
-func (r *AdminReconciler) stopIdleDaemon() {
-	r.idleDaemonMu.Lock()
-	defer r.idleDaemonMu.Unlock()
+// idleDaemonEntry pairs a per-cluster idle daemon with its reconnect factory
+// so the factory's cluster snapshot can be refreshed on every reconcile.
+type idleDaemonEntry struct {
+	daemon  *idle.Daemon
+	factory *idleDaemonDBClientFactory
+}
 
-	if r.idleDaemon != nil {
-		r.idleDaemon.Stop()
-		r.idleDaemon = nil
+// stopIdleDaemonFor stops and removes the idle session daemon of the given
+// cluster if it is running. Used when the cluster's idle rules are removed or
+// the cluster itself is deleted; other clusters' daemons are untouched.
+func (r *AdminReconciler) stopIdleDaemonFor(key types.NamespacedName) {
+	r.idleDaemonMu.Lock()
+	entry := r.idleDaemons[key]
+	delete(r.idleDaemons, key)
+	r.idleDaemonMu.Unlock()
+
+	// Stop outside the lock: Stop blocks until the scan loop exits and must
+	// not stall daemon management for other clusters.
+	if entry != nil {
+		entry.daemon.Stop()
 	}
 }
 
-// startOrUpdateIdleDaemon starts the idle daemon if idle rules are present,
-// or updates the rules if the daemon is already running.
+// startOrUpdateIdleDaemon starts the cluster's idle daemon if idle rules are
+// present, or updates the rules if the daemon is already running. The
+// reconnect factory's cluster snapshot is refreshed on EVERY reconcile so
+// credential rotations or port changes propagate to daemon reconnects.
 func (r *AdminReconciler) startOrUpdateIdleDaemon(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) {
+	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
+
 	if len(cluster.Spec.Workload.IdleRules) == 0 {
-		r.stopIdleDaemon()
+		r.stopIdleDaemonFor(key)
 		return
 	}
 
@@ -1033,16 +1056,22 @@ func (r *AdminReconciler) startOrUpdateIdleDaemon(
 		}
 	}
 	if !hasEnabled {
-		r.stopIdleDaemon()
+		r.stopIdleDaemonFor(key)
 		return
 	}
 
 	r.idleDaemonMu.Lock()
 	defer r.idleDaemonMu.Unlock()
 
-	if r.idleDaemon != nil {
-		// Daemon already running — just update rules.
-		r.idleDaemon.UpdateRules(rules)
+	if r.idleDaemons == nil {
+		r.idleDaemons = make(map[types.NamespacedName]*idleDaemonEntry)
+	}
+
+	if entry, ok := r.idleDaemons[key]; ok {
+		// Daemon already running — update rules and refresh the factory's
+		// cluster snapshot so the next reconnect uses current spec/credentials.
+		entry.factory.setCluster(cluster.DeepCopy())
+		entry.daemon.UpdateRules(rules)
 		return
 	}
 
@@ -1083,19 +1112,33 @@ func (r *AdminReconciler) startOrUpdateIdleDaemon(
 
 	d.Start(ctx)
 	started = true
-	r.idleDaemon = d
+	r.idleDaemons[key] = &idleDaemonEntry{daemon: d, factory: daemonFactory}
 }
 
 // idleDaemonDBClientFactory adapts db.DBClientFactory to idle.DBClientFactory
 // so the idle daemon can reconnect to the database on connection failures.
+// The cluster snapshot is refreshed by the reconciler on every reconcile
+// (setCluster) so reconnects pick up rotated credentials or changed ports.
 type idleDaemonDBClientFactory struct {
 	dbFactory db.DBClientFactory
-	cluster   *cbv1alpha1.CloudberryCluster
+	// mu protects cluster (read by daemon reconnects, replaced by reconciles).
+	mu      sync.RWMutex
+	cluster *cbv1alpha1.CloudberryCluster
 }
 
-// NewClient creates a new database client using the stored cluster reference.
+// setCluster atomically replaces the cluster snapshot used for reconnects.
+func (f *idleDaemonDBClientFactory) setCluster(cluster *cbv1alpha1.CloudberryCluster) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cluster = cluster
+}
+
+// NewClient creates a new database client using the current cluster snapshot.
 func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (db.Client, error) {
-	return f.dbFactory.NewClient(ctx, f.cluster)
+	f.mu.RLock()
+	cluster := f.cluster
+	f.mu.RUnlock()
+	return f.dbFactory.NewClient(ctx, cluster)
 }
 
 // reconcileQueryMonitoring reconciles query monitoring configuration by creating
@@ -1106,10 +1149,13 @@ func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (db.Client, e
 func (r *AdminReconciler) reconcileQueryMonitoring(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
 	if cluster.Spec.QueryMonitoring == nil || !cluster.Spec.QueryMonitoring.Enabled {
 		return nil
 	}
+
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileQueryMonitoring")
+	defer func() { end(err) }()
 
 	logger := util.LoggerFromContext(ctx)
 	qm := cluster.Spec.QueryMonitoring
@@ -1434,6 +1480,15 @@ func (r *AdminReconciler) updateQueryStatusFromDB(
 	} else {
 		r.metrics.SetConnectionsActive(cluster.Name, cluster.Namespace, float64(len(sessions)))
 		r.recordSlowQueries(cluster, sessions)
+	}
+
+	// Publish the REAL max_connections value alongside the active connection
+	// count. On error the gauge is NOT written (it keeps its last sample) so
+	// dashboards never see a bogus 0 ceiling.
+	if maxConns, maxErr := dbClient.GetMaxConnections(dbCtx); maxErr != nil {
+		logger.Debug("failed to query max_connections; keeping last value", "error", maxErr)
+	} else {
+		r.metrics.SetConnectionsMax(cluster.Name, cluster.Namespace, float64(maxConns))
 	}
 }
 
@@ -1963,6 +2018,11 @@ func (r *AdminReconciler) refreshBackupStatus(
 	); err != nil {
 		return fmt.Errorf("listing backup jobs: %w", err)
 	}
+
+	// Annotate succeeded restore Jobs whose statistics restore failed (the
+	// GPRESTORE_PARTIAL termination marker) BEFORE metrics/status are derived,
+	// so the same reconcile already reports the "partial" result.
+	r.reconcileRestorePartialAnnotations(ctx, cluster, jobs.Items)
 
 	// Emit per-Job status metrics for every observed backup/restore/cleanup Job
 	// and record terminal metrics (restore duration, retention deletions) as Jobs
@@ -2617,7 +2677,7 @@ func (r *AdminReconciler) applyBackupJobToStatus(
 
 	operation := job.Labels[util.LabelBackupOperation]
 	if operation == util.BackupOperationRestore {
-		r.metrics.RecordRestore(cluster.Name, cluster.Namespace, strings.ToLower(status))
+		r.metrics.RecordRestore(cluster.Name, cluster.Namespace, restoreMetricStatus(job, status))
 		// Restore failures (e.g. gprestore refusing an incomplete incremental
 		// set, Scenario 78d) are surfaced as a distinct RestoreFailed Warning so
 		// they are observable. The backup-only BackupFailed event semantics
@@ -2736,9 +2796,6 @@ func backupJobSizeHuman(job *batchv1.Job) string {
 	return resource.NewQuantity(int64(bytes), resource.BinarySI).String()
 }
 
-// backupTimestampRegex validates a gpbackup-style YYYYMMDDHHMMSS (14-digit) timestamp.
-var backupTimestampRegex = regexp.MustCompile(`^\d{14}$`)
-
 // backupTimestampFromJob extracts a gpbackup-style 14-digit YYYYMMDDHHMMSS
 // timestamp for a backup/restore Job.
 //
@@ -2762,7 +2819,7 @@ func backupTimestampFromJob(cluster *cbv1alpha1.CloudberryCluster, job *batchv1.
 		// trailing hyphen of the empty-timestamp prefix, so the remainder keeps a
 		// leading "-" (e.g. "-20260101020000"); trim it before validating.
 		parsed := strings.TrimPrefix(strings.TrimPrefix(job.Name, prefix), "-")
-		if backupTimestampRegex.MatchString(parsed) {
+		if util.IsGpbackupTimestamp(parsed) {
 			return parsed
 		}
 	}
@@ -2778,9 +2835,9 @@ func backupTimestampFromJob(cluster *cbv1alpha1.CloudberryCluster, job *batchv1.
 func backupTimestampFromJobTimes(job *batchv1.Job) string {
 	switch {
 	case job.Status.CompletionTime != nil:
-		return job.Status.CompletionTime.UTC().Format(backupTimestampLayout)
+		return job.Status.CompletionTime.UTC().Format(util.GpbackupTimestampLayout)
 	case job.Status.StartTime != nil:
-		return job.Status.StartTime.UTC().Format(backupTimestampLayout)
+		return job.Status.StartTime.UTC().Format(util.GpbackupTimestampLayout)
 	default:
 		return ""
 	}
@@ -3237,7 +3294,13 @@ func (r *AdminReconciler) completePendingReload(
 // It classifies changed parameters into reload-safe (sighup) and restart-required
 // (postmaster) categories and triggers the appropriate action.
 // Additionally, it applies coordinator-only, database-specific, and role-specific parameters.
-func (r *AdminReconciler) reconcileConfig(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (r *AdminReconciler) reconcileConfig(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileConfig")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	if cluster.Spec.Config == nil {
@@ -3659,7 +3722,7 @@ func (r *AdminReconciler) completeRollingRestart(
 		fmt.Sprintf("Rolling restart completed for parameters: %s", strings.Join(state.RestartParams, ", ")))
 	r.metrics.RecordRollingRestart(cluster.Name, cluster.Namespace, "completed")
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // updateRestartAnnotation writes the updated rolling restart state back to the
@@ -3786,7 +3849,11 @@ func (r *AdminReconciler) handleMaintenance(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	maintenance string,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "handleMaintenance",
+		attribute.String("maintenance.operation", maintenance))
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling maintenance operation", "type", maintenance)
 
@@ -3824,13 +3891,13 @@ func (r *AdminReconciler) handleMaintenance(
 				fmt.Sprintf("Maintenance operation %s completed successfully", maintenance))
 			r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance, "success")
 			logger.Info("maintenance operation completed via DB client", "operation", maintenance)
-			return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+			return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 		}
 	}
 
 	// Fallback: create a maintenance Job for operations that failed via DB client
 	// or when the DB factory is not available.
-	timestamp := time.Now().Format("20060102-150405")
+	timestamp := time.Now().Format(util.BackupTimestampLayout)
 	job := r.builder.BuildMaintenanceJob(cluster, maintenance, timestamp)
 	if err := r.client.Create(ctx, job); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
@@ -3843,7 +3910,7 @@ func (r *AdminReconciler) handleMaintenance(
 		fmt.Sprintf("Maintenance operation %s initiated, job: %s", maintenance, job.Name))
 	r.metrics.RecordMaintenanceOperation(cluster.Name, cluster.Namespace, maintenance, "started")
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // executeMaintenanceViaDB executes a maintenance operation directly on the coordinator
