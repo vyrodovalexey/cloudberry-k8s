@@ -286,3 +286,14 @@ func TestGenerateRandomPassword_Uniqueness(t *testing.T) {
 		passwords[pw] = true
 	}
 }
+
+// TestIsGpbackupTimestamp verifies the shared 14-digit gpbackup timestamp
+// validator (L-2).
+func TestIsGpbackupTimestamp(t *testing.T) {
+	assert.True(t, IsGpbackupTimestamp("20260610023305"))
+	assert.False(t, IsGpbackupTimestamp("2026-06-10"))
+	assert.False(t, IsGpbackupTimestamp("2026061002330"))   // 13 digits
+	assert.False(t, IsGpbackupTimestamp("202606100233055")) // 15 digits
+	assert.False(t, IsGpbackupTimestamp(""))
+	assert.False(t, IsGpbackupTimestamp("2026061002330a"))
+}

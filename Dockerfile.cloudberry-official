@@ -179,6 +179,20 @@ RUN dnf -y install \
         lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
         pam perl procps-ng python3 readline rsync shadow-utils sqlite sqlite-libs sudo which zlib \
         zstd && \
+    dnf -y upgrade \
+      gnupg2 \
+      expat \
+      gnutls \
+      krb5-libs \
+      libarchive \
+      libbrotli \
+      libcap \
+      libnghttp2 \
+      libxml2 \
+      openssl \
+      vim-minimal \
+      openssl-libs \
+      pam && \
     dnf -y install "${CB_RPM_URL}" && \
     dnf clean all && rm -rf /var/cache/dnf
 

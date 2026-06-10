@@ -995,7 +995,7 @@ func TestClusterReconciler_UpdatePhase_Success(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 	assert.Equal(t, cbv1alpha1.ClusterPhasePending, cluster.Status.Phase)
 }
 
@@ -1062,7 +1062,7 @@ func TestClusterReconciler_HandleGenerationUnchanged_ScaleStateAnnotation_Restor
 
 	// Assert: should be handled (restores Scaling phase).
 	assert.True(t, result.handled)
-	assert.True(t, result.result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.result.RequeueAfter)
 }
 
 // ============================================================================
@@ -1090,7 +1090,7 @@ func TestClusterReconciler_Reconcile_PendingPhase(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // newTestRequest creates a ctrl.Request for the test cluster.

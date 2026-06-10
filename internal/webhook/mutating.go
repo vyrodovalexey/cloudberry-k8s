@@ -3,6 +3,9 @@ package webhook
 import (
 	"context"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -73,14 +76,40 @@ func NewCloudberryClusterDefaulter(recorder ...metrics.Recorder) *CloudberryClus
 }
 
 // Default sets defaults on a CloudberryCluster.
-func (d *CloudberryClusterDefaulter) Default(_ context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (d *CloudberryClusterDefaulter) Default(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+	// Record the ACTUAL admission operation (create/update, L-8) resolved
+	// from the admission request in the context, instead of bucketing every
+	// defaulting pass as a create. Defaulting never denies admission.
+	operation := admissionOperationFromContext(ctx)
+	_, end := startAdmissionSpan(ctx, "webhook.mutate", operation)
 	setClusterDefaults(cluster)
-	// The mutating webhook applies defaults on both create and update; record it
-	// as a create admission for consistency. Defaulting never denies admission.
 	if d.recorder != nil {
-		d.recorder.RecordWebhookAdmission(webhookMutating, admissionOpCreate, admissionAllowed)
+		d.recorder.RecordWebhookAdmission(webhookMutating, operation, admissionAllowed)
 	}
+	end(nil)
 	return nil
+}
+
+// admissionOperationFromContext maps the admission request operation from the
+// webhook context onto the bounded operation label enum. When no admission
+// request is present (e.g. direct unit-test invocation) or the operation is
+// unrecognized, it falls back to "create" — the historical label value — so
+// the metric cardinality stays bounded.
+func admissionOperationFromContext(ctx context.Context) string {
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return admissionOpCreate
+	}
+	switch req.Operation {
+	case admissionv1.Update:
+		return admissionOpUpdate
+	case admissionv1.Delete:
+		return admissionOpDelete
+	case admissionv1.Create, admissionv1.Connect:
+		return admissionOpCreate
+	default:
+		return admissionOpCreate
+	}
 }
 
 // setClusterDefaults applies default values to a CloudberryCluster.
@@ -262,6 +291,14 @@ func setBackupDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 		// Backup is optional; no defaults needed when not specified or disabled.
 		return
 	}
+	// Default the backup toolchain image to the official backup image when
+	// unset. A backup-capable image MUST contain kubectl (the backup/restore
+	// Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
+	// coordinator-exec model) and the gpbackup/gprestore toolchain; the base
+	// database image is NOT sufficient.
+	if cluster.Spec.Backup.Image == "" {
+		cluster.Spec.Backup.Image = util.DefaultBackupImage
+	}
 	setGpbackupDefaults(cluster.Spec.Backup)
 	setGprestoreDefaults(cluster.Spec.Backup)
 	setBackupRetentionDefaults(cluster.Spec.Backup)
@@ -301,10 +338,14 @@ func setGprestoreDefaults(backup *cbv1alpha1.BackupSpec) {
 	if gr.Jobs == 0 {
 		gr.Jobs = defaultBackupJobs
 	}
-	// WithStats is a *bool: default to true only when unset (nil) so an explicit
-	// withStats:false set by the user is preserved rather than silently reverted.
+	// WithStats is a *bool: default to FALSE only when unset (nil) so an
+	// explicit withStats:true set by the user is preserved. Restores default to
+	// NOT restoring statistics because of a known upstream gpbackup bug where
+	// statistics.sql can carry an invalid bigint, making gprestore exit with
+	// code 2 even though the data restore succeeded. Statistics restore must be
+	// requested explicitly (withStats:true) — or recomputed via runAnalyze.
 	if gr.WithStats == nil {
-		gr.WithStats = util.Ptr(true)
+		gr.WithStats = util.Ptr(false)
 	}
 }
 

@@ -198,7 +198,15 @@ spec:
                     description: SSL defines TLS/SSL configuration.
                     properties:
                       certSecret:
-                        description: CertSecret references the TLS certificate secret.
+                        description: |-
+                          CertSecret references the TLS certificate secret. The Secret must carry
+                          the keys tls.crt, tls.key and ca.crt (the init-tls container requires
+                          ca.crt, so a bare kubernetes.io/tls secret without it is insufficient).
+                          When spec.vault.enabled is true, ssl.enabled is true and the referenced
+                          Secret does NOT exist, the operator auto-issues a server certificate from
+                          its configured Vault PKI mount/role, creates the Secret, and renews the
+                          certificate before expiry. A pre-existing (user-provided) Secret is never
+                          modified by the operator.
                         properties:
                           name:
                             description: Name is the name of the TLS secret.
@@ -318,7 +326,12 @@ spec:
                                   the access key id (default aws_access_key_id).
                                 type: string
                               path:
-                                description: Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+                                description: |-
+                                  Path is the LOGICAL Vault secret path (e.g. secret/cloudberry/backup-s3).
+                                  For KV-v2 mounts the operator injects the "data/" request segment
+                                  automatically, so the same logical path works for KV-v1 and KV-v2; an
+                                  explicit KV-v2 request path (secret/data/cloudberry/backup-s3) is also
+                                  accepted for backward compatibility. The path must not start with "/".
                                 type: string
                               secretKeyField:
                                 description: SecretKeyField is the Vault key holding
@@ -442,14 +455,25 @@ spec:
                         type: boolean
                       withStats:
                         description: |-
-                          WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
-                          to true by the mutating webhook; an explicit false is honored (the flag is
-                          not emitted). Using a pointer distinguishes "unset" from "explicitly false".
+                          WithStats maps to --with-stats. A nil pointer means "unset" and is
+                          defaulted to FALSE by the mutating webhook: restores do NOT restore
+                          statistics unless explicitly requested, because a known upstream gpbackup
+                          bug (invalid bigint in statistics.sql) makes gprestore exit with code 2
+                          when only the statistics restore fails while the data restore succeeded.
+                          When statistics restore IS requested (withStats:true) and gprestore exits
+                          with code 2, the operator treats the restore as success-with-warning
+                          (RestorePartial Event, result label "partial"). Consider runAnalyze to
+                          recompute fresh planner statistics instead.
                         type: boolean
                     type: object
                   image:
-                    description: Image is the backup toolchain container image (e.g.
-                      cloudberry-backup:2.1.0).
+                    description: |-
+                      Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+                      It MUST be backup-capable: the image must contain kubectl (backup/restore
+                      Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
+                      coordinator-exec model) and the gpbackup/gprestore/gpbackup_s3_plugin
+                      toolchain. When unset and backup is enabled, the mutating webhook
+                      defaults it to the official backup image.
                     type: string
                   jobTemplate:
                     description: JobTemplate defines pod template overrides for all

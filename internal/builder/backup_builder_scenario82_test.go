@@ -333,7 +333,7 @@ func assertCredentialsFromSecret(t *testing.T, env []corev1.EnvVar, secretName s
 func TestRenderToolScriptEphemeralS3ConfigScenario82(t *testing.T) {
 	t.Run("s3 destination renders to ephemeral /tmp path at runtime", func(t *testing.T) {
 		cluster := newBackupCluster()
-		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
+		args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
 		})
 		script := renderToolScript(cluster, "gpbackup", args)
@@ -357,7 +357,7 @@ func TestRenderToolScriptEphemeralS3ConfigScenario82(t *testing.T) {
 
 	t.Run("local destination omits the s3 ephemeral render", func(t *testing.T) {
 		cluster := newLocalBackupCluster("/backups", "backup-pvc")
-		args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
+		args := mustGpbackupArgs(t, cluster, cluster.Spec.Backup.Gpbackup, &BackupJobOptions{
 			Databases: []string{"mydb"},
 		})
 		script := renderToolScript(cluster, "gpbackup", args)

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -602,7 +603,11 @@ func TestBindEnvVars(t *testing.T) {
 	t.Setenv("CLOUDBERRY_OPERATOR_URL", "http://test:8443")
 
 	bindEnvVars()
-	// bindEnvVars sets viper values; we just verify it doesn't panic.
+
+	// The bound environment variables must be resolvable through viper.
+	assert.Equal(t, "test-cluster", viper.GetString("cluster"))
+	assert.Equal(t, "test-ns", viper.GetString("namespace"))
+	assert.Equal(t, "http://test:8443", viper.GetString("operator-url"))
 }
 
 // ---------------------------------------------------------------------------
@@ -620,8 +625,10 @@ func TestInitConfig(t *testing.T) {
 	rootCmd = newRootCmd()
 	globals = globalFlags{timeout: "5m"}
 
-	// initConfig should not panic even without a config file.
+	// initConfig must run without a config file and leave the explicitly
+	// set globals intact (no config-file override happened).
 	initConfig()
+	assert.Equal(t, "5m", globals.timeout, "initConfig must not clobber explicit globals")
 }
 
 // ---------------------------------------------------------------------------

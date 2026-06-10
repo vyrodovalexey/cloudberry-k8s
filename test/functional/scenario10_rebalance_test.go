@@ -92,15 +92,33 @@ func (s *Scenario10RebalanceSuite) TestScenario10a_RebalanceViaAnnotation() {
 		nil, s.env.Builder, mockMetrics, s.logger,
 	)
 
-	// Act: run HA controller reconciliation.
-	_, err := reconciler.Reconcile(s.ctx, scenario10Req())
+	// Act: run HA controller reconciliation. Without a DB factory the
+	// controller falls back to a tracked rebalance Job, so the first
+	// reconcile only STARTS the rebalance.
+	result, err := reconciler.Reconcile(s.ctx, scenario10Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
+	assert.Positive(s.T(), result.RequeueAfter,
+		"controller should requeue to track the rebalance Job")
 
-	// Verify annotation was removed.
+	// Verify annotation was removed and the tracking annotation was stamped.
 	updated, err := s.env.GetCluster(s.ctx, scenario10ClusterName, scenario10Namespace)
 	require.NoError(s.T(), err)
 	_, hasAction := updated.Annotations[util.AnnotationAction]
 	assert.False(s.T(), hasAction, "action annotation should be removed after rebalance")
+	jobName := updated.Annotations[util.AnnotationRebalanceJob]
+	require.NotEmpty(s.T(), jobName, "rebalance-job tracking annotation should be set")
+
+	// Simulate the rebalance Job reaching a successful terminal state, then
+	// reconcile again so the controller observes completion.
+	completeScenario10RebalanceJob(s.ctx, s.T(), s.env, jobName)
+	_, err = reconciler.Reconcile(s.ctx, scenario10Req())
+	require.NoError(s.T(), err, "completion reconcile should succeed")
+
+	updated, err = s.env.GetCluster(s.ctx, scenario10ClusterName, scenario10Namespace)
+	require.NoError(s.T(), err)
+	_, hasJobAnnotation := updated.Annotations[util.AnnotationRebalanceJob]
+	assert.False(s.T(), hasJobAnnotation,
+		"rebalance-job tracking annotation should be cleared after completion")
 
 	// Verify DataRedistribution condition set to RebalanceCompleted.
 	redistCond := util.FindCondition(updated.Status.Conditions, "DataRedistribution")
@@ -264,9 +282,21 @@ func (s *Scenario10RebalanceSuite) TestScenario10_RebalanceMetrics() {
 		nil, s.env.Builder, mockMetrics, s.logger,
 	)
 
-	// Act.
+	// Act: first reconcile starts the tracked rebalance Job; the metric is
+	// recorded only when the Job reaches a successful terminal state.
 	_, err := reconciler.Reconcile(s.ctx, scenario10Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
+	assert.Empty(s.T(), mockMetrics.ScaleOperationCalls,
+		"metric must not be recorded before the rebalance Job completes")
+
+	updated, err := s.env.GetCluster(s.ctx, scenario10ClusterName, scenario10Namespace)
+	require.NoError(s.T(), err)
+	jobName := updated.Annotations[util.AnnotationRebalanceJob]
+	require.NotEmpty(s.T(), jobName, "rebalance-job tracking annotation should be set")
+
+	completeScenario10RebalanceJob(s.ctx, s.T(), s.env, jobName)
+	_, err = reconciler.Reconcile(s.ctx, scenario10Req())
+	require.NoError(s.T(), err, "completion reconcile should succeed")
 
 	// Verify RecordScaleOperation called with "rebalance".
 	require.Len(s.T(), mockMetrics.ScaleOperationCalls, 1,
@@ -301,7 +331,7 @@ func (s *Scenario10RebalanceSuite) TestScenario10_DefaultRebalanceConfig() {
 		nil, s.env.Builder, mockMetrics, s.logger,
 	)
 
-	// Act.
+	// Act: first reconcile starts the tracked rebalance Job.
 	_, err := reconciler.Reconcile(s.ctx, scenario10Req())
 	require.NoError(s.T(), err, "reconciliation should succeed")
 
@@ -319,8 +349,18 @@ func (s *Scenario10RebalanceSuite) TestScenario10_DefaultRebalanceConfig() {
 	assert.True(s.T(), rebalanceStartedFound,
 		"RebalanceStarted event should contain default threshold=10%% and parallelism=2; events: %v", events)
 
-	// Verify DataRedistribution condition set.
+	// Simulate the rebalance Job succeeding, then reconcile to observe it.
 	updated, err := s.env.GetCluster(s.ctx, scenario10ClusterName, scenario10Namespace)
+	require.NoError(s.T(), err)
+	jobName := updated.Annotations[util.AnnotationRebalanceJob]
+	require.NotEmpty(s.T(), jobName, "rebalance-job tracking annotation should be set")
+
+	completeScenario10RebalanceJob(s.ctx, s.T(), s.env, jobName)
+	_, err = reconciler.Reconcile(s.ctx, scenario10Req())
+	require.NoError(s.T(), err, "completion reconcile should succeed")
+
+	// Verify DataRedistribution condition set.
+	updated, err = s.env.GetCluster(s.ctx, scenario10ClusterName, scenario10Namespace)
 	require.NoError(s.T(), err)
 	redistCond := util.FindCondition(updated.Status.Conditions, "DataRedistribution")
 	require.NotNil(s.T(), redistCond, "DataRedistribution condition should be set")
@@ -332,6 +372,25 @@ func (s *Scenario10RebalanceSuite) TestScenario10_DefaultRebalanceConfig() {
 		"RecordScaleOperation should be called once")
 	assert.Equal(s.T(), "rebalance", mockMetrics.ScaleOperationCalls[0].Operation,
 		"operation should be rebalance")
+}
+
+// completeScenario10RebalanceJob marks the tracked rebalance Job as
+// succeeded so the next reconcile observes a successful terminal state.
+func completeScenario10RebalanceJob(
+	ctx context.Context,
+	t *testing.T,
+	env *testutil.TestK8sEnv,
+	jobName string,
+) {
+	t.Helper()
+	job := &batchv1.Job{}
+	require.NoError(t, env.Client.Get(ctx, types.NamespacedName{
+		Name:      jobName,
+		Namespace: scenario10Namespace,
+	}, job), "tracked rebalance Job should exist")
+	job.Status.Succeeded = 1
+	require.NoError(t, env.Client.Status().Update(ctx, job),
+		"updating rebalance Job status to succeeded")
 }
 
 // listJobsByLabel lists Jobs in a namespace matching a label key/value.

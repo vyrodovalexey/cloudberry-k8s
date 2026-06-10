@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"flag"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -47,14 +45,18 @@ func TestAddJitter(t *testing.T) {
 	}
 }
 
+// reserveListenAddr reserves a free TCP port, then releases it so run()'s
+// HTTP server can bind it deterministically.
+func reserveListenAddr(t *testing.T) string {
+	t.Helper()
+	lst, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	listenAddr := lst.Addr().String()
+	require.NoError(t, lst.Close())
+	return listenAddr
+}
+
 // TestRun exercises the run() entry point end-to-end against a mock PG server.
-//
-// run() calls parseConfig(), which registers flags on the global
-// flag.CommandLine. Because that registration panics on a second invocation
-// ("flag redefined"), parseConfig may only be invoked once per test binary.
-// We therefore drive parseConfig exclusively through run() here and assert the
-// resulting configuration via a side channel rather than calling parseConfig
-// directly in a separate test.
 func TestRun(t *testing.T) {
 	addr, cleanup := mockPGServer(t, func(query string) []byte {
 		if strings.Contains(query, "INSERT") || strings.Contains(query, "CREATE") {
@@ -70,38 +72,19 @@ func TestRun(t *testing.T) {
 		" dbname=testdb user=testuser password=testpass sslmode=disable"
 	t.Setenv(envDataSourceName, dsn)
 
-	// Reserve a free TCP port, then release it so run()'s HTTP server can bind
-	// it deterministically. Using a concrete port (rather than ":0") avoids any
-	// dependency on run() exposing its chosen ephemeral port back to the test.
-	lst, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	listenAddr := lst.Addr().String()
-	require.NoError(t, lst.Close())
-
-	// Provide CLI args so flag.Parse picks the reserved listen address and a
-	// short sampling interval. Restore os.Args afterwards. Reset the global
-	// flag.CommandLine to a fresh FlagSet so parseConfig can re-register its
-	// flags without panicking ("flag redefined"); this keeps the test safe under
-	// repeated invocation (e.g. -count>1).
-	origArgs := os.Args
-	origFlags := flag.CommandLine
-	defer func() {
-		os.Args = origArgs
-		flag.CommandLine = origFlags
-	}()
-	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	os.Args = []string{
-		"cloudberry-query-exporter",
-		"-listen-address=" + listenAddr,
-		"-sampling-interval=20ms",
-	}
+	listenAddr := reserveListenAddr(t)
 
 	// Drive run() in a goroutine and cancel once the HTTP /health endpoint is
 	// serving, so the graceful-shutdown path is exercised without relying on a
 	// fixed wall-clock deadline (which can be flaky under load / -race).
 	ctx, cancel := context.WithCancel(context.Background())
 	runErrCh := make(chan error, 1)
-	go func() { runErrCh <- run(ctx) }()
+	go func() {
+		runErrCh <- run(ctx, []string{
+			"-listen-address=" + listenAddr,
+			"-sampling-interval=20ms",
+		})
+	}()
 
 	require.Eventually(t, func() bool {
 		resp, getErr := http.Get("http://" + listenAddr + "/health") //nolint:noctx // test poll

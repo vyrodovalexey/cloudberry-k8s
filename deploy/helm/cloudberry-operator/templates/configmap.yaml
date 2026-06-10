@@ -7,7 +7,6 @@ metadata:
     {{- include "cloudberry-operator.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    listen-address: ":8443"
     api-address: ":{{ .Values.api.port }}"
     metrics-address: {{ .Values.operator.metricsAddress | quote }}
     health-probe-address: {{ .Values.operator.healthProbeAddress | quote }}
@@ -19,6 +18,7 @@ data:
     reconcile-interval: {{ .Values.operator.reconcileInterval | quote }}
     operation-timeout: {{ .Values.operator.operationTimeout | quote }}
     namespace: {{ .Values.operator.watchNamespace | quote }}
+    enable-test-users: {{ .Values.operator.enableTestUsers }}
     vault:
       enabled: {{ .Values.vault.enabled }}
       {{- if .Values.vault.enabled }}

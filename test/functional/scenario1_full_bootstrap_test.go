@@ -476,7 +476,7 @@ func (s *Scenario1FullBootstrapSuite) TestScenario1_DeletionPolicy() {
 	// First reconcile: adds finalizer.
 	result, err := reconciler.Reconcile(s.ctx, reqFor(cluster))
 	require.NoError(s.T(), err)
-	assert.True(s.T(), result.Requeue, "first reconcile should requeue to add finalizer")
+	assert.Positive(s.T(), result.RequeueAfter, "first reconcile should requeue to add finalizer")
 
 	// Verify the cluster has DeletionPolicy=Retain and BackupOnDelete=true.
 	updated, err := env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -850,9 +850,79 @@ func (m *mockMetricsRecorder) RecordMonitorResume(_, _ string)                  
 func (m *mockMetricsRecorder) RecordMonitoringDisabledAccess(_, _ string)              {}
 func (m *mockMetricsRecorder) RecordCertRotation(_, _, _ string)                       {}
 func (m *mockMetricsRecorder) SetCertExpirySeconds(_ string, _ float64)                {}
+func (m *mockMetricsRecorder) RecordClusterCertIssuance(_, _, _ string)                {}
 func (m *mockMetricsRecorder) RecordVaultOperation(_, _ string)                        {}
 func (m *mockMetricsRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {}
 func (m *mockMetricsRecorder) RecordWebhookAdmission(_, _, _ string)                   {}
 func (m *mockMetricsRecorder) RecordUpgradeOperation(_, _, _ string)                   {}
-func (m *mockMetricsRecorder) RecordRollingRestart(_, _, _ string)                     {}
-func (m *mockMetricsRecorder) RecordRecoveryOperation(_, _, _, _ string)               {}
+
+// --- Methods added for the new metrics.Recorder surface (API middleware,
+// DB instrumentation, idle daemons, backup-on-delete, OIDC, log streaming).
+// Controller-relevant ones record their calls for assertions; pure API/DB
+// plumbing metrics are no-ops in functional controller tests.
+
+func (m *mockMetricsRecorder) RecordAPIRequest(_, _, _ string, _ time.Duration) {}
+func (m *mockMetricsRecorder) AddAPIRequestsInFlight(_ float64)                 {}
+func (m *mockMetricsRecorder) RecordRateLimitRejection(_ string)                {}
+
+func (m *mockMetricsRecorder) RecordDBConnect(_, _, _ string, _ time.Duration) {}
+func (m *mockMetricsRecorder) ObserveDBQueryDuration(_ string, _ time.Duration) {
+}
+
+func (m *mockMetricsRecorder) RegisterDBPoolStats(_, _ string, _ metrics.DBPoolStatsFunc) func() {
+	return func() {}
+}
+
+func (m *mockMetricsRecorder) SetIdleDaemonUp(cluster, namespace string, up bool) {
+	m.record("SetIdleDaemonUp", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "up": up,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordIdleScanFailure(cluster, namespace string) {
+	m.record("RecordIdleScanFailure", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordIdleReconnectAttempt(cluster, namespace, result string) {
+	m.record("RecordIdleReconnectAttempt", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordSessionTermination(cluster, namespace, result string) {
+	m.record("RecordSessionTermination", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordStorageExpansion(cluster, namespace, result string) {
+	m.record("RecordStorageExpansion", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordBackupOnDelete(cluster, namespace, result string) {
+	m.record("RecordBackupOnDelete", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) ObserveScalePhaseDuration(direction, phase string, d time.Duration) {
+	m.record("ObserveScalePhaseDuration", map[string]interface{}{
+		"direction": direction, "phase": phase, "duration": d,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordMigrateOperation(result string) {
+	m.record("RecordMigrateOperation", map[string]interface{}{"result": result})
+}
+
+func (m *mockMetricsRecorder) RecordAPIClusterOperation(_, _ string)          {}
+func (m *mockMetricsRecorder) RecordLogStreamSession(_ string)                {}
+func (m *mockMetricsRecorder) AddLogStreamBytes(_ float64)                    {}
+func (m *mockMetricsRecorder) RecordOIDCDiscovery(_ string)                   {}
+func (m *mockMetricsRecorder) ObserveAuthTokenVerifyDuration(_ time.Duration) {}
+func (m *mockMetricsRecorder) RecordRollingRestart(_, _, _ string)            {}
+func (m *mockMetricsRecorder) RecordRecoveryOperation(_, _, _, _ string)      {}

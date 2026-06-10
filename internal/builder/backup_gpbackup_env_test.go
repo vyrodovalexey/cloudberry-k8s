@@ -222,11 +222,12 @@ func TestBuildBackupCronJobGpbackupEnv(t *testing.T) {
 	require.Len(t, containers, 1)
 	vals := envValueMap(containers[0].Env)
 
-	// CronJob databases are resolved at runtime, so CBDB_DATABASE is emitted
-	// empty (but still present and inspectable).
+	// The CRD declares no per-schedule database list, so scheduled backups
+	// target the coordinator maintenance database; CBDB_DATABASE mirrors the
+	// rendered --dbname (the env must match the CLI args per spec 11).
 	cbdb, present := vals[envCBDBDatabase]
 	assert.True(t, present, "CBDB_DATABASE must be present on the cronjob container")
-	assert.Equal(t, "", cbdb)
+	assert.Equal(t, defaultCoordinatorDatabase, cbdb)
 
 	// Compression/jobs come from the cluster-level gpbackup options.
 	assert.Equal(t, "6", vals[envCompressionLevel])

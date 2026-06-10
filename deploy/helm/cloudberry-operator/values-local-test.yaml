@@ -1,0 +1,140 @@
+# =============================================================================
+# values-local-test.yaml — Local docker-desktop deployment (cloudberry-test ns)
+# =============================================================================
+# Usage:
+#   helm upgrade --install cloudberry-operator deploy/helm/cloudberry-operator \
+#     --namespace cloudberry-test --create-namespace \
+#     -f deploy/helm/cloudberry-operator/values-local-test.yaml
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  repository: cloudberry-operator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+installCRDs: true
+
+# Service account name must match the Vault k8s-auth role binding
+# (bound to SA "cloudberry-operator" in ns "cloudberry-test").
+serviceAccount:
+  create: true
+  name: cloudberry-operator
+
+# =============================================================================
+# Operator
+# =============================================================================
+operator:
+  logLevel: debug
+  logFormat: json
+  leaderElection: true
+  reconcileInterval: 30s
+  operationTimeout: 5m
+  watchNamespace: ""
+  metricsAddress: ":8080"
+  healthProbeAddress: ":8081"
+  webhookPort: 9443
+  # Enable test users for local e2e/functional tests.
+  enableTestUsers: true
+
+# =============================================================================
+# REST API
+# =============================================================================
+api:
+  enabled: true
+  port: 8090
+
+# =============================================================================
+# Vault — docker-desktop host-accessible address
+# =============================================================================
+vault:
+  enabled: true
+  address: "http://host.docker.internal:8200"
+  authMethod: kubernetes
+  authPath: auth/kubernetes
+  role: cloudberry-operator
+  secretPath: secret/data/cloudberry
+  pkiMountPath: "pki"
+  pkiRole: "cloudberry-operator"
+
+# =============================================================================
+# Webhook — certs from Vault PKI
+# =============================================================================
+webhook:
+  enabled: true
+  port: 443
+  targetPort: 9443
+  failurePolicy: Fail
+  certSource: vault-pki
+  vaultPKI:
+    mountPath: "pki"
+    role: "cloudberry-operator"
+
+# =============================================================================
+# OIDC — Keycloak on docker-desktop
+# =============================================================================
+oidc:
+  enabled: true
+  issuerURL: "http://host.docker.internal:8090/realms/test"
+  clientID: cloudberry-operator
+  existingSecret: oidc-client-secret
+  existingSecretKey: client-secret
+
+# =============================================================================
+# Telemetry — OTLP to otel-collector in monitoring namespace
+# =============================================================================
+telemetry:
+  enabled: true
+  otlpEndpoint: "otel-collector.monitoring.svc:4317"
+  otlpProtocol: grpc
+  otlpInsecure: true
+  samplingRate: 1.0
+  serviceName: cloudberry-operator
+
+# =============================================================================
+# Metrics & Monitoring — prometheus annotations for vmagent scraping
+# =============================================================================
+metrics:
+  enabled: true
+  port: 8080
+
+# ServiceMonitor disabled (using prometheus.io annotations instead of CRD)
+serviceMonitor:
+  enabled: false
+
+# =============================================================================
+# Backup RBAC
+# =============================================================================
+backup:
+  rbac:
+    create: true
+    scopeSecrets: false
+
+# =============================================================================
+# Pod Configuration
+# =============================================================================
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL

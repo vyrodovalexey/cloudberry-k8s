@@ -28,7 +28,7 @@ import (
 func newTestServerWithBatch(objs ...runtime.Object) *Server {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 }
 
 func backupJob(name, operation string) *batchv1.Job {

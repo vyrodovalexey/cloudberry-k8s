@@ -21,12 +21,20 @@ import (
 )
 
 // fakeVaultClient is a minimal vault.Client used to exercise the backup S3
-// vault-credential materialization path without a real Vault server.
+// vault-credential materialization path (ReadSecret) and the cluster TLS
+// auto-issuance path (WriteSecretWithResponse against the PKI issue endpoint)
+// without a real Vault server.
 type fakeVaultClient struct {
 	enabled  bool
 	readData map[string]interface{}
 	readErr  error
 	readPath string
+
+	// writeResp/writeErr drive WriteSecretWithResponse (the PKI issue call);
+	// writePath records the last issue path for assertions.
+	writeResp map[string]interface{}
+	writeErr  error
+	writePath string
 }
 
 func (f *fakeVaultClient) ReadSecret(_ context.Context, path string) (map[string]interface{}, error) {
@@ -42,9 +50,13 @@ func (f *fakeVaultClient) WriteSecret(_ context.Context, _ string, _ map[string]
 }
 
 func (f *fakeVaultClient) WriteSecretWithResponse(
-	_ context.Context, _ string, _ map[string]interface{},
+	_ context.Context, path string, _ map[string]interface{},
 ) (map[string]interface{}, error) {
-	return nil, nil
+	f.writePath = path
+	if f.writeErr != nil {
+		return nil, f.writeErr
+	}
+	return f.writeResp, nil
 }
 
 func (f *fakeVaultClient) IsEnabled() bool { return f.enabled }

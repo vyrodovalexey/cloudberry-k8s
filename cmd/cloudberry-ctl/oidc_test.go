@@ -392,10 +392,15 @@ func TestExchangeCode_InvalidJSON(t *testing.T) {
 }
 
 func TestExchangeCode_ContextCanceled(t *testing.T) {
+	// unblock releases the handler once the client has timed out, replacing
+	// the previous fixed 2s sleep: teardown is instant and deterministic.
+	unblock := make(chan struct{})
 	tokenServer := httptest.NewServer(
-		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			// Delay to allow context cancellation.
-			time.Sleep(2 * time.Second)
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-unblock:
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"access_token": "token",
@@ -403,6 +408,7 @@ func TestExchangeCode_ContextCanceled(t *testing.T) {
 		}),
 	)
 	defer tokenServer.Close()
+	defer close(unblock)
 
 	issuerURL := strings.TrimSuffix(
 		tokenServer.URL, "/protocol/openid-connect/token",
@@ -521,10 +527,10 @@ func TestOpenBrowser_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// With a canceled context, the command should fail quickly.
+	// With a canceled context, exec.CommandContext refuses to start the
+	// browser process: an error is the contract on every platform.
 	err := openBrowser(ctx, "https://example.com/auth")
-	// May or may not error depending on platform, but should not hang.
-	_ = err
+	require.Error(t, err, "a canceled context must prevent launching the browser")
 }
 
 // ---------------------------------------------------------------------------

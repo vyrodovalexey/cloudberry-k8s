@@ -86,6 +86,9 @@ func (m *scenario6MockDBClient) PromoteStandby(_ context.Context) error         
 func (m *scenario6MockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return 0, 0, 0, nil
 }
+func (m *scenario6MockDBClient) GetMaxConnections(_ context.Context) (int32, error) {
+	return 100, nil
+}
 func (m *scenario6MockDBClient) GetResourceGroupUsage(_ context.Context, _ string) (float64, float64, error) {
 	return 0, 0, nil
 }

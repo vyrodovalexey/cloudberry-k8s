@@ -393,8 +393,11 @@ cloudberry-k8s/
 | `internal/builder` | K8s resource construction | api/v1alpha1, internal/util |
 | `internal/controller` | Reconciliation controllers | All internal packages |
 | `internal/api` | REST API server | internal/auth, internal/metrics |
-| `internal/certmanager` | Webhook TLS cert lifecycle (Vault PKI / self-signed) | internal/vault, k8s client |
+| `internal/certmanager` | Webhook and cluster TLS cert lifecycle (Vault PKI / self-signed) | internal/vault, k8s client |
 | `internal/webhook` | Admission webhooks (with cross-namespace duplicate detection) | api/v1alpha1 |
+| `internal/cron` | Single shared 5-field cron engine (next-run computation for the API, schedule validation for the webhook) | — |
+| `internal/httpjson` | Shared JSON response / error-envelope encoder (`{"error":{"code","message"}}`) used by the API server and auth middleware | — |
+| `internal/idle` | Idle-session daemon (scan loop, reconnection, observability) | internal/db, internal/metrics |
 
 ### Key Internal Helpers
 
@@ -2357,7 +2360,7 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario69
 
 #### Scenario 70 — Webhook Defaults
 
-Verifies that the mutating admission webhook applies all twelve backup defaults when a **minimal** backup spec (enabled, destination, image only) is submitted, and that the defaulted values appear on the **persisted** object. The functional/E2E tests exercise the public defaulter (`webhook.NewCloudberryClusterDefaulter().Default`) — the same code path the admission server runs — and assert the resulting object's fields. The E2E suite additionally includes a `KUBECONFIG`-gated live test that `Create`s a minimal-backup CloudberryCluster, `Get`s it back, and asserts the defaults were persisted by the webhook (then deletes it). Defaulting is gated on `backup.enabled: true` and is non-destructive (explicit user values are preserved).
+Verifies that the mutating admission webhook applies all twelve backup defaults when a **minimal** backup spec (enabled + destination only) is submitted, and that the defaulted values appear on the **persisted** object. The webhook also defaults `backup.image` to the official backup toolchain image (`cloudberry-backup:2.1.0`) when unset — a backup-capable image must contain `kubectl` and the `gpbackup`/`gprestore` toolchain. The functional/E2E tests exercise the public defaulter (`webhook.NewCloudberryClusterDefaulter().Default`) — the same code path the admission server runs — and assert the resulting object's fields. The E2E suite additionally includes a `KUBECONFIG`-gated live test that `Create`s a minimal-backup CloudberryCluster, `Get`s it back, and asserts the defaults were persisted by the webhook (then deletes it). Defaulting is gated on `backup.enabled: true` and is non-destructive (explicit user values are preserved).
 
 Defaulted fields verified (minimal spec → persisted object):
 
@@ -2369,7 +2372,7 @@ Defaulted fields verified (minimal spec → persisted object):
 | `gpbackup.singleDataFile` | `false` |
 | `gpbackup.withStats` | `true` |
 | `gprestore.jobs` | `1` |
-| `gprestore.withStats` | `true` |
+| `gprestore.withStats` | `false` — statistics restore is **opt-in** (`gprestore` exits 2 on the upstream `statistics.sql` bug; see the [User Guide](user-guide.md#backup-and-restore-to-s3)) |
 | `retention.fullCount` | `3` |
 | `retention.maxAge` | `30d` |
 | `jobTemplate.backoffLimit` | `2` |
@@ -2397,7 +2400,7 @@ Exercises the full S3 backup configuration (bucket, endpoint, region, folder, en
 **Precondition**: running CloudberryCluster, MinIO reachable, Secret `backup-s3-credentials` present (and, for the Vault variant, the same credentials stored at Vault path `secret/data/cloudberry/backup-s3`).
 
 - **71a — Secret credentials**: `destination.s3.credentialSecret` references the Kubernetes Secret `backup-s3-credentials` (`accessKeyField: aws_access_key_id`, `secretKeyField: aws_secret_access_key`). The backup/restore Job injects `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SecretKeyRef` to that Secret.
-- **71b — Vault credentials**: `destination.s3.vaultSecret` references Vault path `secret/data/cloudberry/backup-s3` (requires `spec.vault.enabled`). The operator reads the path at reconcile time and materializes the Secret `<cluster>-backup-s3-vault-creds`, which the Job consumes via `SecretKeyRef`. Credentials are never written into the Job spec as plaintext.
+- **71b — Vault credentials**: `destination.s3.vaultSecret` references Vault path `secret/data/cloudberry/backup-s3` (requires `spec.vault.enabled`). The operator reads the path at reconcile time and materializes the Secret `<cluster>-backup-s3-vault-creds`, which the Job consumes via `SecretKeyRef`. Credentials are never written into the Job spec as plaintext. (The documented path form is now the **logical** KV path, `secret/cloudberry/backup-s3` — the operator injects `data/` for KV-v2 mounts automatically; the explicit `secret/data/...` form used by this scenario remains accepted with a webhook warning.)
 
 Both variants verify the full S3 plugin config (`region`, `endpoint`, `bucket`, `folder`, `encryption`) and env (`S3_FORCE_PATH_STYLE=true`, multipart `BACKUP_*`/`RESTORE_*` = `4`/`10MB`). The functional/E2E Go tests assert the operator produces the correct ConfigMap, materialized creds Secret (Vault variant), and Job env/args; the actual backup→clean→restore data cycle (≈100 MB in `mydb`) is exercised at live deployment time.
 
@@ -3205,6 +3208,33 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario86
 bash test/e2e/scripts/scenario86-cli-commands.sh --cluster scenario86-s3
 ```
 
+#### Scenario 89 — Backup Artifact Round-Trip Against Real MinIO (Integration)
+
+Verifies the **object-store side** of the backup pipeline against the live MinIO from the
+Docker Compose test environment — the real S3 dependency the backup Jobs talk to. The
+gpbackup/gprestore binaries run inside the database pods (exercised by the live e2e scripts);
+this scenario proves the store itself, using the same bucket (`cloudberry-backups`), the same
+folder layout (`<folder>/<cluster>/<timestamp>/…`), and the same credentials the Jobs receive
+from the `backup-s3-credentials` Secret (`aws_access_key_id`/`aws_secret_access_key`):
+
+- **89-1** the provisioned backup bucket exists and is reachable with the Job credentials
+- **89-2** backup upload path: a synthetic gpbackup artifact set (metadata + data segment) is
+  uploaded under `<folder>/<cluster>/<timestamp>/` and a prefix listing returns exactly the
+  uploaded keys
+- **89-3** restore download path: every artifact is downloaded back and matches the original
+  **byte-for-byte** (sha256)
+- **89-4** retention delete path: deleting the timestamp prefix removes all artifacts and a
+  subsequent listing is empty (the retention cleanup Job's delete semantics)
+
+Configuration comes only from the environment (`MINIO_ADDR`, `MINIO_ACCESS_KEY`,
+`MINIO_SECRET_KEY`) with docker-compose defaults — no hardcoded endpoints. Test-case catalog:
+`test/cases/scenario89_backup_minio_roundtrip_cases.go`; S3 test helper: `test/testutil/s3.go`.
+
+```bash
+# Requires the Docker Compose environment (make test-env-up && make test-env-setup)
+go test ./test/integration/... -v -tags integration -run TestIntegration_Scenario89
+```
+
 ```bash
 # Run all controller tests
 go test ./internal/controller/... -v
@@ -3400,7 +3430,7 @@ scenario1-cluster-segment-mirror-3    (mirror of primary-3)
 
 ### Coverage
 
-The project targets **90%+ unit test statement coverage** per package. Total project coverage: **90.9%** (improved from 85.3%). Current coverage for key packages:
+The project **enforces 90%+ unit test statement coverage per package** (not just overall). Total project coverage: **90.9%** (improved from 85.3%). Current coverage for key packages:
 
 | Package | Coverage | Notes |
 |---------|----------|-------|
@@ -3417,6 +3447,8 @@ The project targets **90%+ unit test statement coverage** per package. Total pro
 | `cmd/cloudberry-ctl` | ~83.4% | Improved from 28.5% → 83.4% with context propagation, bulk import, and signal handling tests |
 
 All 14 internal packages now meet or exceed the 90% coverage target.
+
+**Goroutine-leak detection**: goroutine-heavy packages (`internal/api`, `internal/controller`, `internal/idle`, `internal/vault`) run [goleak](https://github.com/uber-go/goleak) from their `TestMain` (`main_test.go`), failing the package's test run if any test leaks a goroutine. New tests in these packages must clean up servers, daemons, watchers, and clients they start.
 
 ```bash
 # Generate coverage report
@@ -3713,10 +3745,10 @@ The following security and reliability fixes were applied during a comprehensive
 
 All new code must meet the following coverage targets:
 
-- **Per-package minimum**: 90% statement coverage
-- **Critical packages** (`internal/db`, `internal/auth`, `internal/controller`): 85%+ minimum
+- **Per-package minimum**: 90% statement coverage — **enforced** for every package, including the critical ones (`internal/db`, `internal/auth`, `internal/controller`)
 - **Run coverage check**: `make test-cover` generates an HTML report at `coverage/coverage.html`
-- **CI enforcement**: The CI pipeline fails if overall coverage drops below the threshold
+- **CI enforcement**: The CI pipeline fails if coverage drops below the threshold
+- **Goroutine hygiene**: packages with goleak in `TestMain` (`internal/api`, `internal/controller`, `internal/idle`, `internal/vault`) fail on leaked goroutines
 
 **Current coverage** (as of 2026-05-24):
 
@@ -3778,7 +3810,14 @@ cd test/performance
 ./run-perftest.sh --scenario endurance
 ```
 
-**Latest performance test results** (2026-05-19):
+**Current baseline** (latest perf-test cycle):
+
+- Authenticated API throughput: **~7 RPS per client** — bcrypt password verification on every Basic-auth request is the dominant cost (intentional security/throughput trade-off)
+- Health endpoints: **p99 < 10ms**
+- The default API rate limit is **10 requests/minute per IP** — raise it or disable it (`CLOUDBERRY_API_RATE_LIMIT=0`) before load testing, otherwise the limiter (not the server) is what you measure (rejections show up on `cloudberry_api_rate_limit_rejections_total`)
+- The authenticated ammo files (`test/performance/ammo/api-read.txt`) use the `operator_user` test credentials, which require the operator to run with `CLOUDBERRY_ENABLE_TEST_USERS=true` (test environments only — the operator logs a WARN when enabled)
+
+**Earlier full load-test results** (2026-05-19):
 
 | Endpoint Type | p50 | p95 | p99 | Peak RPS | Errors |
 |---------------|-----|-----|-----|----------|--------|

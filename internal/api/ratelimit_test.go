@@ -78,6 +78,7 @@ func TestNewRateLimiter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rl := NewRateLimiter(tt.limit, tt.interval, tt.logger)
+			defer rl.Stop()
 			require.NotNil(t, rl)
 			assert.Equal(t, tt.wantLimit, rl.limit)
 			assert.Equal(t, tt.wantInterval, rl.interval)
@@ -89,6 +90,7 @@ func TestNewRateLimiter(t *testing.T) {
 
 func TestRateLimiter_Allow_WithinLimit(t *testing.T) {
 	rl := NewRateLimiter(5, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	// First 5 requests should be allowed
 	for i := range 5 {
@@ -98,6 +100,7 @@ func TestRateLimiter_Allow_WithinLimit(t *testing.T) {
 
 func TestRateLimiter_Allow_OverLimit(t *testing.T) {
 	rl := NewRateLimiter(3, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	// First 3 requests should be allowed
 	for i := range 3 {
@@ -110,6 +113,7 @@ func TestRateLimiter_Allow_OverLimit(t *testing.T) {
 
 func TestRateLimiter_Allow_DifferentIPs(t *testing.T) {
 	rl := NewRateLimiter(2, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	// Each IP gets its own bucket
 	assert.True(t, rl.Allow("192.168.1.1"))
@@ -125,6 +129,7 @@ func TestRateLimiter_Allow_DifferentIPs(t *testing.T) {
 func TestRateLimiter_Allow_TokenRefill(t *testing.T) {
 	// Use a very short interval so tokens refill quickly
 	rl := NewRateLimiter(2, 100*time.Millisecond, slog.Default())
+	defer rl.Stop()
 
 	// Use up all tokens
 	assert.True(t, rl.Allow("192.168.1.1"))
@@ -168,6 +173,7 @@ func TestRateLimiter_RetryAfterSeconds(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rl := NewRateLimiter(tt.limit, tt.interval, slog.Default())
+			defer rl.Stop()
 			seconds := rl.RetryAfterSeconds()
 			assert.GreaterOrEqual(t, seconds, tt.wantMin)
 		})
@@ -176,6 +182,7 @@ func TestRateLimiter_RetryAfterSeconds(t *testing.T) {
 
 func TestRateLimiter_Middleware_Allowed(t *testing.T) {
 	rl := NewRateLimiter(10, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	handlerCalled := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -196,6 +203,7 @@ func TestRateLimiter_Middleware_Allowed(t *testing.T) {
 
 func TestRateLimiter_Middleware_RateLimited(t *testing.T) {
 	rl := NewRateLimiter(1, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -340,6 +348,7 @@ func TestExtractClientIP_WithTrustedProxies(t *testing.T) {
 
 func TestRateLimiter_ConcurrentAccess(t *testing.T) {
 	rl := NewRateLimiter(100, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	var wg sync.WaitGroup
 	allowedCount := 0
@@ -366,6 +375,7 @@ func TestRateLimiter_ConcurrentAccess(t *testing.T) {
 
 func TestRateLimiter_ConcurrentAccess_DifferentIPs(t *testing.T) {
 	rl := NewRateLimiter(5, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	var wg sync.WaitGroup
 	results := make(map[string]int)
@@ -397,6 +407,7 @@ func TestRateLimiter_ConcurrentAccess_DifferentIPs(t *testing.T) {
 
 func TestRateLimiter_Cleanup(t *testing.T) {
 	rl := NewRateLimiter(10, 50*time.Millisecond, slog.Default())
+	defer rl.Stop()
 
 	// Add some entries
 	rl.Allow("192.168.1.1")
@@ -415,6 +426,7 @@ func TestRateLimiter_Cleanup(t *testing.T) {
 
 func TestRateLimiter_Cleanup_ActiveEntries(t *testing.T) {
 	rl := NewRateLimiter(10, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	// Add entries
 	rl.Allow("192.168.1.1")
@@ -428,6 +440,7 @@ func TestRateLimiter_Cleanup_ActiveEntries(t *testing.T) {
 
 func TestRateLimiter_TokenCap(t *testing.T) {
 	rl := NewRateLimiter(3, 50*time.Millisecond, slog.Default())
+	defer rl.Stop()
 
 	// Use one token
 	assert.True(t, rl.Allow("192.168.1.1"))
@@ -444,6 +457,7 @@ func TestRateLimiter_TokenCap(t *testing.T) {
 
 func TestRateLimiter_Middleware_RetryAfterHeader(t *testing.T) {
 	rl := NewRateLimiter(1, time.Minute, slog.Default())
+	defer rl.Stop()
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

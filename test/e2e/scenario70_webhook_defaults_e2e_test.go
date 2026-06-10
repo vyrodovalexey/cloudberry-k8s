@@ -94,7 +94,8 @@ func (s *Scenario70WebhookDefaultsE2ESuite) assertScenario70E2EDefaults(backup *
 	require.NotNil(t, backup.Gprestore, "gprestore must be allocated by defaulter")
 	assert.Equal(t, int32(1), backup.Gprestore.Jobs, "gprestore.jobs")
 	require.NotNil(t, backup.Gprestore.WithStats, "gprestore.withStats defaulted (non-nil)")
-	assert.True(t, *backup.Gprestore.WithStats, "gprestore.withStats")
+	assert.False(t, *backup.Gprestore.WithStats,
+		"gprestore.withStats defaults false (statistics restore is opt-in)")
 
 	assert.Equal(t, int32(3), backup.Retention.FullCount, "retention.fullCount")
 	assert.Equal(t, "30d", backup.Retention.MaxAge, "retention.maxAge")

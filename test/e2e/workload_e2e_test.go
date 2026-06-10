@@ -1141,6 +1141,10 @@ func (w *nonClosingClientWrapper) GetActiveQueryCount(ctx context.Context) (int3
 	return w.delegate.GetActiveQueryCount(ctx)
 }
 
+func (w *nonClosingClientWrapper) GetMaxConnections(ctx context.Context) (int32, error) {
+	return w.delegate.GetMaxConnections(ctx)
+}
+
 func (w *nonClosingClientWrapper) GetResourceGroupUsage(ctx context.Context, group string) (float64, float64, error) {
 	return w.delegate.GetResourceGroupUsage(ctx, group)
 }

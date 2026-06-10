@@ -164,19 +164,29 @@ func (f *flushRecorder) Write(p []byte) (int, error) { return f.buf.Write(p) }
 func (f *flushRecorder) WriteHeader(int)             {}
 func (f *flushRecorder) Flush()                      { f.flushes++ }
 
+// plainWriter is an http.ResponseWriter WITHOUT http.Flusher support, used to
+// verify graceful (non-flushing, no-panic) degradation of copyLogStream.
+type plainWriter struct{ buf bytes.Buffer }
+
+func (p *plainWriter) Header() http.Header         { return http.Header{} }
+func (p *plainWriter) Write(b []byte) (int, error) { return p.buf.Write(b) }
+func (p *plainWriter) WriteHeader(int)             {}
+
 func TestCopyLogStream_NonFollow(t *testing.T) {
-	var buf bytes.Buffer
+	w := &plainWriter{}
 	src := bytes.NewBufferString("hello world\nsecond line\n")
-	copyLogStream(context.Background(), &buf, src, false)
-	assert.Equal(t, "hello world\nsecond line\n", buf.String())
+	copyLogStream(context.Background(), w, src, false)
+	assert.Equal(t, "hello world\nsecond line\n", w.buf.String())
 }
 
 func TestCopyLogStream_NonFlusherWriter(t *testing.T) {
-	// follow=true but the writer is not an http.Flusher → falls back to io.Copy.
-	var buf bytes.Buffer
+	// follow=true but the writer is not an http.Flusher → the
+	// ResponseController flush returns ErrNotSupported, which is ignored:
+	// the copy completes without panicking.
+	w := &plainWriter{}
 	src := bytes.NewBufferString("streamed data\n")
-	copyLogStream(context.Background(), &buf, src, true)
-	assert.Equal(t, "streamed data\n", buf.String())
+	copyLogStream(context.Background(), w, src, true)
+	assert.Equal(t, "streamed data\n", w.buf.String())
 }
 
 func TestCopyLogStream_FollowFlushes(t *testing.T) {
@@ -264,7 +274,7 @@ func TestFindJobPod_ListError(t *testing.T) {
 			},
 		}).
 		Build()
-	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	s := trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 
 	_, found, err := s.findJobPod(context.Background(), "default", "some-job")
 	require.Error(t, err)
@@ -285,7 +295,7 @@ func TestHandleBackupJobLogs_ListError(t *testing.T) {
 			},
 		}).
 		Build()
-	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0).
+	s := trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)).
 		WithClientset(k8sfake.NewSimpleClientset())
 
 	rec := httptest.NewRecorder()
@@ -314,7 +324,7 @@ func TestHandleBackupJobLogs_StreamError(t *testing.T) {
 		return false, nil, nil
 	})
 
-	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0).WithClientset(cs)
+	s := trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)).WithClientset(cs)
 
 	rec := httptest.NewRecorder()
 	s.handleBackupJobLogs(rec, newJobLogsRequest("test-cluster", "test-cluster-backup-1"))

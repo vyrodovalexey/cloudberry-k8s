@@ -50,6 +50,9 @@ const (
 	// defaultHistoryRetention is the default retention period for query history entries.
 	defaultHistoryRetention = 30 * 24 * time.Hour
 
+	// defaultCleanupInterval is how often the retention cleanup runs.
+	defaultCleanupInterval = 1 * time.Hour
+
 	// hoursPerDay and hoursPerWeek are used to expand the custom "d" and "w" suffixes.
 	hoursPerDay  = 24
 	hoursPerWeek = 7 * hoursPerDay
@@ -144,6 +147,10 @@ type exporterConfig struct {
 	dsn                string
 	planCollection     bool
 	historyRetention   time.Duration
+	// cleanupInterval is how often the retention cleanup tick fires in
+	// collectLoop. It is not exposed as a flag; the default is kept at one
+	// hour and tests inject shorter intervals (testability seam, E-2).
+	cleanupInterval time.Duration
 }
 
 // parseRetention converts a retention string into a time.Duration.
@@ -183,22 +190,30 @@ func parseRetention(s string) (time.Duration, error) {
 	return d, nil
 }
 
-// parseConfig parses command-line flags and reads the DATA_SOURCE_NAME environment variable.
-// Environment variable takes priority over any default for the DSN.
-func parseConfig() (*exporterConfig, error) {
-	listenAddress := flag.String("listen-address", ":9188", "Address to listen on for HTTP requests")
-	samplingInterval := flag.Duration("sampling-interval", 5*time.Second, "Interval between metric collection cycles")
-	slowQueryThreshold := flag.Duration(
+// parseConfigFromFlagSet parses the exporter command-line flags from the given
+// flag set and reads the DATA_SOURCE_NAME environment variable through getenv.
+// The environment variable takes priority over any default for the DSN.
+//
+// The flag set / args / getenv injection is a testability seam (E-2): the
+// production caller passes a fresh flag set with os.Args[1:] and os.Getenv,
+// while tests can drive every parse-error branch repeatedly without touching
+// the process-global flag.CommandLine (which panics on re-registration).
+func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string) string) (*exporterConfig, error) {
+	listenAddress := fs.String("listen-address", ":9188", "Address to listen on for HTTP requests")
+	samplingInterval := fs.Duration("sampling-interval", 5*time.Second, "Interval between metric collection cycles")
+	slowQueryThreshold := fs.Duration(
 		"slow-query-threshold",
 		1000*time.Millisecond,
 		"Duration threshold for classifying a query as slow",
 	)
-	planCollection := flag.Bool("plan-collection", false, "Enable EXPLAIN plan collection for slow queries")
-	historyRetention := flag.String(
+	planCollection := fs.Bool("plan-collection", false, "Enable EXPLAIN plan collection for slow queries")
+	historyRetention := fs.String(
 		"history-retention", "30d",
 		`Retention period for query history entries (e.g. "30d", "2w", "720h")`,
 	)
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
 
 	if *listenAddress == "" {
 		return nil, fmt.Errorf("listen-address must not be empty")
@@ -209,7 +224,7 @@ func parseConfig() (*exporterConfig, error) {
 		return nil, fmt.Errorf("parsing history-retention: %w", err)
 	}
 
-	dsn := os.Getenv(envDataSourceName)
+	dsn := getenv(envDataSourceName)
 	if dsn == "" {
 		slog.Warn("DATA_SOURCE_NAME not set, starting in degraded mode (will retry reading env)")
 	}
@@ -221,6 +236,7 @@ func parseConfig() (*exporterConfig, error) {
 		dsn:                dsn,
 		planCollection:     *planCollection,
 		historyRetention:   retention,
+		cleanupInterval:    defaultCleanupInterval,
 	}, nil
 }
 
@@ -228,16 +244,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx); err != nil {
+	if err := run(ctx, os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		slog.Error("exporter failed", "error", err)
 		cancel()
 		os.Exit(1) //nolint:gocritic // intentional exit after cancel
 	}
 }
 
-func run(ctx context.Context) error {
-	cfg, err := parseConfig()
+func run(ctx context.Context, args []string) error {
+	// A fresh flag set keeps run re-entrant for tests; ContinueOnError makes
+	// parse failures observable as returned errors (main handles ErrHelp).
+	fs := flag.NewFlagSet("cloudberry-query-exporter", flag.ContinueOnError)
+	cfg, err := parseConfigFromFlagSet(fs, args, os.Getenv)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
 		return fmt.Errorf("parsing configuration: %w", err)
 	}
 
@@ -346,11 +371,18 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, "ok")
 }
 
+// connInitialBackoff is the initial backoff between connection attempts. It
+// is a variable (not the const) so tests can shrink the retry cadence
+// (testability seam, E-2); production never mutates it.
+//
+//nolint:gochecknoglobals // test seam, constant in production
+var connInitialBackoff = initialBackoff
+
 // connectWithBackoff attempts to connect to PostgreSQL with exponential backoff.
 // It returns the connection on success, or an error if the context is canceled
 // before a connection is established.
 func connectWithBackoff(ctx context.Context, dsn string, logger *slog.Logger) (*pgx.Conn, error) {
-	backoff := initialBackoff
+	backoff := connInitialBackoff
 
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -400,8 +432,13 @@ func collectLoop(
 	ticker := time.NewTicker(cfg.samplingInterval)
 	defer ticker.Stop()
 
-	// Retention cleanup runs every hour.
-	cleanupTicker := time.NewTicker(1 * time.Hour)
+	// Retention cleanup runs every hour by default; the interval is
+	// configurable through exporterConfig so tests can exercise the tick.
+	cleanupEvery := cfg.cleanupInterval
+	if cleanupEvery <= 0 {
+		cleanupEvery = defaultCleanupInterval
+	}
+	cleanupTicker := time.NewTicker(cleanupEvery)
 	defer cleanupTicker.Stop()
 
 	currentConn := conn

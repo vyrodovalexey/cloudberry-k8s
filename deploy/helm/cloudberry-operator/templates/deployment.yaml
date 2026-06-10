@@ -52,6 +52,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.operator.enableTestUsers }}
+            - name: CLOUDBERRY_ENABLE_TEST_USERS
+              value: "true"
+            {{- end }}
             {{- if .Values.vault.enabled }}
             - name: CLOUDBERRY_VAULT_ENABLED
               value: "true"
@@ -68,6 +72,14 @@ spec:
             {{- if and (eq .Values.vault.authMethod "token") .Values.vault.token }}
             - name: CLOUDBERRY_VAULT_TOKEN
               value: {{ .Values.vault.token | quote }}
+            {{- end }}
+            {{- if and (eq .Values.vault.authMethod "approle") .Values.vault.roleID }}
+            - name: CLOUDBERRY_VAULT_ROLE_ID
+              value: {{ .Values.vault.roleID | quote }}
+            {{- end }}
+            {{- if and (eq .Values.vault.authMethod "approle") .Values.vault.secretID }}
+            - name: CLOUDBERRY_VAULT_SECRET_ID
+              value: {{ .Values.vault.secretID | quote }}
             {{- end }}
             {{- end }}
             {{- if and .Values.oidc.enabled (or .Values.oidc.existingSecret .Values.oidc.clientSecret) }}

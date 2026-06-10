@@ -2,13 +2,14 @@
 [Connection: keep-alive]
 [User-Agent: yandex-tank/perftest]
 [Accept: application/json]
+[Authorization: Basic b3BlcmF0b3JfdXNlcjpvcGVyYXRvcl9wYXNz]
 /api/v1alpha1/clusters
-/api/v1alpha1/clusters/scenario67
-/api/v1alpha1/clusters/scenario67/status
-/api/v1alpha1/clusters/scenario67/segments
-/api/v1alpha1/clusters/scenario67/sessions
-/api/v1alpha1/clusters/scenario67/config
-/api/v1alpha1/clusters/scenario67/mirroring
-/api/v1alpha1/clusters/scenario67/standby
+/api/v1alpha1/clusters/acceptance-test
+/api/v1alpha1/clusters/acceptance-test/status
+/api/v1alpha1/clusters/acceptance-test/segments
+/api/v1alpha1/clusters/acceptance-test/sessions
+/api/v1alpha1/clusters/acceptance-test/config
+/api/v1alpha1/clusters/acceptance-test/mirroring
+/api/v1alpha1/clusters/acceptance-test/standby
 /api/v1alpha1/clusters
-/api/v1alpha1/clusters/scenario67/status
+/api/v1alpha1/clusters/acceptance-test/status

@@ -335,8 +335,13 @@ func TestSetBackupDefaults(t *testing.T) {
 		gr := cluster.Spec.Backup.Gprestore
 		require.NotNil(t, gr)
 		assert.Equal(t, int32(1), gr.Jobs)
+		// gprestore.withStats defaults to FALSE: statistics restore is opt-in
+		// (gprestore exits 2 on the upstream statistics.sql bug).
 		require.NotNil(t, gr.WithStats)
-		assert.True(t, *gr.WithStats)
+		assert.False(t, *gr.WithStats)
+
+		// backup.image defaults to the official backup image (kubectl + gpbackup).
+		assert.Equal(t, util.DefaultBackupImage, cluster.Spec.Backup.Image)
 
 		assert.Equal(t, int32(3), cluster.Spec.Backup.Retention.FullCount)
 		assert.Equal(t, "30d", cluster.Spec.Backup.Retention.MaxAge)
@@ -410,12 +415,12 @@ func backupClusterForDefaults(
 }
 
 // TestSetBackupDefaults_WithStatsPointer verifies the *bool defaulting contract
-// for WithStats: an UNSET (nil) value is defaulted to true, while an EXPLICIT
-// false set by the user is preserved (never silently forced back to true). This
-// guards the regression where WithStats was a plain bool and withStats:false was
-// reverted to true on every admission.
+// for WithStats: an UNSET (nil) gpbackup value is defaulted to true, an UNSET
+// gprestore value is defaulted to FALSE (statistics restore is opt-in because
+// of the upstream gpbackup statistics.sql exit-2 bug), while EXPLICIT values
+// set by the user are always preserved (never silently reverted).
 func TestSetBackupDefaults_WithStatsPointer(t *testing.T) {
-	t.Run("unset withStats defaults to true", func(t *testing.T) {
+	t.Run("unset withStats defaults to backup-true restore-false", func(t *testing.T) {
 		cluster := backupClusterForDefaults(
 			&cbv1alpha1.GpbackupOptions{},
 			&cbv1alpha1.GprestoreOptions{},
@@ -425,7 +430,8 @@ func TestSetBackupDefaults_WithStatsPointer(t *testing.T) {
 		require.NotNil(t, cluster.Spec.Backup.Gpbackup.WithStats)
 		assert.True(t, *cluster.Spec.Backup.Gpbackup.WithStats, "unset gpbackup.withStats defaults true")
 		require.NotNil(t, cluster.Spec.Backup.Gprestore.WithStats)
-		assert.True(t, *cluster.Spec.Backup.Gprestore.WithStats, "unset gprestore.withStats defaults true")
+		assert.False(t, *cluster.Spec.Backup.Gprestore.WithStats,
+			"unset gprestore.withStats defaults FALSE (statistics restore is opt-in)")
 	})
 
 	t.Run("explicit false is preserved", func(t *testing.T) {

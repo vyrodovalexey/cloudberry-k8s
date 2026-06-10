@@ -184,3 +184,19 @@ func execResponse(tag string) []byte {
 func errorResponseMsg(msg string) []byte {
 	return mustEncode(&pgproto3.ErrorResponse{Severity: "ERROR", Message: msg})
 }
+
+// rowsThenError builds a response that starts a result set, delivers the given
+// rows, and then fails with an error INSTEAD of CommandComplete — driving the
+// rows.Err() branch in collectors that iterate result sets.
+func rowsThenError(fields []fieldDesc, rows [][]string, errMsg string) []byte {
+	buf := mustEncode(buildRowDesc(fields))
+	for _, row := range rows {
+		dr := &pgproto3.DataRow{}
+		for _, v := range row {
+			dr.Values = append(dr.Values, []byte(v))
+		}
+		buf = append(buf, mustEncode(dr)...)
+	}
+	buf = append(buf, errorResponseMsg(errMsg)...)
+	return buf
+}

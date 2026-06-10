@@ -84,7 +84,7 @@ backup:
         accessKeyField: aws_access_key_id
         secretKeyField: aws_secret_access_key
       vaultSecret:                           # Option B (alternative): credentials from Vault (requires spec.vault.enabled)
-        path: secret/data/cloudberry/backup-s3  # Vault KV path holding the S3 credentials
+        path: secret/cloudberry/backup-s3    # LOGICAL Vault KV path holding the S3 credentials (the operator injects data/ for KV-v2 mounts)
         accessKeyField: aws_access_key_id    # defaults to aws_access_key_id
         secretKeyField: aws_secret_access_key # defaults to aws_secret_access_key
       multipart:
@@ -241,7 +241,7 @@ spec:
                 name: <cluster>-backup-s3-config
 ```
 
-**Backup Job/CronJob container env.** The operator emits `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` on both the on-demand backup/restore Job and the scheduled backup CronJob containers. `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` are taken from `backup.gpbackup` and **default to `1`, `gzip`, and `1`** respectively when unset. `CBDB_DATABASE` is the backup target database (it is **empty for the CronJob**, whose databases are resolved at runtime). `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef` to `backup-s3-credentials`. These env vars are **informational/inspectable**: the `gpbackup`/`gprestore` CLI invocation still passes `--dbname` / `--compression-level` / `--compression-type` / `--jobs` as explicit args.
+**Backup Job/CronJob container env.** The operator emits `CBDB_DATABASE`, `PGHOST`, `PGPORT`, `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` on both the on-demand backup/restore Job and the scheduled backup CronJob containers. `COMPRESSION_LEVEL`, `COMPRESSION_TYPE`, and `BACKUP_JOBS` are taken from `backup.gpbackup` and **default to `1`, `gzip`, and `1`** respectively when unset. `CBDB_DATABASE` is the backup target database and always mirrors the rendered `--dbname`. `gpbackup` hard-requires `--dbname` (it aborts with `required flag(s) "dbname" not set`), and the CRD declares no per-schedule database field, so when no database is specified the builder defaults the target to the **coordinator maintenance database (`postgres`)** — this applies to the scheduled CronJob (always) and to direct builder callers; the REST API instead **rejects** database-less `POST /backups` requests with `400 INVALID_REQUEST` so user-facing requests are always explicit. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef` to `backup-s3-credentials`. These env vars are **informational/inspectable**: the `gpbackup`/`gprestore` CLI invocation still passes `--dbname` / `--compression-level` / `--compression-type` / `--jobs` as explicit args.
 
 ### Job for On-Demand Backup
 
@@ -306,6 +306,10 @@ data:
 
 - `credentialSecret` — references an existing Kubernetes Secret (`name`, `accessKeyField`, `secretKeyField`). The backup/restore Job's `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are injected via `SecretKeyRef`.
 - `vaultSecret` — references a Vault KV path (`path`, `accessKeyField`, `secretKeyField`); requires `spec.vault.enabled: true`. At reconcile time the operator reads the Vault path and **materializes** a Kubernetes Secret named `<cluster>-backup-s3-vault-creds` (owner-referenced to the cluster) holding the credentials, which the Job then consumes via `SecretKeyRef`. Credentials are never embedded in the Job spec as plaintext.
+
+**Vault KV-v2 logical paths.** `vaultSecret.path` takes the **logical** secret path (e.g. `secret/cloudberry/backup-s3`); the same value works for KV-v1 and KV-v2 mounts. The operator reads the path **verbatim first**, and when that read finds nothing — **or is denied with a 403** — and the path lacks the `data/` segment after its mount, it issues **one** normalized KV-v2 retry against `<mount>/data/<rest>`. The 403 case matters under **least-privilege policies** that grant only `<mount>/data/*`: the verbatim logical read is denied purely by path shape even though the secret is readable at the data path, so the operator attempts the fallback **without re-authenticating** (no re-auth storm for path-shape 403s; a re-login is attempted, generation-gated, only when **both** paths fail with an auth error). The explicit KV-v2 request form (`secret/data/cloudberry/backup-s3`) keeps working for backward compatibility — the validating webhook accepts it with a **warning** suggesting the logical form. An empty path or a path with a leading `/` is rejected at admission (Vault logical paths are mount-relative).
+
+**Failure observability.** Every failure to materialize the credentials — a Vault read error, missing `accessKeyField`/`secretKeyField` keys in the secret, or `vaultSecret` configured while the operator has **no enabled Vault client** — emits a **Warning** Event with reason **`BackupVaultCredentialsFailed`** on the cluster and marks the reconcile outcome metric (`cloudberry_reconcile_total`) with `result="error"`, so silently-missing backup credentials are observable instead of only surfacing when a backup Job fails.
 
 See **Scenario 71 — Enable Backup with Full S3 Configuration** in the test scenarios, which exercises both credential sources against MinIO with the full S3 config (folder, encryption, forcePathStyle, multipart) and performs a live backup → clean → restore cycle. The live data cycle runs via the coordinator-exec model (see [MPP Dispatch and the Coordinator-Exec Data Cycle](#mpp-dispatch-and-the-coordinator-exec-data-cycle)) and is driven by `test/e2e/scripts/scenario71-backup-restore.sh` for both the Secret and Vault credential variants. A real 100MB `mydb` backup → S3 (MinIO) → drop → restore cycle passes with matching row counts for both variants.
 
@@ -989,12 +993,12 @@ recorded from observed Jobs and their outcomes:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `cloudberry_backup_total` | Counter | cluster, namespace, type, **result** | Total backup operations by type (`full`\|`incremental`) and outcome (`result=success`\|`failed`) |
+| `cloudberry_backup_total` | Counter | cluster, namespace, type, **result** | Total backup operations by type (`full`\|`incremental`) and outcome (`result=success`\|`failed`); **transition-gated** (one increment per observed Job state change) |
 | `cloudberry_backup_duration_seconds` | Histogram | cluster, namespace, type | Backup duration distribution, per `type` (buckets `ExponentialBuckets(1, 2, 15)`) |
 | `cloudberry_backup_size_bytes` | Gauge | cluster, namespace, timestamp | Backup size in bytes per 14-digit `YYYYMMDDHHMMSS` timestamp |
 | `cloudberry_backup_last_success_timestamp` | Gauge | cluster, namespace | Unix timestamp of the last successful backup |
 | `cloudberry_backup_last_status` | Gauge | cluster, namespace | Latest backup status: `0=success, 1=failed, 2=in-progress` |
-| `cloudberry_restore_total` | Counter | cluster, namespace, **result** | Total restore operations by outcome (`result=success`\|`failed`) |
+| `cloudberry_restore_total` | Counter | cluster, namespace, **result** | Total restore operations by outcome (`result=success`\|`failed`); **transition-gated** (one increment per observed Job state change) |
 | `cloudberry_restore_duration_seconds` | Histogram | cluster, namespace | Restore duration distribution (buckets `ExponentialBuckets(1, 2, 15)`) |
 | `cloudberry_backup_retention_deleted_total` | Counter | cluster, namespace | Backups deleted by retention policy |
 | `cloudberry_backup_job_status` | Gauge | cluster, namespace, job_name, operation | Per-Job Kubernetes status: `0=pending, 1=running, 2=succeeded, 3=failed` (`operation` ∈ `backup`\|`restore`\|`cleanup`) |
@@ -1009,6 +1013,15 @@ recorded from observed Jobs and their outcomes:
 > change. Always query with `{result="success"}` / `{result="failed"}`. The
 > `cloudberry_backup_last_status` and `cloudberry_backup_job_status` gauges keep their
 > numeric code semantics shown above (these are gauge **values**, not a label).
+
+> **Transition-gated counters.** `cloudberry_backup_total` and `cloudberry_restore_total`
+> increment **once per actual state change** of the observed Job (a new Job name or a new
+> Job status) — periodic no-op reconciles of an unchanged Job do **not** re-increment
+> them, so `rate()`/`increase()` queries and alerts built on these counters reflect real
+> backup/restore operations rather than the reconcile frequency. The gauges
+> (`cloudberry_backup_last_status`, `cloudberry_backup_job_status`,
+> `cloudberry_backup_last_success_timestamp`, `cloudberry_backup_size_bytes`) remain
+> recorded on every reconcile — they are idempotent by definition.
 
 ### Scenario 84 — Prometheus Metrics / `gpbackup_exporter`
 
@@ -1118,6 +1131,7 @@ and is covered by `test/functional/scenario85_api_endpoints_test.go`,
 - `backup.destination.type` is required when `backup.enabled: true`
 - `backup.destination.s3.bucket` is required when `destination.type: s3`
 - For `destination.type: s3`, S3 credentials must be provided via **either** `backup.destination.s3.credentialSecret.name` **or** `backup.destination.s3.vaultSecret.path`. Rejection occurs only when **neither** is specified. (`vaultSecret.path` references a Vault KV path and requires `spec.vault.enabled: true` at runtime.)
+- `backup.destination.s3.vaultSecret.path` (when set) must be non-empty and must not start with `/` (Vault logical paths are mount-relative). The explicit KV-v2 request form (`<mount>/data/<rest>`) is accepted with an admission **warning** suggesting the logical path (`<mount>/<rest>`) — the operator injects the `data/` segment automatically for KV-v2 mounts.
 - `backup.gpbackup.compressionLevel` must be between 1 and 9 (a value of `0` is rejected by the validator as an explicit invalid level; an omitted field is defaulted to `1` by the mutating webhook before validation)
 - `backup.gpbackup.compressionType` must be `gzip` or `zstd`
 - `backup.gpbackup.copyQueueSize` requires `singleDataFile: true`
@@ -1260,6 +1274,10 @@ cloudberry-ctl migrate --source-cluster src --target-cluster dst \
   --tables "public.users,public.orders" \
   --truncate
 ```
+
+`--database` is **required**: the migration backup phase runs `gpbackup`, which
+hard-requires `--dbname`, so the API rejects a database-less migration request with
+`400 INVALID_REQUEST` instead of creating a Job that fails at runtime.
 
 This internally creates ONE Job `<source>-migration-<ts>` (label
 `avsoft.io/backup-operation=migrate`) whose script, under the coordinator-exec

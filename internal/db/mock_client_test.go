@@ -40,6 +40,8 @@ type fullMockDBClient struct {
 	getDiskUsageErr        error
 	getRepLagErr           error
 	promoteErr             error
+	maxConnections         int32
+	maxConnectionsErr      error
 	getActiveQueryErr      error
 	getResGroupUsageErr    error
 	createResGroupErr      error
@@ -166,6 +168,9 @@ func (m *fullMockDBClient) GetReplicationLag(_ context.Context) (int64, error) {
 	return m.repLag, m.getRepLagErr
 }
 func (m *fullMockDBClient) PromoteStandby(_ context.Context) error { return m.promoteErr }
+func (m *fullMockDBClient) GetMaxConnections(_ context.Context) (int32, error) {
+	return m.maxConnections, m.maxConnectionsErr
+}
 func (m *fullMockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return m.activeQueries, m.queuedQueries, m.blockedQueries, m.getActiveQueryErr
 }

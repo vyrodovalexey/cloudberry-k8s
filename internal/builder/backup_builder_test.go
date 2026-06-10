@@ -51,9 +51,24 @@ func newBackupCluster() *cbv1alpha1.CloudberryCluster {
 	return cluster
 }
 
+// mustGpbackupArgs renders gpbackup args for tests, applying the builder's
+// database defaulting (withDefaultBackupDatabase, as the Job/CronJob build
+// paths do) and failing the test on a render error.
+func mustGpbackupArgs(
+	t *testing.T,
+	cluster *cbv1alpha1.CloudberryCluster,
+	opts *cbv1alpha1.GpbackupOptions,
+	jobOpts *BackupJobOptions,
+) []string {
+	t.Helper()
+	args, err := buildGpbackupArgs(cluster, opts, withDefaultBackupDatabase(jobOpts))
+	require.NoError(t, err)
+	return args
+}
+
 func TestBuildGpbackupArgs(t *testing.T) {
 	t.Run("compression level and jobs", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+		args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			CompressionLevel: 6,
 			CompressionType:  "zstd",
 			Jobs:             4,
@@ -68,7 +83,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("single data file excludes jobs and includes copy queue", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+		args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			SingleDataFile: true,
 			CopyQueueSize:  4,
 			Jobs:           4,
@@ -80,7 +95,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("no compression overrides level", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+		args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			NoCompression:    true,
 			CompressionLevel: 9,
 		}, nil)
@@ -90,7 +105,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("incremental with leaf partition and from timestamp", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+		args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 			Incremental:       true,
 			LeafPartitionData: true,
 		}, &BackupJobOptions{FromTimestamp: "20260518020000"})
@@ -101,7 +116,7 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("include schema and exclude table and dbname", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{}, &BackupJobOptions{
+		args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{}, &BackupJobOptions{
 			Databases:      []string{"mydb"},
 			IncludeSchemas: []string{"public", "analytics"},
 			ExcludeTables:  []string{"public.temp_data"},
@@ -114,9 +129,81 @@ func TestBuildGpbackupArgs(t *testing.T) {
 	})
 
 	t.Run("nil options does not panic", func(t *testing.T) {
-		args := buildGpbackupArgs(newBackupCluster(), nil, nil)
+		args := mustGpbackupArgs(t, newBackupCluster(), nil, nil)
 		assert.Contains(t, strings.Join(args, " "), pluginConfigFlag)
 	})
+}
+
+// TestBuildGpbackupArgs_EmptyDbnameError pins the builder-level guard: an
+// unresolved target database is a build-time ERROR (gpbackup hard-requires
+// --dbname), never a silently broken command.
+func TestBuildGpbackupArgs_EmptyDbnameError(t *testing.T) {
+	tests := []struct {
+		name    string
+		jobOpts *BackupJobOptions
+	}{
+		{"nil job options", nil},
+		{"empty databases slice", &BackupJobOptions{Databases: []string{}}},
+		{"empty first database", &BackupJobOptions{Databases: []string{""}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := buildGpbackupArgs(newBackupCluster(), nil, tc.jobOpts)
+			require.Error(t, err)
+			assert.Nil(t, args)
+			assert.Contains(t, err.Error(), "no target database specified")
+		})
+	}
+}
+
+// TestWithDefaultBackupDatabase pins the database-defaulting semantics shared
+// by BuildBackupJob and BuildBackupCronJob.
+func TestWithDefaultBackupDatabase(t *testing.T) {
+	t.Run("nil opts default to the coordinator database", func(t *testing.T) {
+		opts := withDefaultBackupDatabase(nil)
+		require.NotNil(t, opts)
+		assert.Equal(t, []string{defaultCoordinatorDatabase}, opts.Databases)
+	})
+
+	t.Run("explicit databases are preserved", func(t *testing.T) {
+		in := &BackupJobOptions{Databases: []string{"mydb"}}
+		assert.Same(t, in, withDefaultBackupDatabase(in))
+	})
+
+	t.Run("caller's empty opts are not mutated", func(t *testing.T) {
+		in := &BackupJobOptions{Timestamp: "20260101010101"}
+		out := withDefaultBackupDatabase(in)
+		assert.Empty(t, in.Databases, "the caller's value must stay untouched")
+		assert.Equal(t, []string{defaultCoordinatorDatabase}, out.Databases)
+		assert.Equal(t, in.Timestamp, out.Timestamp)
+	})
+}
+
+// TestBuildBackupJob_DefaultsDatabase verifies an on-demand Job built with no
+// databases still renders a VALID gpbackup command targeting the coordinator
+// database, with CBDB_DATABASE mirroring the rendered --dbname.
+func TestBuildBackupJob_DefaultsDatabase(t *testing.T) {
+	b := NewBuilder()
+	job := b.BuildBackupJob(newBackupCluster(), &BackupJobOptions{Timestamp: "20260101020000"})
+	require.NotNil(t, job)
+
+	script := job.Spec.Template.Spec.Containers[0].Args[0]
+	assert.Contains(t, script, "'--dbname' '"+defaultCoordinatorDatabase+"'")
+
+	vals := envValueMap(job.Spec.Template.Spec.Containers[0].Env)
+	assert.Equal(t, defaultCoordinatorDatabase, vals[envCBDBDatabase])
+}
+
+// TestBuildBackupCronJob_RendersDbname pins the scheduled-backup fix: the
+// CronJob's gpbackup command MUST carry --dbname (gpbackup aborts without it),
+// defaulted to the coordinator database since the CRD has no database field.
+func TestBuildBackupCronJob_RendersDbname(t *testing.T) {
+	b := NewBuilder()
+	cj := b.BuildBackupCronJob(newBackupCluster())
+	require.NotNil(t, cj)
+
+	script := cj.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Args[0]
+	assert.Contains(t, script, "'--dbname' '"+defaultCoordinatorDatabase+"'")
 }
 
 func TestBuildGprestoreArgs(t *testing.T) {
@@ -704,7 +791,7 @@ func TestBuildGprestoreArgsDataMetadataResize(t *testing.T) {
 func TestBuildGpbackupArgsIncrementalFromTimestamp(t *testing.T) {
 	// An incremental request type alone (no explicit Incremental flag) must still
 	// emit the incremental flags plus the pinned base timestamp.
-	args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+	args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 		Incremental:       true,
 		LeafPartitionData: true,
 	}, &BackupJobOptions{
@@ -718,7 +805,7 @@ func TestBuildGpbackupArgsIncrementalFromTimestamp(t *testing.T) {
 }
 
 func TestBuildGpbackupArgsIncludeTable(t *testing.T) {
-	args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{SingleDataFile: true}, &BackupJobOptions{
+	args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{SingleDataFile: true}, &BackupJobOptions{
 		IncludeTables: []string{"public.users", "public.orders"},
 	})
 	joined := strings.Join(args, " ")

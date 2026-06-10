@@ -37,6 +37,10 @@ type RateLimiter struct {
 	stopCh         chan struct{}
 	stopOnce       sync.Once
 	trustedProxies []net.IPNet
+	// onReject is an optional callback invoked on every 429 rejection. The
+	// Server uses it to record cloudberry_api_rate_limit_rejections_total
+	// with the matched route template.
+	onReject func(r *http.Request)
 }
 
 // NewRateLimiter creates a new per-IP rate limiter.
@@ -87,6 +91,14 @@ func WithTrustedProxies(cidrs []string) RateLimiterOption {
 			}
 			rl.trustedProxies = append(rl.trustedProxies, *ipNet)
 		}
+	}
+}
+
+// WithRejectionCallback configures a callback invoked for every rejected
+// (429) request, used to record rejection metrics with route labels.
+func WithRejectionCallback(cb func(r *http.Request)) RateLimiterOption {
+	return func(rl *RateLimiter) {
+		rl.onReject = cb
 	}
 }
 
@@ -187,6 +199,9 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			retryAfter := rl.RetryAfterSeconds()
 			w.Header().Set(retryAfterHeader, fmt.Sprintf("%d", retryAfter))
 			rl.logger.Warn("rate limit exceeded", "ip", ip)
+			if rl.onReject != nil {
+				rl.onReject(r)
+			}
 			writeErrorJSON(w, http.StatusTooManyRequests, "RATE_LIMITED",
 				"too many requests, please retry later")
 			return

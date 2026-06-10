@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	// defaultBackupImage is the fallback backup toolchain image.
-	defaultBackupImage = "cloudberry-backup:2.1.0"
+	// defaultBackupImage is the fallback backup toolchain image (kept in sync
+	// with the mutating-webhook default via util.DefaultBackupImage).
+	defaultBackupImage = util.DefaultBackupImage
 
 	// backupContainerName is the container name for gpbackup containers.
 	backupContainerName = "gpbackup"
@@ -172,6 +173,28 @@ const (
 	// validateMarkerPrefix prefixes every parsable marker the post-restore
 	// validation script emits so its log lines can be matched deterministically.
 	validateMarkerPrefix = "post-restore-validate: "
+
+	// gprestoreTool is the gprestore tool name used to gate the statistics
+	// exit-code tolerance wrapper on restore Jobs only.
+	gprestoreTool = "gprestore"
+	// withStatsFlag is the gpbackup/gprestore --with-stats flag.
+	withStatsFlag = "--with-stats"
+	// restorePartialMarker is written to the restore Job pod's termination log
+	// (and stdout) when gprestore exits with code 2 — the known upstream
+	// gpbackup bug where ONLY the statistics restore fails (invalid bigint in
+	// statistics.sql) while the data restore succeeded. The admin controller
+	// parses this marker to annotate the Job and emit the RestorePartial
+	// Warning Event with the "partial" metric result.
+	restorePartialMarker = "GPRESTORE_PARTIAL=stats"
+	// gprestoreStatsExitGuard converts a gprestore exit code 2 (statistics-only
+	// failure) into success-with-warning: it logs the partial marker, writes it
+	// to /dev/termination-log for the controller to pick up, and clears rc so
+	// the Job succeeds. Any other non-zero rc still fails the Job.
+	gprestoreStatsExitGuard = "if [ \"${rc}\" -eq 2 ]; then " +
+		"echo 'gprestore-partial: statistics restore failed (exit code 2); " +
+		"data restore succeeded'; " +
+		"printf '%s' '" + restorePartialMarker + "' > /dev/termination-log 2>/dev/null || true; " +
+		"rc=0; fi\n"
 
 	// sshSetupPreamble installs the cluster-wide shared gpadmin SSH identity (the
 	// operator mounts it read-only at /etc/cloudberry/ssh) into ~/.ssh with the
@@ -355,16 +378,28 @@ func backupDestinationArgs(cluster *cbv1alpha1.CloudberryCluster) []string {
 // buildGpbackupArgs converts gpbackup options and per-request overrides into a
 // gpbackup CLI argument slice. It is a pure function for easy unit testing. The
 // leading args are destination-aware (see backupDestinationArgs).
+//
+// gpbackup hard-requires --dbname (it aborts with `required flag(s) "dbname"
+// not set`), so an empty target database is a build-time ERROR here instead of
+// a silently broken command that only fails when the Job pod runs. Callers
+// resolve the database first (see withDefaultBackupDatabase); the REST API
+// additionally rejects database-less create-backup requests with 400.
 func buildGpbackupArgs(
 	cluster *cbv1alpha1.CloudberryCluster,
 	opts *cbv1alpha1.GpbackupOptions,
 	jobOpts *BackupJobOptions,
-) []string {
-	args := backupDestinationArgs(cluster)
-
-	if jobOpts != nil && len(jobOpts.Databases) > 0 {
-		args = append(args, "--dbname", jobOpts.Databases[0])
+) ([]string, error) {
+	var dbname string
+	if jobOpts != nil {
+		dbname = firstDatabase(jobOpts.Databases)
 	}
+	if dbname == "" {
+		return nil, fmt.Errorf(
+			"building gpbackup args: no target database specified (gpbackup requires --dbname)")
+	}
+
+	args := backupDestinationArgs(cluster)
+	args = append(args, "--dbname", dbname)
 
 	if opts == nil {
 		opts = &cbv1alpha1.GpbackupOptions{}
@@ -378,7 +413,7 @@ func buildGpbackupArgs(
 	// WithStats is a *bool: nil means "unset" and follows the webhook default of
 	// true; a non-nil value is honored (false => omit the flag).
 	if util.DerefOr(opts.WithStats, true) {
-		args = append(args, "--with-stats")
+		args = append(args, withStatsFlag)
 	}
 	if opts.WithoutGlobals {
 		args = append(args, "--without-globals")
@@ -390,7 +425,31 @@ func buildGpbackupArgs(
 		args = appendRepeatedFlag(args, "--exclude-table", jobOpts.ExcludeTables)
 	}
 
-	return args
+	return args, nil
+}
+
+// withDefaultBackupDatabase returns opts with Databases defaulted to the
+// coordinator maintenance database (postgres, matching the Job's PGDATABASE
+// connection default) when none is specified, without mutating the caller's
+// value. It is nil-safe.
+//
+// Rationale (documented behavior): gpbackup hard-requires --dbname and the
+// CRD's BackupSpec declares NO databases/defaultDatabase field, so the
+// scheduled CronJob path has no user-supplied database to render — defaulting
+// here keeps every rendered gpbackup command valid. User-facing on-demand
+// requests are stricter: the REST API rejects an empty databases list with
+// 400, so this fallback only serves the CronJob path and direct builder
+// callers.
+func withDefaultBackupDatabase(opts *BackupJobOptions) *BackupJobOptions {
+	if opts == nil {
+		opts = &BackupJobOptions{}
+	}
+	if len(opts.Databases) > 0 {
+		return opts
+	}
+	out := *opts
+	out.Databases = []string{defaultCoordinatorDatabase}
+	return &out
 }
 
 // appendCompressionArgs appends compression-related flags. NoCompression takes
@@ -541,9 +600,11 @@ func buildGprestoreArgs(
 // set, that one is emitted as-is.
 func appendGprestoreBoolFlags(args []string, opts *cbv1alpha1.GprestoreOptions) []string {
 	// WithStats is a *bool: nil means "unset" and follows the webhook default of
-	// true; a non-nil value is honored (false => omit the flag). run-analyze still
-	// takes precedence so the gprestore invocation stays valid.
-	effectiveWithStats := util.DerefOr(opts.WithStats, true) && !opts.RunAnalyze
+	// FALSE (restores skip statistics unless explicitly requested — a known
+	// upstream gpbackup bug can make a statistics-only restore fail with exit
+	// code 2 while the data restore succeeded); a non-nil value is honored.
+	// run-analyze still takes precedence so the gprestore invocation stays valid.
+	effectiveWithStats := util.DerefOr(opts.WithStats, false) && !opts.RunAnalyze
 
 	flags := []struct {
 		enabled bool
@@ -551,7 +612,7 @@ func appendGprestoreBoolFlags(args []string, opts *cbv1alpha1.GprestoreOptions) 
 	}{
 		{opts.CreateDb, "--create-db"},
 		{opts.WithGlobals, "--with-globals"},
-		{effectiveWithStats, "--with-stats"},
+		{effectiveWithStats, withStatsFlag},
 		{opts.RunAnalyze, "--run-analyze"},
 		{opts.OnErrorContinue, "--on-error-continue"},
 		{opts.TruncateTable, "--truncate-table"},
@@ -623,13 +684,46 @@ func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args [
 	if tool == "" {
 		return b.String()
 	}
+	if statsPartialTolerated(tool, args) {
+		// gprestore with statistics restore requested: capture the exit code so
+		// a statistics-only failure (exit 2) is downgraded to success-with-warning
+		// while any other failure still fails the Job.
+		b.WriteString("rc=0\n")
+		writeToolInvocation(&b, tool, args)
+		b.WriteString(" || rc=$?\n")
+		b.WriteString(gprestoreStatsExitGuard)
+		b.WriteString("exit \"${rc}\"\n")
+		return b.String()
+	}
+	writeToolInvocation(&b, tool, args)
+	b.WriteString("\n")
+	return b.String()
+}
+
+// writeToolInvocation writes "<tool> 'arg1' 'arg2' ..." (no trailing newline).
+func writeToolInvocation(b *strings.Builder, tool string, args []string) {
 	b.WriteString(tool)
 	for _, a := range args {
 		b.WriteString(" ")
 		b.WriteString(shellQuote(a))
 	}
-	b.WriteString("\n")
-	return b.String()
+}
+
+// statsPartialTolerated reports whether the tool invocation is a gprestore run
+// that requested statistics restore (--with-stats) and therefore tolerates the
+// statistics-only exit code 2 as success-with-warning (the known upstream
+// gpbackup bug: invalid bigint in statistics.sql fails ONLY the stats restore
+// while the data restore succeeded).
+func statsPartialTolerated(tool string, args []string) bool {
+	if tool != gprestoreTool {
+		return false
+	}
+	for _, a := range args {
+		if a == withStatsFlag {
+			return true
+		}
+	}
+	return false
 }
 
 // coordinatorExecScript builds the coordinator-exec wrapper the S3 backup/restore
@@ -738,15 +832,29 @@ func coordinatorExecScript(cluster *cbv1alpha1.CloudberryCluster, tool string, a
 	// The remote bootstrap decodes the inner tool script from stdin and runs it
 	// with `bash -c <inner> _ <cfg> <host> <port> <user> <db> <pass>` so the
 	// base64 values land as $1..$6 inside innerTool.
-	b.WriteString("printf '%s' \"${INNER_TOOL}\" | base64 | " +
+	remoteExec := "printf '%s' \"${INNER_TOOL}\" | base64 | " +
 		"\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- bash -c '" +
 		"INNER=$(base64 -d); " +
 		"bash -c \"${INNER}\" _ \"$0\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"' " +
 		"\"${CFG_B64}\" \"${HOST_B64}\" \"${PORT_B64}\" " +
-		"\"${USER_B64}\" \"${DB_B64}\" \"${PASS_B64}\"\n")
+		"\"${USER_B64}\" \"${DB_B64}\" \"${PASS_B64}\""
 	// Best-effort cleanup of the staged config inside the coordinator pod.
-	b.WriteString("\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- " +
-		"bash -c 'rm -f \"$0\"' \"${COORD_CFG}\" 2>/dev/null || true\n")
+	cleanup := "\"${KUBECTL}\" exec -i \"${COORD_POD}\" -- " +
+		"bash -c 'rm -f \"$0\"' \"${COORD_CFG}\" 2>/dev/null || true\n"
+	if statsPartialTolerated(tool, args) {
+		// gprestore with statistics restore requested: capture the remote exit
+		// code (kubectl exec propagates it) so a statistics-only failure
+		// (exit 2) is downgraded to success-with-warning in the Job pod, while
+		// any other failure still fails the Job. Cleanup always runs.
+		b.WriteString("rc=0\n")
+		b.WriteString(remoteExec + " || rc=$?\n")
+		b.WriteString(cleanup)
+		b.WriteString(gprestoreStatsExitGuard)
+		b.WriteString("exit \"${rc}\"\n")
+		return b.String()
+	}
+	b.WriteString(remoteExec + "\n")
+	b.WriteString(cleanup)
 	return b.String()
 }
 
@@ -834,11 +942,21 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	// Record the effective backup type so the controller can derive status from
 	// the spawned Job's label (spec-driven for the CronJob path; nil opts).
 	labels[util.LabelBackupType] = effectiveBackupType(cluster, nil)
-	args := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, nil)
+	// The CRD declares no per-schedule database list, so scheduled backups
+	// target the coordinator maintenance database (postgres): gpbackup
+	// hard-requires --dbname, and rendering the CronJob without it produced
+	// Jobs that always failed at runtime (`required flag(s) "dbname" not set`).
+	jobOpts := withDefaultBackupDatabase(nil)
+	args, err := buildGpbackupArgs(cluster, cluster.Spec.Backup.Gpbackup, jobOpts)
+	if err != nil {
+		// Defense in depth: unreachable — withDefaultBackupDatabase always
+		// resolves a database — but no CronJob is safer than a broken one.
+		return nil
+	}
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
-	// The CronJob's backup target databases are resolved at runtime, so
-	// CBDB_DATABASE is emitted empty (still inspectable) per spec 11.
-	applyBackupGpbackupEnv(&podSpec, "", cluster.Spec.Backup.Gpbackup)
+	// CBDB_DATABASE mirrors the rendered --dbname (spec 11: the env stays
+	// informational/inspectable and must match the CLI args).
+	applyBackupGpbackupEnv(&podSpec, firstDatabase(jobOpts.Databases), cluster.Spec.Backup.Gpbackup)
 	addPreBackupCheckInitContainer(cluster, &podSpec)
 
 	historyLimit := int32(3)
@@ -864,21 +982,28 @@ func (b *DefaultBuilder) BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluste
 	}
 }
 
-// BuildBackupJob builds an on-demand gpbackup Job.
+// BuildBackupJob builds an on-demand gpbackup Job. When opts carries no
+// database the backup targets the coordinator maintenance database (see
+// withDefaultBackupDatabase) so the rendered gpbackup command is always valid;
+// the REST API layer additionally rejects database-less requests with 400, so
+// user-facing requests are always explicit.
 func (b *DefaultBuilder) BuildBackupJob(
 	cluster *cbv1alpha1.CloudberryCluster,
 	opts *BackupJobOptions,
 ) *batchv1.Job {
-	if opts == nil {
-		opts = &BackupJobOptions{}
-	}
+	opts = withDefaultBackupDatabase(opts)
 	labels := backupLabels(cluster.Name, util.BackupOperationBackup)
 	// Record the effective backup type (per-request Type/Gpbackup override or the
 	// cluster spec) so the controller derives status from THIS Job's label.
 	labels[util.LabelBackupType] = effectiveBackupType(cluster, opts)
 
 	gpOpts := opts.gpbackupOrSpec(cluster)
-	args := buildGpbackupArgs(cluster, gpOpts, opts)
+	args, err := buildGpbackupArgs(cluster, gpOpts, opts)
+	if err != nil {
+		// Defense in depth: unreachable — withDefaultBackupDatabase always
+		// resolves a database — but no Job is safer than a broken one.
+		return nil
+	}
 	podSpec := b.buildBackupPodSpec(cluster, backupContainerName, "gpbackup", args)
 	applyBackupGpbackupEnv(&podSpec, firstDatabase(opts.Databases), gpOpts)
 	addPreBackupCheckInitContainer(cluster, &podSpec)

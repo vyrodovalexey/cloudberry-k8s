@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // errAdmissionInternal classifies an internal (non-validation) admission
@@ -87,8 +89,10 @@ func (v *CloudberryClusterValidator) ValidateCreate(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	ctx, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpCreate)
 	warnings, err := v.validateCreate(ctx, cluster)
 	v.recordAdmission(admissionOpCreate, err)
+	end(err)
 	return warnings, err
 }
 
@@ -135,12 +139,14 @@ func (v *CloudberryClusterValidator) checkDuplicateName(
 
 // ValidateUpdate validates a CloudberryCluster on update.
 func (v *CloudberryClusterValidator) ValidateUpdate(
-	_ context.Context,
+	ctx context.Context,
 	oldCluster *cbv1alpha1.CloudberryCluster,
 	newCluster *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
+	_, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpUpdate)
 	warnings, err := validateUpdate(oldCluster, newCluster)
 	v.recordAdmission(admissionOpUpdate, err)
+	end(err)
 	return warnings, err
 }
 
@@ -163,11 +169,13 @@ func validateUpdate(
 
 // ValidateDelete validates a CloudberryCluster on deletion.
 func (v *CloudberryClusterValidator) ValidateDelete(
-	_ context.Context,
+	ctx context.Context,
 	_ *cbv1alpha1.CloudberryCluster,
 ) (admission.Warnings, error) {
 	// No validation needed on delete.
+	_, end := startAdmissionSpan(ctx, "webhook.validate", admissionOpDelete)
 	v.recordAdmission(admissionOpDelete, nil)
+	end(nil)
 	return nil, nil
 }
 
@@ -196,7 +204,7 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateQueryMonitoring(cluster); err != nil {
 		return warnings, err
 	}
-	if err := validateBackup(cluster); err != nil {
+	if err := validateBackup(cluster, &warnings); err != nil {
 		return warnings, err
 	}
 	if err := validateDataLoading(cluster); err != nil {
@@ -328,13 +336,13 @@ const backupDestinationTypeLocal = "local"
 
 // validateBackup validates backup configuration per spec 11 §Webhook Validation.
 // It enforces the full rule set when backup is enabled.
-func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
+func validateBackup(cluster *cbv1alpha1.CloudberryCluster, warnings *admission.Warnings) error {
 	backup := cluster.Spec.Backup
 	if backup == nil || !backup.Enabled {
 		return nil
 	}
 
-	if err := validateBackupDestination(&backup.Destination); err != nil {
+	if err := validateBackupDestination(&backup.Destination, warnings); err != nil {
 		return err
 	}
 	if err := validateBackupGpbackup(backup.Gpbackup); err != nil {
@@ -348,15 +356,21 @@ func validateBackup(cluster *cbv1alpha1.CloudberryCluster) error {
 			return fmt.Errorf("backup.schedule is not a valid cron expression: %w", err)
 		}
 	}
+	// The mutating webhook defaults backup.image to the official backup image,
+	// so an empty value here means defaulting was bypassed. The image must be
+	// backup-capable: it must contain kubectl (the Jobs `kubectl exec`
+	// gpbackup/gprestore into the coordinator pod) and the gpbackup toolchain.
 	if backup.Image == "" {
-		return fmt.Errorf("backup.image is required when backup is enabled")
+		return fmt.Errorf("backup.image is required when backup is enabled; "+
+			"the image must contain kubectl and gpbackup (e.g. %s)", util.DefaultBackupImage)
 	}
 	return nil
 }
 
 // validateBackupDestination validates the destination type and, for s3, the
-// required bucket and credential secret fields (rules 1-3).
-func validateBackupDestination(dest *cbv1alpha1.BackupDestination) error {
+// required bucket and credential secret fields (rules 1-3), including the
+// shape of an optional vaultSecret.path (H-1b).
+func validateBackupDestination(dest *cbv1alpha1.BackupDestination, warnings *admission.Warnings) error {
 	switch dest.Type {
 	case "":
 		return fmt.Errorf("backup.destination.type is required when backup is enabled")
@@ -385,6 +399,35 @@ func validateBackupDestination(dest *cbv1alpha1.BackupDestination) error {
 		return fmt.Errorf(
 			"backup.destination.s3 requires either credentialSecret.name or " +
 				"vaultSecret.path for S3 credentials")
+	}
+	if s3.VaultSecret != nil {
+		return validateS3VaultSecretPath(s3.VaultSecret.Path, warnings)
+	}
+	return nil
+}
+
+// validateS3VaultSecretPath validates the shape of the backup S3
+// vaultSecret.path (H-1b). The documented form is the LOGICAL KV path
+// ("secret/cloudberry/backup-s3" — both KV-v1 and KV-v2); the explicit KV-v2
+// request path ("secret/data/cloudberry/backup-s3") is accepted for backward
+// compatibility with a warning, since the operator injects the "data/"
+// segment automatically when needed. Empty paths and leading slashes are
+// rejected: Vault logical paths are mount-relative and never start with "/".
+func validateS3VaultSecretPath(path string, warnings *admission.Warnings) error {
+	if path == "" {
+		return fmt.Errorf("backup.destination.s3.vaultSecret.path must not be empty")
+	}
+	if strings.HasPrefix(path, "/") {
+		return fmt.Errorf(
+			"backup.destination.s3.vaultSecret.path must not start with %q "+
+				"(vault paths are mount-relative), got %q", "/", path)
+	}
+	if segments := strings.SplitN(path, "/", 3); len(segments) >= 2 && segments[1] == "data" {
+		*warnings = append(*warnings, fmt.Sprintf(
+			"backup.destination.s3.vaultSecret.path %q uses the explicit KV-v2 request "+
+				"path; prefer the logical path %q — the operator injects the data/ "+
+				"segment automatically for KV-v2 mounts",
+			path, segments[0]+"/"+segments[len(segments)-1]))
 	}
 	return nil
 }

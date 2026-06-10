@@ -244,6 +244,8 @@ const (
 	EventReasonRebalanceStarted = "RebalanceStarted"
 	// EventReasonRebalanceCompleted indicates a segment rebalance has completed.
 	EventReasonRebalanceCompleted = "RebalanceCompleted"
+	// EventReasonRebalanceFailed indicates a segment rebalance has failed.
+	EventReasonRebalanceFailed = "RebalanceFailed"
 	// EventReasonStorageExpanded indicates PVC storage has been expanded.
 	EventReasonStorageExpanded = "StorageExpanded"
 	// EventReasonWorkloadReconciled indicates workload management has been reconciled.
@@ -258,6 +260,26 @@ const (
 	// execution). It is emitted as an EventTypeWarning, de-duplicated per failed
 	// Job name so periodic reconciles do not re-emit for the same failure.
 	EventReasonBackupFailed = "BackupFailed"
+	// EventReasonBackupVaultCredentialsFailed indicates the operator could not
+	// materialize the backup S3 credentials from the configured Vault path
+	// (Vault read failure, missing fields, or no Vault client wired while
+	// spec.backup.destination.s3.vaultSecret is configured). Emitted as an
+	// EventTypeWarning so silently-skipped backups are observable (M-2).
+	EventReasonBackupVaultCredentialsFailed = "BackupVaultCredentialsFailed"
+	// EventReasonClusterTLSIssued indicates a cluster server certificate was
+	// auto-issued from Vault PKI into the auth.ssl certSecret.
+	EventReasonClusterTLSIssued = "ClusterTLSIssued"
+	// EventReasonClusterTLSRenewed indicates an operator-managed cluster server
+	// certificate was renewed from Vault PKI before expiry.
+	EventReasonClusterTLSRenewed = "ClusterTLSRenewed"
+	// EventReasonClusterTLSFailed indicates issuing or renewing a cluster
+	// server certificate from Vault PKI failed.
+	EventReasonClusterTLSFailed = "ClusterTLSFailed"
+	// EventReasonRestorePartial indicates a restore Job succeeded for data but
+	// the statistics restore step failed (gprestore exit code 2 — known
+	// upstream gpbackup bug where statistics.sql can carry an invalid bigint);
+	// the restore is treated as success-with-warning.
+	EventReasonRestorePartial = "RestorePartial"
 	// EventReasonRestoreFailed indicates a restore Job failed (e.g. gprestore
 	// refusing an incomplete incremental set). It is emitted as an
 	// EventTypeWarning, de-duplicated per failed Job name so periodic reconciles
@@ -682,7 +704,14 @@ type SSLSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// CertSecret references the TLS certificate secret.
+	// CertSecret references the TLS certificate secret. The Secret must carry
+	// the keys tls.crt, tls.key and ca.crt (the init-tls container requires
+	// ca.crt, so a bare kubernetes.io/tls secret without it is insufficient).
+	// When spec.vault.enabled is true, ssl.enabled is true and the referenced
+	// Secret does NOT exist, the operator auto-issues a server certificate from
+	// its configured Vault PKI mount/role, creates the Secret, and renews the
+	// certificate before expiry. A pre-existing (user-provided) Secret is never
+	// modified by the operator.
 	// +optional
 	CertSecret *CertSecretRef `json:"certSecret,omitempty"`
 
@@ -1184,6 +1213,11 @@ type BackupSpec struct {
 	JobTemplate *BackupJobTemplate `json:"jobTemplate,omitempty"`
 
 	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+	// It MUST be backup-capable: the image must contain kubectl (backup/restore
+	// Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
+	// coordinator-exec model) and the gpbackup/gprestore/gpbackup_s3_plugin
+	// toolchain. When unset and backup is enabled, the mutating webhook
+	// defaults it to the official backup image.
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -1316,7 +1350,11 @@ type S3Destination struct {
 
 // S3VaultSecret references a Vault KV path holding S3 credentials.
 type S3VaultSecret struct {
-	// Path is the Vault secret path (e.g. secret/data/cloudberry/backup-s3).
+	// Path is the LOGICAL Vault secret path (e.g. secret/cloudberry/backup-s3).
+	// For KV-v2 mounts the operator injects the "data/" request segment
+	// automatically, so the same logical path works for KV-v1 and KV-v2; an
+	// explicit KV-v2 request path (secret/data/cloudberry/backup-s3) is also
+	// accepted for backward compatibility. The path must not start with "/".
 	Path string `json:"path"`
 
 	// AccessKeyField is the Vault key holding the access key id (default aws_access_key_id).
@@ -1441,9 +1479,15 @@ type GprestoreOptions struct {
 	// +optional
 	WithGlobals bool `json:"withGlobals,omitempty"`
 
-	// WithStats maps to --with-stats. A nil pointer means "unset" and is defaulted
-	// to true by the mutating webhook; an explicit false is honored (the flag is
-	// not emitted). Using a pointer distinguishes "unset" from "explicitly false".
+	// WithStats maps to --with-stats. A nil pointer means "unset" and is
+	// defaulted to FALSE by the mutating webhook: restores do NOT restore
+	// statistics unless explicitly requested, because a known upstream gpbackup
+	// bug (invalid bigint in statistics.sql) makes gprestore exit with code 2
+	// when only the statistics restore fails while the data restore succeeded.
+	// When statistics restore IS requested (withStats:true) and gprestore exits
+	// with code 2, the operator treats the restore as success-with-warning
+	// (RestorePartial Event, result label "partial"). Consider runAnalyze to
+	// recompute fresh planner statistics instead.
 	// +optional
 	WithStats *bool `json:"withStats,omitempty"`
 

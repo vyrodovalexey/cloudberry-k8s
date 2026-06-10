@@ -29,6 +29,8 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
 - [HTTP Server Timeouts](#http-server-timeouts)
 - [Request Body Limits](#request-body-limits)
 - [Response Body Limits (CLI)](#response-body-limits-cli)
+- [API Observability](#api-observability)
+- [Data Loading Endpoints (Not Implemented)](#data-loading-endpoints-not-implemented)
 - [Input Validation](#input-validation)
 - [Annotations Reference](#annotations-reference)
   - [Action Annotations](#action-annotations-avsoftioaction)
@@ -72,6 +74,10 @@ Authorization: Bearer <JWT token>
 ### OIDC Redirect Protection
 
 The OIDC provider's HTTP client enforces a maximum of 5 redirects during OIDC discovery and token validation. This prevents infinite redirect loops when the identity provider misconfigures its endpoints. If the redirect limit is exceeded, the authentication attempt fails with a `401 UNAUTHORIZED` response.
+
+### OIDC Lazy Discovery
+
+If OIDC discovery fails at operator startup (e.g. the identity provider is briefly unavailable), Bearer authentication is not permanently disabled: the first Bearer request after the IdP recovers re-runs discovery, subject to a 30-second cooldown. Concurrent Bearer requests share a **single** in-flight discovery (singleflight), and each attempt is bounded by a **10-second timeout**, so a burst of requests against an unavailable IdP fails fast together instead of piling up. Successful per-request identity details (username/email/roles) are logged at **Debug** level only.
 
 ### Obtaining a JWT Token
 
@@ -650,6 +656,8 @@ curl -u admin:password -X POST \
   "type": "incremental"
 }
 ```
+
+> **Implementation status**: segment recovery is **not implemented yet**. The endpoint validates and accepts the request (the recovery annotation is set on the cluster), but the operator currently only acknowledges it: the annotation is removed, a `RecoveryNotImplemented` Warning event is emitted, and `cloudberry_recovery_operations_total` records `result="noop"`. No segment recovery work is performed. By contrast, `POST /clusters/{name}/standby/activate` **does** perform a real standby promotion (`PromoteStandby` / `pg_promote()`) with at-most-once semantics.
 
 **Error (400 Bad Request — invalid recovery type):**
 
@@ -2618,7 +2626,8 @@ When `guestAccess: true` is set in a cluster's `queryMonitoring` spec, certain r
 
 The API enforces per-IP token bucket rate limiting on all authenticated endpoints. Rate limiting is applied **before** authentication to protect against brute-force credential attacks.
 
-- **Default limit**: 10 requests per minute per client IP
+- **Default limit**: 10 requests per minute per client IP. Configurable via the `api-rate-limit` config key / `--api-rate-limit` flag / `CLOUDBERRY_API_RATE_LIMIT` environment variable; set `0` to disable (useful for performance testing)
+- **Observability**: rejections are counted on `cloudberry_api_rate_limit_rejections_total{route}` (route template label)
 - **Algorithm**: Token bucket with automatic refill based on elapsed time
 - **IP extraction**: Uses `RemoteAddr` by default. `X-Forwarded-For` and `X-Real-IP` headers are only trusted when the direct connection comes from a configured trusted proxy CIDR range. This prevents header spoofing attacks
 - **Trusted proxies**: Configure trusted proxy CIDR ranges (e.g., `10.0.0.0/8`) to enable proxy header trust. When no trusted proxies are configured (the default), only `RemoteAddr` is used
@@ -2660,6 +2669,36 @@ All endpoints that accept a request body enforce a maximum body size of **1 MiB*
 ## Response Body Limits (CLI)
 
 The `cloudberry-ctl` CLI enforces a maximum response body size of **10 MiB** (10,485,760 bytes) when reading API responses. This prevents the CLI from consuming excessive memory if the server returns an unexpectedly large response. Responses exceeding this limit are truncated.
+
+## API Observability
+
+Every API request is instrumented:
+
+- **Metrics** — `cloudberry_api_requests_total{route,method,code}`, `cloudberry_api_request_duration_seconds{route,method}`, `cloudberry_api_requests_in_flight`, and `cloudberry_api_rate_limit_rejections_total{route}`. The `route` label is always the matched route **template** (e.g. `/api/v1alpha1/clusters/{name}`), never the raw path, so label cardinality stays bounded. Recording is **panic-safe**: the in-flight gauge is decremented and the request recorded via `defer`, so a panicking handler can never leak the gauge upward.
+- **Tracing** — when telemetry is enabled, a server span is opened per request and renamed after routing to `<METHOD> <route template>` (raw path preserved in the `http.target` attribute); the span is marked `Error` on HTTP status `>= 400` and inbound W3C trace context is propagated. Handler-level child spans (`auth.*`, `db.*`) nest underneath.
+
+See the [User Guide — Monitoring and Observability](user-guide.md#monitoring-and-observability) for the full metric and span reference.
+
+## Data Loading Endpoints (Not Implemented)
+
+The data-loading **read** endpoints are functional:
+
+- `GET /api/v1alpha1/clusters/{name}/data-loading/jobs` — list configured jobs
+- `GET /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}` — get a job
+
+The data-loading **mutation** endpoints are not implemented yet and return
+`501 Not Implemented` with the standard error envelope (code
+`NOT_IMPLEMENTED`) instead of fake success responses:
+
+- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs`
+- `PUT /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}`
+- `DELETE /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}`
+- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/start`
+- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/stop`
+
+Full job lifecycle support (patching `spec.dataLoading.jobs`, creating loader
+Jobs, and recording the `cloudberry_data_loading_rows_total` metric) is
+tracked as a dedicated feature.
 
 ## Input Validation
 
@@ -2761,6 +2800,7 @@ The annotation is set when an upgrade begins and removed when the upgrade comple
 | `avsoft.io/confirm-scale-in` | Set to `"true"` to confirm a scale-in of more than 50% of segments |
 | `avsoft.io/scale-started` | Managed by operator — RFC 3339 timestamp tracking when a scale operation started. Used for timeout detection (10 minutes). Removed on success or failure |
 | `avsoft.io/upgrade` | Managed by operator — JSON state tracking an in-progress cluster upgrade. Contains previousImage, previousVersion, phase, startedAt, and phaseStartedAt. Used for phase-by-phase upgrade progression and rollback. Removed on success or rollback |
+| `avsoft.io/tls-cert-checksum` | Managed by operator — pod-template annotation on the coordinator/standby/segment StatefulSets carrying a checksum of the cluster TLS certificate Secret data (`auth.ssl.certSecret`). A certificate rotation changes the checksum and rolls the cluster pods exactly once; identical Secret data never triggers a rollout |
 
 ### Status Phases
 
@@ -2801,6 +2841,7 @@ Validates `CloudberryCluster` resources before admission. Enforces:
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
 - `deletionPolicy` is `Retain` or `Delete`
+- `backup.destination.s3.vaultSecret.path` (when set) must be non-empty and must not start with `/`; the explicit KV-v2 request form (`<mount>/data/<rest>`) is accepted with an admission **warning** suggesting the logical path — the operator injects the `data/` segment automatically for KV-v2 mounts
 
 **Duplicate name rejection example:**
 
@@ -2834,6 +2875,7 @@ Sets defaults on `CloudberryCluster` resources:
 | `segments.antiAffinity` | `preferred` |
 | `auth.basic.enabled` | `true` |
 | `auth.basic.adminUser` | `gpadmin` |
+| `backup.image` (when `backup.enabled`) | `"cloudberry-backup:2.1.0"` — the official backup toolchain image. A backup-capable image must contain `kubectl` (the backup/restore Jobs `kubectl exec` into the coordinator pod) and `gpbackup`/`gprestore`/`gpbackup_s3_plugin`; the base database image is **not** sufficient |
 | `ha.ftsProbeInterval` | `60` |
 | `ha.ftsProbeTimeout` | `20` |
 | `ha.ftsProbeRetries` | `5` |

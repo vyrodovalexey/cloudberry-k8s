@@ -112,7 +112,7 @@ func TestClusterReconciler_Reconcile_AddFinalizer(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 
 	// Verify finalizer was added
 	updated := &cbv1alpha1.CloudberryCluster{}
@@ -142,7 +142,7 @@ func TestClusterReconciler_Reconcile_SetInitialPhase(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 
 	// Verify phase was set to Pending
 	updated := &cbv1alpha1.CloudberryCluster{}
@@ -1028,8 +1028,8 @@ func TestClusterReconciler_RecordReconcileResult(t *testing.T) {
 
 	cluster := newTestCluster()
 	// Should not panic.
-	r.recordReconcileResult(cluster, time.Now(), "success")
-	r.recordReconcileResult(cluster, time.Now(), "error")
+	recordReconcileOutcome(r.metrics, cluster.Name, cluster.Namespace, time.Now(), nil)
+	recordReconcileOutcome(r.metrics, cluster.Name, cluster.Namespace, time.Now(), assert.AnError)
 }
 
 func TestClusterReconciler_UpdateStatus_MirroringInSync(t *testing.T) {
@@ -2022,7 +2022,7 @@ func TestClusterReconciler_CheckScaleProgress_Complete(t *testing.T) {
 
 	result, err := r.checkScaleProgress(context.Background(), cluster)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleProgress_InProgress(t *testing.T) {
@@ -2103,7 +2103,7 @@ func TestClusterReconciler_CompleteScaleOperation_ScaleOut(t *testing.T) {
 
 	result, err := r.completeScaleOperation(context.Background(), cluster)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CompleteScaleOperation_ScaleIn(t *testing.T) {
@@ -2127,7 +2127,7 @@ func TestClusterReconciler_CompleteScaleOperation_ScaleIn(t *testing.T) {
 
 	result, err := r.completeScaleOperation(context.Background(), cluster)
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_FinaliseScaleIn(t *testing.T) {
@@ -2916,7 +2916,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Stopped(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	assert.False(t, result.Requeue)
 }
@@ -2937,7 +2937,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Stopping(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	// Should either requeue or complete.
 	_ = result
@@ -2959,7 +2959,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Restricted(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
 }
@@ -2980,7 +2980,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Maintenance(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
 }
@@ -3001,7 +3001,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Scaling(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	_ = result
 }
@@ -3022,7 +3022,7 @@ func TestClusterReconciler_HandleLifecyclePhase_Updating(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	_ = result
 }
@@ -3046,7 +3046,7 @@ func TestClusterReconciler_HandleLifecyclePhase_WithAction(t *testing.T) {
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
-	_, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	_, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.False(t, handled) // Action pending, should not handle lifecycle.
 }
 
@@ -3675,7 +3675,7 @@ func TestClusterReconciler_CheckMirroringProgress_Initializing(t *testing.T) {
 
 	// Assert: Should advance to syncing phase.
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckMirroringProgress_Syncing(t *testing.T) {
@@ -4646,7 +4646,7 @@ func TestClusterReconciler_AdvanceMirroringPhase(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 	assert.Equal(t, mirroringPhaseInit, state.Phase)
 }
 
@@ -4671,7 +4671,7 @@ func TestClusterReconciler_HandleLifecyclePhase_UpdatingWithMirroringAnnotation(
 	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
 
 	// Act
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 
 	// Assert: Should be handled (mirroring progress check).
 	assert.True(t, handled)
@@ -4939,7 +4939,7 @@ func TestClusterReconciler_CheckMirroringProgress_STSReady_AdvancesToInit(t *tes
 
 	// Assert: Should advance to init phase.
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckMirroringProgress_SyncingWithDBError(t *testing.T) {

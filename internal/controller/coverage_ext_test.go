@@ -95,7 +95,7 @@ func TestClusterReconciler_CheckScaleOutPhases_ScalingSTS_Ready(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue) // Advances to next phase
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter) // Advances to next phase
 }
 
 func TestClusterReconciler_CheckScaleOutPhases_Registering(t *testing.T) {
@@ -124,7 +124,7 @@ func TestClusterReconciler_CheckScaleOutPhases_Registering(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleOutPhases_Redistributing(t *testing.T) {
@@ -152,7 +152,7 @@ func TestClusterReconciler_CheckScaleOutPhases_Redistributing(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleOutPhases_Completed(t *testing.T) {
@@ -180,7 +180,7 @@ func TestClusterReconciler_CheckScaleOutPhases_Completed(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleOutPhases_InvalidJSON(t *testing.T) {
@@ -224,7 +224,7 @@ func TestClusterReconciler_CheckScaleOutPhases_UnknownPhase(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================
@@ -257,7 +257,7 @@ func TestClusterReconciler_CheckScaleInPhases_Redistributing(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_Deregistering(t *testing.T) {
@@ -285,7 +285,7 @@ func TestClusterReconciler_CheckScaleInPhases_Deregistering(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_DeregisteringWithMirroring(t *testing.T) {
@@ -314,7 +314,7 @@ func TestClusterReconciler_CheckScaleInPhases_DeregisteringWithMirroring(t *test
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_ScalingMirrors(t *testing.T) {
@@ -350,7 +350,7 @@ func TestClusterReconciler_CheckScaleInPhases_ScalingMirrors(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_ScalingPrimaries(t *testing.T) {
@@ -385,7 +385,7 @@ func TestClusterReconciler_CheckScaleInPhases_ScalingPrimaries(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_Cleanup(t *testing.T) {
@@ -414,7 +414,7 @@ func TestClusterReconciler_CheckScaleInPhases_Cleanup(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_Completed(t *testing.T) {
@@ -442,7 +442,7 @@ func TestClusterReconciler_CheckScaleInPhases_Completed(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleInPhases_InvalidJSON(t *testing.T) {
@@ -486,7 +486,7 @@ func TestClusterReconciler_CheckScaleInPhases_UnknownPhase(t *testing.T) {
 
 	result, err := r.checkScaleInPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.True(t, result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }
 
 // ============================================================================
@@ -934,7 +934,7 @@ func TestClusterReconciler_HandleGenerationUnchanged_ScaleStateAnnotation(t *tes
 
 	res := r.handleGenerationUnchanged(context.Background(), cluster)
 	assert.True(t, res.handled)
-	assert.True(t, res.result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, res.result.RequeueAfter)
 }
 
 func TestClusterReconciler_HandleGenerationUnchanged_ScaleInStateAnnotation(t *testing.T) {
@@ -958,7 +958,7 @@ func TestClusterReconciler_HandleGenerationUnchanged_ScaleInStateAnnotation(t *t
 
 	res := r.handleGenerationUnchanged(context.Background(), cluster)
 	assert.True(t, res.handled)
-	assert.True(t, res.result.Requeue)
+	assert.Equal(t, requeueAfterImmediate, res.result.RequeueAfter)
 }
 
 func TestClusterReconciler_HandleGenerationUnchanged_ConfirmScaleIn(t *testing.T) {
@@ -1042,7 +1042,7 @@ func TestClusterReconciler_HandleLifecyclePhase_UpdatingWithMirroringState(t *te
 
 	r := NewClusterReconciler(k8sClient, scheme, recorder, builder.NewBuilder(), m, nil)
 
-	result, handled := r.handleLifecyclePhase(context.Background(), cluster)
+	result, handled, _ := r.handleLifecyclePhase(context.Background(), cluster)
 	assert.True(t, handled)
 	_ = result
 }

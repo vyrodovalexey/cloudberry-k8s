@@ -319,18 +319,9 @@ func (m *certManager) checkCertRotation(secret *corev1.Secret) (bool, error) {
 		return true, nil
 	}
 
-	now := time.Now()
-	if now.After(cert.NotAfter) {
-		return true, nil
-	}
-
-	// Rotate at 2/3 of the certificate lifetime.
-	lifetime := cert.NotAfter.Sub(cert.NotBefore)
-	rotationTime := cert.NotBefore.Add(
-		time.Duration(float64(lifetime) * rotationThresholdFraction),
-	)
-
-	return now.After(rotationTime), nil
+	// Rotate when expired or past 2/3 of the certificate lifetime (shared with
+	// NeedsRotationFromPEM, which the cluster controller uses for cluster TLS).
+	return certPastRotationThreshold(cert), nil
 }
 
 // isSelfSignedIssuer reports whether the certificate was issued by the operator's

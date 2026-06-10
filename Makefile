@@ -316,12 +316,12 @@ undeploy-cluster: ## Remove sample cluster
 
 .PHONY: generate
 generate: controller-gen ## Generate deepcopy, CRD manifests
-	$(CONTROLLER_GEN) object paths="./api/..."
-	$(CONTROLLER_GEN) crd:allowDangerousTypes=true paths="./api/..." output:crd:artifacts:config=deploy/helm/cloudberry-operator/crds
+	$$(command -v controller-gen || echo "$$($(GO) env GOPATH)/bin/controller-gen") object paths="./api/..."
+	$$(command -v controller-gen || echo "$$($(GO) env GOPATH)/bin/controller-gen") crd:allowDangerousTypes=true paths="./api/..." output:crd:artifacts:config=deploy/helm/cloudberry-operator/crds
 
 .PHONY: manifests
 manifests: controller-gen ## Generate CRD and RBAC manifests
-	$(CONTROLLER_GEN) crd:allowDangerousTypes=true rbac:roleName=cloudberry-operator paths="./..." \
+	$$(command -v controller-gen || echo "$$($(GO) env GOPATH)/bin/controller-gen") crd:allowDangerousTypes=true rbac:roleName=cloudberry-operator paths="./..." \
 		output:crd:artifacts:config=deploy/helm/cloudberry-operator/crds
 
 .PHONY: controller-gen

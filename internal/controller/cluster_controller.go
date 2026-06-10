@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -28,13 +30,17 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 )
 
 const (
-	clusterControllerName  = "cluster-controller"
-	requeueAfterDefault    = 30 * time.Second
-	requeueAfterError      = 10 * time.Second
-	requeueAfterStopping   = 5 * time.Second
+	clusterControllerName = "cluster-controller"
+	requeueAfterDefault   = 30 * time.Second
+	requeueAfterError     = 10 * time.Second
+	requeueAfterStopping  = 5 * time.Second
+	// requeueAfterImmediate replaces the deprecated ctrl.Result{RequeueAfter: requeueAfterImmediate}
+	// (controller-runtime >= 0.19) for "requeue as soon as possible" exits.
+	requeueAfterImmediate  = time.Second
 	scaleTimeout           = 10 * time.Minute
 	upgradePhaseTimeout    = 10 * time.Minute
 	mirroringEnableTimeout = 30 * time.Minute
@@ -77,6 +83,7 @@ func recordReconcileOutcome(
 
 // ClusterReconciler reconciles a CloudberryCluster object.
 type ClusterReconciler struct {
+	reconcileIntervals
 	client    client.Client
 	scheme    *runtime.Scheme
 	recorder  record.EventRecorder
@@ -84,6 +91,15 @@ type ClusterReconciler struct {
 	metrics   metrics.Recorder
 	dbFactory db.DBClientFactory
 	logger    *slog.Logger
+
+	// vaultClient is the optional Vault client used to auto-issue cluster
+	// server certificates (spec.auth.ssl) from Vault PKI; nil disables
+	// auto-issuance. It is wired via SetClusterTLS together with the
+	// operator-level PKI mount path and role (the same PKI settings used for
+	// the webhook certificates).
+	vaultClient       vault.Client
+	vaultPKIMountPath string
+	vaultPKIRole      string
 }
 
 // NewClusterReconciler creates a new ClusterReconciler.
@@ -117,7 +133,7 @@ func NewClusterReconciler(
 }
 
 // Reconcile handles the reconciliation loop for CloudberryCluster resources.
-func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	startTime := time.Now()
 	logger := r.logger.With("cluster", req.Name, "namespace", req.Namespace)
 	ctx = util.WithLogger(ctx, logger)
@@ -125,20 +141,30 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	ctx, span := telemetry.StartSpan(ctx, clusterControllerName, "Reconcile")
 	defer span.End()
 
+	// Record the reconcile outcome/duration and mark the span on error exactly
+	// once on EVERY exit path (fetch error, action, lifecycle phases,
+	// generation-unchanged, finalizer-add, deletion, main flow). This mirrors
+	// the AdminReconciler pattern so cloudberry_reconcile_* covers all
+	// cluster-controller activity (code review M-9).
+	defer func() {
+		recordReconcileOutcome(r.metrics, req.Name, req.Namespace, startTime, err)
+		telemetry.SetSpanError(span, err)
+	}()
+
 	logger.Info("starting reconciliation")
 	logger.Debug("reconciliation details",
 		"name", req.Name, "namespace", req.Namespace, "startTime", startTime)
 
 	// Fetch the CloudberryCluster resource.
 	cluster := &cbv1alpha1.CloudberryCluster{}
-	if err := r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
+	if err = r.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("cluster resource not found, likely deleted")
+			err = nil
 			return ctrl.Result{}, nil
 		}
-		wrapped := fmt.Errorf("fetching cluster: %w", err)
-		telemetry.SetSpanError(span, wrapped)
-		return ctrl.Result{}, wrapped
+		err = fmt.Errorf("fetching cluster: %w", err)
+		return ctrl.Result{}, err
 	}
 
 	logger.Debug("cluster resource fetched",
@@ -151,19 +177,15 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// generation, so they must be checked before the generation skip.
 	if action, ok := cluster.Annotations[util.AnnotationAction]; ok {
 		logger.Debug("handling action annotation", "action", action)
-		result, err := r.handleAction(ctx, cluster, action)
-		if err != nil {
-			r.recordReconcileResult(cluster, startTime, "error")
-			telemetry.SetSpanError(span, err)
-			return result, err
-		}
-		return result, nil
+		result, err = r.handleAction(ctx, cluster, action)
+		return result, err
 	}
 
 	// Check if the cluster is in a lifecycle phase that should short-circuit reconciliation.
-	if result, handled := r.handleLifecyclePhase(ctx, cluster); handled {
+	if lcResult, handled, lcErr := r.handleLifecyclePhase(ctx, cluster); handled {
 		logger.Debug("lifecycle phase handled, short-circuiting", "phase", cluster.Status.Phase)
-		return result, nil
+		err = lcErr
+		return lcResult, err
 	}
 
 	// Skip full reconciliation if only status changed (ObservedGeneration matches).
@@ -172,38 +194,36 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if cluster.Status.ObservedGeneration == cluster.Generation &&
 		cluster.Status.Phase == cbv1alpha1.ClusterPhaseRunning {
 		if res := r.handleGenerationUnchanged(ctx, cluster); res.handled {
-			return res.result, res.err
+			err = res.err
+			return res.result, err
 		}
 	}
 
 	// Handle deletion.
 	if !cluster.DeletionTimestamp.IsZero() {
 		logger.Debug("handling cluster deletion")
-		return r.handleDeletion(ctx, cluster)
+		result, err = r.handleDeletion(ctx, cluster)
+		return result, err
 	}
 
 	// Ensure finalizer is set.
 	if !controllerutil.ContainsFinalizer(cluster, util.FinalizerName) {
 		logger.Debug("adding finalizer to cluster")
 		controllerutil.AddFinalizer(cluster, util.FinalizerName)
-		if err := r.client.Update(ctx, cluster); err != nil {
-			wrapped := fmt.Errorf("adding finalizer: %w", err)
-			telemetry.SetSpanError(span, wrapped)
-			return ctrl.Result{}, wrapped
+		if err = r.client.Update(ctx, cluster); err != nil {
+			err = fmt.Errorf("adding finalizer: %w", err)
+			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 	}
 
 	// Main reconciliation flow.
 	logger.Debug("entering main reconciliation flow")
-	result, err := r.reconcileCluster(ctx, cluster)
+	result, err = r.reconcileCluster(ctx, cluster)
 	if err != nil {
-		r.recordReconcileResult(cluster, startTime, "error")
-		telemetry.SetSpanError(span, err)
 		return result, err
 	}
 
-	r.recordReconcileResult(cluster, startTime, "success")
 	logger.Info("reconciliation completed", "duration", time.Since(startTime))
 	logger.Debug("reconciliation result", "requeue", result.RequeueAfter > 0, "requeueAfter", result.RequeueAfter)
 	return result, nil
@@ -212,15 +232,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 // handleLifecyclePhase checks whether the cluster is in a lifecycle phase
 // (Stopped, Stopping, Restricted, Maintenance) that should short-circuit
 // normal reconciliation when no action annotation is pending.
-// Returns (result, true) if the phase was handled, or (_, false) to continue.
+// Returns (result, true, err) if the phase was handled, or (_, false, nil) to
+// continue. Phase-progress errors are RETURNED (not swallowed) so
+// controller-runtime applies its error backoff and the reconcile error metric
+// is recorded (code review M-9).
 func (r *ClusterReconciler) handleLifecyclePhase(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, bool) {
+) (result ctrl.Result, handled bool, err error) {
 	_, hasAction := cluster.Annotations[util.AnnotationAction]
 	if hasAction {
 		// An action is pending — let the main reconciliation handle it.
-		return ctrl.Result{}, false
+		return ctrl.Result{}, false, nil
 	}
 
 	logger := util.LoggerFromContext(ctx)
@@ -229,45 +252,33 @@ func (r *ClusterReconciler) handleLifecyclePhase(
 	case cbv1alpha1.ClusterPhaseStopped:
 		logger.Info("cluster is stopped, skipping reconciliation")
 		r.recordMetricsSnapshot(cluster)
-		return ctrl.Result{}, true
+		return ctrl.Result{}, true, nil
 
 	case cbv1alpha1.ClusterPhaseStopping:
 		result, err := r.checkStopProgress(ctx, cluster)
-		if err != nil {
-			logger.Error("error checking stop progress", "error", err)
-		}
-		return result, true
+		return result, true, err
 
 	case cbv1alpha1.ClusterPhaseRestricted, cbv1alpha1.ClusterPhaseMaintenance:
 		logger.Info("cluster in limited mode, skipping full reconciliation",
 			"phase", cluster.Status.Phase)
 		r.recordMetricsSnapshot(cluster)
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, true
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, true, nil
 
 	case cbv1alpha1.ClusterPhaseScaling:
 		result, err := r.checkScaleProgress(ctx, cluster)
-		if err != nil {
-			logger.Error("error checking scale progress", "error", err)
-		}
-		return result, true
+		return result, true, err
 
 	case cbv1alpha1.ClusterPhaseUpdating:
 		// Check if this is a mirroring operation (vs upgrade).
 		if cluster.Annotations[util.AnnotationMirroringState] != "" {
 			result, err := r.checkMirroringProgress(ctx, cluster)
-			if err != nil {
-				logger.Error("error checking mirroring progress", "error", err)
-			}
-			return result, true
+			return result, true, err
 		}
 		result, err := r.continueUpgrade(ctx, cluster)
-		if err != nil {
-			logger.Error("error continuing upgrade", "error", err)
-		}
-		return result, true
+		return result, true, err
 
 	default:
-		return ctrl.Result{}, false
+		return ctrl.Result{}, false, nil
 	}
 }
 
@@ -298,7 +309,7 @@ func (r *ClusterReconciler) handleGenerationUnchanged(
 				err: fmt.Errorf("restoring scaling phase: %w", err), handled: true,
 			}
 		}
-		return generationUnchangedResult{result: ctrl.Result{Requeue: true}, handled: true}
+		return generationUnchangedResult{result: ctrl.Result{RequeueAfter: requeueAfterImmediate}, handled: true}
 	}
 	// If confirm-scale-in annotation is present, a previously blocked scale-in
 	// may now be ready to proceed. Force reconciliation to re-evaluate.
@@ -310,7 +321,7 @@ func (r *ClusterReconciler) handleGenerationUnchanged(
 		"generation", cluster.Generation)
 	r.recordMetricsSnapshot(cluster)
 	return generationUnchangedResult{
-		result: ctrl.Result{RequeueAfter: requeueAfterDefault}, handled: true,
+		result: ctrl.Result{RequeueAfter: r.requeueDefault()}, handled: true,
 	}
 }
 
@@ -346,7 +357,7 @@ func (r *ClusterReconciler) reconcileCluster(
 		if err := r.updateStatus(ctx, cluster); err != nil {
 			return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating status: %w", err)
 		}
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 	}
 
 	// Reconcile StatefulSets and storage.
@@ -360,7 +371,7 @@ func (r *ClusterReconciler) reconcileCluster(
 		return ctrl.Result{RequeueAfter: requeueAfterError}, fmt.Errorf("updating status: %w", err)
 	}
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // reconcileCoreResources reconciles the core Kubernetes resources that must exist
@@ -381,6 +392,14 @@ func (r *ClusterReconciler) reconcileCoreResources(
 	// dispatch over SSH to all segments.
 	if err := r.reconcileClusterSSHSecret(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling cluster ssh secret: %w", err)
+	}
+
+	// Reconcile the cluster server TLS Secret: auto-issue from Vault PKI when
+	// the cluster enables vault + auth.ssl and the referenced certSecret does
+	// not exist, and renew operator-issued certificates before expiry. The
+	// Secret must exist before the StatefulSets mount it.
+	if err := r.reconcileClusterTLSSecret(ctx, cluster); err != nil {
+		return fmt.Errorf("reconciling cluster tls secret: %w", err)
 	}
 
 	// Reconcile ConfigMaps.
@@ -578,6 +597,9 @@ func (r *ClusterReconciler) reconcileCoordinator(
 	if err != nil {
 		return fmt.Errorf("building coordinator StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+		return err
+	}
 	return r.createOrUpdateStatefulSet(ctx, desired)
 }
 
@@ -592,6 +614,9 @@ func (r *ClusterReconciler) reconcileStandby(
 	}
 	if desired == nil {
 		return nil
+	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+		return err
 	}
 	return r.createOrUpdateStatefulSet(ctx, desired)
 }
@@ -631,6 +656,9 @@ func (r *ClusterReconciler) reconcileSegments(
 	if err != nil {
 		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, primarySts); err != nil {
+		return err
+	}
 	// Safety: never scale down replicas via the normal path — scale-in must go
 	// through handleScaleIn to ensure data redistribution and segment deregistration.
 	if getErr == nil && existingSts.Spec.Replicas != nil && primarySts.Spec.Replicas != nil {
@@ -651,6 +679,9 @@ func (r *ClusterReconciler) reconcileSegments(
 	}
 	if mirrorSts == nil {
 		return nil
+	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, mirrorSts); err != nil {
+		return err
 	}
 	r.preserveMirrorReplicasIfNeeded(ctx, mirrorSts, getErr)
 	if err := r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
@@ -736,7 +767,10 @@ func (r *ClusterReconciler) handleScaleOut(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	oldCount, newCount int32,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "scaleOut")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// Pre-flight: cluster must be in Running phase.
@@ -759,10 +793,11 @@ func (r *ClusterReconciler) handleScaleOut(
 
 	// Store scale state for multi-phase operation.
 	state := scaleStateData{
-		Phase:     scalePhaseScalingSTS,
-		OldCount:  oldCount,
-		NewCount:  newCount,
-		StartedAt: scaleStartTime,
+		Phase:          scalePhaseScalingSTS,
+		OldCount:       oldCount,
+		NewCount:       newCount,
+		StartedAt:      scaleStartTime,
+		PhaseStartedAt: scaleStartTime,
 	}
 	stateJSON, err := json.Marshal(state)
 	if err != nil {
@@ -829,7 +864,10 @@ func (r *ClusterReconciler) handleScaleIn(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	oldCount, newCount int32,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "scaleIn")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// Pre-flight: cluster must be in Running phase.
@@ -864,10 +902,11 @@ func (r *ClusterReconciler) handleScaleIn(
 
 	// Store scale-in state for multi-phase operation.
 	state := scaleInStateData{
-		Phase:     scaleInPhaseRedistributing,
-		OldCount:  oldCount,
-		NewCount:  newCount,
-		StartedAt: scaleStartTime,
+		Phase:          scaleInPhaseRedistributing,
+		OldCount:       oldCount,
+		NewCount:       newCount,
+		StartedAt:      scaleStartTime,
+		PhaseStartedAt: scaleStartTime,
 	}
 	stateJSON, err := json.Marshal(state)
 	if err != nil {
@@ -939,7 +978,10 @@ func (r *ClusterReconciler) cleanupOrphanedPVCs(
 func (r *ClusterReconciler) reconcileStorageExpansion(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "storageExpansion")
+	defer func() { end(err) }()
+
 	expanded := false
 
 	// Coordinator PVC.
@@ -1131,8 +1173,10 @@ func (r *ClusterReconciler) expandPVCIfNeeded(
 	// Patch the PVC with the new size.
 	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desired
 	if err := r.client.Update(ctx, pvc); err != nil {
+		r.recordStorageExpansion(ctx, namespace, pvc, reconcileResultError)
 		return false, fmt.Errorf("updating PVC %s: %w", pvcName, err)
 	}
+	r.recordStorageExpansion(ctx, namespace, pvc, reconcileResultSuccess)
 
 	logger.Info("PVC expansion requested",
 		"pvc", pvcName,
@@ -1140,6 +1184,29 @@ func (r *ClusterReconciler) expandPVCIfNeeded(
 		"to", desired.String(),
 	)
 	return true, nil
+}
+
+// recordStorageExpansion records a PVC expansion attempt outcome on the
+// cloudberry_storage_expansions_total counter. The cluster label is derived
+// from the PVC's cluster label (PVCs are listed/expanded per cluster).
+func (r *ClusterReconciler) recordStorageExpansion(
+	ctx context.Context,
+	namespace string,
+	pvc *corev1.PersistentVolumeClaim,
+	result string,
+) {
+	if r.metrics == nil {
+		return
+	}
+	clusterName := pvc.Labels[util.LabelCluster]
+	if clusterName == "" {
+		// Fall back to the logger context cluster when the PVC carries no
+		// cluster label (should not happen for operator-managed PVCs).
+		util.LoggerFromContext(ctx).Debug("PVC missing cluster label for expansion metric",
+			"pvc", pvc.Name)
+		clusterName = "unknown"
+	}
+	r.metrics.RecordStorageExpansion(clusterName, namespace, result)
 }
 
 // storageClassSupportsExpansion checks whether the StorageClass used by a PVC
@@ -1198,6 +1265,11 @@ func (r *ClusterReconciler) createOrUpdateStatefulSet(ctx context.Context, desir
 	if err != nil {
 		return fmt.Errorf("getting statefulset %s: %w", desired.Name, err)
 	}
+
+	// Keep a previously stamped TLS cert checksum annotation when this
+	// desired template was built by a path that does not stamp it, so those
+	// paths never strip the annotation and roll the pods (L-5).
+	preserveTLSChecksumAnnotation(existing, desired)
 
 	// Update if spec changed.
 	if !equality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) ||
@@ -1274,10 +1346,28 @@ func (r *ClusterReconciler) createOrUpdateService(ctx context.Context, desired *
 }
 
 // handleDeletion handles the deletion of a CloudberryCluster.
+//
+// When spec.backupOnDelete=true AND deletionPolicy=Delete, deletion is a
+// small state machine driven by annotations (no CRD change):
+//  1. No deletion-backup Job yet: create it, stamp the Job name + deadline
+//     annotations, and requeue — PVCs and finalizer are NOT touched.
+//  2. Job exists and is non-terminal: requeue without touching PVCs/finalizer
+//     (the "backup before deletion" guarantee).
+//  3. Job Succeeded: proceed with PVC deletion and finalizer removal.
+//  4. Job terminally Failed OR the deadline (deletionBackupTimeout) elapsed:
+//     emit a Warning event, record the backup-on-delete metric with
+//     result="failed", and PROCEED with deletion — a broken backup must
+//     never wedge cluster/namespace deletion forever (documented policy).
+//
+// With deletionPolicy=Retain the volumes survive deletion, so the backup Job
+// remains best-effort fire-and-forget (behavior unchanged).
 func (r *ClusterReconciler) handleDeletion(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "deletion")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling cluster deletion")
 
@@ -1285,25 +1375,26 @@ func (r *ClusterReconciler) handleDeletion(
 		return ctrl.Result{}, nil
 	}
 
-	// Update phase to Deleting.
+	// Update phase to Deleting (event emitted only on the actual transition
+	// so deletion-backup requeues do not spam events).
 	if cluster.Status.Phase != cbv1alpha1.ClusterPhaseDeleting {
 		if _, err := r.updatePhase(ctx, cluster, cbv1alpha1.ClusterPhaseDeleting); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "Deleting", "Cluster deletion initiated")
 	}
-
-	r.recorder.Event(cluster, corev1.EventTypeNormal, "Deleting", "Cluster deletion initiated")
 
 	// Trigger backup before deletion if configured.
 	if cluster.Spec.BackupOnDelete {
-		logger.Info("triggering backup before deletion")
-		timestamp := time.Now().Format("20060102-150405")
-		backupJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceBackupOnDelete, timestamp)
-		if err := r.client.Create(ctx, backupJob); err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error("failed to create backup-on-delete job", "error", err)
+		if cluster.Spec.DeletionPolicy == cbv1alpha1.DeletionPolicyDelete {
+			done, result, err := r.ensureDeletionBackupComplete(ctx, cluster)
+			if err != nil || !done {
+				return result, err
+			}
 		} else {
-			r.recorder.Event(cluster, corev1.EventTypeNormal, "BackupOnDelete",
-				"Backup triggered before cluster deletion")
+			// Retain policy: data survives in the PVCs, so the backup is
+			// best-effort and does not gate deletion.
+			r.triggerBestEffortDeletionBackup(ctx, cluster)
 		}
 	}
 
@@ -1320,7 +1411,7 @@ func (r *ClusterReconciler) handleDeletion(
 			"PVCs retained (deletionPolicy: Retain)")
 	}
 
-	// Remove finalizer.
+	// Remove finalizer (always LAST, after the backup gate and PVC cleanup).
 	controllerutil.RemoveFinalizer(cluster, util.FinalizerName)
 	if err := r.client.Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
@@ -1329,6 +1420,202 @@ func (r *ClusterReconciler) handleDeletion(
 	logger.Info("cluster deletion completed")
 	r.recorder.Event(cluster, corev1.EventTypeNormal, "Deleted", "Cluster deletion completed")
 	return ctrl.Result{}, nil
+}
+
+// deletionBackupTimeout bounds how long the deletion flow waits for the
+// backup-on-delete Job before proceeding anyway (never wedge deletion).
+const deletionBackupTimeout = 30 * time.Minute
+
+// requeueAfterDeletionBackup is the poll interval while waiting for the
+// deletion-backup Job to reach a terminal state.
+const requeueAfterDeletionBackup = 15 * time.Second
+
+// backupOnDeleteMetricType is the backup-type metric label for deletion backups.
+const backupOnDeleteMetricType = "on-delete"
+
+// recordBackupOnDelete records the terminal outcome of a deletion backup
+// ("completed" or "failed") on both the generic backup counter (continuity
+// with pre-existing dashboards) and the dedicated
+// cloudberry_backup_on_delete_total counter.
+func (r *ClusterReconciler) recordBackupOnDelete(cluster *cbv1alpha1.CloudberryCluster, result string) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.RecordBackup(cluster.Name, cluster.Namespace, backupOnDeleteMetricType, result)
+	r.metrics.RecordBackupOnDelete(cluster.Name, cluster.Namespace, result)
+}
+
+// triggerBestEffortDeletionBackup creates the deletion backup Job without
+// waiting for it (deletionPolicy=Retain: the volumes survive, so a failed or
+// slow backup loses nothing).
+func (r *ClusterReconciler) triggerBestEffortDeletionBackup(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("triggering best-effort backup before deletion (deletionPolicy: Retain)")
+	// Deterministic per-deletion timestamp (L-7): a re-reconcile of the
+	// deletion flow re-derives the same Job name, so the AlreadyExists check
+	// below prevents duplicate best-effort backup Jobs.
+	timestamp := deletionBackupTimestamp(cluster)
+	backupJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceBackupOnDelete, timestamp)
+	if err := r.client.Create(ctx, backupJob); err != nil && !apierrors.IsAlreadyExists(err) {
+		logger.Error("failed to create backup-on-delete job", "error", err)
+	} else {
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "BackupOnDelete",
+			"Backup triggered before cluster deletion")
+	}
+}
+
+// ensureDeletionBackupComplete drives the deletion-backup state machine.
+// It returns done=true when deletion may proceed (backup succeeded, failed
+// terminally, timed out, or could not be tracked), and done=false with a
+// requeue result while the Job is still running.
+func (r *ClusterReconciler) ensureDeletionBackupComplete(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (done bool, result ctrl.Result, err error) {
+	logger := util.LoggerFromContext(ctx)
+
+	jobName := cluster.Annotations[util.AnnotationDeletionBackupJob]
+	if jobName == "" {
+		return r.startDeletionBackup(ctx, cluster)
+	}
+
+	// A deletion-backup Job is tracked — observe its state.
+	job := &batchv1.Job{}
+	getErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      jobName,
+		Namespace: cluster.Namespace,
+	}, job)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		// The Job disappeared (deleted externally): there is nothing left to
+		// wait for; report failure and proceed so deletion is not wedged.
+		logger.Warn("deletion-backup job not found; proceeding with deletion", "job", jobName)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, "BackupOnDeleteFailed",
+			fmt.Sprintf("Backup job %s disappeared before completion; proceeding with deletion", jobName))
+		r.recordBackupOnDelete(cluster, "failed")
+		return true, ctrl.Result{}, nil
+	case getErr != nil:
+		return false, ctrl.Result{RequeueAfter: requeueAfterError},
+			fmt.Errorf("fetching deletion-backup job %s: %w", jobName, getErr)
+	}
+
+	switch {
+	case job.Status.Succeeded > 0:
+		logger.Info("deletion backup completed, proceeding with deletion", "job", jobName)
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "BackupOnDeleteCompleted",
+			fmt.Sprintf("Backup job %s completed; proceeding with deletion", jobName))
+		r.recordBackupOnDelete(cluster, "completed")
+		return true, ctrl.Result{}, nil
+
+	case jobHasFailedCondition(job):
+		// Terminal failure (BackoffLimitExceeded / DeadlineExceeded).
+		// Documented policy: proceed with deletion after reporting it.
+		logger.Error("deletion backup failed; proceeding with deletion", "job", jobName)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, "BackupOnDeleteFailed",
+			fmt.Sprintf("Backup job %s failed; proceeding with deletion without a backup", jobName))
+		r.recordBackupOnDelete(cluster, "failed")
+		return true, ctrl.Result{}, nil
+
+	case r.deletionBackupDeadlineExceeded(cluster, logger):
+		// Timeout safety net: never block deletion forever on a stuck Job.
+		logger.Error("deletion backup timed out; proceeding with deletion",
+			"job", jobName, "timeout", deletionBackupTimeout)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, "BackupOnDeleteFailed",
+			fmt.Sprintf("Backup job %s did not finish within %s; proceeding with deletion",
+				jobName, deletionBackupTimeout))
+		r.recordBackupOnDelete(cluster, "failed")
+		return true, ctrl.Result{}, nil
+
+	default:
+		// Job still running/pending: keep PVCs and finalizer intact.
+		logger.Info("waiting for deletion backup to complete",
+			"job", jobName, "active", job.Status.Active)
+		return false, ctrl.Result{RequeueAfter: requeueAfterDeletionBackup}, nil
+	}
+}
+
+// deletionBackupTimestamp derives the deletion-backup Job timestamp from the
+// cluster's deletionTimestamp (L-7): the value is FIXED once deletion starts,
+// so a re-reconcile after a failed annotation patch derives the SAME Job name
+// and the AlreadyExists-tolerant Create stays idempotent (no duplicate Jobs).
+// The wall clock is only a fallback for the impossible nil case.
+func deletionBackupTimestamp(cluster *cbv1alpha1.CloudberryCluster) string {
+	if ts := cluster.GetDeletionTimestamp(); ts != nil {
+		return ts.UTC().Format(util.BackupTimestampLayout)
+	}
+	return time.Now().UTC().Format(util.BackupTimestampLayout)
+}
+
+// startDeletionBackup creates the deletion-backup Job and stamps the tracking
+// annotations (Job name + RFC3339 deadline) in a single MergePatch. The Job
+// name is deterministic per deletion (derived from deletionTimestamp, L-7) so
+// retries after a failed annotation patch re-adopt the same Job.
+func (r *ClusterReconciler) startDeletionBackup(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (done bool, result ctrl.Result, err error) {
+	logger := util.LoggerFromContext(ctx)
+	logger.Info("creating backup before deletion (deletionPolicy: Delete)")
+
+	timestamp := deletionBackupTimestamp(cluster)
+	backupJob := r.builder.BuildMaintenanceJob(cluster, util.MaintenanceBackupOnDelete, timestamp)
+	if createErr := r.client.Create(ctx, backupJob); createErr != nil &&
+		!apierrors.IsAlreadyExists(createErr) {
+		// A backup Job that cannot even be created must not block deletion:
+		// report the failure and proceed (documented policy).
+		logger.Error("failed to create backup-on-delete job; proceeding with deletion",
+			"error", createErr)
+		r.recorder.Event(cluster, corev1.EventTypeWarning, "BackupOnDeleteFailed",
+			fmt.Sprintf("Failed to create backup job before deletion: %v; proceeding with deletion", createErr))
+		r.recordBackupOnDelete(cluster, "failed")
+		return true, ctrl.Result{}, nil
+	}
+
+	deadline := time.Now().Add(deletionBackupTimeout).UTC().Format(time.RFC3339)
+	patchData, marshalErr := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{
+				util.AnnotationDeletionBackupJob:      backupJob.Name,
+				util.AnnotationDeletionBackupDeadline: deadline,
+			},
+		},
+	})
+	if marshalErr != nil {
+		return false, ctrl.Result{}, fmt.Errorf("marshaling deletion-backup annotations: %w", marshalErr)
+	}
+	if patchErr := r.client.Patch(ctx, cluster,
+		client.RawPatch(types.MergePatchType, patchData)); patchErr != nil {
+		return false, ctrl.Result{RequeueAfter: requeueAfterError},
+			fmt.Errorf("recording deletion-backup annotations: %w", patchErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "BackupOnDelete",
+		fmt.Sprintf("Backup job %s started; PVC deletion deferred until it completes", backupJob.Name))
+	return false, ctrl.Result{RequeueAfter: requeueAfterDeletionBackup}, nil
+}
+
+// deletionBackupDeadlineExceeded reports whether the deletion-backup deadline
+// annotation has passed. A missing annotation means no deadline (not
+// exceeded); an unparseable one is treated as exceeded so a corrupted value
+// can never wedge deletion (fail-open by design for the deletion path).
+func (r *ClusterReconciler) deletionBackupDeadlineExceeded(
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) bool {
+	raw := cluster.Annotations[util.AnnotationDeletionBackupDeadline]
+	if raw == "" {
+		return false
+	}
+	deadline, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		logger.Warn("unparseable deletion-backup deadline annotation; treating as exceeded",
+			"value", raw, "error", err)
+		return true
+	}
+	return time.Now().After(deadline)
 }
 
 // deletePVCs deletes all PVCs owned by the cluster.
@@ -1486,6 +1773,10 @@ func (r *ClusterReconciler) performGracefulShutdown(
 	cluster *cbv1alpha1.CloudberryCluster,
 	mode string,
 ) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "gracefulShutdown",
+		attribute.String("shutdown.mode", mode))
+	defer end(nil)
+
 	logger := util.LoggerFromContext(ctx)
 
 	if r.dbFactory == nil {
@@ -1721,7 +2012,7 @@ func (r *ClusterReconciler) checkScaleProgress(
 	startedStr := cluster.Annotations[util.AnnotationScaleStarted]
 	if startedStr != "" {
 		started, err := time.Parse(time.RFC3339, startedStr)
-		if err == nil && time.Since(started) > scaleTimeout {
+		if err == nil && time.Since(started) > r.opTimeout(scaleTimeout) {
 			return r.handleScaleFailure(ctx, cluster)
 		}
 	}
@@ -1751,17 +2042,22 @@ func (r *ClusterReconciler) checkScaleOutPhases(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	stateJSON string,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
 	logger := util.LoggerFromContext(ctx)
 
 	var state scaleStateData
-	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
-		logger.Error("failed to parse scale state, falling back to simple check", "error", err)
+	if parseErr := json.Unmarshal([]byte(stateJSON), &state); parseErr != nil {
+		logger.Error("failed to parse scale state, falling back to simple check", "error", parseErr)
 		if r.allSegmentStatefulSetsReady(ctx, cluster) {
 			return r.completeScaleOperation(ctx, cluster)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 	}
+
+	// Phase span: the phase attribute comes from the bounded scale-phase enum.
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "scaleOut.phase",
+		attribute.String("phase", state.Phase))
+	defer func() { end(err) }()
 
 	logger.Info("scale-out phase check", "phase", state.Phase,
 		"oldCount", state.OldCount, "newCount", state.NewCount)
@@ -1812,14 +2108,17 @@ func (r *ClusterReconciler) checkScaleOutPhases(
 	}
 }
 
-// advanceScalePhase updates the scale state to the next phase.
+// advanceScalePhase updates the scale state to the next phase, recording the
+// completed phase's duration on the scale-phase histogram.
 func (r *ClusterReconciler) advanceScalePhase(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	state *scaleStateData,
 	nextPhase string,
 ) (ctrl.Result, error) {
+	r.observeScalePhase(scaleDirectionOut, state.Phase, state.PhaseStartedAt, state.StartedAt)
 	state.Phase = nextPhase
+	state.PhaseStartedAt = time.Now().Format(time.RFC3339)
 
 	stateJSON, err := json.Marshal(state)
 	if err != nil {
@@ -1830,7 +2129,33 @@ func (r *ClusterReconciler) advanceScalePhase(
 		return ctrl.Result{}, fmt.Errorf("updating scale-state annotation: %w", err)
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
+}
+
+// Scale direction label values for cloudberry_scale_phase_duration_seconds.
+const (
+	scaleDirectionOut = "out"
+	scaleDirectionIn  = "in"
+)
+
+// observeScalePhase records the duration of a completed scale phase on the
+// cloudberry_scale_phase_duration_seconds histogram. The phase start time is
+// taken from phaseStartedAt, falling back to the operation start (states
+// stamped before the field existed). Unparseable timestamps skip the
+// observation (never record a bogus duration).
+func (r *ClusterReconciler) observeScalePhase(direction, phase, phaseStartedAt, startedAt string) {
+	if r.metrics == nil {
+		return
+	}
+	raw := phaseStartedAt
+	if raw == "" {
+		raw = startedAt
+	}
+	start, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return
+	}
+	r.metrics.ObserveScalePhaseDuration(direction, phase, time.Since(start))
 }
 
 // checkScaleInPhases processes the multi-phase scale-in operation.
@@ -1838,17 +2163,22 @@ func (r *ClusterReconciler) checkScaleInPhases(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	stateJSON string,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
 	logger := util.LoggerFromContext(ctx)
 
 	var state scaleInStateData
-	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
-		logger.Error("failed to parse scale-in state, falling back to simple check", "error", err)
+	if parseErr := json.Unmarshal([]byte(stateJSON), &state); parseErr != nil {
+		logger.Error("failed to parse scale-in state, falling back to simple check", "error", parseErr)
 		if r.allSegmentStatefulSetsReady(ctx, cluster) {
 			return r.completeScaleOperation(ctx, cluster)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 	}
+
+	// Phase span: the phase attribute comes from the bounded scale-phase enum.
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "scaleIn.phase",
+		attribute.String("phase", state.Phase))
+	defer func() { end(err) }()
 
 	logger.Info("scale-in phase check", "phase", state.Phase,
 		"oldCount", state.OldCount, "newCount", state.NewCount)
@@ -1970,14 +2300,17 @@ func (r *ClusterReconciler) processScaleInCompleted(
 	return r.completeScaleOperation(ctx, cluster)
 }
 
-// advanceScaleInPhase updates the scale-in state to the next phase.
+// advanceScaleInPhase updates the scale-in state to the next phase, recording
+// the completed phase's duration on the scale-phase histogram.
 func (r *ClusterReconciler) advanceScaleInPhase(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	state *scaleInStateData,
 	nextPhase string,
 ) (ctrl.Result, error) {
+	r.observeScalePhase(scaleDirectionIn, state.Phase, state.PhaseStartedAt, state.StartedAt)
 	state.Phase = nextPhase
+	state.PhaseStartedAt = time.Now().Format(time.RFC3339)
 
 	stateJSON, err := json.Marshal(state)
 	if err != nil {
@@ -1988,7 +2321,7 @@ func (r *ClusterReconciler) advanceScaleInPhase(
 		return ctrl.Result{}, fmt.Errorf("updating scale-in-state annotation: %w", err)
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 }
 
 // redistributeBeforeScaleIn calls the DB client to redistribute data off segments
@@ -2205,7 +2538,7 @@ func (r *ClusterReconciler) completeScaleOperation(
 	// re-fetch overwriting in-memory status changes.
 	r.cleanupScaleAnnotations(ctx, cluster, isScaleIn)
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 }
 
 // finaliseScaleIn handles scale-in specific completion tasks: PVC cleanup,
@@ -2264,7 +2597,7 @@ func (r *ClusterReconciler) handleScaleFailure(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) (ctrl.Result, error) {
 	logger := util.LoggerFromContext(ctx)
-	logger.Error("scale operation timed out", "timeout", scaleTimeout)
+	logger.Error("scale operation timed out", "timeout", r.opTimeout(scaleTimeout))
 
 	// Identify which segments are not ready.
 	var failedSegments []cbv1alpha1.FailedSegment
@@ -2311,7 +2644,7 @@ func (r *ClusterReconciler) handleScaleFailure(
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionScaleOutFailed), metav1.ConditionTrue, "SegmentsNotReady",
 		fmt.Sprintf("Scale-out failed: %d segments not ready after %v",
-			len(failedSegments), scaleTimeout))
+			len(failedSegments), r.opTimeout(scaleTimeout)))
 
 	if err := r.client.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating scale failure status: %w", err)
@@ -2331,7 +2664,7 @@ func (r *ClusterReconciler) handleScaleFailure(
 	}
 
 	// Stay in Scaling phase — operator does NOT automatically scale back.
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // allSegmentStatefulSetsReady checks whether all segment StatefulSets
@@ -2517,7 +2850,7 @@ func (r *ClusterReconciler) updatePhase(
 	if err := r.client.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating phase to %s: %w", phase, err)
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 }
 
 // updateStatus updates the cluster status based on current resource state.
@@ -2672,15 +3005,6 @@ func (r *ClusterReconciler) determineOverallPhase(cluster *cbv1alpha1.Cloudberry
 	}
 }
 
-// recordReconcileResult records the reconciliation result in metrics.
-func (r *ClusterReconciler) recordReconcileResult(
-	cluster *cbv1alpha1.CloudberryCluster,
-	startTime time.Time,
-	result string,
-) {
-	r.metrics.RecordReconcile(cluster.Name, cluster.Namespace, result, time.Since(startTime))
-}
-
 // recordMetricsSnapshot publishes the current cluster state to Prometheus
 // metrics without performing a full reconciliation. This ensures metrics
 // are always up-to-date even when the generation-skip optimisation fires.
@@ -2699,7 +3023,28 @@ func (r *ClusterReconciler) recordMetricsSnapshot(cluster *cbv1alpha1.Cloudberry
 		cluster.Name, cluster.Namespace,
 		cluster.Status.MirroringStatus == cbv1alpha1.MirroringInSync,
 	)
-	r.metrics.SetConnectionsMax(cluster.Name, cluster.Namespace, 0)
+	// cloudberry_connections_max is published by the admin controller's
+	// updateQueryStatusFromDB using the REAL max_connections setting queried
+	// over an already-open DB connection. It is intentionally NOT set here:
+	// the snapshot path has no DB access and writing a constant 0 would
+	// corrupt the gauge (see code review L-5).
+
+	// Publish PVC sizes on every snapshot (steady state), not only on
+	// expansion, so the gauge survives operator restarts.
+	r.recordPVCSizesFromSpec(cluster)
+}
+
+// recordPVCSizesFromSpec publishes the per-component PVC size gauges from the
+// cluster spec storage requests. Called on every metrics snapshot so the
+// cloudberry_pvc_size_bytes series exists in steady state (C-7), not only
+// after an expansion event.
+func (r *ClusterReconciler) recordPVCSizesFromSpec(cluster *cbv1alpha1.CloudberryCluster) {
+	r.recordPVCSize(cluster, "coordinator", cluster.Spec.Coordinator.Storage.Size)
+	r.recordPVCSize(cluster, "segment", cluster.Spec.Segments.Storage.Size)
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled &&
+		cluster.Spec.Standby.Storage != nil {
+		r.recordPVCSize(cluster, "standby", cluster.Spec.Standby.Storage.Size)
+	}
 }
 
 // scaleStateData holds the state of an in-progress scale-out operation.
@@ -2712,6 +3057,10 @@ type scaleStateData struct {
 	NewCount int32 `json:"newCount"`
 	// StartedAt is the timestamp when the operation started.
 	StartedAt string `json:"startedAt"`
+	// PhaseStartedAt is the timestamp when the current phase started. Used for
+	// the cloudberry_scale_phase_duration_seconds histogram; missing (older
+	// in-flight states) falls back to StartedAt.
+	PhaseStartedAt string `json:"phaseStartedAt,omitempty"`
 }
 
 // Scale-out phase constants define the ordered phases of a scale-out operation.
@@ -2748,6 +3097,9 @@ type scaleInStateData struct {
 	NewCount int32 `json:"newCount"`
 	// StartedAt is the timestamp when the operation started.
 	StartedAt string `json:"startedAt"`
+	// PhaseStartedAt is the timestamp when the current phase started (see
+	// scaleStateData.PhaseStartedAt).
+	PhaseStartedAt string `json:"phaseStartedAt,omitempty"`
 }
 
 // mirroringStateData holds the state of an in-progress mirroring enable/disable operation.
@@ -2846,7 +3198,10 @@ func (r *ClusterReconciler) isMirroringDisableNeeded(
 func (r *ClusterReconciler) handleEnableMirroring(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "mirroring.enable")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// Phase 1: Pre-flight validation.
@@ -2955,13 +3310,16 @@ func (r *ClusterReconciler) validateMirroringNodeCount(
 func (r *ClusterReconciler) checkMirroringProgress(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "mirroring.phase")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	stateJSON := cluster.Annotations[util.AnnotationMirroringState]
 	if stateJSON == "" {
 		logger.Warn("checkMirroringProgress called but no mirroring state annotation found")
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 	}
 
 	var state mirroringStateData
@@ -3039,7 +3397,7 @@ func (r *ClusterReconciler) advanceMirroringPhase(
 		return ctrl.Result{}, fmt.Errorf("updating mirroring state annotation: %w", err)
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 }
 
 // completeMirroringEnable finalizes a successful mirroring enable operation.
@@ -3070,7 +3428,7 @@ func (r *ClusterReconciler) completeMirroringEnable(
 	r.metrics.RecordMirroringOperation(cluster.Name, cluster.Namespace, "enable")
 
 	logger.Info("mirroring enable completed successfully")
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // handleMirroringTimeout handles a mirroring enable operation that has exceeded
@@ -3100,7 +3458,7 @@ func (r *ClusterReconciler) handleMirroringTimeout(
 	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonMirroringFailed,
 		fmt.Sprintf("Mirroring initialization timed out after %v", mirroringEnableTimeout))
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // handleDisableMirroring orchestrates disabling mirroring on a cluster.
@@ -3108,7 +3466,10 @@ func (r *ClusterReconciler) handleMirroringTimeout(
 func (r *ClusterReconciler) handleDisableMirroring(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "mirroring.disable")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// Pre-flight: cluster must be in Running phase.
@@ -3345,7 +3706,10 @@ func (r *ClusterReconciler) isUpgradeNeeded(cluster *cbv1alpha1.CloudberryCluste
 func (r *ClusterReconciler) handleUpgrade(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "upgrade")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// If an upgrade is already in progress, continue it.
@@ -3408,7 +3772,10 @@ func (r *ClusterReconciler) handleUpgrade(
 func (r *ClusterReconciler) continueUpgrade(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "upgrade.phase")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	// Parse upgrade state from annotation.
@@ -3416,7 +3783,7 @@ func (r *ClusterReconciler) continueUpgrade(
 	if stateJSON == "" {
 		// No upgrade in progress — should not happen, but handle gracefully.
 		logger.Warn("continueUpgrade called but no upgrade annotation found")
-		return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+		return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 	}
 
 	var state upgradeStateData
@@ -3431,8 +3798,8 @@ func (r *ClusterReconciler) continueUpgrade(
 	// Check for phase timeout.
 	if state.PhaseStartedAt != "" {
 		phaseStart, parseErr := time.Parse(time.RFC3339, state.PhaseStartedAt)
-		if parseErr == nil && time.Since(phaseStart) > upgradePhaseTimeout {
-			reason := fmt.Sprintf("phase %q timed out after %v", state.Phase, upgradePhaseTimeout)
+		if parseErr == nil && time.Since(phaseStart) > r.opTimeout(upgradePhaseTimeout) {
+			reason := fmt.Sprintf("phase %q timed out after %v", state.Phase, r.opTimeout(upgradePhaseTimeout))
 			return r.rollbackUpgrade(ctx, cluster, state, reason)
 		}
 	}
@@ -3531,7 +3898,7 @@ func (r *ClusterReconciler) advanceUpgradePhase(
 	}
 
 	// Immediately continue to the next phase.
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueAfterImmediate}, nil
 }
 
 // verifyUpgrade checks that all cluster components are healthy after the upgrade.
@@ -3592,7 +3959,7 @@ func (r *ClusterReconciler) completeUpgrade(
 		fmt.Sprintf("Upgrade from %s to %s completed", state.PreviousVersion, cluster.Spec.Version))
 	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "completed")
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // rollbackUpgrade reverts all StatefulSets to the previous image and
@@ -3638,7 +4005,7 @@ func (r *ClusterReconciler) rollbackUpgrade(
 	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "failed")
 	r.metrics.RecordUpgradeOperation(cluster.Name, cluster.Namespace, "rollback")
 
-	return ctrl.Result{RequeueAfter: requeueAfterDefault}, nil
+	return ctrl.Result{RequeueAfter: r.requeueDefault()}, nil
 }
 
 // getCurrentImage retrieves the current container image from the coordinator
@@ -4008,8 +4375,13 @@ func (r *ClusterReconciler) createExporterPrereqConfigMap(
 	cmKey := types.NamespacedName{Name: cmName, Namespace: cluster.Namespace}
 
 	cmErr := r.client.Get(ctx, cmKey, existingCM)
+	if cmErr == nil {
+		return nil // Already exists — nothing to create.
+	}
 	if !apierrors.IsNotFound(cmErr) {
-		return nil // Already exists or transient error — skip creation.
+		// Propagate transient errors instead of silently treating them as
+		// "already exists" (code review L-14): the caller retries on requeue.
+		return fmt.Errorf("checking exporter queries configmap %s: %w", cmName, cmErr)
 	}
 
 	desiredCM := r.builder.BuildExporterQueriesConfigMap(cluster)

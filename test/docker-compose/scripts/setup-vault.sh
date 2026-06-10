@@ -213,7 +213,7 @@ copy_certs_to_volume() {
 
     # Detect the correct volume name (project name may vary)
     local volume_name
-    volume_name=$(docker volume ls --format '{{.Name}}' | grep '_mtls_certs$' | head -1)
+    volume_name=$(docker volume ls --format '{{.Name}}' | grep '_mtls_certs$' | head -1 || true)
     if [ -z "$volume_name" ]; then
         volume_name="${COMPOSE_PROJECT_NAME:-avapigw-test}_mtls_certs"
         log_warn "No mtls_certs volume found, using default: ${volume_name}"

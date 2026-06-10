@@ -86,7 +86,11 @@
         "watchNamespace": { "type": "string" },
         "metricsAddress": { "type": "string" },
         "healthProbeAddress": { "type": "string" },
-        "webhookPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        "webhookPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "enableTestUsers": {
+          "type": "boolean",
+          "description": "Enable test users (basic_user, opbasic_user, operator_user) for e2e tests. NEVER enable in production."
+        }
       }
     },
     "vault": {
@@ -103,6 +107,14 @@
         "token": {
           "type": "string",
           "description": "Vault token for token auth method"
+        },
+        "roleID": {
+          "type": "string",
+          "description": "Vault AppRole role_id for approle auth method"
+        },
+        "secretID": {
+          "type": "string",
+          "description": "Vault AppRole secret_id for approle auth method"
         },
         "secretPath": { "type": "string" },
         "tlsSecretName": { "type": "string" },

@@ -37,6 +37,8 @@ type Scenario46VaultE2ESuite struct {
 	vaultHelper *testutil.VaultTestHelper
 	vaultAddr   string
 	vaultToken  string
+	pkiMount    string
+	pkiRole     string
 }
 
 func TestE2E_Scenario46(t *testing.T) {
@@ -49,6 +51,8 @@ func (s *Scenario46VaultE2ESuite) SetupSuite() {
 	env := testutil.NewTestEnv()
 	s.vaultAddr = env.VaultAddr
 	s.vaultToken = env.VaultToken
+	s.pkiMount = env.VaultPKIMount
+	s.pkiRole = env.VaultPKIRole
 	s.vaultHelper = testutil.NewVaultTestHelper(s.vaultAddr, s.vaultToken)
 }
 
@@ -290,21 +294,24 @@ func (s *Scenario46VaultE2ESuite) TestE2E_Scenario46_RetryConfig() {
 }
 
 // TestE2E_Scenario46_PKICertIssuance issues a certificate from the real Vault PKI.
-// This test is skipped if the PKI engine or the "cloudberry" role is not configured.
+// The mount and role come from VAULT_PKI_MOUNT / VAULT_PKI_ROLE (defaults match
+// the docker-compose setup-vault.sh provisioning). The test is skipped only if
+// the PKI engine or the configured role is genuinely absent.
 func (s *Scenario46VaultE2ESuite) TestE2E_Scenario46_PKICertIssuance() {
 	s.skipIfVaultUnavailable()
-	s.logger.Info("starting scenario 46 E2E: PKI cert issuance")
+	s.logger.Info("starting scenario 46 E2E: PKI cert issuance",
+		"mount", s.pkiMount, "role", s.pkiRole)
 
 	// Check if PKI engine is available.
-	pkiErr := s.vaultHelper.CheckPKIEngine(s.ctx, "pki")
+	pkiErr := s.vaultHelper.CheckPKIEngine(s.ctx, s.pkiMount)
 	if pkiErr != nil {
 		s.T().Skipf("PKI engine not available: %v", pkiErr)
 	}
 
-	cert, err := s.vaultHelper.IssueCertificate(s.ctx, "pki", "cloudberry", "test.cloudberry.local")
+	cert, err := s.vaultHelper.IssueCertificate(s.ctx, s.pkiMount, s.pkiRole, "test.cloudberry.local")
 	if err != nil {
 		// Skip if the role is not configured (common in dev/test environments).
-		s.T().Skipf("PKI role 'cloudberry' not configured, skipping: %v", err)
+		s.T().Skipf("PKI role %q not configured, skipping: %v", s.pkiRole, err)
 	}
 	require.NotNil(s.T(), cert)
 	assert.NotEmpty(s.T(), cert.Certificate, "certificate should not be empty")

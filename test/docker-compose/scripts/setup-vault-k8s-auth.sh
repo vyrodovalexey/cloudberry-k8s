@@ -273,6 +273,7 @@ create_pki_role() {
             \"allow_any_name\": true,
             \"allow_localhost\": true,
             \"allow_subdomains\": true,
+            \"allow_glob_domains\": true,
             \"allow_ip_sans\": true,
             \"enforce_hostnames\": false,
             \"server_flag\": true,
@@ -282,7 +283,7 @@ create_pki_role() {
             \"key_bits\": 2048
         }" > /dev/null
     log_info "  PKI role '${PKI_ROLE_NAME}' created/updated"
-    log_info "  allow_any_name=true, server_flag=true, client_flag=true"
+    log_info "  allow_any_name=true, allow_glob_domains=true, server_flag=true, client_flag=true"
 }
 
 # ---------------------------------------------------------------------------

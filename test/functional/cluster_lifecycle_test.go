@@ -60,7 +60,7 @@ func (s *ClusterLifecycleSuite) TestFunctional_CreateCluster_AddsFinalizer() {
 
 	// Assert - first reconcile adds finalizer
 	require.NoError(s.T(), err)
-	assert.True(s.T(), result.Requeue)
+	assert.Positive(s.T(), result.RequeueAfter)
 
 	// Verify finalizer was added
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
@@ -85,7 +85,7 @@ func (s *ClusterLifecycleSuite) TestFunctional_CreateCluster_SetsPhase() {
 
 	// Assert - should set phase to Pending and requeue
 	require.NoError(s.T(), err)
-	assert.True(s.T(), result.Requeue)
+	assert.Positive(s.T(), result.RequeueAfter)
 
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
@@ -287,9 +287,9 @@ func (s *ClusterLifecycleSuite) TestFunctional_ClusterNotFound_ReturnsNoError() 
 		NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"},
 	})
 
-	// Assert - not found should not return error
+	// Assert - not found should not return error and should not requeue
 	require.NoError(s.T(), err)
-	assert.False(s.T(), result.Requeue)
+	assert.Zero(s.T(), result.RequeueAfter)
 }
 
 func (s *ClusterLifecycleSuite) TestFunctional_UnknownAction_IsIgnored() {

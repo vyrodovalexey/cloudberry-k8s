@@ -34,6 +34,12 @@ This document describes the system architecture of the Cloudberry Kubernetes Ope
 - [Status Update Pattern](#status-update-pattern)
 - [Webhook Certificate Manager](#webhook-certificate-manager)
   - [Vault PKI Certificate Issuance](#vault-pki-certificate-issuance)
+    Bug fixes (from 38-finding code review): removed hardcoded prod credentials (critical); fixed rebalance semaphore deadlock; streaming through middleware (Flusher + WriteTimeout exemption); backupOnDelete now waits for the Job before PVC deletion; Vault token renewal/re-auth (LifetimeWatcher); standby activation actually promotes via PromoteStandby; per-cluster idle daemons; ENV > flag > file > default precedence with real flag binding; OIDC discovery retry + lazy re-init; conflict-safe API mutations.
+    Observability extension: 22 new Prometheus metrics (API HTTP, DB connect/pool/query, idle daemon, lifecycle ops, auth/OIDC, log streaming, cluster cert issuance) + honest semantics fixes; OTEL spans across api/db/controller/idle/auth/webhook/operator with low-cardinality route-template names; goleak + PII-scan + cross-package trace-continuity tests.
+    New feature (iteration 2): cluster TLS auto-issuance from Vault PKI (verified live with tls-demo cluster), restore --with-stats=false default + partial-result handling, backup image webhook defaulting/validation.
+    Infrastructure: vmagent/vector/otel-collector/node-exporter deployed and integrated; vector → VictoriaLogs with k8s metadata; perf baseline recorded (~7 RPS bcrypt-bound, health p99 <10ms, zero errors/leaks); documentation updated across README, docs/, and helm README.
+    Residual notes (non-blocking): 37 e2e skips are port-forward/live-script gated by design; bcrypt is the API throughput ceiling (JWT caching suggested as future work); gp_toolkit WARNs from query-exporter are expected on Cloudberry 2.1.0.  - [Cluster TLS Auto-Issuance from Vault PKI](#cluster-tls-auto-issuance-from-vault-pki)
+  - [Vault Token Lifecycle](#vault-token-lifecycle)
 - [Cert Rotation Goroutine Tracking](#cert-rotation-goroutine-tracking)
 - [CLI Context Propagation for Bulk Operations](#cli-context-propagation-for-bulk-operations)
 - [OIDC Redirect Protection](#oidc-redirect-protection)
@@ -131,7 +137,8 @@ The operator runs two server components:
 | **Metrics** | `internal/metrics` | Prometheus metrics registration and recording. Includes `NewNoopRecorder()` for testing |
 | **Telemetry** | `internal/telemetry` | OpenTelemetry tracing setup and span helpers |
 | **Webhooks** | `internal/webhook` | Validating and mutating admission webhooks (including cross-namespace duplicate detection) |
-| **Cert Manager** | `internal/certmanager` | Webhook TLS certificate lifecycle: issuance, storage, and rotation via Vault PKI or self-signed CA |
+| **Cert Manager** | `internal/certmanager` | Webhook and cluster TLS certificate lifecycle: issuance, storage, and rotation via Vault PKI or self-signed CA |
+| **Config Loader** | `internal/config` | Configuration loading with the documented precedence **ENV > flag > config file > default** — command-line flags are bound into the loader, and any key with an explicit environment value is re-resolved so the environment wins even over an explicitly set flag |
 
 ### Managed Kubernetes Resources
 
@@ -598,14 +605,15 @@ The HA Controller manages fault tolerance and recovery:
 │  └─────────────────────────────────────────────┘ │
 │                                                   │
 │  ┌─────────────────────────────────────────────┐ │
-│  │  Recovery Orchestrator                      │ │
+│  │  Recovery Acknowledger (NOT implemented)    │ │
 │  │                                             │ │
-│  │  Handles recovery annotations:              │ │
-│  │  - incremental: WAL-based recovery          │ │
-│  │  - full: pg_basebackup from mirror          │ │
-│  │  - differential: rsync-based recovery       │ │
-│  │  Creates Kubernetes Jobs for execution      │ │
-│  │  Uses MergePatch for annotation removal     │ │
+│  │  Handles recovery annotations honestly:     │ │
+│  │  - validates type (incremental/full/        │ │
+│  │    differential)                            │ │
+│  │  - removes annotation (MergePatch)          │ │
+│  │  - emits RecoveryNotImplemented event       │ │
+│  │  - records metric result="noop"             │ │
+│  │  (no gprecoverseg-equivalent work yet)      │ │
 │  └─────────────────────────────────────────────┘ │
 │                                                   │
 │  ┌─────────────────────────────────────────────┐ │
@@ -613,7 +621,9 @@ The HA Controller manages fault tolerance and recovery:
 │  │                                             │ │
 │  │  - Monitor standby health                   │ │
 │  │  - Track replication lag                    │ │
-│  │  - Handle activate-standby annotation       │ │
+│  │  - Handle activate-standby annotation:      │ │
+│  │    REAL promotion via PromoteStandby        │ │
+│  │    (pg_promote), at-most-once semantics     │ │
 │  │  - Handle reinitialize-standby              │ │
 │  └─────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────┘
@@ -760,6 +770,10 @@ The operator API supports dual-mode authentication:
 4. Extracts role claims from configurable JSON path (e.g., `realm_access.roles`)
 5. Maps IdP roles to permission levels using the `roleMapping` configuration
 6. Supports exact, suffix, prefix, and contains role matching modes
+
+**Lazy discovery (singleflight, bounded).** When discovery fails at operator startup (e.g. the IdP is briefly unavailable), Bearer auth is not permanently disabled: the first Bearer request after the IdP recovers re-runs discovery, subject to a 30-second cooldown. A **burst of concurrent Bearer requests shares a single in-flight discovery** (`singleflight`) — the mutex guards state only and is never held across the network call — and each discovery attempt is bounded by a **10-second timeout**, so request-path callers fail fast together instead of piling up behind the HTTP client's full dial budget. Discovery outcomes are counted on `cloudberry_oidc_discovery_total{result}`.
+
+**PII hygiene.** Per-request identity details on successful OIDC authentication (username, email, roles) are logged at **Debug** level, not Info, so production Info logs carry no per-request PII.
 
 ## High Availability Design
 
@@ -990,13 +1004,15 @@ Standby activation is intentionally **not automatic** to prevent split-brain sce
 
 ### Recovery Operations
 
-| Type | Method | Use Case |
-|------|--------|----------|
+> **Implementation status**: segment recovery (the gprecoverseg-equivalent) is **not implemented yet**. The HA controller acknowledges the `avsoft.io/recovery` annotation honestly: it removes the annotation, emits an explicit `RecoveryNotImplemented` Warning event, and records `cloudberry_recovery_operations_total{result="noop"}` — `result="completed"` only increments when real recovery work runs. The recovery API/CLI validate and accept requests (`type` must be `incremental`, `full`, or `differential`) so the contract is stable for when the implementation lands.
+
+| Type | Intended Method | Use Case |
+|------|-----------------|----------|
 | **Incremental** | WAL replay | Brief downtime, data intact |
 | **Full** | pg_basebackup from mirror | Data corruption |
 | **Differential** | rsync-based file sync | Large segments, minimize transfer |
 
-Recovery operations run as Kubernetes Jobs with configurable backoff and timeout.
+**Standby activation** (a distinct operation) is fully implemented: the `activate-standby` action annotation triggers a real promotion via `db.Client.PromoteStandby` (`pg_promote()`). The annotation is removed *before* the promotion is attempted, giving at-most-once semantics — a failed promotion is surfaced via the `StandbyReady` condition, a `CoordinatorFailover` Warning event, and `cloudberry_recovery_operations_total{type="standby-activation",result="failed"}`, and is never silently re-promoted.
 
 ## Observability Architecture
 
@@ -1015,7 +1031,7 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Mirroring metrics**: `cloudberry_mirroring_operations_total`, `cloudberry_replication_lag_bytes`
 - **Maintenance metrics**: `cloudberry_maintenance_operations_total` (labels `cluster`, `namespace`, `operation`, `result` ∈ {`started`, `success`, `failed`})
 - **Storage metrics**: `cloudberry_pvc_size_bytes` (set on PVC expansion), `cloudberry_disk_usage_bytes` (per-database, set on the disk-usage API)
-- **Backup/restore metrics**: `cloudberry_backup_total` (labels `cluster`, `namespace`, `type`, `result`; recorded on backup reconcile with `result=started`), `cloudberry_restore_total` (labels `cluster`, `namespace`, `result`; recorded on the restore API)
+- **Backup/restore metrics**: `cloudberry_backup_total` (labels `cluster`, `namespace`, `type`, `result` ∈ {`success`, `failed`}) and `cloudberry_restore_total` (labels `cluster`, `namespace`, `result`) — both recorded from the backup/restore Jobs the admin controller observes and **transition-gated**: the counter increments once per actual Job state change (new Job name or new status), never on no-op reconciles of an unchanged Job, so `rate()` and alerting are correct
 - **Recommendation metrics**: `cloudberry_recommendations_total` (gauge, labels `cluster`, `namespace`, `type`) and `cloudberry_recommendation_scan_duration_seconds` (histogram), set during a recommendation scan
 - **Bloat metrics**: `cloudberry_table_bloat_ratio` (gauge, labels `cluster`, `namespace`, `table`) — populated from storage recommendation scans for the top-N most-bloated tables
 - **Auth metrics**: `cloudberry_auth_attempts_total` (labels `method`, `result`). A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}`
@@ -1023,18 +1039,30 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Query history metrics**: `cloudberry_query_history_total`, `cloudberry_query_history_retention_deleted_total`, `cloudberry_query_history_size_bytes`
 - **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`)
 - **Admission metrics**: `cloudberry_webhook_admission_total` (labels `webhook`, `operation`, `result`). Internal (non-validation) admission failures record the distinct `result=error` instead of being bucketed as `denied`
-- **Lifecycle metrics**: `cloudberry_upgrade_operations_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `rollback`, `failed`}), `cloudberry_rolling_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `failed`}), `cloudberry_recovery_operations_total` (labels `cluster`, `namespace`, `type`, `result`)
+- **Lifecycle metrics**: `cloudberry_upgrade_operations_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `rollback`, `failed`}), `cloudberry_rolling_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `failed`}), `cloudberry_recovery_operations_total` (labels `cluster`, `namespace`, `type`, `result`; segment recovery records `result=noop` until implemented, standby activation records real `completed`/`failed`)
+- **REST API server metrics**: `cloudberry_api_requests_total` (labels `route`, `method`, `code`), `cloudberry_api_request_duration_seconds` (labels `route`, `method`), `cloudberry_api_requests_in_flight`, `cloudberry_api_rate_limit_rejections_total` (label `route`). The `route` label is always the matched route **template**, never the raw path (bounded cardinality). The middleware records via `defer`, so the in-flight gauge is decremented — and the request recorded — even when a handler panics (the gauge can never leak upward)
+- **Database client metrics**: `cloudberry_db_connect_total` / `cloudberry_db_connect_duration_seconds` (per cluster), `cloudberry_db_query_duration_seconds` (label `operation` — the `db.Client` method name, a bounded set), and the pool gauges `cloudberry_db_pool_acquired_conns` / `_idle_conns` / `_max_conns` sampled from `pgxpool.Stat()` on every scrape via a custom collector (one provider per cluster; a reconnected client supersedes the closed one, so duplicate label sets are impossible)
+- **Idle daemon metrics**: `cloudberry_idle_daemon_up`, `cloudberry_idle_scan_failures_total`, `cloudberry_idle_reconnect_attempts_total`, plus `cloudberry_session_terminations_total` for API-requested session terminations
+- **Controller operation metrics**: `cloudberry_storage_expansions_total`, `cloudberry_backup_on_delete_total` (terminal outcomes of deletion backups), `cloudberry_scale_phase_duration_seconds` (labels `direction`, `phase`), `cloudberry_cluster_cert_issuance_total` (cluster TLS auto-issuance/renewal from Vault PKI)
+- **API business metrics**: `cloudberry_migrate_operations_total`, `cloudberry_api_cluster_operations_total`, `cloudberry_log_stream_sessions_total` / `cloudberry_log_stream_bytes_total`, `cloudberry_oidc_discovery_total`, `cloudberry_auth_token_verify_duration_seconds`
+- **Honest semantics**: `cloudberry_connections_max` is the **real** `max_connections` queried from `pg_settings`; `cloudberry_pvc_size_bytes` is re-published in steady state on every reconcile (survives operator restarts); `cloudberry_scale_operations_total` distinguishes `rebalance` from `rebalance-failed` (the fallback rebalance Job is tracked to its terminal state); `cloudberry_data_loading_rows_total` is registered but intentionally has **no** production call sites while the data-loading mutation endpoints return `501 NOT_IMPLEMENTED`
 
 ### Tracing (OpenTelemetry)
 
 Tracing is **disabled by default**. When telemetry is enabled (`telemetry.enabled=true` plus an `telemetry.otlp-endpoint`, e.g. the in-cluster `otel-collector` or Tempo on `:4317`), the operator emits OTLP traces for:
 
 - Reconciliation loops — one `Reconcile` span per controller (cluster, admin, HA, auth), with `SetSpanError` recorded on the error paths of all four
-- Sub-reconcilers — `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)
-- API request handling — a server span per request named `<METHOD> <path>`, marked `Error` on HTTP status `>= 400`, with inbound trace-context propagation
+- Controller sub-operations — `controller.<operation>` spans (e.g. `controller.clusterTLS`), plus the named sub-reconcilers `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)
+- API request handling — a server span per request, **renamed after routing** to `<METHOD> <route template>` (e.g. `GET /api/v1alpha1/clusters/{name}`; `<METHOD> unmatched` fallback), marked `Error` on HTTP status `>= 400`, with inbound trace-context propagation. The raw path stays on the `http.target` attribute
+- Database operations — `db.<operation>` spans for each `db.Client` method plus `db.query`, nested under the calling span
+- Authentication — `auth.authenticate` with `auth.oidc.verify` / `auth.oidc.userinfo` child spans
+- Admission webhooks — `webhook.validate` / `webhook.mutate` spans with a `webhook.allowed` attribute
+- Idle daemon — `idle.scan` per scan cycle with `idle.reconnect` span events
 - Migrations — `handleMigrate` with `migrate.validate` / `migrate.create` child spans
 - Vault operations — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`
-- Certificate provisioning — `EnsureCertificates`
+- Certificate provisioning — `EnsureCertificates`, and operator startup spans `operator.setupWebhookCerts` / `operator.injectCABundle`
+
+**Span names are low-cardinality by design**: they come from bounded sets (route templates, method names, operation enums) — never raw URL paths, cluster names, or PIDs. High-cardinality values are carried as span attributes.
 
 Configured via `TelemetryConfig` (config keys `telemetry.enabled`, `telemetry.otlp-endpoint`, `telemetry.otlp-protocol` (`grpc`|`http`), `telemetry.otlp-insecure`, `telemetry.sampling-rate`, `telemetry.service-name`; also via `CLOUDBERRY_TELEMETRY_*` environment variables). Supports both gRPC and HTTP OTLP exporters with a configurable sampling rate.
 
@@ -1258,6 +1286,8 @@ The API server configures explicit timeouts on the `http.Server` to prevent reso
 ### API Server Lifecycle
 
 The API server starts in a background goroutine from the operator `main()` function. It listens on the address configured by `APIAddress` (default `:8090`). On context cancellation, the server performs a graceful shutdown with a 5-second timeout using `context.Background()` to ensure the shutdown completes even when the parent context is already canceled. During shutdown, `Server.Close()` is called, which invokes the rate limiter's `Stop()` method to terminate the background cleanup goroutine and prevent goroutine leaks. This ensures all resources are properly released on operator shutdown.
+
+**The API server is an essential component.** Any API server startup or runtime failure (other than a clean `http.ErrServerClosed` shutdown) is logged immediately and **cancels the operator's run context**: the controller manager stops and the operator process **exits non-zero** instead of silently running without its REST API. Kubernetes then restarts the pod, which retries the API bind — a degraded "controllers-only" operator is never left running.
 
 ## DBClientFactory Pattern
 
@@ -1520,6 +1550,8 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 
 The Vault PKI strategy issues certificates by calling `WriteSecretWithResponse()` on the Vault PKI issue endpoint (e.g., `pki/issue/cloudberry-operator`). This is a write operation that generates a new certificate — using `ReadSecret()` would be incorrect since PKI issuance requires a POST/PUT request. The response contains the certificate, private key, and CA chain, which are stored in the Kubernetes Secret.
 
+**Shared Vault client.** When both operator-level Vault integration (`vault.enabled`) and `webhook.certSource=vault-pki` are enabled, the webhook cert manager **reuses the shared admin Vault client** — a single client instance and a single token lifecycle watcher serve both the admin controller and PKI issuance (one login, one renewal stream, no leaked second client). A dedicated client is created only when operator-level Vault is disabled, and it is closed when cert rotation stops.
+
 ### DNS SANs
 
 Server certificates include the following Subject Alternative Names:
@@ -1537,6 +1569,26 @@ Server certificates include the following Subject Alternative Names:
 | `VaultPKIMountPath` | Vault PKI engine mount path | `pki` |
 | `VaultPKIRole` | Vault PKI role name | `cloudberry-operator` |
 | `CertValidityDuration` | Certificate validity period | `365d` |
+
+### Cluster TLS Auto-Issuance from Vault PKI
+
+The same Vault PKI mount/role used for webhook certificates also backs **cluster server certificate auto-issuance** (`internal/controller/cluster_tls.go` + `certmanager.IssueServerCertificate`). During reconcile, when a `CloudberryCluster` enables **both** `spec.vault.enabled` and `spec.auth.ssl.enabled` with a named `certSecret`:
+
+1. **Secret missing** → the operator issues a server certificate from Vault PKI and creates the Secret itself. The Secret is **generic (Opaque)**, not `kubernetes.io/tls`, because it must carry `ca.crt` alongside `tls.crt`/`tls.key` (the cluster's `init-tls` container requires the CA). It is labelled as operator-managed (`app.kubernetes.io/managed-by` + `component=cluster-tls`) and owner-referenced to the cluster.
+2. **Secret exists and is operator-managed** → the certificate is renewed in place once **2/3 of its lifetime** has elapsed (the same rotation policy as webhook certificates).
+3. **Secret exists but is user-provided** (no operator labels) → it is **never modified**.
+
+The certificate CN is `<cluster>.<namespace>.svc.cluster.local`; DNS SANs cover the coordinator/standby/segment headless Services and the client Service, including `*.<svc>.<ns>.svc.cluster.local` wildcards for per-pod FQDNs — so the Vault PKI role must allow them (`allow_subdomains=true`, `allow_glob_domains=true`). Outcomes are observable via `cloudberry_cluster_cert_issuance_total{cluster,namespace,result}`, the `controller.clusterTLS` span, and `ClusterTLSIssued`/`ClusterTLSRenewed`/`ClusterTLSFailed` events. If the CR requests auto-issuance but the operator has no enabled Vault client, the failure is surfaced loudly (error + `ClusterTLSFailed` event) instead of leaving the cluster pods unable to start.
+
+**Rotation rolls the cluster pods.** For every TLS-enabled cluster (`auth.ssl.enabled` with a named `certSecret`), the cluster controller stamps the **`avsoft.io/tls-cert-checksum`** pod-template annotation — a checksum of the TLS Secret data — onto the coordinator/standby/segment StatefulSets. A certificate rotation (operator renewal or a user update to the Secret) changes the checksum and rolls the pods **exactly once**, so PostgreSQL serves the renewed certificate without manual restarts; identical Secret data always yields an identical checksum, so no-op reconciles never roll pods. Reconcile paths that build a StatefulSet without recomputing the checksum (e.g. scale-out, mirroring enable) **preserve** the previously stamped annotation instead of stripping it. Upgrading to an operator version with this annotation triggers a one-time rollout of existing TLS-enabled pods.
+
+### Vault Token Lifecycle
+
+When Vault integration is enabled, token renewal and re-authentication are **automatic**. After login (`kubernetes` or `approle` auth — AppRole uses `role_id`/`secret_id` from `CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID`), the Vault client starts a background goroutine driving a Vault `LifetimeWatcher`: the login token is renewed before expiry (`cloudberry_vault_operations_total{operation="renew"}`), and when it reaches the end of its renewable lifetime the client re-authenticates with backoff (`operation="reauth"`). Externally managed tokens (`token` auth) and non-renewable leases skip the watcher; reactive re-auth on the next read/write covers expiry in that case. `Close()` stops the watcher and waits for it to terminate (no goroutine leaks).
+
+**Generation-gated re-authentication.** Every authentication bumps an internal token generation. Both the reactive path (a 401/403 on a read/write) and the lifecycle path (the `LifetimeWatcher` reporting an unrenewable token) check the observed generation before re-logging in: if another path already acquired a fresh token in the meantime, the redundant login is skipped and the watcher simply restarts for the already-current token. A burst of concurrent 401/403s therefore produces **one** re-login, not a re-auth storm.
+
+**KV-v2 logical-path reads.** `ReadSecret()` accepts the **logical** KV path (e.g. `secret/cloudberry/backup-s3`). The path is read verbatim first; when that read finds nothing — or is **denied with a 403** — and the path lacks the `data/` segment after its mount, a **single** normalized retry against `<mount>/data/<rest>` is issued. The 403 fallback covers least-privilege KV-v2 policies that grant only `<mount>/data/*` (the verbatim logical read is denied by path shape alone); no re-authentication is triggered for the path-shape 403 — a re-login happens only when **both** paths fail with an auth error. Explicit `data/` paths and KV-v1 paths are read unchanged.
 
 ## Cert Rotation Goroutine Tracking
 

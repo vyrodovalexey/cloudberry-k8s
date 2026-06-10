@@ -46,7 +46,7 @@ func newTestServer(clusters ...*cbv1alpha1.CloudberryCluster) *Server {
 		objs = append(objs, c)
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 }
 
 func newTestCluster(name, namespace string) *cbv1alpha1.CloudberryCluster {
@@ -1116,18 +1116,20 @@ func TestHandleListDataLoadingJobs_NotFound(t *testing.T) {
 }
 
 func TestHandleCreateDataLoadingJob(t *testing.T) {
-	t.Run("data loading not enabled", func(t *testing.T) {
+	// All data-loading mutation endpoints are honest 501 stubs until the
+	// data-loading feature is implemented (B-6).
+	t.Run("cluster not found returns 404", func(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
 		s := newTestServer(cluster)
 		req := httptest.NewRequest(http.MethodPost,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
+			apiPrefix+"/clusters/missing/data-loading/jobs?namespace=default", nil)
+		req.SetPathValue("name", "missing")
 		rec := httptest.NewRecorder()
 		s.handleCreateDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 
-	t.Run("data loading enabled", func(t *testing.T) {
+	t.Run("returns 501 NOT_IMPLEMENTED", func(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
 		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
 		s := newTestServer(cluster)
@@ -1136,7 +1138,8 @@ func TestHandleCreateDataLoadingJob(t *testing.T) {
 		req.SetPathValue("name", "test-cluster")
 		rec := httptest.NewRecorder()
 		s.handleCreateDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusAccepted, rec.Code)
+		assert.Equal(t, http.StatusNotImplemented, rec.Code)
+		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
 	})
 }
 
@@ -1174,24 +1177,26 @@ func TestHandleStartStopDataLoadingJob(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 	s := newTestServer(cluster)
 
-	t.Run("start job", func(t *testing.T) {
+	t.Run("start job returns 501", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost,
 			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/start?namespace=default", nil)
 		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("job", "j1")
 		rec := httptest.NewRecorder()
 		s.handleStartDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusAccepted, rec.Code)
+		assert.Equal(t, http.StatusNotImplemented, rec.Code)
+		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
 	})
 
-	t.Run("stop job", func(t *testing.T) {
+	t.Run("stop job returns 501", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost,
 			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/stop?namespace=default", nil)
 		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("job", "j1")
 		rec := httptest.NewRecorder()
 		s.handleStopDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusAccepted, rec.Code)
+		assert.Equal(t, http.StatusNotImplemented, rec.Code)
+		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
 	})
 }
 
@@ -1199,24 +1204,26 @@ func TestHandleUpdateDeleteDataLoadingJob(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 	s := newTestServer(cluster)
 
-	t.Run("update job", func(t *testing.T) {
+	t.Run("update job returns 501", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPut,
 			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
 		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("job", "j1")
 		rec := httptest.NewRecorder()
 		s.handleUpdateDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, http.StatusNotImplemented, rec.Code)
+		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
 	})
 
-	t.Run("delete job", func(t *testing.T) {
+	t.Run("delete job returns 501", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete,
 			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
 		req.SetPathValue("name", "test-cluster")
 		req.SetPathValue("job", "j1")
 		rec := httptest.NewRecorder()
 		s.handleDeleteDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, http.StatusNotImplemented, rec.Code)
+		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
 	})
 }
 
@@ -1985,7 +1992,7 @@ func TestServer_RunRecommendationScan_NilMetrics(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithRuntimeObjects(cluster).Build()
-	s := NewServer(k8sClient, nil, factory, nil, nil, 0)
+	s := trackServer(NewServer(k8sClient, nil, factory, nil, nil, 0))
 
 	// Act / Assert: must not panic and must not touch the client.
 	s.runRecommendationScan(context.Background(), cluster)
@@ -2428,6 +2435,7 @@ func (m *mockDBClient) GetDiskUsage(_ context.Context, _ string) ([]db.DiskUsage
 }
 func (m *mockDBClient) GetReplicationLag(_ context.Context) (int64, error) { return 0, nil }
 func (m *mockDBClient) PromoteStandby(_ context.Context) error             { return nil }
+func (m *mockDBClient) GetMaxConnections(_ context.Context) (int32, error) { return 100, nil }
 func (m *mockDBClient) GetActiveQueryCount(_ context.Context) (int32, int32, int32, error) {
 	return 0, 0, 0, nil
 }
@@ -2576,7 +2584,7 @@ func newTestServerWithDB(dbClient *mockDBClient, clusters ...*cbv1alpha1.Cloudbe
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	factory := &mockDBFactory{client: dbClient}
-	return NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0))
 }
 
 // newTestServerWithDBErr creates a test server with a DB factory that returns errors.
@@ -2588,7 +2596,7 @@ func newTestServerWithDBErr(err error, clusters ...*cbv1alpha1.CloudberryCluster
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	factory := &mockDBFactory{clientErr: err}
-	return NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, factory, &metrics.NoopRecorder{}, nil, 0))
 }
 
 // diskUsageCall captures a SetDiskUsageBytes invocation.
@@ -2637,7 +2645,7 @@ func (c *countingRecorder) ObserveRecommendationScanDuration(_, _ string, _ time
 func newTestServerWithObjects(objs ...runtime.Object) *Server {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0))
 }
 
 // newTestServerWithDBAndMetrics creates a server wired with both a mock DB
@@ -2653,7 +2661,7 @@ func newTestServerWithDBAndMetrics(
 		objs = append(objs, c)
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, factory, recorder, nil, 0)
+	return trackServer(NewServer(k8sClient, nil, factory, recorder, nil, 0))
 }
 
 // ============================================================================
@@ -4337,7 +4345,7 @@ func TestDeleteResourceGroup_RequiresAdmin(t *testing.T) {
 		identity: &auth.Identity{Username: "operator", Permission: auth.PermissionOperator},
 	}
 	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	s := NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0)
+	s := trackServer(NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0))
 	handler := s.Handler()
 
 	req := httptest.NewRequest(http.MethodDelete,
@@ -4363,7 +4371,7 @@ func TestDeleteResourceGroup_AdminAllowed(t *testing.T) {
 		identity: &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin},
 	}
 	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	s := NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0)
+	s := trackServer(NewServer(k8sClient, mw, factory, &metrics.NoopRecorder{}, nil, 0))
 	handler := s.Handler()
 
 	req := httptest.NewRequest(http.MethodDelete,
@@ -4386,7 +4394,7 @@ func newTestServerWithCredStore(
 ) *Server {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
-	return NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	return trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore))
 }
 
 func TestHandleRotatePassword_Success(t *testing.T) {
@@ -4486,7 +4494,7 @@ func TestHandleRotatePassword_RequiresAdmin(t *testing.T) {
 		identity: &auth.Identity{Username: "operator", Permission: auth.PermissionOperator},
 	}
 	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	s := NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	s := trackServer(NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore))
 	handler := s.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
@@ -4522,7 +4530,7 @@ func TestHandleRotatePassword_AdminAllowed(t *testing.T) {
 		identity: &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin},
 	}
 	mw := auth.NewAuthMiddleware(basicProvider, nil, nil, &metrics.NoopRecorder{})
-	s := NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	s := trackServer(NewServer(k8sClient, mw, nil, &metrics.NoopRecorder{}, nil, 0, credStore))
 	handler := s.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
@@ -4557,7 +4565,7 @@ func TestHandleRotatePassword_UpdatesK8sSecret(t *testing.T) {
 
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(secret).Build()
-	s := NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore)
+	s := trackServer(NewServer(k8sClient, nil, nil, &metrics.NoopRecorder{}, nil, 0, credStore))
 
 	req := httptest.NewRequest(http.MethodPost, apiPrefix+"/auth/rotate-password", nil)
 	identity := &auth.Identity{Username: "admin", Permission: auth.PermissionAdmin}

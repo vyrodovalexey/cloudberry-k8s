@@ -93,7 +93,7 @@ func TestAppendIncrementalArgs_Scenario78(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildGpbackupArgs(newBackupCluster(), tc.opts, tc.jobOpts)
+			args := mustGpbackupArgs(t, newBackupCluster(), tc.opts, tc.jobOpts)
 			joined := strings.Join(args, " ")
 
 			assert.Equal(t, tc.wantIncremental, countFlag(args, "--incremental"),

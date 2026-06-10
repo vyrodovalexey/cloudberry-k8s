@@ -74,3 +74,13 @@ func GenerateRandomPassword() (string, error) {
 	}
 	return string(password), nil
 }
+
+// gpbackupTimestampRegex validates a gpbackup-style YYYYMMDDHHMMSS (14-digit)
+// timestamp. Shared by the API and the admin controller (L-2).
+var gpbackupTimestampRegex = regexp.MustCompile(`^\d{14}$`)
+
+// IsGpbackupTimestamp reports whether ts is a gpbackup-style 14-digit
+// YYYYMMDDHHMMSS timestamp.
+func IsGpbackupTimestamp(ts string) bool {
+	return gpbackupTimestampRegex.MatchString(ts)
+}

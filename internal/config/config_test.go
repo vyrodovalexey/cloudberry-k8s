@@ -45,7 +45,6 @@ func TestLoad_Defaults(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	assert.Equal(t, ":8443", cfg.ListenAddress)
 	assert.Equal(t, ":8080", cfg.MetricsAddress)
 	assert.Equal(t, ":8081", cfg.HealthProbeAddress)
 	assert.Equal(t, 9443, cfg.WebhookPort)
@@ -89,7 +88,6 @@ func TestLoad_ConfigFile(t *testing.T) {
 	configFile := filepath.Join(tmpDir, "config.yaml")
 
 	content := `
-listen-address: ":9443"
 log-level: "debug"
 log-format: "text"
 webhook-port: 9444
@@ -103,7 +101,6 @@ namespace: "test-ns"
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	assert.Equal(t, ":9443", cfg.ListenAddress)
 	assert.Equal(t, "debug", cfg.LogLevel)
 	assert.Equal(t, "text", cfg.LogFormat)
 	assert.Equal(t, 9444, cfg.WebhookPort)

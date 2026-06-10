@@ -1,13 +1,16 @@
 package auth
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/httpjson"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 )
 
 const (
@@ -16,6 +19,9 @@ const (
 	prefixBearer        = "Bearer "
 	authMethodBasic     = "basic"
 	authMethodOIDC      = "oidc"
+
+	// authTracerName is the tracer name for authentication spans.
+	authTracerName = "auth"
 )
 
 // Middleware is an HTTP middleware function.
@@ -52,6 +58,12 @@ func NewAuthMiddleware(
 func (m *AuthMiddleware) Handler() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Span around the authenticate dispatch (D-5). Attributes carry
+			// ONLY the bounded method/result values — never usernames,
+			// passwords or tokens (PII/credential hygiene).
+			ctx, span := telemetry.StartSpan(r.Context(), authTracerName, "auth.authenticate")
+			defer span.End()
+
 			provider, method, err := m.resolveProvider(r)
 			if err != nil {
 				// The Authorization header is missing, malformed, or uses an
@@ -60,13 +72,21 @@ func (m *AuthMiddleware) Handler() Middleware {
 				if m.recorder != nil {
 					m.recorder.RecordAuthAttempt("unknown", "failure")
 				}
+				span.SetAttributes(
+					attribute.String("auth.method", "unknown"),
+					attribute.String("auth.result", "failure"),
+				)
+				telemetry.SetSpanError(span, err)
 				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error())
 				return
 			}
+			span.SetAttributes(attribute.String("auth.method", method))
 
-			identity, authErr := provider.Authenticate(r.Context(), r)
+			identity, authErr := provider.Authenticate(ctx, r)
 			if authErr != nil {
 				m.recordFailure(method, authErr, r.RemoteAddr)
+				span.SetAttributes(attribute.String("auth.result", "failure"))
+				telemetry.SetSpanError(span, authErr)
 				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication failed")
 				return
 			}
@@ -74,9 +94,9 @@ func (m *AuthMiddleware) Handler() Middleware {
 			if m.recorder != nil {
 				m.recorder.RecordAuthAttempt(method, "success")
 			}
+			span.SetAttributes(attribute.String("auth.result", "success"))
 
-			ctx := ContextWithIdentity(r.Context(), identity)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r.WithContext(ContextWithIdentity(ctx, identity)))
 		})
 	}
 }
@@ -223,28 +243,10 @@ func SecurityHeaders() Middleware {
 	}
 }
 
-// errorResponse represents an API error response.
-type errorResponse struct {
-	Error errorDetail `json:"error"`
-}
-
-// errorDetail contains error details.
-type errorDetail struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-// writeErrorResponse writes a JSON error response.
+// writeErrorResponse writes a JSON error response using the shared unified
+// envelope encoder (internal/httpjson, L-9) so auth-layer rejections carry
+// the exact same {"error":{"code","message"}} contract as API responses.
 func writeErrorResponse(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	resp := errorResponse{
-		Error: errorDetail{
-			Code:    code,
-			Message: message,
-		},
-	}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		slog.Error("failed to encode auth error response", "error", err)
-	}
+	httpjson.WriteError(w, status, code, message,
+		slog.Default().With("component", "auth-middleware"))
 }

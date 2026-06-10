@@ -30,7 +30,7 @@ func TestBuildGpbackupArgs_WithStatsPointer(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildGpbackupArgs(newBackupCluster(), &cbv1alpha1.GpbackupOptions{
+			args := mustGpbackupArgs(t, newBackupCluster(), &cbv1alpha1.GpbackupOptions{
 				WithStats: tc.withStats,
 			}, nil)
 			joined := strings.Join(args, " ")
@@ -43,17 +43,19 @@ func TestBuildGpbackupArgs_WithStatsPointer(t *testing.T) {
 	}
 }
 
-// TestBuildGprestoreArgs_WithStatsPointer pins the same *bool WithStats contract
+// TestBuildGprestoreArgs_WithStatsPointer pins the *bool WithStats contract
 // for the gprestore arg builder, with run-analyze disabled so the
-// mutual-exclusivity rule does not interfere: nil defaults to true (flag
-// emitted), explicit false omits, explicit true emits.
+// mutual-exclusivity rule does not interfere: nil defaults to FALSE (the flag
+// is OMITTED — restores skip statistics unless explicitly requested, see the
+// upstream gpbackup statistics.sql exit-2 bug), explicit false omits, explicit
+// true emits.
 func TestBuildGprestoreArgs_WithStatsPointer(t *testing.T) {
 	tests := []struct {
 		name      string
 		withStats *bool
 		wantFlag  bool
 	}{
-		{name: "nil defaults to true (flag emitted)", withStats: nil, wantFlag: true},
+		{name: "nil defaults to false (flag omitted)", withStats: nil, wantFlag: false},
 		{name: "explicit false omits flag", withStats: util.Ptr(false), wantFlag: false},
 		{name: "explicit true emits flag", withStats: util.Ptr(true), wantFlag: true},
 	}

@@ -24,7 +24,7 @@ import (
 //
 //	gpbackup.compressionLevel=1, gpbackup.compressionType=gzip, gpbackup.jobs=1,
 //	gpbackup.singleDataFile=false, gpbackup.withStats=true,
-//	gprestore.jobs=1, gprestore.withStats=true,
+//	gprestore.jobs=1, gprestore.withStats=false (statistics restore is opt-in),
 //	retention.fullCount=3, retention.maxAge=30d,
 //	jobTemplate.backoffLimit=2, jobTemplate.activeDeadlineSeconds=7200,
 //	jobTemplate.ttlSecondsAfterFinished=86400.
@@ -93,7 +93,8 @@ func (s *Scenario70Suite) assertScenario70Defaults(backup *cbv1alpha1.BackupSpec
 	require.NotNil(t, backup.Gprestore, "gprestore must be allocated by defaulter")
 	assert.Equal(t, int32(1), backup.Gprestore.Jobs, "gprestore.jobs")
 	require.NotNil(t, backup.Gprestore.WithStats, "gprestore.withStats defaulted (non-nil)")
-	assert.True(t, *backup.Gprestore.WithStats, "gprestore.withStats")
+	assert.False(t, *backup.Gprestore.WithStats,
+		"gprestore.withStats defaults false (statistics restore is opt-in)")
 
 	assert.Equal(t, int32(3), backup.Retention.FullCount, "retention.fullCount")
 	assert.Equal(t, "30d", backup.Retention.MaxAge, "retention.maxAge")

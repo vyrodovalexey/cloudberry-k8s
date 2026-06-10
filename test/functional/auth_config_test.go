@@ -293,5 +293,5 @@ func (s *AuthConfigSuite) TestFunctional_AuthReconcile_ClusterNotFound() {
 
 	// Assert
 	require.NoError(s.T(), err)
-	assert.False(s.T(), result.Requeue)
+	assert.Zero(s.T(), result.RequeueAfter)
 }

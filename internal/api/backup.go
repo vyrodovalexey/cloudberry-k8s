@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"regexp"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -15,17 +14,12 @@ import (
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/cron"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
-// backupTimestampLayout is the gpbackup-style YYYYMMDDHHMMSS timestamp layout.
-const backupTimestampLayout = "20060102150405"
-
 // responseKeyTimestamp is the JSON response key for a backup timestamp.
 const responseKeyTimestamp = "timestamp"
-
-// backupTimestampRegex validates a gpbackup YYYYMMDDHHMMSS timestamp.
-var backupTimestampRegex = regexp.MustCompile(`^\d{14}$`)
 
 // GpbackupOptionsRequest carries per-request gpbackup option overrides.
 type GpbackupOptionsRequest struct {
@@ -108,19 +102,19 @@ func decodeOptionalJSON(r *http.Request, v interface{}) error {
 
 // isValidBackupTimestamp reports whether ts is a valid gpbackup timestamp.
 func isValidBackupTimestamp(ts string) bool {
-	return backupTimestampRegex.MatchString(ts)
+	return util.IsGpbackupTimestamp(ts)
 }
 
 // newBackupTimestamp returns the current UTC time as a gpbackup-style
 // YYYYMMDDHHMMSS timestamp used to name backup/restore/migration Jobs.
 func newBackupTimestamp() string {
-	return time.Now().UTC().Format(backupTimestampLayout)
+	return time.Now().UTC().Format(util.GpbackupTimestampLayout)
 }
 
-// isValidCronSchedule reports whether schedule is a parseable 5-field cron expr.
+// isValidCronSchedule reports whether schedule is a parseable 5-field cron
+// expr (shared internal/cron engine).
 func isValidCronSchedule(schedule string) bool {
-	_, ok := parseCron(schedule)
-	return ok
+	return cron.Validate(schedule) == nil
 }
 
 // backupTypeOrDefault returns the requested type, defaulting to full.
@@ -136,10 +130,27 @@ func backupTypeOrDefault(t string) string {
 func validateBackupDatabases(w http.ResponseWriter, databases []string) bool {
 	for _, dbName := range databases {
 		if !isValidIdentifier(dbName) {
-			writeErrorJSON(w, http.StatusBadRequest, "INVALID_REQUEST",
+			writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
 				"invalid database identifier: "+dbName)
 			return false
 		}
+	}
+	return true
+}
+
+// requireBackupDatabase ensures the create-backup request names at least one
+// target database, writing a 400 envelope and returning false otherwise.
+// gpbackup hard-requires --dbname and the cluster CRD declares no
+// default-database field, so a database-less request can only produce a Job
+// that fails at runtime (`required flag(s) "dbname" not set`) — reject it
+// up front with an actionable message instead.
+func requireBackupDatabase(w http.ResponseWriter, databases []string) bool {
+	if len(databases) == 0 {
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidRequest,
+			"at least one database must be specified in \"databases\": "+
+				"gpbackup requires a target database (--dbname) and the "+
+				"cluster defines no default backup database")
+		return false
 	}
 	return true
 }

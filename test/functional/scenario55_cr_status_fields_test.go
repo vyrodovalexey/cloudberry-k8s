@@ -320,6 +320,7 @@ type scenario55MetricsCall struct {
 
 // scenario55MetricsRecorder captures metrics calls for verification.
 type scenario55MetricsRecorder struct {
+	metrics.NoopRecorder
 	mu    sync.Mutex
 	calls []scenario55MetricsCall
 }
@@ -437,6 +438,7 @@ func (m *scenario55MetricsRecorder) RecordMonitorResume(_, _ string)            
 func (m *scenario55MetricsRecorder) RecordMonitoringDisabledAccess(_, _ string) {}
 func (m *scenario55MetricsRecorder) RecordCertRotation(_, _, _ string)          {}
 func (m *scenario55MetricsRecorder) SetCertExpirySeconds(_ string, _ float64)   {}
+func (m *scenario55MetricsRecorder) RecordClusterCertIssuance(_, _, _ string)   {}
 func (m *scenario55MetricsRecorder) RecordVaultOperation(_, _ string)           {}
 func (m *scenario55MetricsRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {
 }

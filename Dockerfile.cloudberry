@@ -102,7 +102,7 @@ WORKDIR /home/gpadmin
 # Download and extract Apache Cloudberry 2.1.0 source
 ARG CB_RELEASE_VERSION=2.1.0-incubating
 RUN curl -L -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
-    "https://github.com/apache/cloudberry/archive/refs/tags/${CB_RELEASE_VERSION}.tar.gz && \
+    "https://github.com/apache/cloudberry/archive/refs/tags/${CB_RELEASE_VERSION}.tar.gz" && \
     tar -xzf "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" -C /home/gpadmin && \
     rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
     mv "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}" /home/gpadmin/cloudberry

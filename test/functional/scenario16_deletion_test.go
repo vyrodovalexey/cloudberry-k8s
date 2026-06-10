@@ -343,7 +343,7 @@ func (s *Scenario16DeletionSuite) TestScenario16_NoFinalizerSkipsDeletion() {
 	// Act: reconcile — cluster is gone, should return immediately.
 	result, err := reconciler.Reconcile(s.ctx, scenario16Req())
 	require.NoError(t, err, "reconciliation should succeed when cluster is not found")
-	assert.False(t, result.Requeue, "should not requeue when cluster is not found")
+	assert.Zero(t, result.RequeueAfter, "should not requeue when cluster is not found")
 
 	// Verify: no events emitted.
 	events := collectScenario16Events(fakeRecorder)
