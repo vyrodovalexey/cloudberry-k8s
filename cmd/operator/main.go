@@ -57,6 +57,11 @@ const (
 	// shutdownTimeout is the maximum time to wait for graceful shutdown of
 	// background components (tracer, API server, etc.).
 	shutdownTimeout = 5 * time.Second
+
+	// apiServerJoinTimeout bounds the join of the API server goroutine during
+	// shutdown. startAPIServer terminates on context cancellation on every
+	// path, so this is a defensive fallback that should never fire.
+	apiServerJoinTimeout = 30 * time.Second
 )
 
 var scheme = runtime.NewScheme()
@@ -223,25 +228,51 @@ func run(ctx context.Context, args []string) error {
 	)
 
 	// Start the controller manager; blocks until the context is canceled.
-	if err := mgr.Start(ctx); err != nil {
-		return err
-	}
+	mgrErr := mgr.Start(ctx)
+
+	// mgr.Start has returned: either the run context is already canceled or
+	// the manager failed on its own. Cancel explicitly (the deferred
+	// cancelRun would only fire after run() returns) so the API server and
+	// background goroutines observe shutdown before they are joined below.
+	cancelRun()
 
 	// Wait for background goroutines (e.g. cert rotation) to finish before
 	// returning, so they are not leaked on shutdown.
 	backgroundWg.Wait()
 
-	// Check if the API server returned an error before the manager stopped.
-	select {
-	case apiErr := <-apiErrCh:
-		if apiErr != nil {
-			return fmt.Errorf("API server error: %w", apiErr)
-		}
-	default:
-		// API server is still shutting down; no error yet.
+	// ALWAYS join the API server goroutine before returning. A non-blocking
+	// check here would race the goroutine's send on apiErrCh: a terminal API
+	// error could be silently lost and the goroutine would outlive run().
+	apiErr := awaitAPIServer(apiErrCh, logger)
+	if apiErr != nil && !errors.Is(apiErr, http.ErrServerClosed) {
+		apiErr = fmt.Errorf("API server error: %w", apiErr)
+	} else {
+		apiErr = nil
 	}
 
-	return nil
+	// Surface both failures when the manager and the API server both errored;
+	// errors.Join drops nils, so single-failure cases keep their error and a
+	// clean shutdown returns nil.
+	return errors.Join(mgrErr, apiErr)
+}
+
+// awaitAPIServer joins the API server goroutine after the run context has
+// been canceled. Every wait inside startAPIServer honors context
+// cancellation (the manager cache's WaitForCacheSync takes the run ctx, OIDC
+// discovery retries select on ctx.Done, and api.StartServer shuts the HTTP
+// server down with a bounded timeout once ctx is canceled), so the receive
+// completes promptly. The generous bounded fallback only guards against a
+// future regression introducing a non-ctx-aware wait, turning a potential
+// shutdown deadlock into a loud ERROR instead.
+func awaitAPIServer(apiErrCh <-chan error, logger *slog.Logger) error {
+	select {
+	case apiErr := <-apiErrCh:
+		return apiErr
+	case <-time.After(apiServerJoinTimeout):
+		logger.Error("API server goroutine did not terminate after context cancellation; " +
+			"continuing shutdown without joining it")
+		return nil
+	}
 }
 
 // buildTelemetryConfig maps the operator configuration to the telemetry

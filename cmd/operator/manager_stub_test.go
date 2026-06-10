@@ -37,12 +37,21 @@ type fakeCache struct {
 	notified   bool
 }
 
-func (c *fakeCache) WaitForCacheSync(_ context.Context) bool {
+func (c *fakeCache) WaitForCacheSync(ctx context.Context) bool {
 	if c.syncCalled != nil && !c.notified {
 		c.notified = true
 		close(c.syncCalled)
 	}
-	return c.synced
+	if c.synced {
+		return true
+	}
+	// Mirror the real cache contract: an unsynced cache blocks until the
+	// context is canceled and only then reports failure. This guarantees
+	// startAPIServer (and therefore run()'s blocking join of the API server
+	// goroutine) terminates promptly on cancellation instead of depending on
+	// scheduler timing.
+	<-ctx.Done()
+	return false
 }
 
 // fakeManager implements the ctrl.Manager subset the operator binary uses.

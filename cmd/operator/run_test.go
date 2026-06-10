@@ -322,20 +322,23 @@ func TestRun_APIServerErrorSurfaced(t *testing.T) {
 		"--api-address="+reserveAddr(t),
 	)
 
-	// Wait until the API server goroutine has hit the failed cache sync, give
-	// it a moment to publish the error, then stop the manager.
+	// Wait until the API server goroutine is blocked in the failed cache
+	// sync, then stop the manager. Cancellation aborts the cache wait, the
+	// API goroutine publishes its error, and run() — which now ALWAYS joins
+	// the API server goroutine before returning — must surface it. No sleeps:
+	// the join makes the outcome deterministic regardless of scheduling.
 	select {
 	case <-syncCalled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("startAPIServer never consulted the cache")
 	}
-	time.Sleep(50 * time.Millisecond)
 	cancel()
 
 	select {
 	case err := <-runErrCh:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "API server error")
+		assert.Contains(t, err.Error(), "cache")
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return")
 	}
@@ -668,7 +671,12 @@ func TestStartAPIServer_CacheSyncTimeout(t *testing.T) {
 	mgr := newFakeManager(newFakeClient())
 	mgr.cache = &fakeCache{synced: false}
 
-	err := startAPIServer(context.Background(), testOperatorConfig(), mgr,
+	// The fake cache mirrors the real one: unsynced blocks until ctx is
+	// done. A pre-canceled context exercises the failed-sync return path
+	// without waiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := startAPIServer(ctx, testOperatorConfig(), mgr,
 		&metrics.NoopRecorder{}, testLogger())
 
 	require.Error(t, err)
