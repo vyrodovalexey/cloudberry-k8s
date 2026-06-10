@@ -208,12 +208,29 @@ jobs:
         ports:
           - 9428:9428
 
+      # NOTE: HDFS + Hive (namenode, datanode, hive-metastore-db, hive-metastore,
+      # hiveserver2) are NOT declared as `services:` here. GitHub Actions service
+      # containers start BEFORE the repo is checked out, so the XML config files
+      # under test/docker-compose/{hadoop,hive} cannot be bind-mounted and a
+      # custom start command cannot be supplied (services support only image/env/
+      # ports/volumes/options). Instead the Hive/HDFS stack is started from the
+      # project's own docker-compose file in the "Start Hive + HDFS" step below,
+      # after checkout — keeping CI identical to the local test environment.
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # HDFS + Hive started via docker compose (config files require checkout).
+      # Runs in the background while the inline `services:` finish warming up.
+      - name: Start Hive + HDFS (docker compose)
+        run: |
+          docker compose -f test/docker-compose/docker-compose.yml up -d \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2
+          echo "Hive/HDFS containers launched; readiness checked in the next step."
 
       - name: Wait for services
         run: |
@@ -254,6 +271,24 @@ jobs:
             echo "  attempt $i …"; sleep 2
           done
 
+          echo "--- HDFS NameNode (WebHDFS) ---"
+          for i in {1..60}; do
+            curl -sf "http://127.0.0.1:9870/webhdfs/v1/?op=LISTSTATUS" > /dev/null 2>&1 && echo "HDFS NameNode ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- Hive Metastore (Thrift 9083) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 9083 > /dev/null 2>&1 && echo "Hive Metastore ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- HiveServer2 (JDBC 10000) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 10000 > /dev/null 2>&1 && echo "HiveServer2 ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
       - name: Setup Vault
         env:
           VAULT_ADDR: http://127.0.0.1:8200
@@ -280,6 +315,12 @@ jobs:
           RABBITMQ_ADDR: http://127.0.0.1:15672
         run: bash test/docker-compose/scripts/setup-rabbitmq.sh --ci
 
+      - name: Setup Hive + HDFS
+        env:
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          METASTORE_PORT: "9083"
+        run: bash test/docker-compose/scripts/setup-hive-hdfs.sh
+
       - name: Run functional tests
         env: &test-env
           VAULT_ADDR: http://127.0.0.1:8200
@@ -292,6 +333,10 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
           KAFKA_BROKERS: 127.0.0.1:9094
           RABBITMQ_ADDR: amqp://guest:guest@127.0.0.1:5672/
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          HDFS_NAMENODE: hdfs://127.0.0.1:8020
+          HIVE_METASTORE_URIS: thrift://127.0.0.1:9083
+          HIVESERVER2_JDBC: jdbc:hive2://127.0.0.1:10000
           SKIP_DOCKER_COMPOSE: "true"
         run: |
           mkdir -p coverage
@@ -309,6 +354,22 @@ jobs:
         run: |
           go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
             -tags=e2e -v -timeout 15m ./test/e2e/...
+
+      - name: Hive + HDFS diagnostics (on failure)
+        if: failure()
+        run: |
+          echo "=== compose ps ==="
+          docker compose -f test/docker-compose/docker-compose.yml ps || true
+          for c in namenode datanode hive-metastore-db hive-metastore hiveserver2; do
+            echo "=== logs: $c ==="
+            docker logs --tail 80 "$c" 2>&1 || true
+          done
+
+      - name: Tear down Hive + HDFS
+        if: always()
+        run: |
+          docker compose -f test/docker-compose/docker-compose.yml down -v \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2 || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

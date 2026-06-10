@@ -123,7 +123,7 @@ The project includes a Docker Compose setup with 9 services for integration test
 make test-env-up
 # or: docker compose -f test/docker-compose/docker-compose.yml up -d
 
-# Run setup scripts (configures Vault PKI, Keycloak realm, MinIO buckets, Kafka topics, RabbitMQ queues)
+# Run setup scripts (configures Vault PKI, Keycloak realm, MinIO buckets, Kafka topics, RabbitMQ queues, Hive/HDFS warehouse)
 make test-env-setup
 
 # Run integration tests
@@ -143,6 +143,7 @@ make test-env-down
 6. `scripts/setup-minio.sh` — creates test buckets
 7. `scripts/setup-kafka.sh` — creates test topics
 8. `scripts/setup-rabbitmq.sh` — creates test queues
+9. `scripts/setup-hive-hdfs.sh` — creates the HDFS warehouse directories and a sample Hive table (for PXF `hdfs:*` / `hive:*` data-loading tests)
 
 The setup scripts (`test/docker-compose/scripts/`) configure:
 - **Vault**: Enables the PKI secrets engine, creates policies and Kubernetes auth roles
@@ -153,6 +154,7 @@ The setup scripts (`test/docker-compose/scripts/`) configure:
 - **MinIO**: Creates S3-compatible test buckets for backup testing
 - **Kafka**: Creates test topics for event streaming
 - **RabbitMQ**: Creates test queues for message processing
+- **Hive + HDFS**: Single-node HDFS (NameNode `hdfs://namenode:8020`, DataNode) plus a Hive Metastore (`thrift://hive-metastore:9083`, Postgres-backed) and HiveServer2 (`jdbc:hive2://127.0.0.1:10000`). Endpoints match the PXF server config in `specifications/12-data-loading-spec.md`; `setup-hive-hdfs.sh` creates `/user/hive/warehouse` + `/data-lake` in HDFS and seeds a sample `warehouse.fact_sales` ORC table for PXF `hdfs:*` / `hive:*` external-table tests
 
 ### Monitoring Stack Deployment
 
