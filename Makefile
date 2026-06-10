@@ -418,7 +418,7 @@ test-env-down: ## Stop test environment
 	$(DOCKER) compose -f test/docker-compose/docker-compose.yml down -v
 
 .PHONY: test-env-setup
-test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka, RabbitMQ) and publish dashboards
+test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka, RabbitMQ, Hive/HDFS) and publish dashboards
 	@echo "Waiting for services to be ready..."
 	@sleep 10
 	bash test/docker-compose/scripts/setup-vault.sh
@@ -427,6 +427,7 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	bash test/docker-compose/scripts/setup-minio.sh
 	bash test/docker-compose/scripts/setup-kafka.sh
 	bash test/docker-compose/scripts/setup-rabbitmq.sh
+	bash test/docker-compose/scripts/setup-hive-hdfs.sh
 	bash test/docker-compose/scripts/setup-victorialogs.sh
 	bash test/monitoring/scripts/publish-dashboards.sh
 
