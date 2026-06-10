@@ -89,7 +89,7 @@ jobs:
           mkdir -p coverage
           go test -race -coverprofile=coverage/unit.out -covermode=atomic \
             ./internal/... ./cmd/... ./api/...
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-unit
           path: coverage/unit.out
@@ -310,7 +310,7 @@ jobs:
           go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
             -tags=e2e -v -timeout 15m ./test/e2e/...
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-service-tests
           path: coverage/
@@ -390,7 +390,7 @@ jobs:
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-ctl ./cmd/cloudberry-ctl/
           CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cloudberry-query-exporter ./cmd/cloudberry-query-exporter/
           ls -la ./bin/
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries
           path: bin/
@@ -588,7 +588,7 @@ jobs:
           files: bin/cloudberry-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-binaries
           path: bin/
@@ -747,7 +747,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           helm package ${{ env.HELM_CHART_PATH }} --version "${VERSION}" --app-version "${VERSION}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: helm-chart
           path: cloudberry-operator-*.tgz
