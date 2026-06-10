@@ -87,6 +87,35 @@ func reserveAddr(t *testing.T) string {
 	return addr
 }
 
+// startRun launches run() in a goroutine and guarantees the goroutine has
+// fully terminated before any earlier-registered cleanup (in particular the
+// seam restore from installRunSeams) executes. t.Cleanup runs LIFO, so the
+// join registered here always fires BEFORE the seams are restored — on every
+// exit path, including require/t.Fatal failures and timeouts. Without this
+// join, a failing test could restore the seams while run() was still
+// executing, letting it reach the real ctrl.GetConfigOrDie, which os.Exit(1)s
+// the whole test binary on kubeconfig-less CI runners.
+func startRun(t *testing.T, args ...string) (<-chan error, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	runErrCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runErrCh <- run(ctx, args)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("run() goroutine did not terminate during cleanup; " +
+				"seams would be restored while run() is still executing")
+		}
+	})
+	return runErrCh, cancel
+}
+
 // ----------------------------------------------------------------------------
 // run()
 // ----------------------------------------------------------------------------
@@ -100,11 +129,21 @@ func TestRun_FlagParseError(t *testing.T) {
 func TestRun_ConfigLoadError(t *testing.T) {
 	cleanRunEnv(t)
 	cfgFile := filepath.Join(t.TempDir(), "broken.yaml")
-	require.NoError(t, os.WriteFile(cfgFile, []byte("::: not yaml {{{"), 0o600))
+	// NOTE: the content must be YAML that genuinely fails to parse. A scalar
+	// like "::: not yaml {{{" is accepted by the YAML parser (it decodes to a
+	// plain string), in which case run() proceeds past config loading toward
+	// getRestConfig() — historically reaching the real ctrl.GetConfigOrDie and
+	// os.Exit(1)ing the whole test binary on kubeconfig-less CI runners.
+	require.NoError(t, os.WriteFile(cfgFile, []byte("a: [unclosed"), 0o600))
 	t.Setenv("CLOUDBERRY_CONFIG_FILE", cfgFile)
+	// Defense in depth: even if config loading unexpectedly succeeds, run()
+	// must hit these seams instead of any real cluster machinery.
+	installRunSeams(t, nil, fmt.Errorf("must not reach manager construction"))
 
 	err := run(context.Background(), nil)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading config file",
+		"run() must fail at config loading, not at a later stage")
 }
 
 func TestRun_ManagerConstructionError(t *testing.T) {
@@ -194,16 +233,12 @@ func TestRun_HappyPath_WebhooksDisabled(t *testing.T) {
 	mgr := newFakeManager(newFakeClient())
 	installRunSeams(t, mgr, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
 	apiAddr := reserveAddr(t)
-	runErrCh := make(chan error, 1)
-	go func() {
-		runErrCh <- run(ctx, []string{
-			"--log-level=error",
-			"--webhook-enabled=false",
-			"--api-address=" + apiAddr,
-		})
-	}()
+	runErrCh, cancel := startRun(t,
+		"--log-level=error",
+		"--webhook-enabled=false",
+		"--api-address="+apiAddr,
+	)
 
 	// Wait until the REST API server is actually listening, then shut down.
 	require.Eventually(t, func() bool {
@@ -240,16 +275,12 @@ func TestRun_HappyPath_WebhooksEnabled(t *testing.T) {
 	}
 	t.Cleanup(func() { newDirectClient = prevDirect })
 
-	ctx, cancel := context.WithCancel(context.Background())
 	apiAddr := reserveAddr(t)
-	runErrCh := make(chan error, 1)
-	go func() {
-		runErrCh <- run(ctx, []string{
-			"--log-level=error",
-			"--webhook-enabled=true",
-			"--api-address=" + apiAddr,
-		})
-	}()
+	runErrCh, cancel := startRun(t,
+		"--log-level=error",
+		"--webhook-enabled=true",
+		"--api-address="+apiAddr,
+	)
 
 	require.Eventually(t, func() bool {
 		conn, dialErr := net.DialTimeout("tcp", apiAddr, 100*time.Millisecond)
@@ -285,15 +316,11 @@ func TestRun_APIServerErrorSurfaced(t *testing.T) {
 	mgr.cache = &fakeCache{synced: false, syncCalled: syncCalled}
 	installRunSeams(t, mgr, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	runErrCh := make(chan error, 1)
-	go func() {
-		runErrCh <- run(ctx, []string{
-			"--log-level=error",
-			"--webhook-enabled=false",
-			"--api-address=" + reserveAddr(t),
-		})
-	}()
+	runErrCh, cancel := startRun(t,
+		"--log-level=error",
+		"--webhook-enabled=false",
+		"--api-address="+reserveAddr(t),
+	)
 
 	// Wait until the API server goroutine has hit the failed cache sync, give
 	// it a moment to publish the error, then stop the manager.
