@@ -17,14 +17,23 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
+# Base image ARGs (must be declared before the first FROM).
+# Defaults match the bare local tags used by `make docker-build-official-pxf`.
+# In CI these are overridden via --build-arg to reference images loaded into
+# the local Docker daemon by earlier chain steps.
+# ---------------------------------------------------------------------------
+ARG CB_PXF_IMAGE=cloudberry-pxf:2.1.0
+ARG CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+
+# ---------------------------------------------------------------------------
 # Import the PXF builder stage to get the compiled extension artifacts
 # ---------------------------------------------------------------------------
-FROM cloudberry-pxf:2.1.0 AS pxf-extensions-source
+FROM ${CB_PXF_IMAGE} AS pxf-extensions-source
 
 # ---------------------------------------------------------------------------
 # Derive from the official Cloudberry DB image
 # ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 cloudberry-official:2.1.0
+FROM --platform=linux/amd64 ${CB_OFFICIAL_IMAGE}
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database-official-pxf" \

@@ -19,7 +19,13 @@
 #   docker run -p 8080:8080 cloudberry-gpfdist:2.1.0 gpfdist -d /data -p 8080 -l /var/log/gpfdist.log
 # =============================================================================
 
-FROM --platform=linux/amd64 cloudberry-official-pxf:2.1.0
+# Base image ARG (must be declared before FROM).
+# Default matches the bare local tag used by `make docker-build-gpfdist`.
+# In CI this is overridden via --build-arg to reference the image loaded into
+# the local Docker daemon by the earlier chain step.
+ARG CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
+
+FROM --platform=linux/amd64 ${CB_OFFICIAL_PXF_IMAGE}
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-gpfdist" \

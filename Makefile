@@ -228,6 +228,9 @@ docker-build-gpfdist: ## Build cloudberry-gpfdist image (gpfdist file server, am
 		-t $(IMG_GPFDIST) \
 		-f Dockerfile.cloudberry-gpfdist .
 
+.PHONY: docker-build-cloudberry-chain
+docker-build-cloudberry-chain: docker-build-pxf docker-build-official docker-build-official-pxf docker-build-gpfdist ## Build the full cloudberry image chain: pxf → official → official-pxf → gpfdist
+
 # =============================================================================
 # Kubernetes / Helm targets
 # =============================================================================
