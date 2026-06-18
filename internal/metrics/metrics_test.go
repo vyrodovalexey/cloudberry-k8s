@@ -320,7 +320,12 @@ func TestNoopRecorder(t *testing.T) {
 	recorder.RecordRestore("c", "n", "success")
 	recorder.RecordRestoreValidation("c", "n", "success")
 	recorder.SetDataLoadingJobsActive("c", "n", 1)
+	recorder.SetPXFServersConfigured("c", "n", 5)
 	recorder.RecordDataLoadingRows("c", "n", "job1", "s3", 100)
+	recorder.SetDataLoadingJobStatus("c", "n", "job1", 2)
+	recorder.SetDataLoadingJobLastSuccess("c", "n", "job1", 1700000000)
+	recorder.ObserveDataLoadingJobDuration("c", "n", "job1", time.Second)
+	recorder.RecordDataLoadingErrors("c", "n", "job1")
 	recorder.SetDiskUsagePercent("c", "n", 50)
 	recorder.SetRecommendationsTotal("c", "n", "bloat", 3)
 	recorder.ObserveRecommendationScanDuration("c", "n", time.Second)
@@ -459,10 +464,214 @@ func TestSetDataLoadingJobsActive(t *testing.T) {
 	recorder.SetDataLoadingJobsActive("test", "default", 3)
 }
 
+func TestSetPXFServersConfigured(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetPXFServersConfigured("test", "default", 5)
+
+	got := valueWithLabels(t, reg, "cloudberry_pxf_servers_configured",
+		map[string]string{"cluster": "test", "namespace": "default"})
+	assert.Equal(t, 5.0, got)
+
+	// The gauge is a SET (last-wins) gauge: re-setting overwrites, not adds.
+	recorder.SetPXFServersConfigured("test", "default", 2)
+	got = valueWithLabels(t, reg, "cloudberry_pxf_servers_configured",
+		map[string]string{"cluster": "test", "namespace": "default"})
+	assert.Equal(t, 2.0, got)
+}
+
+// TestIncPXFServersChanged covers Scenario 106 (106-MX-B1): the
+// cloudberry_pxf_servers_changed_total COUNTER increments by exactly 1 per call,
+// is monotonic (accumulates), and carries the {cluster,namespace} labels. The
+// honesty invariant (fire only on a real diff) is enforced at the CALL SITE
+// (controller/api) — the recorder itself just increments — so here we pin that
+// the increment is by 1 and label-scoped.
+func TestIncPXFServersChanged(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	const name = "cloudberry_pxf_servers_changed_total"
+	labels := map[string]string{"cluster": "test", "namespace": "default"}
+
+	// Before any call the series is absent (a counter only appears once touched):
+	// the honest "never fired" state is no sample at all.
+	assert.False(t, metricExists(t, reg, name, labels),
+		"counter must not exist before the first real diff")
+
+	recorder.IncPXFServersChanged("test", "default")
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, name, labels))
+
+	// Monotonic accumulation: a second real diff brings the total to 2.
+	recorder.IncPXFServersChanged("test", "default")
+	assert.Equal(t, 2.0, valueWithLabels(t, reg, name, labels))
+
+	// A DIFFERENT cluster/namespace is an independent series (bounded labels).
+	other := map[string]string{"cluster": "other", "namespace": "ns2"}
+	recorder.IncPXFServersChanged("other", "ns2")
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, name, other))
+	// The original series is unaffected.
+	assert.Equal(t, 2.0, valueWithLabels(t, reg, name, labels))
+}
+
+// TestNoopRecorder_IncPXFServersChanged covers 106-MX-B4: the NoopRecorder
+// implements the new method without panicking (interface satisfied), so test /
+// non-metric setups never crash on the servers-changed signal.
+func TestNoopRecorder_IncPXFServersChanged(t *testing.T) {
+	var r Recorder = &NoopRecorder{}
+	assert.NotPanics(t, func() {
+		r.IncPXFServersChanged("c", "n")
+	})
+}
+
+// TestSetPXFStatus covers 105-MX-B1: the observed PXF status gauge maps
+// Stopped→0, Running→1, Error→2 via the metrics test registry. The controller
+// only sets the gauge when the status is OBSERVABLE; this test pins the encoded
+// values the controller publishes for each observed status.
+func TestSetPXFStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	labels := map[string]string{"cluster": "test", "namespace": "default"}
+
+	// Stopped → 0.
+	recorder.SetPXFStatus("test", "default", 0)
+	assert.Equal(t, 0.0, valueWithLabels(t, reg, "cloudberry_pxf_status", labels))
+
+	// Running → 1 (last-wins overwrite).
+	recorder.SetPXFStatus("test", "default", 1)
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_pxf_status", labels))
+
+	// Error → 2.
+	recorder.SetPXFStatus("test", "default", 2)
+	assert.Equal(t, 2.0, valueWithLabels(t, reg, "cloudberry_pxf_status", labels))
+}
+
+// TestSetPXFStatus_UnobservableNotEmitted covers 105-MX-B1 honesty: when the
+// controller never calls SetPXFStatus (the status was UNOBSERVABLE/absent), the
+// cloudberry_pxf_status series must NOT exist — the gauge never claims a state
+// that was not observed.
+func TestSetPXFStatus_UnobservableNotEmitted(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_ = NewPrometheusRecorder(reg)
+
+	assert.False(t, metricExists(t, reg, "cloudberry_pxf_status",
+		map[string]string{"cluster": "test", "namespace": "default"}),
+		"unobservable status must not emit a cloudberry_pxf_status sample")
+}
+
+// TestSetPXFExtensionsInstalled covers 105-MX-B2: the extensions-installed gauge
+// equals the count of observed extensions (e.g. 2 for {pxf,pxf_fdw}).
+func TestSetPXFExtensionsInstalled(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+
+	labels := map[string]string{"cluster": "test", "namespace": "default"}
+
+	recorder.SetPXFExtensionsInstalled("test", "default", 2)
+	assert.Equal(t, 2.0, valueWithLabels(t, reg, "cloudberry_pxf_extensions_installed", labels))
+
+	// Last-wins: a subsequent observation of only one extension overwrites.
+	recorder.SetPXFExtensionsInstalled("test", "default", 1)
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_pxf_extensions_installed", labels))
+}
+
+// TestSetPXFExtensionsInstalled_UnreachableNotEmitted covers 105-MX-B2 honesty:
+// when the DB is unreachable the controller never calls
+// SetPXFExtensionsInstalled, so the gauge must NOT be present (it must never
+// synthesize a 0 for an unobservable probe).
+func TestSetPXFExtensionsInstalled_UnreachableNotEmitted(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_ = NewPrometheusRecorder(reg)
+
+	assert.False(t, metricExists(t, reg, "cloudberry_pxf_extensions_installed",
+		map[string]string{"cluster": "test", "namespace": "default"}),
+		"unreachable DB must not emit a cloudberry_pxf_extensions_installed sample")
+}
+
+// TestNoopRecorder_PXFObservability covers 105-MX-B1/B2: the NoopRecorder
+// implements both new methods without panicking (interface satisfied).
+func TestNoopRecorder_PXFObservability(t *testing.T) {
+	n := &NoopRecorder{}
+	assert.NotPanics(t, func() {
+		n.SetPXFStatus("c", "n", 1)
+		n.SetPXFExtensionsInstalled("c", "n", 2)
+	})
+}
+
 func TestRecordDataLoadingRows(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)
 	recorder.RecordDataLoadingRows("test", "default", "s3-loader", "s3", 1000)
+
+	got := valueWithLabels(t, reg, "cloudberry_data_loading_rows_total",
+		map[string]string{
+			"cluster": "test", "namespace": "default",
+			"job": "s3-loader", "source_type": "s3",
+		})
+	assert.Equal(t, 1000.0, got)
+
+	// Counter accumulates across calls (DATALOAD_ROWS marker harvests add up).
+	recorder.RecordDataLoadingRows("test", "default", "s3-loader", "s3", 500)
+	got = valueWithLabels(t, reg, "cloudberry_data_loading_rows_total",
+		map[string]string{
+			"cluster": "test", "namespace": "default",
+			"job": "s3-loader", "source_type": "s3",
+		})
+	assert.Equal(t, 1500.0, got)
+}
+
+func TestSetDataLoadingJobStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetDataLoadingJobStatus("test", "default", "loader", 1)
+
+	labels := map[string]string{"cluster": "test", "namespace": "default", "job": "loader"}
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_data_loading_job_status", labels))
+
+	// SET (last-wins) gauge: 1=running -> 2=success overwrites.
+	recorder.SetDataLoadingJobStatus("test", "default", "loader", 2)
+	assert.Equal(t, 2.0, valueWithLabels(t, reg, "cloudberry_data_loading_job_status", labels))
+}
+
+func TestSetDataLoadingJobLastSuccess(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.SetDataLoadingJobLastSuccess("test", "default", "loader", 1700000000)
+
+	got := valueWithLabels(t, reg, "cloudberry_data_loading_job_last_success_timestamp",
+		map[string]string{"cluster": "test", "namespace": "default", "job": "loader"})
+	assert.Equal(t, 1700000000.0, got)
+}
+
+func TestObserveDataLoadingJobDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.ObserveDataLoadingJobDuration("test", "default", "loader", 90*time.Second)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, f := range families {
+		if f.GetName() == "cloudberry_data_loading_job_duration_seconds" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			h := f.GetMetric()[0].GetHistogram()
+			assert.Equal(t, uint64(1), h.GetSampleCount())
+			assert.InDelta(t, 90.0, h.GetSampleSum(), 0.001)
+		}
+	}
+	assert.True(t, found, "duration histogram family must be registered")
+}
+
+func TestRecordDataLoadingErrors(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordDataLoadingErrors("test", "default", "loader")
+	recorder.RecordDataLoadingErrors("test", "default", "loader")
+
+	got := valueWithLabels(t, reg, "cloudberry_data_loading_errors_total",
+		map[string]string{"cluster": "test", "namespace": "default", "job": "loader"})
+	assert.Equal(t, 2.0, got)
 }
 
 func TestSetDiskUsagePercent(t *testing.T) {
@@ -743,7 +952,11 @@ func TestNoopRecorder_AllMethods(t *testing.T) {
 	r.RecordRestore("cluster", "ns", "success")
 	r.RecordRestoreValidation("cluster", "ns", "failed")
 	r.SetDataLoadingJobsActive("cluster", "ns", 3)
+	r.SetPXFServersConfigured("cluster", "ns", 5)
+	r.IncPXFServersChanged("cluster", "ns")
 	r.RecordDataLoadingRows("cluster", "ns", "s3-loader", "s3", 1000)
+	r.RecordGpfdistReconcile("cluster", "ns", "deployment", "success")
+	r.RecordPXFExtensionSetup("cluster", "ns", "installed")
 	r.SetDiskUsagePercent("cluster", "ns", 75.5)
 	r.SetRecommendationsTotal("cluster", "ns", "bloat", 5)
 	r.ObserveRecommendationScanDuration("cluster", "ns", 45*time.Second)
@@ -1318,6 +1531,76 @@ func TestRecordRollingRestart(t *testing.T) {
 	}
 }
 
+func TestRecordPXFRestart(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"started", "started"},
+		{"failed", "failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordPXFRestart("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_pxf_restart_total")
+			assert.True(t, found, "cloudberry_pxf_restart_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordPXFRestart_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordPXFRestart("cluster-a", "ns-a", "started")
+	recorder.RecordPXFRestart("cluster-a", "ns-a", "started")
+	recorder.RecordPXFRestart("cluster-b", "ns-b", "failed")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		startedValue float64
+		failedValue  float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_pxf_restart_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "started":
+				startedValue = m.GetCounter().GetValue()
+			case "failed":
+				failedValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, startedValue, 0.001)
+	assert.InDelta(t, 1.0, failedValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["started"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["started"]["namespace"])
+	assert.Equal(t, "cluster-b", seenLabels["failed"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["failed"]["namespace"])
+}
+
+// TestNoopRecorderPXFRestart ensures the no-op implementation does not panic.
+func TestNoopRecorderPXFRestart(t *testing.T) {
+	var r NoopRecorder
+	assert.NotPanics(t, func() { r.RecordPXFRestart("c", "n", "started") })
+}
+
 func TestRecordRecoveryOperation(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1354,6 +1637,7 @@ func TestNewMetricsRegistration(t *testing.T) {
 	recorder.RecordWebhookAdmission("validating", "create", "allowed")
 	recorder.RecordUpgradeOperation("test", "default", "started")
 	recorder.RecordRollingRestart("test", "default", "started")
+	recorder.RecordPXFRestart("test", "default", "started")
 	recorder.RecordRecoveryOperation("test", "default", "full", "started")
 
 	families, err := reg.Gather()
@@ -1367,6 +1651,7 @@ func TestNewMetricsRegistration(t *testing.T) {
 		"cloudberry_webhook_admission_total",
 		"cloudberry_upgrade_operations_total",
 		"cloudberry_rolling_restart_total",
+		"cloudberry_pxf_restart_total",
 		"cloudberry_recovery_operations_total",
 	}
 
@@ -1396,7 +1681,14 @@ func TestNoopRecorder_NewMethods(t *testing.T) {
 	r.RecordWebhookAdmission("validating", "create", "allowed")
 	r.RecordUpgradeOperation("c", "n", "started")
 	r.RecordRollingRestart("c", "n", "started")
+	r.RecordPXFRestart("c", "n", "started")
 	r.RecordRecoveryOperation("c", "n", "full", "started")
+
+	// Observability V4 API metric families (W2-B3, W2-B4, W2-B6): these
+	// NoopRecorder methods must be safe no-ops on a nil/disabled recorder.
+	r.RecordAPILifecycleRequest("start", "accepted")
+	r.RecordAPIWorkloadOperation("resource_group", "create", "success")
+	r.RecordPXFSync("c", "ns", "success")
 }
 
 // ============================================================================
@@ -1479,4 +1771,498 @@ func TestRecordMaintenanceOperation_MultipleIncrements(t *testing.T) {
 	}
 	assert.True(t, found,
 		"cloudberry_maintenance_operations_total metric should be registered")
+}
+
+// ============================================================================
+// API Lifecycle / Workload / PXF-sync Metrics Tests (W2-B3, W2-B4, W2-B6)
+// ============================================================================
+
+func TestRecordAPILifecycleRequest(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		result    string
+	}{
+		{"start accepted", "start", "accepted"},
+		{"restart error", "restart", "error"},
+		{"vacuum accepted", "vacuum", "accepted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordAPILifecycleRequest(tt.operation, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_api_cluster_lifecycle_requests_total")
+			assert.True(t, found,
+				"cloudberry_api_cluster_lifecycle_requests_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordAPILifecycleRequest_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordAPILifecycleRequest("start", "accepted")
+	recorder.RecordAPILifecycleRequest("start", "accepted")
+	recorder.RecordAPILifecycleRequest("restart", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		acceptedValue float64
+		errorValue    float64
+		seenLabels    = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_api_cluster_lifecycle_requests_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "accepted":
+				acceptedValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, acceptedValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "start", seenLabels["accepted"]["operation"])
+	assert.Equal(t, "restart", seenLabels["error"]["operation"])
+}
+
+func TestRecordAPIWorkloadOperation(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      string
+		operation string
+		result    string
+	}{
+		{"rg create success", "resource_group", "create", "success"},
+		{"rq delete error", "resource_queue", "delete", "error"},
+		{"rule update success", "rule", "update", "success"},
+		{"rg assign success", "resource_group", "assign", "success"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordAPIWorkloadOperation(tt.kind, tt.operation, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_api_workload_operations_total")
+			assert.True(t, found,
+				"cloudberry_api_workload_operations_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordAPIWorkloadOperation_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordAPIWorkloadOperation("resource_group", "create", "success")
+	recorder.RecordAPIWorkloadOperation("resource_group", "create", "success")
+	recorder.RecordAPIWorkloadOperation("rule", "delete", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		successValue float64
+		errorValue   float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_api_workload_operations_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "success":
+				successValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, successValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "resource_group", seenLabels["success"]["kind"])
+	assert.Equal(t, "create", seenLabels["success"]["operation"])
+	assert.Equal(t, "rule", seenLabels["error"]["kind"])
+	assert.Equal(t, "delete", seenLabels["error"]["operation"])
+}
+
+func TestRecordPXFSync(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"success", "success"},
+		{"error", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordPXFSync("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_pxf_sync_total")
+			assert.True(t, found, "cloudberry_pxf_sync_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordPXFSync_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordPXFSync("cluster-a", "ns-a", "success")
+	recorder.RecordPXFSync("cluster-a", "ns-a", "success")
+	recorder.RecordPXFSync("cluster-b", "ns-b", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		successValue float64
+		errorValue   float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_pxf_sync_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "success":
+				successValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, successValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["success"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["success"]["namespace"])
+	assert.Equal(t, "cluster-b", seenLabels["error"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["error"]["namespace"])
+}
+
+func TestRecordGpfdistReconcile(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		result    string
+	}{
+		{"pvc-success", "pvc", "success"},
+		{"deployment-success", "deployment", "success"},
+		{"service-error", "service", "error"},
+		{"delete-success", "delete", "success"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordGpfdistReconcile("test", "default", tt.operation, tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_gpfdist_reconcile_total")
+			assert.True(t, found, "cloudberry_gpfdist_reconcile_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordGpfdistReconcile_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordGpfdistReconcile("cluster-a", "ns-a", "deployment", "success")
+	recorder.RecordGpfdistReconcile("cluster-a", "ns-a", "deployment", "success")
+	recorder.RecordGpfdistReconcile("cluster-b", "ns-b", "delete", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		successValue float64
+		errorValue   float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_gpfdist_reconcile_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "success":
+				successValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, successValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["success"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["success"]["namespace"])
+	assert.Equal(t, "deployment", seenLabels["success"]["operation"])
+	assert.Equal(t, "cluster-b", seenLabels["error"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["error"]["namespace"])
+	assert.Equal(t, "delete", seenLabels["error"]["operation"])
+}
+
+func TestRecordPXFExtensionSetup(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"installed", "installed"},
+		{"absent", "absent"},
+		{"error", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordPXFExtensionSetup("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_pxf_extension_setup_total")
+			assert.True(t, found, "cloudberry_pxf_extension_setup_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+func TestRecordPXFExtensionSetup_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordPXFExtensionSetup("cluster-a", "ns-a", "installed")
+	recorder.RecordPXFExtensionSetup("cluster-a", "ns-a", "installed")
+	recorder.RecordPXFExtensionSetup("cluster-b", "ns-b", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		installedValue float64
+		errorValue     float64
+		seenLabels     = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_pxf_extension_setup_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "installed":
+				installedValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, installedValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["installed"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["installed"]["namespace"])
+	assert.Equal(t, "cluster-b", seenLabels["error"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["error"]["namespace"])
+}
+
+// TestRecordDataLoaderRoleSetup verifies the PrometheusRecorder increments the
+// cloudberry_dataloader_role_setup_total counter for each bounded result label
+// (T-B1, GATE-CRITICAL: this is the only new 0.0%-covered statement).
+func TestRecordDataLoaderRoleSetup(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"success", "success"},
+		{"error", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordDataLoaderRoleSetup("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_dataloader_role_setup_total")
+			assert.True(t, found, "cloudberry_dataloader_role_setup_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+// TestRecordDataLoaderRoleSetup_Labels verifies the counter is partitioned by
+// the {cluster,namespace,result} label set and that NoopRecorder is a safe
+// no-op that registers nothing.
+func TestRecordDataLoaderRoleSetup_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordDataLoaderRoleSetup("cluster-a", "ns-a", "success")
+	recorder.RecordDataLoaderRoleSetup("cluster-a", "ns-a", "success")
+	recorder.RecordDataLoaderRoleSetup("cluster-b", "ns-b", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		successValue float64
+		errorValue   float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_dataloader_role_setup_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "success":
+				successValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, successValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["success"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["success"]["namespace"])
+	assert.Equal(t, "cluster-b", seenLabels["error"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["error"]["namespace"])
+
+	// NoopRecorder must be a safe no-op: it neither panics nor registers anything.
+	noopReg := prometheus.NewRegistry()
+	noop := &NoopRecorder{}
+	assert.NotPanics(t, func() {
+		noop.RecordDataLoaderRoleSetup("c", "ns", "success")
+	})
+	_, found := counterValue(t, noopReg, "cloudberry_dataloader_role_setup_total")
+	assert.False(t, found, "NoopRecorder must not register the dataloader counter")
+}
+
+// TestRecordExporterRoleSetup verifies the PrometheusRecorder increments the
+// cloudberry_exporter_role_setup_total counter for each bounded result label
+// (T-1, GATE-CRITICAL: this is the only new 0.0%-covered statement).
+func TestRecordExporterRoleSetup(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+	}{
+		{"success", "success"},
+		{"error", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			recorder := NewPrometheusRecorder(reg)
+			recorder.RecordExporterRoleSetup("test", "default", tt.result)
+
+			v, found := counterValue(t, reg, "cloudberry_exporter_role_setup_total")
+			assert.True(t, found, "cloudberry_exporter_role_setup_total should be registered")
+			assert.InDelta(t, 1.0, v, 0.001)
+		})
+	}
+}
+
+// TestRecordExporterRoleSetup_Labels verifies the counter is partitioned by
+// the {cluster,namespace,result} label set and that NoopRecorder is a safe
+// no-op that registers nothing.
+func TestRecordExporterRoleSetup_Labels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	recorder.RecordExporterRoleSetup("cluster-a", "ns-a", "success")
+	recorder.RecordExporterRoleSetup("cluster-a", "ns-a", "success")
+	recorder.RecordExporterRoleSetup("cluster-b", "ns-b", "error")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var (
+		successValue float64
+		errorValue   float64
+		seenLabels   = map[string]map[string]string{}
+	)
+	for _, f := range families {
+		if f.GetName() != "cloudberry_exporter_role_setup_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			seenLabels[labels["result"]] = labels
+			switch labels["result"] {
+			case "success":
+				successValue = m.GetCounter().GetValue()
+			case "error":
+				errorValue = m.GetCounter().GetValue()
+			}
+		}
+	}
+
+	assert.InDelta(t, 2.0, successValue, 0.001)
+	assert.InDelta(t, 1.0, errorValue, 0.001)
+	assert.Equal(t, "cluster-a", seenLabels["success"]["cluster"])
+	assert.Equal(t, "ns-a", seenLabels["success"]["namespace"])
+	assert.Equal(t, "cluster-b", seenLabels["error"]["cluster"])
+	assert.Equal(t, "ns-b", seenLabels["error"]["namespace"])
+
+	// NoopRecorder must be a safe no-op: it neither panics nor registers anything.
+	noopReg := prometheus.NewRegistry()
+	noop := &NoopRecorder{}
+	assert.NotPanics(t, func() {
+		noop.RecordExporterRoleSetup("c", "ns", "success")
+	})
+	_, found := counterValue(t, noopReg, "cloudberry_exporter_role_setup_total")
+	assert.False(t, found, "NoopRecorder must not register the exporter counter")
 }

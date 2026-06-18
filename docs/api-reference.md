@@ -30,7 +30,7 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
 - [Request Body Limits](#request-body-limits)
 - [Response Body Limits (CLI)](#response-body-limits-cli)
 - [API Observability](#api-observability)
-- [Data Loading Endpoints (Not Implemented)](#data-loading-endpoints-not-implemented)
+- [Data Loading Endpoints](#data-loading-endpoints)
 - [Input Validation](#input-validation)
 - [Annotations Reference](#annotations-reference)
   - [Action Annotations](#action-annotations-avsoftioaction)
@@ -2679,26 +2679,53 @@ Every API request is instrumented:
 
 See the [User Guide — Monitoring and Observability](user-guide.md#monitoring-and-observability) for the full metric and span reference.
 
-## Data Loading Endpoints (Not Implemented)
+## Data Loading Endpoints
 
-The data-loading **read** endpoints are functional:
+The full data-loading REST surface (P.1–P.15) is **Implemented and serving real
+data** (Scenario 107 flipped the final five job mutations + PXF servers CRUD +
+job logs + external-tables to FULL; the PXF lifecycle routes landed in
+Scenario 95). Status per route (`FULL` = serving real data):
 
-- `GET /api/v1alpha1/clusters/{name}/data-loading/jobs` — list configured jobs
-- `GET /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}` — get a job
+| ID | Method | Path | Perm | Status |
+|----|--------|------|------|--------|
+| P.7 | GET | `/api/v1alpha1/clusters/{name}/data-loading/jobs` | Basic | **FULL** (lists `spec.dataLoading.jobs`) |
+| P.9 | GET | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}` | Basic | **FULL** (reads from spec) |
+| P.8 | POST | `/api/v1alpha1/clusters/{name}/data-loading/jobs` | Operator | **FULL** (`201`; `409 JOB_EXISTS`; `400` unknown server) |
+| P.10 | PUT | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}` | Operator | **FULL** (`200`) |
+| P.11 | DELETE | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}` | Admin | **FULL** (best-effort deletes the spawned Job) |
+| P.12 | POST | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/start` | Operator | **FULL** (creates a REAL one-off `batchv1.Job`; `202`; `409 JOB_ALREADY_RUNNING`) |
+| P.13 | POST | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/stop` | Operator | **FULL** (deletes Job / suspends CronJob; `202`; idempotent `200`) |
+| P.14 | GET | `/api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/logs` | Basic | **FULL** (streams real Job pod logs; `?follow`/`?tailLines`; `501 LOGS_NOT_AVAILABLE` with no clientset) |
+| P.1 | GET | `/api/v1alpha1/clusters/{name}/data-loading/pxf/status` | Basic | **FULL** (honest sidecar readiness) |
+| P.6 | POST | `/api/v1alpha1/clusters/{name}/data-loading/pxf/sync` | Operator | **FULL** (`202`; ConfigMap refresh + roll) |
+| P.2 | GET | `/api/v1alpha1/clusters/{name}/data-loading/pxf/servers[/{server}]` | Basic | **FULL** (REFERENCES only — no literal secrets; `404 SERVER_NOT_FOUND`) |
+| P.3 | POST | `/api/v1alpha1/clusters/{name}/data-loading/pxf/servers` | Operator | **FULL** (`201` rendered `<server>__*.xml`; `409 SERVER_EXISTS`) |
+| P.4 | PUT | `/api/v1alpha1/clusters/{name}/data-loading/pxf/servers/{server}` | Operator | **FULL** (`200` rendered config) |
+| P.5 | DELETE | `/api/v1alpha1/clusters/{name}/data-loading/pxf/servers/{server}` | Admin | **FULL** (`409 SERVER_IN_USE` when referenced — mirrors W.9) |
+| P.15 | GET | `/api/v1alpha1/clusters/{name}/data-loading/external-tables` | Basic | **FULL** (`{observed, observedAvailable, expected}` — live catalog or honest-absent) |
 
-The data-loading **mutation** endpoints are not implemented yet and return
-`501 Not Implemented` with the standard error envelope (code
-`NOT_IMPLEMENTED`) instead of fake success responses:
+New error codes (Scenario 107): `SERVER_NOT_FOUND` (404), `SERVER_EXISTS` (409),
+`SERVER_IN_USE` (409), `JOB_EXISTS` (409), `JOB_ALREADY_RUNNING` (409),
+`LOGS_NOT_AVAILABLE` (501). Permissions: Basic (read/status/logs/external-tables),
+Operator (create/update/start/stop/sync), Admin (delete).
 
-- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs`
-- `PUT /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}`
-- `DELETE /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}`
-- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/start`
-- `POST /api/v1alpha1/clusters/{name}/data-loading/jobs/{job}/stop`
+**Honesty notes.** P.14 streams REAL Job pod logs (it returns the honest
+`501 LOGS_NOT_AVAILABLE` only when no Kubernetes clientset is wired). P.15's
+`observed` reflects a live `pg_exttable` + foreign-table probe
+(`db.Client.ListExternalTables`) — `null` with `observedAvailable:false` when the
+DB is unreachable, **never synthesized** — while `expected` (spec-derived would-be
+tables) is kept separate and never claimed to "exist". See
+[spec 12 §Implementation Status](../specifications/12-data-loading-spec.md#implementation-status).
 
-Full job lifecycle support (patching `spec.dataLoading.jobs`, creating loader
-Jobs, and recording the `cloudberry_data_loading_rows_total` metric) is
-tracked as a dedicated feature.
+The `spec.dataLoading` CRD model is the **PXF (Platform Extension Framework)**
+model — `pxf` (servers, extensions, custom connectors), `gpfdist`, and
+`jobs[]` of `type: pxf|gpload` (`pxfJob`/`gploadJob`). The old simplified model
+(`streamingServer`; `jobs[].type: s3|kafka|rabbitmq` with
+`s3Source`/`kafkaSource`/`rabbitmqSource`) was **replaced** and removed. CRs are
+validated by the admission webhook rules `W.1`–`W.15` (gated on
+`dataLoading.enabled: true`); see
+[spec 12 §Webhook Validation](../specifications/12-data-loading-spec.md#webhook-validation)
+and Scenario 89.
 
 ## Input Validation
 
@@ -2935,7 +2962,7 @@ The operator exposes additional Prometheus metrics covering webhook/certificate 
 | `cloudberry_webhook_admission_total` | Counter | `webhook`, `operation`, `result` | Validating/mutating admission outcomes. `webhook` is `validating` or `mutating`; `operation` is `create`, `update`, or `delete`; `result` is `allowed`, `denied`, or `error` |
 | `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
 | `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
-| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; `result` is `started`, `completed`, or `failed` |
+| `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Segment recovery operations. `type` is `incremental`, `full`, or `differential`; controller-side `result` is `started`, `completed`, `failed`, or `noop`; the recovery API endpoint also records the **request-side** outcome with `result` `requested` (accepted) or `error` (rejected) |
 
 ```promql
 # Certificates expiring within the next 7 days
@@ -2946,6 +2973,82 @@ increase(cloudberry_webhook_admission_total{result="denied"}[1h])
 
 # Upgrade rollbacks per cluster (last 24 hours)
 increase(cloudberry_upgrade_operations_total{result="rollback"}[24h])
+```
+
+### API Business and DDL Metrics
+
+The REST API server records request-side counters for the cluster-lifecycle,
+workload-management, and PXF-sync actions it serves. These are the **request-side**
+view (was the action accepted/attempted?), complementary to the controller-side
+outcome metrics (`cloudberry_maintenance_operations_total`,
+`cloudberry_pxf_servers_changed_total`, etc.) that report what actually happened:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_api_cluster_lifecycle_requests_total` | Counter | `operation`, `result` | Cluster lifecycle/maintenance actions requested via the REST API, incremented at the `setClusterAnnotation`/`setMaintenanceAnnotation` choke points and `handleUpdateConfig`. `operation` is `start`, `stop`, `restart`, `reload`, `activate-standby`, `rebalance`, `vacuum`, `analyze`, `reindex`, or `config-update`; `result` is `accepted` or `error` |
+| `cloudberry_api_workload_operations_total` | Counter | `kind`, `operation`, `result` | Workload-management DDL requested via the API. `kind` is `resource_group`, `resource_queue`, or `rule`; `operation` is `create`, `update`, `delete`, or `assign`; `result` is `success` or `error` |
+| `cloudberry_pxf_sync_total` | Counter | `cluster`, `namespace`, `result` | PXF servers sync **request** outcomes (the request-side counterpart to the honest `cloudberry_pxf_servers_changed_total` force-pair counter, which only fires on a real ConfigMap diff). `result` is `success` or `error` |
+
+```promql
+# Cluster lifecycle requests rejected over the last hour
+increase(cloudberry_api_cluster_lifecycle_requests_total{result="error"}[1h])
+
+# Workload DDL operations by kind (last 24 hours)
+sum by (kind) (increase(cloudberry_api_workload_operations_total{result="success"}[24h]))
+
+# Failed PXF sync requests per cluster
+increase(cloudberry_pxf_sync_total{result="error"}[1h])
+```
+
+### Control-Plane Setup Metrics
+
+The control-plane sub-reconcilers record four honest control-plane outcome counters.
+Each increments **only** at the real outcome (never on a no-op/skip), so a
+persistently-failing provisioning, extension setup, or role setup is visible:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cloudberry_gpfdist_reconcile_total` | Counter | `cluster`, `namespace`, `operation`, `result` | Operator-side gpfdist provisioning reconcile outcome. Incremented at the real Kubernetes create/update/delete outcomes in `reconcileGpfdist`/`ensureGpfdist*`. `operation` is `pvc`, `deployment`, `service`, or `delete`; `result` is `success` or `error` |
+| `cloudberry_pxf_extension_setup_total` | Counter | `cluster`, `namespace`, `result` | PXF client-extension setup attempt outcome (`setupPXFExtensions` DB round-trip). `result` is `installed` (≥1 extension created), `absent` (DB reachable but 0 installed — e.g. `pxf` unavailable in the image / DB in recovery), or `error` (hard connectivity/setup failure). The honest `absent` value means "reachable, nothing installed" — it is **not** a failure |
+| `cloudberry_dataloader_role_setup_total` | Counter | `cluster`, `namespace`, `result` | Outcome of the dedicated least-privilege data-loader role setup (`EnsureDataLoaderRole`, security control SE.6, in `dataload_controller.go`) — the sibling of `cloudberry_pxf_extension_setup_total`. `result` is `success` or `error`. This operation previously only logged a `Warn` on failure with no metric |
+| `cloudberry_exporter_role_setup_total` | Counter | `cluster`, `namespace`, `result` | Outcome of the monitoring exporter role provisioning (`setupExporterRole` DB round-trip, in `admin_controller.go`) — the third sibling of `cloudberry_pxf_extension_setup_total` and `cloudberry_dataloader_role_setup_total`. `result` is `success` or `error`; recorder method `RecordExporterRoleSetup`. This operation previously only logged a `Warn` on failure with no metric, so all three best-effort role-setup DB round-trips are now uniformly observable |
+
+```promql
+# gpfdist provisioning error rate by operation (last 5 minutes)
+sum by (operation) (rate(cloudberry_gpfdist_reconcile_total{result="error"}[5m]))
+
+# PXF extension setups that found the DB reachable but installed nothing (last hour)
+increase(cloudberry_pxf_extension_setup_total{result="absent"}[1h])
+
+# Data-loader role setup failures (last hour)
+increase(cloudberry_dataloader_role_setup_total{result="error"}[1h])
+
+# Exporter role setup failures (last hour)
+increase(cloudberry_exporter_role_setup_total{result="error"}[1h])
+```
+
+### Database Client Query Metrics
+
+Both the mutating/DDL **and** the read-path `db.Client` methods record
+`cloudberry_db_query_duration_seconds` with their method name as the `operation` label
+(and emit a matching `db.<Method>` OTEL span), so the read and write sides are symmetric.
+
+The 15 mutating/DDL operations are: `SetParameter`, `ReloadConfig`, `CreateRole`,
+`AlterRole`, `DropRole`, `Vacuum`, `Analyze`, `Reindex`, `CreateResourceGroup`,
+`AlterResourceGroup`, `DropResourceGroup`, `AssignRoleResourceGroup`,
+`CreateResourceQueue`, `DropResourceQueue`, and `MoveQueryToResourceGroup`.
+
+The 22 read-path operations are: `GetSegmentConfiguration`, `GetMirrorSyncStatus`,
+`GetReplicationLag`, `GetActiveQueryCount`, `GetMaxConnections`, `GetResourceGroupUsage`,
+`ListSessionsWithResourceGroup`, `ListSessions`, `GetDiskUsage`, `GetStorageDiskUsage`,
+`ListResourceGroups`, `ListResourceQueues`, `CancelQuery`, `TriggerFTSProbe`,
+`ShowParameter`, `GetBloatRecommendations`, `GetSkewRecommendations`,
+`GetAgeRecommendations`, `GetIndexBloatRecommendations`, `GetTableDetails`,
+`GetUsageReport`, and `GetRedistributionProgress`.
+
+```promql
+# p95 DB query latency by operation (last 5 minutes)
+histogram_quantile(0.95, sum by (operation, le) (rate(cloudberry_db_query_duration_seconds_bucket[5m])))
 ```
 
 ### OpenAPI Specification

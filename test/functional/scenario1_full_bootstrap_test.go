@@ -760,9 +760,93 @@ func (m *mockMetricsRecorder) SetDataLoadingJobsActive(cluster, namespace string
 	})
 }
 
+func (m *mockMetricsRecorder) SetPXFServersConfigured(cluster, namespace string, count float64) {
+	m.record("SetPXFServersConfigured", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "count": count,
+	})
+}
+
+func (m *mockMetricsRecorder) IncPXFServersChanged(cluster, namespace string) {
+	m.record("IncPXFServersChanged", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace,
+	})
+}
+
+func (m *mockMetricsRecorder) SetPXFStatus(cluster, namespace string, value float64) {
+	m.record("SetPXFStatus", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "value": value,
+	})
+}
+
+func (m *mockMetricsRecorder) SetPXFExtensionsInstalled(cluster, namespace string, count float64) {
+	m.record("SetPXFExtensionsInstalled", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "count": count,
+	})
+}
+
+func (m *mockMetricsRecorder) SetPXFServiceUp(cluster, namespace, segmentHost string, up float64) {
+	m.record("SetPXFServiceUp", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "segmentHost": segmentHost, "up": up,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordGpfdistReconcile(cluster, namespace, operation, result string) {
+	m.record("RecordGpfdistReconcile", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "operation": operation, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordPXFExtensionSetup(cluster, namespace, result string) {
+	m.record("RecordPXFExtensionSetup", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordDataLoaderRoleSetup(cluster, namespace, result string) {
+	m.record("RecordDataLoaderRoleSetup", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordExporterRoleSetup(cluster, namespace, result string) {
+	m.record("RecordExporterRoleSetup", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
 func (m *mockMetricsRecorder) RecordDataLoadingRows(cluster, namespace, job, sourceType string, count float64) {
 	m.record("RecordDataLoadingRows", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "job": job, "sourceType": sourceType, "count": count,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordDataLoadingBytes(cluster, namespace, job, sourceType string, bytes float64) {
+	m.record("RecordDataLoadingBytes", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job, "sourceType": sourceType, "bytes": bytes,
+	})
+}
+
+func (m *mockMetricsRecorder) SetDataLoadingJobStatus(cluster, namespace, job string, status float64) {
+	m.record("SetDataLoadingJobStatus", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job, "status": status,
+	})
+}
+
+func (m *mockMetricsRecorder) SetDataLoadingJobLastSuccess(cluster, namespace, job string, ts float64) {
+	m.record("SetDataLoadingJobLastSuccess", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job, "ts": ts,
+	})
+}
+
+func (m *mockMetricsRecorder) ObserveDataLoadingJobDuration(cluster, namespace, job string, d time.Duration) {
+	m.record("ObserveDataLoadingJobDuration", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job, "duration": d,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordDataLoadingErrors(cluster, namespace, job string) {
+	m.record("RecordDataLoadingErrors", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "job": job,
 	})
 }
 
@@ -919,10 +1003,30 @@ func (m *mockMetricsRecorder) RecordMigrateOperation(result string) {
 	m.record("RecordMigrateOperation", map[string]interface{}{"result": result})
 }
 
-func (m *mockMetricsRecorder) RecordAPIClusterOperation(_, _ string)          {}
+func (m *mockMetricsRecorder) RecordAPIClusterOperation(_, _ string) {}
+
+func (m *mockMetricsRecorder) RecordAPILifecycleRequest(operation, result string) {
+	m.record("RecordAPILifecycleRequest", map[string]interface{}{
+		"operation": operation, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordAPIWorkloadOperation(kind, operation, result string) {
+	m.record("RecordAPIWorkloadOperation", map[string]interface{}{
+		"kind": kind, "operation": operation, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordPXFSync(cluster, namespace, result string) {
+	m.record("RecordPXFSync", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
 func (m *mockMetricsRecorder) RecordLogStreamSession(_ string)                {}
 func (m *mockMetricsRecorder) AddLogStreamBytes(_ float64)                    {}
 func (m *mockMetricsRecorder) RecordOIDCDiscovery(_ string)                   {}
 func (m *mockMetricsRecorder) ObserveAuthTokenVerifyDuration(_ time.Duration) {}
 func (m *mockMetricsRecorder) RecordRollingRestart(_, _, _ string)            {}
+func (m *mockMetricsRecorder) RecordPXFRestart(_, _, _ string)                {}
 func (m *mockMetricsRecorder) RecordRecoveryOperation(_, _, _, _ string)      {}

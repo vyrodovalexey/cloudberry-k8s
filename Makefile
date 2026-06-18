@@ -27,15 +27,20 @@ IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
 IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
 IMG_BACKUP           ?= cloudberry-backup:2.1.0
 IMG_OFFICIAL         ?= cloudberry-official:2.1.0
+IMG_PXF              ?= cloudberry-pxf:2.1.0
+IMG_OFFICIAL_PXF     ?= cloudberry-official-pxf:2.1.0
+IMG_GPFDIST          ?= cloudberry-gpfdist:2.1.0
+PXF_VERSION          ?= 2.1.0-incubating
 GPBACKMAN_VERSION    ?= v0.8.1
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
 # --- Kubernetes / Helm settings ----------------------------------------------
-NAMESPACE_OPERATOR ?= cloudberry-system
-NAMESPACE_TEST     ?= cloudberry-test
-HELM_RELEASE       ?= cloudberry-operator
-HELM_CHART         := deploy/helm/cloudberry-operator
+NAMESPACE_OPERATOR   ?= cloudberry-system
+NAMESPACE_TEST       ?= cloudberry-test
+NAMESPACE_MONITORING ?= monitoring
+HELM_RELEASE         ?= cloudberry-operator
+HELM_CHART           := deploy/helm/cloudberry-operator
 
 # --- Tool versions -----------------------------------------------------------
 GOLANGCI_LINT_VERSION ?= v2.12.2
@@ -105,6 +110,10 @@ test-integration: ## Run integration tests (requires docker-compose)
 test-e2e: ## Run e2e tests
 	$(GO) test ./test/e2e/... -tags=e2e -race -count=1 -v -timeout=30m
 
+.PHONY: test-perf
+test-perf: ## Run performance benchmarks (requires live cluster + MinIO)
+	$(GO) test ./test/perf/... -tags=e2e -run=^$$ -bench=. -benchmem -count=1 -v -timeout=30m
+
 .PHONY: test-all
 test-all: test test-functional test-integration test-e2e ## Run all tests
 
@@ -148,7 +157,7 @@ endif
 docker-build: docker-build-operator docker-build-ctl ## Build Docker images for operator and ctl
 
 .PHONY: docker-build-all
-docker-build-all: docker-build docker-build-cloudberry docker-build-query-exporter docker-build-backup docker-build-official ## Build all Docker images (operator, ctl, cloudberry, query-exporter, backup, official)
+docker-build-all: docker-build docker-build-cloudberry docker-build-query-exporter docker-build-backup docker-build-official docker-build-pxf docker-build-official-pxf docker-build-gpfdist ## Build all Docker images (operator, ctl, cloudberry, query-exporter, backup, official, pxf, gpfdist)
 
 .PHONY: docker-push
 docker-push: ## Push Docker images
@@ -199,6 +208,25 @@ docker-build-official: ## Build cloudberry-official database image (official RPM
 	$(DOCKER) build --platform linux/amd64 \
 		-t $(IMG_OFFICIAL) \
 		-f Dockerfile.cloudberry-official .
+
+.PHONY: docker-build-pxf
+docker-build-pxf: ## Build cloudberry-pxf sidecar image (PXF server + CLI, amd64)
+	$(DOCKER) build --platform linux/amd64 \
+		--build-arg PXF_VERSION=$(PXF_VERSION) \
+		-t $(IMG_PXF) \
+		-f Dockerfile.cloudberry-pxf .
+
+.PHONY: docker-build-official-pxf
+docker-build-official-pxf: ## Build cloudberry-official-pxf image (DB + PXF extensions, amd64; requires cloudberry-pxf + cloudberry-official images)
+	$(DOCKER) build --platform linux/amd64 \
+		-t $(IMG_OFFICIAL_PXF) \
+		-f Dockerfile.cloudberry-official-pxf .
+
+.PHONY: docker-build-gpfdist
+docker-build-gpfdist: ## Build cloudberry-gpfdist image (gpfdist file server, amd64; requires cloudberry-official-pxf image)
+	$(DOCKER) build --platform linux/amd64 \
+		-t $(IMG_GPFDIST) \
+		-f Dockerfile.cloudberry-gpfdist .
 
 # =============================================================================
 # Kubernetes / Helm targets
@@ -336,52 +364,53 @@ endif
 # =============================================================================
 
 .PHONY: monitoring-deploy
-monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + node-exporter) to cloudberry-test namespace
-	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
+monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector + node-exporter + kube-state-metrics) to monitoring namespace
+	kubectl create namespace $(NAMESPACE_MONITORING) --dry-run=client -o yaml | kubectl apply -f -
 	$(HELM) upgrade --install vmagent test/monitoring/vmagent \
-		--namespace $(NAMESPACE_TEST) \
+		--namespace $(NAMESPACE_MONITORING) \
 		--wait --timeout 2m
 	$(HELM) upgrade --install node-exporter test/monitoring/node-exporter \
-		--namespace $(NAMESPACE_TEST) \
+		--namespace $(NAMESPACE_MONITORING) \
 		--wait --timeout 2m
 	$(HELM) upgrade --install vector test/monitoring/vector \
-		--namespace $(NAMESPACE_TEST) \
+		--namespace $(NAMESPACE_MONITORING) \
 		--wait --timeout 2m
-	$(HELM) repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-	$(HELM) repo update
-	$(HELM) upgrade --install otel-collector open-telemetry/opentelemetry-collector \
-		--namespace $(NAMESPACE_TEST) \
-		--set mode=deployment \
-		--set image.repository=otel/opentelemetry-collector-contrib \
-		--set config.receivers.otlp.protocols.grpc.endpoint="0.0.0.0:4317" \
-		--set config.receivers.otlp.protocols.http.endpoint="0.0.0.0:4318" \
-		--wait --timeout 5m
-	@echo "Monitoring stack deployed to namespace $(NAMESPACE_TEST)"
+	$(HELM) upgrade --install otel-collector test/monitoring/otel-collector \
+		--namespace $(NAMESPACE_MONITORING) \
+		--wait --timeout 2m
+	$(HELM) upgrade --install kube-state-metrics test/monitoring/kube-state-metrics \
+		--namespace $(NAMESPACE_MONITORING) \
+		--wait --timeout 2m
+	@echo "Monitoring stack deployed to namespace $(NAMESPACE_MONITORING)"
 
 .PHONY: monitoring-undeploy
-monitoring-undeploy: ## Remove monitoring stack from cloudberry-test namespace
-	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
-	$(HELM) uninstall vector --namespace $(NAMESPACE_TEST) 2>/dev/null || true
-	$(HELM) uninstall node-exporter --namespace $(NAMESPACE_TEST) 2>/dev/null || true
-	$(HELM) uninstall vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || true
-	@echo "Monitoring stack removed from namespace $(NAMESPACE_TEST)"
+monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
+	$(HELM) uninstall kube-state-metrics --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
+	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
+	$(HELM) uninstall vector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
+	$(HELM) uninstall node-exporter --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
+	$(HELM) uninstall vmagent --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
+	@echo "Monitoring stack removed from namespace $(NAMESPACE_MONITORING)"
 
 .PHONY: monitoring-status
-monitoring-status: ## Check monitoring stack status in cloudberry-test namespace
+monitoring-status: ## Check monitoring stack status in monitoring namespace
 	@echo "=== VictoriaMetrics Agent ==="
-	$(HELM) status vmagent --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "vmagent: not installed"
+	$(HELM) status vmagent --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "vmagent: not installed"
 	@echo ""
 	@echo "=== Node Exporter ==="
-	$(HELM) status node-exporter --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "node-exporter: not installed"
+	$(HELM) status node-exporter --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "node-exporter: not installed"
 	@echo ""
 	@echo "=== OpenTelemetry Collector ==="
-	$(HELM) status otel-collector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "otel-collector: not installed"
+	$(HELM) status otel-collector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "otel-collector: not installed"
 	@echo ""
 	@echo "=== Vector ==="
-	$(HELM) status vector --namespace $(NAMESPACE_TEST) 2>/dev/null || echo "vector: not installed"
+	$(HELM) status vector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "vector: not installed"
+	@echo ""
+	@echo "=== Kube State Metrics ==="
+	$(HELM) status kube-state-metrics --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "kube-state-metrics: not installed"
 	@echo ""
 	@echo "=== Pods ==="
-	kubectl get pods -n $(NAMESPACE_TEST) -l 'app.kubernetes.io/name in (vmagent,node-exporter,opentelemetry-collector,vector)' 2>/dev/null || echo "No monitoring pods found"
+	kubectl get pods -n $(NAMESPACE_MONITORING) -l 'app.kubernetes.io/name in (vmagent,node-exporter,otel-collector,vector,kube-state-metrics)' 2>/dev/null || echo "No monitoring pods found"
 	@echo ""
 	@echo "=== Grafana Dashboards ==="
 	@curl -sf -u admin:admin http://127.0.0.1:3000/api/search?tag=cloudberry 2>/dev/null | \
@@ -418,7 +447,7 @@ test-env-down: ## Stop test environment
 	$(DOCKER) compose -f test/docker-compose/docker-compose.yml down -v
 
 .PHONY: test-env-setup
-test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka, RabbitMQ, Hive/HDFS) and publish dashboards
+test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka, RabbitMQ, Hive/HDFS, JDBC sources, HBase, obj-store/hadoop/pushdown/export-targets/gpload-csv/kafka-cdc samples) and publish dashboards
 	@echo "Waiting for services to be ready..."
 	@sleep 10
 	bash test/docker-compose/scripts/setup-vault.sh
@@ -429,6 +458,14 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	bash test/docker-compose/scripts/setup-rabbitmq.sh
 	bash test/docker-compose/scripts/setup-hive-hdfs.sh
 	bash test/docker-compose/scripts/setup-victorialogs.sh
+	bash test/docker-compose/scripts/setup-jdbc-sources.sh
+	bash test/docker-compose/scripts/setup-hbase.sh
+	bash test/docker-compose/scripts/gen-objstore-samples.sh
+	bash test/docker-compose/scripts/gen-hadoop-samples.sh
+	bash test/docker-compose/scripts/gen-pushdown-samples.sh
+	bash test/docker-compose/scripts/gen-export-targets.sh
+	bash test/docker-compose/scripts/gen-gpload-csv.sh
+	bash test/docker-compose/scripts/gen-kafka-cdc.sh
 	bash test/monitoring/scripts/publish-dashboards.sh
 
 # =============================================================================
@@ -447,5 +484,5 @@ clean: ## Clean build artifacts
 .PHONY: help
 help: ## Show this help message
 	@printf "\nUsage: make \033[36m<target>\033[0m\n\n"
-	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@printf "\n"

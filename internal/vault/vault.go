@@ -796,8 +796,14 @@ func (w *SecretWatcher) Watch(ctx context.Context) {
 
 // checkForChanges reads the secret and calls onChange if it has changed.
 func (w *SecretWatcher) checkForChanges(ctx context.Context) {
+	ctx, span := telemetry.StartSpan(ctx, vaultTracerName, "vault.watch.check")
+	defer span.End()
+
 	data, err := w.client.ReadSecret(ctx, w.path)
 	if err != nil {
+		// ReadSecret already meters the read/error outcome; do NOT record another
+		// vault operation here (it would double-count). Only mark the span.
+		telemetry.SetSpanError(span, err)
 		w.logger.Warn("failed to read vault secret for change detection",
 			"path", w.path,
 			"error", err,

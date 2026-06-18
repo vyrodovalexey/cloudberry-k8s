@@ -1112,7 +1112,7 @@ func (b *DefaultBuilder) BuildPostRestoreValidationJob(
 	// The validation container runs the bash script directly rather than a tool.
 	podSpec.Containers[0].Args = []string{postRestoreValidationScript(opts)}
 	if opts.Database != "" {
-		setEnvVar(&podSpec.Containers[0], "PGDATABASE", opts.Database)
+		setEnvVar(&podSpec.Containers[0], envPGDatabase, opts.Database)
 	}
 	// Mirror the restore Job's S3 folder for a cross-cluster migration so this
 	// validation Job's S3 env points at the SOURCE folder it inspects. No-op when
@@ -1802,10 +1802,10 @@ func firstDatabase(databases []string) string {
 func buildBackupEnv(cluster *cbv1alpha1.CloudberryCluster) []corev1.EnvVar {
 	env := make([]corev1.EnvVar, 0, 16)
 	env = append(env, []corev1.EnvVar{
-		{Name: "PGHOST", Value: util.CoordinatorServiceName(cluster.Name)},
-		{Name: "PGPORT", Value: strconv.Itoa(int(resolvePort(cluster)))},
-		{Name: "PGUSER", Value: util.DefaultAdminUser},
-		{Name: "PGDATABASE", Value: defaultCoordinatorDatabase},
+		{Name: envPGHost, Value: util.CoordinatorServiceName(cluster.Name)},
+		{Name: envPGPort, Value: strconv.Itoa(int(resolvePort(cluster)))},
+		{Name: envPGUser, Value: util.DefaultAdminUser},
+		{Name: envPGDatabase, Value: defaultCoordinatorDatabase},
 		{
 			Name: envPGPassword,
 			ValueFrom: &corev1.EnvVarSource{

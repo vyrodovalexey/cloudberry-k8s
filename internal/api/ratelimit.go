@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -222,17 +223,19 @@ func (rl *RateLimiter) extractClientIP(r *http.Request) string {
 		// Check X-Forwarded-For header (first IP in the chain).
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			// X-Forwarded-For can contain multiple IPs; use the first one.
+			// Trim surrounding whitespace because real-world headers are
+			// comma+space separated ("a, b").
 			for i := range len(xff) {
 				if xff[i] == ',' {
-					return xff[:i]
+					return strings.TrimSpace(xff[:i])
 				}
 			}
-			return xff
+			return strings.TrimSpace(xff)
 		}
 
 		// Check X-Real-IP header.
 		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			return xri
+			return strings.TrimSpace(xri)
 		}
 	}
 

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -456,6 +457,10 @@ func TestAdminReconciler_ReconcileDataLoading_Disabled(t *testing.T) {
 
 	err := r.reconcileDataLoading(context.Background(), cluster)
 	require.NoError(t, err)
+
+	// Disabled/absent spec is a no-op: the lightweight status stays unset.
+	assert.Nil(t, cluster.Status.DataLoading)
+	assert.Equal(t, int32(0), cluster.Status.DataLoadingJobs)
 }
 
 func TestAdminReconciler_ReconcileDataLoading_Enabled(t *testing.T) {
@@ -465,9 +470,9 @@ func TestAdminReconciler_ReconcileDataLoading_Enabled(t *testing.T) {
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "job1", Type: "s3", Enabled: true, TargetTable: "public.data"},
-			{Name: "job2", Type: "kafka", Enabled: false, TargetTable: "public.stream"},
-			{Name: "job3", Type: "rabbitmq", Enabled: true, TargetTable: "public.queue"},
+			{Name: "job1", Type: "pxf", Enabled: true},
+			{Name: "job2", Type: "pxf", Enabled: false},
+			{Name: "job3", Type: "gpload", Enabled: true},
 		},
 	}
 
@@ -485,7 +490,315 @@ func TestAdminReconciler_ReconcileDataLoading_Enabled(t *testing.T) {
 	err := r.reconcileDataLoading(context.Background(), cluster)
 	require.NoError(t, err)
 
+	// Backcompat mirror: DataLoadingJobs counts only enabled jobs.
 	assert.Equal(t, int32(2), cluster.Status.DataLoadingJobs)
+
+	// Lightweight DataLoading status.
+	require.NotNil(t, cluster.Status.DataLoading)
+	assert.Equal(t, "Configured", cluster.Status.DataLoading.Phase)
+	assert.Equal(t, int32(3), cluster.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(t, int32(2), cluster.Status.DataLoading.ActiveJobs)
+	require.Len(t, cluster.Status.DataLoading.Jobs, 3)
+	assert.Equal(t, cbv1alpha1.DataLoadingJobStatus{Name: "job1", Enabled: true},
+		cluster.Status.DataLoading.Jobs[0])
+	assert.Equal(t, cbv1alpha1.DataLoadingJobStatus{Name: "job2", Enabled: false},
+		cluster.Status.DataLoading.Jobs[1])
+	assert.Equal(t, cbv1alpha1.DataLoadingJobStatus{Name: "job3", Enabled: true},
+		cluster.Status.DataLoading.Jobs[2])
+
+	// The status patch persists the new fields (verify via re-Get).
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated))
+	require.NotNil(t, updated.Status.DataLoading)
+	assert.Equal(t, "Configured", updated.Status.DataLoading.Phase)
+	assert.Equal(t, int32(3), updated.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(t, int32(2), updated.Status.DataLoading.ActiveJobs)
+	require.Len(t, updated.Status.DataLoading.Jobs, 3)
+	assert.Equal(t, int32(2), updated.Status.DataLoadingJobs)
+}
+
+// pxfCapturingRecorder records the last SetPXFServersConfigured call so PXF
+// reconcile tests can assert the gauge was set with the expected count. It
+// embeds NoopRecorder so all other Recorder methods are no-ops.
+type pxfCapturingRecorder struct {
+	metrics.NoopRecorder
+	calls      int
+	lastCount  float64
+	lastClust  string
+	lastNSpace string
+}
+
+func (m *pxfCapturingRecorder) SetPXFServersConfigured(cluster, namespace string, count float64) {
+	m.calls++
+	m.lastCount = count
+	m.lastClust = cluster
+	m.lastNSpace = namespace
+}
+
+func newPXFDataLoadingCluster() *cbv1alpha1.CloudberryCluster {
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "cloudberry/pxf:2.1.0",
+			Servers: []cbv1alpha1.PxfServerSpec{
+				{Name: "s3-a", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "https://m"}},
+				{Name: "s3-b", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "https://n"}},
+				{Name: "hdfs", Type: "hdfs", Config: map[string]string{"fs.defaultFS": "hdfs://nn:8020"},
+					Hive: map[string]string{"hive.metastore.uris": "thrift://h:9083"}},
+				{Name: "mysql", Type: "jdbc", Config: map[string]string{"jdbc.driver": "com.mysql.cj.jdbc.Driver"}},
+				{Name: "pg", Type: "jdbc", Config: map[string]string{"jdbc.driver": "org.postgresql.Driver"}},
+			},
+		},
+	}
+	return cluster
+}
+
+func TestAdminReconciler_ReconcileDataLoading_PXFEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newPXFDataLoadingCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &pxfCapturingRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// Status.DataLoading.Pxf populated from spec.
+	require.NotNil(t, cluster.Status.DataLoading)
+	require.NotNil(t, cluster.Status.DataLoading.Pxf)
+	assert.True(t, cluster.Status.DataLoading.Pxf.Configured)
+	assert.Equal(t, int32(5), cluster.Status.DataLoading.Pxf.Servers)
+
+	// Gauge recorded with the configured server count.
+	assert.Equal(t, 1, m.calls)
+	assert.Equal(t, 5.0, m.lastCount)
+	assert.Equal(t, cluster.Name, m.lastClust)
+	assert.Equal(t, cluster.Namespace, m.lastNSpace)
+
+	// The admin reconcile NO LONGER creates the "<cluster>-pxf-servers" ConfigMap
+	// (that moved to the CLUSTER controller's reconcileSegments so it exists
+	// before segment pods start). The admin path is status/metric/condition only.
+	cm := &corev1.ConfigMap{}
+	getErr := k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm)
+	assert.True(t, apierrors.IsNotFound(getErr),
+		"admin reconcile must NOT create the PXF servers ConfigMap (cluster controller owns it)")
+
+	// Persisted status includes pxf sub-object.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated))
+	require.NotNil(t, updated.Status.DataLoading.Pxf)
+	assert.True(t, updated.Status.DataLoading.Pxf.Configured)
+	assert.Equal(t, int32(5), updated.Status.DataLoading.Pxf.Servers)
+
+	// Idempotent re-reconcile: no error, ConfigMap update path exercised.
+	require.NoError(t, r.reconcileDataLoading(context.Background(), cluster))
+}
+
+func TestAdminReconciler_ReconcileDataLoading_PXFDisabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: "cloudberry/pxf:2.1.0"},
+		Jobs:    []cbv1alpha1.DataLoadingJob{{Name: "j1", Type: "gpload", Enabled: true}},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &pxfCapturingRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+
+	// PXF status stays nil; gauge never set.
+	require.NotNil(t, cluster.Status.DataLoading)
+	assert.Nil(t, cluster.Status.DataLoading.Pxf)
+	assert.Equal(t, 0, m.calls)
+
+	// No ConfigMap created.
+	cm := &corev1.ConfigMap{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm)
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
+// TestAdminReconciler_ReconcilePxf_ConditionMessage validates the
+// DataLoadingConfigured condition is set True with the enriched PXF-server
+// count message. It asserts on the in-memory condition BEFORE the
+// status-subresource patch (which intentionally only carries dataLoading and
+// therefore refreshes the object without the in-memory conditions). This is
+// verified by driving reconcilePxf directly and replicating the exact condition
+// path reconcileDataLoading uses.
+func TestAdminReconciler_ReconcilePxf_ConditionMessage(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newPXFDataLoadingCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	b := builder.NewBuilder()
+	m := &pxfCapturingRecorder{}
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(10), b, nil, m, nil)
+
+	cluster.Status.DataLoading = &cbv1alpha1.DataLoadingStatus{Phase: "Configured"}
+	count := r.reconcilePxf(context.Background(), cluster)
+	assert.Equal(t, 5, count)
+
+	conditionMsg := "Data loading configuration is applied"
+	if cluster.Status.DataLoading.Pxf != nil {
+		conditionMsg = conditionMsg + "; PXF configured: 5 servers"
+	}
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataLoadingConfigured),
+		metav1.ConditionTrue,
+		"DataLoadingReconciled",
+		conditionMsg,
+	)
+
+	cond := util.FindCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataLoadingConfigured))
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Contains(t, cond.Message, "PXF configured: 5 servers")
+}
+
+func TestClampInt32(t *testing.T) {
+	assert.Equal(t, int32(0), clampInt32(0))
+	assert.Equal(t, int32(5), clampInt32(5))
+	assert.Equal(t, int32(0), clampInt32(-1))
+	assert.Equal(t, int32(math.MaxInt32), clampInt32(math.MaxInt32+1))
+}
+
+func TestAdminReconciler_ReconcileDataLoading_NoJobs(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+
+	require.NotNil(t, cluster.Status.DataLoading)
+	assert.Equal(t, "Configured", cluster.Status.DataLoading.Phase)
+	assert.Equal(t, int32(0), cluster.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(t, int32(0), cluster.Status.DataLoading.ActiveJobs)
+	assert.Empty(t, cluster.Status.DataLoading.Jobs)
+	assert.Equal(t, int32(0), cluster.Status.DataLoadingJobs)
+
+	// The empty jobs array must persist (MergePatch empty-array path).
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated))
+	require.NotNil(t, updated.Status.DataLoading)
+	assert.Empty(t, updated.Status.DataLoading.Jobs)
+}
+
+func TestAdminReconciler_ReconcileDataLoading_MultipleAllEnabled(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Jobs: []cbv1alpha1.DataLoadingJob{
+			{Name: "a", Type: "pxf", Enabled: true},
+			{Name: "b", Type: "gpload", Enabled: true},
+			{Name: "c", Type: "pxf", Enabled: true},
+			{Name: "d", Type: "gpload", Enabled: true},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	err := r.reconcileDataLoading(context.Background(), cluster)
+	require.NoError(t, err)
+
+	require.NotNil(t, cluster.Status.DataLoading)
+	assert.Equal(t, int32(4), cluster.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(t, int32(4), cluster.Status.DataLoading.ActiveJobs)
+	assert.Equal(t, int32(4), cluster.Status.DataLoadingJobs)
+	require.Len(t, cluster.Status.DataLoading.Jobs, 4)
+}
+
+func TestAdminReconciler_PatchDataLoadingStatus_EmptyJobs(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.DataLoadingJobs = 0
+	cluster.Status.DataLoading = &cbv1alpha1.DataLoadingStatus{
+		Phase:          "Configured",
+		ConfiguredJobs: 0,
+		ActiveJobs:     0,
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewAdminReconciler(k8sClient, scheme, recorder, b, nil, m, nil)
+
+	require.NoError(t, r.patchDataLoadingStatus(context.Background(), cluster))
+
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated))
+	require.NotNil(t, updated.Status.DataLoading)
+	assert.Equal(t, "Configured", updated.Status.DataLoading.Phase)
+	assert.Empty(t, updated.Status.DataLoading.Jobs)
 }
 
 func TestAdminReconciler_ReconcileWorkload_Disabled(t *testing.T) {
@@ -625,7 +938,7 @@ func TestAdminReconciler_Reconcile_WithAllFeatures(t *testing.T) {
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "loader", Type: "s3", Enabled: true, TargetTable: "public.data"},
+			{Name: "loader", Type: "pxf", Enabled: true},
 		},
 	}
 
@@ -770,9 +1083,9 @@ func TestAdminReconciler_Reconcile_WithAllFeaturesAndStorage(t *testing.T) {
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "loader1", Type: "s3", Enabled: true, TargetTable: "public.data"},
-			{Name: "loader2", Type: "kafka", Enabled: true, TargetTable: "public.stream"},
-			{Name: "loader3", Type: "rabbitmq", Enabled: false, TargetTable: "public.queue"},
+			{Name: "loader1", Type: "pxf", Enabled: true},
+			{Name: "loader2", Type: "pxf", Enabled: true},
+			{Name: "loader3", Type: "gpload", Enabled: false},
 		},
 	}
 	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{

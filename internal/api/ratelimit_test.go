@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -331,6 +332,28 @@ func TestExtractClientIP_WithTrustedProxies(t *testing.T) {
 			remoteAddr: "10.10.10.10:12345",
 			expected:   "10.10.10.10",
 		},
+		{
+			// W1-A4 (TASK 14): a PADDED first hop (space before the comma) must
+			// be trimmed — the bucket key must have no surrounding whitespace.
+			name:       "X-Forwarded-For padded first hop trimmed",
+			headers:    map[string]string{"X-Forwarded-For": " 1.2.3.4 , 5.6.7.8"},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "1.2.3.4",
+		},
+		{
+			// W1-A4 (TASK 14): X-Real-IP with surrounding spaces is trimmed.
+			name:       "X-Real-IP surrounding spaces trimmed",
+			headers:    map[string]string{"X-Real-IP": "  10.0.0.9  "},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "10.0.0.9",
+		},
+		{
+			// W1-A4 (TASK 14): a single padded hop (no comma) is still trimmed.
+			name:       "X-Forwarded-For single padded hop trimmed",
+			headers:    map[string]string{"X-Forwarded-For": "   7.7.7.7   "},
+			remoteAddr: "192.168.1.1:12345",
+			expected:   "7.7.7.7",
+		},
 	}
 
 	for _, tt := range tests {
@@ -342,6 +365,8 @@ func TestExtractClientIP_WithTrustedProxies(t *testing.T) {
 			}
 			result := rl.extractClientIP(req)
 			assert.Equal(t, tt.expected, result)
+			assert.Equal(t, strings.TrimSpace(result), result,
+				"the bucket key must have no leading/trailing whitespace")
 		})
 	}
 }

@@ -22,6 +22,12 @@ func SegmentMirrorName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-segment-mirror", cluster))
 }
 
+// PxfNetworkPolicyName returns the name of the PXF cluster NetworkPolicy (SE.5)
+// that confines the PXF port on the segment-primary pods.
+func PxfNetworkPolicyName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-pxf", cluster))
+}
+
 // CoordinatorPodName returns the name of the active coordinator pod (ordinal 0
 // of the coordinator StatefulSet). gpbackup/gprestore are MPP orchestrators that
 // must run inside the coordinator pod (segment -1) so they can write the
@@ -126,6 +132,37 @@ func BackupS3VaultCredentialsSecretName(cluster string) string {
 // BackupCronJobName returns the scheduled backup CronJob name.
 func BackupCronJobName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-schedule", cluster))
+}
+
+// DataLoadJobName returns the deterministic data-loading Job/CronJob name for a
+// named job ("<cluster>-dataload-<job>"). It is the single source of truth for
+// the data-loading workload name shared by the builder (create) and the
+// controller (get-or-create/idempotency).
+func DataLoadJobName(cluster, job string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-dataload-%s", cluster, job))
+}
+
+// GpfdistServiceName2 returns the gpfdist Service name ("<cluster>-gpfdist-svc")
+// that fronts the gpfdist Deployment pods. It is distinct from the Deployment
+// name ("<cluster>-gpfdist", returned by builder.GpfdistServiceName) and is the
+// host a gpload control file's gpfdist:// FILE entry targets.
+func GpfdistServiceName2(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-gpfdist-svc", cluster))
+}
+
+// GpfdistDataPVCName returns the gpfdist data PVC name
+// ("<cluster>-gpfdist-data-pvc"). The per-cluster name (vs. the spec's bare
+// "gpfdist-data-pvc" literal) avoids collisions when two clusters share a
+// namespace and lets the operator ownerRef-GC it.
+func GpfdistDataPVCName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-gpfdist-data-pvc", cluster))
+}
+
+// GploadControlFileConfigMapName returns the per-job gpload control-file
+// ConfigMap name ("<cluster>-gpload-<job>"). The ConfigMap carries the rendered
+// gpload YAML control file that the gpload Job/CronJob mounts at /etc/gpload.
+func GploadControlFileConfigMapName(cluster, job string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-gpload-%s", cluster, job))
 }
 
 // ClusterSSHSecretName returns the name of the cluster-wide gpadmin SSH keypair

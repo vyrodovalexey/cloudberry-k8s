@@ -1,0 +1,58 @@
+# =============================================================================
+# Dockerfile.cloudberry-official-pxf — Cloudberry DB + PXF Extensions
+# =============================================================================
+# DELIVERABLE 2 (Option B): A thin derived image that adds the PXF C extensions
+# (pxf + pxf_fdw) to the official Cloudberry DB image. This enables:
+#   CREATE EXTENSION pxf;
+#   CREATE EXTENSION pxf_fdw;
+# on the coordinator and segment pods.
+#
+# The extension artifacts (.so, .control, .sql) are copied from the PXF builder
+# stage (Dockerfile.cloudberry-pxf) to ensure ABI compatibility — both images
+# use the same Cloudberry 2.1.0 RPM.
+#
+# Build (requires cloudberry-pxf builder stage):
+#   docker build --platform linux/amd64 -f Dockerfile.cloudberry-official-pxf \
+#       -t cloudberry-official-pxf:2.1.0 .
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Import the PXF builder stage to get the compiled extension artifacts
+# ---------------------------------------------------------------------------
+FROM cloudberry-pxf:2.1.0 AS pxf-extensions-source
+
+# ---------------------------------------------------------------------------
+# Derive from the official Cloudberry DB image
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 cloudberry-official:2.1.0
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-database-official-pxf" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 (official RPM) with PXF extensions for Kubernetes" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="cloudberry-official:2.1.0"
+
+# Switch to root to install extensions
+USER root
+
+# Copy PXF extension shared libraries (.so) into GPHOME/lib/postgresql
+COPY --from=pxf-extensions-source \
+    /pxf-extensions/lib/postgresql/ \
+    /usr/local/cloudberry-db/lib/postgresql/
+
+# Copy PXF extension SQL + control files into GPHOME/share/postgresql/extension
+COPY --from=pxf-extensions-source \
+    /pxf-extensions/share/postgresql/extension/ \
+    /usr/local/cloudberry-db/share/postgresql/extension/
+
+# Fix ownership (match the base image convention: gpadmin:gpadmin)
+RUN chown -R gpadmin:gpadmin \
+        /usr/local/cloudberry-db/lib/postgresql/pxf*.so \
+        /usr/local/cloudberry-db/share/postgresql/extension/pxf* \
+    2>/dev/null || true
+
+# Switch back to gpadmin
+USER 1000:1000

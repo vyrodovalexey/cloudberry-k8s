@@ -65,9 +65,6 @@ func (m *mockDBClient) Close() {}
 func (m *mockDBClient) GetSegmentConfiguration(_ context.Context) ([]db.SegmentInfo, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetClusterState(_ context.Context) (*db.ClusterState, error) {
-	return nil, nil
-}
 func (m *mockDBClient) SetParameter(_ context.Context, _, _ string, _ db.ParameterScope) error {
 	return nil
 }
@@ -177,6 +174,17 @@ func (m *mockDBClient) AnalyzeSkew(_ context.Context, _ string) ([]db.TableSkewI
 func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) error { return nil }
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error)     { return nil, nil }
 func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error       { return nil }
+func (m *mockDBClient) SetupPXFExtensions(_ context.Context) (int, error)         { return 2, nil }
+func (m *mockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error    { return nil }
+func (m *mockDBClient) ListPXFExtensions(_ context.Context) ([]string, error)     { return nil, nil }
+func (m *mockDBClient) ListExternalTables(_ context.Context) ([]db.ExternalTableInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*db.PXFSourceSample, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
 	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
 }

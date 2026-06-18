@@ -2064,6 +2064,17 @@ The `gpbackupOptions` fields:
 `POST /backups/{timestamp}/restore` (Admin). The `{timestamp}` is the 14-digit
 `YYYYMMDDHHMMSS` backup timestamp.
 
+> **Operator timestamp vs. `gpbackup` timestamp.** `status.lastBackupTimestamp` (and each
+> `backupHistory[].timestamp`) is the **operator-assigned Job-creation timestamp**, which
+> can **differ** from the `gpbackup` internal timestamp embedded in the S3 object paths. In
+> the coordinator-exec model `gpbackup` runs asynchronously inside the coordinator and
+> assigns its own timestamp. The operator's `POST /backups/{timestamp}/restore` resolves the
+> correct backup from its recorded history, so restoring **through the operator** is
+> unaffected. But when you restore **by timestamp directly against S3** (a manual
+> `gprestore` outside the operator), you must pass the actual `gpbackup` timestamp — the one
+> in the S3 object path — or `gprestore` will report a `NotFound`. This is an observed known
+> characteristic, not a bug.
+
 ```bash
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -6137,15 +6148,15 @@ When OpenTelemetry tracing is enabled, the operator creates spans across its imp
 **Spans emitted:**
 
 - **Reconciliation loops** — one `Reconcile` span per controller (cluster, admin, HA, auth); `SetSpanError` is recorded on the admin/HA/auth error paths in addition to the cluster controller.
-- **Controller sub-operations** — `controller.<operation>` spans for sub-reconcilers (e.g. `controller.clusterTLS` for cluster TLS auto-issuance, `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)), parented on the controller's `Reconcile` span.
+- **Controller sub-operations** — `controller.<operation>` spans for sub-reconcilers (e.g. `controller.clusterTLS` for cluster TLS auto-issuance, the cluster-controller sub-operation spans `controller.reconcileCoreResources` and `controller.reconcileStatefulSets`, `reconcileBackup` (admin), `runFTSProbe` and `handleFailover` (HA), `recordTableBloatRatios` (admin)), parented on the controller's `Reconcile` span.
 - **API requests** — the tracing middleware opens a server span per request that is **renamed after routing** to `<METHOD> <route template>` (e.g. `GET /api/v1alpha1/clusters/{name}`) — never the raw path; unmatched requests get the `<METHOD> unmatched` fallback. The raw path remains available as the `http.target` attribute. The span status is set to `Error` on responses with HTTP status `>= 400`, and inbound trace context is propagated so cross-service traces continue.
-- **Database operations** — `db.<operation>` spans for every `db.Client` method (bounded operation set), plus `db.query` for raw query instrumentation, nested under the calling controller/API span.
+- **Database operations** — `db.<operation>` spans for every `db.Client` method (bounded operation set), plus `db.query` for raw query instrumentation, nested under the calling controller/API span. Both the 15 mutating/DDL methods and the 22 read-path methods open a named `db.<Method>` span (and record `cloudberry_db_query_duration_seconds`), so the read and write sides are symmetric.
 - **Authentication** — `auth.authenticate` per authenticated request, with `auth.oidc.verify` (Bearer token verification) and `auth.oidc.userinfo` (UserInfo role-claim fetch) child spans; `auth.method`/`auth.result` attributes.
 - **Admission webhooks** — `webhook.validate` and `webhook.mutate` spans with the admission operation and a `webhook.allowed` attribute.
 - **Idle daemon** — `idle.scan` per scan cycle, with `idle.reconnect` span events on reconnect attempts.
 - **Migration** — `handleMigrate` with `migrate.validate` and `migrate.create` child spans.
-- **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, and `vault.WriteSecret`.
-- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning) and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`).
+- **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`, and `vault.watch.check` (the `SecretWatcher.checkForChanges` read — span-only, error status on a read failure; the vault read/error metric is already emitted by `ReadSecret`, so there is no double-count).
+- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning), `certmanager.issueVaultPKICert` (the Vault PKI cert-issuance call, error status on failure), and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`).
 
 **Error recording on spans:**
 
@@ -6198,6 +6209,559 @@ The validating admission webhook rejects invalid `CloudberryCluster` resources a
 | Missing coordinator storage | `coordinator.storage.size is required` |
 | Missing segment storage | `segments.storage.size is required` |
 | Duplicate cluster name | `CloudberryCluster with name "X" already exists in namespace "Y"` |
+
+#### Data-loading (PXF) validation
+
+When `dataLoading.enabled: true`, the validating webhook enforces the PXF +
+gpload data-loading rules (`W.1`–`W.25` plus `W.10b`; W.1–W.15 verified by
+**Scenario 89** and the complete multi-layer matrix **Scenario 110**, W.10b by
+**96/97**, W.17 by **99**, W.18–W.22 by **101**, the custom-connector / streaming
+rules **W.23/W.24/W.23c** by **102**, and the `loadMethod` rule **W.25** + the
+W.17 fdw-read tweak by **103**).
+Validation is fail-fast — the first offending field is reported with its field
+path and the CR is **not persisted**. A disabled/absent `dataLoading` spec is
+skipped.
+
+> **Rejection source per rule (Scenario 110).** Three rules — **W.3** (server
+> `type`), **W.8** (job `type`), **W.15** (`segmentRejectLimitType`) — are **also**
+> backed by a CRD OpenAPI **`Enum`**, so on a live `kubectl apply` the **apiserver
+> schema rejects the bad value BEFORE the webhook runs** (the webhook keeps the
+> rule for defense-in-depth; the apiserver error — `Unsupported value: "ftp"`,
+> etc. — is itself descriptive). Two rules — **W.11** (`pxfJob.targetTable`) and
+> **W.12** (`gploadJob.targetTable`) — are **expression-dependent**: an **omitted**
+> key is rejected by the CRD schema `required`, an **empty-string** value by the
+> webhook. The other **11** rules are **webhook-enforced only** (you see our
+> descriptive message). Scenario 110 is the complete W.1–W.15 rejected-CR matrix
+> (descriptive error + NO-PERSIST + CONTROL admit) across unit/functional/
+> integration/e2e/perf layers — see
+> [spec 12 §Scenario 110](../specifications/12-data-loading-spec.md#scenario-110--webhook-validation-all-rules).
+
+> **What is implemented today.** The *declarative* data-loading model is live:
+> the `DataLoadingSpec` CRD, the `W.1`–`W.15` webhook validation and the 14
+> webhook defaults, plus a controller reconcile that writes `status.dataLoading`
+> and the `cloudberry_data_loading_jobs_active` gauge. Enabling `dataLoading.pxf`
+> (gated on `dataLoading.enabled && pxf.enabled && pxf.image != ""`) deploys a
+> **PXF sidecar on segment-primary pods** (coordinator/standby/mirror untouched)
+> plus the **`pxf-cred-init` credential init-container** (live `envsubst`
+> secret→XML rendering into a **one-directory-per-server** `<server>/<file>.xml`
+> layout — **secrets never land in the ConfigMap**), and applies the
+> `<cluster>-pxf-servers` **ConfigMap** (rendered `*-site.xml` per server with the
+> **per-type file-mapping** — `s3`→`s3-site.xml`; `hdfs`→`core-site.xml`+
+> `hdfs-site.xml` always (+ optional `hive`/`hbase`/`mapred`/`yarn` site files,
+> with the `config` map prefix-split `fs.*`→core/`dfs.*`→hdfs/…); `jdbc`→
+> `jdbc-site.xml`; `hive`→`core`+`hive`; `hbase`→`core`+`hbase` — and
+> `credentialSecrets[]` as `${PLACEHOLDER}` markers, never literal secrets). The
+> sidecar's `PXF_LOG_LEVEL` reflects `pxf.logLevel` and is rebuilt from spec each
+> reconcile. Because every segment-primary sidecar mounts the **same**
+> `<cluster>-pxf-servers` ConfigMap and renders byte-identical configs, **config
+> sync is structural — no explicit `pxf sync` is needed**.
+>
+> **The ingestion runtime is now implemented.** For every enabled
+> `dataLoading.jobs[]` entry the operator **creates and launches** a one-off
+> `Job` (no `schedule`) or a `CronJob` (when `schedule` is set), named
+> `<cluster>-dataload-<job>`, that runs `psql` against the coordinator:
+> `CREATE EXTERNAL TABLE (LIKE <target>)` → `INSERT…SELECT` → `ANALYZE`. It
+> best-effort-installs the PXF extensions (`CREATE EXTENSION pxf/pxf_fdw`,
+> non-fatal) and — only when the `pxf` extension installed — `GRANT SELECT`/
+> `INSERT ON PROTOCOL pxf TO "gpadmin"` (also best-effort/non-fatal), enriches
+> `status.dataLoading.jobs[].{lastRun,lastStatus,rowsLoaded,
+> duration}` from the real terminal Job status + the harvested `DATALOAD_ROWS`
+> marker, and emits **5 data-loading metrics** (`…_job_status`,
+> `…_job_last_success_timestamp`, `…_job_duration_seconds`, `…_rows_total`,
+> `…_errors_total`).
+>
+> **✅ PXF note.** The engine-native `gpfdist://`/`s3://` external-table
+> protocols (and bare paths served by the cluster gpfdist Service) **load real
+> data end-to-end** (row-count verified — e.g. **183,961 rows** from a staged
+> CSV) using the same Job machinery and need **no PXF**. (The bare `file://`
+> scheme is **not** a supported `gploadJob.filePaths` input for a multi-segment
+> cluster — it is admission-rejected by webhook rule **W.16**; use `gpfdist://`,
+> `s3://`, or a bare path.) A **live `pxf://` read-back is now Implemented and
+> row-count verified**: an operator-driven `pxf://` load from MinIO S3 (via the
+> PXF sidecar) loaded **183,961 rows** with credentials rendered automatically by
+> the operator. It requires the **`cloudberry-pxf` sidecar image**
+> (`Dockerfile.cloudberry-pxf`, built from `apache/cloudberry-pxf` via `make
+> docker-build-pxf`) **and** the **`pxf`/`pxf_fdw` extensions** in the DB image
+> (the `cloudberry-official-pxf` image, `Dockerfile.cloudberry-official-pxf`,
+> `make docker-build-official-pxf`). On a stock `cloudberry-official:2.1.0` (no
+> PXF extension) the operator still **generates and launches** the correct
+> `pxf://` Job, but it cannot **read back** until those images are in place — an
+> image prerequisite, not a code gap.
+>
+> **PXF lifecycle commands (Scenario 95).** The operator now exposes an
+> on-demand PXF lifecycle via `cloudberry-ctl pxf status|restart|sync --cluster
+> <name> [--namespace <ns>]` (and the matching `…/data-loading/pxf/{status,
+> restart,sync}` REST routes):
+> - `cloudberry-ctl pxf status` — **honest** sidecar readiness aggregated from the
+>   segment-primary pods' real `pxf` container statuses (no synthetic health, no
+>   exec), plus the spec-derived `configured`/`servers` counts.
+> - `cloudberry-ctl pxf restart` — operator-driven restart: the operator bumps the
+>   `<cluster>-segment-primary` StatefulSet restart-trigger annotation, so **all
+>   segment pods roll** and each re-runs the entrypoint (`pxf prepare`/`pxf
+>   start`), restarting every PXF sidecar. This is a **pod ROLL — heavier than an
+>   in-place sidecar restart** (for a single sidecar in-place restart, use
+>   `kubectl exec <segpod> -c pxf -- pxf restart`). Emits the
+>   `cloudberry_pxf_restart_total{cluster,namespace,result}` metric.
+> - `cloudberry-ctl pxf sync` — refreshes the `<cluster>-pxf-servers` ConfigMap and
+>   rolls the sidecars; the **explicit, on-demand** counterpart to the always-on
+>   structural sync below. Use it to force a config refresh + roll immediately.
+>
+> `status`/`restart`/`sync` and (as of **Scenario 108**) `servers …` are ctl
+> commands; `pxf prepare`/`start`/`stop` are sidecar-local verbs run via
+> `kubectl exec -c pxf`. `pxf servers {list,create,update,delete}` CRUD is now
+> **Implemented** (Scenario 108) — see the Scenario 108 note below.
+
+> **Now Implemented (Scenario 101):** the **gpfdist `Deployment`/`Service`/`PVC`**
+> (gated on `dataLoading.gpfdist.enabled`; `reconcileGpfdist`) and the **gpload
+> control-file load path** — a `type: gpload` job renders a gpload YAML control
+> file delivered via the `<cluster>-gpload-<job>` ConfigMap (mounted at
+> `/etc/gpload`) and run by a `Job`/`CronJob` with `gpload -f`. The new
+> `gploadJob` fields (`inputSource`, `delimiter`, `header`, `encoding`,
+> `matchColumns`, `updateColumns`, `preload.truncate`, `postActions`) drive the
+> control file; webhook rules **W.18-W.22** guard them. gpload reuses the existing
+> `cloudberry_data_loading_*` metrics (no new metric); gpfdist Deployment readiness
+> is observed via `kubectl` (kube-state-metrics is absent in the test env) and the
+> 2 `cloudberry_gpfdist_*` metrics stay **Planned** (no scrapable endpoint). See
+> [spec 12 §Scenario 101](../specifications/12-data-loading-spec.md#scenario-101--gpfdist-deployment--gpload-csv).
+
+> **Now Implemented (Scenario 102 — kafka-cdc continuous streaming via a custom
+> connector):** the `kafka` profile is **reinstated** as a **custom-connector**
+> profile (a policy reversal scoped to custom connectors; built-in streaming is
+> still out of scope). Configure it with: a `dataLoading.pxf.servers[]` entry of
+> the new **`custom`** type (no forced config keys), a matching
+> `dataLoading.pxf.customConnectors[]` entry `{name, jarUrl}` that provides the
+> connector JAR, and a `dataLoading.jobs[].pxfJob` with `profile: kafka`,
+> `continuous: true`, plus optional `batchSize`/`flushInterval`. The operator's
+> new **`pxf-connector-init`** init container downloads each `jarUrl` into
+> `/pxf/lib/custom/<name>.jar` on the PXF sidecar (`s3://` via the backup S3
+> credentials, `http(s)://` via curl). A `continuous: true` job runs as a **one-off
+> long-running Job** (NOT a CronJob — and it must NOT set a `schedule`); the loader
+> streams `INSERT INTO <target> SELECT * FROM <ext>` per flush (`batchSize` →
+> `CBK_BATCH_SIZE`, `flushInterval` → `CBK_FLUSH_INTERVAL`) until the Job is
+> deleted. Three webhook rules guard it: **W.23** (`kafka`/`rabbitmq` admitted only
+> on a connector-backed `custom` server), **W.24** (a `custom` server needs a
+> matching `customConnectors[]`), **W.23c** (`batchSize ≥ 1`, valid-duration
+> `flushInterval`, `continuous` excludes `schedule`). **How to observe it (no new
+> metric):** kafka-cdc reuses `cloudberry_data_loading_*` — a continuous consumer's
+> **steady state is `cloudberry_data_loading_job_status = Running`** (NOT
+> Complete), `rows_total` is best-effort per flush. **Live caveat:** end-to-end
+> kafka→table row landing needs a REAL Kafka→PXF connector JAR; with only a
+> placeholder JAR staged the row-landing is **config-only/documented** (the JAR
+> download + mount + Job + DDL + streaming params are still fully exercised). See
+> [spec 12 §Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kafka-cdc-continuous-streaming-custom-connector).
+
+> **All Prometheus metrics M.1–M.16 (Implemented, honesty-bounded — Scenario
+> 109).** Scenario 109 closes out the metric catalog under one rule — **every
+> emitted metric traces to a REAL source; a metric with no honest source stays
+> intentionally ABSENT and is NEVER synthesized.** Four flip to Implemented:
+> **`cloudberry_pxf_service_up{cluster,namespace,segment_host}`** (M.1 — the
+> **per-segment** disaggregation of `cloudberry_pxf_status`, `1` healthy / `0` on a
+> killed segment from real per-segment-primary-pod `pxf` container readiness;
+> emitted only for observed hosts, never synthesized); **`cloudberry_pxf_requests_total`**
+> (M.2) + **`cloudberry_pxf_request_duration_seconds`** (M.3) — the **real**
+> `http_server_requests_*` count + latency scraped from the PXF Spring Boot Actuator
+> `/actuator/prometheus` (enabled via `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus`)
+> by a **dedicated vmagent `:5888` scrape job** — a single pod annotation can't
+> cover both the pg-exporter `:9187` and the actuator `:5888`; **label-honesty
+> caveat:** count + latency are REAL, but the `server`/`profile`/`operation` labels
+> are downgraded to the actuator-native `uri`/`method`/`status` (not honestly
+> derivable from the URI — never fabricated); and
+> **`cloudberry_data_loading_bytes_total{cluster,namespace,job,source_type}`**
+> (M.10 — from the real `DATALOAD_BYTES=<n>` marker computed via `wc -c` for a
+> **local gpload input source**; **omitted (honestly absent)** for
+> external-table/pxf/FDW/continuous loads). **`cloudberry_pxf_errors_total` (M.6)
+> is FOLDED, not fabricated** — observed via `cloudberry_data_loading_errors_total{job}`
+> (+ `job_status=3`) and actuator non-2xx; no synthetic typed counter is registered.
+> See [spec 12 §Scenario 109](../specifications/12-data-loading-spec.md#scenario-109--all-prometheus-metrics-m1m16).
+>
+> **Still Planned / honestly absent (NEVER fabricated):** the first-class
+> data-export Job kind, and the **6 honestly-absent metric families** —
+> `cloudberry_pxf_bytes_transferred_total` (M.4), `cloudberry_pxf_records_total`
+> (M.5; substituted by `cloudberry_data_loading_rows_total`),
+> `cloudberry_pxf_errors_total` (M.6; **folded**, not synthesized),
+> `cloudberry_pxf_active_connections` (M.7), and the 2 `cloudberry_gpfdist_*`
+> metrics (M.15/M.16; no scrapable endpoint) — which have no honest source in PXF
+> 2.1.0 / gpfdist and whose absence the Scenario 109 tests assert. (**Scenario 109
+> flipped `cloudberry_pxf_service_up`, the actuator request/latency passthrough, and
+> `cloudberry_data_loading_bytes_total` to Implemented** — see the note above.) (The **FDW-based loading path** —
+> `pxfJob.loadMethod: fdw` — is now **Implemented** in Scenario 103; see the note
+> above. Config sync across sidecars is satisfied
+> structurally by the shared `<cluster>-pxf-servers` ConfigMap; an **explicit**
+> `cloudberry-ctl pxf sync` trigger is now also **Implemented** — Scenario 95 — as
+> the on-demand counterpart.) The
+> `cloudberry-ctl data-loading jobs {create,start,stop,delete}` commands hit
+> their **FULL** REST routes (Scenario 107 flipped the job-mutation + PXF servers
+> CRUD + `jobs/{job}/logs` + `external-tables` endpoints to Implemented; `start`
+> creates a REAL one-off `batchv1.Job`); the matching **CLI** subcommands (L.1–L.16)
+> are now **Implemented (Scenario 108)** — see the Scenario 108 note below. See
+> [spec 12 §Implementation Status](../specifications/12-data-loading-spec.md#implementation-status),
+> [§Scenario 95](../specifications/12-data-loading-spec.md#scenario-95--pxf-cli-lifecycle),
+> and [§Data Loading Jobs](../specifications/12-data-loading-spec.md#data-loading-jobs).
+
+> **Now Implemented (Scenario 108 — all data-loading / PXF CLI commands
+> L.1–L.16):** `cloudberry-ctl` fully implements the data-loading / PXF CLI
+> surface wired to the Scenario 107 REST endpoints, plus **one new** server-side
+> test-read endpoint. **PXF servers CRUD** (NEW): `pxf servers list` →
+> `GET .../pxf/servers`; `pxf servers create --name --type --endpoint --bucket
+> --credential-secret` (repeatable `name[:key]`) → `POST .../pxf/servers`;
+> `pxf servers update [name] --endpoint` → `PUT .../pxf/servers/{name}` (via the
+> new `runAPIPut` helper); `pxf servers delete [name]` →
+> `DELETE .../pxf/servers/{name}` (`409 SERVER_IN_USE`). **Enriched
+> `data-loading jobs create`:** `--type pxf` (`--name --server --profile
+> --resource --target --schedule`; previously posted a nil body), `--type gpload`
+> (`--gpfdist-host --gpfdist-port --file-path --format`), and `--from-yaml <file>`
+> (reads + unmarshals a full job, **precedence over flags**). **`data-loading jobs
+> logs --job --follow --tail`** (NEW) streams the Job pod logs via
+> `OperatorClient.GetStream` with a **kubectl fallback** (mirrors `backup jobs
+> logs`). **`data-loading test-read`** (`--job` OR `--server/--profile/--resource`,
+> `--limit N` default 10 cap 1000) calls the **NEW**
+> `GET .../data-loading/test-read` endpoint (`handleTestReadPXFSource`, Permission
+> Basic, **no metric**) backed by the **NEW** `db.Client.ReadPXFSourceSample`
+> (transient external table → `SELECT … LIMIT N` → **always DROP**); it prints
+> **REAL rows**, or `available:false`/empty when the DB/source is unreachable —
+> **never fabricated, never `500`**. See
+> [spec 12 §Scenario 108](../specifications/12-data-loading-spec.md#scenario-108--all-cli-commands-l1l16)
+> and [cloudberry-ctl §5.10](../specifications/07-cloudberry-ctl-spec.md#510-data-loading-and-pxf-scenario-108).
+
+| Rule | Validation | Error contains | Rejection source |
+|------|------------|----------------|------------------|
+| W.1 | `dataLoading.pxf.image` required when `pxf.enabled: true` | `dataLoading.pxf.image` | webhook |
+| W.2 | `pxf.servers[].name` non-empty and unique | `dataLoading.pxf.servers[…].name` / `duplicate` | webhook |
+| W.3 | `pxf.servers[].type` in `s3,hdfs,jdbc,hbase,hive,gs,abfss,wasbs,custom` (object-store types `gs`/`abfss`/`wasbs` added in Scenario 96; **`custom` added in Scenario 102** — no forced config keys) | `dataLoading.pxf.servers[…].type` ; live: `Unsupported value` | **CRD-schema enum** (webhook = defense-in-depth) |
+| W.4 | object-store server (`s3`/`gs`/`abfss`/`wasbs`) needs `config["fs.s3a.endpoint"]`; `credentialSecrets[]` required **only for `s3`** (GCS/Azure use cloud-native auth) | `fs.s3a.endpoint` / `credentialSecrets` | webhook |
+| W.5 | jdbc server needs `config["jdbc.driver"]` + `["jdbc.url"]` | `jdbc.driver` / `jdbc.url` | webhook |
+| W.6 | hdfs server needs `config["fs.defaultFS"]` | `fs.defaultFS` | webhook |
+| W.7 | `jobs[].name` non-empty and unique | `dataLoading.jobs[…].name` / `duplicate` | webhook |
+| W.8 | `jobs[].type` in `pxf,gpload` | `dataLoading.jobs[…].type` ; live: `Unsupported value` | **CRD-schema enum** (webhook = defense-in-depth) |
+| W.9 | `jobs[].pxfJob.server` references a defined server | `pxfJob.server` | webhook |
+| W.10 | `jobs[].pxfJob.profile` is a valid PXF profile | `pxfJob.profile` | webhook |
+| W.11 | `jobs[].pxfJob.targetTable` required | `pxfJob.targetTable` | **both** (omitted key → schema `required`; `""` → webhook) |
+| W.12 | `jobs[].gploadJob.targetTable` required | `gploadJob.targetTable` | **both** (omitted key → schema `required`; `""` → webhook) |
+| W.13 | `jobs[].schedule` valid cron when set | `schedule` | webhook |
+| W.14 | `pxfJob.partitioning` needs `column`+`range`+`interval` | `partitioning` | webhook |
+| W.15 | `pxfJob.errorHandling.segmentRejectLimitType` in `rows,percent` | `segmentRejectLimitType` ; live: `Unsupported value` | **CRD-schema enum** (webhook = defense-in-depth) |
+| W.10b | **Write-capability (Scenario 96; scheme-aware in Scenario 97):** a `mode: writable` job is rejected when its format is read-only (`json`/`orc`/`rc`) **or** its scheme is read-only (**all** `hive*` + `HBase`, regardless of format — e.g. writable `hive:text` is rejected) | `write-unsupported` / `writable` | webhook |
+| W.17 | **`sourceFilter` sanity (Scenario 99; fdw-read tweak Scenario 103):** `pxfJob.sourceFilter` is valid on a `mode: writable` export job **OR** a `loadMethod: fdw` read job (rejected on a plain external-table read), and must not contain `;`/`--`/`/*` (statement terminators / SQL comments) | `sourceFilter` / `writable` ; `statement terminators or SQL comments` | webhook |
+| W.18 | **gpload input source (Scenario 101):** `gploadJob.inputSource.type`, when set, must be `gpfdist` or `local` | `inputSource.type` | webhook (CRD enum also) |
+| W.19 | **gpload delimiter (Scenario 101):** `gploadJob.delimiter`, when set, must be exactly one character | `delimiter` / `single character` | webhook (CRD `MaxLength=1` also) |
+| W.20 | **gpload update/merge key (Scenario 101):** `mode: update`/`merge` requires a non-empty `gploadJob.matchColumns` | `matchColumns` | webhook |
+| W.21 | **gpload post-action sanity (Scenario 101):** each `gploadJob.postActions[]` element must not contain `;`/`--`/`/*` (reuses the W.17 check) | `postActions[…]` / `forbidden SQL fragment` | webhook |
+| W.22 | **gpload host/port scope (Scenario 101):** `gploadJob.inputSource.host`/`.port` are valid only for `type: gpfdist` (rejected on `local`) | `host/port are only valid for type gpfdist` | webhook |
+| W.23 | **kafka-profile-requires-custom-connector (Scenario 102):** a custom-connector / streaming profile (`kafka`/`rabbitmq`) is admitted **only** when the referenced server is `type: custom` with a matching `customConnectors[]` entry — a bare `kafka`, or `kafka` on a non-custom server, is **still rejected** (no built-in streaming) | `custom-connector profile` / `type=custom with a matching customConnectors[] entry` | webhook |
+| W.24 | **custom-server-requires-connector (Scenario 102):** a `type: custom` server requires a `customConnectors[].name` of the same name | `of type custom requires a matching customConnectors` | webhook |
+| W.23c | **streaming-knobs sanity (Scenario 102):** `pxfJob.batchSize` (when set) ≥ 1; `pxfJob.flushInterval` (when set) parses as a Go duration; a `continuous: true` job must NOT set a `schedule` | `must be >= 1` / `must be a valid duration` / `continuous streaming jobs must not set a schedule` | webhook |
+| W.25 | **load-method (Scenario 103):** `pxfJob.loadMethod` (when set) must be `external-table` or `fdw`; `loadMethod: fdw` is **read-only** — rejected with `mode: writable` or `continuous: true` | `must be external-table or fdw` / `loadMethod=fdw is a read/import path` / `loadMethod=fdw is a one-off persistent load` | webhook (CRD enum also) |
+
+The **W.10 profile allowlist** is case-insensitive and is one of:
+`s3`/`gs`/`abfss`/`wasbs` + `:{text,parquet,avro,json,orc}`;
+`hdfs` + `:{text,parquet,avro,json,orc,SequenceFile}`; `hive` bare or
+`:{text,orc,rc}`; bare `jdbc`; bare `hbase`. A bare `s3`/`hdfs`, an unknown
+scheme (`foo:bar`), and a bad suffix (`s3:nonsense`) are rejected. **Streaming
+profiles (`kafka`/`rabbitmq`) are NOT in the built-in allowlist** (so a bare
+`kafka`, or `kafka` on a non-custom server, is rejected) — but they ARE admitted
+as **custom-connector profiles** when the referenced server is `type: custom`
+backed by a matching `customConnectors[]` JAR (W.23/W.24 — Scenario 102 policy
+reversal, scoped to custom connectors). See
+[spec 12 §W.10](../specifications/12-data-loading-spec.md#w10-valid-pxf-profile-policy)
+and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kafka-cdc-continuous-streaming-custom-connector).
+
+> **Object-store profiles & write-capability (Scenario 96).** PXF object stores
+> are exposed both as profile schemes and as server **types**: `gs` (Google Cloud
+> Storage), `abfss` (Azure Data Lake Gen2), `wasbs` (Azure Blob), plus **Dell ECS**
+> (an `s3` server with a custom `fs.s3a.endpoint`) and **MinIO** (an `s3` server
+> with `fs.s3a.path.style.access=true`). All four object-store types render into a
+> single `<server>__s3-site.xml`; the profile scheme picks the connector at query
+> time. The per-format **write-capability matrix** is `text`/`parquet`/`avro` →
+> **writable**, `json`/`orc`/`rc` → **read-only**. A `mode: writable` job using a
+> read-only format is **rejected at admission** (W.10b, error contains
+> `write-unsupported`/`writable`); a writable job with a writable format builds a
+> `CREATE WRITABLE EXTERNAL TABLE … FORMATTER='pxfwritable_export')` external
+> table. The matrix lives once in `internal/pxfpolicy` and is shared by the
+> webhook and the builder. See
+> [spec 12 §Scenario 96](../specifications/12-data-loading-spec.md#scenario-96--object-store-profiles--format-write-capability).
+
+> **Hadoop profiles & scheme-aware write-capability (Scenario 97).** PXF also
+> exposes the **Hadoop** connectors: **HDFS** (`hdfs:text`/`parquet`/`avro`/`json`/
+> `orc`/`SequenceFile`), **Hive** (`hive` auto-detect / `hive:text`/`hive:orc`/
+> `hive:rc`), and **HBase** (bare `HBase`) — all valid **read** profiles. For an
+> `hdfs` server the operator always renders `core-site.xml`+`hdfs-site.xml` and, when
+> configured, `<server>__hive-site.xml` (carrying `hive.metastore.uris`) and
+> `<server>__hbase-site.xml` (carrying `hbase.zookeeper.quorum`). The
+> write-capability is **scheme-aware**: `hdfs:text`/`parquet`/`avro`/`SequenceFile`
+> are **writable** while `hdfs:json`/`hdfs:orc` are read-only; and **every `hive*`
+> profile and `HBase` is read-only at the SCHEME level regardless of format** — so a
+> `mode: writable` `hive:text` job is **rejected** even though `text` is a writable
+> format on HDFS/object stores. See
+> [spec 12 §Scenario 97](../specifications/12-data-loading-spec.md#scenario-97--hadoop-profiles-hdfs--hive--hbase).
+
+> **Filter pushdown, column projection & per-row error handling (Scenario 98).**
+> Three optional `pxfJob` knobs tune how external data is read:
+> - `pxfJob.filterPushdown: true` pushes WHERE-clause predicates down to the source
+>   (object store / JDBC / Hive) → the operator emits `FILTER_PUSHDOWN=true` in the
+>   `pxf://` LOCATION. **Defaults to `true`** when you omit it (set `false` to
+>   disable; that emits nothing).
+> - `pxfJob.columnProjection: true` reads only the requested columns from columnar
+>   formats (Parquet/ORC) → the operator emits `PROJECT=true`. Also **defaults to
+>   `true`** when omitted.
+> - `pxfJob.errorHandling.{segmentRejectLimit, segmentRejectLimitType (rows|percent),
+>   logErrors}` tolerates malformed rows up to a threshold → the operator emits
+>   `[LOG ERRORS ]SEGMENT REJECT LIMIT <n> [ROWS|PERCENT]` on the READ external
+>   table. Rows above the limit fail the job. (A `mode: writable` export job
+>   **ignores** error handling — writable tables take no reject limit.)
+>
+> The operator only emits the correct DDL option; the live PXF/engine layer
+> performs the actual prune/tolerance. **How to observe it (honest signals):** there
+> is **no `bytes_transferred` metric** (PXF exposes no honest external-byte counter
+> — it stays **Planned**). Instead, confirm filter pushdown via **row-count
+> reduction** (`cloudberry_data_loading_rows_total` is lower for a filtered job than
+> an unfiltered baseline), via `EXPLAIN` (the pushed filter / projected columns
+> appear in the external-scan plan), and via your **source's query log** (the WHERE
+> predicate reaching JDBC/Hive). Confirm per-row error handling via the real
+> `cloudberry_data_loading_job_status` (2=success / 3=failed) +
+> `cloudberry_data_loading_errors_total` + `rows_total` (valid rows only). See
+> [spec 12 §Scenario 98](../specifications/12-data-loading-spec.md#scenario-98--filter-pushdown-column-projection-per-row-error-handling).
+
+> **Writable external tables / data export (Scenario 99).** A `mode: writable` PXF
+> job **exports** Cloudberry rows OUT to an external store instead of importing
+> them: the operator builds a `CREATE WRITABLE EXTERNAL TABLE …
+> FORMATTER='pxfwritable_export'` table and runs `INSERT INTO <writable_ext> SELECT
+> * FROM <targetTable>` (the INSERT direction is reversed; `targetTable` is the
+> SOURCE you read from). The same job shape exports to **three** target types — set
+> the profile/server accordingly:
+> - **S3 / object store** (FE.9/WE.1) — e.g. `profile: s3:text`, `resource:
+>   "cloudberry-warehouse/exports/s3/"` → objects land in the bucket.
+> - **HDFS** (FE.10) — e.g. `profile: hdfs:text`, `resource:
+>   "/data-lake/exports/hdfs/"` → part files land in HDFS. (`hdfs:parquet`/`avro`
+>   export may need a `DATA_SCHEMA` — config-only; prefer `hdfs:text` for a
+>   deterministic landing.)
+> - **JDBC** (FE.11) — `profile: jdbc`, `resource: "export_target"` → rows land in
+>   the JDBC target table (the strongest, deterministic proof).
+>
+> **Filtered export — `sourceFilter`.** Add the **optional** `pxfJob.sourceFilter`
+> WHERE-predicate body (valid **only** on `mode: writable`) to export a subset:
+> `sourceFilter: "region='us-east'"` makes the export `INSERT INTO <ext> SELECT *
+> FROM <target> WHERE region='us-east'` (fewer rows than the unfiltered baseline);
+> omit it for a full-table export. The predicate is **raw SQL you author** (the same
+> trust boundary as `targetTable`), so it is emitted verbatim; admission rule
+> **W.17** rejects a `sourceFilter` on a non-writable job (error names `sourceFilter`
+> + `writable`) and any predicate containing `;`, `--` or `/*` (a cheap sanity
+> check, not a SQL parser). **How to observe it:** an export reuses the existing
+> metrics (no new metric) — confirm via `cloudberry_data_loading_rows_total` (the
+> exported rowcount; the filtered export reports fewer rows) +
+> `cloudberry_data_loading_job_status` (2=success / 3=failed). `bytes_transferred`
+> and a first-class data-export Job kind stay **Planned**. See
+> [spec 12 §Scenario 99](../specifications/12-data-loading-spec.md#scenario-99--writable-external-tables--data-export).
+
+> **Known limitation — `hdfs:SequenceFile` read (PXF 2.1.0).** In the live
+> end-to-end verification, 6 of 7 PXF external writable-table profiles (s3/hdfs ×
+> text/parquet/avro) **fully round-trip** (write → read back, row counts match). The
+> seventh, **`hdfs:SequenceFile`, round-trips only on the WRITE side**: the writable
+> export succeeds and lands a valid SequenceFile in HDFS, but **reading it back
+> requires a custom Java `Writable` class** deployed onto the PXF sidecar classpath
+> (PXF must know the concrete key/value `Writable` schema to deserialize the file).
+> Without that classpath-deployed schema class the read leg fails. This is a
+> documented **PXF 2.1.0 limitation**, not an operator defect — the operator emits
+> the correct DDL; the missing piece is the source-specific `Writable` schema class.
+> Prefer `hdfs:text`/`parquet`/`avro` for a deterministic write **and** read.
+
+> **FDW-based loading path (Scenario 103).** Set **`pxfJob.loadMethod: fdw`** (the
+> default `external-table` keeps the transient external-table path) to load via a
+> **PERSISTENT** foreign-data-wrapper chain instead. The operator builds, all
+> idempotent (`IF NOT EXISTS`) and **never dropped**: `CREATE SERVER
+> "foreign_<server>" FOREIGN DATA WRAPPER <scheme>_pxf_fdw` → `CREATE USER MAPPING
+> FOR "gpadmin"` → `CREATE FOREIGN TABLE "foreign_<job>" (LIKE <target>)`, then
+> loads via `INSERT INTO <target> SELECT * FROM "foreign_<job>" [WHERE
+> <sourceFilter>]` (the foreign table stays directly queryable afterward). The
+> `FOREIGN DATA WRAPPER` is the **per-protocol** `pxf_fdw` wrapper (live-verified in
+> `cloudberry-official-pxf:2.1.0`: `s3`→`s3_pxf_fdw`, `gs`→`gs_pxf_fdw`,
+> `abfss`→`abfss_pxf_fdw`, `wasbs`→`wasbs_pxf_fdw`, `jdbc`→`jdbc_pxf_fdw`,
+> `hdfs`→`hdfs_pxf_fdw`, `hive`→`hive_pxf_fdw`, `hbase`→`hbase_pxf_fdw`; the
+> `format` OPTION is omitted for bare `jdbc`/`hive`). The FDW path is **EQUIVALENT**
+> to the external-table path — the SAME rows land. It is **read-only**: admission
+> rule **W.25** rejects `loadMethod: fdw` with `mode: writable` or
+> `continuous: true` (and an unknown `loadMethod`); the **W.17** tweak now allows
+> `sourceFilter` on an fdw read. **How to observe it (no new metric):** an FDW load
+> reuses `cloudberry_data_loading_*` — confirm the equivalence by **equal row
+> counts** (`SELECT count(*)` on the external-table target vs. the fdw target over
+> the same dataset); `cloudberry_pxf_*`/`cloudberry_gpfdist_*` stay **Planned**. See
+> [spec 12 §Scenario 103](../specifications/12-data-loading-spec.md#scenario-103--fdw-based-loading-path).
+
+> **Pre-load health checks (Scenario 104).** Before each data-loading Job the
+> operator runs a **`dataload-healthcheck` init container** (FIRST in the pod) on
+> **both** PXF/native and gpload Jobs; a failed check **blocks the load** and the
+> Job fails. It runs five gated checks: **HC.1** PXF readiness (PXF jobs — a
+> `psql` **DB-proxy** probe against the coordinator: `SELECT 1` / the `pxf`
+> extension present / `pxf_version()`; it is **not** a direct probe of the
+> segment's PXF sidecar, which the load pod cannot reach — the segment-pod sidecar
+> liveness probe uses `/actuator/health`, and the legacy `/pxf/v15/Status` path
+> 404s and is not used; the live proof is "stop PXF on a segment → the job
+> fails"), **HC.2** the target table exists (`to_regclass`, all jobs), **HC.3**
+> object-store source connectivity (`curl --head ${AWS_S3_ENDPOINT}`; s3-family
+> only, skipped for jdbc/hive/hbase/hdfs), **HC.4** gpfdist reachability
+> (`curl http://<cluster>-gpfdist-svc:8080/`, gpload jobs when gpfdist enabled),
+> **HC.5** scratch disk space (`df` on `/dataload-scratch` ≥ `diskMinFreeMB`, all
+> jobs). Configure with `dataLoading.healthChecks { enabled (default true; a nil
+> block ⇒ on), diskMinFreeMB (default 64), scratchSizeLimit }`; `enabled: false`
+> removes the init container and its `dataload-scratch` volume. **How to observe a
+> failure (no new operator metric):** `cloudberry_data_loading_job_status=3` +
+> `cloudberry_data_loading_errors_total` + a de-duplicated
+> **`DataLoadingHealthCheckFailed`** Warning Event on the cluster + the
+> kube-state-metrics families (`kube_job_status_failed{job_name=~".*-dataload-.*"}`,
+> `kube_pod_init_container_status_*`, `kube_deployment_status_replicas_available`);
+> `cloudberry_pxf_*`/`cloudberry_gpfdist_*` stay **Planned**. See
+> [spec 12 §Scenario 104](../specifications/12-data-loading-spec.md#scenario-104--pre-load-health-checks).
+
+> **Live PXF health sub-status / DataLoadingStatus fields (Scenario 105).** The
+> `status.dataLoading.pxf` sub-status now reports two **LIVE, HONEST,
+> observed-only** fields (both **ABSENT when unobservable** — never synthesized):
+> - **`pxf.status`** — `Running` | `Stopped` | `Error`, derived **ONLY** from the
+>   real segment-primary `pxf` container readiness (`ContainerStatuses`)
+>   aggregation — **no `kubectl exec`, no live HTTP probe of the sidecar, no
+>   synthesized health**: all `pxf` containers ready → `Running`; some down →
+>   `Error` (degraded); none ready → `Stopped`; no pods observed → the field is
+>   **absent**. Stopping PXF on a segment flips it `Running → Error` (or `Stopped`
+>   for a single segment); restoring it returns to `Running`.
+> - **`pxf.extensionsInstalled`** — the list of installed PXF extensions
+>   (`pxf`/`pxf_fdw`) from a **real read-only `pg_extension` probe**; **absent**
+>   when the database is unreachable **or** no PXF extensions are installed (never
+>   synthesized, never inferred from the `pxf.extensions` spec flags — on a stock
+>   `cloudberry-official:2.1.0` it honestly reflects only what `pg_extension`
+>   returns).
+>
+> The already-Implemented `pxf.servers` (= the configured-server count, S.2),
+> `activeJobs` (enabled-job count, S.4) and per-job `jobs[].{name,lastRun,
+> lastStatus,rowsLoaded,duration}` (S.5) remain honest. **How to observe it (two
+> new HONEST gauges, emitted only when observable):**
+> `cloudberry_pxf_status{cluster,namespace}` (0=Stopped/1=Running/2=Error — not
+> recorded when status is absent) and `cloudberry_pxf_extensions_installed{cluster,
+> namespace}` (the installed-extension count — not emitted when the DB is
+> unreachable); the 7 `cloudberry_pxf_*` runtime/health metrics stay **Planned**.
+> Read the fields with `kubectl get cloudberrycluster <name> -o yaml` (under
+> `status.dataLoading.pxf`) or `cloudberry-ctl pxf status`. See
+> [spec 12 §Scenario 105](../specifications/12-data-loading-spec.md#scenario-105--dataloadingstatus-pxf-fields).
+
+> **Updating / deleting a PXF server (Scenario 106).** When you change
+> `dataLoading.pxf.servers[]`, the operator regenerates the `<cluster>-pxf-servers`
+> ConfigMap (full-replacement reconcile):
+> - **Update (SL.7).** Patching a server — e.g. `minio-warehouse`'s
+>   `fs.s3a.endpoint` — re-renders only that server's `<server>__s3-site.xml` (every
+>   other server's files stay byte-identical). The sidecars pick up the change on
+>   the next volume sync, or **immediately** if you run `cloudberry-ctl pxf sync
+>   --cluster <name>` (an explicit ConfigMap refresh + segment-primary roll — the
+>   on-demand counterpart to the always-on structural sync); subsequent reads use
+>   the **new** endpoint.
+> - **Delete (SL.8).** Removing a server drops its `<server>__*.xml` keys; any
+>   external/foreign tables referencing that `SERVER` **fail** until you recreate
+>   them against a still-configured server.
+>
+> **How to observe it (HONEST — fires only on a real change):** on a real ConfigMap
+> `Data` diff (a server added, removed, or its rendered files changed) the operator
+> emits a `PXFServersChanged` event (message `PXF servers changed: added=[..]
+> removed=[..] updated=[..]`) and increments the
+> `cloudberry_pxf_servers_changed_total{cluster,namespace}` counter — the SAME
+> signal whether the change came from a reconcile or an explicit `pxf sync`. A
+> no-op sync or a first-time create fires **neither**. Watch the events with
+> `kubectl get events --field-selector reason=PXFServersChanged`. See
+> [spec 12 §Scenario 106](../specifications/12-data-loading-spec.md#scenario-106--server-configuration-update--delete).
+
+> **Data-loading security (Scenario 111 — SE.1–SE.6, SL.6).** The data-loading
+> security controls are **Implemented**, each classified **REAL** (proven) or
+> **CONFIG-ONLY** (rendered config verified; a live handshake is **never faked** —
+> the test env has no KDC and no TLS-speaking source).
+> - **Dedicated minimal-privilege DB role (SE.6 — REAL).** By default PXF loads
+>   run as `gpadmin`. To run them under a dedicated, minimal-privilege role
+>   instead, set `dataLoading.pxf.dataLoaderRole`. The operator then creates the
+>   role as `NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` and grants it **only**
+>   `SELECT,INSERT ON PROTOCOL pxf` — it cannot perform unrelated privileged
+>   operations. Leaving the field empty keeps the existing `gpadmin` behavior
+>   unchanged (the feature is additive/opt-in):
+>
+>   ```yaml
+>   spec:
+>     dataLoading:
+>       enabled: true
+>       pxf:
+>         enabled: true
+>         image: cloudberry-pxf:2.1.0
+>         dataLoaderRole: cb_dataload   # opt-in; empty ⇒ gpadmin (unchanged)
+>   ```
+>
+> - **Kerberos-authenticated Hadoop server (SE.4 — config-correct).** For a
+>   Hadoop-family server (`hdfs`/`hive`/`hbase` only), add a `kerberos` block. The
+>   operator mounts the keytab Secret on the PXF sidecar at
+>   `$PXF_BASE/keytabs/<server>/<key>` and renders the
+>   `hadoop.security.authentication=kerberos` properties (principal + keytab path)
+>   into the server's `core-site.xml`; an optional `krb5ConfigMap` is mounted at
+>   `/etc/krb5.conf`. The webhook **requires** `principal` + `keytabSecret{name,key}`
+>   and **rejects** `kerberos` on non-Hadoop server types:
+>
+>   ```yaml
+>   spec:
+>     dataLoading:
+>       pxf:
+>         servers:
+>           - name: hadoop-cluster
+>             type: hdfs
+>             config:
+>               fs.defaultFS: hdfs://namenode:8020
+>             kerberos:
+>               principal: pxf/_HOST@EXAMPLE.COM        # required
+>               keytabSecret:                            # required
+>                 name: pxf-keytab
+>                 key: pxf.service.keytab
+>               krb5ConfigMap: krb5-conf                 # optional
+>               realm: EXAMPLE.COM                       # optional (docs only)
+>   ```
+>
+>   **HONESTY:** live *authenticated* access is **CONFIG-ONLY** — the operator
+>   never performs a live `kinit`, and the test env has **no KDC**, so
+>   config-correctness is verified but a live Kerberos handshake is never
+>   simulated.
+> - **Other controls.** SE.1/SL.6 — credentials referenced via
+>   `servers[].credentialSecrets[]` are rendered into the PXF site XMLs by the
+>   `pxf-cred-init` init container and live **only** in the ephemeral pod
+>   filesystem; the rendered `<cluster>-pxf-servers` ConfigMap contains only
+>   `${...}` placeholders, **never** plaintext secrets (**REAL**). SE.5 — a
+>   NetworkPolicy keeps the segment↔sidecar PXF `:5888` traffic `localhost`-only,
+>   so loads keep working while cross-pod access is blocked (**REAL**). SE.2/SE.3 —
+>   JDBC/S3 TLS is wired declaratively (JDBC URL `ssl` params;
+>   `fs.s3a.connection.ssl.enabled=true`); a live encrypted handshake is asserted
+>   **only** when the source speaks TLS, otherwise **CONFIG-ONLY**. See
+>   [spec 12 §Security Considerations](../specifications/12-data-loading-spec.md#security-considerations)
+>   and [§Scenario 111](../specifications/12-data-loading-spec.md#scenario-111--security-se1se6-sl6).
+
+> **Disabling data loading (Scenario 112 — DIS.1–DIS.3).** Setting
+> `dataLoading.enabled: false` (or removing the `dataLoading` block) **tears the
+> subsystem down** — it is **no longer a no-op**. The operator deletes every
+> object it created for data loading: the `<cluster>-pxf-servers` ConfigMap, the
+> gpfdist `Deployment`/`Service`/`PVC`, all data-loading `Job`s and `CronJob`s, the
+> gpload control-file ConfigMaps, and the PXF `NetworkPolicy`; the PXF **sidecar**
+> is removed from the segment pods. The `DataLoadingConfigured` condition goes
+> **`False`** (reason `DataLoadingDisabled`), a one-shot `DataLoadingDisabled`
+> event fires, `status.dataLoading` is cleared, and the
+> `cloudberry_data_loading_jobs_active` gauge drops to `0`. While disabled, the
+> data-loading REST API returns **`DATA_LOADING_NOT_ENABLED`** (mutating endpoints
+> `400`; the job list/get endpoints `200` with a "disabled" envelope; a PXF
+> endpoint reports `DATA_LOADING_NOT_ENABLED` rather than `PXF_NOT_ENABLED`).
+> **Re-enabling (`dataLoading.enabled: true`) redeploys everything** — the
+> reconcile is idempotent, so no manual recovery is needed. You can also disable
+> the sub-features independently: **`pxf.enabled: false`** removes the PXF
+> sidecars/extensions/ConfigMap while gpload-type jobs keep working (DIS.2), and
+> **`gpfdist.enabled: false`** removes the gpfdist objects while
+> `inputSource.type: local` gpload jobs keep working — a `gpfdist`-source gpload
+> job then simply **fails at runtime** (the Job is Failed +
+> `cloudberry_data_loading_errors_total`) because gpload cannot reach the absent
+> gpfdist host (DIS.3; this is an honest runtime signal, not a pre-flight check).
+> See [spec 12 §Scenario 112](../specifications/12-data-loading-spec.md#scenario-112--disabled-states-dis1dis3).
+
+> **Breaking change.** The old simplified data-loading model
+> (`dataLoading.streamingServer`; `jobs[].type: s3|kafka|rabbitmq` with
+> `s3Source`/`kafkaSource`/`rabbitmqSource`) has been **replaced** by the PXF
+> model. The only valid `jobs[].type` values are now `pxf` and `gpload`. CRs
+> using the old shape must be rewritten. *(Note: the old `kafkaSource` shape stays
+> removed, but the kafka **profile** is reinstated via the PXF custom-connector
+> model — `servers[].type: custom` + `customConnectors[]` + `pxfJob.profile: kafka`
+> — see the Scenario 102 note above.)*
 
 **Example: Webhook rejection**
 
@@ -6488,7 +7052,7 @@ The operator reads its telemetry configuration from `TelemetryConfig` (config ke
 | `telemetry.sampling-rate` | `CLOUDBERRY_TELEMETRY_SAMPLING_RATE` | `1.0` | Trace sampling rate (0.0–1.0) |
 | `telemetry.service-name` | `CLOUDBERRY_TELEMETRY_SERVICE_NAME` | `cloudberry-operator` | `service.name` resource attribute applied to all spans |
 
-Traces include spans for reconciliation loops (all four controllers), controller sub-operations (`controller.*`), API requests (`<METHOD> <route template>` server spans), database operations (`db.*`), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret`), certificate provisioning (`EnsureCertificates`), and operator startup (`operator.*`). All span names are low-cardinality. See [Telemetry Spans](#telemetry-spans) for the full list.
+Traces include spans for reconciliation loops (all four controllers), controller sub-operations (`controller.*`), API requests (`<METHOD> <route template>` server spans), database operations (`db.*` — both the mutating/DDL and the read-path methods), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret` / `vault.watch.check`), certificate provisioning (`EnsureCertificates` / `certmanager.issueVaultPKICert`), and operator startup (`operator.*`). All span names are low-cardinality. See [Telemetry Spans](#telemetry-spans) for the full list.
 
 The **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) visualizes Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs. It is one of four dashboards (operator, exporters, node-metrics, otel) published by `test/monitoring/scripts/publish-dashboards.sh`.
 

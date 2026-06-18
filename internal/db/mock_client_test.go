@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,7 +26,6 @@ type fullMockDBClient struct {
 	// Error fields for each method.
 	pingErr                error
 	getSegErr              error
-	getStateErr            error
 	setParamErr            error
 	showParamErr           error
 	reloadErr              error
@@ -86,7 +87,6 @@ type fullMockDBClient struct {
 
 	// Return values.
 	segments           []SegmentInfo
-	clusterState       *ClusterState
 	showParamVal       string
 	sessions           []Session
 	cancelResult       bool
@@ -124,12 +124,6 @@ func (m *fullMockDBClient) Ping(_ context.Context) error { return m.pingErr }
 func (m *fullMockDBClient) Close()                       { m.closeCalls++ }
 func (m *fullMockDBClient) GetSegmentConfiguration(_ context.Context) ([]SegmentInfo, error) {
 	return m.segments, m.getSegErr
-}
-func (m *fullMockDBClient) GetClusterState(_ context.Context) (*ClusterState, error) {
-	if m.clusterState == nil {
-		return &ClusterState{IsUp: true}, m.getStateErr
-	}
-	return m.clusterState, m.getStateErr
 }
 func (m *fullMockDBClient) SetParameter(_ context.Context, _, _ string, _ ParameterScope) error {
 	return m.setParamErr
@@ -299,7 +293,20 @@ func (m *fullMockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]S
 func (m *fullMockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return m.userDatabases, m.listUserDBsErr
 }
-func (m *fullMockDBClient) SetupExporterRole(_ context.Context, _ string) error { return nil }
+func (m *fullMockDBClient) SetupExporterRole(_ context.Context, _ string) error    { return nil }
+func (m *fullMockDBClient) SetupPXFExtensions(_ context.Context) (int, error)      { return 2, nil }
+func (m *fullMockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error { return nil }
+func (m *fullMockDBClient) ListPXFExtensions(_ context.Context) ([]string, error) {
+	return []string{"pxf", "pxf_fdw"}, nil
+}
+func (m *fullMockDBClient) ListExternalTables(_ context.Context) ([]ExternalTableInfo, error) {
+	return nil, nil
+}
+func (m *fullMockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*PXFSourceSample, error) {
+	return nil, nil
+}
 func (m *fullMockDBClient) GetQueryDetail(_ context.Context, pid int32) (*QueryDetail, error) {
 	return &QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
 }
@@ -918,27 +925,75 @@ func TestPgConnURL_String(t *testing.T) {
 	}
 }
 
-// TestURLEncode tests the urlEncode function.
-func TestURLEncode(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"simple string", "hello"},
-		{"empty string", ""},
-		{"string with spaces", "hello world"},
-		{"string with special chars", "p@ss!word"},
+// TestPgConnURL_String_MetacharacterRoundTrip verifies that credentials and the
+// database name containing DSN metacharacters ('@', '/', '?', '#', '&', '=',
+// ':') round-trip without corruption or parameter injection (W1-A1/E-1). The
+// produced URL must parse back — via both net/url and pgx ParseConfig — to the
+// ORIGINAL field values, and sslmode must remain exactly the configured value.
+func TestPgConnURL_String_MetacharacterRoundTrip(t *testing.T) {
+	u := pgConnURL{
+		host:     "db.example.com",
+		port:     5433,
+		database: "weird/db?name#x",
+		user:     "u@ser:name",
+		password: "p@ss/w0rd?x=1&y=2#z:colon",
+		sslMode:  "require",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := urlEncode(tt.input)
-			if tt.input != "" {
-				assert.NotEmpty(t, result, "urlEncode should return non-empty for non-empty input")
-			}
-			// For empty input, just verify no panic.
-		})
+	raw := u.String()
+
+	parsed, err := url.Parse(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "postgres", parsed.Scheme)
+	assert.Equal(t, u.user, parsed.User.Username())
+	pw, hasPw := parsed.User.Password()
+	require.True(t, hasPw)
+	assert.Equal(t, u.password, pw)
+	// Leading "/" stripped → original database name preserved.
+	assert.Equal(t, u.database, strings.TrimPrefix(parsed.Path, "/"))
+	// sslmode must be exactly the configured value — no injected extra params.
+	assert.Equal(t, u.sslMode, parsed.Query().Get("sslmode"))
+	assert.Len(t, parsed.Query(), 1, "no extra connection parameters may be injected")
+
+	// pgx must also parse the DSN back to the original credentials.
+	cfg, err := pgconn.ParseConfig(raw)
+	require.NoError(t, err)
+	assert.Equal(t, u.user, cfg.User)
+	assert.Equal(t, u.password, cfg.Password)
+	assert.Equal(t, u.host, cfg.Host)
+	assert.Equal(t, uint16(u.port), cfg.Port)
+	assert.Equal(t, u.database, cfg.Database)
+}
+
+// TestPgConnURL_String_EmptySSLMode verifies the W1-A1 regression edge case: an
+// empty sslMode still yields a valid DSN that pgconn.ParseConfig accepts, with a
+// single "sslmode=" (empty value) query parameter and no panic (TASK 12).
+func TestPgConnURL_String_EmptySSLMode(t *testing.T) {
+	u := pgConnURL{
+		host:     "localhost",
+		port:     5432,
+		database: "testdb",
+		user:     "admin",
+		password: "secret",
+		sslMode:  "", // explicitly empty
 	}
+
+	raw := u.String()
+
+	parsed, err := url.Parse(raw)
+	require.NoError(t, err)
+	// Exactly one query param, the empty-valued sslmode (matches prior behavior).
+	assert.Len(t, parsed.Query(), 1, "exactly one connection parameter expected")
+	values, ok := parsed.Query()["sslmode"]
+	require.True(t, ok, "sslmode parameter must be present")
+	require.Len(t, values, 1)
+	assert.Equal(t, "", values[0], "sslmode value must be empty")
+
+	// pgx must accept the empty-sslmode DSN without error.
+	cfg, err := pgconn.ParseConfig(raw)
+	require.NoError(t, err)
+	assert.Equal(t, u.user, cfg.User)
+	assert.Equal(t, u.database, cfg.Database)
 }
 
 // TestMirrorInitOptions_Construction tests MirrorInitOptions struct.

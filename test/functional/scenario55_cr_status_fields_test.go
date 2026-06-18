@@ -405,6 +405,7 @@ func (m *scenario55MetricsRecorder) SetBackupJobStatus(_, _, _, _ string, _ floa
 func (m *scenario55MetricsRecorder) RecordRestore(_, _, _ string)                          {}
 func (m *scenario55MetricsRecorder) RecordRestoreValidation(_, _, _ string)                {}
 func (m *scenario55MetricsRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)       {}
+func (m *scenario55MetricsRecorder) SetPXFServersConfigured(_, _ string, _ float64)        {}
 func (m *scenario55MetricsRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)    {}
 func (m *scenario55MetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64)            {}
 func (m *scenario55MetricsRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)     {}
@@ -445,4 +446,5 @@ func (m *scenario55MetricsRecorder) ObserveVaultOperationDuration(_ string, _ ti
 func (m *scenario55MetricsRecorder) RecordWebhookAdmission(_, _, _ string)     {}
 func (m *scenario55MetricsRecorder) RecordUpgradeOperation(_, _, _ string)     {}
 func (m *scenario55MetricsRecorder) RecordRollingRestart(_, _, _ string)       {}
+func (m *scenario55MetricsRecorder) RecordPXFRestart(_, _, _ string)           {}
 func (m *scenario55MetricsRecorder) RecordRecoveryOperation(_, _, _, _ string) {}

@@ -854,17 +854,20 @@ func TestBuildCoordinatorStatefulSet_WithDataLoadingConfig(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
-		StreamingServer: &cbv1alpha1.StreamingServerSpec{
-			Host:    "streaming.example.com",
-			Port:    5432,
-			TLSMode: "none",
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "cloudberry-pxf:7.1.0",
 		},
 		Jobs: []cbv1alpha1.DataLoadingJob{
 			{
-				Name:        "s3-loader",
-				Type:        "s3",
-				Enabled:     true,
-				TargetTable: "public.events",
+				Name:    "s3-loader",
+				Type:    "pxf",
+				Enabled: true,
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server:      "s3-datalake",
+					Profile:     "s3:parquet",
+					TargetTable: "public.events",
+				},
 			},
 		},
 	}

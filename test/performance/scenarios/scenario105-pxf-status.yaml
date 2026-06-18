@@ -1,0 +1,96 @@
+# =============================================================================
+# Scenario 105 -- DataLoadingStatus PXF Status Read Path Performance Test
+# =============================================================================
+#
+# Purpose: Validate the operator API performance under the READ-heavy polling
+#          pattern that a CLI / dashboard drives when observing PXF sidecar
+#          readiness via GET /api/v1alpha1/clusters/{name}/data-loading/pxf/status.
+#
+#          Scenario 105 exercises the honest PXF sidecar readiness aggregation
+#          (handlePXFStatus) which lists segment-primary pods and reads each
+#          one's "pxf" container readiness from Status.ContainerStatuses.
+#          The endpoint requires PermissionBasic auth (OIDC Bearer).
+#
+#          The read path is the primary load target:
+#            - GET /api/v1alpha1/clusters/s105/data-loading/pxf/status
+#            - GET /api/v1alpha1/clusters/s105  (cluster status, for context)
+#          These are the endpoints that see sustained load from monitoring
+#          loops and dashboards (typically 1-5 RPS per endpoint, multiplied
+#          by the number of concurrent watchers/dashboards polling).
+#
+# Profile: Ramp from 1 to 50 RPS over 30s, hold 50 RPS for 90s
+#          This models ~10 concurrent watchers polling every 2-3s.
+#          Suitable for docker-desktop single-node dev cluster.
+# Expected: p95 < 300ms, p99 < 1000ms, error rate < 0.5%
+# Duration: ~2 minutes (ramp-up + constant)
+#
+# SLO Targets:
+#   - Availability: >= 99.5%
+#   - p50 latency:  < 100ms
+#   - p95 latency:  < 300ms
+#   - p99 latency:  < 1000ms
+#   - Error rate:   < 0.5%
+#
+# How to run:
+#   1. Port-forward the operator REST API to localhost:8190:
+#        kubectl port-forward -n cloudberry-test deployment/cloudberry-operator 8190:8090
+#   2. Obtain an OIDC bearer token:
+#        export OIDC_TOKEN=$(curl -sS -X POST \
+#          -H "Host: host.docker.internal:8090" \
+#          http://127.0.0.1:8090/realms/test/protocol/openid-connect/token \
+#          -d grant_type=password -d client_id=cloudberry-operator \
+#          -d client_secret=some-secret -d username=adminuser \
+#          -d password=adminpass -d scope=openid | python3 -c \
+#          "import sys,json; print(json.load(sys.stdin)['access_token'])")
+#   3. Run via Docker (from test/performance/):
+#        docker run --rm -v $(pwd):/var/loadtest \
+#          -v $(pwd)/.yandextank:/tmp/artifacts \
+#          --net host direvius/yandex-tank \
+#          -c scenarios/scenario105-pxf-status.yaml
+#   4. Or via the runner script:
+#        ./run-perftest.sh --scenario scenario105
+#
+# NOTE: The Yandex Tank URI-style ammo does NOT support per-request auth
+#       headers dynamically. For authenticated load testing, use the hey-based
+#       runner (run-perftest.sh --hey --scenario scenario105) which injects
+#       the Bearer token via -H flag, or use the request-style ammo format
+#       with a pre-obtained token baked into the ammo file.
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/scenario105-pxf-status-read.txt
+  load_profile:
+    load_type: rps
+    # Warmup: ramp from 1 to 50 RPS over 30 seconds
+    # Sustain: hold 50 RPS for 90 seconds (1.5 minutes)
+    # Rationale: PXF status polling is a moderate-rate read path;
+    # 50 RPS models ~10 concurrent watchers each polling every ~2s.
+    # Kept modest for docker-desktop single-node cluster.
+    schedule: line(1, 50, 30s) const(50, 90s)
+  timeout: 5s
+  instances: 100
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    # Stop if average response time exceeds 2 seconds for 30 seconds
+    - time(2000, 30s)
+    # Stop if 5xx error rate exceeds 5% for 15 seconds
+    - http(5xx, 5%, 15s)
+    # Stop if 4xx error rate exceeds 30% for 15 seconds
+    - http(4xx, 30%, 15s)
+    # Stop if network errors exceed 3% for 10 seconds
+    - net(xx, 3%, 10s)
+    # Stop if 99th percentile exceeds 3 seconds for 30 seconds
+    - quantile(99, 3000, 30s)
+    # Stop if total 5xx count exceeds 200 in 60 seconds
+    - total_http(5xx, 200, 60s)
+
+console:
+  enabled: true
+  short_only: false

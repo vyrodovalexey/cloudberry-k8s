@@ -293,6 +293,20 @@ const (
 	EventReasonValidationFailed = "ValidationFailed"
 	// EventReasonDataLoadingReconciled indicates data loading has been reconciled.
 	EventReasonDataLoadingReconciled = "DataLoadingReconciled"
+	// EventReasonDataLoadingDisabled indicates the data-loading subsystem has
+	// been disabled (dataLoading.enabled=false / absent): the operator tore down
+	// the gpfdist server, the data-loading Jobs/CronJobs and the gpload
+	// control-file ConfigMaps, cleared the data-loading status and zeroed the
+	// related gauges. It is emitted as an EventTypeNormal ONCE on the transition
+	// into the disabled state so periodic reconciles do not re-emit.
+	EventReasonDataLoadingDisabled = "DataLoadingDisabled"
+	// EventReasonDataLoadingHealthCheckFailed indicates a data-loading Job failed
+	// its pre-load health checks: the dataload-healthcheck init container exited
+	// non-zero (e.g. target table missing, source unreachable, gpfdist down, or
+	// insufficient scratch disk), which blocks the main load container. It is
+	// emitted as an EventTypeWarning, de-duplicated per failed Job name so
+	// periodic reconciles do not re-emit for the same failure.
+	EventReasonDataLoadingHealthCheckFailed = "DataLoadingHealthCheckFailed"
 	// EventReasonStorageReconciled indicates storage management has been reconciled.
 	EventReasonStorageReconciled = "StorageReconciled"
 	// EventReasonConfigReloaded indicates configuration has been reloaded.
@@ -321,6 +335,11 @@ const (
 	EventReasonSegmentFailover = "SegmentFailover"
 	// EventReasonSegmentFailoverCompleted indicates a segment failover has completed.
 	EventReasonSegmentFailoverCompleted = "SegmentFailoverCompleted"
+	// EventReasonPXFServersChanged indicates the rendered PXF servers ConfigMap
+	// Data actually changed (a server was added, removed, or updated). It is an
+	// HONEST signal — emitted ONLY on a real Data diff, never on a labels-only
+	// change, a no-op reconcile, a create, or when PXF is disabled.
+	EventReasonPXFServersChanged = "PXFServersChanged"
 )
 
 // +kubebuilder:object:root=true
@@ -1570,51 +1589,239 @@ type SecretReference struct {
 	Key string `json:"key,omitempty"`
 }
 
-// DataLoadingSpec defines data loading configuration.
+// DataLoadingSpec defines data loading configuration based on the PXF
+// (Platform Extension Framework) model. PXF provides federated access to
+// external data stores (object storage, HDFS, JDBC, Hive, HBase) via external
+// tables, while gpfdist provides high-throughput file-based loading.
 type DataLoadingSpec struct {
 	// Enabled controls whether data loading is active.
 	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// StreamingServer defines the streaming server configuration.
+	// Pxf defines the PXF service configuration.
 	// +optional
-	StreamingServer *StreamingServerSpec `json:"streamingServer,omitempty"`
+	Pxf *PxfSpec `json:"pxf,omitempty"`
+
+	// Gpfdist defines the gpfdist file-server configuration.
+	// +optional
+	Gpfdist *GpfdistSpec `json:"gpfdist,omitempty"`
 
 	// Jobs defines data loading job configurations.
 	// +optional
 	Jobs []DataLoadingJob `json:"jobs,omitempty"`
+
+	// JobTemplate defines pod template overrides for data loading Jobs.
+	// +optional
+	JobTemplate *DataLoadingJobTemplate `json:"jobTemplate,omitempty"`
+
+	// HealthChecks configures the pre-load health-check init container that runs
+	// before each data-loading Job. Defaults are applied when the block is unset
+	// (the checks run by default).
+	// +optional
+	HealthChecks *DataLoadHealthChecksSpec `json:"healthChecks,omitempty"`
 }
 
-// StreamingServerSpec defines the streaming server configuration.
-type StreamingServerSpec struct {
-	// Host is the streaming server hostname.
-	Host string `json:"host"`
+// DataLoadHealthChecksSpec configures the pre-load health-check init container.
+type DataLoadHealthChecksSpec struct {
+	// Enabled controls whether the dataload-healthcheck init container runs
+	// before each data-loading Job. Default true (the checks run by default).
+	// +kubebuilder:default=true
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 
-	// Port is the streaming server port.
+	// DiskMinFreeMB is the HC.5 free-space threshold (MB) required on the
+	// shared scratch volume. Default 64.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=64
+	// +optional
+	DiskMinFreeMB int32 `json:"diskMinFreeMB,omitempty"`
+
+	// ScratchSizeLimit optionally bounds the shared scratch emptyDir (e.g.
+	// "256Mi"); when set it both caps the volume and makes HC.5 deterministic.
+	// +optional
+	ScratchSizeLimit string `json:"scratchSizeLimit,omitempty"`
+}
+
+// PxfSpec defines the PXF (Platform Extension Framework) service configuration.
+type PxfSpec struct {
+	// Enabled controls whether the PXF service is deployed.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Image is the PXF container image. Required when Enabled is true.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the PXF service port.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
-	// TLSMode defines the TLS mode (none, tls, skip-verify).
-	// +kubebuilder:validation:Enum=none;tls;skip-verify
-	// +kubebuilder:default="none"
+	// JvmOpts are the JVM options passed to the PXF service.
 	// +optional
-	TLSMode string `json:"tlsMode,omitempty"`
+	JvmOpts string `json:"jvmOpts,omitempty"`
 
-	// CredentialSecret references the secret containing server credentials.
+	// LogLevel is the PXF log level.
+	// +kubebuilder:validation:Enum=DEBUG;INFO;WARN;ERROR
 	// +optional
-	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+	LogLevel string `json:"logLevel,omitempty"`
+
+	// Extensions controls which PXF database extensions are installed.
+	// +optional
+	Extensions *PxfExtensionsSpec `json:"extensions,omitempty"`
+
+	// Servers defines the external PXF server configurations.
+	// +optional
+	Servers []PxfServerSpec `json:"servers,omitempty"`
+
+	// CustomConnectors defines additional JARs for custom PXF plugins.
+	// +optional
+	CustomConnectors []PxfCustomConnector `json:"customConnectors,omitempty"`
+
+	// Resources defines compute resource requirements for the PXF service.
+	// +optional
+	Resources *ResourceRequirements `json:"resources,omitempty"`
+
+	// DataLoaderRole is the dedicated, minimal-privilege database role granted
+	// only the pxf protocol privileges (SELECT/INSERT ON PROTOCOL pxf) used to
+	// run PXF data loads (SE.6). When set to a non-empty value other than the
+	// cluster admin (gpadmin), the operator ensures the role exists as a
+	// NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN role and targets the protocol
+	// GRANTs at it instead of gpadmin. When empty (the default) the existing
+	// behavior is preserved: the GRANTs target gpadmin, which already exists.
+	// +optional
+	DataLoaderRole string `json:"dataLoaderRole,omitempty"`
+}
+
+// PxfExtensionsSpec controls which PXF database extensions are installed.
+// Pointer fields allow an explicit "false" to survive webhook defaulting.
+type PxfExtensionsSpec struct {
+	// Pxf installs the pxf extension (external tables).
+	// +optional
+	Pxf *bool `json:"pxf,omitempty"`
+
+	// PxfFdw installs the pxf_fdw extension (foreign data wrappers).
+	// +optional
+	PxfFdw *bool `json:"pxfFdw,omitempty"`
+}
+
+// PxfServerSpec defines an external PXF server configuration. The operator
+// translates each server into a directory of XML configuration files under
+// $PXF_BASE/servers/<name>/. The Config map carries the non-sensitive site
+// settings (e.g. fs.s3a.endpoint, jdbc.driver, jdbc.url, fs.defaultFS), while
+// CredentialSecrets reference the Kubernetes Secrets holding sensitive values
+// (resolved by an init container — never stored in ConfigMaps).
+type PxfServerSpec struct {
+	// Name is the unique server name.
+	Name string `json:"name"`
+
+	// Type is the server type. A `custom` server has no forced type-specific
+	// configuration keys; its profile implementation is supplied by a matching
+	// customConnectors[] JAR (see webhook rules W.23/W.24).
+	// +kubebuilder:validation:Enum=s3;hdfs;jdbc;hbase;hive;gs;abfss;wasbs;custom
+	Type string `json:"type"`
+
+	// Config holds the non-sensitive site configuration as a key/value map.
+	// +optional
+	Config map[string]string `json:"config,omitempty"`
+
+	// Hive holds optional hive-site.xml settings.
+	// +optional
+	Hive map[string]string `json:"hive,omitempty"`
+
+	// Hbase holds optional hbase-site.xml settings.
+	// +optional
+	Hbase map[string]string `json:"hbase,omitempty"`
+
+	// Jdbc holds optional jdbc-site.xml settings.
+	// +optional
+	Jdbc map[string]string `json:"jdbc,omitempty"`
+
+	// CredentialSecrets references Kubernetes Secrets containing sensitive
+	// credential values for this server (e.g. access keys, JDBC passwords).
+	// +optional
+	CredentialSecrets []SecretReference `json:"credentialSecrets,omitempty"`
+
+	// Kerberos enables Kerberos (SPNEGO/keytab) authentication for this server
+	// (SE.4). It is only supported for the Hadoop-family server types
+	// (hdfs/hive/hbase); the admission webhook rejects it on other types. When
+	// set, the keytab Secret is mounted into the PXF sidecar and the
+	// hadoop.security.authentication=kerberos properties (principal + keytab
+	// path) are folded into the server's core-site.xml. The operator wires the
+	// configuration only — it never performs a live kinit.
+	// +optional
+	Kerberos *PxfKerberosSpec `json:"kerberos,omitempty"`
+}
+
+// PxfKerberosSpec configures Kerberos (keytab) authentication for a Hadoop-family
+// PXF server (SE.4). The operator renders the hadoop.security.authentication
+// properties into the server's core-site.xml and mounts the keytab Secret into
+// the PXF sidecar at a fixed per-server path; it never performs a live kinit, so
+// the configuration is correct even without a reachable KDC.
+type PxfKerberosSpec struct {
+	// Principal is the Kerberos service principal PXF authenticates as
+	// (e.g. "pxf/_HOST@REALM"). Required.
+	Principal string `json:"principal"`
+
+	// KeytabSecret references the Kubernetes Secret holding the keytab file. The
+	// referenced key's bytes are mounted into the PXF sidecar. Both Name and Key
+	// are required by the admission webhook.
+	KeytabSecret SecretReference `json:"keytabSecret"`
+
+	// Krb5ConfigMap optionally references a ConfigMap whose "krb5.conf" key is
+	// mounted at /etc/krb5.conf in the PXF sidecar (KRB5_CONFIG). When unset the
+	// image's default krb5.conf is used.
+	// +optional
+	Krb5ConfigMap string `json:"krb5ConfigMap,omitempty"`
+
+	// Realm optionally records the Kerberos realm for documentation/diagnostics.
+	// It is not required to render a working configuration.
+	// +optional
+	Realm string `json:"realm,omitempty"`
+}
+
+// PxfCustomConnector defines an additional JAR for a custom PXF plugin.
+type PxfCustomConnector struct {
+	// Name is the connector name.
+	Name string `json:"name"`
+
+	// JarURL is the location of the connector JAR to fetch.
+	JarURL string `json:"jarUrl"`
+}
+
+// GpfdistSpec defines the gpfdist file-server configuration for high-throughput
+// file-based parallel loading.
+type GpfdistSpec struct {
+	// Enabled controls whether the gpfdist service is deployed.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Replicas is the number of gpfdist pods.
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Image is the gpfdist container image.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the gpfdist service port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
 }
 
 // DataLoadingJob defines a data loading job configuration.
 type DataLoadingJob struct {
-	// Name is the job name.
+	// Name is the job name. Required and must be unique.
 	Name string `json:"name"`
 
-	// Type is the source type (s3, kafka, rabbitmq).
-	// +kubebuilder:validation:Enum=s3;kafka;rabbitmq
+	// Type is the job type.
+	// +kubebuilder:validation:Enum=pxf;gpload
 	Type string `json:"type"`
 
 	// Enabled controls whether the job is active.
@@ -1626,104 +1833,263 @@ type DataLoadingJob struct {
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 
-	// TargetTable is the target database table.
+	// PxfJob defines the PXF job configuration (when Type is pxf).
+	// +optional
+	PxfJob *PxfJobSpec `json:"pxfJob,omitempty"`
+
+	// GploadJob defines the gpload job configuration (when Type is gpload).
+	// +optional
+	GploadJob *GploadJobSpec `json:"gploadJob,omitempty"`
+}
+
+// PxfJobSpec defines a PXF-based data loading job.
+type PxfJobSpec struct {
+	// Server references a defined PXF server name.
+	Server string `json:"server"`
+
+	// Profile is the PXF profile (e.g. s3:parquet, jdbc, hive:orc).
+	Profile string `json:"profile"`
+
+	// Resource is the external resource locator (path, table, etc).
+	// +optional
+	Resource string `json:"resource,omitempty"`
+
+	// TargetTable is the target database table. Required.
 	TargetTable string `json:"targetTable"`
 
-	// S3Source defines the S3 source configuration.
+	// Mode is the load mode: "insert" / "insert-select" build a READABLE
+	// external table (FORMATTER='pxfwritable_import') for ingestion, while
+	// "writable" builds a WRITABLE external table (FORMATTER='pxfwritable_export')
+	// for export. When Mode == "writable" the admission webhook enforces the
+	// write-capability matrix: only profiles whose format is writable
+	// (text/parquet/avro for object stores) are admitted; json/orc are rejected
+	// as write-unsupported (see internal/pxfpolicy).
 	// +optional
-	S3Source *S3SourceSpec `json:"s3Source,omitempty"`
+	Mode string `json:"mode,omitempty"`
 
-	// KafkaSource defines the Kafka source configuration.
+	// LoadMethod selects HOW the PXF data flows: "external-table" (default) builds a
+	// transient CREATE EXTERNAL TABLE + INSERT...SELECT then DROPs it; "fdw" builds a
+	// PERSISTENT foreign-data-wrapper chain (CREATE SERVER + USER MAPPING + FOREIGN
+	// TABLE, idempotent IF NOT EXISTS, retained for direct querying) and loads via
+	// INSERT INTO <target> SELECT * FROM <foreign_table> [WHERE <sourceFilter>]. The
+	// FDW path is a READ/import path only (webhook W.25 rejects loadMethod:fdw with
+	// mode:writable). The two methods are EQUIVALENT: the same rows land in the target.
+	// +kubebuilder:validation:Enum=external-table;fdw
 	// +optional
-	KafkaSource *KafkaSourceSpec `json:"kafkaSource,omitempty"`
+	LoadMethod string `json:"loadMethod,omitempty"`
 
-	// RabbitMQSource defines the RabbitMQ source configuration.
+	// SourceFilter is an optional SQL WHERE-predicate body applied ONLY to a
+	// writable EXPORT job (mode: writable). When set, the export becomes
+	// `INSERT INTO <writable_ext> SELECT * FROM <targetTable> WHERE <sourceFilter>`,
+	// exporting a filtered subset of the source rows; when unset the full table is
+	// exported. It is IGNORED/rejected for read/import jobs (see webhook W.17).
+	// The predicate is a raw SQL fragment authored by the cluster administrator in
+	// the CR (same trust boundary as targetTable) — see the webhook W.17 sanity
+	// check which rejects statement terminators / comment sequences.
 	// +optional
-	RabbitMQSource *RabbitMQSourceSpec `json:"rabbitMQSource,omitempty"`
+	SourceFilter string `json:"sourceFilter,omitempty"`
+
+	// FilterPushdown enables predicate pushdown to the external source.
+	// +optional
+	FilterPushdown *bool `json:"filterPushdown,omitempty"`
+
+	// ColumnProjection enables column projection for columnar formats.
+	// +optional
+	ColumnProjection *bool `json:"columnProjection,omitempty"`
+
+	// Partitioning configures JDBC partitioning for parallel reads.
+	// +optional
+	Partitioning *PartitioningSpec `json:"partitioning,omitempty"`
+
+	// ErrorHandling configures per-row error tolerance.
+	// +optional
+	ErrorHandling *ErrorHandlingSpec `json:"errorHandling,omitempty"`
+
+	// Continuous, when true, runs the load Job as a long-running streaming consumer
+	// (e.g. kafka-cdc): the Job does not complete on its own and is shaped without a
+	// short activeDeadline; it runs until deleted. Only meaningful for custom-connector
+	// streaming profiles (e.g. profile: kafka).
+	// +optional
+	Continuous *bool `json:"continuous,omitempty"`
+
+	// BatchSize is the number of rows the streaming loader buffers before a flush
+	// into the target table. Passed to the loader as CBK_BATCH_SIZE.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	BatchSize int32 `json:"batchSize,omitempty"`
+
+	// FlushInterval is the max time the streaming loader waits before flushing a
+	// partial batch (Go duration, e.g. "30s"). Passed to the loader as CBK_FLUSH_INTERVAL.
+	// +optional
+	FlushInterval string `json:"flushInterval,omitempty"`
 }
 
-// S3SourceSpec defines an S3 data source.
-type S3SourceSpec struct {
-	// Bucket is the S3 bucket name.
-	Bucket string `json:"bucket"`
-
-	// Path is the object path prefix.
+// PartitioningSpec configures JDBC partitioning for parallel reads. Column,
+// Range, and Interval must all be provided together.
+type PartitioningSpec struct {
+	// Column is the partition column.
 	// +optional
-	Path string `json:"path,omitempty"`
+	Column string `json:"column,omitempty"`
 
-	// Endpoint is the S3-compatible endpoint.
+	// Range is the partition range (e.g. "2024-01-01:2026-12-31").
 	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
+	Range string `json:"range,omitempty"`
 
-	// Region is the S3 region.
+	// Interval is the partition interval (e.g. "1:month").
 	// +optional
-	Region string `json:"region,omitempty"`
+	Interval string `json:"interval,omitempty"`
+}
 
-	// Format is the data format (csv, json, avro).
-	// +kubebuilder:validation:Enum=csv;json;avro
+// ErrorHandlingSpec configures per-row error tolerance for a load job.
+type ErrorHandlingSpec struct {
+	// SegmentRejectLimit is the maximum number of rejected rows (or percent).
+	// +optional
+	SegmentRejectLimit int32 `json:"segmentRejectLimit,omitempty"`
+
+	// SegmentRejectLimitType is the unit for SegmentRejectLimit.
+	// +kubebuilder:validation:Enum=rows;percent
+	// +optional
+	SegmentRejectLimitType string `json:"segmentRejectLimitType,omitempty"`
+
+	// LogErrors enables logging of rejected rows.
+	// +optional
+	LogErrors *bool `json:"logErrors,omitempty"`
+}
+
+// GploadJobSpec defines a gpfdist/gpload-based data loading job. The operator
+// renders a gpload YAML CONTROL FILE from these fields (GL.1-GL.7) and runs
+// `gpload -f <ctl>` in a Job/CronJob.
+type GploadJobSpec struct {
+	// TargetTable is the OUTPUT TABLE (GL.5 / J.34). Required.
+	TargetTable string `json:"targetTable"`
+
+	// Mode is the gpload OUTPUT MODE (GL.5 / J.35-J.37): insert | update | merge.
+	// For update/merge gpload REQUIRES MatchColumns (and typically UpdateColumns);
+	// the webhook enforces this (W.20).
+	// +kubebuilder:validation:Enum=insert;update;merge
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// Format is the INPUT FORMAT (GL.3 / J.30): csv | text.
+	// +kubebuilder:validation:Enum=csv;text
 	// +optional
 	Format string `json:"format,omitempty"`
 
-	// CredentialSecret references the secret containing S3 credentials.
+	// InputSource selects WHERE gpload reads from (GL.2 / J.26-J.29): a gpfdist
+	// service (gpfdist://host:port<glob>) or local files. When nil, defaults to
+	// type=gpfdist against the cluster gpfdist Service.
 	// +optional
-	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+	InputSource *GploadInputSourceSpec `json:"inputSource,omitempty"`
 
-	// ForcePathStyle enables path-style addressing for S3-compatible storage.
-	// +kubebuilder:default=false
+	// FilePaths is the list of source file GLOBS (J.26/J.29) appended to the
+	// INPUT.SOURCE.FILE list. For inputSource.type=gpfdist each entry becomes
+	// gpfdist://<host>:<port><glob>; for type=local each entry is used verbatim
+	// as a local path. file:// is rejected at admission (W.16, retained).
 	// +optional
-	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+	FilePaths []string `json:"filePaths,omitempty"`
+
+	// Delimiter is the INPUT DELIMITER (GL.3 / J.31). Single character; default ",".
+	// +kubebuilder:validation:MaxLength=1
+	// +optional
+	Delimiter string `json:"delimiter,omitempty"`
+
+	// Header indicates the first row is a header (GL.3 / J.32 → HEADER true).
+	// Pointer so "unset" is distinct from explicit false. Default: emitted only
+	// when true (CSV header).
+	// +optional
+	Header *bool `json:"header,omitempty"`
+
+	// Encoding is the INPUT ENCODING (GL.3 / J.33); default "UTF-8".
+	// +optional
+	Encoding string `json:"encoding,omitempty"`
+
+	// MatchColumns lists the key columns used by update/merge MODE (gpload
+	// OUTPUT.MATCH_COLUMNS). REQUIRED when Mode is update or merge (W.20);
+	// ignored for insert.
+	// +optional
+	MatchColumns []string `json:"matchColumns,omitempty"`
+
+	// UpdateColumns lists the columns updated by update/merge MODE (gpload
+	// OUTPUT.UPDATE_COLUMNS). Optional; when empty gpload updates all non-match
+	// columns. Ignored for insert.
+	// +optional
+	UpdateColumns []string `json:"updateColumns,omitempty"`
+
+	// Preload configures the PRELOAD block (GL.6 / J.39).
+	// +optional
+	Preload *GploadPreloadSpec `json:"preload,omitempty"`
+
+	// PostActions is the gpload SQL.AFTER block (GL.7 / J.40): each entry is one
+	// raw SQL statement run AFTER the load (e.g. "ANALYZE public.raw_data").
+	// Author-trusted (same boundary as targetTable); webhook applies the W.21
+	// sanity check (no statement terminators / comment sequences per element).
+	// +optional
+	PostActions []string `json:"postActions,omitempty"`
+
+	// ErrorHandling drives ERROR_LIMIT + LOG_ERRORS (GL.4 / J.38):
+	// segmentRejectLimit→ERROR_LIMIT, logErrors→LOG_ERRORS. (Existing type reused.)
+	// +optional
+	ErrorHandling *ErrorHandlingSpec `json:"errorHandling,omitempty"`
 }
 
-// KafkaSourceSpec defines a Kafka data source.
-type KafkaSourceSpec struct {
-	// Brokers is the list of Kafka broker addresses.
-	Brokers []string `json:"brokers"`
-
-	// Topic is the Kafka topic to consume from.
-	Topic string `json:"topic"`
-
-	// GroupID is the consumer group ID.
+// GploadInputSourceSpec selects the gpload INPUT SOURCE (GL.2 / J.26-J.29).
+type GploadInputSourceSpec struct {
+	// Type is the source kind (J.27): "gpfdist" (served by a gpfdist Service) or
+	// "local" (paths local to the gpload pod). Default "gpfdist".
+	// +kubebuilder:validation:Enum=gpfdist;local
 	// +optional
-	GroupID string `json:"groupId,omitempty"`
+	Type string `json:"type,omitempty"`
 
-	// Format is the message format (json, avro, csv).
-	// +kubebuilder:validation:Enum=json;avro;csv
+	// Host is the gpfdist server host (J.28). Only used when Type=gpfdist; when
+	// empty it defaults to the cluster gpfdist Service "<cluster>-gpfdist-svc".
 	// +optional
-	Format string `json:"format,omitempty"`
+	Host string `json:"host,omitempty"`
 
-	// StartOffset defines where to start consuming (earliest, latest).
-	// +kubebuilder:validation:Enum=earliest;latest
-	// +kubebuilder:default="earliest"
-	// +optional
-	StartOffset string `json:"startOffset,omitempty"`
-}
-
-// RabbitMQSourceSpec defines a RabbitMQ data source.
-type RabbitMQSourceSpec struct {
-	// Host is the RabbitMQ hostname.
-	Host string `json:"host"`
-
-	// Port is the RabbitMQ port.
+	// Port is the gpfdist server port (J.29). Only used when Type=gpfdist; when
+	// zero it defaults to the gpfdist spec port (or 8080).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
+}
 
-	// VHost is the RabbitMQ virtual host.
+// GploadPreloadSpec configures the gpload PRELOAD block (GL.6 / J.39).
+type GploadPreloadSpec struct {
+	// Truncate emits PRELOAD.TRUNCATE: true (J.39) — empty the target table
+	// before the load. Pointer so unset != explicit false.
 	// +optional
-	VHost string `json:"vhost,omitempty"`
+	Truncate *bool `json:"truncate,omitempty"`
+}
 
-	// Queue is the RabbitMQ queue name.
-	Queue string `json:"queue"`
-
-	// Format is the message format (json, avro, csv).
-	// +kubebuilder:validation:Enum=json;avro;csv
+// DataLoadingJobTemplate defines pod template overrides for data loading Jobs.
+type DataLoadingJobTemplate struct {
+	// Resources defines compute resource requirements for the Job pod.
 	// +optional
-	Format string `json:"format,omitempty"`
+	Resources *ResourceRequirements `json:"resources,omitempty"`
 
-	// CredentialSecret references the secret containing RabbitMQ credentials.
+	// NodeSelector constrains the Job pod to matching nodes.
 	// +optional
-	CredentialSecret *SecretReference `json:"credentialSecret,omitempty"`
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations allow the Job pod to schedule onto tainted nodes.
+	// +optional
+	Tolerations []Toleration `json:"tolerations,omitempty"`
+
+	// ServiceAccountName is the ServiceAccount used by the Job pod.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// BackoffLimit is the number of retries before the Job is marked failed.
+	// +optional
+	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
+
+	// ActiveDeadlineSeconds is the Job timeout in seconds.
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+
+	// TTLSecondsAfterFinished cleans up finished Jobs after the given seconds.
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 }
 
 // StorageManagementSpec defines storage management configuration.
@@ -1866,8 +2232,15 @@ type CloudberryClusterStatus struct {
 	BackupHistory []BackupHistoryEntry `json:"backupHistory,omitempty"`
 
 	// DataLoadingJobs is the number of active data loading jobs.
+	// Retained for backward compatibility; it mirrors DataLoading.ActiveJobs.
 	// +optional
 	DataLoadingJobs int32 `json:"dataLoadingJobs,omitempty"`
+
+	// DataLoading is the lightweight data loading status (counts, phase, and
+	// per-job name/enabled). The rich per-server/per-job runtime status from
+	// specifications/12-data-loading-spec.md is Planned/Future.
+	// +optional
+	DataLoading *DataLoadingStatus `json:"dataLoading,omitempty"`
 
 	// DiskUsagePercent is the current disk usage percentage.
 	// +optional
@@ -1903,6 +2276,129 @@ type FailedSegment struct {
 
 	// Status is the segment status description.
 	Status string `json:"status"`
+}
+
+// DataLoadingStatus is the lightweight, honestly-populatable status for data
+// loading. It captures only what the controller can truthfully report today:
+// high-level phase, job counts, and per-job name/enabled state. The rich
+// per-server/per-job runtime status described in
+// specifications/12-data-loading-spec.md (rowsLoaded, duration, lastRun,
+// lastStatus, pxf.status, servers, extensionsInstalled) is Planned/Future and
+// requires the PXF sidecars and execution Jobs that do not exist yet.
+type DataLoadingStatus struct {
+	// Phase is the high-level data-loading phase (e.g. "Configured").
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// ConfiguredJobs is the total number of declared data loading jobs.
+	// +optional
+	ConfiguredJobs int32 `json:"configuredJobs,omitempty"`
+
+	// ActiveJobs is the number of enabled data loading jobs.
+	// +optional
+	ActiveJobs int32 `json:"activeJobs,omitempty"`
+
+	// Jobs lists per-job declarative state plus, for jobs that have executed at
+	// least once, the truthful execution status (lastRun/lastStatus/rowsLoaded/
+	// duration) harvested from the spawned data-loading Job and its
+	// DATALOAD_ROWS termination marker.
+	// +optional
+	Jobs []DataLoadingJobStatus `json:"jobs,omitempty"`
+
+	// Pxf is the lightweight, spec-derived PXF configuration status. It is
+	// populated only when PXF is enabled (pxf.enabled && image set). It reports
+	// ONLY what the controller can truthfully derive from the spec: whether PXF
+	// is configured and how many external servers are declared. It deliberately
+	// omits live runtime/health fields (pxf.status, per-server reachability,
+	// extensionsInstalled), which require live probing and remain Planned/Future.
+	// +optional
+	Pxf *DataLoadingPxfStatus `json:"pxf,omitempty"`
+}
+
+// DataLoadingPxfStatus is the honestly-populatable PXF status. Configured and
+// Servers are computed purely from the spec (Configured = pxf.enabled && image
+// set; Servers = len(pxf.servers)), so they never imply the PXF service is
+// actually reachable or healthy. Status and ExtensionsInstalled are the
+// observed-only runtime fields: Status is derived ONLY from the real readiness
+// of the segment-primary "pxf" containers, and ExtensionsInstalled ONLY from a
+// live pg_extension probe. Both runtime fields stay ABSENT when unobservable, so
+// the type never fabricates health or installed state.
+type DataLoadingPxfStatus struct {
+	// Configured indicates the PXF sidecar configuration has been applied
+	// (spec-derived: pxf.enabled with a non-empty image). It does NOT imply the
+	// PXF service is up or healthy.
+	// +optional
+	Configured bool `json:"configured,omitempty"`
+
+	// Servers is the number of external PXF servers declared in the spec
+	// (len(pxf.servers)). It is a config count, not a live-reachable count.
+	// +optional
+	Servers int32 `json:"servers,omitempty"`
+
+	// Status is the HONEST, observed PXF runtime status, derived ONLY from the
+	// real readiness of the "pxf" container across the segment-primary pods
+	// (their Status.ContainerStatuses) — there is no live health probe, exec or
+	// cross-pod HTTP. It is one of "Running" (all observed pxf containers ready),
+	// "Error" (some but not all ready — a segment's PXF is down), or "Stopped"
+	// (pods observed but none ready). It is deliberately ABSENT (empty) when the
+	// state is UNOBSERVABLE (no segment-primary pods or no pxf containers
+	// observed): an absent Status never claims health that was not observed. The
+	// CRD models it as a free-form string (not an enum) precisely so the absent
+	// state stays representable.
+	// +optional
+	Status string `json:"status,omitempty"`
+
+	// ExtensionsInstalled lists the PXF client extensions actually present in the
+	// database, derived from a LIVE pg_extension probe (SELECT extname FROM
+	// pg_extension WHERE extname IN ('pxf','pxf_fdw')), sorted ascending. It is
+	// HONEST: it reports only names truly observed in pg_extension and is ABSENT
+	// (nil) when the probe is UNOBSERVABLE — the DB is unreachable or no PXF
+	// extensions are installed. It is never synthesized to an empty array and
+	// never lists fabricated names.
+	// +optional
+	ExtensionsInstalled []string `json:"extensionsInstalled,omitempty"`
+}
+
+// DataLoadingJobStatus reflects the declarative per-job state derived from the
+// spec (Name, Enabled) enriched, for jobs that have actually run, with the
+// truthful execution status harvested from the spawned data-loading Job. The
+// execution fields are populated ONLY from real Job status and the
+// DATALOAD_ROWS termination marker (never synthesized), so they stay honest:
+// they are absent until a Job for the named job reaches a terminal state. It is
+// distinct from the database-layer db.DataLoadingJobStatus type.
+type DataLoadingJobStatus struct {
+	// Name is the job name.
+	Name string `json:"name"`
+
+	// Enabled indicates whether the job is active.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// LastRun is the start time of the most recent data-loading Job observed for
+	// this job. It is sourced from the Job's status.startTime and is absent until
+	// a Job has run.
+	// +optional
+	LastRun *metav1.Time `json:"lastRun,omitempty"`
+
+	// LastStatus is the terminal status of the most recent data-loading Job
+	// observed for this job ("Succeeded", "Failed", "Running" or "Pending"),
+	// derived from the Job's status. It is absent until a Job has run.
+	// +optional
+	LastStatus string `json:"lastStatus,omitempty"`
+
+	// RowsLoaded is the number of rows loaded by the most recent successful
+	// data-loading Job for this job, harvested from the Job pod's DATALOAD_ROWS
+	// termination marker. It is absent until a row count is observed and is never
+	// synthesized.
+	// +optional
+	RowsLoaded *int64 `json:"rowsLoaded,omitempty"`
+
+	// Duration is the wall-clock duration of the most recent data-loading Job for
+	// this job (computed from the Job's start and completion timestamps,
+	// formatted as a Go duration string, e.g. "1m30s"). It is absent until a Job
+	// has completed.
+	// +optional
+	Duration string `json:"duration,omitempty"`
 }
 
 // Types are registered via SchemeBuilder in groupversion_info.go.

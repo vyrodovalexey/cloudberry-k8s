@@ -11,7 +11,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -721,29 +720,6 @@ func TestCreateAdminPasswordSecret_RaceThenGetFails_Returns500(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "failed to create admin password secret")
 }
 
-// ----------------------------------------------------------------------------
-// B-6: data-loading stub envelope shape
-// ----------------------------------------------------------------------------
-
-func TestDataLoadingStubs_ErrorEnvelopeShape(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
-	s := newTestServer(cluster)
-
-	req := httptest.NewRequest(http.MethodPost,
-		apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
-	req.SetPathValue("name", "test-cluster")
-	rec := httptest.NewRecorder()
-	s.handleCreateDataLoadingJob(rec, req)
-
-	require.Equal(t, http.StatusNotImplemented, rec.Code)
-
-	var envelope struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
-	assert.Equal(t, errCodeNotImplemented, envelope.Error.Code)
-	assert.NotEmpty(t, envelope.Error.Message)
-}
+// The data-loading job mutation endpoints are now fully implemented
+// (Scenario 107); their error-envelope shape is covered by the dedicated
+// Scenario 107 suite written separately.

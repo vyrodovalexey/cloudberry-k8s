@@ -110,6 +110,25 @@ cloudberry-ctl
 │   └── jobs                      # List backup/restore Jobs
 │       └── logs                  # Stream a backup Job's logs
 ├── migrate                       # Cross-cluster database migration (Scenario 87)
+├── data-loading                  # Data loading / PXF (Scenario 108)
+│   ├── status                    # Show data-loading status (lists jobs)
+│   ├── test-read                 # Honest sample read of a PXF source (L.15)
+│   └── jobs                      # Data-loading jobs
+│       ├── list                  # List data-loading jobs
+│       ├── create                # Create a job (--type pxf|gpload, --from-yaml)
+│       ├── start                 # Start/trigger a job
+│       ├── stop                  # Stop a job
+│       ├── delete                # Delete a job
+│       └── logs                  # Stream a data-loading Job's logs (L.13)
+├── pxf                           # PXF lifecycle + servers (Scenario 95 / 108)
+│   ├── status                    # Show PXF sidecar readiness
+│   ├── restart                   # Operator-driven PXF restart (pod roll)
+│   ├── sync                      # Refresh PXF servers ConfigMap + roll
+│   └── servers                   # PXF server CRUD (Scenario 108)
+│       ├── list                  # List configured PXF servers
+│       ├── create                # Create a PXF server
+│       ├── update                # Update a PXF server's endpoint
+│       └── delete                # Delete a PXF server
 ├── inspect                       # Inspection commands
 │   ├── disk-usage                # Show disk usage
 │   ├── skew                      # Show data distribution skew
@@ -493,6 +512,146 @@ cloudberry-ctl workload rules import --cluster my-cluster -f rules.yaml
 cloudberry-ctl workload rules export --cluster my-cluster -O rules.yaml
 ```
 
+### 5.10 Data Loading and PXF (Scenario 108)
+
+All `data-loading` and `pxf` subcommands talk to the operator's data-loading REST
+API (see [Data Loading Specification §API Endpoints](12-data-loading-spec.md#api-endpoints)),
+mirroring the `backup` group: point the CLI at the operator API and authenticate
+first (`--operator-url` / `CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + a token
+via `--password` / `CLOUDBERRY_PASSWORD`; see [§5.6.1](#561-pointing-the-cli-at-the-operator-api)).
+**Scenario 108** wired the full data-loading/PXF CLI surface (L.1–L.16) to the
+Scenario 107 REST endpoints, plus one new server-side test-read endpoint.
+
+```bash
+# --- PXF lifecycle (Scenario 95) ---
+cloudberry-ctl pxf status  --cluster my-cluster                 # L.1  → GET  .../pxf/status
+cloudberry-ctl pxf sync    --cluster my-cluster                 # L.6  → POST .../pxf/sync
+cloudberry-ctl pxf restart --cluster my-cluster                 # L.7  → POST .../pxf/restart
+
+# --- PXF servers CRUD (NEW — Scenario 108) ---
+cloudberry-ctl pxf servers list --cluster my-cluster            # L.2  → GET  .../pxf/servers
+cloudberry-ctl pxf servers create --cluster my-cluster \
+  --name s3-lake --type s3 \
+  --endpoint http://minio:9000 --bucket data-lake \
+  --credential-secret s3-creds:access_key \
+  --credential-secret s3-creds:secret_key                       # L.3  → POST .../pxf/servers
+cloudberry-ctl pxf servers update s3-lake --cluster my-cluster \
+  --endpoint http://minio:9001                                  # L.4  → PUT  .../pxf/servers/{name}
+cloudberry-ctl pxf servers delete s3-lake --cluster my-cluster  # L.5  → DELETE .../pxf/servers/{name}
+
+# --- Data-loading jobs ---
+cloudberry-ctl data-loading jobs list   --cluster my-cluster    # L.8  → GET  .../jobs
+cloudberry-ctl data-loading status      --cluster my-cluster    # (lists jobs)
+
+# Create a PXF job (NEW flag set — Scenario 108) -> POST .../jobs
+cloudberry-ctl data-loading jobs create --cluster my-cluster \
+  --name s3-ingest --type pxf \
+  --server s3-lake --profile s3:parquet \
+  --resource "s3a://data-lake/events/" \
+  --target public.events \
+  --schedule "0 */6 * * *"                                      # L.9
+
+# Create a gpload job (NEW — Scenario 108) -> POST .../jobs
+cloudberry-ctl data-loading jobs create --cluster my-cluster \
+  --name csv-load --type gpload \
+  --gpfdist-host gpfdist-svc --gpfdist-port 8080 \
+  --file-path "/data/incoming/*.csv" \
+  --target public.raw_data --format csv                         # L.14
+
+# Create a job from a full YAML definition (NEW — Scenario 108) -> POST .../jobs
+cloudberry-ctl data-loading jobs create --cluster my-cluster \
+  --from-yaml job-config.yaml                                   # L.16
+
+cloudberry-ctl data-loading jobs start  --cluster my-cluster s3-ingest  # L.10 → POST .../jobs/{job}/start
+cloudberry-ctl data-loading jobs stop   --cluster my-cluster s3-ingest  # L.11 → POST .../jobs/{job}/stop
+cloudberry-ctl data-loading jobs delete --cluster my-cluster s3-ingest  # L.12 → DELETE .../jobs/{job}
+
+# Stream a data-loading Job's logs (NEW — Scenario 108) -> GET .../jobs/{job}/logs
+cloudberry-ctl data-loading jobs logs --cluster my-cluster --job s3-ingest         # L.13
+cloudberry-ctl data-loading jobs logs --cluster my-cluster --job s3-ingest \
+  --follow --tail 200
+
+# Honest sample read of a PXF source (NEW — Scenario 108) -> GET .../data-loading/test-read
+cloudberry-ctl data-loading test-read --cluster my-cluster --job s3-ingest --limit 5
+cloudberry-ctl data-loading test-read --cluster my-cluster \
+  --server s3-lake --profile s3:parquet \
+  --resource "s3a://data-lake/events/sample.parquet" --limit 10             # L.15
+```
+
+#### 5.10.1 `pxf servers` CRUD flags
+
+| Subcommand | REST | Flags |
+|------------|------|-------|
+| `pxf servers list` | `GET .../pxf/servers` | — (lists servers as references; never literal secrets) |
+| `pxf servers create` | `POST .../pxf/servers` | `--name` (required), `--type` (`s3`/`hdfs`/`jdbc`/…), `--endpoint`, `--bucket`, `--credential-secret` (repeatable, `name[:key]`) |
+| `pxf servers update [name]` | `PUT .../pxf/servers/{name}` (via `runAPIPut`) | positional `name`, `--endpoint` |
+| `pxf servers delete [name]` | `DELETE .../pxf/servers/{name}` | positional `name`; `409 SERVER_IN_USE` when a job still references it |
+
+`--credential-secret` is **repeatable** and takes a `name[:key]` value (e.g.
+`s3-creds:access_key`); each occurrence adds one `credentialSecrets[]` reference.
+
+#### 5.10.2 `data-loading jobs create` flags
+
+`jobs create` builds the job body from flags, or reads a full job from
+`--from-yaml`. `--from-yaml` takes **precedence** over the individual flags.
+
+| Mode | Flags |
+|------|-------|
+| `--type pxf` | `--name`, `--server`, `--profile`, `--resource`, `--target`, `--schedule` |
+| `--type gpload` | `--name`, `--gpfdist-host`, `--gpfdist-port`, `--file-path`, `--format`, `--target`, `--schedule` |
+| `--from-yaml <file>` | reads + unmarshals a complete job definition; overrides flag-built body |
+
+> Before Scenario 108, `jobs create` posted a `nil`/minimal body to the REST
+> route. It now builds the real PXF / gpload job body from the flags above (or
+> from `--from-yaml`).
+
+#### 5.10.3 Streaming data-loading Job logs (`data-loading jobs logs`)
+
+`data-loading jobs logs --job <name>` **streams** the selected data-loading Job's
+pod logs to stdout by calling `GET .../data-loading/jobs/{job}/logs`, exactly
+mirroring [`backup jobs logs` (sub-case 86k)](#562-streaming-backup-job-logs-backup-jobs-logs):
+it uses `OperatorClient.GetStream` (copies the `text/plain` body straight to
+stdout, no buffering / JSON parse) and falls back to a **kubectl** instruction
+when the endpoint is unavailable.
+
+| Flag | Description |
+|------|-------------|
+| `--job` | Data-loading Job name (**required**) |
+| `--follow` | Stream logs as they are produced → `?follow=true` |
+| `--tail` | Number of recent log lines to show (`-1` = all) → `?tailLines=N` |
+
+**kubectl fallback.** If the streaming endpoint is unavailable (older operator, a
+`404`/`405`, a connection error, or `501 LOGS_NOT_AVAILABLE` when no clientset is
+wired), the CLI prints the equivalent instruction rather than failing silently:
+
+```
+unable to stream logs from the operator API (<cause>); run:
+  kubectl logs -n <namespace> job/<job>
+```
+
+#### 5.10.4 Honest source sample (`data-loading test-read`)
+
+`data-loading test-read` performs an **honest** sample read of a PXF source by
+calling the new `GET .../data-loading/test-read` endpoint (Scenario 108,
+`PermissionBasic`, **no metric**). The operator's `db.Client.ReadPXFSourceSample`
+builds a **transient** external table, runs `SELECT … LIMIT N`, and **always
+DROPs** it.
+
+| Flag | Description |
+|------|-------------|
+| `--job <job>` | Read the source defined by an existing job, OR specify it inline below |
+| `--server` | PXF server name (inline source) |
+| `--profile` | PXF profile (inline source, e.g. `s3:parquet`) |
+| `--resource` | Source resource / LOCATION path (inline source) |
+| `--limit N` | Max rows to sample — **default 10**, **capped at 1000** |
+
+The response shape is `TestReadResponse`
+`{cluster, source{server,profile,resource}, limit, available, rowCount, columns, rows}`.
+**Honesty contract:** the command prints **real rows** when the source is
+reachable, or `available:false` / an empty result when the DB or source is
+unreachable — values are **never fabricated** and the endpoint **never returns
+`500`** for an unreachable source.
+
 ## 6. Output Formats
 
 ### 6.1 Table (default)
@@ -742,3 +901,78 @@ All commands inherit the global flags (`--cluster`, `--namespace` default `cloud
 `test/e2e/scripts/scenario86-cli-commands.sh` (builds the CLI, obtains an OIDC token,
 port-forwards the operator API, runs every backup command 86a–k, and asserts the created
 Jobs/args, the CronJob schedule/suspend changes, and the streamed Job logs).
+
+## 13. Scenario 108 — All Data-Loading / PXF CLI Commands (L.1–L.16)
+
+**Scenario 108** wires the **full** data-loading / PXF CLI surface in
+`cmd/cloudberry-ctl/main.go` to the Scenario 107 REST endpoints, plus **one new**
+server-side endpoint for `test-read`. Most verbs reuse the already-FULL Scenario
+107 routes; the code additions are the `pxf servers` CRUD subcommands, the
+enriched `data-loading jobs create` flag set (pxf + gpload + `--from-yaml`), the
+`data-loading jobs logs` streaming path (mirroring `backup jobs logs` 86k), the
+`data-loading test-read` command, the new `runAPIPut` helper, and the new
+test-read endpoint + `db.Client.ReadPXFSourceSample`.
+
+All commands inherit the global flags (`--cluster`, `--namespace` default
+`cloudberry-test`, `--operator-url`/`CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc`
++ token via `--password`/`CLOUDBERRY_PASSWORD`); the CLI prefixes every path with
+the API prefix (`/api/v1alpha1`). Acceptance per sub-case (L.1–L.16):
+
+| Sub-case | Command (cobra path) | REST request | Notes |
+|----------|----------------------|--------------|-------|
+| **L.1** | `pxf status` | `GET /clusters/{cluster}/data-loading/pxf/status` | existed (Scenario 95); honest sidecar readiness |
+| **L.2** | `pxf servers list` | `GET …/data-loading/pxf/servers` | **NEW**; references only, never literal secrets |
+| **L.3** | `pxf servers create` | `POST …/data-loading/pxf/servers` | **NEW**; `--name --type --endpoint --bucket --credential-secret` (repeatable `name[:key]`) |
+| **L.4** | `pxf servers update [name]` | `PUT …/data-loading/pxf/servers/{name}` | **NEW**; positional name + `--endpoint` (via `runAPIPut`) |
+| **L.5** | `pxf servers delete [name]` | `DELETE …/data-loading/pxf/servers/{name}` | **NEW**; `409 SERVER_IN_USE` when referenced |
+| **L.6** | `pxf sync` | `POST …/data-loading/pxf/sync` | existed (Scenario 95) |
+| **L.7** | `pxf restart` | `POST …/data-loading/pxf/restart` | existed (Scenario 95); pod roll |
+| **L.8** | `data-loading jobs list` | `GET …/data-loading/jobs` | existed |
+| **L.9** | `data-loading jobs create --type pxf` | `POST …/data-loading/jobs` | enriched: `--name --server --profile --resource --target --schedule` (previously posted nil body) |
+| **L.10** | `data-loading jobs start [job]` | `POST …/data-loading/jobs/{job}/start` | existed |
+| **L.11** | `data-loading jobs stop [job]` | `POST …/data-loading/jobs/{job}/stop` | existed |
+| **L.12** | `data-loading jobs delete [job]` | `DELETE …/data-loading/jobs/{job}` | existed |
+| **L.13** | `data-loading jobs logs --job <job>` | `GET …/data-loading/jobs/{job}/logs` | **NEW**; `GetStream` (`--follow`/`--tail`) + kubectl fallback |
+| **L.14** | `data-loading jobs create --type gpload` | `POST …/data-loading/jobs` | **NEW** flags: `--gpfdist-host --gpfdist-port --file-path --format` |
+| **L.15** | `data-loading test-read` | `GET …/data-loading/test-read` | **NEW** CLI + **NEW** REST; `--job` OR `--server/--profile/--resource`; `--limit N` (default 10, cap 1000) |
+| **L.16** | `data-loading jobs create --from-yaml <file>` | `POST …/data-loading/jobs` | **NEW**; reads + unmarshals a full job; precedence over flags |
+
+- **L.2–L.5 — `pxf servers` CRUD.** New subcommands under `newPxfCmd` →
+  `newPxfServersCmd`. `create` builds a server spec from `--name --type
+  --endpoint --bucket` and the repeatable `--credential-secret` (`name[:key]`);
+  `update [name]` PUTs an endpoint change via the new `runAPIPut` helper; `delete
+  [name]` honors the `409 SERVER_IN_USE` guard. See
+  [§5.10.1](#5101-pxf-servers-crud-flags).
+
+- **L.9/L.14/L.16 — enriched `data-loading jobs create`.** The command now builds
+  a **real** PXF (`--type pxf`) or gpload (`--type gpload`) job body from flags,
+  or reads a complete job from `--from-yaml <file>` (which takes precedence over
+  the flags). See [§5.10.2](#5102-data-loading-jobs-create-flags).
+
+- **L.13 — `data-loading jobs logs` (streaming + fallback).** Mirrors `backup
+  jobs logs` (86k): streams `GET …/data-loading/jobs/{job}/logs` to stdout via
+  `OperatorClient.GetStream` (`--follow` → `?follow=true`, `--tail N` →
+  `?tailLines=N`); a `404`/`405`/connection error or `501 LOGS_NOT_AVAILABLE`
+  prints the kubectl fallback. See [§5.10.3](#5103-streaming-data-loading-job-logs-data-loading-jobs-logs).
+
+- **L.15 — `data-loading test-read` (NEW endpoint + honest contract).** The CLI
+  calls the **new** `GET …/data-loading/test-read` endpoint (`handleTestReadPXFSource`,
+  `PermissionBasic`, **no metric**), which uses the **new**
+  `db.Client.ReadPXFSourceSample` to build a **transient** external table, run
+  `SELECT … LIMIT N` (default 10, cap 1000), and **always DROP** it. The response
+  `TestReadResponse` `{cluster, source{server,profile,resource}, limit, available,
+  rowCount, columns, rows}` carries **real rows**, or `available:false`/empty when
+  the DB or source is unreachable — **never fabricated, never `500`**. See
+  [§5.10.4](#5104-honest-source-sample-data-loading-test-read).
+
+**Implementation.** The command tree lives in `cmd/cloudberry-ctl/main.go`
+(`newDataLoadingCmd`/`newPxfCmd` → `newPxfServersCmd`(+`list`/`create`/`update`/
+`delete`), `newDataLoadingJobsCmd`(+`create`/`logs`), `newDataLoadingTestReadCmd`),
+with the new `runAPIPut` helper alongside the existing `runAPIGet`/`runAPIPost`/
+`runAPIDelete`; streaming reuses `OperatorClient.GetStream` (`internal/ctl/client.go`).
+The new operator endpoint is `handleTestReadPXFSource` (`internal/api/dataloading.go`),
+backed by `db.Client.ReadPXFSourceSample` (`internal/db/client.go`); its response
+shape is `TestReadResponse`. The data-loading REST mappings (P.1–P.15) are
+documented in [Data Loading Specification §Scenario 107](12-data-loading-spec.md#scenario-107--all-api-endpoints-p1p15)
+and the new test-read endpoint in
+[§Scenario 108](12-data-loading-spec.md#scenario-108--all-cli-commands-l1l16).

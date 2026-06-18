@@ -3,7 +3,9 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
@@ -66,8 +69,6 @@ type Client interface {
 	Close()
 	// GetSegmentConfiguration returns the segment configuration.
 	GetSegmentConfiguration(ctx context.Context) ([]SegmentInfo, error)
-	// GetClusterState returns the overall cluster health state.
-	GetClusterState(ctx context.Context) (*ClusterState, error)
 	// SetParameter sets a configuration parameter.
 	SetParameter(ctx context.Context, name, value string, scope ParameterScope) error
 	// ShowParameter returns the current value of a parameter.
@@ -204,6 +205,54 @@ type Client interface {
 	// SetupExporterRole creates the cloudberry_exporter database role with LOGIN privilege,
 	// grants pg_monitor membership, and grants SELECT on monitoring views.
 	SetupExporterRole(ctx context.Context, password string) error
+	// SetupPXFExtensions best-effort installs the PXF client extensions:
+	// CREATE EXTENSION IF NOT EXISTS pxf, then pxf_fdw. Both statements are
+	// NON-FATAL — the pxf agent/extension is absent in cloudberry-official:2.1.0
+	// (only a pxf_fdw client stub may exist), so a CREATE EXTENSION failure is
+	// logged as a warning and the method returns (count, nil). Only a hard
+	// connectivity error (the existence probe itself failing) is surfaced.
+	// Idempotent. The returned int is the number of extensions actually CREATE
+	// EXTENSIONed on this call (0..2); callers use it to avoid marking PXF
+	// "ready" when nothing was installed (e.g. DB in recovery / pxf absent).
+	SetupPXFExtensions(ctx context.Context) (int, error)
+	// EnsureDataLoaderRole ensures the dedicated, minimal-privilege data-loading
+	// database role exists and is GRANTed only the pxf protocol privileges
+	// (SELECT/INSERT ON PROTOCOL pxf) — SE.6. The role is created (when absent)
+	// as NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN via an existence-probe +
+	// CREATE pattern (mirroring SetupExporterRole), then the protocol GRANTs are
+	// applied. It is best-effort/NON-FATAL like SetupPXFExtensions: a missing
+	// PROTOCOL pxf (stub image) is logged and tolerated. When roleName is empty
+	// or the cluster admin (gpadmin) the method is a no-op — gpadmin already
+	// exists and SetupPXFExtensions retains the existing RP.11 grant behavior.
+	// Only a hard connectivity error (the existence probe failing) is surfaced.
+	EnsureDataLoaderRole(ctx context.Context, roleName string) error
+	// ListPXFExtensions returns the PXF client extensions actually present in
+	// pg_extension among {pxf, pxf_fdw}, sorted ascending. It is a LIVE,
+	// observed-only probe: it never synthesizes names and returns only what the
+	// catalog reports. A connectivity/query error is surfaced (not swallowed) so
+	// the caller can treat an unobservable probe as ABSENT rather than as "none
+	// installed". An empty (nil) slice with a nil error means a reachable DB with
+	// no PXF extensions present.
+	ListPXFExtensions(ctx context.Context) ([]string, error)
+	// ListExternalTables returns the external tables (pg_exttable) and foreign
+	// tables (pg_foreign_table) actually present in the catalog, each tagged with
+	// its kind ("external" or "foreign") and, when derivable, its backing server.
+	// It is a LIVE, observed-only probe: it never synthesizes rows and reports
+	// only what the catalog returns. A connectivity/query error is surfaced (not
+	// swallowed) so the caller can treat an unobservable probe as ABSENT rather
+	// than as "none present". An empty (nil) slice with a nil error means a
+	// reachable DB with no external/foreign tables defined.
+	ListExternalTables(ctx context.Context) ([]ExternalTableInfo, error)
+	// ReadPXFSourceSample reads up to limit rows from a PXF source (identified by
+	// server/profile/resource) by creating a TRANSIENT readable external table,
+	// running SELECT * ... LIMIT N under a bounded statement_timeout, and ALWAYS
+	// dropping the transient table afterwards (deferred/best-effort). It is an
+	// HONEST preview: it returns the REAL sampled rows on success, or a wrapped
+	// error on any connect/DDL/query failure so the caller can treat the source
+	// as unreachable (available:false) rather than fabricating rows.
+	ReadPXFSourceSample(
+		ctx context.Context, server, profile, resource string, limit int,
+	) (*PXFSourceSample, error)
 	// GetQueryDetail returns detailed execution information for a specific query by PID.
 	GetQueryDetail(ctx context.Context, pid int32) (*QueryDetail, error)
 	// EnsureQueryHistoryTable creates the query history table and indexes if they don't exist.
@@ -244,18 +293,6 @@ type SegmentInfo struct {
 	Port           int32  `json:"port"`
 	DataDirectory  string `json:"dataDirectory"`
 	ReplicationLag int64  `json:"replicationLag,omitempty"`
-}
-
-// ClusterState represents the overall cluster health.
-type ClusterState struct {
-	IsUp              bool
-	Version           string
-	SegmentsUp        int32
-	SegmentsDown      int32
-	SegmentsTotal     int32
-	MirroringInSync   bool
-	ActiveConnections int32
-	MaxConnections    int32
 }
 
 // Session represents an active database session.
@@ -798,20 +835,24 @@ type pgConnURL struct {
 }
 
 // String returns the connection URL string with properly encoded parameters.
+//
+// Each field is escaped in its correct URL context: userinfo via
+// url.UserPassword, the database name as a path segment, and sslmode as a query
+// value via url.Values.Encode(). Reusing a single Path-based escape for every
+// position is incorrect because characters such as '@', '?', '#', '&', '=' and
+// ':' are syntactically significant in the userinfo/query positions and could
+// otherwise corrupt the DSN or inject additional connection parameters.
 func (u *pgConnURL) String() string {
-	hostPort := net.JoinHostPort(u.host, strconv.Itoa(int(u.port)))
-	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-		urlEncode(u.user),
-		urlEncode(u.password),
-		hostPort,
-		urlEncode(u.database),
-		urlEncode(u.sslMode),
-	)
-}
-
-// urlEncode encodes a string for use in a URL path or query parameter.
-func urlEncode(s string) string {
-	return (&url.URL{Path: s}).String()
+	ru := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(u.user, u.password),
+		Host:   net.JoinHostPort(u.host, strconv.Itoa(int(u.port))),
+		Path:   "/" + u.database,
+	}
+	q := url.Values{}
+	q.Set("sslmode", u.sslMode)
+	ru.RawQuery = q.Encode()
+	return ru.String()
 }
 
 // Ping checks database connectivity.
@@ -829,7 +870,10 @@ func (c *pgxClient) Close() {
 }
 
 // GetSegmentConfiguration returns the segment configuration from gp_segment_configuration.
-func (c *pgxClient) GetSegmentConfiguration(ctx context.Context) ([]SegmentInfo, error) {
+func (c *pgxClient) GetSegmentConfiguration(ctx context.Context) (segments []SegmentInfo, err error) {
+	ctx, end := c.startOperation(ctx, "GetSegmentConfiguration")
+	defer func() { end(err) }()
+
 	// Cast char(1) columns (role, preferred_role, mode, status) to text explicitly.
 	// Cloudberry's gp_segment_configuration uses "char" type (OID 18) for these columns,
 	// which pgx cannot scan into *string in binary protocol mode. Casting to text
@@ -838,79 +882,39 @@ func (c *pgxClient) GetSegmentConfiguration(ctx context.Context) ([]SegmentInfo,
 		hostname, address, port, datadir 
 		FROM gp_segment_configuration ORDER BY content, role`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying segment configuration: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying segment configuration: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var segments []SegmentInfo
 	for rows.Next() {
 		var seg SegmentInfo
-		if err := rows.Scan(
+		if scanErr := rows.Scan(
 			&seg.ContentID, &seg.DBID, &seg.Role, &seg.PreferredRole,
 			&seg.Mode, &seg.Status, &seg.Hostname, &seg.Address,
 			&seg.Port, &seg.DataDirectory,
-		); err != nil {
-			return nil, fmt.Errorf("scanning segment row: %w", err)
+		); scanErr != nil {
+			err = fmt.Errorf("scanning segment row: %w", scanErr)
+			return nil, err
 		}
 		segments = append(segments, seg)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating segment rows: %w", err)
+	if rowErr := rows.Err(); rowErr != nil {
+		err = fmt.Errorf("iterating segment rows: %w", rowErr)
+		return nil, err
 	}
 
 	return segments, nil
 }
 
-// GetClusterState returns the overall cluster health state.
-func (c *pgxClient) GetClusterState(ctx context.Context) (*ClusterState, error) {
-	state := &ClusterState{}
-
-	// Check if database is up.
-	if err := c.pool.Ping(ctx); err != nil {
-		state.IsUp = false
-		return state, fmt.Errorf("database ping failed: %w", err)
-	}
-	state.IsUp = true
-
-	// Get version.
-	if err := c.pool.QueryRow(ctx, "SHOW server_version").Scan(&state.Version); err != nil {
-		c.logger.Warn("failed to get server version", "error", err)
-	}
-
-	// Get segment counts.
-	segQuery := `SELECT 
-		COUNT(*) FILTER (WHERE status = 'u') as up,
-		COUNT(*) FILTER (WHERE status = 'd') as down,
-		COUNT(*) as total
-		FROM gp_segment_configuration WHERE content >= 0`
-
-	if err := c.pool.QueryRow(ctx, segQuery).Scan(
-		&state.SegmentsUp, &state.SegmentsDown, &state.SegmentsTotal,
-	); err != nil {
-		c.logger.Warn("failed to get segment counts", "error", err)
-	}
-
-	state.MirroringInSync = state.SegmentsDown == 0
-
-	// Get connection counts.
-	connQuery := `SELECT 
-		(SELECT count(*) FROM pg_stat_activity WHERE state != 'idle') as active,
-		(SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn`
-
-	if err := c.pool.QueryRow(ctx, connQuery).Scan(
-		&state.ActiveConnections, &state.MaxConnections,
-	); err != nil {
-		c.logger.Warn("failed to get connection counts", "error", err)
-	}
-
-	return state, nil
-}
-
 // SetParameter sets a configuration parameter at the specified scope.
-func (c *pgxClient) SetParameter(ctx context.Context, name, value string, scope ParameterScope) error {
+func (c *pgxClient) SetParameter(ctx context.Context, name, value string, scope ParameterScope) (err error) {
+	ctx, end := c.startOperation(ctx, "SetParameter")
+	defer func() { end(err) }()
+
 	var query string
 
 	switch scope.Level {
@@ -933,35 +937,51 @@ func (c *pgxClient) SetParameter(ctx context.Context, name, value string, scope 
 		)
 	}
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("setting parameter %s=%s (scope=%s): %w", name, value, scope.Level, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		// Do not embed the raw value: GUCs can carry sensitive material and the
+		// error is logged again upstream, risking secret leakage.
+		err = fmt.Errorf("setting parameter %s (scope=%s): %w", name, scope.Level, execErr)
+		return err
 	}
 
-	c.logger.Info("parameter set", "name", name, "value", value, "scope", scope.Level)
+	// Log only the parameter name + scope at Info; the value is gated behind Debug
+	// because GUC values may contain secrets.
+	c.logger.Info("parameter set", "name", name, "scope", scope.Level)
+	c.logger.Debug("parameter set value", "name", name, "value", value)
 	return nil
 }
 
 // ShowParameter returns the current value of a parameter.
-func (c *pgxClient) ShowParameter(ctx context.Context, name string) (string, error) {
-	var value string
+func (c *pgxClient) ShowParameter(ctx context.Context, name string) (value string, err error) {
+	ctx, end := c.startOperation(ctx, "ShowParameter")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("SHOW %s", pgx.Identifier{name}.Sanitize())
-	if err := c.pool.QueryRow(ctx, query).Scan(&value); err != nil {
-		return "", fmt.Errorf("showing parameter %s: %w", name, err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&value); scanErr != nil {
+		err = fmt.Errorf("showing parameter %s: %w", name, scanErr)
+		return "", err
 	}
 	return value, nil
 }
 
 // ReloadConfig triggers a configuration reload.
-func (c *pgxClient) ReloadConfig(ctx context.Context) error {
-	if _, err := c.pool.Exec(ctx, "SELECT pg_reload_conf()"); err != nil {
-		return fmt.Errorf("reloading configuration: %w", err)
+func (c *pgxClient) ReloadConfig(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "ReloadConfig")
+	defer func() { end(err) }()
+
+	if _, execErr := c.pool.Exec(ctx, "SELECT pg_reload_conf()"); execErr != nil {
+		err = fmt.Errorf("reloading configuration: %w", execErr)
+		return err
 	}
 	c.logger.Info("configuration reloaded")
 	return nil
 }
 
 // ListSessions returns active database sessions.
-func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
+func (c *pgxClient) ListSessions(ctx context.Context) (sessions []Session, err error) {
+	ctx, end := c.startOperation(ctx, "ListSessions")
+	defer func() { end(err) }()
+
 	query := `SELECT pid, COALESCE(usename, ''), COALESCE(datname, ''),
 		COALESCE(application_name, ''),
 		COALESCE(client_addr::text, ''), COALESCE(state, ''),
@@ -973,33 +993,38 @@ func (c *pgxClient) ListSessions(ctx context.Context) ([]Session, error) {
 		AND usename IS NOT NULL
 		ORDER BY query_start DESC NULLS LAST`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying sessions: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying sessions: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var sessions []Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(
+		if scanErr := rows.Scan(
 			&s.PID, &s.Username, &s.Database, &s.Application, &s.ClientAddress,
 			&s.State, &s.WaitEventType, &s.Query, &s.QueryStart, &s.Duration,
-		); err != nil {
-			return nil, fmt.Errorf("scanning session row: %w", err)
+		); scanErr != nil {
+			err = fmt.Errorf("scanning session row: %w", scanErr)
+			return nil, err
 		}
 		sessions = append(sessions, s)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating session rows: %w", err)
+	if rowErr := rows.Err(); rowErr != nil {
+		err = fmt.Errorf("iterating session rows: %w", rowErr)
+		return nil, err
 	}
 
 	return sessions, nil
 }
 
 // ListSessionsWithResourceGroup returns sessions with their resource group assignment.
-func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) ([]SessionWithGroup, error) {
+func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) (sessions []SessionWithGroup, err error) {
+	ctx, end := c.startOperation(ctx, "ListSessionsWithResourceGroup")
+	defer func() { end(err) }()
+
 	query := `SELECT s.pid, COALESCE(s.usename, ''), COALESCE(s.datname, ''),
 		COALESCE(s.application_name, ''),
 		COALESCE(s.client_addr::text, ''), COALESCE(s.state, ''),
@@ -1014,37 +1039,42 @@ func (c *pgxClient) ListSessionsWithResourceGroup(ctx context.Context) ([]Sessio
 		AND s.usename IS NOT NULL
 		ORDER BY s.query_start DESC NULLS LAST`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying sessions with resource group: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying sessions with resource group: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var sessions []SessionWithGroup
 	for rows.Next() {
 		var sg SessionWithGroup
-		if err := rows.Scan(
+		if scanErr := rows.Scan(
 			&sg.PID, &sg.Username, &sg.Database, &sg.Application, &sg.ClientAddress,
 			&sg.State, &sg.WaitEventType, &sg.Query, &sg.QueryStart, &sg.Duration,
 			&sg.ResourceGroup,
-		); err != nil {
-			return nil, fmt.Errorf("scanning session with resource group row: %w", err)
+		); scanErr != nil {
+			err = fmt.Errorf("scanning session with resource group row: %w", scanErr)
+			return nil, err
 		}
 		sessions = append(sessions, sg)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating session with resource group rows: %w", err)
+	if rowErr := rows.Err(); rowErr != nil {
+		err = fmt.Errorf("iterating session with resource group rows: %w", rowErr)
+		return nil, err
 	}
 
 	return sessions, nil
 }
 
 // CancelQuery cancels a running query by PID.
-func (c *pgxClient) CancelQuery(ctx context.Context, pid int32) (bool, error) {
-	var result bool
-	if err := c.pool.QueryRow(ctx, "SELECT pg_cancel_backend($1)", pid).Scan(&result); err != nil {
-		return false, fmt.Errorf("canceling query for PID %d: %w", pid, err)
+func (c *pgxClient) CancelQuery(ctx context.Context, pid int32) (result bool, err error) {
+	ctx, end := c.startOperation(ctx, "CancelQuery")
+	defer func() { end(err) }()
+
+	if scanErr := c.pool.QueryRow(ctx, "SELECT pg_cancel_backend($1)", pid).Scan(&result); scanErr != nil {
+		err = fmt.Errorf("canceling query for PID %d: %w", pid, scanErr)
+		return false, err
 	}
 	c.logger.Info("query canceled", "pid", pid, "result", result)
 	return result, nil
@@ -1061,41 +1091,56 @@ func (c *pgxClient) TerminateSession(ctx context.Context, pid int32) (bool, erro
 }
 
 // CreateRole creates a new database role.
-func (c *pgxClient) CreateRole(ctx context.Context, opts RoleOptions) error {
+func (c *pgxClient) CreateRole(ctx context.Context, opts RoleOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "CreateRole")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("CREATE ROLE %s", pgx.Identifier{opts.Name}.Sanitize())
 	query += buildRoleOptions(opts)
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("creating role %s: %w", opts.Name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("creating role %s: %w", opts.Name, execErr)
+		return err
 	}
 	c.logger.Info("role created", "name", opts.Name)
 	return nil
 }
 
 // AlterRole modifies an existing database role.
-func (c *pgxClient) AlterRole(ctx context.Context, opts RoleOptions) error {
+func (c *pgxClient) AlterRole(ctx context.Context, opts RoleOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "AlterRole")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("ALTER ROLE %s", pgx.Identifier{opts.Name}.Sanitize())
 	query += buildRoleOptions(opts)
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("altering role %s: %w", opts.Name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("altering role %s: %w", opts.Name, execErr)
+		return err
 	}
 	c.logger.Info("role altered", "name", opts.Name)
 	return nil
 }
 
 // DropRole drops a database role.
-func (c *pgxClient) DropRole(ctx context.Context, name string) error {
+func (c *pgxClient) DropRole(ctx context.Context, name string) (err error) {
+	ctx, end := c.startOperation(ctx, "DropRole")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("DROP ROLE IF EXISTS %s", pgx.Identifier{name}.Sanitize())
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("dropping role %s: %w", name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("dropping role %s: %w", name, execErr)
+		return err
 	}
 	c.logger.Info("role dropped", "name", name)
 	return nil
 }
 
 // Vacuum runs a vacuum operation.
-func (c *pgxClient) Vacuum(ctx context.Context, opts VacuumOptions) error {
+func (c *pgxClient) Vacuum(ctx context.Context, opts VacuumOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "Vacuum")
+	defer func() { end(err) }()
+
 	query := "VACUUM"
 	if opts.Full {
 		query += " FULL"
@@ -1107,29 +1152,37 @@ func (c *pgxClient) Vacuum(ctx context.Context, opts VacuumOptions) error {
 		query += " " + pgx.Identifier{opts.Table}.Sanitize()
 	}
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("running vacuum: %w", err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("running vacuum: %w", execErr)
+		return err
 	}
 	c.logger.Info("vacuum completed", "full", opts.Full, "analyze", opts.Analyze, "table", opts.Table)
 	return nil
 }
 
 // Analyze runs an analyze operation.
-func (c *pgxClient) Analyze(ctx context.Context, table string) error {
+func (c *pgxClient) Analyze(ctx context.Context, table string) (err error) {
+	ctx, end := c.startOperation(ctx, "Analyze")
+	defer func() { end(err) }()
+
 	query := "ANALYZE"
 	if table != "" {
 		query += " " + pgx.Identifier{table}.Sanitize()
 	}
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("running analyze: %w", err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("running analyze: %w", execErr)
+		return err
 	}
 	c.logger.Info("analyze completed", "table", table)
 	return nil
 }
 
 // Reindex runs a reindex operation.
-func (c *pgxClient) Reindex(ctx context.Context, opts ReindexOptions) error {
+func (c *pgxClient) Reindex(ctx context.Context, opts ReindexOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "Reindex")
+	defer func() { end(err) }()
+
 	var query string
 	switch {
 	case opts.Table != "":
@@ -1137,18 +1190,23 @@ func (c *pgxClient) Reindex(ctx context.Context, opts ReindexOptions) error {
 	case opts.Database != "":
 		query = fmt.Sprintf("REINDEX DATABASE %s", pgx.Identifier{opts.Database}.Sanitize())
 	default:
-		return fmt.Errorf("either database or table must be specified for reindex")
+		err = fmt.Errorf("either database or table must be specified for reindex")
+		return err
 	}
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("running reindex: %w", err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("running reindex: %w", execErr)
+		return err
 	}
 	c.logger.Info("reindex completed", "database", opts.Database, "table", opts.Table)
 	return nil
 }
 
 // GetDiskUsage returns disk usage information.
-func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) ([]DiskUsage, error) {
+func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) (usages []DiskUsage, err error) {
+	ctx, end := c.startOperation(ctx, "GetDiskUsage")
+	defer func() { end(err) }()
+
 	query := `SELECT datname, pg_database_size(datname) as size_bytes,
 		pg_size_pretty(pg_database_size(datname)) as size_human
 		FROM pg_database WHERE datistemplate = false`
@@ -1158,37 +1216,42 @@ func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) ([]DiskUs
 	}
 	query += " ORDER BY size_bytes DESC"
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying disk usage: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying disk usage: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var usages []DiskUsage
 	for rows.Next() {
 		var du DiskUsage
-		if err := rows.Scan(&du.Database, &du.SizeBytes, &du.SizeHuman); err != nil {
-			return nil, fmt.Errorf("scanning disk usage row: %w", err)
+		if scanErr := rows.Scan(&du.Database, &du.SizeBytes, &du.SizeHuman); scanErr != nil {
+			err = fmt.Errorf("scanning disk usage row: %w", scanErr)
+			return nil, err
 		}
 		usages = append(usages, du)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating disk usage rows: %w", err)
+	if rowErr := rows.Err(); rowErr != nil {
+		err = fmt.Errorf("iterating disk usage rows: %w", rowErr)
+		return nil, err
 	}
 
 	return usages, nil
 }
 
 // GetReplicationLag returns the replication lag in bytes.
-func (c *pgxClient) GetReplicationLag(ctx context.Context) (int64, error) {
-	var lag int64
+func (c *pgxClient) GetReplicationLag(ctx context.Context) (lag int64, err error) {
+	ctx, end := c.startOperation(ctx, "GetReplicationLag")
+	defer func() { end(err) }()
+
 	query := `SELECT COALESCE(
 		pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0
 	) FROM pg_stat_replication LIMIT 1`
 
-	if err := c.pool.QueryRow(ctx, query).Scan(&lag); err != nil {
-		return 0, fmt.Errorf("querying replication lag: %w", err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&lag); scanErr != nil {
+		err = fmt.Errorf("querying replication lag: %w", scanErr)
+		return 0, err
 	}
 	return lag, nil
 }
@@ -1207,17 +1270,23 @@ func (c *pgxClient) PromoteStandby(ctx context.Context) (err error) {
 
 // GetMaxConnections returns the server's max_connections setting from
 // pg_settings. Used to publish the real cloudberry_connections_max gauge.
-func (c *pgxClient) GetMaxConnections(ctx context.Context) (int32, error) {
-	var maxConns int32
+func (c *pgxClient) GetMaxConnections(ctx context.Context) (maxConns int32, err error) {
+	ctx, end := c.startOperation(ctx, "GetMaxConnections")
+	defer func() { end(err) }()
+
 	query := `SELECT setting::int FROM pg_settings WHERE name = 'max_connections'`
-	if err := c.pool.QueryRow(ctx, query).Scan(&maxConns); err != nil {
-		return 0, fmt.Errorf("querying max_connections: %w", err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&maxConns); scanErr != nil {
+		err = fmt.Errorf("querying max_connections: %w", scanErr)
+		return 0, err
 	}
 	return maxConns, nil
 }
 
 // GetActiveQueryCount returns the number of active, queued, and blocked queries.
 func (c *pgxClient) GetActiveQueryCount(ctx context.Context) (active, queued, blocked int32, err error) {
+	ctx, end := c.startOperation(ctx, "GetActiveQueryCount")
+	defer func() { end(err) }()
+
 	query := `SELECT 
 		COUNT(*) FILTER (WHERE state = 'active') as active,
 		COUNT(*) FILTER (WHERE wait_event_type = 'Lock') as blocked,
@@ -1225,7 +1294,8 @@ func (c *pgxClient) GetActiveQueryCount(ctx context.Context) (active, queued, bl
 		FROM pg_stat_activity WHERE pid != pg_backend_pid()`
 
 	if scanErr := c.pool.QueryRow(ctx, query).Scan(&active, &blocked, &queued); scanErr != nil {
-		return 0, 0, 0, fmt.Errorf("querying active query counts: %w", scanErr)
+		err = fmt.Errorf("querying active query counts: %w", scanErr)
+		return 0, 0, 0, err
 	}
 	return active, queued, blocked, nil
 }
@@ -1235,19 +1305,26 @@ func (c *pgxClient) GetResourceGroupUsage(
 	ctx context.Context,
 	group string,
 ) (cpu, memory float64, err error) {
+	ctx, end := c.startOperation(ctx, "GetResourceGroupUsage")
+	defer func() { end(err) }()
+
 	query := `SELECT 
 		COALESCE(cpu_usage, 0), COALESCE(memory_usage, 0)
 		FROM gp_toolkit.gp_resgroup_status 
 		WHERE rsgname = $1`
 
 	if scanErr := c.pool.QueryRow(ctx, query, group).Scan(&cpu, &memory); scanErr != nil {
-		return 0, 0, fmt.Errorf("querying resource group usage for %s: %w", group, scanErr)
+		err = fmt.Errorf("querying resource group usage for %s: %w", group, scanErr)
+		return 0, 0, err
 	}
 	return cpu, memory, nil
 }
 
 // CreateResourceGroup creates a new resource group.
-func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupOptions) error {
+func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "CreateResourceGroup")
+	defer func() { end(err) }()
+
 	params := []string{}
 	if opts.Concurrency > 0 {
 		params = append(params, fmt.Sprintf("concurrency=%d", opts.Concurrency))
@@ -1272,8 +1349,9 @@ func (c *pgxClient) CreateResourceGroup(ctx context.Context, opts ResourceGroupO
 	query := fmt.Sprintf("CREATE RESOURCE GROUP %s WITH (%s)",
 		pgx.Identifier{opts.Name}.Sanitize(), strings.Join(params, ", "))
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("creating resource group %s: %w", opts.Name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("creating resource group %s: %w", opts.Name, execErr)
+		return err
 	}
 	c.logger.Info("resource group created", "name", opts.Name)
 	return nil
@@ -1295,7 +1373,10 @@ func FormatIOLimits(limits []IOLimitOption) string {
 }
 
 // AlterResourceGroup modifies an existing resource group.
-func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOptions) error {
+func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "AlterResourceGroup")
+	defer func() { end(err) }()
+
 	alterations := []struct {
 		param string
 		value int32
@@ -1318,8 +1399,9 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 		query := fmt.Sprintf("ALTER RESOURCE GROUP %s SET %s %d",
 			pgx.Identifier{opts.Name}.Sanitize(),
 			alt.param, alt.value)
-		if _, err := c.pool.Exec(ctx, query); err != nil {
-			return fmt.Errorf("altering resource group %s param %s: %w", opts.Name, alt.param, err)
+		if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+			err = fmt.Errorf("altering resource group %s param %s: %w", opts.Name, alt.param, execErr)
+			return err
 		}
 	}
 
@@ -1328,8 +1410,9 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 		ioLimitStr := FormatIOLimits(opts.IOLimits)
 		alterSQL := fmt.Sprintf(`ALTER RESOURCE GROUP %s SET io_limit '%s'`,
 			pgx.Identifier{opts.Name}.Sanitize(), ioLimitStr)
-		if _, err := c.pool.Exec(ctx, alterSQL); err != nil {
-			return fmt.Errorf("setting io_limit for resource group %s: %w", opts.Name, err)
+		if _, execErr := c.pool.Exec(ctx, alterSQL); execErr != nil {
+			err = fmt.Errorf("setting io_limit for resource group %s: %w", opts.Name, execErr)
+			return err
 		}
 		c.logger.Info("resource group io_limit set", "name", opts.Name, "ioLimit", ioLimitStr)
 	}
@@ -1339,17 +1422,24 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 }
 
 // DropResourceGroup drops a resource group.
-func (c *pgxClient) DropResourceGroup(ctx context.Context, name string) error {
+func (c *pgxClient) DropResourceGroup(ctx context.Context, name string) (err error) {
+	ctx, end := c.startOperation(ctx, "DropResourceGroup")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("DROP RESOURCE GROUP %s", pgx.Identifier{name}.Sanitize())
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("dropping resource group %s: %w", name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("dropping resource group %s: %w", name, execErr)
+		return err
 	}
 	c.logger.Info("resource group dropped", "name", name)
 	return nil
 }
 
 // ListResourceGroups returns all resource groups.
-func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo, error) {
+func (c *pgxClient) ListResourceGroups(ctx context.Context) (groups []ResourceGroupInfo, err error) {
+	ctx, end := c.startOperation(ctx, "ListResourceGroups")
+	defer func() { end(err) }()
+
 	query := `SELECT g.rsgname,
 		COALESCE((SELECT c.value::int FROM pg_resgroupcapability c
 			WHERE c.resgroupid = g.oid AND c.reslimittype = 1), 0) AS concurrency,
@@ -1365,36 +1455,42 @@ func (c *pgxClient) ListResourceGroups(ctx context.Context) ([]ResourceGroupInfo
 		WHERE g.rsgname NOT IN ('default_group', 'admin_group', 'system_group')
 		ORDER BY g.rsgname`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying resource groups: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying resource groups: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var groups []ResourceGroupInfo
 	for rows.Next() {
 		var g ResourceGroupInfo
 		scanErr := rows.Scan(&g.Name, &g.Concurrency, &g.CPUMaxPercent,
 			&g.CPUWeight, &g.MemoryLimit, &g.MinCost)
 		if scanErr != nil {
-			return nil, fmt.Errorf("scanning resource group row: %w", scanErr)
+			err = fmt.Errorf("scanning resource group row: %w", scanErr)
+			return nil, err
 		}
 		groups = append(groups, g)
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating resource group rows: %w", rowErr)
+		err = fmt.Errorf("iterating resource group rows: %w", rowErr)
+		return nil, err
 	}
 
 	return groups, nil
 }
 
 // AssignRoleResourceGroup assigns a role to a resource group.
-func (c *pgxClient) AssignRoleResourceGroup(ctx context.Context, role, group string) error {
+func (c *pgxClient) AssignRoleResourceGroup(ctx context.Context, role, group string) (err error) {
+	ctx, end := c.startOperation(ctx, "AssignRoleResourceGroup")
+	defer func() { end(err) }()
+
 	sql := fmt.Sprintf("ALTER ROLE %s RESOURCE GROUP %s",
 		pgx.Identifier{role}.Sanitize(), pgx.Identifier{group}.Sanitize())
-	if _, err := c.pool.Exec(ctx, sql); err != nil {
-		return fmt.Errorf("assigning role %s to resource group %s: %w", role, group, err)
+	if _, execErr := c.pool.Exec(ctx, sql); execErr != nil {
+		err = fmt.Errorf("assigning role %s to resource group %s: %w", role, group, execErr)
+		return err
 	}
 	c.logger.Info("role assigned to resource group", "role", role, "group", group)
 	return nil
@@ -1402,7 +1498,10 @@ func (c *pgxClient) AssignRoleResourceGroup(ctx context.Context, role, group str
 
 // CreateResourceQueue creates a new resource queue.
 // SQL: CREATE RESOURCE QUEUE <name> WITH (ACTIVE_STATEMENTS=<n>, MEMORY_LIMIT='<size>', PRIORITY=<level>)
-func (c *pgxClient) CreateResourceQueue(ctx context.Context, opts ResourceQueueOptions) error {
+func (c *pgxClient) CreateResourceQueue(ctx context.Context, opts ResourceQueueOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "CreateResourceQueue")
+	defer func() { end(err) }()
+
 	var withClauses []string
 
 	if opts.ActiveStatements > 0 {
@@ -1426,25 +1525,33 @@ func (c *pgxClient) CreateResourceQueue(ctx context.Context, opts ResourceQueueO
 		query += " WITH (" + strings.Join(withClauses, ", ") + ")"
 	}
 
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("creating resource queue %s: %w", opts.Name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("creating resource queue %s: %w", opts.Name, execErr)
+		return err
 	}
 	c.logger.Info("resource queue created", "name", opts.Name)
 	return nil
 }
 
 // DropResourceQueue drops a resource queue.
-func (c *pgxClient) DropResourceQueue(ctx context.Context, name string) error {
+func (c *pgxClient) DropResourceQueue(ctx context.Context, name string) (err error) {
+	ctx, end := c.startOperation(ctx, "DropResourceQueue")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("DROP RESOURCE QUEUE %s", pgx.Identifier{name}.Sanitize())
-	if _, err := c.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("dropping resource queue %s: %w", name, err)
+	if _, execErr := c.pool.Exec(ctx, query); execErr != nil {
+		err = fmt.Errorf("dropping resource queue %s: %w", name, execErr)
+		return err
 	}
 	c.logger.Info("resource queue dropped", "name", name)
 	return nil
 }
 
 // ListResourceQueues returns all resource queues from pg_resqueue.
-func (c *pgxClient) ListResourceQueues(ctx context.Context) ([]ResourceQueueInfo, error) {
+func (c *pgxClient) ListResourceQueues(ctx context.Context) (queues []ResourceQueueInfo, err error) {
+	ctx, end := c.startOperation(ctx, "ListResourceQueues")
+	defer func() { end(err) }()
+
 	query := `SELECT q.rsqname,
 		COALESCE(q.rsqcountlimit, -1)::int AS active_statements,
 		COALESCE((SELECT a.ressetting FROM pg_resqueue_attributes a
@@ -1459,26 +1566,28 @@ func (c *pgxClient) ListResourceQueues(ctx context.Context) ([]ResourceQueueInfo
 		WHERE q.rsqname != 'pg_default'
 		ORDER BY q.rsqname`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying resource queues: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying resource queues: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var queues []ResourceQueueInfo
 	for rows.Next() {
 		var q ResourceQueueInfo
 		if scanErr := rows.Scan(
 			&q.Name, &q.ActiveStatements, &q.MemoryLimit,
 			&q.Priority, &q.MaxCost, &q.MinCost,
 		); scanErr != nil {
-			return nil, fmt.Errorf("scanning resource queue row: %w", scanErr)
+			err = fmt.Errorf("scanning resource queue row: %w", scanErr)
+			return nil, err
 		}
 		queues = append(queues, q)
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating resource queue rows: %w", rowErr)
+		err = fmt.Errorf("iterating resource queue rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved resource queues", "count", len(queues))
@@ -1555,29 +1664,34 @@ func (c *pgxClient) ListDataLoadingJobs(_ context.Context) ([]DataLoadingJobStat
 }
 
 // GetStorageDiskUsage returns disk usage information per tablespace/segment.
-func (c *pgxClient) GetStorageDiskUsage(ctx context.Context) ([]DiskUsageInfo, error) {
+func (c *pgxClient) GetStorageDiskUsage(ctx context.Context) (usages []DiskUsageInfo, err error) {
+	ctx, end := c.startOperation(ctx, "GetStorageDiskUsage")
+	defer func() { end(err) }()
+
 	query := `SELECT spcname,
 		pg_tablespace_size(oid) AS size_bytes,
 		pg_size_pretty(pg_tablespace_size(oid)) AS size_human
 		FROM pg_tablespace ORDER BY size_bytes DESC`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying storage disk usage: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying storage disk usage: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var usages []DiskUsageInfo
 	for rows.Next() {
 		var du DiskUsageInfo
 		if scanErr := rows.Scan(&du.Tablespace, &du.SizeBytes, &du.SizeHuman); scanErr != nil {
-			return nil, fmt.Errorf("scanning storage disk usage row: %w", scanErr)
+			err = fmt.Errorf("scanning storage disk usage row: %w", scanErr)
+			return nil, err
 		}
 		usages = append(usages, du)
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating storage disk usage rows: %w", rowErr)
+		err = fmt.Errorf("iterating storage disk usage rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved storage disk usage", "count", len(usages))
@@ -1586,7 +1700,10 @@ func (c *pgxClient) GetStorageDiskUsage(ctx context.Context) ([]DiskUsageInfo, e
 
 // GetBloatRecommendations returns bloat recommendations by querying table statistics
 // for dead tuple ratios that indicate bloat.
-func (c *pgxClient) GetBloatRecommendations(ctx context.Context) ([]Recommendation, error) {
+func (c *pgxClient) GetBloatRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+	ctx, end := c.startOperation(ctx, "GetBloatRecommendations")
+	defer func() { end(err) }()
+
 	query := `SELECT schemaname, relname,
 		n_dead_tup,
 		CASE WHEN n_live_tup + n_dead_tup > 0
@@ -1598,18 +1715,19 @@ func (c *pgxClient) GetBloatRecommendations(ctx context.Context) ([]Recommendati
 		ORDER BY n_dead_tup DESC
 		LIMIT 50`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying bloat recommendations: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying bloat recommendations: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var recs []Recommendation
 	for rows.Next() {
 		var r Recommendation
 		var deadPct int64
 		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value, &deadPct); scanErr != nil {
-			return nil, fmt.Errorf("scanning bloat recommendation row: %w", scanErr)
+			err = fmt.Errorf("scanning bloat recommendation row: %w", scanErr)
+			return nil, err
 		}
 		r.Type = "bloat"
 		r.Severity = classifySeverity(deadPct, 20, 50)
@@ -1621,7 +1739,8 @@ func (c *pgxClient) GetBloatRecommendations(ctx context.Context) ([]Recommendati
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating bloat recommendation rows: %w", rowErr)
+		err = fmt.Errorf("iterating bloat recommendation rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved bloat recommendations", "count", len(recs))
@@ -1630,7 +1749,10 @@ func (c *pgxClient) GetBloatRecommendations(ctx context.Context) ([]Recommendati
 
 // GetSkewRecommendations returns data skew recommendations by querying
 // table size distribution across segments.
-func (c *pgxClient) GetSkewRecommendations(ctx context.Context) ([]Recommendation, error) {
+func (c *pgxClient) GetSkewRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+	ctx, end := c.startOperation(ctx, "GetSkewRecommendations")
+	defer func() { end(err) }()
+
 	// Query pg_stat_user_tables for tables with significant size variation.
 	// In Cloudberry/Greenplum, gp_toolkit.gp_skew_coefficients provides skew data.
 	// Fall back to pg_stat_user_tables if gp_toolkit is not available.
@@ -1640,17 +1762,18 @@ func (c *pgxClient) GetSkewRecommendations(ctx context.Context) ([]Recommendatio
 		ORDER BY n_live_tup DESC
 		LIMIT 50`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying skew recommendations: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying skew recommendations: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var recs []Recommendation
 	for rows.Next() {
 		var r Recommendation
 		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value); scanErr != nil {
-			return nil, fmt.Errorf("scanning skew recommendation row: %w", scanErr)
+			err = fmt.Errorf("scanning skew recommendation row: %w", scanErr)
+			return nil, err
 		}
 		r.Type = "skew"
 		r.Severity = severityInfo
@@ -1659,7 +1782,8 @@ func (c *pgxClient) GetSkewRecommendations(ctx context.Context) ([]Recommendatio
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating skew recommendation rows: %w", rowErr)
+		err = fmt.Errorf("iterating skew recommendation rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved skew recommendations", "count", len(recs))
@@ -1668,7 +1792,10 @@ func (c *pgxClient) GetSkewRecommendations(ctx context.Context) ([]Recommendatio
 
 // GetAgeRecommendations returns XID age recommendations by querying
 // tables with high dead tuple counts that need vacuuming.
-func (c *pgxClient) GetAgeRecommendations(ctx context.Context) ([]Recommendation, error) {
+func (c *pgxClient) GetAgeRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+	ctx, end := c.startOperation(ctx, "GetAgeRecommendations")
+	defer func() { end(err) }()
+
 	query := `SELECT schemaname, relname, n_dead_tup,
 		COALESCE(EXTRACT(EPOCH FROM (now() - last_autovacuum))::bigint, 0) AS secs_since_vacuum
 		FROM pg_stat_user_tables
@@ -1676,18 +1803,19 @@ func (c *pgxClient) GetAgeRecommendations(ctx context.Context) ([]Recommendation
 		ORDER BY n_dead_tup DESC
 		LIMIT 50`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying age recommendations: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying age recommendations: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var recs []Recommendation
 	for rows.Next() {
 		var r Recommendation
 		var secsSinceVacuum int64
 		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value, &secsSinceVacuum); scanErr != nil {
-			return nil, fmt.Errorf("scanning age recommendation row: %w", scanErr)
+			err = fmt.Errorf("scanning age recommendation row: %w", scanErr)
+			return nil, err
 		}
 		r.Type = "age"
 		r.Severity = classifySeverity(r.Value, 100000, 500000)
@@ -1696,7 +1824,8 @@ func (c *pgxClient) GetAgeRecommendations(ctx context.Context) ([]Recommendation
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating age recommendation rows: %w", rowErr)
+		err = fmt.Errorf("iterating age recommendation rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved age recommendations", "count", len(recs))
@@ -1705,7 +1834,10 @@ func (c *pgxClient) GetAgeRecommendations(ctx context.Context) ([]Recommendation
 
 // GetIndexBloatRecommendations returns index bloat recommendations by querying
 // index statistics for unused or oversized indexes.
-func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) ([]Recommendation, error) {
+func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+	ctx, end := c.startOperation(ctx, "GetIndexBloatRecommendations")
+	defer func() { end(err) }()
+
 	query := `SELECT schemaname, relname, indexrelname,
 		pg_relation_size(indexrelid) AS index_size,
 		idx_scan
@@ -1714,19 +1846,20 @@ func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) ([]Recomme
 		ORDER BY pg_relation_size(indexrelid) DESC
 		LIMIT 50`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying index bloat recommendations: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying index bloat recommendations: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var recs []Recommendation
 	for rows.Next() {
 		var r Recommendation
 		var indexName string
 		var idxScan int64
 		if scanErr := rows.Scan(&r.Schema, &r.Table, &indexName, &r.Value, &idxScan); scanErr != nil {
-			return nil, fmt.Errorf("scanning index bloat recommendation row: %w", scanErr)
+			err = fmt.Errorf("scanning index bloat recommendation row: %w", scanErr)
+			return nil, err
 		}
 		r.Type = "index_bloat"
 		if idxScan == 0 {
@@ -1742,7 +1875,8 @@ func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) ([]Recomme
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating index bloat recommendation rows: %w", rowErr)
+		err = fmt.Errorf("iterating index bloat recommendation rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved index bloat recommendations", "count", len(recs))
@@ -1762,7 +1896,10 @@ func (c *pgxClient) TriggerRecommendationScan(ctx context.Context) error {
 
 // GetTableDetails returns detailed information about a specific table
 // by querying system catalog views.
-func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (*TableDetail, error) {
+func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (detail *TableDetail, err error) {
+	ctx, end := c.startOperation(ctx, "GetTableDetails")
+	defer func() { end(err) }()
+
 	query := `SELECT
 		s.schemaname,
 		s.relname,
@@ -1780,12 +1917,13 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 		JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
 		WHERE s.schemaname = $1 AND s.relname = $2`
 
-	detail := &TableDetail{}
-	if err := c.pool.QueryRow(ctx, query, schema, table).Scan(
+	detail = &TableDetail{}
+	if scanErr := c.pool.QueryRow(ctx, query, schema, table).Scan(
 		&detail.Schema, &detail.Table, &detail.SizeBytes, &detail.SizeHuman,
 		&detail.RowCount, &detail.BloatPercent, &detail.LastVacuum, &detail.LastAnalyze,
-	); err != nil {
-		return nil, fmt.Errorf("querying table details for %s.%s: %w", schema, table, err)
+	); scanErr != nil {
+		err = fmt.Errorf("querying table details for %s.%s: %w", schema, table, scanErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved table details", "schema", schema, "table", table)
@@ -1794,7 +1932,10 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 
 // GetUsageReport returns a usage report for the given month by querying
 // current database sizes and connection statistics.
-func (c *pgxClient) GetUsageReport(ctx context.Context, month string) ([]UsageReportEntry, error) {
+func (c *pgxClient) GetUsageReport(ctx context.Context, month string) (entries []UsageReportEntry, err error) {
+	ctx, end := c.startOperation(ctx, "GetUsageReport")
+	defer func() { end(err) }()
+
 	query := `SELECT datname,
 		pg_database_size(datname) AS size_bytes,
 		pg_size_pretty(pg_database_size(datname)) AS size_human,
@@ -1804,24 +1945,26 @@ func (c *pgxClient) GetUsageReport(ctx context.Context, month string) ([]UsageRe
 		WHERE d.datistemplate = false
 		ORDER BY size_bytes DESC`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying usage report: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying usage report: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var entries []UsageReportEntry
 	for rows.Next() {
 		var e UsageReportEntry
 		if scanErr := rows.Scan(&e.Database, &e.SizeBytes, &e.SizeHuman, &e.Connections); scanErr != nil {
-			return nil, fmt.Errorf("scanning usage report row: %w", scanErr)
+			err = fmt.Errorf("scanning usage report row: %w", scanErr)
+			return nil, err
 		}
 		e.Month = month
 		entries = append(entries, e)
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating usage report rows: %w", rowErr)
+		err = fmt.Errorf("iterating usage report rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved usage report", "month", month, "count", len(entries))
@@ -1877,7 +2020,10 @@ func (c *pgxClient) ConfigureReplication(ctx context.Context, opts ReplicationOp
 
 // GetMirrorSyncStatus returns the synchronization status of all mirror segments
 // by querying gp_segment_configuration and pg_stat_replication.
-func (c *pgxClient) GetMirrorSyncStatus(ctx context.Context) ([]MirrorSyncInfo, error) {
+func (c *pgxClient) GetMirrorSyncStatus(ctx context.Context) (results []MirrorSyncInfo, err error) {
+	ctx, end := c.startOperation(ctx, "GetMirrorSyncStatus")
+	defer func() { end(err) }()
+
 	query := `SELECT
 		sc.content AS content_id,
 		CASE WHEN sc.mode = 's' THEN true ELSE false END AS is_synced,
@@ -1897,23 +2043,25 @@ func (c *pgxClient) GetMirrorSyncStatus(ctx context.Context) ([]MirrorSyncInfo, 
 		WHERE sc.content >= 0 AND sc.role = 'm'
 		ORDER BY sc.content`
 
-	rows, err := c.pool.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("querying mirror sync status: %w", err)
+	rows, queryErr := c.pool.Query(ctx, query)
+	if queryErr != nil {
+		err = fmt.Errorf("querying mirror sync status: %w", queryErr)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var results []MirrorSyncInfo
 	for rows.Next() {
 		var info MirrorSyncInfo
 		if scanErr := rows.Scan(&info.ContentID, &info.IsSynced, &info.ReplicationLag, &info.State); scanErr != nil {
-			return nil, fmt.Errorf("scanning mirror sync status row: %w", scanErr)
+			err = fmt.Errorf("scanning mirror sync status row: %w", scanErr)
+			return nil, err
 		}
 		results = append(results, info)
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		return nil, fmt.Errorf("iterating mirror sync status rows: %w", rowErr)
+		err = fmt.Errorf("iterating mirror sync status rows: %w", rowErr)
+		return nil, err
 	}
 
 	c.logger.Info("retrieved mirror sync status", "count", len(results))
@@ -1923,10 +2071,13 @@ func (c *pgxClient) GetMirrorSyncStatus(ctx context.Context) ([]MirrorSyncInfo, 
 // TriggerFTSProbe requests Cloudberry's FTS daemon to perform an immediate probe scan.
 // This triggers the internal FTS mechanism that detects failed segments and promotes
 // mirrors to primary role. The call blocks until the scan completes.
-func (c *pgxClient) TriggerFTSProbe(ctx context.Context) error {
-	_, err := c.pool.Exec(ctx, "SELECT gp_request_fts_probe_scan()")
-	if err != nil {
-		return fmt.Errorf("triggering FTS probe scan: %w", err)
+func (c *pgxClient) TriggerFTSProbe(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "TriggerFTSProbe")
+	defer func() { end(err) }()
+
+	if _, execErr := c.pool.Exec(ctx, "SELECT gp_request_fts_probe_scan()"); execErr != nil {
+		err = fmt.Errorf("triggering FTS probe scan: %w", execErr)
+		return err
 	}
 	c.logger.Info("FTS probe scan triggered successfully")
 	return nil
@@ -2316,7 +2467,10 @@ func (c *pgxClient) redistributeDatabase(ctx context.Context, dbName string, opt
 // GetRedistributionProgress returns the current redistribution progress (0-100).
 // It estimates progress by comparing the number of tables that have been analyzed
 // (indicating redistribution completion) against the total number of user tables.
-func (c *pgxClient) GetRedistributionProgress(ctx context.Context) (int32, error) {
+func (c *pgxClient) GetRedistributionProgress(ctx context.Context) (progress int32, err error) {
+	ctx, end := c.startOperation(ctx, "GetRedistributionProgress")
+	defer func() { end(err) }()
+
 	// Query total user tables and those with recent analyze timestamps.
 	query := `SELECT 
 		COUNT(*) AS total,
@@ -2325,15 +2479,16 @@ func (c *pgxClient) GetRedistributionProgress(ctx context.Context) (int32, error
 		WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'gp_toolkit')`
 
 	var total, analyzed int32
-	if err := c.pool.QueryRow(ctx, query).Scan(&total, &analyzed); err != nil {
-		return 0, fmt.Errorf("querying redistribution progress: %w", err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&total, &analyzed); scanErr != nil {
+		err = fmt.Errorf("querying redistribution progress: %w", scanErr)
+		return 0, err
 	}
 
 	if total == 0 {
 		return 100, nil
 	}
 
-	progress := (analyzed * 100) / total
+	progress = (analyzed * 100) / total
 	c.logger.Info("redistribution progress", "progress", progress, "total", total, "analyzed", analyzed)
 	return progress, nil
 }
@@ -2870,6 +3025,456 @@ func (c *pgxClient) SetupExporterRole(ctx context.Context, password string) (err
 	return nil
 }
 
+// pxfExtensionNames are the PXF client extensions installed best-effort by
+// SetupPXFExtensions, in deterministic order. The statements are constant (no
+// interpolation) so there is no injection surface.
+var pxfExtensionNames = []string{"pxf", "pxf_fdw"}
+
+// pxfExtensionName is the specific extension that, once installed, exposes the
+// "pxf" PROTOCOL the data-loader role must be GRANTed on (RP.11).
+const pxfExtensionName = "pxf"
+
+// pxfDataLoaderRole is the role GRANTed SELECT/INSERT on PROTOCOL pxf after a
+// successful pxf-extension install (RP.11). It defaults to the cluster admin
+// (gpadmin), which always exists as a superuser; it is a package var (not a
+// const) so a future configurable role can be wired in without changing the
+// SetupPXFExtensions signature or the db.Client interface.
+var pxfDataLoaderRole = util.DefaultAdminUser
+
+// pxfProtocolPrivileges are the protocol privileges GRANTed to the data-loader
+// role, in deterministic order. SELECT enables readable external tables and
+// INSERT enables writable external tables over the pxf protocol.
+var pxfProtocolPrivileges = []string{"SELECT", "INSERT"}
+
+// SetupPXFExtensions best-effort installs the PXF client extensions (pxf, then
+// pxf_fdw) via CREATE EXTENSION IF NOT EXISTS. It mirrors SetupExporterRole's
+// shape (an existence probe for connectivity, then per-statement Exec with
+// tracing) but is deliberately NON-FATAL: the pxf agent/extension is not
+// present in the cloudberry-official:2.1.0 image (at most a pxf_fdw client stub
+// exists), so a CREATE EXTENSION failure is logged as a warning and the method
+// returns nil. Only a hard connectivity error (the probe itself failing) is
+// surfaced so reconcile can distinguish "DB unreachable" from "pxf unavailable".
+// The method is idempotent (IF NOT EXISTS) and safe to call repeatedly. It
+// returns the number of extensions actually CREATE EXTENSIONed on this call
+// (0..2) so the caller can avoid marking PXF "ready" when nothing installed.
+func (c *pgxClient) SetupPXFExtensions(ctx context.Context) (installed int, err error) {
+	ctx, end := c.startOperation(ctx, "SetupPXFExtensions")
+	defer func() { end(err) }()
+
+	// Connectivity probe: a successful trivial query proves the pool is usable.
+	// Failure here is the only hard error surfaced (DB unreachable), so the
+	// caller can tell a connectivity problem apart from pxf simply being absent.
+	var ok bool
+	if probeErr := c.pool.QueryRow(ctx, "SELECT true").Scan(&ok); probeErr != nil {
+		err = fmt.Errorf("probing connectivity for PXF extension setup: %w", probeErr)
+		return 0, err
+	}
+
+	installed = 0
+	pxfInstalled := false
+	for _, ext := range pxfExtensionNames {
+		// pgx.Identifier.Sanitize quotes the extension name even though it is a
+		// constant from pxfExtensionNames (defense in depth, no injection).
+		stmt := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s",
+			pgx.Identifier{ext}.Sanitize())
+		if _, execErr := c.pool.Exec(ctx, stmt); execErr != nil {
+			// NON-FATAL: pxf/pxf_fdw may be unavailable in this image. Log and
+			// continue so reconcile never errors on an absent PXF agent.
+			c.logger.Warn("PXF extension not installed (best-effort, non-fatal)",
+				"extension", ext, "error", execErr)
+			continue
+		}
+		installed++
+		if ext == pxfExtensionName {
+			pxfInstalled = true
+		}
+		c.logger.Info("PXF extension ensured", "extension", ext)
+	}
+
+	// RP.11: GRANT SELECT,INSERT ON PROTOCOL pxf to the data-loader role. The
+	// "pxf" PROTOCOL only exists once the pxf extension is installed, so the
+	// GRANTs are gated on pxfInstalled and are best-effort/non-fatal (the
+	// protocol may still be absent on a stub image). Skipped silently otherwise.
+	if pxfInstalled {
+		c.grantPXFProtocol(ctx, pxfDataLoaderRole)
+	}
+
+	c.logger.Info("PXF extension setup completed (best-effort)",
+		"requested", len(pxfExtensionNames), "installed", installed,
+		"pxfProtocolGranted", pxfInstalled)
+	// Always nil error on a reachable DB: missing extensions are expected and
+	// tolerated. The installed count lets the caller distinguish "DB reachable
+	// but pxf absent" (installed==0) from a real install (installed>=1).
+	return installed, nil
+}
+
+// grantPXFProtocol GRANTs each privilege in pxfProtocolPrivileges on PROTOCOL pxf
+// to the given data-loader role (RP.11/SE.6). It is best-effort: a missing
+// protocol or role is logged at Warn and ignored so reconcile stays green on
+// images where the pxf protocol is not fully wired. The role identifier is
+// sanitized via pgx.Identifier (mirroring SetupExporterRole) so there is no
+// injection surface; the privilege tokens are constants from
+// pxfProtocolPrivileges.
+func (c *pgxClient) grantPXFProtocol(ctx context.Context, role string) {
+	sanitizedRole := pgx.Identifier{role}.Sanitize()
+	for _, priv := range pxfProtocolPrivileges {
+		stmt := fmt.Sprintf("GRANT %s ON PROTOCOL pxf TO %s", priv, sanitizedRole)
+		if _, execErr := c.pool.Exec(ctx, stmt); execErr != nil {
+			// NON-FATAL: PROTOCOL pxf may not exist on a stub image. Log and
+			// continue so reconcile never errors on an absent pxf protocol.
+			c.logger.Warn("GRANT on PROTOCOL pxf failed (best-effort, non-fatal)",
+				"privilege", priv, "role", role, "error", execErr)
+			continue
+		}
+		c.logger.Info("GRANT on PROTOCOL pxf ensured",
+			"privilege", priv, "role", role)
+	}
+}
+
+// EnsureDataLoaderRole ensures the dedicated minimal-privilege data-loading role
+// exists and is GRANTed only the pxf protocol privileges (SE.6). See the Client
+// interface for the full contract. It is a no-op for an empty role name or the
+// cluster admin (gpadmin already exists and keeps the existing RP.11 grant
+// behavior in SetupPXFExtensions). For any other role it probes pg_roles, CREATEs
+// the role as NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN when absent, then applies
+// the protocol GRANTs (reusing grantPXFProtocol — itself best-effort/non-fatal).
+func (c *pgxClient) EnsureDataLoaderRole(ctx context.Context, roleName string) (err error) {
+	ctx, end := c.startOperation(ctx, "EnsureDataLoaderRole")
+	defer func() { end(err) }()
+
+	// No dedicated role requested: gpadmin (the default) already exists, so the
+	// existing SetupPXFExtensions GRANT path is sufficient. Nothing to do.
+	if roleName == "" || roleName == util.DefaultAdminUser {
+		c.logger.Debug("EnsureDataLoaderRole no-op (gpadmin fallback)", "role", roleName)
+		return nil
+	}
+
+	// Existence probe doubles as the connectivity check: only a failure here is
+	// surfaced as a hard error (mirrors SetupExporterRole).
+	var exists bool
+	if probeErr := c.pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", roleName).Scan(&exists); probeErr != nil {
+		err = fmt.Errorf("probing data-loader role existence: %w", probeErr)
+		return err
+	}
+
+	sanitizedRole := pgx.Identifier{roleName}.Sanitize()
+	if !exists {
+		// Create the minimal-privilege login role. The privilege attributes are
+		// constants (no interpolation); the identifier is sanitized via
+		// pgx.Identifier so there is no injection surface.
+		createSQL := fmt.Sprintf(
+			"CREATE ROLE %s NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN", sanitizedRole)
+		if _, execErr := c.pool.Exec(ctx, createSQL); execErr != nil {
+			// NON-FATAL: tolerate a benign failure (e.g. concurrent create) so a
+			// stub image / racing reconcile never errors. The GRANTs below are
+			// still attempted best-effort.
+			c.logger.Warn("creating data-loader role failed (best-effort, non-fatal)",
+				"role", roleName, "error", execErr)
+		} else {
+			c.logger.Info("data-loader role created", "role", roleName)
+		}
+	}
+
+	// GRANT ONLY the pxf protocol privileges to the dedicated role (best-effort).
+	c.grantPXFProtocol(ctx, roleName)
+	c.logger.Info("data-loader role ensured (best-effort)", "role", roleName)
+	return nil
+}
+
+// ListPXFExtensions returns the PXF client extensions actually present in
+// pg_extension among pxfExtensionNames ({pxf, pxf_fdw}), sorted ascending. It is
+// an HONEST, observed-only probe: only names truly returned by the catalog are
+// reported, never synthesized. A connectivity/query error is surfaced (wrapped)
+// so the caller can treat the probe as UNOBSERVABLE (status ABSENT) rather than
+// as "none installed"; a nil slice with a nil error means a reachable DB with no
+// PXF extensions present. The query is parameterized (ANY($1)) — no interpolation
+// — so there is no injection surface.
+func (c *pgxClient) ListPXFExtensions(ctx context.Context) (extensions []string, err error) {
+	ctx, end := c.startOperation(ctx, "ListPXFExtensions")
+	defer func() { end(err) }()
+
+	const query = `SELECT extname FROM pg_extension WHERE extname = ANY($1) ORDER BY extname`
+
+	rows, queryErr := c.pool.Query(ctx, query, pxfExtensionNames)
+	if queryErr != nil {
+		err = fmt.Errorf("querying pg_extension for PXF extensions: %w", queryErr)
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			err = fmt.Errorf("scanning PXF extension name: %w", scanErr)
+			return nil, err
+		}
+		extensions = append(extensions, name)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		err = fmt.Errorf("iterating PXF extension rows: %w", rowsErr)
+		return nil, err
+	}
+	return extensions, nil
+}
+
+// ExternalTableInfo describes a single external or foreign table observed in the
+// catalog. Kind discriminates an external table (pg_exttable, kind ==
+// "external") from a foreign table (pg_foreign_table, kind == "foreign").
+// Server carries the backing server name when derivable
+// (foreign tables reference a pg_foreign_server; external tables have no server
+// and leave it empty).
+type ExternalTableInfo struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	Server string `json:"server,omitempty"`
+}
+
+// listExternalTablesQuery unions the external tables (pg_exttable joined to
+// pg_class/pg_namespace) with the foreign tables (pg_foreign_table joined to
+// pg_class/pg_namespace/pg_foreign_server). Each row carries a schema, table
+// name, a kind discriminator, and the backing server (” for external tables,
+// the foreign-server name for foreign tables). System schemas (pg_catalog,
+// information_schema) are excluded. The result is ordered for determinism. The
+// query is fully static (no interpolation) so there is no injection surface.
+const listExternalTablesQuery = `
+SELECT n.nspname AS schema, c.relname AS name, 'external' AS kind, '' AS server
+  FROM pg_exttable x
+  JOIN pg_class c ON c.oid = x.reloid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+UNION ALL
+SELECT n.nspname AS schema, c.relname AS name, 'foreign' AS kind,
+       COALESCE(s.srvname, '') AS server
+  FROM pg_foreign_table ft
+  JOIN pg_class c ON c.oid = ft.ftrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  LEFT JOIN pg_foreign_server s ON s.oid = ft.ftserver
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY kind, schema, name`
+
+// ListExternalTables returns the external (pg_exttable) and foreign
+// (pg_foreign_table) tables present in the catalog. It is an HONEST,
+// observed-only probe: only rows truly returned by the catalog are reported,
+// never synthesized. A connectivity/query error is surfaced (wrapped) so the
+// caller can treat the probe as UNOBSERVABLE (observed ABSENT) rather than as
+// "none present"; a nil slice with a nil error means a reachable DB with no
+// external/foreign tables. The query is fully static — no interpolation — so
+// there is no injection surface.
+func (c *pgxClient) ListExternalTables(ctx context.Context) (tables []ExternalTableInfo, err error) {
+	ctx, end := c.startOperation(ctx, "ListExternalTables")
+	defer func() { end(err) }()
+
+	rows, queryErr := c.pool.Query(ctx, listExternalTablesQuery)
+	if queryErr != nil {
+		err = fmt.Errorf("querying catalog for external/foreign tables: %w", queryErr)
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info ExternalTableInfo
+		if scanErr := rows.Scan(&info.Schema, &info.Name, &info.Kind, &info.Server); scanErr != nil {
+			err = fmt.Errorf("scanning external/foreign table row: %w", scanErr)
+			return nil, err
+		}
+		tables = append(tables, info)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		err = fmt.Errorf("iterating external/foreign table rows: %w", rowsErr)
+		return nil, err
+	}
+	return tables, nil
+}
+
+// PXFSourceSample is the HONEST result of a transient PXF source preview read:
+// the column names (FieldDescriptions) and up to N sampled rows, each cell
+// rendered as a string. It carries ONLY rows truly returned by the live read —
+// never synthesized. RowCount is len(Rows).
+type PXFSourceSample struct {
+	Columns []string   `json:"columns"`
+	Rows    [][]string `json:"rows"`
+}
+
+const (
+	// pxfSampleMaxLimit is the hard server-side cap on the number of preview
+	// rows read from a PXF source, defending the coordinator/PXF agent even if a
+	// caller bypasses the API-layer cap. Requests above this are clamped down.
+	pxfSampleMaxLimit = 1000
+	// pxfSampleDefaultLimit is the preview row count used when a non-positive
+	// limit is supplied.
+	pxfSampleDefaultLimit = 10
+	// pxfSampleStatementTimeout bounds the transient read so a hung/slow PXF
+	// source cannot wedge the request indefinitely. Applied as a LOCAL GUC inside
+	// the read transaction.
+	pxfSampleStatementTimeout = "30s"
+	// pxfSampleTablePrefix is the deterministic prefix for the randomized,
+	// session-unique transient external-table name so concurrent previews never
+	// collide and a leftover (if any) is greppable.
+	pxfSampleTablePrefix = "cb_pxf_sample_"
+)
+
+// clampPXFSampleLimit normalizes a requested preview limit into [1,
+// pxfSampleMaxLimit], defaulting a non-positive value to pxfSampleDefaultLimit.
+func clampPXFSampleLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return pxfSampleDefaultLimit
+	case limit > pxfSampleMaxLimit:
+		return pxfSampleMaxLimit
+	default:
+		return limit
+	}
+}
+
+// randomPXFSampleTableName returns a randomized, session-unique transient table
+// name (pxfSampleTablePrefix + 16 hex chars). The randomness comes from
+// crypto/rand so two concurrent previews never collide; on the (astronomically
+// unlikely) RNG failure it falls back to a timestamp suffix so the read can
+// still proceed under a unique-enough name.
+func randomPXFSampleTableName() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%s%d", pxfSampleTablePrefix, time.Now().UnixNano())
+	}
+	return pxfSampleTablePrefix + hex.EncodeToString(buf)
+}
+
+// buildPXFSampleLocation renders the pxf:// LOCATION URI for a preview read from
+// the sanitized server/profile/resource. PROFILE is always present; SERVER is
+// appended only when set. The resource path and option values are URI-escaped so
+// a crafted value cannot break out of the single-quoted LOCATION literal added
+// by the caller.
+func buildPXFSampleLocation(server, profile, resource string) string {
+	opts := "PROFILE=" + url.QueryEscape(profile)
+	if server != "" {
+		opts += "&SERVER=" + url.QueryEscape(server)
+	}
+	return fmt.Sprintf("pxf://%s?%s", resource, opts)
+}
+
+// ReadPXFSourceSample reads up to limit rows from the PXF source identified by
+// server/profile/resource. It creates a TRANSIENT readable external table over
+// the source, runs SELECT * ... LIMIT N under a bounded statement_timeout, and
+// ALWAYS drops the transient table afterwards (deferred, best-effort, even on
+// error). It is HONEST: it returns the REAL sampled rows on success, or a
+// wrapped error on any connect/DDL/query failure so the caller maps it to
+// available:false (NEVER fabricated rows). Identifiers are sanitized via
+// pgx.Identifier and the LOCATION URI is single-quoted, so there is no injection
+// surface; the row limit is bounded defensively (clampPXFSampleLimit).
+func (c *pgxClient) ReadPXFSourceSample(
+	ctx context.Context, server, profile, resource string, limit int,
+) (sample *PXFSourceSample, err error) {
+	ctx, end := c.startOperation(ctx, "ReadPXFSourceSample")
+	defer func() { end(err) }()
+
+	if profile == "" || resource == "" {
+		err = fmt.Errorf("reading PXF source sample: profile and resource are required")
+		return nil, err
+	}
+	limit = clampPXFSampleLimit(limit)
+
+	tableName := randomPXFSampleTableName()
+	sanitizedTable := pgx.Identifier{tableName}.Sanitize()
+	location := buildPXFSampleLocation(server, profile, resource)
+
+	// The transient external table reads the source as a single TEXT line so a
+	// preview never needs the source's column schema (which is not knowable
+	// up-front). FORMAT 'TEXT' with a non-occurring delimiter keeps each source
+	// record intact in one cell. The LOCATION literal is single-quoted.
+	createStmt := fmt.Sprintf(
+		"CREATE EXTERNAL TABLE %s (line text)\nLOCATION ('%s')\nFORMAT 'TEXT' (DELIMITER E'\\x01');",
+		sanitizedTable, strings.ReplaceAll(location, "'", "''"))
+
+	if _, execErr := c.pool.Exec(ctx, createStmt); execErr != nil {
+		err = fmt.Errorf("creating transient PXF preview table: %w", execErr)
+		return nil, err
+	}
+	// ALWAYS drop the transient external table (deferred/best-effort) on every
+	// path so no preview scaffolding is ever left behind in the catalog. A drop
+	// failure is logged at Warn and does not mask the read result. A fresh,
+	// short-lived context is used so the cleanup still runs even if the request
+	// context was canceled mid-read.
+	defer func() {
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		dropStmt := fmt.Sprintf("DROP EXTERNAL TABLE IF EXISTS %s", sanitizedTable)
+		if _, dropErr := c.pool.Exec(dropCtx, dropStmt); dropErr != nil {
+			c.logger.Warn("failed to drop transient PXF preview table (best-effort)",
+				"table", tableName, "error", dropErr)
+		}
+	}()
+
+	sample, err = c.scanPXFSampleRows(ctx, sanitizedTable, limit)
+	if err != nil {
+		return nil, err
+	}
+	return sample, nil
+}
+
+// scanPXFSampleRows sets a LOCAL statement_timeout, runs SELECT * ... LIMIT N
+// against the (already-created, sanitized) transient table, and renders each
+// cell to a string. It runs inside an explicit transaction so the LOCAL GUC is
+// scoped to the read and rolled back afterwards.
+func (c *pgxClient) scanPXFSampleRows(
+	ctx context.Context, sanitizedTable string, limit int,
+) (*PXFSourceSample, error) {
+	tx, txErr := c.pool.Begin(ctx)
+	if txErr != nil {
+		return nil, fmt.Errorf("beginning PXF preview transaction: %w", txErr)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, gucErr := tx.Exec(ctx,
+		"SET LOCAL statement_timeout = '"+pxfSampleStatementTimeout+"'"); gucErr != nil {
+		return nil, fmt.Errorf("setting PXF preview statement_timeout: %w", gucErr)
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s LIMIT %d", sanitizedTable, limit)
+	rows, queryErr := tx.Query(ctx, query)
+	if queryErr != nil {
+		return nil, fmt.Errorf("reading PXF source sample: %w", queryErr)
+	}
+	defer rows.Close()
+
+	sample := &PXFSourceSample{Columns: pxfSampleColumns(rows.FieldDescriptions())}
+	for rows.Next() {
+		values, valErr := rows.Values()
+		if valErr != nil {
+			return nil, fmt.Errorf("scanning PXF source sample row: %w", valErr)
+		}
+		sample.Rows = append(sample.Rows, pxfSampleRowToStrings(values))
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterating PXF source sample rows: %w", rowsErr)
+	}
+	return sample, nil
+}
+
+// pxfSampleColumns extracts the column names from the pgx field descriptions.
+func pxfSampleColumns(fields []pgconn.FieldDescription) []string {
+	cols := make([]string, 0, len(fields))
+	for i := range fields {
+		cols = append(cols, fields[i].Name)
+	}
+	return cols
+}
+
+// pxfSampleRowToStrings renders a row's raw values to strings, mapping a SQL
+// NULL to the empty string so the JSON payload stays a flat [][]string.
+func pxfSampleRowToStrings(values []any) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v == nil {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, fmt.Sprintf("%v", v))
+	}
+	return out
+}
+
 // GetQueryDetail returns detailed execution information for a specific query by PID.
 // It queries pg_stat_activity for session info, pg_locks for lock information,
 // and pg_stat_user_tables for recently accessed tables.
@@ -2984,22 +3589,28 @@ func escapeQuotes(s string) string {
 // It looks up the session's role from pg_stat_activity by PID, then executes
 // ALTER ROLE <role> RESOURCE GROUP <group> to reassign the role's resource group.
 // Both role and group names are sanitized via pgx.Identifier to prevent SQL injection.
-func (c *pgxClient) MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error {
+func (c *pgxClient) MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) (err error) {
+	ctx, end := c.startOperation(ctx, "MoveQueryToResourceGroup")
+	defer func() { end(err) }()
+
 	// Look up the username for the given PID from pg_stat_activity.
 	var username string
 	lookupQuery := `SELECT COALESCE(usename, '') FROM pg_stat_activity WHERE pid = $1`
-	if err := c.pool.QueryRow(ctx, lookupQuery, pid).Scan(&username); err != nil {
-		return fmt.Errorf("looking up session for PID %d: %w", pid, err)
+	if scanErr := c.pool.QueryRow(ctx, lookupQuery, pid).Scan(&username); scanErr != nil {
+		err = fmt.Errorf("looking up session for PID %d: %w", pid, scanErr)
+		return err
 	}
 	if username == "" {
-		return fmt.Errorf("session with PID %d not found or has no associated role", pid)
+		err = fmt.Errorf("session with PID %d not found or has no associated role", pid)
+		return err
 	}
 
 	// Execute ALTER ROLE to reassign the resource group.
 	alterSQL := fmt.Sprintf("ALTER ROLE %s RESOURCE GROUP %s",
 		pgx.Identifier{username}.Sanitize(), pgx.Identifier{targetGroup}.Sanitize())
-	if _, err := c.pool.Exec(ctx, alterSQL); err != nil {
-		return fmt.Errorf("moving PID %d (role %s) to resource group %s: %w", pid, username, targetGroup, err)
+	if _, execErr := c.pool.Exec(ctx, alterSQL); execErr != nil {
+		err = fmt.Errorf("moving PID %d (role %s) to resource group %s: %w", pid, username, targetGroup, execErr)
+		return err
 	}
 
 	c.logger.Info("query moved to resource group",

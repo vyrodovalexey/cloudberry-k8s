@@ -37,8 +37,6 @@ func (f *mockDBClientFactory) NewClient(_ context.Context, _ *cbv1alpha1.Cloudbe
 type mockDBClient struct {
 	segments           []db.SegmentInfo
 	segErr             error
-	clusterState       *db.ClusterState
-	stateErr           error
 	replicationLag     int64
 	repLagErr          error
 	triggerFTSProbeErr error
@@ -50,9 +48,6 @@ func (m *mockDBClient) Ping(_ context.Context) error { return nil }
 func (m *mockDBClient) Close()                       {}
 func (m *mockDBClient) GetSegmentConfiguration(_ context.Context) ([]db.SegmentInfo, error) {
 	return m.segments, m.segErr
-}
-func (m *mockDBClient) GetClusterState(_ context.Context) (*db.ClusterState, error) {
-	return m.clusterState, m.stateErr
 }
 func (m *mockDBClient) SetParameter(_ context.Context, _, _ string, _ db.ParameterScope) error {
 	return nil
@@ -186,7 +181,20 @@ func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.Se
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"postgres", "mydb"}, nil
 }
-func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error    { return nil }
+func (m *mockDBClient) SetupPXFExtensions(_ context.Context) (int, error)      { return 2, nil }
+func (m *mockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) ListPXFExtensions(_ context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ListExternalTables(_ context.Context) ([]db.ExternalTableInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*db.PXFSourceSample, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
 	return &db.QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
 }

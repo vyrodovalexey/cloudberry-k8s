@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -380,9 +381,12 @@ func (r *ClusterReconciler) reconcileCluster(
 func (r *ClusterReconciler) reconcileCoreResources(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileCoreResources")
+	defer func() { end(err) }()
+
 	// Reconcile admin password Secret (must exist before StatefulSets reference it).
-	if err := r.reconcileAdminSecret(ctx, cluster); err != nil {
+	if err = r.reconcileAdminSecret(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling admin secret: %w", err)
 	}
 
@@ -390,7 +394,7 @@ func (r *ClusterReconciler) reconcileCoreResources(
 	// before StatefulSets reference it as a volume). Every cluster pod and the
 	// backup/restore Jobs mount this single identity so gpbackup/gprestore can
 	// dispatch over SSH to all segments.
-	if err := r.reconcileClusterSSHSecret(ctx, cluster); err != nil {
+	if err = r.reconcileClusterSSHSecret(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling cluster ssh secret: %w", err)
 	}
 
@@ -398,25 +402,25 @@ func (r *ClusterReconciler) reconcileCoreResources(
 	// the cluster enables vault + auth.ssl and the referenced certSecret does
 	// not exist, and renew operator-issued certificates before expiry. The
 	// Secret must exist before the StatefulSets mount it.
-	if err := r.reconcileClusterTLSSecret(ctx, cluster); err != nil {
+	if err = r.reconcileClusterTLSSecret(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling cluster tls secret: %w", err)
 	}
 
 	// Reconcile ConfigMaps.
-	if err := r.reconcileConfigMaps(ctx, cluster); err != nil {
+	if err = r.reconcileConfigMaps(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling configmaps: %w", err)
 	}
 
 	// Reconcile Services.
-	if err := r.reconcileServices(ctx, cluster); err != nil {
+	if err = r.reconcileServices(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling services: %w", err)
 	}
 
 	// Ensure exporter resources exist before the coordinator StatefulSet
 	// references them (Secret for DATA_SOURCE_NAME, ConfigMap for queries).
 	if needsExporterPrerequisites(cluster) {
-		if err := r.ensureExporterPrerequisites(ctx, cluster); err != nil {
-			util.LoggerFromContext(ctx).Warn("failed to create exporter prerequisites", "error", err)
+		if prereqErr := r.ensureExporterPrerequisites(ctx, cluster); prereqErr != nil {
+			util.LoggerFromContext(ctx).Warn("failed to create exporter prerequisites", "error", prereqErr)
 		}
 	}
 
@@ -428,26 +432,29 @@ func (r *ClusterReconciler) reconcileCoreResources(
 func (r *ClusterReconciler) reconcileStatefulSets(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileStatefulSets")
+	defer func() { end(err) }()
+
 	// Reconcile coordinator StatefulSet.
-	if err := r.reconcileCoordinator(ctx, cluster); err != nil {
+	if err = r.reconcileCoordinator(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling coordinator: %w", err)
 	}
 
 	// Reconcile standby if enabled.
 	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
-		if err := r.reconcileStandby(ctx, cluster); err != nil {
+		if err = r.reconcileStandby(ctx, cluster); err != nil {
 			return fmt.Errorf("reconciling standby: %w", err)
 		}
 	}
 
 	// Reconcile segments.
-	if err := r.reconcileSegments(ctx, cluster); err != nil {
+	if err = r.reconcileSegments(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling segments: %w", err)
 	}
 
 	// Reconcile storage expansion (PVC resizing).
-	if err := r.reconcileStorageExpansion(ctx, cluster); err != nil {
+	if err = r.reconcileStorageExpansion(ctx, cluster); err != nil {
 		return fmt.Errorf("reconciling storage expansion: %w", err)
 	}
 
@@ -629,8 +636,6 @@ func (r *ClusterReconciler) reconcileSegments(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 ) error {
-	logger := util.LoggerFromContext(ctx)
-
 	// Check for scale-out/scale-in by comparing desired vs actual replicas.
 	existingSts := &appsv1.StatefulSet{}
 	getErr := r.client.Get(ctx, types.NamespacedName{
@@ -651,25 +656,29 @@ func (r *ClusterReconciler) reconcileSegments(
 		return r.handleDisableMirroring(ctx, cluster)
 	}
 
-	// Normal reconciliation — primary segments.
-	primarySts, err := r.builder.BuildSegmentPrimaryStatefulSet(cluster)
-	if err != nil {
-		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, err)
+	// Ensure the rendered "<cluster>-pxf-servers" ConfigMap exists BEFORE the
+	// segment-primary StatefulSet is applied. The segment-primary pods carry the
+	// pxf-cred-init init container whose pxf-templates volume references this
+	// ConfigMap (Optional:true); the cluster controller owns pod lifecycle and
+	// runs during INITIALIZATION (unlike the admin reconcile, which is gated on
+	// Phase==Running), so creating the ConfigMap here guarantees it is present by
+	// the time segment pods first start — avoiding the empty-/pxf-base/servers
+	// race that previously required a manual rollout-restart. No-op when PXF is
+	// disabled (the builder returns nil).
+	if err := r.ensurePxfServersConfigMap(ctx, cluster); err != nil {
+		return fmt.Errorf("ensuring PXF servers ConfigMap for cluster %s: %w", cluster.Name, err)
 	}
-	if err := r.applyClusterTLSChecksum(ctx, cluster, primarySts); err != nil {
+
+	// SE.5: ensure the cluster NetworkPolicy that confines the PXF port (5888)
+	// on the segment-primary pods. No-op when PXF is disabled (builder nil).
+	if err := r.ensurePxfNetworkPolicy(ctx, cluster); err != nil {
+		return fmt.Errorf("ensuring PXF NetworkPolicy for cluster %s: %w", cluster.Name, err)
+	}
+
+	// Normal reconciliation — primary segments (build + scale-down safety + apply
+	// extracted to keep this function's cyclomatic complexity in budget).
+	if err := r.reconcileSegmentPrimary(ctx, cluster, existingSts, getErr); err != nil {
 		return err
-	}
-	// Safety: never scale down replicas via the normal path — scale-in must go
-	// through handleScaleIn to ensure data redistribution and segment deregistration.
-	if getErr == nil && existingSts.Spec.Replicas != nil && primarySts.Spec.Replicas != nil {
-		if *primarySts.Spec.Replicas < *existingSts.Spec.Replicas {
-			logger.Info("scale-in required but not yet confirmed/processed, preserving current replicas",
-				"current", *existingSts.Spec.Replicas, "desired", *primarySts.Spec.Replicas)
-			primarySts.Spec.Replicas = existingSts.Spec.Replicas
-		}
-	}
-	if err := r.createOrUpdateStatefulSet(ctx, primarySts); err != nil {
-		return fmt.Errorf("primary segments: %w", err)
 	}
 
 	// Mirror segments.
@@ -689,6 +698,186 @@ func (r *ClusterReconciler) reconcileSegments(
 	}
 
 	return nil
+}
+
+// reconcileSegmentPrimary builds the primary segment StatefulSet, applies the
+// cluster TLS checksum, enforces the never-scale-down-via-normal-path safety
+// (scale-in must go through handleScaleIn), and applies it. Extracted from
+// reconcileSegments to keep that function's cyclomatic complexity in budget.
+func (r *ClusterReconciler) reconcileSegmentPrimary(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	existingSts *appsv1.StatefulSet,
+	getErr error,
+) error {
+	primarySts, err := r.builder.BuildSegmentPrimaryStatefulSet(cluster)
+	if err != nil {
+		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, err)
+	}
+	if err := r.applyClusterTLSChecksum(ctx, cluster, primarySts); err != nil {
+		return err
+	}
+	// Safety: never scale down replicas via the normal path — scale-in must go
+	// through handleScaleIn to ensure data redistribution and segment deregistration.
+	if getErr == nil && existingSts.Spec.Replicas != nil && primarySts.Spec.Replicas != nil &&
+		*primarySts.Spec.Replicas < *existingSts.Spec.Replicas {
+		util.LoggerFromContext(ctx).Info(
+			"scale-in required but not yet confirmed/processed, preserving current replicas",
+			"current", *existingSts.Spec.Replicas, "desired", *primarySts.Spec.Replicas)
+		primarySts.Spec.Replicas = existingSts.Spec.Replicas
+	}
+	if err := r.createOrUpdateStatefulSet(ctx, primarySts); err != nil {
+		return fmt.Errorf("primary segments: %w", err)
+	}
+	return nil
+}
+
+// ensurePxfServersConfigMap creates or updates the rendered "<cluster>-pxf-servers"
+// ConfigMap using a get-or-create + MergePatch-style update (ownerRef +
+// CommonLabels are set by the builder for garbage collection). It returns nil
+// when the builder yields no ConfigMap (PXF disabled), so callers never need a
+// second gate. The cluster controller owns this ConfigMap so it exists before
+// the segment-primary pods (whose pxf-cred-init init container consumes it)
+// first start; it is reconciled on every pass so logLevel/server changes
+// propagate. The rendered Data is byte-stable, so a no-change pass is a no-op.
+func (r *ClusterReconciler) ensurePxfServersConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	desired := r.builder.BuildPXFServersConfigMap(cluster)
+	if desired == nil {
+		// PXF sidecar disabled: the builder yields no ConfigMap. Reclaim any
+		// previously-rendered "<cluster>-pxf-servers" ConfigMap (DIS.1/DIS.2) so a
+		// stale one is not left ORPHANED when PXF/data-loading is turned off.
+		// Best-effort + NotFound-tolerant: never fails the reconcile.
+		return r.deletePxfServersConfigMap(ctx, cluster)
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	existing := &corev1.ConfigMap{}
+	err := r.client.Get(ctx,
+		types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			if apierrors.IsAlreadyExists(createErr) {
+				return nil
+			}
+			return fmt.Errorf("creating PXF servers ConfigMap %s: %w", desired.Name, createErr)
+		}
+		logger.Info("created PXF servers ConfigMap",
+			"name", desired.Name, "servers", len(cluster.Spec.DataLoading.Pxf.Servers))
+		return nil
+	case err != nil:
+		return fmt.Errorf("getting PXF servers ConfigMap %s: %w", desired.Name, err)
+	default:
+		// dataChanged is the HONEST server-config-change signal: it is computed
+		// BEFORE the assignment so it reflects a REAL ConfigMap Data diff (a
+		// server added/removed/updated), independent of any labels-only change.
+		dataChanged := !equality.Semantic.DeepEqual(existing.Data, desired.Data)
+		if dataChanged || !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
+			existingData := existing.Data
+			existing.Data = desired.Data
+			existing.Labels = desired.Labels
+			if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+				return fmt.Errorf("updating PXF servers ConfigMap %s: %w", desired.Name, updateErr)
+			}
+			logger.Info("updated PXF servers ConfigMap",
+				"name", desired.Name, "servers", len(cluster.Spec.DataLoading.Pxf.Servers))
+			// Fire the server-config-change signal ONLY on a real Data diff —
+			// never on a labels-only change — so the metric/event stay honest.
+			if dataChanged {
+				r.emitPXFServersChanged(cluster, existingData, desired.Data)
+			}
+		}
+		return nil
+	}
+}
+
+// deletePxfServersConfigMap best-effort deletes the rendered
+// "<cluster>-pxf-servers" ConfigMap when the PXF sidecar is disabled (DIS.1/
+// DIS.2). It is NotFound-tolerant (absent => clean no-op) and non-fatal: any
+// other delete error is logged but never fails the cluster reconcile, mirroring
+// the admin-path best-effort teardown. This prevents a stale servers ConfigMap
+// (created while PXF was on) from being orphaned after PXF/data-loading is
+// turned off.
+func (r *ClusterReconciler) deletePxfServersConfigMap(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}}
+	if err := r.client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		util.LoggerFromContext(ctx).Warn(
+			"best-effort PXF servers ConfigMap delete failed (non-fatal)",
+			"name", cm.Name, "error", err)
+	}
+	return nil
+}
+
+// ensurePxfNetworkPolicy creates or updates the SE.5 PXF cluster NetworkPolicy
+// (get-or-create + spec/label reconcile, ownerRef set by the builder for GC). It
+// returns nil when the builder yields no policy (PXF disabled), so callers need
+// no second gate. The policy confines the PXF port (5888) on the segment-primary
+// pods to same-pod (localhost) traffic, so legitimate cross-pod cluster traffic
+// (PostgreSQL, exporters) keeps working while no other pod can reach :5888.
+func (r *ClusterReconciler) ensurePxfNetworkPolicy(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	desired := r.builder.BuildPXFClusterNetworkPolicy(cluster)
+	if desired == nil {
+		return nil
+	}
+
+	logger := util.LoggerFromContext(ctx)
+
+	existing := &networkingv1.NetworkPolicy{}
+	err := r.client.Get(ctx,
+		types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			if apierrors.IsAlreadyExists(createErr) {
+				return nil
+			}
+			return fmt.Errorf("creating PXF NetworkPolicy %s: %w", desired.Name, createErr)
+		}
+		logger.Info("created PXF NetworkPolicy", "name", desired.Name)
+		return nil
+	case err != nil:
+		return fmt.Errorf("getting PXF NetworkPolicy %s: %w", desired.Name, err)
+	default:
+		if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) ||
+			!equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
+			existing.Spec = desired.Spec
+			existing.Labels = desired.Labels
+			if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+				return fmt.Errorf("updating PXF NetworkPolicy %s: %w", desired.Name, updateErr)
+			}
+			logger.Info("updated PXF NetworkPolicy", "name", desired.Name)
+		}
+		return nil
+	}
+}
+
+// emitPXFServersChanged records the HONEST PXF servers-changed signal: it
+// increments the cloudberry_pxf_servers_changed_total counter and emits a
+// PXFServersChanged Normal event listing the added/removed/updated server names.
+// Callers MUST invoke it only after a successful ConfigMap Update whose Data
+// actually changed.
+func (r *ClusterReconciler) emitPXFServersChanged(
+	cluster *cbv1alpha1.CloudberryCluster,
+	existingData, desiredData map[string]string,
+) {
+	r.metrics.IncPXFServersChanged(cluster.Name, cluster.Namespace)
+	added, removed, updated := util.DiffPXFServerNames(existingData, desiredData)
+	r.recorder.Event(cluster, corev1.EventTypeNormal,
+		cbv1alpha1.EventReasonPXFServersChanged,
+		util.FormatPXFServersChangedMessage(added, removed, updated))
 }
 
 // detectAndHandleScale checks for scale-out/scale-in by comparing desired vs actual replicas.

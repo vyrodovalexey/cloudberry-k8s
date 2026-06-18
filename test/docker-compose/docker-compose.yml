@@ -16,6 +16,11 @@
 #   9864/9866  - HDFS DataNode (WebUI / data transfer)
 #   9083       - Hive Metastore (Thrift)
 #   10000/10002- HiveServer2 (JDBC / WebUI)
+#   3306       - MySQL (PXF JDBC source mysql-oltp, pxfuser/pxfpass)
+#   5432       - PostgreSQL source (PXF JDBC source postgres-source, pxfuser/pxfpass)
+#   2181       - HBase ZooKeeper (PXF hbase:* external-table tests)
+#   16010      - HBase Master WebUI
+#   16020/16030- HBase RegionServer RPC / WebUI
 #
 # Setup order:
 #   1. docker compose up -d
@@ -26,6 +31,14 @@
 #   6. Run scripts/setup-kafka.sh     (creates test topics)
 #   7. Run scripts/setup-rabbitmq.sh  (creates test queues)
 #   8. Run scripts/setup-hive-hdfs.sh (creates HDFS warehouse + sample Hive table)
+#   9. Run scripts/setup-jdbc-sources.sh (seeds MySQL + PostgreSQL JDBC sources)
+#  10. Run scripts/setup-hbase.sh     (creates sample HBase table for PXF tests)
+#  11. Run scripts/gen-objstore-samples.sh (generates object-store sample data in MinIO)
+#  12. Run scripts/gen-hadoop-samples.sh   (generates Hadoop HDFS/Hive/HBase sample data)
+#  13. Run scripts/gen-pushdown-samples.sh (generates pushdown/projection/error sample data)
+#  14. Run scripts/gen-export-targets.sh   (prepares Scenario 99 writable-export targets)
+#  15. Run scripts/gen-gpload-csv.sh       (generates Scenario 101 gpload CSV sample data)
+#  16. Run scripts/gen-kafka-cdc.sh        (generates Scenario 102 kafka-cdc sample messages)
 # =============================================================================
 
 services:
@@ -301,6 +314,7 @@ services:
       - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
     ports:
       - 9864:9864    # DataNode WebUI
+      - 9866:9866    # DataNode data transfer (needed for PXF from k8s)
     depends_on:
       namenode:
         condition: service_healthy
@@ -401,6 +415,78 @@ services:
       retries: 30
       start_period: 60s
 
+  # ===========================================================================
+  # MySQL - PXF JDBC source (mysql-oltp)
+  # Used by Scenario 93 for external-table data-loading tests via PXF JDBC.
+  # jdbc:mysql://mysql:3306/oltp  user=pxfuser  password=pxfpass
+  # ===========================================================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: oltp
+      MYSQL_USER: pxfuser
+      MYSQL_PASSWORD: pxfpass
+    ports:
+      - 3306:3306
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ===========================================================================
+  # PostgreSQL source - PXF JDBC source (postgres-source)
+  # Dedicated generic Postgres instance for PXF JDBC external-table tests.
+  # jdbc:postgresql://pgsource:5432/sourcedb  user=pxfuser  password=pxfpass
+  # ===========================================================================
+  pgsource:
+    image: postgres:16
+    container_name: pgsource
+    hostname: pgsource
+    environment:
+      POSTGRES_DB: sourcedb
+      POSTGRES_USER: pxfuser
+      POSTGRES_PASSWORD: pxfpass
+    ports:
+      - 5432:5432
+    volumes:
+      - pgsource_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pxfuser -d sourcedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # HBase - Single-node pseudo-distributed HBase (bundles ZooKeeper)
+  # Provides ZooKeeper quorum at hbase:2181 for PXF hbase:* external-table
+  # tests (Scenario 93 acceptance test).
+  # ===========================================================================
+  hbase:
+    image: harisekhon/hbase:2.1
+    container_name: hbase
+    hostname: hbase
+    ports:
+      - 2181:2181      # ZooKeeper client port
+      - 16010:16010    # HBase Master WebUI
+      - 16020:16020    # HBase RegionServer RPC
+      - 16030:16030    # HBase RegionServer WebUI
+    volumes:
+      - hbase_data:/hbase-data
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc 127.0.0.1 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
 volumes:
   postgres_data:
   vault_data:
@@ -415,3 +501,6 @@ volumes:
   hdfs_namenode:
   hdfs_datanode:
   hive_metastore_db:
+  mysql_data:
+  pgsource_data:
+  hbase_data:

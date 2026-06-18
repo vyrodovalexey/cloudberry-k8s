@@ -3,11 +3,13 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -25,6 +27,11 @@ import (
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
+
+// assertExporterSecretBoom is the sentinel injected into the exporter-credentials
+// Secret Create so TASK 4 can prove the real cause propagates through
+// ensureExporterCoreResources and onto its span.
+var assertExporterSecretBoom = errors.New("exporter secret create boom")
 
 // wave345Recorder captures the controller-operation metric calls added in
 // waves 3-5 (B-9, C-7) on top of the reconcile counts.
@@ -542,6 +549,13 @@ func TestControllerPhaseSpans(t *testing.T) {
 	r3, _ := newWave345Reconciler(rec, cluster3)
 	_, _ = r3.checkScaleOutPhases(context.Background(), cluster3, string(state))
 
+	// D-01/D-02: reconcileCoreResources and reconcileStatefulSets child spans via
+	// direct calls (the span is created regardless of the call's success/error).
+	cluster4 := newTestCluster()
+	r4, _ := newWave345Reconciler(rec, cluster4)
+	_ = r4.reconcileCoreResources(context.Background(), cluster4)
+	_ = r4.reconcileStatefulSets(context.Background(), cluster4)
+
 	spans := sr.Ended()
 	names := map[string]bool{}
 	var deletionParented bool
@@ -563,6 +577,10 @@ func TestControllerPhaseSpans(t *testing.T) {
 	assert.True(t, names["controller.storageExpansion"], "missing controller.storageExpansion span")
 	assert.True(t, names["controller.scaleOut.phase"], "missing controller.scaleOut.phase span")
 	assert.True(t, deletionParented, "controller.deletion must be parented on the Reconcile root")
+
+	// D-01/D-02: the two new reconcile child spans must be produced.
+	assert.True(t, names["controller.reconcileCoreResources"], "missing reconcileCoreResources span")
+	assert.True(t, names["controller.reconcileStatefulSets"], "missing reconcileStatefulSets span")
 }
 
 // TestAdminControllerPhaseSpans verifies the admin controller operation spans.
@@ -591,6 +609,284 @@ func TestAdminControllerPhaseSpans(t *testing.T) {
 	}
 	assert.True(t, names["controller.reconcileWorkload"])
 	assert.True(t, names["controller.handleMaintenance"])
+}
+
+// pxfDataLoadingCluster returns a running cluster with data-loading + PXF enabled
+// so reconcileDataLoading executes its body and nests the reconcilePxf span.
+func pxfDataLoadingCluster() *cbv1alpha1.CloudberryCluster {
+	c := newTestCluster()
+	c.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "apache/cloudberry-pxf:2.1.0",
+			Servers: []cbv1alpha1.PxfServerSpec{
+				{Name: "s3srv", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "s3.local"}},
+			},
+		},
+	}
+	return c
+}
+
+// TestAdminControllerSubReconcilerSpans verifies the W3-C1 child spans for the
+// five named sub-reconcilers exist and are parented on the per-call span
+// (TASK 9). reconcilePxf nests inside reconcileDataLoading; the others are
+// driven directly. Confirms NO double-span on a sibling (reconcileWorkload).
+func TestAdminControllerSubReconcilerSpans(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := pxfDataLoadingCluster()
+	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{DiskMonitoring: true}
+	// reconcileResourceGroups dereferences Spec.Workload (the production caller
+	// gates on it); supply an empty spec so the span is emitted as a no-op.
+	cluster.Spec.Workload = &cbv1alpha1.WorkloadSpec{}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), &mockDBClientFactory{client: &mockDBClient{}},
+		&wave345Recorder{}, nil)
+
+	// reconcileDataLoading (enabled) → nests reconcilePxf.
+	require.NoError(t, r.reconcileDataLoading(context.Background(), cluster))
+	// reconcileStorage (disk monitoring enabled).
+	require.NoError(t, r.reconcileStorage(context.Background(), cluster))
+	// reconcileResourceGroups (DB-backed; empty lists → no-op success).
+	require.NoError(t, r.reconcileResourceGroups(context.Background(), cluster, &mockDBClient{}))
+
+	names := map[string]int{}
+	for _, s := range sr.Ended() {
+		names[s.Name()]++
+	}
+	assert.GreaterOrEqual(t, names["controller.reconcileDataLoading"], 1,
+		"missing controller.reconcileDataLoading span")
+	assert.GreaterOrEqual(t, names["controller.reconcilePxf"], 1,
+		"missing controller.reconcilePxf span (must nest in reconcileDataLoading)")
+	assert.GreaterOrEqual(t, names["controller.reconcileStorage"], 1,
+		"missing controller.reconcileStorage span")
+	assert.GreaterOrEqual(t, names["controller.reconcileResourceGroups"], 1,
+		"missing controller.reconcileResourceGroups span")
+	// No accidental double-span on a sibling we never called here.
+	assert.Equal(t, 0, names["controller.reconcileWorkload"],
+		"reconcileWorkload must not be spanned when it was never invoked")
+}
+
+// TestAdminControllerDataLoadSpans verifies the new C-1/C-2/C-3 sub-reconciler
+// spans (T8): driving reconcileDataLoadingJobs, reconcileGpfdist and
+// setupPXFExtensions on a fake-client reconciler emits the
+// "controller.reconcileDataLoadingJobs", "controller.reconcileGpfdist" and
+// "controller.setupPXFExtensions" spans via startControllerSpan. The existing
+// TestAdminControllerSubReconcilerSpans asserts only the wave-3 sub-reconcilers,
+// so these three are otherwise unasserted.
+func TestAdminControllerDataLoadSpans(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := pxfDataLoadingCluster()
+	// An enabled dataload job (drives reconcileDataLoadingJobs body) and gpfdist
+	// enabled (drives reconcileGpfdist create path).
+	cluster.Spec.DataLoading.Jobs = []cbv1alpha1.DataLoadingJob{
+		{
+			Name: "loader", Type: "pxf", Enabled: true,
+			PxfJob: &cbv1alpha1.PxfJobSpec{
+				Server: "s3srv", Profile: "s3:parquet",
+				Resource: "s3a://data-lake/events/", TargetTable: "public.events",
+			},
+		},
+	}
+	cluster.Spec.DataLoading.Gpfdist = &cbv1alpha1.GpfdistSpec{Enabled: true}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).WithStatusSubresource(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), &mockDBClientFactory{client: &mockDBClient{}},
+		&wave345Recorder{}, nil)
+
+	// C-1: reconcileDataLoadingJobs (enabled job → body executes).
+	require.NoError(t, r.reconcileDataLoadingJobs(context.Background(), cluster))
+	// C-2: reconcileGpfdist (gpfdist enabled → create path).
+	require.NoError(t, r.reconcileGpfdist(context.Background(), cluster))
+	// C-3: setupPXFExtensions (PXF enabled + mock dbFactory → body executes).
+	r.setupPXFExtensions(context.Background(), cluster, r.logger)
+
+	names := map[string]int{}
+	for _, s := range sr.Ended() {
+		names[s.Name()]++
+	}
+	assert.GreaterOrEqual(t, names["controller.reconcileDataLoadingJobs"], 1,
+		"missing controller.reconcileDataLoadingJobs span")
+	assert.GreaterOrEqual(t, names["controller.reconcileGpfdist"], 1,
+		"missing controller.reconcileGpfdist span")
+	assert.GreaterOrEqual(t, names["controller.setupPXFExtensions"], 1,
+		"missing controller.setupPXFExtensions span")
+}
+
+// TestReconcileGpfdist_CreateError_RecordsSpanError forces the gpfdist PVC Create
+// to fail and asserts the reconcileGpfdist span is marked codes.Error (T8 bonus),
+// mirroring the TestEnsureExporterCoreResources_*_RecordsSpanError idiom so the
+// error-status propagation through end(err) is verified, not just span presence.
+func TestReconcileGpfdist_CreateError_RecordsSpanError(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+		Enabled: true,
+		Gpfdist: &cbv1alpha1.GpfdistSpec{Enabled: true},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).WithStatusSubresource(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object,
+				_ ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+					return assertGpfdistBoom
+				}
+				return nil
+			},
+		}).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), nil, &wave345Recorder{}, nil)
+
+	err := r.reconcileGpfdist(context.Background(), cluster)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, assertGpfdistBoom)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() == "controller.reconcileGpfdist" {
+			found = true
+			assert.Equal(t, codes.Error, s.Status().Code,
+				"the reconcileGpfdist span must be codes.Error on the propagated error")
+		}
+	}
+	assert.True(t, found, "controller.reconcileGpfdist span must exist")
+}
+
+// TestEnsureExporterCoreResources_SubResourceError_RecordsSpanError forces the
+// exporter-credentials Secret Create to fail, driving the currently-unexecuted
+// error return of ensureExporterCoreResources, and asserts the propagated error
+// AND the codes.Error span status (TASK 4 + the ensureExporterCoreResources slice
+// of TASK 9).
+func TestEnsureExporterCoreResources_SubResourceError_RecordsSpanError(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	// Fail Create for the exporter credentials Secret so the first ensure*
+	// helper returns an error and ensureExporterCoreResources propagates it.
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object,
+				_ ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.Secret); ok {
+					return assertExporterSecretBoom
+				}
+				return nil
+			},
+		}).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), nil, &wave345Recorder{}, nil)
+
+	err := r.ensureExporterCoreResources(context.Background(), cluster,
+		"exporter-password", "postgres://user@host:5432/db", r.logger)
+
+	require.Error(t, err, "the sub-resource Create error must propagate")
+	assert.ErrorIs(t, err, assertExporterSecretBoom)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() == "controller.ensureExporterCoreResources" {
+			found = true
+			assert.Equal(t, codes.Error, s.Status().Code,
+				"the span must be marked codes.Error on the propagated error")
+		}
+	}
+	assert.True(t, found, "controller.ensureExporterCoreResources span must exist")
+}
+
+// TestEnsureExporterCoreResources_ConfigMapError covers the SECOND error branch
+// of ensureExporterCoreResources: the credentials Secret is created, but the
+// queries ConfigMap Create fails, so the configmap-error return is exercised
+// (lifts the function past the secret-only path) and the span is codes.Error.
+func TestEnsureExporterCoreResources_ConfigMapError(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(cluster).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object,
+				opts ...client.CreateOption) error {
+				// Secret create succeeds; ConfigMap create fails.
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return assertExporterSecretBoom
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), nil, &wave345Recorder{}, nil)
+
+	err := r.ensureExporterCoreResources(context.Background(), cluster,
+		"exporter-password", "postgres://user@host:5432/db", r.logger)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, assertExporterSecretBoom)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() == "controller.ensureExporterCoreResources" {
+			found = true
+			assert.Equal(t, codes.Error, s.Status().Code)
+		}
+	}
+	assert.True(t, found, "controller.ensureExporterCoreResources span must exist")
+}
+
+// TestEnsureExporterCoreResources_Success covers the full happy path: all three
+// sub-resources (Secret, ConfigMap, Service) are created on a clean client, so
+// the ConfigMap-success and Service paths execute and the span ends with no
+// error status.
+func TestEnsureExporterCoreResources_Success(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	r := NewAdminReconciler(k8sClient, scheme, record.NewFakeRecorder(40),
+		builder.NewBuilder(), nil, &wave345Recorder{}, nil)
+
+	require.NoError(t, r.ensureExporterCoreResources(context.Background(), cluster,
+		"exporter-password", "postgres://user@host:5432/db", r.logger))
+
+	// All three exporter core resources now exist.
+	secret := &corev1.Secret{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name: util.ExporterCredentialsSecretName(cluster.Name), Namespace: cluster.Namespace}, secret))
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name: util.ExporterQueriesConfigMapName(cluster.Name), Namespace: cluster.Namespace}, cm))
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() == "controller.ensureExporterCoreResources" {
+			found = true
+			assert.NotEqual(t, codes.Error, s.Status().Code,
+				"the span must NOT be errored on the success path")
+		}
+	}
+	assert.True(t, found, "controller.ensureExporterCoreResources span must exist")
 }
 
 // TestHandleLifecyclePhaseReturnsErrors verifies the new three-value contract

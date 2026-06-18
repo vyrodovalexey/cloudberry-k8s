@@ -1073,10 +1073,6 @@ func (w *nonClosingClientWrapper) GetSegmentConfiguration(ctx context.Context) (
 	return w.delegate.GetSegmentConfiguration(ctx)
 }
 
-func (w *nonClosingClientWrapper) GetClusterState(ctx context.Context) (*db.ClusterState, error) {
-	return w.delegate.GetClusterState(ctx)
-}
-
 func (w *nonClosingClientWrapper) SetParameter(ctx context.Context, name, value string, scope db.ParameterScope) error {
 	return w.delegate.SetParameter(ctx, name, value, scope)
 }
@@ -1311,6 +1307,28 @@ func (w *nonClosingClientWrapper) ListUserDatabases(ctx context.Context) ([]stri
 
 func (w *nonClosingClientWrapper) SetupExporterRole(ctx context.Context, password string) error {
 	return w.delegate.SetupExporterRole(ctx, password)
+}
+
+func (w *nonClosingClientWrapper) SetupPXFExtensions(ctx context.Context) (int, error) {
+	return w.delegate.SetupPXFExtensions(ctx)
+}
+
+func (w *nonClosingClientWrapper) EnsureDataLoaderRole(ctx context.Context, roleName string) error {
+	return w.delegate.EnsureDataLoaderRole(ctx, roleName)
+}
+
+func (w *nonClosingClientWrapper) ListPXFExtensions(ctx context.Context) ([]string, error) {
+	return w.delegate.ListPXFExtensions(ctx)
+}
+
+func (w *nonClosingClientWrapper) ListExternalTables(ctx context.Context) ([]db.ExternalTableInfo, error) {
+	return w.delegate.ListExternalTables(ctx)
+}
+
+func (w *nonClosingClientWrapper) ReadPXFSourceSample(
+	ctx context.Context, server, profile, resource string, limit int,
+) (*db.PXFSourceSample, error) {
+	return w.delegate.ReadPXFSourceSample(ctx, server, profile, resource, limit)
 }
 
 func (w *nonClosingClientWrapper) GetQueryDetail(ctx context.Context, pid int32) (*db.QueryDetail, error) {

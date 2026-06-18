@@ -146,7 +146,6 @@ func (e *TestK8sEnv) GetSecret(ctx context.Context, name, namespace string) (*co
 type MockDBClient struct {
 	PingFunc                          func(ctx context.Context) error
 	GetSegmentConfigurationFunc       func(ctx context.Context) ([]db.SegmentInfo, error)
-	GetClusterStateFunc               func(ctx context.Context) (*db.ClusterState, error)
 	SetParameterFunc                  func(ctx context.Context, name, value string, scope db.ParameterScope) error
 	ShowParameterFunc                 func(ctx context.Context, name string) (string, error)
 	ReloadConfigFunc                  func(ctx context.Context) error
@@ -189,6 +188,11 @@ type MockDBClient struct {
 	ListSessionsWithResourceGroupFunc func(ctx context.Context) ([]db.SessionWithGroup, error)
 	RebalanceTableFunc                func(ctx context.Context, database, schema, table, distKey string) error
 	SetupExporterRoleFunc             func(ctx context.Context, password string) error
+	SetupPXFExtensionsFunc            func(ctx context.Context) (int, error)
+	EnsureDataLoaderRoleFunc          func(ctx context.Context, roleName string) error
+	ListPXFExtensionsFunc             func(ctx context.Context) ([]string, error)
+	ListExternalTablesFunc            func(ctx context.Context) ([]db.ExternalTableInfo, error)
+	ReadPXFSourceSampleFunc           func(ctx context.Context, server, profile, resource string, limit int) (*db.PXFSourceSample, error)
 	GetQueryDetailFunc                func(ctx context.Context, pid int32) (*db.QueryDetail, error)
 	EnsureQueryHistoryTableFunc       func(ctx context.Context) error
 	InsertQueryHistoryFunc            func(ctx context.Context, entry *db.QueryHistoryEntry) error
@@ -219,23 +223,6 @@ func (m *MockDBClient) GetSegmentConfiguration(ctx context.Context) ([]db.Segmen
 		return m.GetSegmentConfigurationFunc(ctx)
 	}
 	return DefaultSegmentConfiguration(), nil
-}
-
-// GetClusterState implements db.Client.
-func (m *MockDBClient) GetClusterState(ctx context.Context) (*db.ClusterState, error) {
-	if m.GetClusterStateFunc != nil {
-		return m.GetClusterStateFunc(ctx)
-	}
-	return &db.ClusterState{
-		IsUp:              true,
-		Version:           "2.1.0",
-		SegmentsUp:        4,
-		SegmentsDown:      0,
-		SegmentsTotal:     4,
-		MirroringInSync:   true,
-		ActiveConnections: 5,
-		MaxConnections:    200,
-	}, nil
 }
 
 // SetParameter implements db.Client.
@@ -675,6 +662,58 @@ func (m *MockDBClient) SetupExporterRole(ctx context.Context, password string) e
 		return m.SetupExporterRoleFunc(ctx, password)
 	}
 	return nil
+}
+
+// SetupPXFExtensions implements db.Client. It returns the number of extensions
+// installed (default 2 — both pxf and pxf_fdw) so the default mock marks PXF
+// ready; override SetupPXFExtensionsFunc to exercise the 0-installed retry path.
+func (m *MockDBClient) SetupPXFExtensions(ctx context.Context) (int, error) {
+	if m.SetupPXFExtensionsFunc != nil {
+		return m.SetupPXFExtensionsFunc(ctx)
+	}
+	return 2, nil
+}
+
+// EnsureDataLoaderRole implements db.Client. It returns nil by default (the
+// SE.6 minimal-privilege role setup is best-effort/non-fatal). Override
+// EnsureDataLoaderRoleFunc to exercise specific behavior.
+func (m *MockDBClient) EnsureDataLoaderRole(ctx context.Context, roleName string) error {
+	if m.EnsureDataLoaderRoleFunc != nil {
+		return m.EnsureDataLoaderRoleFunc(ctx, roleName)
+	}
+	return nil
+}
+
+// ListPXFExtensions implements db.Client. It returns nil by default (a reachable
+// DB with no PXF extensions present — the honest default on the stub image);
+// override ListPXFExtensionsFunc to exercise the observed/unobservable paths.
+func (m *MockDBClient) ListPXFExtensions(ctx context.Context) ([]string, error) {
+	if m.ListPXFExtensionsFunc != nil {
+		return m.ListPXFExtensionsFunc(ctx)
+	}
+	return nil, nil
+}
+
+// ListExternalTables implements db.Client. It returns nil by default (a
+// reachable DB with no external/foreign tables — the honest default); override
+// ListExternalTablesFunc to exercise the observed/unobservable paths.
+func (m *MockDBClient) ListExternalTables(ctx context.Context) ([]db.ExternalTableInfo, error) {
+	if m.ListExternalTablesFunc != nil {
+		return m.ListExternalTablesFunc(ctx)
+	}
+	return nil, nil
+}
+
+// ReadPXFSourceSample implements db.Client. It returns (nil, nil) by default;
+// override ReadPXFSourceSampleFunc to seed real rows for the happy path or an
+// error for the honest ABSENT (source unreachable) path.
+func (m *MockDBClient) ReadPXFSourceSample(
+	ctx context.Context, server, profile, resource string, limit int,
+) (*db.PXFSourceSample, error) {
+	if m.ReadPXFSourceSampleFunc != nil {
+		return m.ReadPXFSourceSampleFunc(ctx, server, profile, resource, limit)
+	}
+	return nil, nil
 }
 
 // GetQueryDetail implements db.Client.

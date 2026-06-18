@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -397,14 +398,23 @@ func TestDeepCopy_NilReceivers(t *testing.T) {
 		{"S3VaultSecret", func() interface{} { var s *S3VaultSecret; return s.DeepCopy() }},
 		{"SecretReference", func() interface{} { var s *SecretReference; return s.DeepCopy() }},
 		{"DataLoadingSpec", func() interface{} { var s *DataLoadingSpec; return s.DeepCopy() }},
-		{"StreamingServerSpec", func() interface{} { var s *StreamingServerSpec; return s.DeepCopy() }},
+		{"PxfSpec", func() interface{} { var s *PxfSpec; return s.DeepCopy() }},
+		{"PxfExtensionsSpec", func() interface{} { var s *PxfExtensionsSpec; return s.DeepCopy() }},
+		{"PxfServerSpec", func() interface{} { var s *PxfServerSpec; return s.DeepCopy() }},
+		{"PxfCustomConnector", func() interface{} { var s *PxfCustomConnector; return s.DeepCopy() }},
+		{"GpfdistSpec", func() interface{} { var s *GpfdistSpec; return s.DeepCopy() }},
 		{"DataLoadingJob", func() interface{} { var s *DataLoadingJob; return s.DeepCopy() }},
-		{"S3SourceSpec", func() interface{} { var s *S3SourceSpec; return s.DeepCopy() }},
-		{"KafkaSourceSpec", func() interface{} { var s *KafkaSourceSpec; return s.DeepCopy() }},
-		{"RabbitMQSourceSpec", func() interface{} { var s *RabbitMQSourceSpec; return s.DeepCopy() }},
+		{"PxfJobSpec", func() interface{} { var s *PxfJobSpec; return s.DeepCopy() }},
+		{"PartitioningSpec", func() interface{} { var s *PartitioningSpec; return s.DeepCopy() }},
+		{"ErrorHandlingSpec", func() interface{} { var s *ErrorHandlingSpec; return s.DeepCopy() }},
+		{"GploadJobSpec", func() interface{} { var s *GploadJobSpec; return s.DeepCopy() }},
+		{"DataLoadingJobTemplate", func() interface{} { var s *DataLoadingJobTemplate; return s.DeepCopy() }},
 		{"StorageManagementSpec", func() interface{} { var s *StorageManagementSpec; return s.DeepCopy() }},
 		{"RecommendationScanSpec", func() interface{} { var s *RecommendationScanSpec; return s.DeepCopy() }},
 		{"UsageReportSpec", func() interface{} { var s *UsageReportSpec; return s.DeepCopy() }},
+		{"DataLoadingStatus", func() interface{} { var s *DataLoadingStatus; return s.DeepCopy() }},
+		{"DataLoadingJobStatus", func() interface{} { var s *DataLoadingJobStatus; return s.DeepCopy() }},
+		{"DataLoadingPxfStatus", func() interface{} { var s *DataLoadingPxfStatus; return s.DeepCopy() }},
 	}
 
 	for _, tt := range nilTests {
@@ -556,39 +566,77 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 			},
 			DataLoading: &DataLoadingSpec{
 				Enabled: true,
-				StreamingServer: &StreamingServerSpec{
-					Host: "gpfdist.example.com", Port: 8081, TLSMode: "tls",
-					CredentialSecret: &SecretReference{Name: "gpfdist-creds"},
+				Pxf: &PxfSpec{
+					Enabled: true, Image: "cloudberry-pxf:7.1.0", Port: 5888,
+					JvmOpts: "-Xmx1g -Xms256m", LogLevel: "INFO",
+					Extensions: &PxfExtensionsSpec{Pxf: ptr.To(true), PxfFdw: ptr.To(true)},
+					Servers: []PxfServerSpec{
+						{
+							Name: "s3-datalake", Type: "s3",
+							Config: map[string]string{
+								"fs.s3a.endpoint": "s3.amazonaws.com",
+							},
+							CredentialSecrets: []SecretReference{{Name: "s3-credentials", Key: "access_key"}},
+						},
+						{
+							Name: "mysql-oltp", Type: "jdbc",
+							Config: map[string]string{
+								"jdbc.driver": "com.mysql.cj.jdbc.Driver",
+								"jdbc.url":    "jdbc:mysql://mysql:3306/production",
+							},
+							CredentialSecrets: []SecretReference{{Name: "mysql-credentials"}},
+						},
+						{
+							Name: "hadoop-cluster", Type: "hdfs",
+							Config: map[string]string{"fs.defaultFS": "hdfs://namenode:8020"},
+							Hive:   map[string]string{"hive.metastore.uris": "thrift://hive-metastore:9083"},
+							Hbase:  map[string]string{"hbase.zookeeper.quorum": "zk1:2181"},
+						},
+					},
+					CustomConnectors: []PxfCustomConnector{
+						{Name: "custom-connector", JarURL: "s3://artifacts/pxf-plugins/my-connector.jar"},
+					},
+				},
+				Gpfdist: &GpfdistSpec{
+					Enabled: true, Replicas: ptr.To(int32(2)), Image: "cloudberry-gpfdist:2.1.0", Port: 8080,
 				},
 				Jobs: []DataLoadingJob{
 					{
-						Name: "s3-loader", Type: "s3", Enabled: true,
-						Schedule: "*/15 * * * *", TargetTable: "public.events",
-						S3Source: &S3SourceSpec{
-							Bucket: "data-lake", Path: "/events/", Endpoint: "s3.amazonaws.com",
-							Region: "us-east-1", Format: "json",
-							CredentialSecret: &SecretReference{Name: "s3-data-creds"},
-							ForcePathStyle:   true,
+						Name: "s3-parquet-ingest", Type: "pxf", Enabled: true,
+						Schedule: "*/15 * * * *",
+						PxfJob: &PxfJobSpec{
+							Server: "s3-datalake", Profile: "s3:parquet",
+							Resource: "s3a://data-lake/events/", TargetTable: "public.events",
+							Mode: "insert", FilterPushdown: ptr.To(true), ColumnProjection: ptr.To(true),
+							ErrorHandling: &ErrorHandlingSpec{
+								SegmentRejectLimit: 100, SegmentRejectLimitType: "rows", LogErrors: ptr.To(true),
+							},
 						},
 					},
 					{
-						Name: "kafka-stream", Type: "kafka", Enabled: true,
-						TargetTable: "public.stream",
-						KafkaSource: &KafkaSourceSpec{
-							Brokers: []string{"kafka-1:9092", "kafka-2:9092"},
-							Topic:   "events", GroupID: "cloudberry-consumer",
-							Format: "avro", StartOffset: "latest",
+						Name: "jdbc-sync", Type: "pxf", Enabled: true,
+						PxfJob: &PxfJobSpec{
+							Server: "mysql-oltp", Profile: "jdbc",
+							Resource: "production.orders", TargetTable: "public.orders_staging",
+							Mode: "insert-select", FilterPushdown: ptr.To(true),
+							Partitioning: &PartitioningSpec{
+								Column: "order_date", Range: "2024-01-01:2026-12-31", Interval: "1:month",
+							},
 						},
 					},
 					{
-						Name: "rabbitmq-queue", Type: "rabbitmq", Enabled: false,
-						TargetTable: "public.messages",
-						RabbitMQSource: &RabbitMQSourceSpec{
-							Host: "rabbitmq.example.com", Port: 5672, VHost: "/production",
-							Queue: "db-messages", Format: "json",
-							CredentialSecret: &SecretReference{Name: "rmq-creds"},
+						Name: "gpload-csv", Type: "gpload", Enabled: false,
+						GploadJob: &GploadJobSpec{
+							TargetTable: "public.raw_data", Mode: "insert", Format: "csv",
+							FilePaths: []string{"/data/incoming/*.csv"},
 						},
 					},
+				},
+				JobTemplate: &DataLoadingJobTemplate{
+					ServiceAccountName:      "cloudberry-data-loading-sa",
+					BackoffLimit:            ptr.To(int32(3)),
+					ActiveDeadlineSeconds:   ptr.To(int64(14400)),
+					TTLSecondsAfterFinished: ptr.To(int32(86400)),
 				},
 			},
 			Storage: &StorageManagementSpec{
@@ -611,6 +659,19 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 			ActiveQueries: 15, QueuedQueries: 3, BlockedQueries: 1,
 			LastBackupTime: &now, LastBackupStatus: "Success",
 			DataLoadingJobs: 2, DiskUsagePercent: 45, RecommendationCount: 3,
+			DataLoading: &DataLoadingStatus{
+				Phase: "Configured", ConfiguredJobs: 3, ActiveJobs: 2,
+				Jobs: []DataLoadingJobStatus{
+					{
+						Name: "job1", Enabled: true,
+						LastRun: &now, LastStatus: "Succeeded",
+						RowsLoaded: ptr.To[int64](183961), Duration: "1m30s",
+					},
+					{Name: "job2", Enabled: false},
+					{Name: "job3", Enabled: true},
+				},
+				Pxf: &DataLoadingPxfStatus{Configured: true, Servers: 5},
+			},
 			ObservedGeneration: 5,
 			Conditions: []metav1.Condition{
 				{Type: "ClusterReady", Status: metav1.ConditionTrue,
@@ -702,9 +763,16 @@ func TestDeepCopy_IndependentCopies_Spec(t *testing.T) {
 		assert.Equal(t, "analytics", original.Spec.Workload.ResourceGroups[0].Name)
 	})
 
-	t.Run("modify data loading kafka brokers", func(t *testing.T) {
-		copied.Spec.DataLoading.Jobs[1].KafkaSource.Brokers[0] = "changed:9092"
-		assert.Equal(t, "kafka-1:9092", original.Spec.DataLoading.Jobs[1].KafkaSource.Brokers[0])
+	t.Run("modify data loading pxf server config", func(t *testing.T) {
+		copied.Spec.DataLoading.Pxf.Servers[0].Config["fs.s3a.endpoint"] = "changed"
+		assert.Equal(t, "s3.amazonaws.com",
+			original.Spec.DataLoading.Pxf.Servers[0].Config["fs.s3a.endpoint"])
+	})
+
+	t.Run("modify data loading pxf job partitioning", func(t *testing.T) {
+		copied.Spec.DataLoading.Jobs[1].PxfJob.Partitioning.Column = "changed"
+		assert.Equal(t, "order_date",
+			original.Spec.DataLoading.Jobs[1].PxfJob.Partitioning.Column)
 	})
 }
 
@@ -716,6 +784,13 @@ func TestDeepCopy_IndependentCopies_Status(t *testing.T) {
 	t.Run("modify conditions", func(t *testing.T) {
 		copied.Status.Conditions[0].Reason = "Modified"
 		assert.Equal(t, "AllReady", original.Status.Conditions[0].Reason)
+	})
+
+	t.Run("modify data loading status jobs", func(t *testing.T) {
+		copied.Status.DataLoading.Jobs[0].Name = "changed-job"
+		assert.Equal(t, "job1", original.Status.DataLoading.Jobs[0].Name)
+		copied.Status.DataLoading.Phase = "Changed"
+		assert.Equal(t, "Configured", original.Status.DataLoading.Phase)
 	})
 
 	t.Run("modify failed segments", func(t *testing.T) {
@@ -753,45 +828,62 @@ func TestDeepCopy_SubTypes_Populated(t *testing.T) {
 		assert.Equal(t, "creds", original.Destination.S3.CredentialSecret.Name)
 	})
 
-	t.Run("DataLoadingJob with S3Source", func(t *testing.T) {
+	t.Run("DataLoadingJob with PxfJob", func(t *testing.T) {
 		original := &DataLoadingJob{
-			Name: "loader", Type: "s3", TargetTable: "public.data",
-			S3Source: &S3SourceSpec{
-				Bucket: "data", Format: "csv",
-				CredentialSecret: &SecretReference{Name: "s3-creds"},
+			Name: "loader", Type: "pxf",
+			PxfJob: &PxfJobSpec{
+				Server: "s3-datalake", Profile: "s3:parquet", TargetTable: "public.data",
+				Mode: "insert", SourceFilter: "region='us-east'",
+				FilterPushdown: ptr.To(true), ColumnProjection: ptr.To(true),
+				Partitioning: &PartitioningSpec{
+					Column: "order_date", Range: "2024-01-01:2026-12-31", Interval: "1:month",
+				},
+				ErrorHandling: &ErrorHandlingSpec{
+					SegmentRejectLimit: 100, SegmentRejectLimitType: "rows", LogErrors: ptr.To(true),
+				},
 			},
 		}
 		copied := original.DeepCopy()
 		require.NotNil(t, copied)
-		copied.S3Source.Bucket = "changed"
-		assert.Equal(t, "data", original.S3Source.Bucket)
+		copied.PxfJob.TargetTable = "changed"
+		assert.Equal(t, "public.data", original.PxfJob.TargetTable)
+		// SourceFilter (Scenario 99) is carried through the deep copy.
+		assert.Equal(t, "region='us-east'", copied.PxfJob.SourceFilter)
+		copied.PxfJob.SourceFilter = "changed"
+		assert.Equal(t, "region='us-east'", original.PxfJob.SourceFilter)
+		copied.PxfJob.Partitioning.Column = "changed"
+		assert.Equal(t, "order_date", original.PxfJob.Partitioning.Column)
 	})
 
-	t.Run("DataLoadingJob with KafkaSource", func(t *testing.T) {
+	t.Run("DataLoadingJob with GploadJob", func(t *testing.T) {
 		original := &DataLoadingJob{
-			Name: "kafka-job", Type: "kafka", TargetTable: "public.stream",
-			KafkaSource: &KafkaSourceSpec{
-				Brokers: []string{"b1:9092", "b2:9092"}, Topic: "events",
+			Name: "gpload-job", Type: "gpload",
+			GploadJob: &GploadJobSpec{
+				TargetTable: "public.raw_data", Mode: "insert", Format: "csv",
+				FilePaths: []string{"/data/incoming/*.csv"},
 			},
 		}
 		copied := original.DeepCopy()
 		require.NotNil(t, copied)
-		copied.KafkaSource.Brokers[0] = "changed:9092"
-		assert.Equal(t, "b1:9092", original.KafkaSource.Brokers[0])
+		copied.GploadJob.FilePaths[0] = "changed"
+		assert.Equal(t, "/data/incoming/*.csv", original.GploadJob.FilePaths[0])
 	})
 
-	t.Run("DataLoadingJob with RabbitMQSource", func(t *testing.T) {
-		original := &DataLoadingJob{
-			Name: "rmq-job", Type: "rabbitmq", TargetTable: "public.msgs",
-			RabbitMQSource: &RabbitMQSourceSpec{
-				Host: "rmq.example.com", Queue: "messages",
-				CredentialSecret: &SecretReference{Name: "rmq-creds"},
-			},
+	t.Run("PxfServerSpec with credentials", func(t *testing.T) {
+		original := &PxfServerSpec{
+			Name: "mysql-oltp", Type: "jdbc",
+			Config:            map[string]string{"jdbc.driver": "drv", "jdbc.url": "url"},
+			Hive:              map[string]string{"k": "v"},
+			Hbase:             map[string]string{"k": "v"},
+			Jdbc:              map[string]string{"k": "v"},
+			CredentialSecrets: []SecretReference{{Name: "mysql-creds"}},
 		}
 		copied := original.DeepCopy()
 		require.NotNil(t, copied)
-		copied.RabbitMQSource.CredentialSecret.Name = "changed"
-		assert.Equal(t, "rmq-creds", original.RabbitMQSource.CredentialSecret.Name)
+		copied.CredentialSecrets[0].Name = "changed"
+		assert.Equal(t, "mysql-creds", original.CredentialSecrets[0].Name)
+		copied.Config["jdbc.driver"] = "changed"
+		assert.Equal(t, "drv", original.Config["jdbc.driver"])
 	})
 
 	t.Run("StorageManagementSpec with all sub-specs", func(t *testing.T) {
@@ -808,15 +900,98 @@ func TestDeepCopy_SubTypes_Populated(t *testing.T) {
 		assert.Equal(t, int32(20), original.RecommendationScan.BloatThreshold)
 	})
 
-	t.Run("StreamingServerSpec with credential", func(t *testing.T) {
-		original := &StreamingServerSpec{
-			Host: "gpfdist.example.com", Port: 8081,
-			CredentialSecret: &SecretReference{Name: "creds"},
+	t.Run("PxfSpec with extensions and connectors", func(t *testing.T) {
+		original := &PxfSpec{
+			Enabled: true, Image: "pxf:1.0", Port: 5888,
+			Extensions: &PxfExtensionsSpec{Pxf: ptr.To(true), PxfFdw: ptr.To(false)},
+			CustomConnectors: []PxfCustomConnector{
+				{Name: "c1", JarURL: "s3://jars/c1.jar"},
+			},
 		}
 		copied := original.DeepCopy()
 		require.NotNil(t, copied)
-		copied.CredentialSecret.Name = "changed"
-		assert.Equal(t, "creds", original.CredentialSecret.Name)
+		copied.CustomConnectors[0].Name = "changed"
+		assert.Equal(t, "c1", original.CustomConnectors[0].Name)
+		*copied.Extensions.Pxf = false
+		assert.True(t, *original.Extensions.Pxf)
+	})
+
+	t.Run("DataLoadingStatus with jobs", func(t *testing.T) {
+		original := &DataLoadingStatus{
+			Phase: "Configured", ConfiguredJobs: 2, ActiveJobs: 1,
+			Jobs: []DataLoadingJobStatus{
+				{Name: "job1", Enabled: true},
+				{Name: "job2", Enabled: false},
+			},
+			Pxf: &DataLoadingPxfStatus{Configured: true, Servers: 5},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, original.Phase, copied.Phase)
+		assert.Equal(t, original.ConfiguredJobs, copied.ConfiguredJobs)
+		assert.Equal(t, original.ActiveJobs, copied.ActiveJobs)
+		require.Len(t, copied.Jobs, 2)
+		copied.Jobs[0].Name = "changed"
+		assert.Equal(t, "job1", original.Jobs[0].Name)
+		// Pxf is deep-copied independently of the source.
+		require.NotNil(t, copied.Pxf)
+		assert.True(t, copied.Pxf.Configured)
+		assert.Equal(t, int32(5), copied.Pxf.Servers)
+		copied.Pxf.Servers = 0
+		copied.Pxf.Configured = false
+		assert.Equal(t, int32(5), original.Pxf.Servers)
+		assert.True(t, original.Pxf.Configured)
+	})
+
+	t.Run("DataLoadingStatus with empty jobs", func(t *testing.T) {
+		original := &DataLoadingStatus{Phase: "Configured"}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, "Configured", copied.Phase)
+		assert.Nil(t, copied.Jobs)
+		assert.Nil(t, copied.Pxf)
+	})
+
+	t.Run("DataLoadingPxfStatus populated roundtrip", func(t *testing.T) {
+		// 105-S1/S3: the PXF status carries the observed-only Status and
+		// ExtensionsInstalled fields in addition to the config-derived ones.
+		original := &DataLoadingPxfStatus{
+			Configured:          true,
+			Servers:             5,
+			Status:              "Running",
+			ExtensionsInstalled: []string{"pxf", "pxf_fdw"},
+		}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Equal(t, original.Configured, copied.Configured)
+		assert.Equal(t, original.Servers, copied.Servers)
+		assert.Equal(t, original.Status, copied.Status)
+		assert.Equal(t, original.ExtensionsInstalled, copied.ExtensionsInstalled)
+
+		// The ExtensionsInstalled slice must be a DEEP copy: mutating the copy's
+		// slice (element + length) must not alias back to the source.
+		copied.ExtensionsInstalled[0] = "mutated"
+		copied.ExtensionsInstalled = append(copied.ExtensionsInstalled, "extra")
+		assert.Equal(t, []string{"pxf", "pxf_fdw"}, original.ExtensionsInstalled,
+			"deepcopy must not alias the ExtensionsInstalled slice")
+
+		// Mutating the scalar fields of the copy must not affect the source.
+		copied.Configured = false
+		copied.Servers = 0
+		copied.Status = "Stopped"
+		assert.True(t, original.Configured)
+		assert.Equal(t, int32(5), original.Servers)
+		assert.Equal(t, "Running", original.Status)
+	})
+
+	t.Run("DataLoadingPxfStatus nil ExtensionsInstalled roundtrip", func(t *testing.T) {
+		// 105-S3-B4: the ABSENT (nil) extensions case must round-trip as nil —
+		// deepcopy must never synthesize an empty slice for an unobservable probe.
+		original := &DataLoadingPxfStatus{Configured: true, Servers: 0}
+		copied := original.DeepCopy()
+		require.NotNil(t, copied)
+		assert.Nil(t, copied.ExtensionsInstalled)
+		assert.Empty(t, copied.Status)
 	})
 
 	t.Run("Toleration with TolerationSeconds", func(t *testing.T) {
@@ -1217,31 +1392,44 @@ func TestDeepCopy_SpecAndStatus_NonNil(t *testing.T) {
 
 	t.Run("DataLoadingSpec non-nil", func(t *testing.T) {
 		src := &DataLoadingSpec{
-			Enabled:         true,
-			StreamingServer: &StreamingServerSpec{Host: "h"},
-			Jobs:            []DataLoadingJob{{Name: "j"}},
+			Enabled: true,
+			Pxf:     &PxfSpec{Enabled: true, Image: "pxf:1.0"},
+			Gpfdist: &GpfdistSpec{Enabled: true, Replicas: ptr.To(int32(1))},
+			Jobs:    []DataLoadingJob{{Name: "j"}},
+			JobTemplate: &DataLoadingJobTemplate{
+				BackoffLimit: ptr.To(int32(3)),
+			},
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
 		assert.True(t, copied.Enabled)
 	})
 
-	t.Run("StreamingServerSpec non-nil with credential", func(t *testing.T) {
-		src := &StreamingServerSpec{
-			Host:             "h",
-			CredentialSecret: &SecretReference{Name: "c"},
+	t.Run("PxfSpec non-nil with servers", func(t *testing.T) {
+		src := &PxfSpec{
+			Enabled: true, Image: "pxf:1.0",
+			Extensions: &PxfExtensionsSpec{Pxf: ptr.To(true), PxfFdw: ptr.To(true)},
+			Servers: []PxfServerSpec{
+				{Name: "s1", Type: "s3", Config: map[string]string{"k": "v"},
+					CredentialSecrets: []SecretReference{{Name: "c"}}},
+			},
+			Resources: &ResourceRequirements{},
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
-		assert.Equal(t, "h", copied.Host)
+		assert.Equal(t, "pxf:1.0", copied.Image)
 	})
 
-	t.Run("DataLoadingJob with all sources", func(t *testing.T) {
+	t.Run("DataLoadingJob with pxf and gpload bodies", func(t *testing.T) {
 		src := &DataLoadingJob{
-			Name:           "j",
-			S3Source:       &S3SourceSpec{Bucket: "b", CredentialSecret: &SecretReference{Name: "s"}},
-			KafkaSource:    &KafkaSourceSpec{Brokers: []string{"b1"}},
-			RabbitMQSource: &RabbitMQSourceSpec{Host: "h", CredentialSecret: &SecretReference{Name: "r"}},
+			Name: "j",
+			PxfJob: &PxfJobSpec{
+				Server: "s1", Profile: "s3:parquet", TargetTable: "t",
+				FilterPushdown: ptr.To(true), ColumnProjection: ptr.To(true),
+				Partitioning:  &PartitioningSpec{Column: "c", Range: "r", Interval: "i"},
+				ErrorHandling: &ErrorHandlingSpec{SegmentRejectLimitType: "rows", LogErrors: ptr.To(true)},
+			},
+			GploadJob: &GploadJobSpec{TargetTable: "t", FilePaths: []string{"f"}},
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
@@ -1259,34 +1447,28 @@ func TestDeepCopy_SpecAndStatus_NonNil(t *testing.T) {
 		assert.True(t, copied.DiskMonitoring)
 	})
 
-	t.Run("S3SourceSpec non-nil", func(t *testing.T) {
-		src := &S3SourceSpec{
-			Bucket:           "b",
-			CredentialSecret: &SecretReference{Name: "c"},
+	t.Run("GpfdistSpec non-nil", func(t *testing.T) {
+		src := &GpfdistSpec{
+			Enabled: true, Replicas: ptr.To(int32(2)), Image: "g:1", Port: 8080,
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
-		assert.Equal(t, "b", copied.Bucket)
+		assert.Equal(t, int32(8080), copied.Port)
 	})
 
-	t.Run("KafkaSourceSpec non-nil", func(t *testing.T) {
-		src := &KafkaSourceSpec{
-			Brokers: []string{"b1", "b2"},
-			Topic:   "t",
+	t.Run("DataLoadingJobTemplate non-nil", func(t *testing.T) {
+		src := &DataLoadingJobTemplate{
+			Resources:               &ResourceRequirements{},
+			NodeSelector:            map[string]string{"k": "v"},
+			Tolerations:             []Toleration{{Key: "k"}},
+			ServiceAccountName:      "sa",
+			BackoffLimit:            ptr.To(int32(3)),
+			ActiveDeadlineSeconds:   ptr.To(int64(14400)),
+			TTLSecondsAfterFinished: ptr.To(int32(86400)),
 		}
 		copied := src.DeepCopy()
 		require.NotNil(t, copied)
-		assert.Len(t, copied.Brokers, 2)
-	})
-
-	t.Run("RabbitMQSourceSpec non-nil", func(t *testing.T) {
-		src := &RabbitMQSourceSpec{
-			Host:             "h",
-			CredentialSecret: &SecretReference{Name: "c"},
-		}
-		copied := src.DeepCopy()
-		require.NotNil(t, copied)
-		assert.Equal(t, "h", copied.Host)
+		assert.Equal(t, "sa", copied.ServiceAccountName)
 	})
 }
 
@@ -1528,4 +1710,83 @@ func TestS3VaultSecret_DeepCopy(t *testing.T) {
 		assert.Equal(t, "secret/data/cloudberry/backup-s3", src.VaultSecret.Path)
 		assert.NotSame(t, src.VaultSecret, copied.VaultSecret)
 	})
+}
+
+// TestDataLoadingJobStatus_ExecutionFields exercises the additive execution
+// status fields (lastRun/lastStatus/rowsLoaded/duration): backward-compatible
+// marshaling of a {name,enabled}-only status, a full round-trip with all four
+// fields set, and deep-copy independence of the *metav1.Time and *int64
+// pointers.
+func TestDataLoadingJobStatus_ExecutionFields(t *testing.T) {
+	t.Run("name+enabled only marshals identically (backward compatible)", func(t *testing.T) {
+		s := DataLoadingJobStatus{Name: "job1", Enabled: true}
+		data, err := json.Marshal(s)
+		require.NoError(t, err)
+		// The four optional execution fields must be omitted entirely when unset.
+		assert.JSONEq(t, `{"name":"job1","enabled":true}`, string(data))
+		assert.NotContains(t, string(data), "lastRun")
+		assert.NotContains(t, string(data), "lastStatus")
+		assert.NotContains(t, string(data), "rowsLoaded")
+		assert.NotContains(t, string(data), "duration")
+	})
+
+	t.Run("full execution fields JSON round-trip", func(t *testing.T) {
+		now := metav1.Now()
+		src := DataLoadingJobStatus{
+			Name:       "s3-parquet-loader",
+			Enabled:    true,
+			LastRun:    &now,
+			LastStatus: "Succeeded",
+			RowsLoaded: ptr.To[int64](183961),
+			Duration:   "1m30s",
+		}
+		data, err := json.Marshal(src)
+		require.NoError(t, err)
+
+		var got DataLoadingJobStatus
+		require.NoError(t, json.Unmarshal(data, &got))
+		assert.Equal(t, src.Name, got.Name)
+		assert.Equal(t, src.Enabled, got.Enabled)
+		assert.Equal(t, src.LastStatus, got.LastStatus)
+		assert.Equal(t, src.Duration, got.Duration)
+		require.NotNil(t, got.RowsLoaded)
+		assert.Equal(t, int64(183961), *got.RowsLoaded)
+		require.NotNil(t, got.LastRun)
+	})
+
+	t.Run("DeepCopy independence of pointer fields", func(t *testing.T) {
+		now := metav1.Now()
+		src := DataLoadingJobStatus{
+			Name:       "job1",
+			Enabled:    true,
+			LastRun:    &now,
+			LastStatus: "Succeeded",
+			RowsLoaded: ptr.To[int64](100),
+			Duration:   "2m",
+		}
+		dst := src.DeepCopy()
+		require.NotNil(t, dst)
+		require.NotNil(t, dst.RowsLoaded)
+		require.NotNil(t, dst.LastRun)
+
+		// The pointers must be independent copies, not aliases of the source.
+		assert.NotSame(t, src.RowsLoaded, dst.RowsLoaded)
+		assert.NotSame(t, src.LastRun, dst.LastRun)
+
+		// Mutating the copy must not affect the source.
+		*dst.RowsLoaded = 999
+		dst.LastStatus = "Failed"
+		dst.Duration = "9m"
+		assert.Equal(t, int64(100), *src.RowsLoaded)
+		assert.Equal(t, "Succeeded", src.LastStatus)
+		assert.Equal(t, "2m", src.Duration)
+	})
+}
+
+// TestEventReasonDataLoadingDisabled pins the Scenario 112 (DIS.1) event-reason
+// constant: the one-shot Normal event emitted when the data-loading subsystem is
+// torn down (dataLoading.enabled=false). Its stable string value is part of the
+// observable contract (consumers match on the literal reason).
+func TestEventReasonDataLoadingDisabled(t *testing.T) {
+	assert.Equal(t, "DataLoadingDisabled", EventReasonDataLoadingDisabled)
 }

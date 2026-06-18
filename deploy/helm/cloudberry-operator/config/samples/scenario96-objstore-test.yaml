@@ -1,0 +1,294 @@
+# =============================================================================
+# Scenario 96 — Object Store Profiles & Format Write-Capability
+# =============================================================================
+# Object-store-focused acceptance cluster modeled on scenario93-acceptance-test
+# but with dataLoading.pxf.servers = the OBJECT-STORE set and dataLoading.jobs
+# covering live reads (s3:text/json on the MinIO-backed servers) AND the
+# write-capability matrix FF.1-FF.3 (mode: writable export jobs).
+#
+# Cluster name is "objstore-test" (NOT acceptance-test) so it does not clash with
+# the deployed scenario93 acceptance cluster. Namespace cloudberry-test.
+#
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl) + Vault KV secrets + Vault k8s auth
+#   - Keycloak OIDC
+#   - Query monitoring: postgres-exporter on segments+mirrors
+#     + cloudberry-query-exporter
+#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - deletionPolicy Retain
+#
+# OBJECT-STORE SERVERS:
+#   - s3-datalake     : MinIO (live), AWS-style s3 (points at MinIO for live read)
+#   - minio-warehouse : MinIO (live), path-style (fs.s3a.path.style.access=true),
+#                       bucket cloudberry-warehouse
+#   - gcs-datalake    : gs   (CONFIG-ONLY, dummy GCS config — no backing store)
+#   - adls-gen2       : abfss(CONFIG-ONLY, dummy Azure ADLS Gen2 config)
+#   - azure-blob      : wasbs(CONFIG-ONLY, dummy Azure Blob config)
+#   - dell-ecs        : s3 + custom fs.s3a.endpoint (CONFIG-ONLY, dummy endpoint)
+#
+# JOBS:
+#   live reads : s3:text + s3:json on minio-warehouse (and s3:text on s3-datalake)
+#   writable   : FF.1 s3:text, FF.2 s3:parquet, FF.3 s3:avro (mode: writable)
+#
+# CONFIG-ONLY NOTE: gs/abfss/wasbs/Dell-ECS have no local backing store, so they
+# carry dummy config and are config-only (server-config + LOCATION correctness
+# proven by tests, NOT live reads). ORC is also config-only (not synthesizable).
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: objstore-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "96"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: objstore-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # --- MinIO-backed (LIVE) ---
+        - name: s3-datalake
+          type: s3
+          config:
+            # Points at MinIO for live reads (AWS-style addressing).
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        - name: minio-warehouse
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        # --- CONFIG-ONLY object stores (dummy config, no local backing store) ---
+        - name: gcs-datalake
+          type: gs
+          config:
+            # CONFIG-ONLY: dummy GCS config — no live GCS backing store.
+            fs.s3a.endpoint: "storage.googleapis.com"
+            fs.gs.project.id: "cloudberry-demo"
+        - name: adls-gen2
+          type: abfss
+          config:
+            # CONFIG-ONLY: dummy Azure ADLS Gen2 config.
+            fs.s3a.endpoint: "cloudberrydemo.dfs.core.windows.net"
+        - name: azure-blob
+          type: wasbs
+          config:
+            # CONFIG-ONLY: dummy Azure Blob config.
+            fs.s3a.endpoint: "cloudberrydemo.blob.core.windows.net"
+        - name: dell-ecs
+          type: s3
+          config:
+            # CONFIG-ONLY: S3-compatible with a CUSTOM endpoint override.
+            fs.s3a.endpoint: "https://ecs.dell.example.com:9021"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      # --- LIVE reads (synthesizable formats on MinIO-backed servers) ---
+      - name: s3-text-read
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: minio-warehouse
+          profile: "s3:text"
+          resource: "cloudberry-warehouse/text/data.csv"
+          targetTable: "public.os_text_read"
+      - name: s3-json-read
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: minio-warehouse
+          profile: "s3:json"
+          resource: "cloudberry-warehouse/json/data.json"
+          targetTable: "public.os_json_read"
+      - name: s3-datalake-text-read
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/text/data.csv"
+          targetTable: "public.os_datalake_text_read"
+      # --- WRITABLE export matrix FF.1-FF.3 (mode: writable) ---
+      - name: ff1-s3-text-write
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          mode: writable
+          resource: "cloudberry-warehouse/exports/text/"
+          targetTable: "public.ff1_export_src"
+      - name: ff2-s3-parquet-write
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:parquet"
+          mode: writable
+          resource: "cloudberry-warehouse/exports/parquet/"
+          targetTable: "public.ff2_export_src"
+      - name: ff3-s3-avro-write
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:avro"
+          mode: writable
+          resource: "cloudberry-warehouse/exports/avro/"
+          targetTable: "public.ff3_export_src"
+
+  deletionPolicy: Retain

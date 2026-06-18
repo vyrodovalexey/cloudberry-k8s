@@ -1,11 +1,13 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,6 +228,46 @@ func newMockPgxClient(t *testing.T, responder func(query string) []byte) (*pgxCl
 	require.NoError(t, err)
 	poolCfg.MaxConns = 1
 	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	require.NoError(t, err)
+
+	client := &pgxClient{
+		pool:      pool,
+		config:    Config{Host: host, Port: 5432, Database: "testdb"},
+		retryOpts: util.RetryOptions{MaxRetries: 1, InitialBackoff: time.Millisecond},
+		logger:    slog.Default(),
+	}
+
+	return client, func() {
+		pool.Close()
+		cleanup()
+	}
+}
+
+// newMockPgxClientWithTracer is newMockPgxClient with the pgxQueryTracer
+// installed on the pool config BEFORE the pool is built (mirroring NewClient),
+// so per-statement "db.query" child spans are produced. Used to prove the
+// QueryTracer still nests inside a W3-C2 operation span.
+func newMockPgxClientWithTracer(t *testing.T, responder func(query string) []byte) (*pgxClient, func()) {
+	t.Helper()
+
+	addr, cleanup := mockPGServer(t, func(backend *pgproto3.Backend, conn net.Conn) {
+		handleSimpleQueries(backend, conn, responder)
+	})
+
+	host, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+
+	connStr := "host=" + host + " port=" + port + " dbname=testdb user=testuser password=testpass sslmode=disable"
+	poolCfg, err := pgxpool.ParseConfig(connStr)
+	require.NoError(t, err)
+	poolCfg.MaxConns = 1
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	poolCfg.ConnConfig.Tracer = &pgxQueryTracer{database: "testdb"}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1231,6 +1273,51 @@ func TestPgxClient_SetParameter_Error(t *testing.T) {
 	assert.Contains(t, err.Error(), "setting parameter")
 }
 
+// TestSetParameter_ErrorOmitsValue is the W1-D1 SECURITY guarantee on the error
+// path: the returned error must name the parameter and scope but MUST NOT leak
+// the GUC value (TASK 11).
+func TestSetParameter_ErrorOmitsValue(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(_ string) []byte {
+		return errorResponseMsg("permission denied")
+	})
+	defer cleanup()
+
+	err := client.SetParameter(context.Background(), "x", "SUPERSECRET",
+		ParameterScope{Level: "cluster"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "setting parameter x")
+	assert.Contains(t, err.Error(), "scope=cluster")
+	assert.NotContains(t, err.Error(), "SUPERSECRET",
+		"the GUC value must never appear in the error string (W1-D1 redaction)")
+}
+
+// TestSetParameter_InfoLogOmitsValue is the W1-D1 SECURITY guarantee on the
+// success path: the Info-level audit log records the parameter name and scope
+// but MUST NOT contain the value (which is gated behind Debug, disabled here)
+// (TASK 11).
+func TestSetParameter_InfoLogOmitsValue(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(_ string) []byte {
+		return execResponse("ALTER SYSTEM")
+	})
+	defer cleanup()
+
+	// An Info-level handler over a buffer: Debug (where the value is logged) is
+	// disabled, so a leaked value would only be visible if it were logged at
+	// Info — exactly what W1-D1 forbids.
+	var buf bytes.Buffer
+	client.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	require.NoError(t, client.SetParameter(context.Background(), "x", "SUPERSECRET",
+		ParameterScope{Level: "cluster"}))
+
+	out := buf.String()
+	assert.Contains(t, out, "parameter set", "the Info audit line must be emitted")
+	assert.Contains(t, out, "name=x")
+	assert.Contains(t, out, "scope=cluster")
+	assert.NotContains(t, out, "SUPERSECRET",
+		"the GUC value must not appear at Info level (value is Debug-only, W1-D1)")
+}
+
 func TestPgxClient_CreateResourceGroup_Error(t *testing.T) {
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return errorResponseMsg("resource group exists")
@@ -1283,39 +1370,6 @@ func TestPgxClient_DropResourceGroup_Error(t *testing.T) {
 	err := client.DropResourceGroup(context.Background(), "busy_group")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dropping resource group")
-}
-
-func TestPgxClient_GetClusterState_Mock(t *testing.T) {
-	callCount := 0
-	client, cleanup := newMockPgxClient(t, func(query string) []byte {
-		callCount++
-		switch {
-		case callCount == 1:
-			// Ping
-			return execResponse("SELECT 1")
-		case callCount == 2:
-			// SHOW server_version
-			return singleRowResponse([]string{"server_version"}, []string{"14.0"})
-		case callCount == 3:
-			// Segment counts
-			return singleRowResponseTyped(
-				[]fieldDesc{int4Field("up"), int4Field("down"), int4Field("total")},
-				[]string{"4", "0", "4"},
-			)
-		default:
-			// Connection counts
-			return singleRowResponseTyped(
-				[]fieldDesc{int4Field("active"), int4Field("max_conn")},
-				[]string{"10", "100"},
-			)
-		}
-	})
-	defer cleanup()
-
-	state, err := client.GetClusterState(context.Background())
-	assert.NoError(t, err)
-	assert.True(t, state.IsUp)
-	assert.Equal(t, "14.0", state.Version)
 }
 
 // TestPgxClient_RegisterNewSegments_Mock tests segment registration with mock PG server.
@@ -2086,22 +2140,6 @@ func TestPgxClient_DeregisterSegments_Errors(t *testing.T) {
 	})
 }
 
-// TestPgxClient_GetClusterState_PingError tests GetClusterState when ping fails.
-func TestPgxClient_GetClusterState_PingError(t *testing.T) {
-	client, cleanup := newMockPgxClient(t, func(query string) []byte {
-		return execResponse("SELECT 1")
-	})
-	defer cleanup()
-
-	client.pool.Close()
-
-	state, err := client.GetClusterState(context.Background())
-	assert.Error(t, err)
-	assert.NotNil(t, state)
-	assert.False(t, state.IsUp)
-	assert.Contains(t, err.Error(), "database ping failed")
-}
-
 // TestPgxClient_GetSegmentConfiguration_ScanError tests scan error in GetSegmentConfiguration.
 func TestPgxClient_GetSegmentConfiguration_ScanError(t *testing.T) {
 	// Return wrong number of columns to trigger scan error
@@ -2818,6 +2856,238 @@ func TestPgxClient_SetupExporterRole_GrantViewErrorIgnored(t *testing.T) {
 
 	err := client.SetupExporterRole(context.Background(), "pass")
 	assert.NoError(t, err)
+}
+
+// ============================================================================
+// SetupPXFExtensions Tests (best-effort, non-fatal contract)
+// ============================================================================
+
+// pxfProbeRow is the bool response for the "SELECT true" connectivity probe.
+func pxfProbeRow() []byte {
+	return singleRowResponseTyped([]fieldDesc{boolField("bool")}, []string{"t"})
+}
+
+// recordingResponder wraps a responder, capturing every query it sees into the
+// returned slice pointer so a test can assert which statements were executed
+// (GRANT presence/absence). The mutex guards concurrent pool access.
+func recordingResponder(inner func(query string) []byte) (func(query string) []byte, *[]string) {
+	var mu sync.Mutex
+	var queries []string
+	wrapped := func(query string) []byte {
+		mu.Lock()
+		queries = append(queries, query)
+		mu.Unlock()
+		return inner(query)
+	}
+	return wrapped, &queries
+}
+
+// countQueriesContaining returns the number of recorded queries containing sub.
+func countQueriesContaining(queries []string, sub string) int {
+	n := 0
+	for _, q := range queries {
+		if strings.Contains(q, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestPgxClient_SetupPXFExtensions_BothSucceed(t *testing.T) {
+	responder, queries := recordingResponder(func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT true"):
+			return pxfProbeRow()
+		case strings.Contains(query, "CREATE EXTENSION"):
+			return execResponse("CREATE EXTENSION")
+		case strings.Contains(query, "GRANT"):
+			return execResponse("GRANT")
+		default:
+			return execResponse("OK")
+		}
+	})
+	client, cleanup := newMockPgxClient(t, responder)
+	defer cleanup()
+
+	installed, err := client.SetupPXFExtensions(context.Background())
+	assert.NoError(t, err)
+	// Both pxf and pxf_fdw installed → installed count is 2.
+	assert.Equal(t, 2, installed)
+
+	// RP.11: pxf installed → GRANT SELECT and GRANT INSERT ON PROTOCOL pxf are
+	// issued to the sanitized "gpadmin" data-loader role.
+	assert.Equal(t, 1, countQueriesContaining(*queries, `GRANT SELECT ON PROTOCOL pxf TO "gpadmin"`))
+	assert.Equal(t, 1, countQueriesContaining(*queries, `GRANT INSERT ON PROTOCOL pxf TO "gpadmin"`))
+}
+
+func TestPgxClient_SetupPXFExtensions_PxfFailsFdwSucceeds(t *testing.T) {
+	responder, queries := recordingResponder(func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT true"):
+			return pxfProbeRow()
+		case strings.Contains(query, `"pxf_fdw"`):
+			return execResponse("CREATE EXTENSION")
+		case strings.Contains(query, "CREATE EXTENSION"):
+			// The plain "pxf" extension is unavailable in this image.
+			return errorResponseMsg(`extension "pxf" is not available`)
+		default:
+			return execResponse("OK")
+		}
+	})
+	client, cleanup := newMockPgxClient(t, responder)
+	defer cleanup()
+
+	// Best-effort: a failing pxf with a succeeding pxf_fdw still returns nil.
+	installed, err := client.SetupPXFExtensions(context.Background())
+	assert.NoError(t, err)
+	// Only pxf_fdw installed (pxf failed) → installed count is 1.
+	assert.Equal(t, 1, installed)
+
+	// RP.11: pxf did NOT install → the PROTOCOL pxf GRANTs are NOT attempted.
+	assert.Zero(t, countQueriesContaining(*queries, "GRANT"),
+		"no GRANT must be issued when the pxf extension is absent")
+}
+
+func TestPgxClient_SetupPXFExtensions_BothFailBenign(t *testing.T) {
+	responder, queries := recordingResponder(func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT true"):
+			return pxfProbeRow()
+		case strings.Contains(query, "CREATE EXTENSION"):
+			// Neither pxf nor pxf_fdw is available — both fail benignly.
+			return errorResponseMsg("extension not available")
+		default:
+			return execResponse("OK")
+		}
+	})
+	client, cleanup := newMockPgxClient(t, responder)
+	defer cleanup()
+
+	// Non-fatal: both extensions unavailable on a reachable DB returns nil.
+	installed, err := client.SetupPXFExtensions(context.Background())
+	assert.NoError(t, err)
+	// Reachable DB but nothing installed → installed count is 0 (retryable).
+	assert.Zero(t, installed)
+	assert.Zero(t, countQueriesContaining(*queries, "GRANT"))
+}
+
+// TestPgxClient_SetupPXFExtensions_GrantFailsNonFatal proves the PROTOCOL pxf
+// GRANTs are best-effort: the pxf extension installs but the GRANTs error (e.g.
+// the protocol is absent on a stub image) and the method still returns nil.
+func TestPgxClient_SetupPXFExtensions_GrantFailsNonFatal(t *testing.T) {
+	responder, queries := recordingResponder(func(query string) []byte {
+		switch {
+		case strings.Contains(query, "SELECT true"):
+			return pxfProbeRow()
+		case strings.Contains(query, "CREATE EXTENSION"):
+			return execResponse("CREATE EXTENSION")
+		case strings.Contains(query, "GRANT"):
+			return errorResponseMsg(`protocol "pxf" does not exist`)
+		default:
+			return execResponse("OK")
+		}
+	})
+	client, cleanup := newMockPgxClient(t, responder)
+	defer cleanup()
+
+	installed, err := client.SetupPXFExtensions(context.Background())
+	assert.NoError(t, err)
+	// Both extensions installed even though the GRANTs failed best-effort.
+	assert.Equal(t, 2, installed)
+	// Both GRANTs were attempted (best-effort) even though they failed.
+	assert.Equal(t, 2, countQueriesContaining(*queries, "GRANT"))
+}
+
+func TestPgxClient_SetupPXFExtensions_ConnectivityError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		// The connectivity probe itself fails => hard error surfaced.
+		return errorResponseMsg("server closed the connection")
+	})
+	defer cleanup()
+
+	installed, err := client.SetupPXFExtensions(context.Background())
+	require.Error(t, err)
+	assert.Zero(t, installed)
+	assert.Contains(t, err.Error(), "probing connectivity")
+}
+
+// ============================================================================
+// ListPXFExtensions Tests (read-only, observed-only honesty contract)
+// ============================================================================
+
+// TestPgxClient_ListPXFExtensions_BothInstalled covers 105-S3-B1: a reachable DB
+// with both extensions present returns ["pxf","pxf_fdw"] in deterministic
+// (ascending) order, exactly as the catalog query (ORDER BY extname) yields.
+func TestPgxClient_ListPXFExtensions_BothInstalled(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		// The pg_extension probe returns both rows, ascending.
+		return multiRowResponse([]string{"extname"}, [][]string{{"pxf"}, {"pxf_fdw"}})
+	})
+	defer cleanup()
+
+	exts, err := client.ListPXFExtensions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pxf", "pxf_fdw"}, exts)
+}
+
+// TestPgxClient_ListPXFExtensions_OnlyPxf covers 105-S3-B2: an HONEST subset —
+// only "pxf" present in pg_extension → exactly ["pxf"] (never padded with
+// fabricated names).
+func TestPgxClient_ListPXFExtensions_OnlyPxf(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return multiRowResponse([]string{"extname"}, [][]string{{"pxf"}})
+	})
+	defer cleanup()
+
+	exts, err := client.ListPXFExtensions(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pxf"}, exts)
+}
+
+// TestPgxClient_ListPXFExtensions_None covers 105-S3-B3: a reachable DB with
+// neither extension present → an empty slice + nil error. The probe was
+// OBSERVABLE (DB reachable) and honestly reports nothing installed; the caller
+// then leaves the field absent.
+func TestPgxClient_ListPXFExtensions_None(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return emptyRowResponse([]string{"extname"})
+	})
+	defer cleanup()
+
+	exts, err := client.ListPXFExtensions(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, exts)
+}
+
+// TestPgxClient_ListPXFExtensions_QueryError covers 105-S3-B4: a query/
+// connectivity error is SURFACED (wrapped), so the caller can treat the probe as
+// UNOBSERVABLE (extensions absent) rather than as "none installed".
+func TestPgxClient_ListPXFExtensions_QueryError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return errorResponseMsg("server closed the connection")
+	})
+	defer cleanup()
+
+	exts, err := client.ListPXFExtensions(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, exts)
+	assert.Contains(t, err.Error(), "querying pg_extension")
+}
+
+// TestPgxClient_ListPXFExtensions_ScanError covers 105-S3-B4 (row-scan path): a
+// row with the wrong column count triggers a scan error, which is SURFACED
+// (wrapped) so the caller treats the probe as UNOBSERVABLE rather than empty.
+func TestPgxClient_ListPXFExtensions_ScanError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		// Two columns where the scan expects one → scan error.
+		return multiRowResponse([]string{"extname", "extra"}, [][]string{{"pxf", "boom"}})
+	})
+	defer cleanup()
+
+	exts, err := client.ListPXFExtensions(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, exts)
+	assert.Contains(t, err.Error(), "scanning PXF extension name")
 }
 
 // ============================================================================

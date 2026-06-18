@@ -1,0 +1,219 @@
+# =============================================================================
+# Scenario 101 — gpfdist Deployment + Job 4 (gpload-csv)
+# =============================================================================
+# Acceptance-test cluster (modeled on scenario93-acceptance-test.yaml) with:
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl) + Vault k8s auth
+#   - OIDC
+#   - Query monitoring: postgres-exporter on segments+mirrors
+#     + cloudberry-query-exporter
+#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - deletionPolicy Retain
+#
+# Scenario 101 ADDITIONS:
+#   - dataLoading.gpfdist {enabled:true, replicas:1, image cloudberry-gpfdist:2.1.0,
+#     port 8080}. replicas:1 because the gpfdist PVC is RWO (one writer); for the
+#     live run a single replica serves /data/incoming/*.csv.
+#   - dataLoading.jobs: the gpload-csv job EXACTLY per the spec example — a gpload
+#     CronJob (schedule */30) whose control file (rendered by the operator) reads
+#     gpfdist://gpfdist-test-gpfdist-svc:8080/incoming/*.csv and loads
+#     public.raw_data (mode insert, csv, header, UTF-8, error-limit 50 + log-errors,
+#     preload truncate, postAction ANALYZE).
+#
+# NOTE: the gpfdist image cloudberry-gpfdist:2.1.0 must exist (devops builds it).
+# Seed the gpfdist PVC's /data/incoming with the CSV sample
+# (gen-gpload-csv.sh --emit-seed-job | kubectl apply -f -) and create
+# public.raw_data before the gpload CronJob fires. The honest "data loads" proof
+# is SELECT count(*) FROM public.raw_data > 0; gpfdist Deployment readiness is
+# observed via kubectl (kube-state-metrics absent). cloudberry_gpfdist_* stay
+# PLANNED; gpload reuses cloudberry_data_loading_*.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: gpfdist-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "101"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: gpfdist-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    # gpfdist file-server: serves /data/incoming/*.csv to the gpload job over
+    # gpfdist://gpfdist-test-gpfdist-svc:8080. RWO PVC -> replicas:1.
+    gpfdist:
+      enabled: true
+      replicas: 1
+      image: "cloudberry-gpfdist:2.1.0"
+      port: 8080
+    jobs:
+      # gpload-csv (Job 4) — EXACTLY the spec example. The operator renders a
+      # gpload control file from this and runs `gpload -f /etc/gpload/gpload-csv.yml`
+      # on the */30 schedule (CronJob), loading public.raw_data from the gpfdist
+      # CSVs.
+      - name: gpload-csv
+        type: gpload
+        enabled: true
+        schedule: "*/30 * * * *"
+        gploadJob:
+          targetTable: public.raw_data
+          mode: insert
+          format: csv
+          inputSource:
+            type: gpfdist
+          filePaths:
+            - "/incoming/*.csv"
+          delimiter: ","
+          header: true
+          encoding: UTF-8
+          errorHandling:
+            segmentRejectLimit: 50
+            segmentRejectLimitType: rows
+            logErrors: true
+          preload:
+            truncate: true
+          postActions:
+            - "ANALYZE public.raw_data"
+
+  deletionPolicy: Retain

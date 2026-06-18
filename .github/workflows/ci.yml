@@ -21,6 +21,7 @@ env:
   DOCKER_IMAGE_CLOUDBERRY: ghcr.io/${{ github.repository }}-cloudberry
   DOCKER_IMAGE_QUERY_EXPORTER: ghcr.io/${{ github.repository }}-query-exporter
   DOCKER_IMAGE_BACKUP: ghcr.io/${{ github.repository }}-backup
+  DOCKER_IMAGE_GPFDIST: ghcr.io/${{ github.repository }}-gpfdist
   HELM_CHART_PATH: deploy/helm/cloudberry-operator
 
 jobs:
@@ -114,58 +115,13 @@ jobs:
           VAULT_DEV_ROOT_TOKEN_ID: myroot
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
 
-      keycloakdb:
-        image: postgres:16
-        env:
-          POSTGRES_DB: keycloak
-          POSTGRES_USER: keycloak
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd "pg_isready -U keycloak"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 10s
-
-      keycloak:
-        image: quay.io/keycloak/keycloak:26.5
-        command: start-dev
-        env:
-          KC_DB: postgres
-          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
-          KC_DB_USERNAME: keycloak
-          KC_DB_PASSWORD: password
-          KC_HTTP_PORT: 8090
-          KC_HOSTNAME_STRICT: "false"
-          KC_HOSTNAME_STRICT_HTTPS: "false"
-          KC_HTTP_ENABLED: "true"
-          KC_PROXY_HEADERS: xforwarded
-          KC_FEATURES: token-exchange,admin-fine-grained-authz
-          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
-          KC_LOG_LEVEL: info
-          KC_METRICS_ENABLED: "true"
-          KC_HEALTH_ENABLED: "true"
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-        ports:
-          - 8090:8090
-          - 8091:9000
-
-      minio:
-        image: minio/minio:RELEASE.2024-11-07T00-52-20Z
-        command: server /data --console-address ":9001"
-        ports:
-          - 9000:9000
-          - 9001:9001
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
+      # NOTE: Keycloak (+ keycloakdb) and MinIO are NOT declared as services
+      # here. GitHub Actions service containers do NOT support the `command:`
+      # key (only image/env/ports/volumes/options/credentials). Keycloak
+      # requires `start-dev` and MinIO requires `server /data ...` — without
+      # these commands the containers print help and exit immediately.
+      # They are started via docker compose in the step below, which correctly
+      # passes the command and keeps CI identical to the local test environment.
 
       kafka:
         image: apache/kafka:3.9.0
@@ -209,13 +165,12 @@ jobs:
           - 9428:9428
 
       # NOTE: HDFS + Hive (namenode, datanode, hive-metastore-db, hive-metastore,
-      # hiveserver2) are NOT declared as `services:` here. GitHub Actions service
-      # containers start BEFORE the repo is checked out, so the XML config files
-      # under test/docker-compose/{hadoop,hive} cannot be bind-mounted and a
-      # custom start command cannot be supplied (services support only image/env/
-      # ports/volumes/options). Instead the Hive/HDFS stack is started from the
-      # project's own docker-compose file in the "Start Hive + HDFS" step below,
-      # after checkout — keeping CI identical to the local test environment.
+      # hiveserver2) are also NOT declared as `services:` here. GitHub Actions
+      # service containers start BEFORE the repo is checked out, so the XML
+      # config files under test/docker-compose/{hadoop,hive} cannot be
+      # bind-mounted. Instead the Hive/HDFS stack is started from the project's
+      # own docker-compose file in the step below, after checkout — keeping CI
+      # identical to the local test environment.
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -224,13 +179,17 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # HDFS + Hive started via docker compose (config files require checkout).
-      # Runs in the background while the inline `services:` finish warming up.
-      - name: Start Hive + HDFS (docker compose)
+      # Keycloak, MinIO, and HDFS/Hive are started via docker compose because
+      # they need a custom `command:` or bind-mounted config files — neither of
+      # which GitHub Actions `services:` supports. Runs in the background while
+      # the inline `services:` (vault, kafka, rabbitmq, victorialogs) warm up.
+      - name: Start compose services (Keycloak, MinIO, Hive, HDFS, MySQL, PgSource, HBase)
         run: |
           docker compose -f test/docker-compose/docker-compose.yml up -d \
-            namenode datanode hive-metastore-db hive-metastore hiveserver2
-          echo "Hive/HDFS containers launched; readiness checked in the next step."
+            keycloakdb keycloak_web minio \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2 \
+            mysql pgsource hbase
+          echo "Compose containers launched; readiness checked in the next step."
 
       - name: Wait for services
         run: |
@@ -289,6 +248,24 @@ jobs:
             echo "  attempt $i …"; sleep 3
           done
 
+          echo "--- MySQL (3306) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 3306 > /dev/null 2>&1 && echo "MySQL ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- PostgreSQL source (5432) ---"
+          for i in {1..30}; do
+            nc -z -w 3 127.0.0.1 5432 > /dev/null 2>&1 && echo "PgSource ready" && break
+            echo "  attempt $i …"; sleep 2
+          done
+
+          echo "--- HBase (ZooKeeper 2181) ---"
+          for i in {1..60}; do
+            echo ruok | nc -w 3 127.0.0.1 2181 2>/dev/null | grep -q imok && echo "HBase ZooKeeper ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
       - name: Setup Vault
         env:
           VAULT_ADDR: http://127.0.0.1:8200
@@ -321,6 +298,47 @@ jobs:
           METASTORE_PORT: "9083"
         run: bash test/docker-compose/scripts/setup-hive-hdfs.sh
 
+      - name: Setup JDBC sources
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+        run: bash test/docker-compose/scripts/setup-jdbc-sources.sh --ci
+
+      - name: Setup HBase
+        run: bash test/docker-compose/scripts/setup-hbase.sh
+
+      - name: Generate object-store samples
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+        run: bash test/docker-compose/scripts/gen-objstore-samples.sh --no-docker
+
+      - name: Generate Hadoop samples
+        env:
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+        run: bash test/docker-compose/scripts/gen-hadoop-samples.sh --ci
+
+      - name: Generate pushdown samples
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+        run: bash test/docker-compose/scripts/gen-pushdown-samples.sh --no-docker
+
+      - name: Generate export targets (Scenario 99)
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          PG_CONTAINER: pgsource
+        run: bash test/docker-compose/scripts/gen-export-targets.sh
+
+      - name: Generate gpload CSV samples (Scenario 101)
+        run: bash test/docker-compose/scripts/gen-gpload-csv.sh
+
+      - name: Generate kafka-cdc samples (Scenario 102)
+        env:
+          KAFKA_BROKERS: 127.0.0.1:9094
+        run: bash test/docker-compose/scripts/gen-kafka-cdc.sh
+
       - name: Run functional tests
         env: &test-env
           VAULT_ADDR: http://127.0.0.1:8200
@@ -337,6 +355,11 @@ jobs:
           HDFS_NAMENODE: hdfs://127.0.0.1:8020
           HIVE_METASTORE_URIS: thrift://127.0.0.1:9083
           HIVESERVER2_JDBC: jdbc:hive2://127.0.0.1:10000
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+          HBASE_ZOOKEEPER_QUORUM: 127.0.0.1:2181
           SKIP_DOCKER_COMPOSE: "true"
         run: |
           mkdir -p coverage
@@ -355,21 +378,23 @@ jobs:
           go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
             -tags=e2e -v -timeout 15m ./test/e2e/...
 
-      - name: Hive + HDFS diagnostics (on failure)
+      - name: Compose services diagnostics (on failure)
         if: failure()
         run: |
           echo "=== compose ps ==="
           docker compose -f test/docker-compose/docker-compose.yml ps || true
-          for c in namenode datanode hive-metastore-db hive-metastore hiveserver2; do
+          for c in keycloakdb keycloak_web minio namenode datanode hive-metastore-db hive-metastore hiveserver2 mysql pgsource hbase; do
             echo "=== logs: $c ==="
             docker logs --tail 80 "$c" 2>&1 || true
           done
 
-      - name: Tear down Hive + HDFS
+      - name: Tear down compose services
         if: always()
         run: |
           docker compose -f test/docker-compose/docker-compose.yml down -v \
-            namenode datanode hive-metastore-db hive-metastore hiveserver2 || true
+            keycloakdb keycloak_web minio \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2 \
+            mysql pgsource hbase || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -489,6 +514,10 @@ jobs:
           - name: backup
             dockerfile: Dockerfile.cloudberry-backup
             image_env: DOCKER_IMAGE_BACKUP
+          # gpfdist is a thin wrapper over cloudberry-official-pxf (Scenario 101).
+          - name: gpfdist
+            dockerfile: Dockerfile.cloudberry-gpfdist
+            image_env: DOCKER_IMAGE_GPFDIST
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -564,6 +593,7 @@ jobs:
           helm lint test/monitoring/vmagent
           helm lint test/monitoring/vector
           helm lint test/monitoring/node-exporter
+          helm lint test/monitoring/kube-state-metrics
 
       - name: Validate monitoring chart templates
         run: |
@@ -572,6 +602,7 @@ jobs:
           helm template vmagent test/monitoring/vmagent > /dev/null
           helm template vector test/monitoring/vector > /dev/null
           helm template node-exporter test/monitoring/node-exporter > /dev/null
+          helm template kube-state-metrics test/monitoring/kube-state-metrics > /dev/null
           echo "Monitoring chart template validation successful!"
 
       - name: Dry-run install monitoring charts
@@ -581,6 +612,7 @@ jobs:
           helm install --dry-run --debug vmagent test/monitoring/vmagent
           helm install --dry-run --debug vector test/monitoring/vector
           helm install --dry-run --debug node-exporter test/monitoring/node-exporter
+          helm install --dry-run --debug kube-state-metrics test/monitoring/kube-state-metrics
 
       - name: Validate monitoring chart Kubernetes manifests
         run: |
@@ -589,6 +621,7 @@ jobs:
           helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
           helm template vector test/monitoring/vector | kubectl apply --dry-run=client -f -
           helm template node-exporter test/monitoring/node-exporter | kubectl apply --dry-run=client -f -
+          helm template kube-state-metrics test/monitoring/kube-state-metrics | kubectl apply --dry-run=client -f -
           echo "Monitoring chart Kubernetes manifest validation successful!"
 
 
@@ -619,7 +652,7 @@ jobs:
         id: version
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
       - name: Build multi-platform binaries
         run: |
           mkdir -p bin
@@ -687,6 +720,9 @@ jobs:
           - name: backup
             dockerfile: Dockerfile.cloudberry-backup
             image_key: DOCKER_IMAGE_BACKUP
+          - name: gpfdist
+            dockerfile: Dockerfile.cloudberry-gpfdist
+            image_key: DOCKER_IMAGE_GPFDIST
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -723,7 +759,9 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           images=""
+          # shellcheck disable=SC2086
           for tag in ${TAGS}; do images+="${tag}@${DIGEST} "; done
+          # shellcheck disable=SC2086
           cosign sign --yes ${images}
 
   # ===========================================================================
@@ -761,6 +799,10 @@ jobs:
           - name: backup
             image_key: DOCKER_IMAGE_BACKUP
             skip_dirs: '/usr/local/bin'
+          # gpfdist: exclude the Cloudberry bin directory (same as cloudberry image).
+          - name: gpfdist
+            image_key: DOCKER_IMAGE_GPFDIST
+            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

@@ -206,7 +206,7 @@ parse_args() {
 
 # Validate the scenario name
 validate_scenario() {
-    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "scenario87" "scenario88" "custom")
+    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "scenario87" "scenario88" "scenario105" "custom")
     local found=false
 
     for s in "${valid_scenarios[@]}"; do
@@ -234,6 +234,9 @@ get_config_file() {
             ;;
         scenario88)
             echo "scenarios/scenario88-backup-status.yaml"
+            ;;
+        scenario105)
+            echo "scenarios/scenario105-pxf-status.yaml"
             ;;
         custom)
             echo "load.yaml"
@@ -446,6 +449,10 @@ print_test_summary() {
             echo -e "  ${CYAN}Scenario 88: Backup-status read-polling at 40 RPS for 2 minutes${NC}"
             echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
             ;;
+        scenario105)
+            echo -e "  ${CYAN}Scenario 105: PXF status read-polling at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
     esac
     echo ""
 }
@@ -649,6 +656,12 @@ analyze_results() {
             evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
             ;;
         scenario88)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario105)
             evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
             evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
             evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
@@ -1105,6 +1118,11 @@ run_hey() {
         scenario88)
             duration=120
             rps=40
+            concurrency=10
+            ;;
+        scenario105)
+            duration=120
+            rps=50
             concurrency=10
             ;;
         custom)

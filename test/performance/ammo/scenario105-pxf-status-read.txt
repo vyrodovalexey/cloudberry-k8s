@@ -1,0 +1,14 @@
+[Host: localhost:8190]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest]
+[Accept: application/json]
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test
+/api/v1alpha1/clusters/s105/data-loading/pxf/status?namespace=cloudberry-test

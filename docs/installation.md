@@ -453,10 +453,10 @@ For local development, the Docker Compose test environment includes VictoriaMetr
 
 #### Kubernetes Monitoring Stack (Makefile Targets)
 
-The Makefile provides dedicated targets for deploying the monitoring stack (vmagent + vector + otel-collector + node-exporter) to a Kubernetes cluster:
+The Makefile provides dedicated targets for deploying the monitoring stack (vmagent + vector + otel-collector + node-exporter + kube-state-metrics) to a Kubernetes cluster:
 
 ```bash
-# Deploy the monitoring stack (vmagent + vector + otel-collector + node-exporter)
+# Deploy the monitoring stack (vmagent + vector + otel-collector + node-exporter + kube-state-metrics)
 make monitoring-deploy
 
 # Check the status of the monitoring stack
@@ -473,7 +473,8 @@ make grafana-publish
 - **vmagent** (`test/monitoring/vmagent` Helm chart) — Prometheus-compatible metrics collection agent that remote-writes to VictoriaMetrics at `host.docker.internal:8428`
 - **node-exporter** (`test/monitoring/node-exporter` Helm chart) — node-level metrics
 - **vector** (`test/monitoring/vector` Helm chart) — tails the `kubernetes_logs` source and ships logs to VictoriaLogs at `host.docker.internal:9428`
-- **otel-collector** (`open-telemetry/opentelemetry-collector` Helm chart) — OpenTelemetry Collector with OTLP gRPC (port 4317) and HTTP (port 4318) receivers
+- **otel-collector** (`test/monitoring/otel-collector` Helm chart) — OpenTelemetry Collector with OTLP gRPC (port 4317) and HTTP (port 4318) receivers; the repo chart renders the service as `otel-collector`, matching the operator's `telemetry.otlpEndpoint`
+- **kube-state-metrics** (`test/monitoring/kube-state-metrics` Helm chart) — Kubernetes object-state metrics (`kube_job_*`, `kube_pod_init_container_status_*`, `kube_deployment_status_replicas_available`) scraped into VictoriaMetrics; added in Scenario 104 to make pre-load health-check failures (failed data-load Jobs / failed `dataload-healthcheck` init containers / gpfdist deployment readiness) observable in metrics
 
 **`monitoring-status`** shows the Helm release status and running pods for all components, plus the published Grafana dashboard URLs.
 

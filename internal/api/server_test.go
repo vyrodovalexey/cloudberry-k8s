@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -36,6 +37,7 @@ func newTestScheme() *runtime.Scheme {
 	_ = cbv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = batchv1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
 	return scheme
 }
 
@@ -1089,7 +1091,9 @@ func TestHandleListDataLoadingJobs(t *testing.T) {
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "job1", Type: "s3", TargetTable: "public.data"},
+			{Name: "job1", Type: "pxf", PxfJob: &cbv1alpha1.PxfJobSpec{
+				Server: "s3-datalake", Profile: "s3:parquet", TargetTable: "public.data",
+			}},
 		},
 	}
 	s := newTestServer(cluster)
@@ -1116,8 +1120,9 @@ func TestHandleListDataLoadingJobs_NotFound(t *testing.T) {
 }
 
 func TestHandleCreateDataLoadingJob(t *testing.T) {
-	// All data-loading mutation endpoints are honest 501 stubs until the
-	// data-loading feature is implemented (B-6).
+	// The full create-job behavior (and its 409/400 edges) is covered by the
+	// dedicated Scenario 107 suite; this case retains only the pre-mutation
+	// cluster-not-found contract.
 	t.Run("cluster not found returns 404", func(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
 		s := newTestServer(cluster)
@@ -1128,19 +1133,6 @@ func TestHandleCreateDataLoadingJob(t *testing.T) {
 		s.handleCreateDataLoadingJob(rec, req)
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
-
-	t.Run("returns 501 NOT_IMPLEMENTED", func(t *testing.T) {
-		cluster := newTestCluster("test-cluster", "default")
-		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
-		s := newTestServer(cluster)
-		req := httptest.NewRequest(http.MethodPost,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
-		rec := httptest.NewRecorder()
-		s.handleCreateDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusNotImplemented, rec.Code)
-		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
-	})
 }
 
 func TestHandleGetDataLoadingJob(t *testing.T) {
@@ -1148,7 +1140,9 @@ func TestHandleGetDataLoadingJob(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
 		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 			Enabled: true,
-			Jobs:    []cbv1alpha1.DataLoadingJob{{Name: "job1", Type: "s3", TargetTable: "t"}},
+			Jobs: []cbv1alpha1.DataLoadingJob{{Name: "job1", Type: "pxf", PxfJob: &cbv1alpha1.PxfJobSpec{
+				Server: "s3-datalake", Profile: "s3:parquet", TargetTable: "t",
+			}}},
 		}
 		s := newTestServer(cluster)
 		req := httptest.NewRequest(http.MethodGet,
@@ -1162,6 +1156,9 @@ func TestHandleGetDataLoadingJob(t *testing.T) {
 
 	t.Run("job not found", func(t *testing.T) {
 		cluster := newTestCluster("test-cluster", "default")
+		// DL enabled so the 404 job-not-found path is exercised (a disabled
+		// subsystem now returns the 200 disabled envelope instead).
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
 		s := newTestServer(cluster)
 		req := httptest.NewRequest(http.MethodGet,
 			apiPrefix+"/clusters/test-cluster/data-loading/jobs/missing?namespace=default", nil)
@@ -1173,59 +1170,9 @@ func TestHandleGetDataLoadingJob(t *testing.T) {
 	})
 }
 
-func TestHandleStartStopDataLoadingJob(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
-	s := newTestServer(cluster)
-
-	t.Run("start job returns 501", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/start?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
-		req.SetPathValue("job", "j1")
-		rec := httptest.NewRecorder()
-		s.handleStartDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusNotImplemented, rec.Code)
-		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
-	})
-
-	t.Run("stop job returns 501", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1/stop?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
-		req.SetPathValue("job", "j1")
-		rec := httptest.NewRecorder()
-		s.handleStopDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusNotImplemented, rec.Code)
-		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
-	})
-}
-
-func TestHandleUpdateDeleteDataLoadingJob(t *testing.T) {
-	cluster := newTestCluster("test-cluster", "default")
-	s := newTestServer(cluster)
-
-	t.Run("update job returns 501", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPut,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
-		req.SetPathValue("job", "j1")
-		rec := httptest.NewRecorder()
-		s.handleUpdateDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusNotImplemented, rec.Code)
-		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
-	})
-
-	t.Run("delete job returns 501", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodDelete,
-			apiPrefix+"/clusters/test-cluster/data-loading/jobs/j1?namespace=default", nil)
-		req.SetPathValue("name", "test-cluster")
-		req.SetPathValue("job", "j1")
-		rec := httptest.NewRecorder()
-		s.handleDeleteDataLoadingJob(rec, req)
-		assert.Equal(t, http.StatusNotImplemented, rec.Code)
-		assert.Contains(t, rec.Body.String(), errCodeNotImplemented)
-	})
-}
+// The start/stop and update/delete data-loading job behaviors are now fully
+// implemented (Scenario 107); their happy-path, idempotency and 404/409 edges
+// are covered by the dedicated Scenario 107 suite written separately.
 
 // Workload endpoint tests.
 
@@ -2407,9 +2354,6 @@ func (m *mockDBClient) Close()                       { m.closeCalls++ }
 func (m *mockDBClient) GetSegmentConfiguration(_ context.Context) ([]db.SegmentInfo, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetClusterState(_ context.Context) (*db.ClusterState, error) {
-	return &db.ClusterState{IsUp: true}, nil
-}
 func (m *mockDBClient) SetParameter(_ context.Context, _, _ string, _ db.ParameterScope) error {
 	return nil
 }
@@ -2533,8 +2477,19 @@ func (m *mockDBClient) RebalanceTable(_ context.Context, _, _, _, _ string) erro
 func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]db.SessionWithGroup, error) {
 	return m.sessionsWithGroup, m.listSessionsWithGroupErr
 }
-func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) { return nil, nil }
-func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error   { return nil }
+func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error)  { return nil, nil }
+func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error    { return nil }
+func (m *mockDBClient) SetupPXFExtensions(_ context.Context) (int, error)      { return 2, nil }
+func (m *mockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) ListPXFExtensions(_ context.Context) ([]string, error)  { return nil, nil }
+func (m *mockDBClient) ListExternalTables(_ context.Context) ([]db.ExternalTableInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*db.PXFSourceSample, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*db.QueryDetail, error) {
 	if m.queryDetailErr != nil {
 		return nil, m.queryDetailErr
@@ -4926,6 +4881,61 @@ func TestHandleCancelQuery_WithReason(t *testing.T) {
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 		assert.Equal(t, true, resp["canceled"])
 	})
+}
+
+// TestCancelBackendByPID_OversizedReasonBodyRejected verifies the W1-A3 limitBody
+// guard on the cancel/terminate path (TASK 15): a reason body exceeding the
+// maxBodySize cap is BOUNDED by MaxBytesReader, so the oversized reason cannot be
+// decoded (it is silently dropped — reason is optional) while the request still
+// succeeds; normal/empty bodies continue to decode the optional reason.
+func TestCancelBackendByPID_OversizedReasonBodyRejected(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	dbClient := &mockDBClient{cancelResult: true}
+	s := newTestServerWithDB(dbClient, cluster)
+
+	// A valid JSON object whose "reason" string alone exceeds the 1 MiB cap.
+	huge := strings.Repeat("a", maxBodySize+1024)
+	body := `{"reason":"` + huge + `"}`
+	require.Greater(t, len(body), maxBodySize)
+
+	req := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+		strings.NewReader(body))
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("pid", "123")
+	rec := httptest.NewRecorder()
+	s.handleCancelQuery(rec, req)
+
+	// The operation still succeeds; the oversized reason is NOT echoed because
+	// MaxBytesReader bounded the body and the (optional) decode failed.
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, true, resp["canceled"])
+	_, hasReason := resp["reason"]
+	assert.False(t, hasReason,
+		"an oversized reason body must be bounded/dropped, never echoed (W1-A3)")
+
+	// Demonstrate the bound directly: a fresh MaxBytesReader over the same data
+	// errors once the cap is exceeded, proving the body is bounded.
+	mbr := http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(strings.NewReader(body)), maxBodySize)
+	_, readErr := io.ReadAll(mbr)
+	require.Error(t, readErr, "MaxBytesReader must reject reads beyond maxBodySize")
+	var maxErr *http.MaxBytesError
+	assert.ErrorAs(t, readErr, &maxErr)
+
+	// A normal-sized body still decodes the optional reason (behavior unchanged).
+	smallReq := httptest.NewRequest(http.MethodPost,
+		apiPrefix+"/clusters/test-cluster/sessions/123/cancel?namespace=default",
+		strings.NewReader(`{"reason":"ok"}`))
+	smallReq.SetPathValue("name", "test-cluster")
+	smallReq.SetPathValue("pid", "123")
+	smallRec := httptest.NewRecorder()
+	s.handleCancelQuery(smallRec, smallReq)
+	require.Equal(t, http.StatusOK, smallRec.Code)
+	var smallResp map[string]interface{}
+	require.NoError(t, json.NewDecoder(smallRec.Body).Decode(&smallResp))
+	assert.Equal(t, "ok", smallResp["reason"])
 }
 
 func TestMatchStatus(t *testing.T) {

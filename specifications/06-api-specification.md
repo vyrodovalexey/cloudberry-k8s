@@ -165,6 +165,32 @@ All backup/restore endpoints are namespaced under `/clusters/{name}/backups`, ar
 
 The full request schemas (`CreateBackupRequest.gpbackupOptions`, `RestoreRequest.gprestoreOptions`), the option → `gpbackup`/`gprestore` flag mapping, and the mutual-exclusivity rules are documented in §5.15–§5.18. The cross-cluster migration request/response is documented in §5.19.
 
+### 4.9.1 Data Loading (PXF) — P.1–P.15
+
+All P.1–P.15 endpoints are **Implemented and serving real data** (Scenario 107 flipped the final five job mutations + PXF servers CRUD + job logs + external-tables to FULL; PXF lifecycle landed in Scenario 95). See the [Data-Loading API Endpoints table](12-data-loading-spec.md#api-endpoints) for the full per-route status.
+
+| ID | Method | Path | Permission | Description |
+|----|--------|------|-----------|-------------|
+| P.7 | GET | /clusters/{name}/data-loading/jobs | Basic | List data-loading jobs (from spec) |
+| P.8 | POST | /clusters/{name}/data-loading/jobs | Operator | Create a job; `201`; `409 JOB_EXISTS`; `400` when `pxfJob.server` is unknown |
+| P.9 | GET | /clusters/{name}/data-loading/jobs/{job} | Basic | Get one job (from spec) |
+| P.10 | PUT | /clusters/{name}/data-loading/jobs/{job} | Operator | Update a job; `200` |
+| P.11 | DELETE | /clusters/{name}/data-loading/jobs/{job} | Admin | Delete a job; best-effort deletes the spawned Job |
+| P.12 | POST | /clusters/{name}/data-loading/jobs/{job}/start | Operator | Start → creates a REAL one-off `batchv1.Job`; `202`; `409 JOB_ALREADY_RUNNING` |
+| P.13 | POST | /clusters/{name}/data-loading/jobs/{job}/stop | Operator | Stop → deletes the Job / suspends the CronJob; `202`; idempotent `200` when nothing to stop |
+| P.14 | GET | /clusters/{name}/data-loading/jobs/{job}/logs | Basic | **Stream** the data-loading Job pod logs (`?follow`, `?tailLines`); `501 LOGS_NOT_AVAILABLE` when no clientset |
+| P.1 | GET | /clusters/{name}/data-loading/pxf/status | Basic | Honest PXF sidecar readiness across segment-primary pods |
+| — | POST | /clusters/{name}/data-loading/pxf/restart | Operator | Operator-driven PXF restart (segment-primary pod roll); `202` |
+| P.6 | POST | /clusters/{name}/data-loading/pxf/sync | Operator | Refresh the `<cluster>-pxf-servers` ConfigMap + roll sidecars; `202` |
+| P.2 | GET | /clusters/{name}/data-loading/pxf/servers | Basic | List configured PXF servers (REFERENCES only — no literal secrets) |
+| P.2 | GET | /clusters/{name}/data-loading/pxf/servers/{server} | Basic | Get one server; `404 SERVER_NOT_FOUND` |
+| P.3 | POST | /clusters/{name}/data-loading/pxf/servers | Operator | Create a server; `201` returns the rendered `<server>__*.xml`; `409 SERVER_EXISTS` |
+| P.4 | PUT | /clusters/{name}/data-loading/pxf/servers/{server} | Operator | Update a server; `200` rendered config; `404 SERVER_NOT_FOUND` |
+| P.5 | DELETE | /clusters/{name}/data-loading/pxf/servers/{server} | Admin | Delete a server; `409 SERVER_IN_USE` if referenced by a job (mirrors webhook W.9) |
+| P.15 | GET | /clusters/{name}/data-loading/external-tables | Basic | `{observed, observedAvailable, expected}` — live catalog vs spec-derived (honest split) — see §5.20 |
+
+> **Honesty notes.** P.14 streams REAL pod logs (mirrors `backups/jobs/{job}/logs`); it returns `501 LOGS_NOT_AVAILABLE` only when no Kubernetes clientset is wired. P.15's `observed` is the live `pg_exttable` + foreign-table catalog; it is `null` with `observedAvailable:false` when the DB is unreachable — **never synthesized** — while `expected` (spec-derived would-be tables) is kept in a separate field and never claimed to "exist".
+
 ### 4.10 Health and Metrics
 
 | Method | Path | Permission | Description |
@@ -523,6 +549,43 @@ POST /api/v1alpha1/clusters/src/migrate
 
 > **Note.** `timestamp` is the operator-chosen value used **only to NAME the Job**; the actual `gpbackup`/`gprestore` timestamp is the one `gpbackup` generates at runtime and the Job captures (see [Backup & Restore Spec §Cross-Cluster Migration](11-backup-restore-spec.md#cross-cluster-migration)).
 
+### 5.20 External Tables Response (`GET /clusters/{name}/data-loading/external-tables`)
+
+The P.15 response splits the **live, DB-observed** catalog from the **spec-derived expected** tables; the two are never merged.
+
+```json
+{
+  "cluster": "my-cluster",
+  "observed": [
+    { "schema": "public", "name": "ext_events", "kind": "external", "server": "minio-warehouse" },
+    { "schema": "public", "name": "foreign_s3_ingest", "kind": "foreign", "server": "s3-lake" }
+  ],
+  "observedAvailable": true,
+  "expected": [
+    { "name": "public.events", "kind": "external", "server": "s3-lake", "job": "s3-ingest", "profile": "s3:parquet" },
+    { "name": "foreign_csv_load", "kind": "foreign", "server": "jdbc-oltp", "job": "csv-load" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cluster` | string | Cluster name |
+| `observed` | `ExternalTableInfo[]` \| `null` | Live `pg_exttable` + foreign-table catalog rows. **`null`** when the DB is unreachable — **never synthesized** |
+| `observedAvailable` | bool | `true` when the live probe succeeded; `false` distinguishes "observed: none" from "observed: unobservable" |
+| `expected` | `ExternalTableInfo[]` | Spec-derived would-be tables (`foreign_<job>` for fdw jobs, target tables for pxf jobs). **Clearly labeled — never claimed to "exist"** |
+
+**`ExternalTableInfo`** — observed rows carry the live catalog fields; expected rows carry the spec correlation:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | string (omitempty) | Catalog schema (observed rows) |
+| `name` | string | Table name (observed: catalog name; expected: would-be name) |
+| `kind` | string | `external` or `foreign` |
+| `server` | string (omitempty) | PXF server the table references |
+| `job` | string (omitempty) | Correlated data-loading job (expected rows) |
+| `profile` | string (omitempty) | PXF profile (expected rows) |
+
 ## 6. Error Handling
 
 ### 6.1 Error Response Format
@@ -551,6 +614,12 @@ POST /api/v1alpha1/clusters/src/migrate
 | 404 | SEGMENT_NOT_FOUND | Segment does not exist |
 | 404 | BACKUP_NOT_FOUND | Backup timestamp not found in the cluster's backup history |
 | 400 | BACKUP_NOT_ENABLED | `spec.backup.enabled` is `false` (backup create rejected) |
+| 404 | SERVER_NOT_FOUND | Named PXF server is absent (data-loading P.2 get / P.4 / P.5) |
+| 409 | SERVER_EXISTS | PXF server create would duplicate an existing server name (P.3) |
+| 409 | SERVER_IN_USE | PXF server delete refused — a job still references it (P.5; mirrors W.9) |
+| 409 | JOB_EXISTS | Data-loading job create would duplicate an existing job name (P.8) |
+| 409 | JOB_ALREADY_RUNNING | Data-loading job start refused — the one-off Job already exists (P.12) |
+| 501 | LOGS_NOT_AVAILABLE | No Kubernetes clientset wired to stream Job pod logs (P.14) |
 | 409 | CONFLICT | Operation conflicts with current state |
 | 422 | VALIDATION_ERROR | Request validation failed |
 | 500 | INTERNAL_ERROR | Unexpected server error |

@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,6 +49,13 @@ const (
 	// envPGPassword is the libpq PGPASSWORD env var name. It is sourced from a
 	// Secret (never embedded as plaintext) on the backup/restore/migration pods.
 	envPGPassword = "PGPASSWORD" //nolint:gosec // env var NAME, not a credential
+
+	// envPGHost/envPGPort/envPGUser/envPGDatabase are the libpq connection env
+	// var NAMES shared by the backup/restore/migration/data-loading pods.
+	envPGHost     = "PGHOST"
+	envPGPort     = "PGPORT"
+	envPGUser     = "PGUSER"
+	envPGDatabase = "PGDATABASE"
 
 	// maintenanceContainerName is the container name for maintenance jobs.
 	maintenanceContainerName = "maintenance"
@@ -141,6 +149,47 @@ type ResourceBuilder interface {
 	BuildSegmentPostgresExporterSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
 	// BuildExporterSidecarVolumes returns the volumes for exporter sidecars.
 	BuildExporterSidecarVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume
+	// BuildPXFSidecarContainers returns the PXF sidecar container(s) for the
+	// primary segment pod (empty when PXF is disabled).
+	BuildPXFSidecarContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildPXFSidecarVolumes returns the volumes required by the PXF sidecar
+	// (empty when PXF is disabled).
+	BuildPXFSidecarVolumes(cluster *cbv1alpha1.CloudberryCluster) []corev1.Volume
+	// BuildPXFCredentialInitContainers returns the credential-resolution init
+	// container(s) that render the per-server site templates with live secret
+	// values into the shared pxf-servers emptyDir (empty when PXF is disabled).
+	BuildPXFCredentialInitContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildPXFConnectorInitContainers returns the connector-download init
+	// container(s) that fetch each customConnectors[].jarUrl into the shared
+	// pxf-lib emptyDir at /pxf/lib/custom (empty when PXF is disabled or no
+	// custom connectors are declared).
+	BuildPXFConnectorInitContainers(cluster *cbv1alpha1.CloudberryCluster) []corev1.Container
+	// BuildPXFServersConfigMap renders the "<cluster>-pxf-servers" ConfigMap of
+	// per-server *-site.xml + custom connectors (nil when PXF is disabled).
+	BuildPXFServersConfigMap(cluster *cbv1alpha1.CloudberryCluster) *corev1.ConfigMap
+	// BuildPXFClusterNetworkPolicy builds the SE.5 NetworkPolicy that confines
+	// the PXF port (5888) on the segment-primary pods (nil when PXF is disabled).
+	BuildPXFClusterNetworkPolicy(cluster *cbv1alpha1.CloudberryCluster) *networkingv1.NetworkPolicy
+	// BuildDataLoadJob builds a one-off data-loading Job for a job spec (nil when
+	// the job is mis-configured). Used when the job has no Schedule.
+	BuildDataLoadJob(cluster *cbv1alpha1.CloudberryCluster, job cbv1alpha1.DataLoadingJob) *batchv1.Job
+	// BuildDataLoadCronJob builds a scheduled data-loading CronJob for a job spec
+	// (nil when the job has no Schedule or is mis-configured).
+	BuildDataLoadCronJob(cluster *cbv1alpha1.CloudberryCluster, job cbv1alpha1.DataLoadingJob) *batchv1.CronJob
+	// BuildGpfdistPVC builds the gpfdist data PersistentVolumeClaim (GP.4).
+	BuildGpfdistPVC(cluster *cbv1alpha1.CloudberryCluster) *corev1.PersistentVolumeClaim
+	// BuildGpfdistDeployment builds the gpfdist Deployment (GP.2/GP.3/GP.4).
+	BuildGpfdistDeployment(cluster *cbv1alpha1.CloudberryCluster) *appsv1.Deployment
+	// BuildGpfdistService builds the gpfdist Service (GP.5).
+	BuildGpfdistService(cluster *cbv1alpha1.CloudberryCluster) *corev1.Service
+	// BuildGploadControlFile renders the gpload YAML control file for a gpload
+	// job (GL.1-GL.7); error when the job is mis-configured.
+	BuildGploadControlFile(cluster *cbv1alpha1.CloudberryCluster, job cbv1alpha1.DataLoadingJob) (string, error)
+	// BuildGploadControlFileConfigMap builds the per-job control-file ConfigMap
+	// (nil when the control file cannot be rendered).
+	BuildGploadControlFileConfigMap(
+		cluster *cbv1alpha1.CloudberryCluster, job cbv1alpha1.DataLoadingJob,
+	) *corev1.ConfigMap
 	// BuildNodeExporterDaemonSet builds the node exporter DaemonSet.
 	BuildNodeExporterDaemonSet(cluster *cbv1alpha1.CloudberryCluster) *appsv1.DaemonSet
 	// BuildExporterService builds the exporter metrics Service.
@@ -403,6 +452,14 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 		injectSegmentPostgresExporter(b, cluster, sts)
 	}
 
+	// Inject the PXF data-loading sidecar into each primary segment pod when the
+	// full PXF config is enabled. Strictly gated by pxfSidecarEnabled so a
+	// default cluster (DataLoading==nil) yields a byte-identical pod template.
+	// Segment-primary scope only: coordinator/standby/mirror are untouched.
+	if pxfSidecarEnabled(cluster) {
+		injectPXFSidecar(b, cluster, sts)
+	}
+
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {
 		return nil, fmt.Errorf("building segment primary PVC: %w", err)
@@ -454,6 +511,34 @@ func injectSegmentPostgresExporter(
 	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet,
 ) {
 	injectSegmentExporterWithComponent(b, cluster, sts, util.ComponentSegmentPrimary)
+}
+
+// injectPXFSidecar appends the PXF sidecar container and its volumes to the
+// primary segment pod template. It is only ever called when pxfSidecarEnabled is
+// true, so it has no internal gate. Scope is the SEGMENT PRIMARY StatefulSet
+// only; the coordinator/standby/mirror builders never call it.
+func injectPXFSidecar(
+	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet,
+) {
+	// The credential init container resolves the per-server site templates (with
+	// live credential-secret values) into the shared pxf-servers emptyDir BEFORE
+	// the sidecar starts, so the sidecar only ever sees fully-resolved files.
+	sts.Spec.Template.Spec.InitContainers = append(
+		sts.Spec.Template.Spec.InitContainers, b.BuildPXFCredentialInitContainers(cluster)...,
+	)
+	// The connector-download init container fetches each customConnectors[].jarUrl
+	// into the shared pxf-lib emptyDir (/pxf/lib/custom) BEFORE the sidecar starts.
+	// It touches a DIFFERENT emptyDir (pxf-lib) than the credential init container
+	// (pxf-servers); it is listed AFTER pxf-cred-init for readability (C.18).
+	sts.Spec.Template.Spec.InitContainers = append(
+		sts.Spec.Template.Spec.InitContainers, b.BuildPXFConnectorInitContainers(cluster)...,
+	)
+	sts.Spec.Template.Spec.Containers = append(
+		sts.Spec.Template.Spec.Containers, b.BuildPXFSidecarContainers(cluster)...,
+	)
+	sts.Spec.Template.Spec.Volumes = append(
+		sts.Spec.Template.Spec.Volumes, b.BuildPXFSidecarVolumes(cluster)...,
+	)
 }
 
 // injectMirrorPostgresExporter appends the postgres-exporter sidecar (in utility

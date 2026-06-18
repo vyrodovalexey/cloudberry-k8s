@@ -45,8 +45,24 @@ const (
 	defaultBackupJobActiveDeadlineSeconds = int64(7200)
 	// defaultBackupJobTTLSecondsAfterFinished cleans up finished Jobs after 24 hours.
 	defaultBackupJobTTLSecondsAfterFinished = int32(86400)
-	// defaultStreamingServerPort is the default streaming server port.
-	defaultStreamingServerPort = 5432
+	// defaultPxfPort is the default PXF service port.
+	defaultPxfPort = int32(5888)
+	// defaultPxfJvmOpts is the default PXF JVM options string.
+	defaultPxfJvmOpts = "-Xmx1g -Xms256m"
+	// defaultPxfLogLevel is the default PXF log level.
+	defaultPxfLogLevel = "INFO"
+	// defaultGpfdistReplicas is the default number of gpfdist replicas.
+	defaultGpfdistReplicas = int32(1)
+	// defaultGpfdistPort is the default gpfdist service port.
+	defaultGpfdistPort = int32(8080)
+	// defaultDataLoadingJobMode is the default load mode for pxf/gpload jobs.
+	defaultDataLoadingJobMode = "insert"
+	// defaultDataLoadingBackoffLimit is the default Job backoffLimit.
+	defaultDataLoadingBackoffLimit = int32(3)
+	// defaultDataLoadingActiveDeadlineSeconds is the default Job timeout (4 hours).
+	defaultDataLoadingActiveDeadlineSeconds = int64(14400)
+	// defaultDataLoadingTTLSecondsAfterFinished cleans up finished Jobs after 24 hours.
+	defaultDataLoadingTTLSecondsAfterFinished = int32(86400)
 	// defaultBloatThreshold is the default table bloat threshold percentage.
 	defaultBloatThreshold = 20
 	// defaultSkewThreshold is the default data skew threshold percentage.
@@ -281,6 +297,35 @@ func setQueryMonitoringDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	if cluster.Spec.QueryMonitoring.SlowQueryThreshold == "" {
 		cluster.Spec.QueryMonitoring.SlowQueryThreshold = "1000ms"
 	}
+
+	setExporterImageDefaults(cluster.Spec.QueryMonitoring.Exporters)
+}
+
+// setExporterImageDefaults defaults the container image of each enabled query
+// monitoring exporter when the user left it unset. The exporter builders set
+// the container Image directly from spec.Image with no fallback, so an enabled
+// exporter without an image produces a container with an empty image and the
+// coordinator/segment StatefulSet (or node-exporter DaemonSet) is rejected by
+// the API server with "spec.template.spec.containers[N].image: Required value".
+// Defaulting here is the single source of truth (util.Default*ExporterImage).
+func setExporterImageDefaults(exporters *cbv1alpha1.QueryMonitoringExportersSpec) {
+	if exporters == nil {
+		// Exporters are optional; nothing to default when not specified.
+		return
+	}
+	defaultExporterImage(exporters.PostgresExporter, util.DefaultPostgresExporterImage)
+	defaultExporterImage(exporters.NodeExporter, util.DefaultNodeExporterImage)
+	defaultExporterImage(exporters.CloudberryQueryExporter, util.DefaultCloudberryQueryExporterImage)
+}
+
+// defaultExporterImage sets the exporter image to the supplied default only
+// when the exporter is non-nil, enabled, and has no explicit image, preserving
+// any user-provided image and leaving disabled/nil exporters untouched.
+func defaultExporterImage(exporter *cbv1alpha1.ExporterSpec, defaultImage string) {
+	if exporter == nil || !exporter.Enabled || exporter.Image != "" {
+		return
+	}
+	exporter.Image = defaultImage
 }
 
 // setBackupDefaults sets backup defaults per spec 11 §Webhook Defaults.
@@ -377,20 +422,113 @@ func setBackupJobTemplateDefaults(backup *cbv1alpha1.BackupSpec) {
 	}
 }
 
-// setDataLoadingDefaults sets data loading defaults.
+// setDataLoadingDefaults sets data loading defaults per spec 12 §Webhook
+// Defaults. All defaults are applied only when data loading is enabled and the
+// corresponding field is unset/zero/nil, taking care not to overwrite explicit
+// user values (including explicit false on *bool fields).
 func setDataLoadingDefaults(cluster *cbv1alpha1.CloudberryCluster) {
-	if cluster.Spec.DataLoading == nil {
-		// Data loading is optional; no defaults needed when not specified.
+	dl := cluster.Spec.DataLoading
+	if dl == nil || !dl.Enabled {
+		// Data loading is optional; no defaults when not specified or disabled.
 		return
 	}
+	setPxfDefaults(dl.Pxf)
+	setGpfdistDefaults(dl.Gpfdist)
+	setDataLoadingJobDefaults(dl.Jobs)
+	setDataLoadingJobTemplateDefaults(dl)
+}
 
-	if cluster.Spec.DataLoading.StreamingServer != nil {
-		if cluster.Spec.DataLoading.StreamingServer.Port == 0 {
-			cluster.Spec.DataLoading.StreamingServer.Port = defaultStreamingServerPort
-		}
-		if cluster.Spec.DataLoading.StreamingServer.TLSMode == "" {
-			cluster.Spec.DataLoading.StreamingServer.TLSMode = "none"
-		}
+// setPxfDefaults applies PXF service defaults.
+func setPxfDefaults(pxf *cbv1alpha1.PxfSpec) {
+	if pxf == nil {
+		return
+	}
+	if pxf.Port == 0 {
+		pxf.Port = defaultPxfPort
+	}
+	if pxf.JvmOpts == "" {
+		pxf.JvmOpts = defaultPxfJvmOpts
+	}
+	if pxf.LogLevel == "" {
+		pxf.LogLevel = defaultPxfLogLevel
+	}
+	if pxf.Extensions == nil {
+		pxf.Extensions = &cbv1alpha1.PxfExtensionsSpec{}
+	}
+	// Pxf/PxfFdw are *bool: default to true only when unset (nil) so an explicit
+	// false set by the user is preserved rather than silently re-enabled.
+	if pxf.Extensions.Pxf == nil {
+		pxf.Extensions.Pxf = util.Ptr(true)
+	}
+	if pxf.Extensions.PxfFdw == nil {
+		pxf.Extensions.PxfFdw = util.Ptr(true)
+	}
+}
+
+// setGpfdistDefaults applies gpfdist service defaults.
+func setGpfdistDefaults(gpfdist *cbv1alpha1.GpfdistSpec) {
+	if gpfdist == nil {
+		return
+	}
+	if gpfdist.Replicas == nil {
+		gpfdist.Replicas = util.Ptr(defaultGpfdistReplicas)
+	}
+	if gpfdist.Port == 0 {
+		gpfdist.Port = defaultGpfdistPort
+	}
+}
+
+// setDataLoadingJobDefaults applies per-job defaults.
+func setDataLoadingJobDefaults(jobs []cbv1alpha1.DataLoadingJob) {
+	for i := range jobs {
+		setPxfJobDefaults(jobs[i].PxfJob)
+		setGploadJobDefaults(jobs[i].GploadJob)
+	}
+}
+
+// setPxfJobDefaults applies pxf job defaults.
+func setPxfJobDefaults(pxfJob *cbv1alpha1.PxfJobSpec) {
+	if pxfJob == nil {
+		return
+	}
+	if pxfJob.Mode == "" {
+		pxfJob.Mode = defaultDataLoadingJobMode
+	}
+	// FilterPushdown/ColumnProjection are *bool: default to true only when unset
+	// (nil) so an explicit false set by the user is preserved.
+	if pxfJob.FilterPushdown == nil {
+		pxfJob.FilterPushdown = util.Ptr(true)
+	}
+	if pxfJob.ColumnProjection == nil {
+		pxfJob.ColumnProjection = util.Ptr(true)
+	}
+}
+
+// setGploadJobDefaults applies gpload job defaults.
+func setGploadJobDefaults(gploadJob *cbv1alpha1.GploadJobSpec) {
+	if gploadJob == nil {
+		return
+	}
+	if gploadJob.Mode == "" {
+		gploadJob.Mode = defaultDataLoadingJobMode
+	}
+}
+
+// setDataLoadingJobTemplateDefaults applies Job template defaults, allocating
+// the JobTemplate and its pointer fields when needed.
+func setDataLoadingJobTemplateDefaults(dl *cbv1alpha1.DataLoadingSpec) {
+	if dl.JobTemplate == nil {
+		dl.JobTemplate = &cbv1alpha1.DataLoadingJobTemplate{}
+	}
+	jt := dl.JobTemplate
+	if jt.BackoffLimit == nil {
+		jt.BackoffLimit = util.Ptr(defaultDataLoadingBackoffLimit)
+	}
+	if jt.ActiveDeadlineSeconds == nil {
+		jt.ActiveDeadlineSeconds = util.Ptr(defaultDataLoadingActiveDeadlineSeconds)
+	}
+	if jt.TTLSecondsAfterFinished == nil {
+		jt.TTLSecondsAfterFinished = util.Ptr(defaultDataLoadingTTLSecondsAfterFinished)
 	}
 }
 

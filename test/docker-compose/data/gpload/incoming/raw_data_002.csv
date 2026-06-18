@@ -1,0 +1,5 @@
+id,event_type,payload,created_at
+4,click,"{""x"":4}",2026-06-14T10:03:00Z
+5,view,"{""y"":5}",2026-06-14T10:04:00Z
+6,signup,"{""plan"":""pro""}",2026-06-14T10:05:00Z
+7,purchase,"{""amt"":19.95}",2026-06-14T10:06:00Z

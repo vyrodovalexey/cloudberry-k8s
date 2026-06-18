@@ -470,43 +470,184 @@ func TestSetDataLoadingDefaults(t *testing.T) {
 		assert.Nil(t, cluster.Spec.DataLoading)
 	})
 
-	t.Run("streaming server gets defaults", func(t *testing.T) {
+	t.Run("disabled data loading is a no-op", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: false,
+			Pxf:     &cbv1alpha1.PxfSpec{Enabled: true},
+		}
+		setDataLoadingDefaults(cluster)
+		// Nothing defaulted: PXF port stays zero, JobTemplate stays nil.
+		assert.Equal(t, int32(0), cluster.Spec.DataLoading.Pxf.Port)
+		assert.Nil(t, cluster.Spec.DataLoading.JobTemplate)
+	})
+
+	t.Run("pxf service defaults applied when unset", func(t *testing.T) {
 		cluster := newMinimalCluster()
 		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 			Enabled: true,
-			StreamingServer: &cbv1alpha1.StreamingServerSpec{
-				Host: "streaming.example.com",
+			Pxf:     &cbv1alpha1.PxfSpec{Enabled: true, Image: "pxf:1.0"},
+		}
+		setDataLoadingDefaults(cluster)
+
+		pxf := cluster.Spec.DataLoading.Pxf
+		assert.Equal(t, int32(5888), pxf.Port)
+		assert.Equal(t, "-Xmx1g -Xms256m", pxf.JvmOpts)
+		assert.Equal(t, "INFO", pxf.LogLevel)
+		require.NotNil(t, pxf.Extensions)
+		require.NotNil(t, pxf.Extensions.Pxf)
+		require.NotNil(t, pxf.Extensions.PxfFdw)
+		assert.True(t, *pxf.Extensions.Pxf)
+		assert.True(t, *pxf.Extensions.PxfFdw)
+	})
+
+	t.Run("pxf explicit values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Pxf: &cbv1alpha1.PxfSpec{
+				Enabled: true, Image: "pxf:1.0",
+				Port: 9999, JvmOpts: "-Xmx2g", LogLevel: "DEBUG",
+				Extensions: &cbv1alpha1.PxfExtensionsSpec{
+					Pxf:    util.Ptr(false),
+					PxfFdw: util.Ptr(false),
+				},
 			},
 		}
 		setDataLoadingDefaults(cluster)
 
-		assert.Equal(t, int32(5432), cluster.Spec.DataLoading.StreamingServer.Port)
-		assert.Equal(t, "none", cluster.Spec.DataLoading.StreamingServer.TLSMode)
+		pxf := cluster.Spec.DataLoading.Pxf
+		assert.Equal(t, int32(9999), pxf.Port)
+		assert.Equal(t, "-Xmx2g", pxf.JvmOpts)
+		assert.Equal(t, "DEBUG", pxf.LogLevel)
+		// Explicit false must survive defaulting.
+		assert.False(t, *pxf.Extensions.Pxf)
+		assert.False(t, *pxf.Extensions.PxfFdw)
 	})
 
-	t.Run("existing streaming server values preserved", func(t *testing.T) {
+	t.Run("gpfdist defaults applied when unset", func(t *testing.T) {
 		cluster := newMinimalCluster()
 		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 			Enabled: true,
-			StreamingServer: &cbv1alpha1.StreamingServerSpec{
-				Host:    "streaming.example.com",
-				Port:    5433,
-				TLSMode: "tls",
+			Gpfdist: &cbv1alpha1.GpfdistSpec{Enabled: true},
+		}
+		setDataLoadingDefaults(cluster)
+
+		gp := cluster.Spec.DataLoading.Gpfdist
+		require.NotNil(t, gp.Replicas)
+		assert.Equal(t, int32(1), *gp.Replicas)
+		assert.Equal(t, int32(8080), gp.Port)
+	})
+
+	t.Run("gpfdist explicit values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Gpfdist: &cbv1alpha1.GpfdistSpec{
+				Enabled: true, Replicas: util.Ptr(int32(4)), Port: 9090,
 			},
 		}
 		setDataLoadingDefaults(cluster)
 
-		assert.Equal(t, int32(5433), cluster.Spec.DataLoading.StreamingServer.Port)
-		assert.Equal(t, "tls", cluster.Spec.DataLoading.StreamingServer.TLSMode)
+		gp := cluster.Spec.DataLoading.Gpfdist
+		assert.Equal(t, int32(4), *gp.Replicas)
+		assert.Equal(t, int32(9090), gp.Port)
 	})
 
-	t.Run("data loading without streaming server", func(t *testing.T) {
+	t.Run("pxf job defaults applied when unset", func(t *testing.T) {
 		cluster := newMinimalCluster()
 		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 			Enabled: true,
+			Jobs: []cbv1alpha1.DataLoadingJob{
+				{
+					Name: "j1", Type: "pxf",
+					PxfJob: &cbv1alpha1.PxfJobSpec{
+						Server: "s1", Profile: "s3:parquet", TargetTable: "t",
+					},
+				},
+			},
 		}
 		setDataLoadingDefaults(cluster)
-		assert.Nil(t, cluster.Spec.DataLoading.StreamingServer)
+
+		pj := cluster.Spec.DataLoading.Jobs[0].PxfJob
+		assert.Equal(t, "insert", pj.Mode)
+		require.NotNil(t, pj.FilterPushdown)
+		require.NotNil(t, pj.ColumnProjection)
+		assert.True(t, *pj.FilterPushdown)
+		assert.True(t, *pj.ColumnProjection)
+	})
+
+	t.Run("pxf job explicit false preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Jobs: []cbv1alpha1.DataLoadingJob{
+				{
+					Name: "j1", Type: "pxf",
+					PxfJob: &cbv1alpha1.PxfJobSpec{
+						Server: "s1", Profile: "jdbc", TargetTable: "t",
+						Mode:             "insert-select",
+						FilterPushdown:   util.Ptr(false),
+						ColumnProjection: util.Ptr(false),
+					},
+				},
+			},
+		}
+		setDataLoadingDefaults(cluster)
+
+		pj := cluster.Spec.DataLoading.Jobs[0].PxfJob
+		assert.Equal(t, "insert-select", pj.Mode)
+		assert.False(t, *pj.FilterPushdown)
+		assert.False(t, *pj.ColumnProjection)
+	})
+
+	t.Run("gpload job mode defaulted when unset", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Jobs: []cbv1alpha1.DataLoadingJob{
+				{
+					Name: "g1", Type: "gpload",
+					GploadJob: &cbv1alpha1.GploadJobSpec{TargetTable: "t"},
+				},
+			},
+		}
+		setDataLoadingDefaults(cluster)
+
+		assert.Equal(t, "insert", cluster.Spec.DataLoading.Jobs[0].GploadJob.Mode)
+	})
+
+	t.Run("job template defaults allocated when unset", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{Enabled: true}
+		setDataLoadingDefaults(cluster)
+
+		jt := cluster.Spec.DataLoading.JobTemplate
+		require.NotNil(t, jt)
+		require.NotNil(t, jt.BackoffLimit)
+		require.NotNil(t, jt.ActiveDeadlineSeconds)
+		require.NotNil(t, jt.TTLSecondsAfterFinished)
+		assert.Equal(t, int32(3), *jt.BackoffLimit)
+		assert.Equal(t, int64(14400), *jt.ActiveDeadlineSeconds)
+		assert.Equal(t, int32(86400), *jt.TTLSecondsAfterFinished)
+	})
+
+	t.Run("job template explicit values preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			JobTemplate: &cbv1alpha1.DataLoadingJobTemplate{
+				BackoffLimit:            util.Ptr(int32(7)),
+				ActiveDeadlineSeconds:   util.Ptr(int64(100)),
+				TTLSecondsAfterFinished: util.Ptr(int32(200)),
+			},
+		}
+		setDataLoadingDefaults(cluster)
+
+		jt := cluster.Spec.DataLoading.JobTemplate
+		assert.Equal(t, int32(7), *jt.BackoffLimit)
+		assert.Equal(t, int64(100), *jt.ActiveDeadlineSeconds)
+		assert.Equal(t, int32(200), *jt.TTLSecondsAfterFinished)
 	})
 }
 
@@ -670,5 +811,76 @@ func TestSetQueryMonitoringDefaults(t *testing.T) {
 		assert.Equal(t, "90d", cluster.Spec.QueryMonitoring.HistoryRetention)
 		assert.Equal(t, int32(5), cluster.Spec.QueryMonitoring.SamplingInterval)
 		assert.Equal(t, "500ms", cluster.Spec.QueryMonitoring.SlowQueryThreshold)
+	})
+
+	t.Run("enabled exporters with empty image get default image", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled: true,
+			Exporters: &cbv1alpha1.QueryMonitoringExportersSpec{
+				PostgresExporter:        &cbv1alpha1.ExporterSpec{Enabled: true},
+				NodeExporter:            &cbv1alpha1.ExporterSpec{Enabled: true},
+				CloudberryQueryExporter: &cbv1alpha1.ExporterSpec{Enabled: true},
+			},
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		exporters := cluster.Spec.QueryMonitoring.Exporters
+		assert.Equal(t, util.DefaultPostgresExporterImage, exporters.PostgresExporter.Image)
+		assert.Equal(t, util.DefaultNodeExporterImage, exporters.NodeExporter.Image)
+		assert.Equal(t, util.DefaultCloudberryQueryExporterImage, exporters.CloudberryQueryExporter.Image)
+	})
+
+	t.Run("enabled exporters with explicit image preserved", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled: true,
+			Exporters: &cbv1alpha1.QueryMonitoringExportersSpec{
+				PostgresExporter:        &cbv1alpha1.ExporterSpec{Enabled: true, Image: "custom/pg:1"},
+				NodeExporter:            &cbv1alpha1.ExporterSpec{Enabled: true, Image: "custom/node:2"},
+				CloudberryQueryExporter: &cbv1alpha1.ExporterSpec{Enabled: true, Image: "custom/cbdb:3"},
+			},
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		exporters := cluster.Spec.QueryMonitoring.Exporters
+		assert.Equal(t, "custom/pg:1", exporters.PostgresExporter.Image)
+		assert.Equal(t, "custom/node:2", exporters.NodeExporter.Image)
+		assert.Equal(t, "custom/cbdb:3", exporters.CloudberryQueryExporter.Image)
+	})
+
+	t.Run("disabled exporter with empty image unchanged", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled: true,
+			Exporters: &cbv1alpha1.QueryMonitoringExportersSpec{
+				PostgresExporter: &cbv1alpha1.ExporterSpec{Enabled: false},
+			},
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		assert.Empty(t, cluster.Spec.QueryMonitoring.Exporters.PostgresExporter.Image)
+	})
+
+	t.Run("nil exporters and nil exporter entries do nothing", func(t *testing.T) {
+		cluster := newMinimalCluster()
+		cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{
+			Enabled:   true,
+			Exporters: &cbv1alpha1.QueryMonitoringExportersSpec{
+				// PostgresExporter, NodeExporter, CloudberryQueryExporter all nil.
+			},
+		}
+		setQueryMonitoringDefaults(cluster)
+
+		exporters := cluster.Spec.QueryMonitoring.Exporters
+		assert.Nil(t, exporters.PostgresExporter)
+		assert.Nil(t, exporters.NodeExporter)
+		assert.Nil(t, exporters.CloudberryQueryExporter)
+
+		// Exporters block entirely absent must also be a no-op.
+		clusterNoExporters := newMinimalCluster()
+		clusterNoExporters.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: true}
+		setQueryMonitoringDefaults(clusterNoExporters)
+		assert.Nil(t, clusterNoExporters.Spec.QueryMonitoring.Exporters)
 	})
 }

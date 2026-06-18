@@ -16,6 +16,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,7 +25,68 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	fakeinterceptor "sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 )
+
+// certSpanByName returns the first ended span with the given name, or nil.
+func certSpanByName(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	for _, s := range spans {
+		if s.Name() == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// TestIssueVaultPKICert_Span asserts the E-01 contract: the
+// certmanager.issueVaultPKICert span is created on the success path (not marked
+// error) and is marked codes.Error when WriteSecretWithResponse fails, while the
+// wrapped error still propagates. T-E.
+func TestIssueVaultPKICert_Span(t *testing.T) {
+	t.Run("success path: span present, not errored", func(t *testing.T) {
+		sr, restore := telemetry.InstallSpanRecorder()
+		defer restore()
+
+		cfg := newTestConfig()
+		mockVault := &mockVaultClient{
+			enabled: true,
+			writeData: map[string]interface{}{
+				"certificate": "cert-pem",
+				"private_key": "key-pem",
+				"issuing_ca":  "ca-pem",
+			},
+		}
+
+		_, _, _, err := issueVaultPKICert(context.Background(), mockVault, cfg, []string{"test.svc"}, time.Hour)
+		require.NoError(t, err)
+
+		span := certSpanByName(sr.Ended(), "certmanager.issueVaultPKICert")
+		require.NotNil(t, span, "certmanager.issueVaultPKICert span must be created")
+		assert.NotEqual(t, codes.Error, span.Status().Code,
+			"successful issuance must not mark the span errored")
+	})
+
+	t.Run("write error: span present and errored, wrapped error propagates", func(t *testing.T) {
+		sr, restore := telemetry.InstallSpanRecorder()
+		defer restore()
+
+		cfg := newTestConfig()
+		mockVault := &mockVaultClient{
+			enabled:  true,
+			writeErr: fmt.Errorf("vault write failed"),
+		}
+
+		_, _, _, err := issueVaultPKICert(context.Background(), mockVault, cfg, []string{"test.svc"}, time.Hour)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "issuing certificate via vault PKI")
+
+		span := certSpanByName(sr.Ended(), "certmanager.issueVaultPKICert")
+		require.NotNil(t, span, "certmanager.issueVaultPKICert span must be created on write error")
+		assert.Equal(t, codes.Error, span.Status().Code,
+			"write failure must mark the span errored")
+	})
+}
 
 func newTestScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()

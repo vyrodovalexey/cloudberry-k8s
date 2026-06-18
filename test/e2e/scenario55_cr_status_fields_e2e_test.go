@@ -405,6 +405,7 @@ func (m *scenario55E2EMetricsRecorder) SetBackupJobStatus(_, _, _, _ string, _ f
 func (m *scenario55E2EMetricsRecorder) RecordRestore(_, _, _ string)                          {}
 func (m *scenario55E2EMetricsRecorder) RecordRestoreValidation(_, _, _ string)                {}
 func (m *scenario55E2EMetricsRecorder) SetDataLoadingJobsActive(_, _ string, _ float64)       {}
+func (m *scenario55E2EMetricsRecorder) SetPXFServersConfigured(_, _ string, _ float64)        {}
 func (m *scenario55E2EMetricsRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64)    {}
 func (m *scenario55E2EMetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64)            {}
 func (m *scenario55E2EMetricsRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)     {}
@@ -445,4 +446,5 @@ func (m *scenario55E2EMetricsRecorder) ObserveVaultOperationDuration(_ string, _
 func (m *scenario55E2EMetricsRecorder) RecordWebhookAdmission(_, _, _ string)     {}
 func (m *scenario55E2EMetricsRecorder) RecordUpgradeOperation(_, _, _ string)     {}
 func (m *scenario55E2EMetricsRecorder) RecordRollingRestart(_, _, _ string)       {}
+func (m *scenario55E2EMetricsRecorder) RecordPXFRestart(_, _, _ string)           {}
 func (m *scenario55E2EMetricsRecorder) RecordRecoveryOperation(_, _, _, _ string) {}

@@ -84,10 +84,13 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	// Phase: create the coordinated migration Job.
 	createCtx, createSpan := telemetry.StartSpan(ctx, apiTracerName, "migrate.create")
-	if !s.createMigrateJob(w, createCtx, migrationJob, "migration") {
-		telemetry.SetSpanError(createSpan, fmt.Errorf("creating migration job %q", migrationJob.Name))
+	if createErr := s.createMigrateJob(w, createCtx, migrationJob, "migration"); createErr != nil {
+		// Record the SAME underlying error on both spans so the parent and child
+		// agree and the root cause is preserved (not a fabricated placeholder).
+		jobErr := fmt.Errorf("creating migration job %q: %w", migrationJob.Name, createErr)
+		telemetry.SetSpanError(createSpan, jobErr)
 		createSpan.End()
-		telemetry.SetSpanError(span, fmt.Errorf("migration job creation failed"))
+		telemetry.SetSpanError(span, jobErr)
 		s.recordMigrate("error")
 		return
 	}
@@ -241,20 +244,22 @@ func migrateTargetDatabase(req *MigrateRequest) string {
 }
 
 // createMigrateJob creates a single migration Job, writing an error response and
-// returning false on failure.
+// returning the underlying error on failure (nil on success). The error is
+// surfaced so callers can record the real root cause on their telemetry spans
+// instead of fabricating a placeholder.
 func (s *Server) createMigrateJob(
 	w http.ResponseWriter,
 	ctx context.Context,
 	job *batchv1.Job,
 	what string,
-) bool {
+) error {
 	if createErr := s.k8sClient.Create(ctx, job); createErr != nil {
 		s.logger.Error("failed to create "+what+" job", "job", job.Name, "error", createErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create "+what+" job")
-		return false
+		return fmt.Errorf("creating %s job %q: %w", what, job.Name, createErr)
 	}
-	return true
+	return nil
 }
 
 // writeMigrateAccepted writes the 202 response describing the created migration

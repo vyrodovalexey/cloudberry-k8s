@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/auth"
@@ -37,6 +40,11 @@ type obsRecorder struct {
 	logStreamResults    []string
 	logStreamBytes      float64
 	migrateResults      []string
+	lifecycleRequests   []string
+	workloadOps         []string
+	pxfSyncs            []string
+	recoveryOps         []string
+	pxfServersChanged   int
 }
 
 type apiRequestSample struct {
@@ -98,6 +106,46 @@ func (o *obsRecorder) RecordMigrateOperation(result string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.migrateResults = append(o.migrateResults, result)
+}
+
+// RecordAPILifecycleRequest captures lifecycle request outcomes as
+// "operation/result" strings (W2-B3).
+func (o *obsRecorder) RecordAPILifecycleRequest(operation, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.lifecycleRequests = append(o.lifecycleRequests, operation+"/"+result)
+}
+
+// RecordAPIWorkloadOperation captures workload DDL outcomes as
+// "kind/operation/result" strings (W2-B4).
+func (o *obsRecorder) RecordAPIWorkloadOperation(kind, operation, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.workloadOps = append(o.workloadOps, kind+"/"+operation+"/"+result)
+}
+
+// RecordPXFSync captures PXF sync outcomes as "cluster/namespace/result"
+// strings (W2-B6).
+func (o *obsRecorder) RecordPXFSync(cluster, namespace, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pxfSyncs = append(o.pxfSyncs, cluster+"/"+namespace+"/"+result)
+}
+
+// RecordRecoveryOperation captures recovery-request outcomes as
+// "type/result" strings (W2-B2, request-side reuse of the existing family).
+func (o *obsRecorder) RecordRecoveryOperation(_, _, recoveryType, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.recoveryOps = append(o.recoveryOps, recoveryType+"/"+result)
+}
+
+// IncPXFServersChanged captures the honest servers-changed counter so a test
+// can assert it stays flat on a no-op sync (C-FORCE-PAIR).
+func (o *obsRecorder) IncPXFServersChanged(_, _ string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pxfServersChanged++
 }
 
 // obsAuthedRequest builds a request carrying an admin identity so the
@@ -426,6 +474,193 @@ func TestCSVEscapeFormulaInjection(t *testing.T) {
 	for in, want := range cases {
 		assert.Equal(t, want, csvEscape(in), "input %q", in)
 	}
+}
+
+// newObsServerWithInterceptor builds a Server with the capturing recorder and a
+// fake client carrying the supplied interceptor funcs (e.g. a failing Patch).
+func newObsServerWithInterceptor(
+	rec metrics.Recorder, funcs interceptor.Funcs, clusters ...*cbv1alpha1.CloudberryCluster,
+) *Server {
+	scheme := newTestScheme()
+	objs := make([]client.Object, 0, len(clusters))
+	for _, c := range clusters {
+		objs = append(objs, c)
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(objs...).WithInterceptorFuncs(funcs).Build()
+	return trackServer(NewServer(k8sClient, nil, nil, rec, nil, 0))
+}
+
+// TestRecordLifecycleRequest_ErrorAndNilRecorder verifies the W2-B3 request-side
+// lifecycle counter records the error AND accepted spellings, and is a safe
+// no-op when the recorder is nil (TASK 3: closes the 83.3% branch gap).
+func TestRecordLifecycleRequest_ErrorAndNilRecorder(t *testing.T) {
+	rec := &obsRecorder{}
+	s := newObsServer(rec)
+
+	// err != nil -> "error"; err == nil -> "accepted".
+	s.recordLifecycleRequest("reload", errors.New("boom"))
+	s.recordLifecycleRequest("reload", nil)
+
+	assert.Equal(t, []string{"reload/error", "reload/accepted"}, rec.lifecycleRequests,
+		"both the error and accepted result branches must be recorded")
+
+	// nil-recorder Server: the nil-guard must short-circuit without panicking.
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	nilRecServer := trackServer(NewServer(k8sClient, nil, nil, nil, nil, 0))
+	assert.NotPanics(t, func() {
+		nilRecServer.recordLifecycleRequest("reload", errors.New("boom"))
+		nilRecServer.recordLifecycleRequest("reload", nil)
+	})
+}
+
+// TestLifecycleRequestCounter_AcceptedAndError drives every lifecycle/maintenance
+// handler and the config-update path, asserting that EACH request increments the
+// counter exactly once with the bounded operation literal and a result in
+// {accepted,error}, never the cluster name/namespace (TASK 5, C-CARDINALITY).
+func TestLifecycleRequestCounter_AcceptedAndError(t *testing.T) {
+	type handlerFn func(*Server, http.ResponseWriter, *http.Request)
+
+	// clusterAnnotation handlers POST /<verb>; maintenance handlers POST
+	// /maintenance/<verb>; config-update is a PUT body.
+	cases := []struct {
+		name      string
+		operation string
+		method    string
+		path      string
+		body      string
+		invoke    handlerFn
+	}{
+		{"start", "start", http.MethodPost, "/start", "",
+			(*Server).handleStartCluster},
+		{"stop", "stop", http.MethodPost, "/stop", "",
+			(*Server).handleStopCluster},
+		{"restart", "restart", http.MethodPost, "/restart", "",
+			(*Server).handleRestartCluster},
+		{"reload", "reload", http.MethodPost, "/reload", "",
+			(*Server).handleReloadConfig},
+		{"activate-standby", "activate-standby", http.MethodPost, "/activate-standby", "",
+			(*Server).handleActivateStandby},
+		{"rebalance", "rebalance", http.MethodPost, "/rebalance", "",
+			(*Server).handleRebalance},
+		{"vacuum", "vacuum", http.MethodPost, "/maintenance/vacuum", "",
+			(*Server).handleVacuum},
+		{"analyze", "analyze", http.MethodPost, "/maintenance/analyze", "",
+			(*Server).handleAnalyze},
+		{"reindex", "reindex", http.MethodPost, "/maintenance/reindex", "",
+			(*Server).handleReindex},
+		{"config-update", "config-update", http.MethodPut, "/config",
+			`{"parameters":{"max_connections":"200"}}`, (*Server).handleUpdateConfig},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name+"/accepted", func(t *testing.T) {
+			rec := &obsRecorder{}
+			s := newObsServer(rec, newTestCluster("test-cluster", "default"))
+			req := obsAuthedRequest(tc.method,
+				apiPrefix+"/clusters/test-cluster"+tc.path+"?namespace=default",
+				bodyReader(tc.body))
+			req.SetPathValue("name", "test-cluster")
+			w := httptest.NewRecorder()
+			tc.invoke(s, w, req)
+
+			require.Less(t, w.Code, 500, "happy path must not 500: body=%s", w.Body.String())
+			assert.Equal(t, []string{tc.operation + "/accepted"}, rec.lifecycleRequests,
+				"exactly one accepted increment with the bounded operation literal")
+		})
+
+		t.Run(tc.name+"/error", func(t *testing.T) {
+			rec := &obsRecorder{}
+			// config-update mutates via Update (RetryOnConflict); the
+			// annotation/maintenance handlers mutate via Patch. Fail both so
+			// the same table row drives the error branch uniformly.
+			s := newObsServerWithInterceptor(rec, interceptor.Funcs{
+				Patch: func(_ context.Context, _ client.WithWatch, _ client.Object,
+					_ client.Patch, _ ...client.PatchOption) error {
+					return errBoom
+				},
+				Update: func(_ context.Context, _ client.WithWatch, _ client.Object,
+					_ ...client.UpdateOption) error {
+					return errBoom
+				},
+			}, newTestCluster("test-cluster", "default"))
+			req := obsAuthedRequest(tc.method,
+				apiPrefix+"/clusters/test-cluster"+tc.path+"?namespace=default",
+				bodyReader(tc.body))
+			req.SetPathValue("name", "test-cluster")
+			w := httptest.NewRecorder()
+			tc.invoke(s, w, req)
+
+			require.Equal(t, http.StatusInternalServerError, w.Code)
+			assert.Equal(t, []string{tc.operation + "/error"}, rec.lifecycleRequests,
+				"exactly one error increment with the bounded operation literal")
+		})
+	}
+}
+
+// TestRecoveryRequestCounter_RequestedAndError verifies the W2-B2 request-side
+// reuse of the existing recovery family: a happy request records
+// (req.Type,"requested"); a Patch failure records (req.Type,"error"); and an
+// invalid type 400 records NOTHING (no unbounded label) (TASK 7).
+func TestRecoveryRequestCounter_RequestedAndError(t *testing.T) {
+	t.Run("requested", func(t *testing.T) {
+		rec := &obsRecorder{}
+		s := newObsServer(rec, newTestCluster("test-cluster", "default"))
+		req := obsAuthedRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/recovery?namespace=default",
+			strings.NewReader(`{"type":"full"}`))
+		req.SetPathValue("name", "test-cluster")
+		w := httptest.NewRecorder()
+		s.handleStartRecovery(w, req)
+
+		require.Equal(t, http.StatusAccepted, w.Code)
+		assert.Equal(t, []string{"full/requested"}, rec.recoveryOps)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		rec := &obsRecorder{}
+		s := newObsServerWithInterceptor(rec, interceptor.Funcs{
+			Patch: func(_ context.Context, _ client.WithWatch, _ client.Object,
+				_ client.Patch, _ ...client.PatchOption) error {
+				return errBoom
+			},
+		}, newTestCluster("test-cluster", "default"))
+		req := obsAuthedRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/recovery?namespace=default",
+			strings.NewReader(`{"type":"incremental"}`))
+		req.SetPathValue("name", "test-cluster")
+		w := httptest.NewRecorder()
+		s.handleStartRecovery(w, req)
+
+		require.Equal(t, http.StatusInternalServerError, w.Code)
+		assert.Equal(t, []string{"incremental/error"}, rec.recoveryOps)
+	})
+
+	t.Run("invalid-type-not-counted", func(t *testing.T) {
+		rec := &obsRecorder{}
+		s := newObsServer(rec, newTestCluster("test-cluster", "default"))
+		req := obsAuthedRequest(http.MethodPost,
+			apiPrefix+"/clusters/test-cluster/recovery?namespace=default",
+			strings.NewReader(`{"type":"definitely-not-valid"}`))
+		req.SetPathValue("name", "test-cluster")
+		w := httptest.NewRecorder()
+		s.handleStartRecovery(w, req)
+
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Empty(t, rec.recoveryOps,
+			"an unvalidated recovery type must NEVER be recorded as a label")
+	})
+}
+
+// bodyReader returns nil for an empty body so GET/POST handlers without a body
+// behave exactly as in production.
+func bodyReader(body string) io.Reader {
+	if body == "" {
+		return nil
+	}
+	return strings.NewReader(body)
 }
 
 // TestMigrateMetric verifies the migrate counter (C-8) on the success path.
