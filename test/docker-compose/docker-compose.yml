@@ -12,15 +12,33 @@
 #   9000/9001  - MinIO (S3-compatible storage, minioadmin/minioadmin)
 #   9094       - Kafka (KRaft mode, external listener)
 #   5672/15672 - RabbitMQ (guest/guest)
+#   8020/9870  - HDFS NameNode (RPC / WebUI+WebHDFS)
+#   9864/9866  - HDFS DataNode (WebUI / data transfer)
+#   9083       - Hive Metastore (Thrift)
+#   10000/10002- HiveServer2 (JDBC / WebUI)
+#   3306       - MySQL (PXF JDBC source mysql-oltp, pxfuser/pxfpass)
+#   5432       - PostgreSQL source (PXF JDBC source postgres-source, pxfuser/pxfpass)
+#   2181       - HBase ZooKeeper (PXF hbase:* external-table tests)
+#   16010      - HBase Master WebUI
+#   16020/16030- HBase RegionServer RPC / WebUI
 #
 # Setup order:
 #   1. docker compose up -d
 #   2. Wait for Vault and Keycloak to be ready
-#   3. Run scripts/setup-vault.sh   (configures PKI, issues certs)
-#   4. Run scripts/setup-keycloak.sh (creates realm, clients for service-to-service)
-#   5. Run scripts/setup-minio.sh    (creates test buckets)
-#   6. Run scripts/setup-kafka.sh    (creates test topics)
-#   7. Run scripts/setup-rabbitmq.sh (creates test queues)
+#   3. Run scripts/setup-vault.sh     (configures PKI, issues certs)
+#   4. Run scripts/setup-keycloak.sh  (creates realm, clients for service-to-service)
+#   5. Run scripts/setup-minio.sh     (creates test buckets)
+#   6. Run scripts/setup-kafka.sh     (creates test topics)
+#   7. Run scripts/setup-rabbitmq.sh  (creates test queues)
+#   8. Run scripts/setup-hive-hdfs.sh (creates HDFS warehouse + sample Hive table)
+#   9. Run scripts/setup-jdbc-sources.sh (seeds MySQL + PostgreSQL JDBC sources)
+#  10. Run scripts/setup-hbase.sh     (creates sample HBase table for PXF tests)
+#  11. Run scripts/gen-objstore-samples.sh (generates object-store sample data in MinIO)
+#  12. Run scripts/gen-hadoop-samples.sh   (generates Hadoop HDFS/Hive/HBase sample data)
+#  13. Run scripts/gen-pushdown-samples.sh (generates pushdown/projection/error sample data)
+#  14. Run scripts/gen-export-targets.sh   (prepares Scenario 99 writable-export targets)
+#  15. Run scripts/gen-gpload-csv.sh       (generates Scenario 101 gpload CSV sample data)
+#  16. Run scripts/gen-kafka-cdc.sh        (generates Scenario 102 kafka-cdc sample messages)
 # =============================================================================
 
 services:
@@ -241,6 +259,234 @@ services:
       retries: 10
       start_period: 15s
 
+  # ===========================================================================
+  # HDFS - Hadoop Distributed File System (single-node: NameNode + DataNode)
+  # Backing store for PXF hdfs:* / hive:* external-table data-loading tests.
+  # Endpoints match the PXF server config in
+  # specifications/12-data-loading-spec.md (hdfs://namenode:8020).
+  # ===========================================================================
+  namenode:
+    image: apache/hadoop:3.4.1
+    container_name: namenode
+    hostname: namenode
+    user: root
+    # Format the NameNode storage dir on first start (idempotent: the format
+    # is skipped once VERSION exists), then run the NameNode. The apache/hadoop
+    # image has no auto-format entrypoint, so this is done explicitly here.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        mkdir -p /hadoop/dfs/name
+        if [ ! -f /hadoop/dfs/name/current/VERSION ]; then
+          echo "Formatting HDFS NameNode (first start)..."
+          hdfs namenode -format -nonInteractive -force
+        fi
+        exec hdfs namenode
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    ports:
+      - 8020:8020    # NameNode RPC (fs.defaultFS)
+      - 9870:9870    # NameNode WebUI + WebHDFS
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9870/webhdfs/v1/?op=LISTSTATUS || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  datanode:
+    image: apache/hadoop:3.4.1
+    container_name: datanode
+    hostname: datanode
+    user: root
+    command: ["hdfs", "datanode"]
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    ports:
+      - 9864:9864    # DataNode WebUI
+      - 9866:9866    # DataNode data transfer (needed for PXF from k8s)
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9864 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ===========================================================================
+  # Hive - Metastore (Thrift) + HiveServer2 (JDBC) over the test HDFS
+  # Metastore Thrift endpoint matches the PXF config:
+  # thrift://hive-metastore:9083
+  # ===========================================================================
+  hive-metastore-db:
+    image: postgres:16
+    container_name: hive-metastore-db
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+    volumes:
+      - hive_metastore_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  hive-metastore:
+    image: apache/hive:4.0.1
+    container_name: hive-metastore
+    hostname: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # IS_RESUME=false runs schematool -initOrUpgradeSchema on start. This is
+      # idempotent on Hive 4 (initOrUpgrade is a no-op once the schema exists),
+      # so the metastore self-initializes the Postgres backend on first boot.
+      IS_RESUME: "false"
+      # hive-site.xml is symlinked into $HIVE_HOME/conf by the entrypoint.
+      HIVE_CUSTOM_CONF_DIR: /hive-custom-conf
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://hive-metastore-db:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    volumes:
+      - ./hive/hive-site.xml:/hive-custom-conf/hive-site.xml:ro
+      - ./hadoop/core-site.xml:/hive-custom-conf/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/hive-custom-conf/hdfs-site.xml:ro
+      # PostgreSQL JDBC driver (not bundled in the apache/hive image).
+      - ./hive/lib/postgresql-42.7.4.jar:/opt/hive/lib/postgresql-42.7.4.jar:ro
+    ports:
+      - 9083:9083    # Metastore Thrift
+    depends_on:
+      hive-metastore-db:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      # Use bash explicitly: the image's /bin/sh (dash) has no /dev/tcp support.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9083"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  hiveserver2:
+    image: apache/hive:4.0.1
+    container_name: hiveserver2
+    hostname: hiveserver2
+    environment:
+      SERVICE_NAME: hiveserver2
+      # Schema is owned by the metastore; HiveServer2 must skip schema init.
+      IS_RESUME: "true"
+      HIVE_CUSTOM_CONF_DIR: /hive-custom-conf
+      SERVICE_OPTS: >-
+        -Dhive.metastore.uris=thrift://hive-metastore:9083
+    volumes:
+      - ./hive/hive-site.xml:/hive-custom-conf/hive-site.xml:ro
+      - ./hadoop/core-site.xml:/hive-custom-conf/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/hive-custom-conf/hdfs-site.xml:ro
+      - ./hive/lib/postgresql-42.7.4.jar:/opt/hive/lib/postgresql-42.7.4.jar:ro
+    ports:
+      - 10000:10000  # HiveServer2 Thrift (JDBC)
+      - 10002:10002  # HiveServer2 WebUI
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      # Use bash explicitly: the image's /bin/sh (dash) has no /dev/tcp support.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/10000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # ===========================================================================
+  # MySQL - PXF JDBC source (mysql-oltp)
+  # Used by Scenario 93 for external-table data-loading tests via PXF JDBC.
+  # jdbc:mysql://mysql:3306/oltp  user=pxfuser  password=pxfpass
+  # ===========================================================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: oltp
+      MYSQL_USER: pxfuser
+      MYSQL_PASSWORD: pxfpass
+    ports:
+      - 3306:3306
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ===========================================================================
+  # PostgreSQL source - PXF JDBC source (postgres-source)
+  # Dedicated generic Postgres instance for PXF JDBC external-table tests.
+  # jdbc:postgresql://pgsource:5432/sourcedb  user=pxfuser  password=pxfpass
+  # ===========================================================================
+  pgsource:
+    image: postgres:16
+    container_name: pgsource
+    hostname: pgsource
+    environment:
+      POSTGRES_DB: sourcedb
+      POSTGRES_USER: pxfuser
+      POSTGRES_PASSWORD: pxfpass
+    ports:
+      - 5432:5432
+    volumes:
+      - pgsource_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pxfuser -d sourcedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # HBase - Single-node pseudo-distributed HBase (bundles ZooKeeper)
+  # Provides ZooKeeper quorum at hbase:2181 for PXF hbase:* external-table
+  # tests (Scenario 93 acceptance test).
+  # ===========================================================================
+  hbase:
+    image: harisekhon/hbase:2.1
+    container_name: hbase
+    hostname: hbase
+    ports:
+      - 2181:2181      # ZooKeeper client port
+      - 16010:16010    # HBase Master WebUI
+      - 16020:16020    # HBase RegionServer RPC
+      - 16030:16030    # HBase RegionServer WebUI
+    volumes:
+      - hbase_data:/hbase-data
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc 127.0.0.1 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
 volumes:
   postgres_data:
   vault_data:
@@ -252,3 +498,9 @@ volumes:
   minio_data:
   kafka_data:
   rabbitmq_data:
+  hdfs_namenode:
+  hdfs_datanode:
+  hive_metastore_db:
+  mysql_data:
+  pgsource_data:
+  hbase_data:

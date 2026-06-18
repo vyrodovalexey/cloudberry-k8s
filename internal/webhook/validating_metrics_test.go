@@ -231,7 +231,7 @@ func TestValidateCluster_AllErrorBranches(t *testing.T) {
 			mutate: func(c *cbv1alpha1.CloudberryCluster) {
 				c.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 					Enabled: true,
-					Jobs:    []cbv1alpha1.DataLoadingJob{{Type: "s3", TargetTable: "t"}},
+					Jobs:    []cbv1alpha1.DataLoadingJob{{Type: "pxf"}},
 				}
 			},
 			errContains: "dataLoading.jobs[0].name",

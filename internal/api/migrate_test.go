@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,10 +11,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -259,6 +267,107 @@ func TestHandleMigrate_RestoreUsesSourceFolder(t *testing.T) {
 		client.ObjectKey{Name: util.MigrationJobName("src", timestamp), Namespace: "default"}, migrationJob))
 	assert.Equal(t, "scenario87-src", jobS3Folder(migrationJob),
 		"migration Job must read/write the source folder, not the target folder")
+}
+
+// newMigrateServerWithCreateError builds a batch-capable server whose fake
+// client fails Create for batchv1.Job objects with the given error, wired to the
+// capturing obsRecorder so the migrate result counter can be asserted.
+func newMigrateServerWithCreateError(
+	rec *obsRecorder, createErr error, objs ...runtime.Object,
+) *Server {
+	scheme := newTestScheme()
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(objs...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object,
+				opts ...client.CreateOption) error {
+				if _, ok := obj.(*batchv1.Job); ok {
+					return createErr
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	return trackServer(NewServer(k8sClient, nil, nil, rec, nil, 0))
+}
+
+// TestHandleMigrate_CreateJobFails_RecordsRealError verifies the W1-C4 contract:
+// when the migration Job Create fails, both the "migrate.create" child span and
+// the "handleMigrate" parent span carry codes.Error with the SAME real root-cause
+// message (no fabricated placeholder), the response is a 500 with the
+// internal-error code, and exactly one "error" migrate result is recorded.
+func TestHandleMigrate_CreateJobFails_RecordsRealError(t *testing.T) {
+	sr, restore := telemetry.InstallSpanRecorder()
+	defer restore()
+
+	// A distinctive sentinel so we can prove the REAL cause reaches the spans.
+	sentinel := apierrors.NewInternalError(errors.New("etcd unavailable: quota exceeded"))
+
+	source := migrateCluster("src", "shared-bucket")
+	target := migrateCluster("dst", "shared-bucket")
+	rec := &obsRecorder{}
+	s := newMigrateServerWithCreateError(rec, sentinel, source, target)
+
+	w := httptest.NewRecorder()
+	s.handleMigrate(w, postMigrateRequest("src",
+		`{"targetCluster":"dst","database":"mydb"}`))
+
+	// (a) HTTP 500 + internal-error body.
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), errCodeInternal)
+	assert.Contains(t, w.Body.String(), "failed to create migration job")
+
+	// (d) exactly one "error" migrate result recorded.
+	assert.Equal(t, []string{"error"}, rec.migrateResults)
+
+	// (c) Both spans carry codes.Error with the SAME real root-cause message.
+	spans := sr.Ended()
+	var createSpan, parentSpan bool
+	const rootCause = "etcd unavailable: quota exceeded"
+	for _, sp := range spans {
+		switch sp.Name() {
+		case "migrate.create":
+			createSpan = true
+			assert.Equal(t, codes.Error, sp.Status().Code, "create span must be errored")
+			assert.Contains(t, sp.Status().Description, rootCause,
+				"create span must carry the real root cause, not a placeholder")
+		case "handleMigrate":
+			parentSpan = true
+			assert.Equal(t, codes.Error, sp.Status().Code, "parent span must be errored")
+			assert.Contains(t, sp.Status().Description, rootCause,
+				"parent span must carry the SAME real root cause as the child")
+		}
+	}
+	assert.True(t, createSpan, "migrate.create span must exist")
+	assert.True(t, parentSpan, "handleMigrate span must exist")
+}
+
+// TestCreateMigrateJob_CreateError_Returns500AndWrappedError verifies that
+// createMigrateJob writes a 500 internal-error response AND returns a non-nil
+// error wrapping the injected root cause (errors.Is reaches the sentinel), so a
+// caller can record the genuine cause on its span (W1-C4).
+func TestCreateMigrateJob_CreateError_Returns500AndWrappedError(t *testing.T) {
+	sentinel := apierrors.NewConflict(
+		schema.GroupResource{Resource: "jobs"}, "migration-job", errors.New("boom"))
+
+	rec := &obsRecorder{}
+	s := newMigrateServerWithCreateError(rec, sentinel)
+
+	job := &batchv1.Job{}
+	job.Name = "migration-job"
+	job.Namespace = "default"
+
+	w := httptest.NewRecorder()
+	err := s.createMigrateJob(w, context.Background(), job, "migration")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel, "returned error must wrap the injected root cause")
+	assert.Contains(t, err.Error(), `creating migration job "migration-job"`)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), errCodeInternal)
+	assert.Contains(t, w.Body.String(), "failed to create migration job")
 }
 
 func TestHandleCreateBackup_IncrementalArgs(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -97,6 +98,17 @@ const (
 	resultSuccess = "success"
 	resultError   = "error"
 
+	// lifecycleResultAccepted is the request-side success spelling used by
+	// cloudberry_api_cluster_lifecycle_requests_total (a requested action was
+	// accepted, distinct from the controller-side "success" of execution).
+	lifecycleResultAccepted = "accepted"
+
+	// recoveryResultRequested is the request-side success spelling recorded on
+	// cloudberry_recovery_operations_total when a recovery is REQUESTED via the
+	// API. It is distinct from the controller-side started/completed/failed
+	// values so the two signals do not collide.
+	recoveryResultRequested = "requested"
+
 	// errCodeClusterNotFound is the error code for cluster-not-found responses.
 	errCodeClusterNotFound = "CLUSTER_NOT_FOUND"
 
@@ -106,9 +118,22 @@ const (
 	// errCodeInvalidRequest is the error code for malformed/invalid requests.
 	errCodeInvalidRequest = "INVALID_REQUEST"
 
-	// errCodeNotImplemented is the error code for endpoints that are not
-	// implemented yet (HTTP 501 responses).
-	errCodeNotImplemented = "NOT_IMPLEMENTED"
+	// errCodePXFNotEnabled is the error code returned when a PXF lifecycle
+	// endpoint is invoked for a cluster that does not have PXF enabled.
+	errCodePXFNotEnabled = "PXF_NOT_ENABLED"
+
+	// errCodePXFNotReady is returned when a PXF sync/restart cannot proceed
+	// because the segment-primary StatefulSet does not exist yet (a
+	// precondition, not an internal error). It maps to HTTP 409 Conflict.
+	errCodePXFNotReady = "PXF_NOT_READY"
+
+	// msgPXFNotEnabled is the message returned when PXF is not enabled.
+	msgPXFNotEnabled = "PXF is not enabled for this cluster"
+
+	// pxfRestartResultStarted / pxfRestartResultFailed are the result label
+	// values recorded on cloudberry_pxf_restart_total.
+	pxfRestartResultStarted = "started"
+	pxfRestartResultFailed  = "failed"
 
 	// jobLogsFlushInterval is how often streamed log output is flushed to the
 	// client when following a Job's logs.
@@ -403,7 +428,15 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/storage/usage-report",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetUsageReport)))
 
-	// Data loading.
+	// Data loading (jobs CRUD/lifecycle, logs, external-tables, PXF lifecycle
+	// and PXF servers CRUD).
+	s.registerDataLoadingRoutes()
+}
+
+// registerDataLoadingRoutes registers the data-loading job CRUD/lifecycle
+// endpoints (P.7–P.13), job logs (P.14), external-tables (P.15), the PXF
+// lifecycle endpoints (P.1/P.6 + restart) and the PXF servers CRUD (P.2–P.5).
+func (s *Server) registerDataLoadingRoutes() {
 	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/jobs",
 		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListDataLoadingJobs)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/jobs",
@@ -418,6 +451,42 @@ func (s *Server) registerRoutes() {
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStartDataLoadingJob)))
 	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}/stop",
 		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleStopDataLoadingJob)))
+	// Data-loading job logs (P.14) and external-tables observed/expected view (P.15).
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/jobs/{job}/logs",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleDataLoadingJobLogs)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/external-tables",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListExternalTables)))
+	// PXF source preview read (L.15). "test-read" is a literal path segment
+	// distinct from the {job} wildcard above, so Go 1.22's ServeMux prefers this
+	// literal route — no pattern collision. PermissionBasic: it is a read-only,
+	// self-cleaning sample (transient external table created & always dropped),
+	// records NO metric, and never fabricates rows.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/test-read",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleTestReadPXFSource)))
+
+	// PXF lifecycle. "pxf" is a literal path segment distinct from the {job}
+	// wildcard above, so Go 1.22's ServeMux prefers these literal routes and
+	// there is no pattern collision.
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/pxf/status",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handlePXFStatus)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/pxf/restart",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handlePXFRestart)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/pxf/sync",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handlePXFSync)))
+
+	// PXF servers CRUD (P.2–P.5). The "pxf/servers" prefix is literal and
+	// distinct from the "{job}" wildcard, so Go 1.22's ServeMux prefers these
+	// literal routes — no pattern collision (same reasoning as pxf/status above).
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/pxf/servers",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleListPXFServers)))
+	s.mux.Handle("GET "+apiPrefix+"/clusters/{name}/data-loading/pxf/servers/{server}",
+		s.withAuth(s.withPermission(auth.PermissionBasic, s.handleGetPXFServer)))
+	s.mux.Handle("POST "+apiPrefix+"/clusters/{name}/data-loading/pxf/servers",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleCreatePXFServer)))
+	s.mux.Handle("PUT "+apiPrefix+"/clusters/{name}/data-loading/pxf/servers/{server}",
+		s.withAuth(s.withPermission(auth.PermissionOperator, s.handleUpdatePXFServer)))
+	s.mux.Handle("DELETE "+apiPrefix+"/clusters/{name}/data-loading/pxf/servers/{server}",
+		s.withAuth(s.withPermission(auth.PermissionAdmin, s.handleDeletePXFServer)))
 }
 
 // registerWorkloadRoutes registers workload, resource group, rule, and queue routes.
@@ -849,6 +918,56 @@ func (s *Server) recordClusterOperation(operation string, err error) {
 	s.metrics.RecordAPIClusterOperation(operation, result)
 }
 
+// recordLifecycleRequest records the REQUEST-side outcome of a cluster
+// lifecycle/maintenance action on cloudberry_api_cluster_lifecycle_requests_total
+// (nil-safe). It is the request-side complement of the controller-side counters
+// (RecordConfigReload, RecordRollingRestart, RecordMaintenanceOperation, ...).
+//
+// operation MUST be one of the bounded literals {start, stop, restart, reload,
+// activate-standby, rebalance, vacuum, analyze, reindex, config-update};
+// result is "accepted" on a successfully-requested action or resultError on a
+// patch/update failure.
+func (s *Server) recordLifecycleRequest(operation string, err error) {
+	if s.metrics == nil {
+		return
+	}
+	result := lifecycleResultAccepted
+	if err != nil {
+		result = resultError
+	}
+	s.metrics.RecordAPILifecycleRequest(operation, result)
+}
+
+// Workload-management metric label values (bounded enums for
+// cloudberry_api_workload_operations_total). The counter is recorded ONLY at the
+// real DDL call site (success or DB error); pre-DDL validation 400s and the
+// db-factory-unavailable "pending" responses are intentionally NOT counted
+// because no DDL was attempted.
+const (
+	workloadKindResourceGroup = "resource_group"
+	workloadKindResourceQueue = "resource_queue"
+	workloadKindRule          = "rule"
+
+	workloadOpCreate = "create"
+	workloadOpUpdate = "update"
+	workloadOpDelete = "delete"
+	workloadOpAssign = "assign"
+)
+
+// recordWorkloadOp records a workload-management DDL outcome on
+// cloudberry_api_workload_operations_total (nil-safe). kind/op come from the
+// bounded enums above; result is resultSuccess or resultError.
+func (s *Server) recordWorkloadOp(kind, op string, err error) {
+	if s.metrics == nil {
+		return
+	}
+	result := resultSuccess
+	if err != nil {
+		result = resultError
+	}
+	s.metrics.RecordAPIWorkloadOperation(kind, op, result)
+}
+
 // handleDeleteCluster deletes a CloudberryCluster.
 func (s *Server) handleDeleteCluster(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -924,10 +1043,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}); updateErr != nil {
 		s.logger.Error("failed to update config", "cluster", name, "error", updateErr)
+		s.recordLifecycleRequest("config-update", updateErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			fmt.Sprintf("failed to update config: %v", updateErr))
 		return
 	}
+	s.recordLifecycleRequest("config-update", nil)
 
 	// Audit log: config change
 	if identity := auth.IdentityFromContext(r.Context()); identity != nil {
@@ -1165,6 +1286,9 @@ func (s *Server) cancelBackendByPID(w http.ResponseWriter, r *http.Request, opts
 		Reason string `json:"reason"`
 	}
 	if opts.parseReason {
+		// Bound and close the body for parity with the other mutating handlers.
+		limitBody(w, r)
+		defer r.Body.Close()
 		// Ignore decode errors — reason is optional.
 		_ = json.NewDecoder(r.Body).Decode(&cancelReq)
 	}
@@ -1352,11 +1476,28 @@ func (s *Server) handleStartRecovery(w http.ResponseWriter, r *http.Request) {
 	if patchErr := s.patchClusterAnnotation(r.Context(), cluster,
 		util.AnnotationRecovery, req.Type); patchErr != nil {
 		s.logger.Error("failed to start recovery", "cluster", name, "error", patchErr)
+		// Request-side outcome on the EXISTING recovery family (the controller's
+		// own started/completed/failed values stay distinct). req.Type is already
+		// validated to the bounded set above, so the label is bounded.
+		s.recordRecoveryRequest(cluster, req.Type, resultError)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to start recovery")
 		return
 	}
 
+	s.recordRecoveryRequest(cluster, req.Type, recoveryResultRequested)
 	writeJSON(w, http.StatusAccepted, map[string]string{responseKeyStatus: "recovery started", "type": req.Type})
+}
+
+// recordRecoveryRequest records the REQUEST-side outcome of a recovery action on
+// the EXISTING cloudberry_recovery_operations_total family (nil-safe). result is
+// recoveryResultRequested on success or resultError on a patch failure;
+// recoveryType is already validated to the bounded {incremental, full,
+// differential} set by the caller.
+func (s *Server) recordRecoveryRequest(cluster *cbv1alpha1.CloudberryCluster, recoveryType, result string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.RecordRecoveryOperation(cluster.Name, cluster.Namespace, recoveryType, result)
 }
 
 // handleRebalance starts a rebalance operation.
@@ -1543,10 +1684,12 @@ func (s *Server) handleCreateResourceGroup(w http.ResponseWriter, r *http.Reques
 	if createErr := dbClient.CreateResourceGroup(r.Context(), opts); createErr != nil {
 		s.logger.Error("failed to create resource group",
 			"cluster", cluster.Name, "group", req.Name, "error", createErr)
+		s.recordWorkloadOp(workloadKindResourceGroup, workloadOpCreate, createErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create resource group")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceGroup, workloadOpCreate, nil)
 
 	s.logger.Info("resource group created",
 		"cluster", cluster.Name, "group", req.Name)
@@ -1600,10 +1743,12 @@ func (s *Server) handleDeleteResourceGroup(w http.ResponseWriter, r *http.Reques
 	if dropErr := dbClient.DropResourceGroup(r.Context(), groupName); dropErr != nil {
 		s.logger.Error("failed to drop resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "error", dropErr)
+		s.recordWorkloadOp(workloadKindResourceGroup, workloadOpDelete, dropErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to drop resource group")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceGroup, workloadOpDelete, nil)
 
 	s.logger.Info("resource group dropped",
 		"cluster", cluster.Name, responseKeyGroup, groupName)
@@ -1680,10 +1825,12 @@ func (s *Server) handleUpdateResourceGroup(w http.ResponseWriter, r *http.Reques
 	if alterErr := dbClient.AlterResourceGroup(r.Context(), opts); alterErr != nil {
 		s.logger.Error("failed to alter resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "error", alterErr)
+		s.recordWorkloadOp(workloadKindResourceGroup, workloadOpUpdate, alterErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to alter resource group")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceGroup, workloadOpUpdate, nil)
 
 	s.logger.Info("resource group updated",
 		"cluster", cluster.Name, responseKeyGroup, groupName)
@@ -1760,10 +1907,12 @@ func (s *Server) handleAssignResourceGroup(w http.ResponseWriter, r *http.Reques
 	if assignErr := dbClient.AssignRoleResourceGroup(r.Context(), req.Role, groupName); assignErr != nil {
 		s.logger.Error("failed to assign role to resource group",
 			"cluster", cluster.Name, responseKeyGroup, groupName, "role", req.Role, "error", assignErr)
+		s.recordWorkloadOp(workloadKindResourceGroup, workloadOpAssign, assignErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to assign role to resource group")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceGroup, workloadOpAssign, nil)
 
 	// Audit log: role management
 	identity := auth.IdentityFromContext(r.Context())
@@ -1903,10 +2052,12 @@ func (s *Server) handleCreateResourceQueue(w http.ResponseWriter, r *http.Reques
 	if createErr := dbClient.CreateResourceQueue(r.Context(), opts); createErr != nil {
 		s.logger.Error("failed to create resource queue",
 			"cluster", cluster.Name, "queue", req.Name, "error", createErr)
+		s.recordWorkloadOp(workloadKindResourceQueue, workloadOpCreate, createErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to create resource queue")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceQueue, workloadOpCreate, nil)
 
 	s.logger.Info("resource queue created",
 		"cluster", cluster.Name, "queue", req.Name)
@@ -1960,10 +2111,12 @@ func (s *Server) handleDeleteResourceQueue(w http.ResponseWriter, r *http.Reques
 	if dropErr := dbClient.DropResourceQueue(r.Context(), queueName); dropErr != nil {
 		s.logger.Error("failed to drop resource queue",
 			"cluster", cluster.Name, "queue", queueName, "error", dropErr)
+		s.recordWorkloadOp(workloadKindResourceQueue, workloadOpDelete, dropErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			"failed to drop resource queue")
 		return
 	}
+	s.recordWorkloadOp(workloadKindResourceQueue, workloadOpDelete, nil)
 
 	s.logger.Info("resource queue dropped",
 		"cluster", cluster.Name, "queue", queueName)
@@ -2050,6 +2203,7 @@ func (s *Server) handleCreateWorkloadRule(w http.ResponseWriter, r *http.Request
 			return nil
 		})
 	if errors.Is(updateErr, errDuplicateWorkloadRule) {
+		s.recordWorkloadOp(workloadKindRule, workloadOpCreate, updateErr)
 		writeErrorJSON(w, http.StatusBadRequest, "DUPLICATE_RULE",
 			fmt.Sprintf("workload rule %q already exists", rule.Name))
 		return
@@ -2057,10 +2211,12 @@ func (s *Server) handleCreateWorkloadRule(w http.ResponseWriter, r *http.Request
 	if updateErr != nil {
 		s.logger.Error("failed to create workload rule",
 			"cluster", name, "rule", rule.Name, "error", updateErr)
+		s.recordWorkloadOp(workloadKindRule, workloadOpCreate, updateErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			fmt.Sprintf("failed to create workload rule: %v", updateErr))
 		return
 	}
+	s.recordWorkloadOp(workloadKindRule, workloadOpCreate, nil)
 
 	s.logger.Info("workload rule created", "cluster", name, responseKeyRule, rule.Name)
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
@@ -2162,6 +2318,7 @@ func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request
 			return errWorkloadRuleNotFound
 		})
 	if errors.Is(updateErr, errWorkloadRuleNotFound) {
+		s.recordWorkloadOp(workloadKindRule, workloadOpUpdate, updateErr)
 		writeErrorJSON(w, http.StatusNotFound, "RULE_NOT_FOUND",
 			fmt.Sprintf("workload rule %q not found", ruleName))
 		return
@@ -2169,10 +2326,12 @@ func (s *Server) handleUpdateWorkloadRule(w http.ResponseWriter, r *http.Request
 	if updateErr != nil {
 		s.logger.Error("failed to update workload rule",
 			"cluster", name, "rule", ruleName, "error", updateErr)
+		s.recordWorkloadOp(workloadKindRule, workloadOpUpdate, updateErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			fmt.Sprintf("failed to update workload rule: %v", updateErr))
 		return
 	}
+	s.recordWorkloadOp(workloadKindRule, workloadOpUpdate, nil)
 
 	s.logger.Info("workload rule updated", "cluster", name, responseKeyRule, ruleName)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2240,10 +2399,12 @@ func (s *Server) handleDeleteWorkloadRule(w http.ResponseWriter, r *http.Request
 	if updateErr != nil {
 		s.logger.Error("failed to delete workload rule",
 			"cluster", name, "rule", ruleName, "error", updateErr)
+		s.recordWorkloadOp(workloadKindRule, workloadOpDelete, updateErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
 			fmt.Sprintf("failed to delete workload rule: %v", updateErr))
 		return
 	}
+	s.recordWorkloadOp(workloadKindRule, workloadOpDelete, nil)
 
 	s.logger.Info("workload rule deleted", "cluster", name, responseKeyRule, ruleName)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -3942,6 +4103,12 @@ func (s *Server) handleListDataLoadingJobs(w http.ResponseWriter, r *http.Reques
 		writeClusterNotFound(w, name)
 		return
 	}
+	// Read endpoint: a disabled subsystem returns the 200 disabled envelope
+	// (mirrors writeMonitoringDisabled) rather than an error.
+	if !dataLoadingEnabled(cluster) {
+		writeDataLoadingDisabled(w, cluster)
+		return
+	}
 
 	var jobs []interface{}
 	if cluster.Spec.DataLoading != nil {
@@ -3956,35 +4123,6 @@ func (s *Server) handleListDataLoadingJobs(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// msgDataLoadingNotImplemented is the standard 501 message for the
-// data-loading job mutation endpoints. The full implementation (patching
-// spec.dataLoading.jobs, creating loader Jobs and wiring
-// RecordDataLoadingRows) is tracked as a dedicated feature; until it lands,
-// these endpoints honestly report NOT_IMPLEMENTED instead of fake successes.
-const msgDataLoadingNotImplemented = "data loading job mutations are not implemented yet; " +
-	"track the data-loading feature for availability. Read-only endpoints (list/get) remain available"
-
-// writeDataLoadingNotImplemented validates that the target cluster exists
-// (preserving the 404 contract) and then writes the standard 501
-// NOT_IMPLEMENTED error envelope shared by all five data-loading mutation
-// endpoints. No success metric or event is emitted from these stubs.
-func (s *Server) writeDataLoadingNotImplemented(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
-		writeClusterNotFound(w, name)
-		return
-	}
-
-	writeErrorJSON(w, http.StatusNotImplemented, errCodeNotImplemented,
-		msgDataLoadingNotImplemented)
-}
-
-// handleCreateDataLoadingJob is a 501 stub: data-loading job creation is not
-// implemented yet (see msgDataLoadingNotImplemented).
-func (s *Server) handleCreateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	s.writeDataLoadingNotImplemented(w, r)
-}
-
 // handleGetDataLoadingJob gets a specific data loading job.
 func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -3992,6 +4130,11 @@ func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request)
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
+		return
+	}
+	// Read endpoint: a disabled subsystem returns the 200 disabled envelope.
+	if !dataLoadingEnabled(cluster) {
+		writeDataLoadingDisabled(w, cluster)
 		return
 	}
 
@@ -4008,35 +4151,290 @@ func (s *Server) handleGetDataLoadingJob(w http.ResponseWriter, r *http.Request)
 		fmt.Sprintf("data loading job %q not found", jobName))
 }
 
-// handleUpdateDataLoadingJob is a 501 stub: data-loading job updates are not
-// implemented yet (see msgDataLoadingNotImplemented).
-func (s *Server) handleUpdateDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	s.writeDataLoadingNotImplemented(w, r)
+// pxfEnabled reports whether the cluster has PXF data loading enabled. It
+// mirrors the builder gate (pxf_builder.go pxfSidecarEnabled) at the
+// spec.dataLoading.pxf level: data loading enabled, the PXF block present and
+// enabled. It deliberately does NOT require a non-empty image here — the
+// handlers treat any pxf.enabled cluster as in-scope and report honest status.
+func pxfEnabled(cluster *cbv1alpha1.CloudberryCluster) bool {
+	dl := cluster.Spec.DataLoading
+	return dl != nil && dl.Enabled && dl.Pxf != nil && dl.Pxf.Enabled
 }
 
-// handleDeleteDataLoadingJob is a 501 stub: data-loading job deletion is not
-// implemented yet (see msgDataLoadingNotImplemented).
-func (s *Server) handleDeleteDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	s.writeDataLoadingNotImplemented(w, r)
+// pxfSidecarStatus is a single segment-primary pod's PXF sidecar readiness as
+// derived ONLY from the pod's real ContainerStatuses (no synthetic health, no
+// actuator call, no exec).
+type pxfSidecarStatus struct {
+	Pod   string `json:"pod"`
+	Ready bool   `json:"ready"`
 }
 
-// handleStartDataLoadingJob is a 501 stub: starting data-loading jobs is not
-// implemented yet (see msgDataLoadingNotImplemented).
-//
-// NOTE: the cloudberry_data_loading_rows_total metric
-// (Recorder.RecordDataLoadingRows) is intentionally NOT recorded here: there
-// is no rows-loaded signal available. The recorder call must be wired at the
-// point where a data-loading Job actually completes and reports its
-// loaded-row count, which does not exist yet. Recording a value here would
-// fabricate data, so it is deliberately omitted.
-func (s *Server) handleStartDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	s.writeDataLoadingNotImplemented(w, r)
+// getPXFCluster resolves the cluster and enforces the PXF-enabled gate shared by
+// all three PXF lifecycle handlers. On the not-found path it writes a 404 and on
+// the not-enabled path a 400 PXF_NOT_ENABLED envelope, returning nil so callers
+// stop. The boolean reports whether the caller may proceed.
+func (s *Server) getPXFCluster(
+	w http.ResponseWriter, r *http.Request,
+) (*cbv1alpha1.CloudberryCluster, bool) {
+	name := r.PathValue("name")
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
+		writeClusterNotFound(w, name)
+		return nil, false
+	}
+	// Subsystem precedence: when the data-loading subsystem itself is disabled,
+	// report DATA_LOADING_NOT_ENABLED (the broader gate) rather than the
+	// PXF-specific PXF_NOT_ENABLED, so the honest reason is surfaced first.
+	if !dataLoadingEnabled(cluster) {
+		writeErrorJSON(w, http.StatusBadRequest,
+			errCodeDataLoadingNotEnabled, msgDataLoadingNotEnabled)
+		return nil, false
+	}
+	if !pxfEnabled(cluster) {
+		writeErrorJSON(w, http.StatusBadRequest, errCodePXFNotEnabled, msgPXFNotEnabled)
+		return nil, false
+	}
+	return cluster, true
 }
 
-// handleStopDataLoadingJob is a 501 stub: stopping data-loading jobs is not
-// implemented yet (see msgDataLoadingNotImplemented).
-func (s *Server) handleStopDataLoadingJob(w http.ResponseWriter, r *http.Request) {
-	s.writeDataLoadingNotImplemented(w, r)
+// handlePXFStatus reports the honest PXF sidecar readiness for a cluster. It
+// lists the segment-primary pods and reads each one's "pxf" container readiness
+// straight from Status.ContainerStatuses — there is no live health probe, no
+// exec, and no cross-pod HTTP. It echoes the spec-derived
+// Status.DataLoading.Pxf.{Configured,Servers} for context.
+func (s *Server) handlePXFStatus(w http.ResponseWriter, r *http.Request) {
+	cluster, ok := s.getPXFCluster(w, r)
+	if !ok {
+		return
+	}
+
+	podList := &corev1.PodList{}
+	if err := s.k8sClient.List(r.Context(), podList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(util.SegmentPrimaryPXFSelector(cluster.Name)),
+	); err != nil {
+		s.logger.Error("failed to list segment-primary pods for PXF status",
+			"cluster", cluster.Name, "error", err)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to list segment-primary pods")
+		return
+	}
+
+	sidecars, ready := pxfSidecarStatuses(podList)
+
+	configured := false
+	var servers int32
+	if cluster.Status.DataLoading != nil && cluster.Status.DataLoading.Pxf != nil {
+		configured = cluster.Status.DataLoading.Pxf.Configured
+		servers = cluster.Status.DataLoading.Pxf.Servers
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"servers":       servers,
+		"configured":    configured,
+		"sidecars":      sidecars,
+		"readySidecars": ready,
+		"totalSidecars": len(sidecars),
+	})
+}
+
+// pxfSidecarStatuses builds the per-pod PXF sidecar readiness slice plus the
+// count of ready sidecars from the real ContainerStatuses. A pod with no "pxf"
+// container status is reported as not ready (honest: it is not observably up).
+// The aggregate count is delegated to util.PXFReadyCount so the API handler and
+// the controller share a single readiness source of truth; the per-pod Ready
+// flags use the same util.PXFContainerName container so they stay consistent.
+func pxfSidecarStatuses(podList *corev1.PodList) (sidecars []pxfSidecarStatus, readyCount int) {
+	sidecars = make([]pxfSidecarStatus, 0, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		podReady := false
+		for j := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[j]
+			if cs.Name == util.PXFContainerName {
+				podReady = cs.Ready
+				break
+			}
+		}
+		sidecars = append(sidecars, pxfSidecarStatus{Pod: pod.Name, Ready: podReady})
+	}
+	readyCount, _ = util.PXFReadyCount(podList)
+	return sidecars, readyCount
+}
+
+// handlePXFRestart triggers an operator-driven PXF restart by bumping the
+// restart-trigger annotation on the <cluster>-segment-primary StatefulSet, which
+// causes the segment-primary pods to roll (kubelet recreates them and the
+// entrypoint re-runs pxf prepare/start). This is a pod ROLL, NOT an in-place
+// sidecar restart. It records cloudberry_pxf_restart_total{result}.
+func (s *Server) handlePXFRestart(w http.ResponseWriter, r *http.Request) {
+	cluster, ok := s.getPXFCluster(w, r)
+	if !ok {
+		return
+	}
+
+	stsName := util.SegmentPrimaryName(cluster.Name)
+	if err := util.PatchStatefulSetRestartTrigger(
+		r.Context(), s.k8sClient, cluster.Namespace, stsName); err != nil {
+		s.recordPXFRestart(cluster, pxfRestartResultFailed)
+		s.logger.Error("failed to trigger PXF restart",
+			"cluster", cluster.Name, "statefulSet", stsName, "error", err)
+		if apierrors.IsNotFound(err) {
+			// Precondition not met: the segment-primary StatefulSet must exist
+			// before its sidecars can be rolled. 409 (not 404/500) with a
+			// dedicated code so the status and code agree.
+			writeErrorJSON(w, http.StatusConflict, errCodePXFNotReady,
+				"cannot restart PXF: segment-primary StatefulSet does not exist yet")
+			return
+		}
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to trigger PXF restart: segment-primary StatefulSet not patched")
+		return
+	}
+
+	s.recordPXFRestart(cluster, pxfRestartResultStarted)
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"restarted":        true,
+		"statefulSet":      stsName,
+		responseKeyMessage: "PXF restart triggered (segment-primary pods will roll)",
+	})
+}
+
+// handlePXFSync refreshes the <cluster>-pxf-servers ConfigMap (rendering the
+// current spec) and then bumps the segment-primary restart-trigger annotation so
+// the pxf-cred-init init container re-renders the servers on the next roll. This
+// is the explicit "ConfigMap refresh + sidecar roll" sync, complementary to the
+// structural shared-ConfigMap reconcile performed by the cluster controller.
+func (s *Server) handlePXFSync(w http.ResponseWriter, r *http.Request) {
+	cluster, ok := s.getPXFCluster(w, r)
+	if !ok {
+		return
+	}
+
+	cmName, err := s.syncPXFServersConfigMap(r.Context(), cluster)
+	if err != nil {
+		s.logger.Error("failed to sync PXF servers ConfigMap",
+			"cluster", cluster.Name, "error", err)
+		s.recordPXFSync(cluster, resultError)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to sync PXF servers ConfigMap")
+		return
+	}
+
+	stsName := util.SegmentPrimaryName(cluster.Name)
+	if err := util.PatchStatefulSetRestartTrigger(
+		r.Context(), s.k8sClient, cluster.Namespace, stsName); err != nil {
+		s.logger.Error("failed to bump segment-primary restart trigger on PXF sync",
+			"cluster", cluster.Name, "statefulSet", stsName, "error", err)
+		s.recordPXFSync(cluster, resultError)
+		if apierrors.IsNotFound(err) {
+			// The ConfigMap was synced, but the segment-primary StatefulSet does
+			// not exist yet to roll. 409 (precondition) with a code that agrees
+			// with the status, rather than a 404/INTERNAL_ERROR mismatch.
+			writeErrorJSON(w, http.StatusConflict, errCodePXFNotReady,
+				"PXF ConfigMap synced but segment-primary StatefulSet does not exist yet to roll")
+			return
+		}
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"PXF ConfigMap synced but segment-primary StatefulSet not patched")
+		return
+	}
+
+	s.recordPXFSync(cluster, resultSuccess)
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"synced":           true,
+		"configMap":        cmName,
+		"statefulSet":      stsName,
+		responseKeyMessage: "PXF config synced; segment-primary sidecars rolling",
+	})
+}
+
+// recordPXFSync records the OUTCOME of a PXF servers sync request on
+// cloudberry_pxf_sync_total (nil-safe). This is a SEPARATE dimension from the
+// honest IncPXFServersChanged counter (which stays flat on a no-op): a sync that
+// errors is now visible without inferring from the HTTP status. result is
+// resultSuccess or resultError.
+func (s *Server) recordPXFSync(cluster *cbv1alpha1.CloudberryCluster, result string) {
+	if s.metrics != nil {
+		s.metrics.RecordPXFSync(cluster.Name, cluster.Namespace, result)
+	}
+}
+
+// syncPXFServersConfigMap renders the desired PXF servers ConfigMap and creates
+// or byte-stably updates it, mirroring the cluster controller's
+// ensurePxfServersConfigMap get-or-update semantics. It returns the ConfigMap
+// name. A nil desired ConfigMap (PXF off / no image) is treated as a no-op and
+// the resolved name is still returned for the response envelope.
+func (s *Server) syncPXFServersConfigMap(
+	ctx context.Context, cluster *cbv1alpha1.CloudberryCluster,
+) (string, error) {
+	desired := s.builder.BuildPXFServersConfigMap(cluster)
+	if desired == nil {
+		return builder.PxfServersConfigMapName(cluster.Name), nil
+	}
+
+	existing := &corev1.ConfigMap{}
+	err := s.k8sClient.Get(ctx,
+		types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		if createErr := s.k8sClient.Create(ctx, desired); createErr != nil &&
+			!apierrors.IsAlreadyExists(createErr) {
+			return desired.Name, fmt.Errorf("creating PXF servers ConfigMap %s: %w",
+				desired.Name, createErr)
+		}
+		return desired.Name, nil
+	case err != nil:
+		return desired.Name, fmt.Errorf("getting PXF servers ConfigMap %s: %w", desired.Name, err)
+	default:
+		// dataChanged is the HONEST server-config-change signal: it is computed
+		// BEFORE the assignment so it reflects a REAL ConfigMap Data diff (a
+		// server added/removed/updated), independent of any labels-only change.
+		dataChanged := !equality.Semantic.DeepEqual(existing.Data, desired.Data)
+		if dataChanged || !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
+			existingData := existing.Data
+			existing.Data = desired.Data
+			existing.Labels = desired.Labels
+			if updateErr := s.k8sClient.Update(ctx, existing); updateErr != nil {
+				return desired.Name, fmt.Errorf("updating PXF servers ConfigMap %s: %w",
+					desired.Name, updateErr)
+			}
+			// Fire the server-config-change signal ONLY on a real Data diff —
+			// never on a labels-only change — so the metric stays honest.
+			if dataChanged {
+				s.recordPXFServersChanged(cluster, existingData, desired.Data)
+			}
+		}
+		return desired.Name, nil
+	}
+}
+
+// recordPXFServersChanged records the HONEST PXF servers-changed signal on the
+// explicit sync path: it increments the cloudberry_pxf_servers_changed_total
+// counter (guarding against a nil recorder in tests/non-metric setups) and logs
+// the added/removed/updated server names. The API Server has no Kubernetes
+// EventRecorder, so the Normal event is emitted by the cluster controller's
+// reconcile path; here the diff is logged for parity. Callers MUST invoke it
+// only after a successful ConfigMap Update whose Data actually changed.
+func (s *Server) recordPXFServersChanged(
+	cluster *cbv1alpha1.CloudberryCluster,
+	existingData, desiredData map[string]string,
+) {
+	if s.metrics != nil {
+		s.metrics.IncPXFServersChanged(cluster.Name, cluster.Namespace)
+	}
+	added, removed, updated := util.DiffPXFServerNames(existingData, desiredData)
+	s.logger.Info("PXF servers ConfigMap changed",
+		"cluster", cluster.Name,
+		"message", util.FormatPXFServersChangedMessage(added, removed, updated))
+}
+
+// recordPXFRestart records the PXF restart metric, guarding against a nil
+// recorder (tests / non-metric setups).
+func (s *Server) recordPXFRestart(cluster *cbv1alpha1.CloudberryCluster, result string) {
+	if s.metrics != nil {
+		s.metrics.RecordPXFRestart(cluster.Name, cluster.Namespace, result)
+	}
 }
 
 // handleListPVCs lists all PVCs for a cluster with their sizes.
@@ -4290,10 +4688,12 @@ func (s *Server) setClusterAnnotation(w http.ResponseWriter, r *http.Request, ac
 	if patchErr := s.patchClusterAnnotation(r.Context(), cluster,
 		util.AnnotationAction, action); patchErr != nil {
 		s.logger.Error("failed to set action annotation", "cluster", name, "action", action, "error", patchErr)
+		s.recordLifecycleRequest(action, patchErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to set action")
 		return
 	}
 
+	s.recordLifecycleRequest(action, nil)
 	writeJSON(w, http.StatusAccepted, map[string]string{responseKeyStatus: action + " initiated"})
 }
 
@@ -4311,11 +4711,13 @@ func (s *Server) setMaintenanceAnnotation(w http.ResponseWriter, r *http.Request
 		util.AnnotationMaintenance, operation); patchErr != nil {
 		s.logger.Error("failed to set maintenance annotation",
 			"cluster", name, "operation", operation, "error", patchErr)
+		s.recordLifecycleRequest(operation, patchErr)
 		writeErrorJSON(w, http.StatusInternalServerError,
 			errCodeInternal, "failed to set maintenance")
 		return
 	}
 
+	s.recordLifecycleRequest(operation, nil)
 	writeJSON(w, http.StatusAccepted, map[string]string{responseKeyStatus: operation + " initiated"})
 }
 

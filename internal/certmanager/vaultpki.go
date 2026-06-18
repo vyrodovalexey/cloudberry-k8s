@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/vault"
 )
 
@@ -54,8 +55,12 @@ func issueVaultPKICert(
 		"ttl":         fmt.Sprintf("%ds", int(validity.Seconds())),
 	}
 
+	ctx, span := telemetry.StartSpan(ctx, certTracerName, "certmanager.issueVaultPKICert")
+	defer span.End()
+
 	result, err := vaultClient.WriteSecretWithResponse(ctx, issuePath, data)
 	if err != nil {
+		telemetry.SetSpanError(span, err)
 		return nil, nil, nil, fmt.Errorf("issuing certificate via vault PKI at %s: %w", issuePath, err)
 	}
 

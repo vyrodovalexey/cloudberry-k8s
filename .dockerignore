@@ -38,6 +38,9 @@ Dockerfile.cloudberry
 Dockerfile.cloudberry-backup
 Dockerfile.cloudberry-official
 Dockerfile.cloudberry-query-exporter
+Dockerfile.cloudberry-gpfdist
+Dockerfile.cloudberry-official-pxf
+Dockerfile.cloudberry-pxf
 
 # CI/CD
 .github/

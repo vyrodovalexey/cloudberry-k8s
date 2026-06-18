@@ -67,6 +67,21 @@ const (
 	ComponentExporter = "exporter"
 	// ComponentNodeExporter is the component label value for node exporters.
 	ComponentNodeExporter = "node-exporter"
+	// ComponentPxf is the component label value for PXF data-loading resources.
+	ComponentPxf = "pxf"
+	// ComponentDataLoad is the component label value for data-loading Job/CronJob
+	// resources (the ingestion runtime that builds and launches load Jobs).
+	ComponentDataLoad = "dataload"
+	// ComponentGpfdist is the component label value for the gpfdist file-server
+	// Deployment/Service/PVC (the high-throughput parallel file distributor that
+	// gpload jobs read from over gpfdist://).
+	ComponentGpfdist = "gpfdist"
+
+	// LabelDataLoadJob is the label key carrying the declarative data-loading job
+	// NAME (cluster.Spec.DataLoading.Jobs[].Name) on a spawned data-loading
+	// Job/CronJob, so the controller can correlate a Job back to its spec entry
+	// and populate the matching status.dataLoading.jobs[] element.
+	LabelDataLoadJob = "avsoft.io/dataload-job"
 
 	// AnnotationAction is the annotation key for cluster actions.
 	AnnotationAction = "avsoft.io/action"
@@ -99,6 +114,13 @@ const (
 	// AnnotationExporterRoleReady indicates the exporter DB role has been created.
 	// When absent or not "true", the admin-controller will retry role setup on each cycle.
 	AnnotationExporterRoleReady = "avsoft.io/exporter-role-ready"
+	// AnnotationPXFExtensionsReady indicates the best-effort PXF client extension
+	// setup (CREATE EXTENSION IF NOT EXISTS pxf / pxf_fdw) has been attempted
+	// successfully. When absent or not "true", the admin controller retries the
+	// best-effort setup on each cycle; once set it skips the DB round-trip. The
+	// setup is NON-FATAL (the pxf agent is absent in cloudberry-official), so this
+	// only suppresses repeated work, never blocks reconcile.
+	AnnotationPXFExtensionsReady = "avsoft.io/pxf-extensions-ready"
 	// AnnotationBackupRetentionDeleted records the number of backups removed by a
 	// retention cleanup Job, used to drive the cloudberry_backup_retention_deleted_total counter.
 	AnnotationBackupRetentionDeleted = "avsoft.io/backup-retention-deleted"
@@ -213,6 +235,22 @@ const (
 	// into the coordinator pod — the coordinator-exec model) and the
 	// gpbackup/gprestore/gpbackup_s3_plugin toolchain.
 	DefaultBackupImage = "cloudberry-backup:2.1.0"
+
+	// DefaultPostgresExporterImage is the default container image for the
+	// Prometheus postgres_exporter sidecar, applied by the mutating webhook
+	// when query monitoring enables the postgres exporter without an explicit
+	// image. Without a default the generated StatefulSet container would have
+	// an empty image and be rejected by the API server
+	// ("spec.template.spec.containers[N].image: Required value").
+	DefaultPostgresExporterImage = "prometheuscommunity/postgres-exporter:v0.16.0"
+	// DefaultCloudberryQueryExporterImage is the default container image for the
+	// Cloudberry query exporter sidecar, applied by the mutating webhook when
+	// query monitoring enables the query exporter without an explicit image.
+	DefaultCloudberryQueryExporterImage = "cloudberry-query-exporter:1.0.0"
+	// DefaultNodeExporterImage is the default container image for the Prometheus
+	// node_exporter DaemonSet, applied by the mutating webhook when query
+	// monitoring enables the node exporter without an explicit image.
+	DefaultNodeExporterImage = "prom/node-exporter:v1.8.2"
 
 	// OperatorNamespace is the default operator namespace.
 	OperatorNamespace = "cloudberry-system"

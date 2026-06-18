@@ -21,6 +21,8 @@ env:
   DOCKER_IMAGE_CLOUDBERRY: ghcr.io/${{ github.repository }}-cloudberry
   DOCKER_IMAGE_QUERY_EXPORTER: ghcr.io/${{ github.repository }}-query-exporter
   DOCKER_IMAGE_BACKUP: ghcr.io/${{ github.repository }}-backup
+  DOCKER_IMAGE_GPFDIST: ghcr.io/${{ github.repository }}-gpfdist
+  DOCKER_IMAGE_OFFICIAL_PXF: ghcr.io/${{ github.repository }}-official-pxf
   HELM_CHART_PATH: deploy/helm/cloudberry-operator
 
 jobs:
@@ -114,58 +116,13 @@ jobs:
           VAULT_DEV_ROOT_TOKEN_ID: myroot
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
 
-      keycloakdb:
-        image: postgres:16
-        env:
-          POSTGRES_DB: keycloak
-          POSTGRES_USER: keycloak
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd "pg_isready -U keycloak"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 10s
-
-      keycloak:
-        image: quay.io/keycloak/keycloak:26.5
-        command: start-dev
-        env:
-          KC_DB: postgres
-          KC_DB_URL: jdbc:postgresql://keycloakdb:5432/keycloak
-          KC_DB_USERNAME: keycloak
-          KC_DB_PASSWORD: password
-          KC_HTTP_PORT: 8090
-          KC_HOSTNAME_STRICT: "false"
-          KC_HOSTNAME_STRICT_HTTPS: "false"
-          KC_HTTP_ENABLED: "true"
-          KC_PROXY_HEADERS: xforwarded
-          KC_FEATURES: token-exchange,admin-fine-grained-authz
-          KC_SPI_REALM_DEFAULT_SSL_REQUIRED: none
-          KC_LOG_LEVEL: info
-          KC_METRICS_ENABLED: "true"
-          KC_HEALTH_ENABLED: "true"
-          KEYCLOAK_ADMIN: admin
-          KEYCLOAK_ADMIN_PASSWORD: admin
-        ports:
-          - 8090:8090
-          - 8091:9000
-
-      minio:
-        image: minio/minio:RELEASE.2024-11-07T00-52-20Z
-        command: server /data --console-address ":9001"
-        ports:
-          - 9000:9000
-          - 9001:9001
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
+      # NOTE: Keycloak (+ keycloakdb) and MinIO are NOT declared as services
+      # here. GitHub Actions service containers do NOT support the `command:`
+      # key (only image/env/ports/volumes/options/credentials). Keycloak
+      # requires `start-dev` and MinIO requires `server /data ...` — without
+      # these commands the containers print help and exit immediately.
+      # They are started via docker compose in the step below, which correctly
+      # passes the command and keeps CI identical to the local test environment.
 
       kafka:
         image: apache/kafka:3.9.0
@@ -208,12 +165,32 @@ jobs:
         ports:
           - 9428:9428
 
+      # NOTE: HDFS + Hive (namenode, datanode, hive-metastore-db, hive-metastore,
+      # hiveserver2) are also NOT declared as `services:` here. GitHub Actions
+      # service containers start BEFORE the repo is checked out, so the XML
+      # config files under test/docker-compose/{hadoop,hive} cannot be
+      # bind-mounted. Instead the Hive/HDFS stack is started from the project's
+      # own docker-compose file in the step below, after checkout — keeping CI
+      # identical to the local test environment.
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # Keycloak, MinIO, and HDFS/Hive are started via docker compose because
+      # they need a custom `command:` or bind-mounted config files — neither of
+      # which GitHub Actions `services:` supports. Runs in the background while
+      # the inline `services:` (vault, kafka, rabbitmq, victorialogs) warm up.
+      - name: Start compose services (Keycloak, MinIO, Hive, HDFS, MySQL, PgSource, HBase)
+        run: |
+          docker compose -f test/docker-compose/docker-compose.yml up -d \
+            keycloakdb keycloak_web minio \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2 \
+            mysql pgsource hbase
+          echo "Compose containers launched; readiness checked in the next step."
 
       - name: Wait for services
         run: |
@@ -254,6 +231,42 @@ jobs:
             echo "  attempt $i …"; sleep 2
           done
 
+          echo "--- HDFS NameNode (WebHDFS) ---"
+          for i in {1..60}; do
+            curl -sf "http://127.0.0.1:9870/webhdfs/v1/?op=LISTSTATUS" > /dev/null 2>&1 && echo "HDFS NameNode ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- Hive Metastore (Thrift 9083) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 9083 > /dev/null 2>&1 && echo "Hive Metastore ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- HiveServer2 (JDBC 10000) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 10000 > /dev/null 2>&1 && echo "HiveServer2 ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- MySQL (3306) ---"
+          for i in {1..60}; do
+            nc -z -w 3 127.0.0.1 3306 > /dev/null 2>&1 && echo "MySQL ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
+          echo "--- PostgreSQL source (5432) ---"
+          for i in {1..30}; do
+            nc -z -w 3 127.0.0.1 5432 > /dev/null 2>&1 && echo "PgSource ready" && break
+            echo "  attempt $i …"; sleep 2
+          done
+
+          echo "--- HBase (ZooKeeper 2181) ---"
+          for i in {1..60}; do
+            echo ruok | nc -w 3 127.0.0.1 2181 2>/dev/null | grep -q imok && echo "HBase ZooKeeper ready" && break
+            echo "  attempt $i …"; sleep 3
+          done
+
       - name: Setup Vault
         env:
           VAULT_ADDR: http://127.0.0.1:8200
@@ -280,6 +293,53 @@ jobs:
           RABBITMQ_ADDR: http://127.0.0.1:15672
         run: bash test/docker-compose/scripts/setup-rabbitmq.sh --ci
 
+      - name: Setup Hive + HDFS
+        env:
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          METASTORE_PORT: "9083"
+        run: bash test/docker-compose/scripts/setup-hive-hdfs.sh
+
+      - name: Setup JDBC sources
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+        run: bash test/docker-compose/scripts/setup-jdbc-sources.sh --ci
+
+      - name: Setup HBase
+        run: bash test/docker-compose/scripts/setup-hbase.sh
+
+      - name: Generate object-store samples
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+        run: bash test/docker-compose/scripts/gen-objstore-samples.sh --no-docker
+
+      - name: Generate Hadoop samples
+        env:
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+        run: bash test/docker-compose/scripts/gen-hadoop-samples.sh --ci
+
+      - name: Generate pushdown samples
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+        run: bash test/docker-compose/scripts/gen-pushdown-samples.sh --no-docker
+
+      - name: Generate export targets (Scenario 99)
+        env:
+          MINIO_ADDR: http://127.0.0.1:9000
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          PG_CONTAINER: pgsource
+        run: bash test/docker-compose/scripts/gen-export-targets.sh
+
+      - name: Generate gpload CSV samples (Scenario 101)
+        run: bash test/docker-compose/scripts/gen-gpload-csv.sh
+
+      - name: Generate kafka-cdc samples (Scenario 102)
+        env:
+          KAFKA_BROKERS: 127.0.0.1:9094
+        run: bash test/docker-compose/scripts/gen-kafka-cdc.sh
+
       - name: Run functional tests
         env: &test-env
           VAULT_ADDR: http://127.0.0.1:8200
@@ -292,6 +352,15 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
           KAFKA_BROKERS: 127.0.0.1:9094
           RABBITMQ_ADDR: amqp://guest:guest@127.0.0.1:5672/
+          WEBHDFS_ADDR: http://127.0.0.1:9870
+          HDFS_NAMENODE: hdfs://127.0.0.1:8020
+          HIVE_METASTORE_URIS: thrift://127.0.0.1:9083
+          HIVESERVER2_JDBC: jdbc:hive2://127.0.0.1:10000
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+          HBASE_ZOOKEEPER_QUORUM: 127.0.0.1:2181
           SKIP_DOCKER_COMPOSE: "true"
         run: |
           mkdir -p coverage
@@ -309,6 +378,24 @@ jobs:
         run: |
           go test -race -coverprofile=coverage/e2e.out -covermode=atomic \
             -tags=e2e -v -timeout 15m ./test/e2e/...
+
+      - name: Compose services diagnostics (on failure)
+        if: failure()
+        run: |
+          echo "=== compose ps ==="
+          docker compose -f test/docker-compose/docker-compose.yml ps || true
+          for c in keycloakdb keycloak_web minio namenode datanode hive-metastore-db hive-metastore hiveserver2 mysql pgsource hbase; do
+            echo "=== logs: $c ==="
+            docker logs --tail 80 "$c" 2>&1 || true
+          done
+
+      - name: Tear down compose services
+        if: always()
+        run: |
+          docker compose -f test/docker-compose/docker-compose.yml down -v \
+            keycloakdb keycloak_web minio \
+            namenode datanode hive-metastore-db hive-metastore hiveserver2 \
+            mysql pgsource hbase || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -417,10 +504,6 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_env: DOCKER_IMAGE_CTL
-          # cloudberry builds the Apache Cloudberry image from the official RPM; built on PRs and releases.
-          - name: cloudberry
-            dockerfile: Dockerfile.cloudberry-official
-            image_env: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_env: DOCKER_IMAGE_QUERY_EXPORTER
@@ -448,6 +531,71 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
+  # ===========================================================================
+  # Docker Build — Cloudberry chain (PR only - no push)
+  # ===========================================================================
+  # The cloudberry images have a dependency chain that requires sequential
+  # builds in a single runner so bare-tag FROM references resolve locally:
+  #   cloudberry-pxf:2.1.0           (standalone)
+  #   cloudberry-official:2.1.0      (standalone)
+  #   cloudberry-official-pxf:2.1.0  (FROM cloudberry-pxf + cloudberry-official)
+  #   cloudberry-gpfdist:2.1.0       (FROM cloudberry-official-pxf)
+
+  docker-build-cloudberry-chain:
+    name: Docker Build (cloudberry chain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [build]
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker
+      # Step a: Build cloudberry-pxf (standalone, amd64)
+      - name: Build cloudberry-pxf
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-pxf
+          push: false
+          load: true
+          tags: cloudberry-pxf:2.1.0
+      # Step b: Build cloudberry-official (standalone, amd64)
+      - name: Build cloudberry-official
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-official
+          push: false
+          load: true
+          tags: cloudberry-official:2.1.0
+      # Step c: Build cloudberry-official-pxf (depends on pxf + official)
+      - name: Build cloudberry-official-pxf
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-official-pxf
+          push: false
+          load: true
+          tags: cloudberry-official-pxf:2.1.0
+          build-args: |
+            CB_PXF_IMAGE=cloudberry-pxf:2.1.0
+            CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+      # Step d: Build cloudberry-gpfdist (depends on official-pxf)
+      - name: Build cloudberry-gpfdist
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-gpfdist
+          push: false
+          load: true
+          tags: cloudberry-gpfdist:2.1.0
+          build-args: |
+            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
 
   # ===========================================================================
   # Helm Chart Testing (PR - Dry Run)
@@ -503,6 +651,7 @@ jobs:
           helm lint test/monitoring/vmagent
           helm lint test/monitoring/vector
           helm lint test/monitoring/node-exporter
+          helm lint test/monitoring/kube-state-metrics
 
       - name: Validate monitoring chart templates
         run: |
@@ -511,6 +660,7 @@ jobs:
           helm template vmagent test/monitoring/vmagent > /dev/null
           helm template vector test/monitoring/vector > /dev/null
           helm template node-exporter test/monitoring/node-exporter > /dev/null
+          helm template kube-state-metrics test/monitoring/kube-state-metrics > /dev/null
           echo "Monitoring chart template validation successful!"
 
       - name: Dry-run install monitoring charts
@@ -520,6 +670,7 @@ jobs:
           helm install --dry-run --debug vmagent test/monitoring/vmagent
           helm install --dry-run --debug vector test/monitoring/vector
           helm install --dry-run --debug node-exporter test/monitoring/node-exporter
+          helm install --dry-run --debug kube-state-metrics test/monitoring/kube-state-metrics
 
       - name: Validate monitoring chart Kubernetes manifests
         run: |
@@ -528,6 +679,7 @@ jobs:
           helm template vmagent test/monitoring/vmagent | kubectl apply --dry-run=client -f -
           helm template vector test/monitoring/vector | kubectl apply --dry-run=client -f -
           helm template node-exporter test/monitoring/node-exporter | kubectl apply --dry-run=client -f -
+          helm template kube-state-metrics test/monitoring/kube-state-metrics | kubectl apply --dry-run=client -f -
           echo "Monitoring chart Kubernetes manifest validation successful!"
 
 
@@ -558,7 +710,7 @@ jobs:
         id: version
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
       - name: Build multi-platform binaries
         run: |
           mkdir -p bin
@@ -617,9 +769,6 @@ jobs:
           - name: ctl
             dockerfile: Dockerfile.ctl
             image_key: DOCKER_IMAGE_CTL
-          - name: cloudberry
-            dockerfile: Dockerfile.cloudberry-official
-            image_key: DOCKER_IMAGE_CLOUDBERRY
           - name: query-exporter
             dockerfile: Dockerfile.cloudberry-query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
@@ -662,8 +811,158 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           images=""
+          # shellcheck disable=SC2086
           for tag in ${TAGS}; do images+="${tag}@${DIGEST} "; done
+          # shellcheck disable=SC2086
           cosign sign --yes ${images}
+
+  # ===========================================================================
+  # Tag-only: Docker Build & Push — Cloudberry chain
+  # ===========================================================================
+  # Sequential chain build: pxf → official → official-pxf → gpfdist.
+  # Intermediate images are loaded into the local daemon (load:true) so the
+  # dependent FROM references resolve. Final images are pushed to GHCR.
+
+  docker-build-push-cloudberry-chain:
+    name: Docker Push (cloudberry chain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step a: Build cloudberry-pxf (standalone, amd64) — load only
+      - name: Build cloudberry-pxf
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-pxf
+          push: false
+          load: true
+          tags: cloudberry-pxf:2.1.0
+
+      # Step b: Build cloudberry-official (standalone, amd64) — load + push
+      - id: meta-cloudberry
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_CLOUDBERRY }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest
+      - name: Build cloudberry-official
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-official
+          push: false
+          load: true
+          tags: |
+            cloudberry-official:2.1.0
+            ${{ steps.meta-cloudberry.outputs.tags }}
+          labels: ${{ steps.meta-cloudberry.outputs.labels }}
+      - name: Push cloudberry-official
+        run: |
+          tags="${{ steps.meta-cloudberry.outputs.tags }}"
+          for tag in ${tags}; do
+            docker push "${tag}"
+          done
+
+      # Step c: Build cloudberry-official-pxf (depends on pxf + official) — load + push
+      - id: meta-official-pxf
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_OFFICIAL_PXF }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest
+      - name: Build cloudberry-official-pxf
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-official-pxf
+          push: false
+          load: true
+          tags: |
+            cloudberry-official-pxf:2.1.0
+            ${{ steps.meta-official-pxf.outputs.tags }}
+          labels: ${{ steps.meta-official-pxf.outputs.labels }}
+          build-args: |
+            CB_PXF_IMAGE=cloudberry-pxf:2.1.0
+            CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+      - name: Push cloudberry-official-pxf
+        run: |
+          tags="${{ steps.meta-official-pxf.outputs.tags }}"
+          for tag in ${tags}; do
+            docker push "${tag}"
+          done
+
+      # Step d: Build cloudberry-gpfdist (depends on official-pxf) — load + push
+      - id: meta-gpfdist
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_GPFDIST }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest
+      - name: Build cloudberry-gpfdist
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.cloudberry-gpfdist
+          push: false
+          load: true
+          tags: |
+            cloudberry-gpfdist:2.1.0
+            ${{ steps.meta-gpfdist.outputs.tags }}
+          labels: ${{ steps.meta-gpfdist.outputs.labels }}
+          build-args: |
+            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
+      - name: Push cloudberry-gpfdist
+        run: |
+          tags="${{ steps.meta-gpfdist.outputs.tags }}"
+          for tag in ${tags}; do
+            docker push "${tag}"
+          done
+
+      # Sign all pushed images
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.7.0
+      - name: Sign cloudberry-official
+        run: |
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-cloudberry.outputs.tags }}' | head -1)" 2>/dev/null || true)
+          if [ -n "${digest}" ]; then
+            cosign sign --yes "${digest}"
+          fi
+      - name: Sign cloudberry-official-pxf
+        run: |
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-official-pxf.outputs.tags }}' | head -1)" 2>/dev/null || true)
+          if [ -n "${digest}" ]; then
+            cosign sign --yes "${digest}"
+          fi
+      - name: Sign cloudberry-gpfdist
+        run: |
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-gpfdist.outputs.tags }}' | head -1)" 2>/dev/null || true)
+          if [ -n "${digest}" ]; then
+            cosign sign --yes "${digest}"
+          fi
 
   # ===========================================================================
   # Tag-only: Trivy Scan
@@ -673,7 +972,7 @@ jobs:
     name: Trivy (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [docker-build-push]
+    needs: [docker-build-push, docker-build-push-cloudberry-chain]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -700,6 +999,14 @@ jobs:
           - name: backup
             image_key: DOCKER_IMAGE_BACKUP
             skip_dirs: '/usr/local/bin'
+          # official-pxf: exclude the Cloudberry bin directory (same as cloudberry image).
+          - name: official-pxf
+            image_key: DOCKER_IMAGE_OFFICIAL_PXF
+            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
+          # gpfdist: exclude the Cloudberry bin directory (same as cloudberry image).
+          - name: gpfdist
+            image_key: DOCKER_IMAGE_GPFDIST
+            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

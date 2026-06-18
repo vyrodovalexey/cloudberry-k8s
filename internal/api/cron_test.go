@@ -63,7 +63,7 @@ func TestComputeNextCron_Invalid(t *testing.T) {
 		"0 3 * * * *", // too many fields
 		"60 3 * * *",  // minute out of range
 		"0 24 * * *",  // hour out of range
-		"0 3 * * 7",   // weekday out of range
+		"0 3 * * 8",   // weekday out of range (7 is valid Sunday; 8 is not)
 		"0 3 */0 * *", // zero step
 		"abc 3 * * *", // non-numeric
 		"0 3 32 * *",  // day out of range

@@ -1,0 +1,258 @@
+# =============================================================================
+# Acceptance Cluster Deploy — Scenario 93 + S3 Backup (Vault credentials)
+# =============================================================================
+# Full acceptance-test cluster combining:
+#   - Scenario 93: Multi-Server PXF + HA + Vault PKI + Monitoring
+#   - Scenario 71 backup block: S3 destination with Vault-sourced credentials
+#
+# Components:
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl)
+#   - Vault KV secrets
+#   - Query monitoring: postgres-exporter on segments+mirrors+coordinator
+#     + cloudberry-query-exporter
+#   - PXF sidecar with 6 servers (s3, hdfs, jdbc×2, hive, hbase)
+#   - S3 backup to MinIO via Vault-materialized credentials
+#   - deletionPolicy Retain
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: acceptance-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "93"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: acceptance-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        - name: s3-datalake
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        - name: hadoop-cluster
+          type: hdfs
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            dfs.replication: "1"
+          hive:
+            hive.metastore.uris: "thrift://hive-metastore:9083"
+          hbase:
+            hbase.zookeeper.quorum: "hbase:2181"
+        - name: mysql-oltp
+          type: jdbc
+          config:
+            jdbc.driver: "com.mysql.cj.jdbc.Driver"
+            jdbc.url: "jdbc:mysql://mysql:3306/oltp"
+          credentialSecrets:
+            - name: mysql-credentials
+              key: username
+            - name: mysql-credentials
+              key: password
+        - name: postgres-source
+          type: jdbc
+          config:
+            jdbc.driver: "org.postgresql.Driver"
+            jdbc.url: "jdbc:postgresql://pgsource:5432/sourcedb"
+          credentialSecrets:
+            - name: pg-source-credentials
+              key: username
+            - name: pg-source-credentials
+              key: password
+        - name: hive-warehouse
+          type: hive
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            hive.metastore.uris: "thrift://hive-metastore:9083"
+        - name: hbase-store
+          type: hbase
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            hbase.zookeeper.quorum: "hbase:2181"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      - name: s3-csv-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/dataset/data_1.csv"
+          targetTable: "public.pxf_loaded"
+
+  # S3 Backup with Vault-sourced credentials (from scenario71)
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    image: "cloudberry-backup:2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-backups
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        vaultSecret:
+          path: "secret/cloudberry/backup-s3"
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Retain

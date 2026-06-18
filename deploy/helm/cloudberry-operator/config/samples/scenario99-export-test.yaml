@@ -1,0 +1,286 @@
+# =============================================================================
+# Scenario 99 — Writable External Tables / Data Export
+# =============================================================================
+# Writable-export acceptance cluster modeled on scenario93-acceptance-test
+# (HA coord+standby, 2 segments mirrored group, Vault-PKI TLS, OIDC,
+# postgres-exporter on segments+mirrors, cloudberry-query-exporter, Vault k8s
+# auth, DB cloudberry-official-pxf:2.1.0, PXF sidecar cloudberry-pxf:2.1.0,
+# deletionPolicy Retain).
+#
+# Cluster name is "export-test" (NOT acceptance-test) so it does not clash with
+# the deployed scenario93 acceptance cluster. Namespace cloudberry-test.
+#
+# SERVERS (mirror the Scenario 99 export targets):
+#   - s3-datalake     : MinIO (live), s3
+#   - minio-warehouse : MinIO (live), s3 (cloudberry-warehouse export bucket)
+#   - hadoop-cluster  : hdfs (HDFS /data-lake/exports export dir)
+#   - postgres-source : jdbc (pgsource sourcedb, WRITE creds → export_target)
+#   - mysql-oltp      : jdbc (oltp)
+#
+# JOBS (mode: writable export). The operator's export job reads FROM targetTable
+# (a SOURCE table in the cluster the e2e/deploy seeds, e.g. public.export_src) and
+# writes TO the external store named by resource/server. The generated DDL is a
+# WRITABLE EXTERNAL TABLE with FORMATTER='pxfwritable_export' and the reversed
+# INSERT (INSERT INTO <writable_ext> SELECT * FROM <targetTable>).
+#   FE.9   s3-export          : s3:text writable → cloudberry-warehouse/exports/s3/
+#   FE.10  hdfs-export        : hdfs:text writable → /data-lake/exports/hdfs/
+#   FE.11  jdbc-export        : jdbc writable → export_target (pgsource table)
+#   SF.1   s3-export-filtered : s3:text writable + sourceFilter region='us-east'
+#          (shows the filtered export — FEWER rows than the unfiltered FE.9).
+#
+# HONESTY: NO bytes_transferred metric is implied (it stays PLANNED — PXF has no
+# honest external-bytes counter). The proofs are object/file/row LANDING (S3 list,
+# WebHDFS LISTSTATUS, JDBC count(*)) + the FORMATTER='pxfwritable_export' DDL
+# clause + the load Job status (cloudberry_data_loading_job_status / rows_total).
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: export-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "99"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: export-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # --- MinIO-backed (LIVE) ---
+        - name: s3-datalake
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        # cloudberry-warehouse export bucket (FE.9/WE.1 + SF.1 export target).
+        - name: minio-warehouse
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        # --- Hadoop (hdfs) — FE.10 export dir /data-lake/exports ---
+        - name: hadoop-cluster
+          type: hdfs
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            dfs.replication: "1"
+        # --- JDBC export target (FE.11): pgsource sourcedb, WRITE creds ---
+        # jdbc-site.xml MUST carry WRITE credentials for export_target (the
+        # gen-export-targets.sh script pre-creates + grants the table).
+        - name: postgres-source
+          type: jdbc
+          config:
+            jdbc.driver: "org.postgresql.Driver"
+            jdbc.url: "jdbc:postgresql://pgsource:5432/sourcedb"
+          credentialSecrets:
+            - name: pg-source-credentials
+              key: username
+            - name: pg-source-credentials
+              key: password
+        # --- JDBC (mysql) — additional writable jdbc target option ---
+        - name: mysql-oltp
+          type: jdbc
+          config:
+            jdbc.driver: "com.mysql.cj.jdbc.Driver"
+            jdbc.url: "jdbc:mysql://mysql:3306/oltp"
+          credentialSecrets:
+            - name: mysql-credentials
+              key: username
+            - name: mysql-credentials
+              key: password
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      # --- FE.9 / WE.1 S3 WRITABLE EXPORT (s3:text) ---
+      # Exports public.export_src TO cloudberry-warehouse/exports/s3/ as text.
+      # DDL = CREATE WRITABLE EXTERNAL TABLE ... FORMATTER='pxfwritable_export'.
+      - name: s3-export
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: minio-warehouse
+          profile: "s3:text"
+          mode: writable
+          resource: "cloudberry-warehouse/exports/s3/"
+          targetTable: "public.export_src"
+      # --- FE.10 HDFS WRITABLE EXPORT (hdfs:text) ---
+      - name: hdfs-export
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hdfs:text"
+          mode: writable
+          resource: "/data-lake/exports/hdfs/"
+          targetTable: "public.export_src"
+      # --- FE.11 JDBC WRITABLE EXPORT (strongest: rows land in export_target) ---
+      - name: jdbc-export
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: postgres-source
+          profile: "jdbc"
+          mode: writable
+          resource: "export_target"
+          targetTable: "public.export_src"
+      # --- SF.1 FILTERED S3 WRITABLE EXPORT (sourceFilter region='us-east') ---
+      # The export SCRIPT carries `... SELECT * FROM public.export_src WHERE
+      # region='us-east'`, so this filtered export lands FEWER rows than FE.9.
+      - name: s3-export-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: minio-warehouse
+          profile: "s3:text"
+          mode: writable
+          sourceFilter: "region='us-east'"
+          resource: "cloudberry-warehouse/exports/s3-filtered/"
+          targetTable: "public.export_src"
+
+  deletionPolicy: Retain

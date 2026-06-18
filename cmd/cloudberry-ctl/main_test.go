@@ -2278,6 +2278,11 @@ func TestDataLoadingCommands_WithMockServer(t *testing.T) {
 		require.NotNil(t, jobsCmd)
 		createCmd := findSubcommand(jobsCmd, "create")
 		require.NotNil(t, createCmd)
+		require.NoError(t, createCmd.Flags().Set("name", "job-1"))
+		require.NoError(t, createCmd.Flags().Set("type", "pxf"))
+		require.NoError(t, createCmd.Flags().Set("server", "s3"))
+		require.NoError(t, createCmd.Flags().Set("profile", "s3:parquet"))
+		require.NoError(t, createCmd.Flags().Set("target", "public.t"))
 		err := createCmd.RunE(createCmd, nil)
 		require.NoError(t, err)
 	})
@@ -3569,4 +3574,110 @@ func TestAuthStatusCmd_Execute(t *testing.T) {
 
 	err := statusCmd.RunE(statusCmd, nil)
 	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// PXF command group
+// ---------------------------------------------------------------------------
+
+func TestNewPxfCmd_Structure(t *testing.T) {
+	cmd := newPxfCmd()
+	require.NotNil(t, cmd)
+	assert.Equal(t, "pxf", cmd.Use)
+	assert.NotEmpty(t, cmd.Short)
+
+	names := subcommandNames(cmd)
+	for _, e := range []string{"status", "restart", "sync"} {
+		assert.Contains(t, names, e, "pxf should have %q subcommand", e)
+	}
+
+	// Sidecar-local verbs are exec-only and must NOT be exposed as ctl commands.
+	for _, forbidden := range []string{"prepare", "start", "stop"} {
+		assert.NotContains(t, names, forbidden,
+			"pxf must NOT expose the exec-only verb %q", forbidden)
+	}
+
+	// Each subcommand has a Long help description.
+	for _, name := range []string{"status", "restart", "sync"} {
+		sub := findSubcommand(cmd, name)
+		require.NotNil(t, sub)
+		assert.NotEmpty(t, sub.Short, "%q should have a Short description", name)
+		assert.NotEmpty(t, sub.Long, "%q should have a Long description", name)
+	}
+}
+
+func TestRootCmd_HasPxfSubcommand(t *testing.T) {
+	root := newRootCmd()
+	pxf := findSubcommand(root, "pxf")
+	require.NotNil(t, pxf, "root should have a 'pxf' subcommand")
+}
+
+func TestPxfCmd_RequireCluster(t *testing.T) {
+	saved := globals
+	defer func() { globals = saved }()
+	globals.cluster = ""
+	globals.operatorURL = "http://localhost:8443"
+	globals.timeout = "5s"
+
+	for _, name := range []string{"status", "restart", "sync"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := newPxfCmd()
+			sub := findSubcommand(cmd, name)
+			require.NotNil(t, sub)
+			err := sub.RunE(sub, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cluster name is required")
+		})
+	}
+}
+
+func TestPxfCmd_PathBuilding(t *testing.T) {
+	tests := []struct {
+		subcmd     string
+		method     string
+		wantSuffix string
+	}{
+		{"status", http.MethodGet, "/clusters/test-cluster/data-loading/pxf/status"},
+		{"restart", http.MethodPost, "/clusters/test-cluster/data-loading/pxf/restart"},
+		{"sync", http.MethodPost, "/clusters/test-cluster/data-loading/pxf/sync"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.subcmd, func(t *testing.T) {
+			var (
+				gotPath   string
+				gotMethod string
+				gotNS     string
+			)
+			server := setupMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotMethod = r.Method
+				gotNS = r.URL.Query().Get("namespace")
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			})
+
+			saved := globals
+			defer func() { globals = saved }()
+			globals.cluster = "test-cluster"
+			globals.namespace = "test-ns"
+			globals.operatorURL = server.URL
+			globals.timeout = "5s"
+			globals.username = "admin"
+			globals.password = "pass"
+			globals.authMethod = "basic"
+			globals.output = "json"
+
+			cmd := newPxfCmd()
+			sub := findSubcommand(cmd, tt.subcmd)
+			require.NotNil(t, sub)
+			require.NoError(t, sub.RunE(sub, nil))
+
+			assert.True(t, len(gotPath) >= len(tt.wantSuffix) &&
+				gotPath[len(gotPath)-len(tt.wantSuffix):] == tt.wantSuffix,
+				"path %q should end with %q", gotPath, tt.wantSuffix)
+			assert.Equal(t, tt.method, gotMethod)
+			assert.Equal(t, "test-ns", gotNS)
+		})
+	}
 }

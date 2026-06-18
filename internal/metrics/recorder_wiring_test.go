@@ -19,13 +19,13 @@ import (
 
 // wiringAllowlist enumerates Recorder methods that intentionally have no
 // production call site, each with the justification required by E-4.
-var wiringAllowlist = map[string]string{
-	// C-6: the data-loading mutation endpoints return 501 NOT_IMPLEMENTED, so
-	// there is no real row count to record yet. The method and its family are
-	// kept so the wiring lands together with the data-loading Job feature.
-	// See the interface comment at Recorder.RecordDataLoadingRows.
-	"RecordDataLoadingRows": "data-loading endpoints are 501 stubs (C-6)",
-}
+//
+// The data-loading metrics (RecordDataLoadingRows + the four new families) now
+// have real production call sites in the controller's reconcileDataLoadingJobs
+// terminal-state handling (the DATALOAD_ROWS marker harvest and the Job-status
+// derived gauges), so RecordDataLoadingRows is no longer exempt. The allowlist
+// is intentionally empty: every Recorder method must be wired.
+var wiringAllowlist = map[string]string{}
 
 // collectProductionSources returns the contents of every non-test .go file in
 // the repository outside internal/metrics (the defining package, whose own

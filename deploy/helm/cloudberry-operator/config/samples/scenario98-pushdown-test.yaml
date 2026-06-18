@@ -1,0 +1,351 @@
+# =============================================================================
+# Scenario 98 — Filter Pushdown, Column Projection, Per-Row Error Handling
+# =============================================================================
+# Pushdown/projection/error-handling acceptance cluster modeled on
+# scenario93-acceptance-test (HA coord+standby, 2 segments mirrored group,
+# Vault-PKI TLS, OIDC, postgres-exporter on segments+mirrors,
+# cloudberry-query-exporter, Vault k8s auth, DB cloudberry-official-pxf:2.1.0,
+# PXF sidecar cloudberry-pxf:2.1.0, deletionPolicy Retain).
+#
+# Cluster name is "pushdown-test" (NOT acceptance-test) so it does not clash with
+# the deployed scenario93 acceptance cluster. Namespace cloudberry-test.
+#
+# SERVERS (mirror the Scenario 98 catalog):
+#   - s3-datalake     : MinIO (live), s3 (wide+filterable parquet, malformed CSV)
+#   - minio-warehouse : MinIO (live), path-style
+#   - mysql-oltp      : jdbc (jdbc_test_data, filter column 'category')
+#   - postgres-source : jdbc (jdbc_test_data, filter column 'category')
+#   - hadoop-cluster  : hdfs + hive (warehouse.fact_sales) — FE.3 CONFIG-ONLY
+#
+# JOBS (demonstrate the scenario; honest signals noted):
+#   FE.1  filter pushdown on parquet — an UNFILTERED baseline load and a
+#         filterPushdown:true load so cloudberry_data_loading_rows_total differs.
+#         NOTE: PXF filter pushdown happens at query time via the external-table
+#         WHERE. The operator's load job does INSERT INTO target SELECT * FROM ext,
+#         so to get a row-count REDUCTION the external scan must carry the filter.
+#         Where the operator model cannot express a WHERE on the load, FE.1 live
+#         row-count is proven by a filtered vs unfiltered EXTERNAL TABLE the e2e
+#         creates directly (psql exec); the jobs below at least carry
+#         filterPushdown:true (DDL proof).
+#   FE.2  jdbc read with filterPushdown:true (mysql + postgres).
+#   FE.3  hive read with filterPushdown:true (CONFIG-ONLY without live Hive).
+#   FE.4  parquet read with columnProjection:true (wide table).
+#   FE.5  orc read with columnProjection:true (CONFIG-ONLY without wide-ORC).
+#   FE.12a malformed-source load with errorHandling.segmentRejectLimit ABOVE the
+#          bad-row count (5) → tolerated → Completed.
+#   FE.12b same source with segmentRejectLimit BELOW the bad-row count → Failed.
+#
+# HONESTY: NO bytes_transferred metric is implied (it stays PLANNED — PXF has no
+# honest external-bytes counter). The proofs are row-count reduction, EXPLAIN,
+# source query logs, and the load Job status (job_status / errors_total).
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: pushdown-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "98"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: pushdown-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # --- MinIO-backed (LIVE) ---
+        - name: s3-datalake
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        - name: minio-warehouse
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+        # --- JDBC sources (LIVE, jdbc_test_data filter column 'category') ---
+        - name: mysql-oltp
+          type: jdbc
+          config:
+            jdbc.driver: "com.mysql.cj.jdbc.Driver"
+            jdbc.url: "jdbc:mysql://mysql:3306/oltp"
+          credentialSecrets:
+            - name: mysql-credentials
+              key: username
+            - name: mysql-credentials
+              key: password
+        - name: postgres-source
+          type: jdbc
+          config:
+            jdbc.driver: "org.postgresql.Driver"
+            jdbc.url: "jdbc:postgresql://pgsource:5432/sourcedb"
+          credentialSecrets:
+            - name: pg-source-credentials
+              key: username
+            - name: pg-source-credentials
+              key: password
+        # --- Hadoop (hdfs + hive); FE.3 CONFIG-ONLY without a live Hive backing ---
+        - name: hadoop-cluster
+          type: hdfs
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            dfs.replication: "1"
+          hive:
+            hive.metastore.uris: "thrift://hive-metastore:9083"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      # --- FE.1 FILTER PUSHDOWN on parquet: UNFILTERED baseline + filtered ---
+      # The baseline carries filterPushdown:false (no predicate pushdown) and the
+      # filtered job carries filterPushdown:true. The e2e creates the filtered vs
+      # unfiltered EXTERNAL TABLE directly to prove rows_total(filtered) < baseline.
+      - name: fe1-parquet-baseline
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:parquet"
+          filterPushdown: false
+          resource: "cloudberry-data/wide/data.parquet"
+          targetTable: "public.s98_fe_1_baseline"
+      - name: fe1-parquet-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:parquet"
+          filterPushdown: true
+          resource: "cloudberry-data/wide/data.parquet"
+          targetTable: "public.s98_fe_1_filtered"
+      # --- FE.2 FILTER PUSHDOWN on jdbc (mysql + postgres) ---
+      - name: fe2-jdbc-mysql-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: mysql-oltp
+          profile: "jdbc"
+          filterPushdown: true
+          resource: "jdbc_test_data"
+          targetTable: "public.s98_fe_2_mysql_filtered"
+      - name: fe2-jdbc-pg-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: postgres-source
+          profile: "jdbc"
+          filterPushdown: true
+          resource: "jdbc_test_data"
+          targetTable: "public.s98_fe_2_filtered"
+      - name: fe2-jdbc-pg-baseline
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: postgres-source
+          profile: "jdbc"
+          filterPushdown: false
+          resource: "jdbc_test_data"
+          targetTable: "public.s98_fe_2_baseline"
+      # --- FE.3 FILTER PUSHDOWN on hive (CONFIG-ONLY without live Hive) ---
+      - name: fe3-hive-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hive"
+          filterPushdown: true
+          resource: "warehouse.fact_sales"
+          targetTable: "public.s98_fe_3_filtered"
+      # --- FE.4 COLUMN PROJECTION on wide parquet ---
+      - name: fe4-parquet-projection
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:parquet"
+          columnProjection: true
+          resource: "cloudberry-data/wide/data.parquet"
+          targetTable: "public.s98_fe_4"
+      # --- FE.5 COLUMN PROJECTION on wide orc (CONFIG-ONLY without wide-ORC) ---
+      - name: fe5-orc-projection
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:orc"
+          columnProjection: true
+          resource: "cloudberry-data/wide/data.orc"
+          targetTable: "public.s98_fe_5"
+      # --- FE.12a ERROR HANDLING within limit (10 > 5 bad rows) → Completed ---
+      - name: fe12a-malformed-tolerated
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/errors/malformed.csv"
+          targetTable: "public.s98_fe_12a"
+          errorHandling:
+            segmentRejectLimit: 10
+            segmentRejectLimitType: rows
+            logErrors: true
+      # --- FE.12b ERROR HANDLING over limit (2 < 5 bad rows) → Failed ---
+      - name: fe12b-malformed-failed
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/errors/malformed.csv"
+          targetTable: "public.s98_fe_12b"
+          errorHandling:
+            segmentRejectLimit: 2
+            segmentRejectLimitType: rows
+            logErrors: true
+
+  deletionPolicy: Retain

@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,7 @@ func newTestScheme() *runtime.Scheme {
 	_ = batchv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = storagev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
 	return scheme
 }
 
@@ -3643,9 +3645,138 @@ func TestClusterReconciler_CheckMirroringProgress_STSNotReady(t *testing.T) {
 	// Act
 	result, err := r.checkMirroringProgress(context.Background(), cluster)
 
-	// Assert: Should requeue since STS is not ready.
+	// Assert: a not-yet-ready mirror StatefulSet during creating-sts is normal
+	// in-progress mirroring (not an error), so the controller requeues with the
+	// faster progress interval rather than the error backoff.
 	require.NoError(t, err)
-	assert.NotZero(t, result.RequeueAfter)
+	assert.Equal(t, requeueAfterStopping, result.RequeueAfter)
+}
+
+// TestClusterReconciler_EnsurePxfServersConfigMap_Created proves the cluster
+// controller creates the "<cluster>-pxf-servers" ConfigMap when PXF is enabled
+// (BUG 1 fix: created alongside/before the segment-primary StatefulSet so it
+// exists by the time segment pods start, instead of being created late by the
+// admin reconcile gated on Phase==Running).
+func TestClusterReconciler_EnsurePxfServersConfigMap_Created(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newPXFDataLoadingCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.ensurePxfServersConfigMap(context.Background(), cluster))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm))
+	require.Len(t, cm.OwnerReferences, 1)
+	assert.Equal(t, cluster.Name, cm.OwnerReferences[0].Name)
+	assert.Contains(t, cm.Data, "mysql__jdbc-site.xml")
+	assert.Contains(t, cm.Data["mysql__jdbc-site.xml"], "com.mysql.cj.jdbc.Driver")
+}
+
+// TestClusterReconciler_EnsurePxfServersConfigMap_DefaultClusterSkipped proves a
+// default (non-PXF) cluster never gets a PXF servers ConfigMap (the builder
+// returns nil, so the helper is a no-op).
+func TestClusterReconciler_EnsurePxfServersConfigMap_DefaultClusterSkipped(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.ensurePxfServersConfigMap(context.Background(), cluster))
+
+	cm := &corev1.ConfigMap{}
+	getErr := k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm)
+	assert.True(t, apierrors.IsNotFound(getErr),
+		"default cluster must NOT get a PXF servers ConfigMap")
+}
+
+// TestClusterReconciler_EnsurePxfServersConfigMap_UpdatePath exercises the
+// update branch: an existing ConfigMap with stale data is reconciled to the
+// freshly rendered desired state (logLevel/server changes propagate).
+func TestClusterReconciler_EnsurePxfServersConfigMap_UpdatePath(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newPXFDataLoadingCluster()
+
+	stale := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      builder.PxfServersConfigMapName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Data: map[string]string{"obsolete": "value"},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, stale).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.ensurePxfServersConfigMap(context.Background(), cluster))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm))
+	assert.NotContains(t, cm.Data, "obsolete")
+	assert.Contains(t, cm.Data, "mysql__jdbc-site.xml")
+}
+
+// TestClusterReconciler_ReconcileSegments_PXFConfigMapBeforeSegmentSTS proves
+// reconcileSegments creates the PXF servers ConfigMap together with (before) the
+// segment-primary StatefulSet, so a FRESH deploy (cluster still Initializing)
+// has the ConfigMap present by the time segment pods start (no manual
+// rollout-restart needed).
+func TestClusterReconciler_ReconcileSegments_PXFConfigMapBeforeSegmentSTS(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newPXFDataLoadingCluster()
+	// Simulate first deploy: cluster initializing (NOT yet Running).
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseInitializing
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(10),
+		builder.NewBuilder(), &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.reconcileSegments(context.Background(), cluster))
+
+	// ConfigMap present.
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      builder.PxfServersConfigMapName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, cm))
+	assert.Contains(t, cm.Data, "mysql__jdbc-site.xml")
+
+	// Segment-primary StatefulSet also present (proves both were applied).
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      util.SegmentPrimaryName(cluster.Name),
+		Namespace: cluster.Namespace,
+	}, sts))
 }
 
 func TestClusterReconciler_CheckMirroringProgress_Initializing(t *testing.T) {
@@ -3673,7 +3804,15 @@ func TestClusterReconciler_CheckMirroringProgress_Initializing(t *testing.T) {
 	// Act
 	result, err := r.checkMirroringProgress(context.Background(), cluster)
 
-	// Assert: Should advance to syncing phase.
+	// Assert: this exercises the "initializing" (mirroringPhaseInit) branch.
+	// With no dbFactory the DB-level mirror init is a no-op that SUCCEEDS, so
+	// the state machine ADVANCES to the next phase (syncing). A phase that
+	// completes and advances always requeues immediately (requeueAfterImmediate,
+	// 1s) so the freshly-set next phase is processed without delay — this is the
+	// intended behavior of advanceMirroringPhase. This differs from the
+	// sibling STSNotReady test (creating-sts, STS not yet ready), which is a
+	// polling/in-progress state that has NOT advanced and so uses the slower
+	// requeueAfterStopping (5s) interval.
 	require.NoError(t, err)
 	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
 }

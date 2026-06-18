@@ -44,7 +44,7 @@ func TestAdminReconciler_ReconcileSubComponents_ErrorPaths(t *testing.T) {
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "j1", Type: "s3", Enabled: true, TargetTable: "t"},
+			{Name: "j1", Type: "pxf", Enabled: true},
 		},
 	}
 	cluster.Spec.Storage = &cbv1alpha1.StorageManagementSpec{

@@ -18,10 +18,68 @@ func TestValidate_Valid(t *testing.T) {
 		"0 0 1 1 0",
 		"5,10,15 1-5 * * 1-5",
 		"0-30/5 * * * *",
+		"0 0 * * 7", // Sunday-as-7 (Kubernetes/standard cron parity)
+		"0 0 * * 5-7",
 	}
 	for _, expr := range valid {
 		assert.NoError(t, cron.Validate(expr), expr)
 	}
+}
+
+func TestSundayAsSevenEquivalence(t *testing.T) {
+	from := time.Date(2026, 6, 10, 2, 30, 0, 0, time.UTC) // Wednesday
+
+	// "0 0 * * 0" and "0 0 * * 7" must produce identical next-run times.
+	next0, ok0 := cron.NextAfter("0 0 * * 0", from)
+	require.True(t, ok0)
+	next7, ok7 := cron.NextAfter("0 0 * * 7", from)
+	require.True(t, ok7)
+	assert.Equal(t, next0, next7)
+	assert.Equal(t, time.Sunday, next7.Weekday())
+
+	// A range including 7 must match Sunday too.
+	nextRange, okRange := cron.NextAfter("0 0 * * 5-7", from)
+	require.True(t, okRange)
+	// The next match after Wed the 10th is Friday the 12th (weekday 5).
+	assert.Equal(t, time.Friday, nextRange.Weekday())
+}
+
+// TestCronRange5To7IncludesSunday verifies the W1-A2 normalization: the
+// day-of-week range "5-7" matches Friday(5), Saturday(6) AND Sunday(0). Walking
+// NextAfter forward from a Thursday must land on Fri, then Sat, then Sun (TASK 13).
+func TestCronRange5To7IncludesSunday(t *testing.T) {
+	const expr = "0 0 * * 5-7"
+	// 2026-06-11 is a Thursday.
+	thursday := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+	require.Equal(t, time.Thursday, thursday.Weekday())
+
+	fri, ok := cron.NextAfter(expr, thursday)
+	require.True(t, ok)
+	assert.Equal(t, time.Friday, fri.Weekday(), "5-7 must match Friday")
+
+	sat, ok := cron.NextAfter(expr, fri)
+	require.True(t, ok)
+	assert.Equal(t, time.Saturday, sat.Weekday(), "5-7 must match Saturday")
+
+	sun, ok := cron.NextAfter(expr, sat)
+	require.True(t, ok)
+	assert.Equal(t, time.Sunday, sun.Weekday(),
+		"5-7 must include Sunday via the 7->0 normalization")
+}
+
+// TestCronDayOfWeek8Rejected verifies the updated [0-7] day-of-week bound: 7 is a
+// valid Sunday but 8 is rejected, and the error references the [0-7] bound (not
+// the old [0-6]) (TASK 13).
+func TestCronDayOfWeek8Rejected(t *testing.T) {
+	err := cron.Validate("0 0 * * 8")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "[0-7]",
+		"the bound message must reflect the updated [0-7] day-of-week range")
+	assert.NotContains(t, err.Error(), "[0-6]",
+		"the message must not reference the pre-normalization [0-6] bound")
+
+	// And 7 itself remains valid (Sunday).
+	assert.NoError(t, cron.Validate("0 0 * * 7"))
 }
 
 func TestValidate_Invalid(t *testing.T) {
@@ -33,7 +91,7 @@ func TestValidate_Invalid(t *testing.T) {
 		"* 24 * * *",  // hour out of range
 		"* * 0 * *",   // day-of-month out of range
 		"* * * 13 *",  // month out of range
-		"* * * * 7",   // day-of-week out of range
+		"* * * * 8",   // day-of-week out of range (7 is valid Sunday; 8 is not)
 		"a * * * *",   // non-numeric
 		"5-1 * * * *", // inverted range
 		"*/0 * * * *", // zero step

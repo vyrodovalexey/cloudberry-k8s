@@ -1,0 +1,241 @@
+# =============================================================================
+# Scenario 103 — FDW-Based Loading Path (EX.5-EX.8)
+# =============================================================================
+# Acceptance-test cluster proving the FDW loading path is EQUIVALENT to the
+# external-table loading path over the SAME MinIO s3 dataset:
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions; the
+#     pxf_fdw wrappers s3_pxf_fdw/jdbc_pxf_fdw/... are registered — live-verified)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth + Vault KV secrets
+#   - Query monitoring: postgres-exporter on segments+mirrors+coordinator
+#     + cloudberry-query-exporter
+#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - deletionPolicy Retain
+#
+#   - dataLoading.pxf with ONE s3 server (s3-datalake) pointing at the MinIO s3
+#     dataset (cloudberry-data/text/data.csv, 1000 rows: id int, name text,
+#     value int).
+#   - dataLoading.jobs: THREE jobs over the SAME s3 dataset for the EQUIVALENCE
+#     proof (EX.8):
+#       * s3-ext-load     — type:pxf, loadMethod unset (external-table path) ->
+#                           public.events_ext
+#       * s3-fdw-load     — type:pxf, loadMethod:fdw  (FDW path)             ->
+#                           public.events_fdw
+#       * s3-fdw-filtered — type:pxf, loadMethod:fdw + sourceFilter          ->
+#                           public.events_fdw_filtered
+#     The headline equivalence proof is count(public.events_ext) ==
+#     count(public.events_fdw) over the SAME dataset; the filtered FDW load lands
+#     FEWER rows (sourceFilter WHERE).
+#
+# NOTE: the e2e (Part B) creates the target tables on the coordinator BEFORE the
+# load, matching the CSV schema (id int, name text, value int):
+#     CREATE TABLE IF NOT EXISTS public.events_ext          (id int, name text, value int);
+#     CREATE TABLE IF NOT EXISTS public.events_fdw          (id int, name text, value int);
+#     CREATE TABLE IF NOT EXISTS public.events_fdw_filtered (id int, name text, value int);
+# The s3 dataset (cloudberry-data/text/data.csv, 1000 rows) is the source.
+#
+# METRIC HONESTY: NO new metric. An FDW load IS a data-loading job -> it reuses
+# cloudberry_data_loading_* (job_status/rows_total/errors_total). The
+# cloudberry_pxf_*/cloudberry_gpfdist_* families stay PLANNED and are NEVER
+# asserted; the EX.8 equivalence is proven by ROW COUNTS, not a bytes metric.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: fdw-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "103"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: fdw-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # The s3 server points at the MinIO s3 dataset; BOTH the external-table
+        # LOCATION and the FDW SERVER/FOREIGN TABLE resource read the SAME bytes
+        # so the equivalence comparison is over identical data.
+        - name: s3-datalake
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      # Leg A — external-table path (loadMethod unset == external-table).
+      - name: s3-ext-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/text/data.csv"
+          targetTable: "public.events_ext"
+      # Leg B — FDW path (loadMethod:fdw). SAME dataset, different mechanism.
+      # The headline equivalence proof: count(events_ext) == count(events_fdw).
+      - name: s3-fdw-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/text/data.csv"
+          targetTable: "public.events_fdw"
+          loadMethod: fdw
+      # Filtered FDW load — sourceFilter WHERE on the CSV "value" column (the
+      # schema is id,name,value). Lands FEWER rows than the unfiltered FDW load.
+      - name: s3-fdw-filtered
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/text/data.csv"
+          targetTable: "public.events_fdw_filtered"
+          loadMethod: fdw
+          sourceFilter: "value > 500"
+
+  deletionPolicy: Retain

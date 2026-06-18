@@ -18,8 +18,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"sigs.k8s.io/yaml"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/ctl"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 const appName = "cloudberry-ctl"
@@ -54,15 +56,18 @@ const (
 
 // Command name constants to avoid string duplication.
 const (
-	cmdStatus = "status"
-	cmdList   = "list"
-	cmdCreate = "create"
-	cmdUpdate = "update"
-	cmdDelete = "delete"
-	cmdStart  = "start"
-	cmdStop   = "stop"
-	cmdExport = "export"
-	cmdJobs   = "jobs"
+	cmdStatus  = "status"
+	cmdList    = "list"
+	cmdCreate  = "create"
+	cmdUpdate  = "update"
+	cmdDelete  = "delete"
+	cmdStart   = "start"
+	cmdStop    = "stop"
+	cmdExport  = "export"
+	cmdJobs    = "jobs"
+	cmdRestart = "restart"
+	cmdSync    = "sync"
+	cmdLogs    = "logs"
 )
 
 // JSON body field name constants to avoid string duplication.
@@ -71,6 +76,72 @@ const (
 	fieldTables = "tables"
 	fieldJobs   = "jobs"
 )
+
+// Data-loading job type constants (mirror the operator CR enum).
+const (
+	dataLoadTypePXF    = "pxf"
+	dataLoadTypeGpload = "gpload"
+)
+
+// pxfConfigEndpointKey / pxfConfigBucketKey are the PXF server config keys the
+// friendly --endpoint / --bucket flags map into (s3a endpoint + bucket).
+const (
+	pxfConfigEndpointKey = "fs.s3a.endpoint"
+	pxfConfigBucketKey   = "bucket"
+)
+
+// secretRef mirrors api/v1alpha1.SecretReference for the CLI request body so the
+// JSON marshals 1:1 into the operator's CreatePXFServerRequest.credentialSecrets.
+type secretRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key,omitempty"`
+}
+
+// pxfServerRequest is the CLI mirror of api.CreatePXFServerRequest /
+// UpdatePXFServerRequest. The same shape serves create (Name set) and update
+// (Name elided; the path carries it). It serializes 1:1 into the operator DTO.
+type pxfServerRequest struct {
+	Name              string            `json:"name,omitempty"`
+	Type              string            `json:"type,omitempty"`
+	Config            map[string]string `json:"config,omitempty"`
+	CredentialSecrets []secretRef       `json:"credentialSecrets,omitempty"`
+}
+
+// pxfJobBody mirrors api/v1alpha1.PxfJobSpec (the subset the CLI sets).
+type pxfJobBody struct {
+	Server      string `json:"server"`
+	Profile     string `json:"profile"`
+	Resource    string `json:"resource,omitempty"`
+	TargetTable string `json:"targetTable"`
+	Mode        string `json:"mode,omitempty"`
+}
+
+// gploadInputSourceBody mirrors api/v1alpha1.GploadInputSourceSpec.
+type gploadInputSourceBody struct {
+	Type string `json:"type,omitempty"`
+	Host string `json:"host,omitempty"`
+	Port int32  `json:"port,omitempty"`
+}
+
+// gploadJobBody mirrors the subset of api/v1alpha1.GploadJobSpec the CLI sets.
+type gploadJobBody struct {
+	TargetTable string                 `json:"targetTable"`
+	Format      string                 `json:"format,omitempty"`
+	InputSource *gploadInputSourceBody `json:"inputSource,omitempty"`
+	FilePaths   []string               `json:"filePaths,omitempty"`
+}
+
+// dataLoadingJobRequest is the CLI mirror of api.CreateDataLoadingJobRequest. It
+// is the SAME target for both flag-built and --from-yaml bodies, so the JSON
+// tags must match the operator DTO exactly.
+type dataLoadingJobRequest struct {
+	Name      string         `json:"name"`
+	Type      string         `json:"type"`
+	Enabled   bool           `json:"enabled,omitempty"`
+	Schedule  string         `json:"schedule,omitempty"`
+	PxfJob    *pxfJobBody    `json:"pxfJob,omitempty"`
+	GploadJob *gploadJobBody `json:"gploadJob,omitempty"`
+}
 
 // globalFlags holds the global CLI flags.
 type globalFlags struct {
@@ -198,6 +269,24 @@ func runAPIPost(path string, body interface{}) error {
 	return newFormatter().Format(resp.Body)
 }
 
+// runAPIPut is a helper that creates a client, performs a PUT request, and
+// formats the output. It mirrors runAPIPost for the few endpoints that replace
+// a named resource in place (e.g. pxf servers update).
+func runAPIPut(path string, body interface{}) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	resp, apiErr := client.Put(ctx, path, body)
+	if apiErr != nil {
+		return apiErr
+	}
+	return newFormatter().Format(resp.Body)
+}
+
 // runAPIDelete is a helper that creates a client, performs a DELETE request, and formats the output.
 func runAPIDelete(path string) error {
 	client, err := newClient()
@@ -284,6 +373,7 @@ to Cloudberry cluster management operations through the Cloudberry Operator API.
 		newBackupCmd(),
 		newMigrateCmd(),
 		newDataLoadingCmd(),
+		newPxfCmd(),
 		newStorageCmd(),
 		newCompletionCmd(),
 		newMetricsCmd(),
@@ -1253,7 +1343,7 @@ func newInspectCmd() *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:   "logs",
+			Use:   cmdLogs,
 			Short: "View server logs",
 			RunE: func(_ *cobra.Command, _ []string) error {
 				if err := requireCluster(); err != nil {
@@ -2711,7 +2801,7 @@ type backupJobsLogsFlags struct {
 func newBackupJobsLogsCmd() *cobra.Command {
 	f := &backupJobsLogsFlags{tail: -1}
 	cmd := &cobra.Command{
-		Use:   "logs",
+		Use:   cmdLogs,
 		Short: "Stream logs for a backup Job",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := requireCluster(); err != nil {
@@ -2885,6 +2975,254 @@ func newStorageCmd() *cobra.Command {
 	return cmd
 }
 
+// newPxfCmd creates the "pxf" command group for the operator-driven PXF
+// lifecycle. It exposes only the operator-level verbs that the API server
+// implements: status (honest sidecar readiness), restart (segment-primary pod
+// roll), and sync (servers ConfigMap refresh + roll). The sidecar-local verbs
+// pxf prepare/start/stop are exec-only and intentionally NOT exposed here.
+func newPxfCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pxf",
+		Short: "PXF data-loading sidecar lifecycle",
+		Long: "Operator-driven PXF lifecycle commands. 'restart' and 'sync' bump the\n" +
+			"segment-primary StatefulSet restart trigger, causing the PXF sidecars to\n" +
+			"ROLL (pods are recreated) — this is heavier than an in-place sidecar restart.\n" +
+			"The sidecar-local verbs (prepare/start/stop) are exec-only and not exposed here.",
+	}
+
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   cmdStatus,
+			Short: "Show PXF sidecar readiness across segment-primary pods",
+			Long: "Reports honest PXF sidecar readiness aggregated from the real container\n" +
+				"statuses of the segment-primary pods, plus the spec-derived configured/servers counts.",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIGet(ctl.ClusterSubresourcePath(
+					globals.cluster, "data-loading/pxf/status", globals.namespace))
+			},
+		},
+		&cobra.Command{
+			Use:   cmdRestart,
+			Short: "Restart PXF sidecars across all segment-primary pods",
+			Long: "Triggers an operator-driven PXF restart by bumping the segment-primary\n" +
+				"StatefulSet restart trigger. The segment-primary pods ROLL (kubelet recreates\n" +
+				"them; the entrypoint re-runs pxf prepare/start) — heavier than an in-place restart.",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterSubresourcePath(
+					globals.cluster, "data-loading/pxf/restart", globals.namespace), nil)
+			},
+		},
+		&cobra.Command{
+			Use:   cmdSync,
+			Short: "Refresh the PXF servers ConfigMap and roll the sidecars",
+			Long: "Re-renders the <cluster>-pxf-servers ConfigMap from the current spec and bumps\n" +
+				"the segment-primary restart trigger so the pxf-cred-init init container\n" +
+				"re-renders the servers on the next roll.",
+			RunE: func(_ *cobra.Command, _ []string) error {
+				if err := requireCluster(); err != nil {
+					return err
+				}
+				return runAPIPost(ctl.ClusterSubresourcePath(
+					globals.cluster, "data-loading/pxf/sync", globals.namespace), nil)
+			},
+		},
+		newPxfServersCmd(),
+	)
+
+	return cmd
+}
+
+// pxfServersFlags holds the flags for the `pxf servers create/update` commands.
+type pxfServersFlags struct {
+	name              string
+	serverType        string
+	endpoint          string
+	bucket            string
+	credentialSecrets []string
+}
+
+// newPxfServersCmd creates the `pxf servers` subtree (L.2–L.5): list/create/
+// update/delete, wired to the existing Scenario 107 REST server CRUD endpoints.
+func newPxfServersCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "servers",
+		Short: "Manage PXF servers",
+	}
+	cmd.AddCommand(
+		newPxfServersListCmd(),
+		newPxfServersCreateCmd(),
+		newPxfServersUpdateCmd(),
+		newPxfServersDeleteCmd(),
+	)
+	return cmd
+}
+
+// newPxfServersListCmd creates `pxf servers list` (L.2).
+func newPxfServersListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   cmdList,
+		Short: "List PXF servers",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			return runAPIGet(ctl.ClusterSubresourcePath(
+				globals.cluster, "data-loading/pxf/servers", globals.namespace))
+		},
+	}
+}
+
+// newPxfServersCreateCmd creates `pxf servers create` (L.3). --name and --type
+// are required and guarded locally (usage error, no API call) before the POST.
+func newPxfServersCreateCmd() *cobra.Command {
+	f := &pxfServersFlags{}
+	cmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create a PXF server",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if f.name == "" || f.serverType == "" {
+				return fmt.Errorf("--name and --type are required")
+			}
+			body := pxfServerRequest{
+				Name:              f.name,
+				Type:              f.serverType,
+				Config:            buildPxfServerConfig(f),
+				CredentialSecrets: parseCredentialSecrets(f.credentialSecrets),
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "data-loading/pxf/servers", globals.namespace), body)
+		},
+	}
+	bindPxfServerFlags(cmd, f, true)
+	return cmd
+}
+
+// newPxfServersUpdateCmd creates `pxf servers update [name]` (L.4). The server
+// name comes from the positional arg or --name; the body is PUT to the named
+// server endpoint.
+func newPxfServersUpdateCmd() *cobra.Command {
+	f := &pxfServersFlags{}
+	cmd := &cobra.Command{
+		Use:   cmdUpdate + " [name]",
+		Short: "Update a PXF server",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			name := f.name
+			if len(args) == 1 {
+				name = args[0]
+			}
+			if name == "" {
+				return fmt.Errorf("server name is required (positional arg or --name)")
+			}
+			body := pxfServerRequest{
+				Type:              f.serverType,
+				Config:            buildPxfServerConfig(f),
+				CredentialSecrets: parseCredentialSecrets(f.credentialSecrets),
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/data-loading/pxf/servers/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(name)),
+				globals.namespace)
+			return runAPIPut(path, body)
+		},
+	}
+	bindPxfServerFlags(cmd, f, false)
+	return cmd
+}
+
+// newPxfServersDeleteCmd creates `pxf servers delete [name]` (L.5).
+func newPxfServersDeleteCmd() *cobra.Command {
+	var name string
+	cmd := &cobra.Command{
+		Use:   cmdDelete + " [name]",
+		Short: "Delete a PXF server",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if len(args) == 1 {
+				name = args[0]
+			}
+			if name == "" {
+				return fmt.Errorf("server name is required (positional arg or --name)")
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/data-loading/pxf/servers/%s",
+					url.PathEscape(globals.cluster), url.PathEscape(name)),
+				globals.namespace)
+			return runAPIDelete(path)
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "PXF server name")
+	return cmd
+}
+
+// bindPxfServerFlags binds the shared --type/--endpoint/--bucket/--credential-secret
+// flags used by create and update. When requireName is true a --name flag is
+// also bound (create); update takes the name positionally or via a bare --name.
+func bindPxfServerFlags(cmd *cobra.Command, f *pxfServersFlags, requireName bool) {
+	fl := cmd.Flags()
+	fl.StringVar(&f.name, "name", "", "PXF server name")
+	if requireName {
+		fl.StringVar(&f.serverType, "type", "",
+			"PXF server type (s3|hdfs|jdbc|hbase|hive|gs|abfss|wasbs|custom)")
+	} else {
+		fl.StringVar(&f.serverType, "type", "", "PXF server type (optional on update)")
+	}
+	fl.StringVar(&f.endpoint, "endpoint", "", "Object-store endpoint (maps to "+pxfConfigEndpointKey+")")
+	fl.StringVar(&f.bucket, "bucket", "", "Object-store bucket")
+	fl.StringArrayVar(&f.credentialSecrets, "credential-secret", nil,
+		"Credential secret as \"secretName[:key]\" (repeatable)")
+}
+
+// buildPxfServerConfig maps the friendly --endpoint/--bucket flags into the PXF
+// server config map. It returns nil when neither flag is set so an empty config
+// is omitted from the JSON body.
+func buildPxfServerConfig(f *pxfServersFlags) map[string]string {
+	cfg := map[string]string{}
+	if f.endpoint != "" {
+		cfg[pxfConfigEndpointKey] = f.endpoint
+	}
+	if f.bucket != "" {
+		cfg[pxfConfigBucketKey] = f.bucket
+	}
+	if len(cfg) == 0 {
+		return nil
+	}
+	return cfg
+}
+
+// parseCredentialSecrets parses each "secretName[:key]" flag value into a
+// secretRef. An empty input yields nil so the field is omitted from the body.
+func parseCredentialSecrets(raw []string) []secretRef {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]secretRef, 0, len(raw))
+	for _, v := range raw {
+		name, key, found := strings.Cut(v, ":")
+		ref := secretRef{Name: name}
+		if found {
+			ref.Key = key
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
 // newDataLoadingCmd creates the data loading command group.
 func newDataLoadingCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -2908,20 +3246,8 @@ func newDataLoadingCmd() *cobra.Command {
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "data-loading/jobs", globals.namespace))
 			},
 		},
-		&cobra.Command{
-			Use:   cmdCreate,
-			Short: "Create a data loading job",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				p := ctl.ClusterSubresourcePath(
-					globals.cluster, "data-loading/jobs",
-					globals.namespace,
-				)
-				return runAPIPost(p, nil)
-			},
-		},
+		newDataLoadingJobsCreateCmd(),
+		newDataLoadingJobsLogsCmd(),
 		&cobra.Command{
 			Use:   cmdStart + " [job-name]",
 			Short: "Start a data loading job",
@@ -2981,9 +3307,277 @@ func newDataLoadingCmd() *cobra.Command {
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "data-loading/jobs", globals.namespace))
 			},
 		},
+		newDataLoadingTestReadCmd(),
 	)
 
 	return cmd
+}
+
+// dataLoadingJobCreateFlags holds the flags for `data-loading jobs create`.
+type dataLoadingJobCreateFlags struct {
+	jobType     string
+	name        string
+	schedule    string
+	fromYAML    string
+	server      string
+	profile     string
+	resource    string
+	target      string
+	gpfdistHost string
+	gpfdistPort int32
+	filePath    string
+	format      string
+}
+
+// newDataLoadingJobsCreateCmd creates the enriched `data-loading jobs create`
+// command (L.9/L.14/L.16). It builds a CreateDataLoadingJobRequest from --type
+// pxf|gpload flags, or — when --from-yaml is given (which takes PRECEDENCE over
+// the individual flags) — from a YAML file. The assembled body is POSTed; the
+// operator webhook stays authoritative for deep validation (cron, server refs).
+func newDataLoadingJobsCreateCmd() *cobra.Command {
+	f := &dataLoadingJobCreateFlags{jobType: dataLoadTypePXF}
+	cmd := &cobra.Command{
+		Use:   cmdCreate,
+		Short: "Create a data loading job (pxf|gpload, or --from-yaml)",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			body, err := buildDataLoadingJobBody(f)
+			if err != nil {
+				return err
+			}
+			return runAPIPost(ctl.ClusterSubresourcePath(
+				globals.cluster, "data-loading/jobs", globals.namespace), body)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.jobType, "type", dataLoadTypePXF, "Job type (pxf|gpload)")
+	fl.StringVar(&f.name, "name", "", "Job name (required unless --from-yaml)")
+	fl.StringVar(&f.schedule, "schedule", "", "Cron schedule (5-field); empty = one-off")
+	fl.StringVar(&f.fromYAML, "from-yaml", "", "Path to a job definition YAML (takes precedence over flags)")
+	// pxf flags.
+	fl.StringVar(&f.server, "server", "", "PXF server name (pxf)")
+	fl.StringVar(&f.profile, "profile", "", "PXF profile (pxf)")
+	fl.StringVar(&f.resource, "resource", "", "PXF resource locator (pxf)")
+	fl.StringVar(&f.target, "target", "", "Target table")
+	// gpload flags.
+	fl.StringVar(&f.gpfdistHost, "gpfdist-host", "", "gpfdist host (gpload)")
+	fl.Int32Var(&f.gpfdistPort, "gpfdist-port", 0, "gpfdist port (gpload)")
+	fl.StringVar(&f.filePath, "file-path", "", "Source file glob (gpload)")
+	fl.StringVar(&f.format, "format", "", "Input format csv|text (gpload)")
+	return cmd
+}
+
+// buildDataLoadingJobBody assembles the job request body. --from-yaml takes
+// PRECEDENCE: when set, the file is read+unmarshalled and the flag-built body is
+// ignored (a note is logged if other job flags were also supplied). Otherwise a
+// pxf or gpload body is built from the typed flags.
+func buildDataLoadingJobBody(f *dataLoadingJobCreateFlags) (*dataLoadingJobRequest, error) {
+	if f.fromYAML != "" {
+		if f.name != "" || f.server != "" || f.target != "" {
+			slog.Info("--from-yaml takes precedence; individual job flags are ignored",
+				"file", f.fromYAML)
+		}
+		return readDataLoadingJobYAML(f.fromYAML)
+	}
+	if f.name == "" {
+		return nil, fmt.Errorf("--name is required (or use --from-yaml)")
+	}
+	switch f.jobType {
+	case dataLoadTypePXF:
+		return buildPxfJobBody(f), nil
+	case dataLoadTypeGpload:
+		return buildGploadJobBody(f), nil
+	default:
+		return nil, fmt.Errorf("invalid --type %q; valid types: pxf, gpload", f.jobType)
+	}
+}
+
+// buildPxfJobBody builds a pxf-type job request from the typed flags (L.9). Mode
+// defaults to "insert" (a readable import external table).
+func buildPxfJobBody(f *dataLoadingJobCreateFlags) *dataLoadingJobRequest {
+	return &dataLoadingJobRequest{
+		Name:     f.name,
+		Type:     dataLoadTypePXF,
+		Schedule: f.schedule,
+		PxfJob: &pxfJobBody{
+			Server:      f.server,
+			Profile:     f.profile,
+			Resource:    f.resource,
+			TargetTable: f.target,
+			Mode:        "insert",
+		},
+	}
+}
+
+// buildGploadJobBody builds a gpload-type job request from the typed flags
+// (L.14): a gpfdist inputSource (host/port) plus the single file-path glob.
+func buildGploadJobBody(f *dataLoadingJobCreateFlags) *dataLoadingJobRequest {
+	gpload := &gploadJobBody{
+		TargetTable: f.target,
+		Format:      f.format,
+		InputSource: &gploadInputSourceBody{
+			Type: "gpfdist",
+			Host: f.gpfdistHost,
+			Port: f.gpfdistPort,
+		},
+	}
+	if f.filePath != "" {
+		gpload.FilePaths = []string{f.filePath}
+	}
+	return &dataLoadingJobRequest{
+		Name:      f.name,
+		Type:      dataLoadTypeGpload,
+		Schedule:  f.schedule,
+		GploadJob: gpload,
+	}
+}
+
+// readDataLoadingJobYAML reads and unmarshals a job definition YAML file into a
+// dataLoadingJobRequest (L.16). It uses sigs.k8s.io/yaml so the YAML keys match
+// the request's JSON tags 1:1. A missing file or malformed YAML is surfaced as a
+// clean error (no POST is attempted by the caller).
+func readDataLoadingJobYAML(path string) (*dataLoadingJobRequest, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // operator-authored job file path supplied by the CLI user
+	if err != nil {
+		return nil, fmt.Errorf("reading job file %q: %w", path, err)
+	}
+	var req dataLoadingJobRequest
+	if unmarshalErr := yaml.Unmarshal(data, &req); unmarshalErr != nil {
+		return nil, fmt.Errorf("parsing job file %q: %w", path, unmarshalErr)
+	}
+	return &req, nil
+}
+
+// newDataLoadingJobsLogsCmd creates `data-loading jobs logs` (L.13). It streams
+// the data-loading Job's pod logs via the operator API and falls back to the
+// kubectl instruction when the streaming endpoint is unavailable, mirroring the
+// backup jobs logs command.
+func newDataLoadingJobsLogsCmd() *cobra.Command {
+	f := &backupJobsLogsFlags{tail: -1}
+	cmd := &cobra.Command{
+		Use:   cmdLogs,
+		Short: "Stream logs for a data loading Job",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if f.job == "" {
+				return fmt.Errorf("--job is required")
+			}
+			return runDataLoadingJobsLogs(cmd, f)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.job, "job", "", "Data loading Job name")
+	fl.BoolVar(&f.follow, "follow", false, "Stream logs as they are produced")
+	fl.Int64Var(&f.tail, "tail", -1, "Number of recent log lines to show (-1 for all)")
+	return cmd
+}
+
+// runDataLoadingJobsLogs streams the data-loading Job's pod logs to stdout,
+// falling back to the kubectl instruction when the operator streaming endpoint
+// is unavailable. It reuses the backup logs streaming helper + fallback.
+func runDataLoadingJobsLogs(cmd *cobra.Command, f *backupJobsLogsFlags) error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cmdContext()
+	defer cancel()
+
+	path := buildDataLoadingJobLogsPath(f)
+	if streamErr := client.GetStream(ctx, path, cmd.OutOrStdout()); streamErr != nil {
+		printBackupJobLogsFallback(cmd, util.DataLoadJobName(globals.cluster, f.job), streamErr)
+	}
+	return nil
+}
+
+// buildDataLoadingJobLogsPath builds the namespace-qualified data-loading logs
+// endpoint path, including the optional follow/tail query parameters.
+func buildDataLoadingJobLogsPath(f *backupJobsLogsFlags) string {
+	path := fmt.Sprintf("/clusters/%s/data-loading/jobs/%s/logs",
+		url.PathEscape(globals.cluster), url.PathEscape(f.job))
+
+	query := url.Values{}
+	if globals.namespace != "" {
+		query.Set("namespace", globals.namespace)
+	}
+	if f.follow {
+		query.Set("follow", "true")
+	}
+	if f.tail >= 0 {
+		query.Set("tailLines", strconv.FormatInt(f.tail, 10))
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return path
+}
+
+// dataLoadingTestReadFlags holds the flags for `data-loading test-read`.
+type dataLoadingTestReadFlags struct {
+	job      string
+	server   string
+	profile  string
+	resource string
+	limit    int
+}
+
+// newDataLoadingTestReadCmd creates `data-loading test-read` (L.15). It reads up
+// to --limit rows from a PXF source — selected by --job (primary) or by explicit
+// --server/--profile/--resource — and prints the REAL sampled rows. When the
+// source is not readable it prints an honest "(source unavailable)" notice and
+// exits 0 (this is a read/preview command), never fabricating rows.
+func newDataLoadingTestReadCmd() *cobra.Command {
+	f := &dataLoadingTestReadFlags{limit: 10}
+	cmd := &cobra.Command{
+		Use:   "test-read",
+		Short: "Read N rows from a PXF source (preview)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			if f.limit < 1 {
+				return fmt.Errorf("--limit must be a positive integer")
+			}
+			if f.job == "" && (f.profile == "" || f.resource == "") {
+				return fmt.Errorf("either --job or both --profile and --resource are required")
+			}
+			return runDataLoadingTestRead(cmd, f)
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.job, "job", "", "Resolve the source from a defined job (primary)")
+	fl.StringVar(&f.server, "server", "", "PXF server name (alternative to --job)")
+	fl.StringVar(&f.profile, "profile", "", "PXF profile (alternative to --job)")
+	fl.StringVar(&f.resource, "resource", "", "PXF resource locator (alternative to --job)")
+	fl.IntVar(&f.limit, "limit", 10, "Maximum rows to read (default 10, cap 1000)")
+	return cmd
+}
+
+// runDataLoadingTestRead builds the test-read query string and GETs the preview
+// endpoint, rendering the result via the standard formatter.
+func runDataLoadingTestRead(_ *cobra.Command, f *dataLoadingTestReadFlags) error {
+	query := url.Values{}
+	if globals.namespace != "" {
+		query.Set("namespace", globals.namespace)
+	}
+	if f.job != "" {
+		query.Set("job", f.job)
+	} else {
+		if f.server != "" {
+			query.Set("server", f.server)
+		}
+		query.Set("profile", f.profile)
+		query.Set("resource", f.resource)
+	}
+	query.Set("limit", strconv.Itoa(f.limit))
+
+	path := fmt.Sprintf("/clusters/%s/data-loading/test-read?%s",
+		url.PathEscape(globals.cluster), query.Encode())
+	return runAPIGet(path)
 }
 
 // newMetricsCmd creates the metrics command group.

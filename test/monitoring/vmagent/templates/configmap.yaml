@@ -11,6 +11,11 @@ data:
 
     scrape_configs:
       - job_name: 'kubernetes-pods'
+        # Preserve a scraped target's own `job` label (e.g. the operator's
+        # cloudberry_data_loading_job_status{job=<load-job>}); without this the
+        # scrape `job=kubernetes-pods` collides and the metric label is renamed
+        # to `exported_job`, breaking dashboards/PromQL that use {job}.
+        honor_labels: true
         kubernetes_sd_configs:
           - role: pod
         relabel_configs:
@@ -46,7 +51,50 @@ data:
             action: replace
             target_label: component
 
+      # -----------------------------------------------------------------
+      # PXF Spring Boot Actuator (M.2/M.3: http_server_requests_seconds_*)
+      # -----------------------------------------------------------------
+      # The segment-primary pods already carry prometheus.io/scrape
+      # annotations for the pg-exporter (:9187 /metrics). A single pod
+      # annotation cannot cover two targets, so this SEPARATE job
+      # discovers the PXF sidecar actuator endpoint by label + container
+      # port. It selects pods with:
+      #   app.kubernetes.io/component = segment-primary
+      #   container port 5888 (named "pxf")
+      # and scrapes /actuator/prometheus on that port.
+      - job_name: 'pxf-actuator'
+        kubernetes_sd_configs:
+          - role: pod
+        metrics_path: /actuator/prometheus
+        relabel_configs:
+          # Keep only pods labelled as segment-primary (PXF sidecar host).
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: keep
+            regex: segment-primary
+          # Keep only the container port named "pxf" (5888).
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: pxf
+          # Override the scrape address to use port 5888.
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:5888
+            target_label: __address__
+          # Standard metadata labels.
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: replace
+            target_label: component
+
       - job_name: 'kubernetes-service-endpoints'
+        # Preserve a scraped target's own `job` label (avoid exported_job).
+        honor_labels: true
         kubernetes_sd_configs:
           - role: endpointslice
         relabel_configs:

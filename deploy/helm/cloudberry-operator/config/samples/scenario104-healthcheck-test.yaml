@@ -1,0 +1,263 @@
+# =============================================================================
+# Scenario 104 — Pre-Load Health Checks (HC.1-HC.5)
+# =============================================================================
+# Acceptance-test cluster proving the pre-load health-check init container
+# (dataload-healthcheck) blocks a data-load Job when any of the 5 checks fail,
+# and lets the load proceed once the condition is restored. Modeled on
+# scenario93-acceptance-test.yaml:
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth + Vault KV secrets
+#   - Query monitoring: postgres-exporter on segments+mirrors+coordinator
+#     + cloudberry-query-exporter
+#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - deletionPolicy Retain
+#
+#   - dataLoading.pxf with ONE s3 server (s3-datalake) pointing at the MinIO s3
+#     dataset (cloudberry-data/text/data.csv) — for HC.1/HC.2/HC.3/HC.5.
+#   - dataLoading.gpfdist {enabled, replicas:1, cloudberry-gpfdist:2.1.0, 8080} —
+#     deployed so HC.4 (gpfdist reachability) has a real Service to probe and to
+#     break (scale to 0).
+#   - dataLoading.healthChecks {enabled:true, diskMinFreeMB:64,
+#     scratchSizeLimit:"64Mi"} — a small scratchSizeLimit makes the HC.5 fill
+#     deterministic (fill /dataload-scratch beyond 64Mi).
+#   - dataLoading.jobs:
+#       * s3-load   — type:pxf, s3-datalake/s3:text/cloudberry-data/text/data.csv
+#                     → public.events. Exercises HC.1 (stop PXF), HC.2 (drop the
+#                     table — the DETERMINISTIC headline), HC.3 (break the s3
+#                     endpoint), HC.5 (raise diskMinFreeMB / fill the scratch).
+#       * gpload-csv — type:gpload, gpfdist source, /incoming/*.csv, csv →
+#                     public.events. Exercises HC.4 (scale gpfdist to 0).
+#
+# NOTE: the e2e (Part B) creates public.events on the coordinator BEFORE the
+# load (matching the CSV schema id int, name text, value int):
+#     CREATE TABLE IF NOT EXISTS public.events (id int, name text, value int);
+# The HC.* are exercised by BREAKING then RESTORING each condition:
+#   HC.1  stop PXF on a segment   → restart PXF
+#   HC.2  drop public.events      → re-create public.events     (HEADLINE)
+#   HC.3  break fs.s3a.endpoint   → restore fs.s3a.endpoint
+#   HC.4  scale gpfdist to 0      → scale gpfdist back to 1
+#   HC.5  raise diskMinFreeMB     → lower diskMinFreeMB / free scratch
+# Each break → the dataload-healthcheck init exits non-zero → the Job Fails → a
+# de-duplicated DataLoadingHealthCheckFailed Warning Event + data_loading_job_status=3
+# + kube-state-metrics (kube_job_status_failed{job_name=~".*-dataload-.*"},
+# kube_pod_init_container_status_*). Restore → the Job re-runs → init passes →
+# the load proceeds → Job Succeeded.
+#
+# HC.1 HONESTY: HC.1 is a DB-PROXY PXF-readiness probe (the load pod CANNOT
+# reach a segment's localhost-only sidecar per spec §3341); the live proof is
+# "stop PXF → the job fails". A direct sidecar curl from the load pod is out of
+# scope.
+#
+# METRIC HONESTY: NO new operator metric. HC failures are observed via the REAL
+# cloudberry_data_loading_job_status=3 + cloudberry_data_loading_errors_total +
+# the DataLoadingHealthCheckFailed Event + the NEW kube-state-metrics. The
+# cloudberry_pxf_*/cloudberry_gpfdist_* families stay PLANNED and are NEVER
+# asserted.
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: healthcheck-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "104"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: healthcheck-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # The s3 server points at the MinIO s3 dataset. HC.3 breaks/restores
+        # fs.s3a.endpoint to fail/pass the init's curl-head reachability probe.
+        - name: s3-datalake
+          type: s3
+          config:
+            fs.s3a.endpoint: "http://minio:9000"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - name: backup-s3-credentials
+              key: aws_access_key_id
+            - name: backup-s3-credentials
+              key: aws_secret_access_key
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    # gpfdist file-server (HC.4): the init's HC.4 curl probes
+    # http://healthcheck-test-gpfdist-svc:8080/. Scale this Deployment to 0 to
+    # make HC.4 fail; scale back to 1 to restore.
+    gpfdist:
+      enabled: true
+      replicas: 1
+      image: "cloudberry-gpfdist:2.1.0"
+      port: 8080
+    # Pre-load health checks (default ON). diskMinFreeMB 64 is the HC.5 threshold;
+    # a small scratchSizeLimit (64Mi) bounds the shared scratch emptyDir so HC.5
+    # can be made to fail deterministically (fill /dataload-scratch beyond it, or
+    # raise diskMinFreeMB above the free space).
+    healthChecks:
+      enabled: true
+      diskMinFreeMB: 64
+      scratchSizeLimit: "64Mi"
+    jobs:
+      # s3-load (pxf) — exercises HC.1 (stop PXF), HC.2 (drop public.events; the
+      # DETERMINISTIC headline), HC.3 (break fs.s3a.endpoint) and HC.5 (raise
+      # diskMinFreeMB / fill the scratch). loadMethod unset == external-table.
+      - name: s3-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: s3-datalake
+          profile: "s3:text"
+          resource: "cloudberry-data/text/data.csv"
+          targetTable: "public.events"
+      # gpload-csv (gpload) — exercises HC.4 (scale the gpfdist Deployment to 0).
+      - name: gpload-csv
+        type: gpload
+        enabled: true
+        gploadJob:
+          targetTable: "public.events"
+          mode: insert
+          format: csv
+          inputSource:
+            type: gpfdist
+          filePaths:
+            - "/incoming/*.csv"
+
+  deletionPolicy: Retain

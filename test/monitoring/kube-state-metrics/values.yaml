@@ -1,0 +1,45 @@
+replicaCount: 1
+
+image:
+  repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+  tag: "v2.13.0"
+  pullPolicy: IfNotPresent
+
+# Metrics port exposed by kube-state-metrics
+metricsPort: 8080
+# Telemetry port for self-metrics
+telemetryPort: 8081
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+serviceAccount:
+  create: true
+  name: ""
+
+rbac:
+  create: true
+
+# Prometheus scrape annotations on the Service
+prometheus:
+  scrape: "true"
+  port: "8080"
+  path: "/metrics"
+
+# Security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

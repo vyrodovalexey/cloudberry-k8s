@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -341,6 +343,10 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 		// reaches steady state, backup status would never be populated after a
 		// scheduled/on-demand backup Job succeeds.
 		r.refreshBackupStatusOnSteadyState(ctx, cluster)
+		// Data-loading Jobs are likewise Job-derived: a deleted dataload Job must
+		// be re-created and its terminal status/metrics refreshed on the periodic
+		// requeue, even when the generation is unchanged (mirrors backup status).
+		r.refreshDataLoadingStatusOnSteadyState(ctx, cluster)
 		return ctrl.Result{RequeueAfter: r.requeueDefault()}, true, nil
 	}
 
@@ -442,6 +448,92 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 	// status-only change does not bump the spec generation (status subresource).
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		logger.Warn("failed to patch backup status on steady-state reconcile", "error", err)
+	}
+}
+
+// refreshDataLoadingStatusOnSteadyState re-creates any missing enabled
+// data-loading Job/CronJob and refreshes the per-job runtime status (and the 5
+// data-loading metrics) from completed Jobs, even when the spec generation is
+// unchanged (steady state). This is required because the generation gate in
+// handleAdminEarlyReturns short-circuits spec-driven reconciliation (which
+// normally runs reconcileDataLoadingJobs via reconcileDataLoading), but
+// Job-derived status — and the re-creation of a Job that was deleted out from
+// under the operator — must still happen on each periodic requeue. It mirrors
+// refreshBackupStatusOnSteadyState exactly: idempotent, non-fatal (errors are
+// logged and ignored), and it only persists when there is data-loading status to
+// write, so a non-data-loading cluster sees no spurious status updates.
+func (r *AdminReconciler) refreshDataLoadingStatusOnSteadyState(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
+		// Data loading disabled / absent: nothing Job-derived to refresh. No-op
+		// (no status patch), so default/non-data-loading clusters are untouched.
+		return
+	}
+
+	// Rebuild the spec-derived per-job status skeleton (name/enabled + counts) so
+	// enrichDataLoadingStatus has entries to enrich. This is the same lightweight
+	// status reconcileDataLoading computes; recomputing it here is idempotent and
+	// carries no generation bump (status subresource).
+	jobs := cluster.Spec.DataLoading.Jobs
+	configuredJobs := int32(0)
+	activeJobs := int32(0)
+	jobStatuses := make([]cbv1alpha1.DataLoadingJobStatus, 0, len(jobs))
+	for _, job := range jobs {
+		configuredJobs++
+		if job.Enabled {
+			activeJobs++
+		}
+		jobStatuses = append(jobStatuses, cbv1alpha1.DataLoadingJobStatus{
+			Name:    job.Name,
+			Enabled: job.Enabled,
+		})
+	}
+	cluster.Status.DataLoadingJobs = activeJobs
+	cluster.Status.DataLoading = &cbv1alpha1.DataLoadingStatus{
+		Phase:          dataLoadingPhaseConfigured,
+		ConfiguredJobs: configuredJobs,
+		ActiveJobs:     activeJobs,
+		Jobs:           jobStatuses,
+	}
+
+	// Preserve the spec-derived PXF summary on the steady-state path too, so a
+	// status patch here never drops status.dataLoading.pxf.{configured,servers},
+	// and refresh the HONEST observed-only runtime fields (status from live
+	// segment-primary "pxf" readiness, extensionsInstalled from a live
+	// pg_extension probe) so steady-state reconciles keep them current. Both
+	// observed fields stay ABSENT when unobservable.
+	if pxf := cluster.Spec.DataLoading.Pxf; pxf != nil && pxf.Enabled {
+		pxfStatus := &cbv1alpha1.DataLoadingPxfStatus{
+			Configured: true,
+			Servers:    clampInt32(len(pxf.Servers)),
+		}
+		r.populatePxfObservedStatus(ctx, cluster, pxfStatus)
+		cluster.Status.DataLoading.Pxf = pxfStatus
+		r.recordPxfObservedMetrics(cluster, pxfStatus)
+	}
+
+	r.metrics.SetDataLoadingJobsActive(
+		cluster.Name, cluster.Namespace, float64(activeJobs),
+	)
+
+	// Re-create missing enabled Jobs/CronJobs and re-harvest terminal status +
+	// metrics. reconcileDataLoadingJobs is idempotent (get-or-create by the
+	// deterministic name), so a Job deleted out from under the operator is
+	// re-created here, and an existing Job's terminal status is refreshed.
+	if err := r.reconcileDataLoadingJobs(ctx, cluster); err != nil {
+		logger.Warn("failed to reconcile data loading jobs on steady-state reconcile", "error", err)
+		return
+	}
+
+	// Persist refreshed data-loading status. patchDataLoadingStatus uses an
+	// explicit MergePatch (zero counters and an empty jobs slice are always
+	// included) so a status-only change never bumps the spec generation.
+	if err := r.patchDataLoadingStatus(ctx, cluster); err != nil {
+		logger.Warn("failed to patch data loading status on steady-state reconcile", "error", err)
 	}
 }
 
@@ -630,7 +722,10 @@ func (r *AdminReconciler) reconcileResourceGroups(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	dbClient db.Client,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileResourceGroups")
+	defer func() { end(err) }()
+
 	// Get existing resource groups from DB.
 	existing, err := dbClient.ListResourceGroups(ctx)
 	if err != nil {
@@ -1294,14 +1389,20 @@ func (r *AdminReconciler) ensureExporterCoreResources(
 	cluster *cbv1alpha1.CloudberryCluster,
 	password, dsn string,
 	logger *slog.Logger,
-) error {
-	if err := r.ensureExporterCredentialsSecret(ctx, cluster, password, dsn, logger); err != nil {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "ensureExporterCoreResources")
+	defer func() { end(err) }()
+
+	if secretErr := r.ensureExporterCredentialsSecret(ctx, cluster, password, dsn, logger); secretErr != nil {
+		err = secretErr
 		return err
 	}
-	if err := r.ensureExporterQueriesConfigMap(ctx, cluster, logger); err != nil {
+	if cmErr := r.ensureExporterQueriesConfigMap(ctx, cluster, logger); cmErr != nil {
+		err = cmErr
 		return err
 	}
-	return r.ensureExporterService(ctx, cluster, logger)
+	err = r.ensureExporterService(ctx, cluster, logger)
+	return err
 }
 
 // isNodeExporterEnabled returns true if the node exporter is configured and enabled.
@@ -1429,16 +1530,21 @@ func (r *AdminReconciler) setupExporterRole(
 
 	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
 	if err != nil {
+		// A real setup attempt that failed at the connectivity boundary: count it
+		// honestly as an error so a persistently-unreachable DB is visible.
+		r.metrics.RecordExporterRoleSetup(cluster.Name, cluster.Namespace, metricResultError)
 		logger.Warn("failed to create DB client for exporter role setup (will retry)", "error", err)
 		return
 	}
 	defer dbClient.Close()
 
 	if setupErr := dbClient.SetupExporterRole(dbCtx, password); setupErr != nil {
+		r.metrics.RecordExporterRoleSetup(cluster.Name, cluster.Namespace, metricResultError)
 		logger.Warn("failed to setup exporter role (will retry)", "error", setupErr)
 		return
 	}
 
+	r.metrics.RecordExporterRoleSetup(cluster.Name, cluster.Namespace, metricResultSuccess)
 	logger.Info("exporter role configured successfully")
 
 	// Mark the role as ready so the admin-controller stops retrying.
@@ -2958,43 +3064,498 @@ func appendBackupHistory(
 func (r *AdminReconciler) reconcileDataLoading(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileDataLoading")
+	defer func() { end(err) }()
+
 	if cluster.Spec.DataLoading == nil || !cluster.Spec.DataLoading.Enabled {
-		return nil
+		return r.cleanupDataLoading(ctx, cluster)
 	}
 
 	logger := util.LoggerFromContext(ctx)
+
+	jobs := cluster.Spec.DataLoading.Jobs
+	configuredJobs := int32(0)
 	activeJobs := int32(0)
-	for _, job := range cluster.Spec.DataLoading.Jobs {
+	jobStatuses := make([]cbv1alpha1.DataLoadingJobStatus, 0, len(jobs))
+	for _, job := range jobs {
+		configuredJobs++
 		if job.Enabled {
 			activeJobs++
 		}
+		jobStatuses = append(jobStatuses, cbv1alpha1.DataLoadingJobStatus{
+			Name:    job.Name,
+			Enabled: job.Enabled,
+		})
 	}
 
 	logger.Info("reconciling data loading configuration",
-		"totalJobs", len(cluster.Spec.DataLoading.Jobs),
+		"totalJobs", configuredJobs,
 		"activeJobs", activeJobs,
 	)
 
-	// Update data loading status.
+	// Update data loading status. DataLoadingJobs is retained as a backward
+	// compatible mirror of the enabled-job count (ActiveJobs).
 	cluster.Status.DataLoadingJobs = activeJobs
+	cluster.Status.DataLoading = &cbv1alpha1.DataLoadingStatus{
+		Phase:          dataLoadingPhaseConfigured,
+		ConfiguredJobs: configuredJobs,
+		ActiveJobs:     activeJobs,
+		Jobs:           jobStatuses,
+	}
+
 	r.metrics.SetDataLoadingJobsActive(
 		cluster.Name, cluster.Namespace, float64(activeJobs),
 	)
+
+	// Reconcile the PXF configuration when enabled: publish the config-derived
+	// gauge and populate Status.DataLoading.Pxf. The "<cluster>-pxf-servers"
+	// ConfigMap is created by the CLUSTER controller (before segment pods start),
+	// not here. When PXF is not enabled, Pxf status stays nil.
+	pxfServers := r.reconcilePxf(ctx, cluster)
+
+	// Snapshot the in-memory DataLoading status (counts + jobs + the just-built
+	// observed Pxf status) BEFORE setupPXFExtensions. When setupPXFExtensions
+	// installs >=1 extension it issues a MergePatch annotation write, and the
+	// API client writes the server response back into `cluster`, CLEARING the
+	// not-yet-persisted in-memory Status.DataLoading (back to nil). dlStatus
+	// holds the same pointer reconcilePxf mutated, so re-assigning it after the
+	// patch round-trip preserves the observed status for patchDataLoadingStatus.
+	dlStatus := cluster.Status.DataLoading
+
+	// Best-effort PXF client extension setup (CREATE EXTENSION IF NOT EXISTS pxf
+	// / pxf_fdw). NON-FATAL: the pxf agent is absent in cloudberry-official, so a
+	// failure logs a warning and never fails reconcile. Idempotent via the
+	// AnnotationPXFExtensionsReady guard.
+	r.setupPXFExtensions(ctx, cluster, logger)
+
+	// Restore the in-memory status the annotation-patch round-trip may have
+	// cleared, so the counts/jobs/pxf observed status survive to be persisted by
+	// patchDataLoadingStatus below (and to keep the L3124 condition honest).
+	cluster.Status.DataLoading = dlStatus
+
+	// Reconcile the gpfdist file-server (Deployment/Service/PVC) when
+	// dataLoading.gpfdist.enabled (GP.2-GP.5); best-effort GC the objects when
+	// disabled. NON-FATAL: an object error is logged but never fails the
+	// data-loading reconcile (the gpfdist runtime is independent of the gpload
+	// Jobs, which connect to the coordinator directly).
+	if gpfdistErr := r.reconcileGpfdist(ctx, cluster); gpfdistErr != nil {
+		logger.Warn("gpfdist reconcile failed (non-fatal)", "error", gpfdistErr)
+	}
+
+	// Build and launch the per-job data-loading Jobs/CronJobs, harvest the
+	// DATALOAD_ROWS markers and enrich the per-job status with the real execution
+	// state. The enriched job statuses replace the spec-only jobStatuses above.
+	// NON-FATAL on the happy path (the genuine native load path runs on
+	// cloudberry-official; pxf:// is generated but image-blocked for execution).
+	if jobErr := r.reconcileDataLoadingJobs(ctx, cluster); jobErr != nil {
+		return fmt.Errorf("reconciling data loading jobs: %w", jobErr)
+	}
+
+	conditionMsg := "Data loading configuration is applied"
+	if cluster.Status.DataLoading != nil && cluster.Status.DataLoading.Pxf != nil {
+		conditionMsg = fmt.Sprintf("%s; PXF configured: %d servers", conditionMsg, pxfServers)
+	}
 
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionDataLoadingConfigured),
 		metav1.ConditionTrue,
 		"DataLoadingReconciled",
-		"Data loading configuration is applied",
+		conditionMsg,
 	)
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonDataLoadingReconciled,
 		fmt.Sprintf("Data loading reconciled: %d jobs configured, %d active",
-			len(cluster.Spec.DataLoading.Jobs), activeJobs))
+			configuredJobs, activeJobs))
+
+	if err := r.patchDataLoadingStatus(ctx, cluster); err != nil {
+		return fmt.Errorf("patching data loading status: %w", err)
+	}
 
 	return nil
+}
+
+// cleanupDataLoading tears down the data-loading subsystem when it is disabled
+// or absent (DIS.1). It mirrors cleanupWorkload: the disabled branch of the
+// spec-driven reconcile is the ONLY caller, so the enabled path is never
+// affected. Every step is best-effort / non-fatal (logged + continue), because
+// disabling (not deleting) the cluster does NOT fire the ownerRef GC, so these
+// explicit deletes are what reclaim the stale resources promptly:
+//
+//   - gpfdist Deployment/Service/PVC (reuse deleteGpfdistResources);
+//   - the data-loading Jobs AND CronJobs (label-scoped GC);
+//   - the gpload control-file ConfigMaps (same label-scoped GC);
+//   - the cluster PXF NetworkPolicy (SE.5, gated on pxf — reaped on disable too).
+//
+// The "<cluster>-pxf-servers" ConfigMap and the PXF sidecar removal are owned by
+// the CLUSTER controller (ensurePxfServersConfigMap delete-when-disabled and the
+// segment-primary StatefulSet re-render without the sidecar), NOT here, because
+// the admin reconcile only runs once the cluster is Running.
+//
+// It then clears Status.DataLoading, zeroes the data-loading + PXF gauges, sets
+// the DataLoadingConfigured condition to False (reason DataLoadingDisabled),
+// emits a one-shot Normal event on the transition into the disabled state, and
+// persists the cleared status. Re-enabling redeploys everything via the normal
+// (idempotent get-or-create) reconcile body — no special-casing needed there.
+func (r *AdminReconciler) cleanupDataLoading(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	logger := util.LoggerFromContext(ctx)
+
+	// transitioning is true ONLY on the first reconcile that observes the
+	// disabled state with status still present, so the Normal event is emitted
+	// once (de-dup), mirroring cleanupWorkload's condition-driven semantics.
+	transitioning := cluster.Status.DataLoading != nil || cluster.Status.DataLoadingJobs != 0
+
+	logger.Info("cleaning up data loading (disabled)")
+
+	// 1. gpfdist Deployment/Service/PVC (best-effort).
+	r.deleteGpfdistResources(ctx, cluster)
+
+	// 2. data-loading Jobs + CronJobs (label-scoped best-effort).
+	r.deleteDataLoadingWorkloads(ctx, cluster)
+
+	// 3. gpload control-file ConfigMaps (label-scoped best-effort).
+	r.deleteGploadControlFileConfigMaps(ctx, cluster)
+
+	// 4. cluster PXF NetworkPolicy (SE.5) — present only when pxf was enabled;
+	// reclaim it on disable too (NotFound-tolerant, non-fatal).
+	pxfNetPol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+		Name: util.PxfNetworkPolicyName(cluster.Name), Namespace: cluster.Namespace}}
+	if err := r.client.Delete(ctx, pxfNetPol); err != nil && !apierrors.IsNotFound(err) {
+		logger.Warn("best-effort PXF NetworkPolicy delete failed (non-fatal)",
+			"name", pxfNetPol.Name, "error", err)
+	}
+
+	// 5. Clear status + zero the gauges (honest: disabled => 0 active jobs,
+	// 0 configured PXF servers).
+	cluster.Status.DataLoading = nil
+	cluster.Status.DataLoadingJobs = 0
+	r.metrics.SetDataLoadingJobsActive(cluster.Name, cluster.Namespace, 0)
+	r.metrics.SetPXFServersConfigured(cluster.Name, cluster.Namespace, 0)
+
+	// 6. Condition False (reason DataLoadingDisabled).
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataLoadingConfigured),
+		metav1.ConditionFalse,
+		"DataLoadingDisabled",
+		"Data loading is disabled",
+	)
+
+	// 7. One-shot Normal event on the transition into disabled.
+	if transitioning {
+		r.recorder.Event(cluster, corev1.EventTypeNormal,
+			cbv1alpha1.EventReasonDataLoadingDisabled,
+			"Data loading disabled: gpfdist, jobs/cronjobs and control-file ConfigMaps removed")
+	}
+
+	// 8. Persist the cleared status. patchDataLoadingStatus dereferences
+	// Status.DataLoading, so build a zeroed status object for the patch (the
+	// in-memory pointer was cleared above to keep the steady-state path honest).
+	cluster.Status.DataLoading = &cbv1alpha1.DataLoadingStatus{
+		Phase:          dataLoadingPhaseDisabled,
+		ConfiguredJobs: 0,
+		ActiveJobs:     0,
+		Jobs:           nil,
+	}
+	if err := r.patchDataLoadingStatus(ctx, cluster); err != nil {
+		return fmt.Errorf("patching cleared data loading status: %w", err)
+	}
+	// Drop the in-memory status back to nil AFTER persisting the zeroed snapshot,
+	// so subsequent in-process reads see "disabled" (no resurrection) and the
+	// next disabled reconcile observes transitioning=false (no event storm).
+	cluster.Status.DataLoading = nil
+	return nil
+}
+
+// reconcilePxf sets the cloudberry_pxf_servers_configured gauge and populates
+// Status.DataLoading.Pxf. It is a no-op (returns 0) when PXF is not enabled,
+// leaving Pxf status nil. The returned int is the configured server count.
+//
+// NOTE: the rendered "<cluster>-pxf-servers" ConfigMap is NO LONGER created here.
+// Its creation moved to the CLUSTER controller (ensurePxfServersConfigMap, called
+// from reconcileSegments before the segment-primary StatefulSet is applied) so it
+// exists by the time segment pods first start during INITIALIZATION — the admin
+// reconcile only runs once the cluster reaches Running, which was too late and
+// caused the pxf-cred-init init container to mount an empty templates volume.
+// The admin path keeps status/metric/condition + SetupPXFExtensions only; since
+// the only error source (ConfigMap apply) moved out, this no longer returns one.
+func (r *AdminReconciler) reconcilePxf(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) int {
+	// reconcilePxf no longer returns an error (its only error source moved out),
+	// so the span always ends with a nil status; it exists to attribute the
+	// phase's latency and nest the downstream observe-probe DB spans.
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcilePxf")
+	defer func() { end(nil) }()
+
+	pxf := cluster.Spec.DataLoading.Pxf
+	if pxf == nil || !pxf.Enabled {
+		return 0
+	}
+
+	serverCount := len(pxf.Servers)
+
+	r.metrics.SetPXFServersConfigured(
+		cluster.Name, cluster.Namespace, float64(serverCount),
+	)
+
+	pxfStatus := &cbv1alpha1.DataLoadingPxfStatus{
+		Configured: true,
+		Servers:    clampInt32(serverCount),
+	}
+	// Enrich with the HONEST observed-only runtime fields. Both are best-effort:
+	// an unobservable probe leaves the field ABSENT (empty/nil), never fabricated.
+	r.populatePxfObservedStatus(ctx, cluster, pxfStatus)
+	cluster.Status.DataLoading.Pxf = pxfStatus
+
+	// Publish the honest PXF status gauge only when the status is OBSERVABLE
+	// (non-empty); an absent status is skipped so the metric never claims a state
+	// that was not observed. Extension count is emitted only when observed.
+	r.recordPxfObservedMetrics(cluster, pxfStatus)
+
+	return serverCount
+}
+
+// populatePxfObservedStatus enriches the given PXF status with the two
+// observed-only runtime fields — Status (segment-primary "pxf" container
+// readiness aggregation) and ExtensionsInstalled (live pg_extension probe). Both
+// are best-effort and HONEST: any failure or unobservable probe leaves the
+// corresponding field ABSENT (Status "" / ExtensionsInstalled nil), so the
+// status never claims health or installed state that was not observed.
+func (r *AdminReconciler) populatePxfObservedStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	pxfStatus *cbv1alpha1.DataLoadingPxfStatus,
+) {
+	pxfStatus.Status = r.observePxfStatus(ctx, cluster)
+	pxfStatus.ExtensionsInstalled = r.observePxfExtensions(ctx, cluster)
+}
+
+// observePxfStatus lists the segment-primary pods with the SHARED selector,
+// aggregates the real "pxf" container readiness via the SHARED helper and maps
+// it to the honest status string. It is NON-FATAL: a list error leaves the
+// status ABSENT ("") and logs a warning — it never fails reconcile and never
+// fabricates a status. An unobservable aggregation (no pods / no pxf containers)
+// also maps to "" per util.PXFStatusFromReadiness.
+func (r *AdminReconciler) observePxfStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) string {
+	podList := &corev1.PodList{}
+	if err := r.client.List(ctx, podList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(util.SegmentPrimaryPXFSelector(cluster.Name)),
+	); err != nil {
+		util.LoggerFromContext(ctx).Warn(
+			"failed to list segment-primary pods for PXF status (leaving status absent)",
+			"cluster", cluster.Name, "error", err)
+		return ""
+	}
+	// Publish the HONEST per-segment-host pxf_service_up gauge (M.1) for every
+	// OBSERVED segment-primary pod: 1 when its "pxf" container is Ready, 0
+	// otherwise. This is the per-host disaggregation of the aggregate readiness
+	// below — emitted only for pods actually listed, so killing a segment's pxf
+	// container drives that host's gauge to 0 without fabricating an unobserved
+	// host. Non-fatal: it shares the same list as the aggregate status path.
+	for host, ready := range util.PXFReadyByHost(podList) {
+		r.metrics.SetPXFServiceUp(cluster.Name, cluster.Namespace, host, boolToFloat64Metric(ready))
+	}
+
+	readyCount, total := util.PXFReadyCount(podList)
+	return util.PXFStatusFromReadiness(readyCount, total)
+}
+
+// boolToFloat64Metric maps a readiness bool to the pxf_service_up gauge value
+// (1.0 Ready, 0.0 not). Kept local to the controller so the metrics package's
+// gauge contract (a float64) stays the single boundary.
+func boolToFloat64Metric(b bool) float64 {
+	if b {
+		return 1.0
+	}
+	return 0.0
+}
+
+// observePxfExtensions best-effort probes the live pg_extension catalog for the
+// installed PXF client extensions, modeled on setupPXFExtensions and capped by
+// pxfExtensionSetupTimeout. It is NON-FATAL: a nil dbFactory, a connect error or
+// a query error all leave the result ABSENT (nil) and log — so an unobservable
+// probe is honestly reported as absent rather than as "[]" (none installed). A
+// reachable DB with no PXF extensions also returns nil (absent), matching the
+// honesty invariant that an empty array is never synthesized.
+func (r *AdminReconciler) observePxfExtensions(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) []string {
+	logger := util.LoggerFromContext(ctx)
+	if r.dbFactory == nil {
+		logger.Debug("skipping PXF extension probe: no dbFactory configured")
+		return nil
+	}
+
+	dbCtx, cancel := context.WithTimeout(ctx, pxfExtensionSetupTimeout)
+	defer cancel()
+
+	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	if err != nil {
+		logger.Warn("skipping PXF extension probe: DB not available (leaving extensions absent)",
+			"error", err)
+		return nil
+	}
+	defer dbClient.Close()
+
+	extensions, listErr := dbClient.ListPXFExtensions(dbCtx)
+	if listErr != nil {
+		logger.Warn("PXF extension probe failed (leaving extensions absent)", "error", listErr)
+		return nil
+	}
+	// A reachable DB with zero extensions returns an empty slice from the probe;
+	// normalize it to nil so the field stays ABSENT (never a synthesized "[]").
+	if len(extensions) == 0 {
+		return nil
+	}
+	return extensions
+}
+
+// recordPxfObservedMetrics publishes the honest PXF observability gauges from an
+// already-computed status. The status gauge is set ONLY when the status is
+// OBSERVABLE (non-empty); an absent status is skipped so the metric never claims
+// a state that was not observed. The extensions-installed count is published
+// only when extensions were observed.
+func (r *AdminReconciler) recordPxfObservedMetrics(
+	cluster *cbv1alpha1.CloudberryCluster,
+	pxfStatus *cbv1alpha1.DataLoadingPxfStatus,
+) {
+	if value, ok := pxfStatusMetricValue(pxfStatus.Status); ok {
+		r.metrics.SetPXFStatus(cluster.Name, cluster.Namespace, value)
+	}
+	if len(pxfStatus.ExtensionsInstalled) > 0 {
+		r.metrics.SetPXFExtensionsInstalled(
+			cluster.Name, cluster.Namespace, float64(len(pxfStatus.ExtensionsInstalled)),
+		)
+	}
+}
+
+// pxfStatusMetricValue maps the honest PXF status string to its gauge value
+// (0=Stopped, 1=Running, 2=Error). The bool is false for the ABSENT/unobservable
+// status ("") so the caller can SKIP emitting the gauge entirely — keeping the
+// metric honest (no value implies an observation that did not happen).
+func pxfStatusMetricValue(status string) (float64, bool) {
+	switch status {
+	case util.PXFStatusStopped:
+		return 0, true
+	case util.PXFStatusRunning:
+		return 1, true
+	case util.PXFStatusError:
+		return 2, true
+	default:
+		return 0, false
+	}
+}
+
+// clampInt32 safely narrows a non-negative int to int32, capping at math.MaxInt32
+// to avoid integer-overflow on platforms where int is 64-bit. The PXF server
+// count is bounded by the CRD in practice; the clamp is a defensive guard.
+func clampInt32(n int) int32 {
+	if n < 0 {
+		return 0
+	}
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(n)
+}
+
+// dataLoadingPhaseConfigured is the data-loading phase reported once an enabled
+// DataLoading spec has been reconciled.
+const dataLoadingPhaseConfigured = "Configured"
+
+// dataLoadingPhaseDisabled is the data-loading phase persisted by the teardown
+// path (DIS.1) so the status honestly reflects the subsystem being off.
+const dataLoadingPhaseDisabled = "Disabled"
+
+// patchDataLoadingStatus explicitly patches the data loading status fields.
+// It mirrors patchQueryStatus / patchFTSStatus: a manual MergePatch is used so
+// that zero-valued counters and an empty jobs slice are always included (an
+// empty jobs array clears any previously reported jobs instead of being
+// dropped by json.Marshal omitempty).
+//
+// IMPORTANT: this is a MID-RECONCILE status patch. controller-runtime's
+// Status().Patch writes the SERVER's response object back into the passed-in
+// `cluster`, which OVERWRITES any in-memory cluster.Status fields that earlier
+// sub-reconcilers set but the single authoritative final patchStatus in
+// Reconcile has not yet persisted (e.g. cluster.Status.Conditions written by
+// reconcileWorkload/reconcileBackup, lastBackupStatus, etc.). Because this
+// merge patch only touches dataLoading/dataLoadingJobs, the round-trip would
+// silently DROP those not-yet-persisted in-memory fields, and the final
+// patchStatus would then persist a status missing them (the proven
+// status-persistence bug). To stay consistent with the "one final patchStatus"
+// design while still issuing this patch (the disabled-teardown and steady-state
+// callers, plus their unit tests, rely on it firing), we SNAPSHOT the in-memory
+// status before the patch and RESTORE it afterward. The snapshot already holds
+// the data-loading mutation being persisted here, so after restore the
+// in-memory object and the server agree on dataLoading AND every other
+// in-memory status field survives intact for the final patchStatus.
+func (r *AdminReconciler) patchDataLoadingStatus(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	dataLoading := map[string]interface{}{
+		"phase":          cluster.Status.DataLoading.Phase,
+		"configuredJobs": cluster.Status.DataLoading.ConfiguredJobs,
+		"activeJobs":     cluster.Status.DataLoading.ActiveJobs,
+	}
+	if len(cluster.Status.DataLoading.Jobs) == 0 {
+		dataLoading["jobs"] = []interface{}{}
+	} else {
+		dataLoading["jobs"] = cluster.Status.DataLoading.Jobs
+	}
+
+	// Include the spec-derived PXF status sub-object only when PXF is enabled, so
+	// default/non-PXF clusters keep status.dataLoading.pxf unset (nil).
+	if cluster.Status.DataLoading.Pxf != nil {
+		pxf := cluster.Status.DataLoading.Pxf
+		pxfMap := map[string]interface{}{
+			"configured": pxf.Configured,
+			"servers":    pxf.Servers,
+		}
+		// HONESTY: emit the observed-only fields ONLY when they are set in memory.
+		// An ABSENT status ("") / empty extensions list must NOT round-trip as an
+		// empty string/array, which would falsely claim an observation. Omitting
+		// the key leaves status.dataLoading.pxf.{status,extensionsInstalled} unset.
+		if pxf.Status != "" {
+			pxfMap["status"] = pxf.Status
+		}
+		if len(pxf.ExtensionsInstalled) > 0 {
+			pxfMap["extensionsInstalled"] = pxf.ExtensionsInstalled
+		}
+		dataLoading["pxf"] = pxfMap
+	}
+
+	patch, err := json.Marshal(map[string]interface{}{
+		patchKeyStatus: map[string]interface{}{
+			"dataLoadingJobs": cluster.Status.DataLoadingJobs,
+			"dataLoading":     dataLoading,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling data loading status patch: %w", err)
+	}
+
+	// Snapshot the in-memory status BEFORE the patch and restore it AFTER, so the
+	// Status().Patch round-trip cannot clobber cross-cutting in-memory status
+	// (conditions, backup, workload, …) that earlier sub-reconcilers set but the
+	// final patchStatus has not yet persisted. The snapshot already contains the
+	// dataLoading mutation this patch persists, so the restore keeps the in-memory
+	// object and the server in agreement on dataLoading while preserving the rest.
+	statusSnapshot := cluster.Status.DeepCopy()
+	patchErr := r.client.Status().Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patch))
+	cluster.Status = *statusSnapshot
+	return patchErr
 }
 
 // reconcileStorage reconciles storage management configuration and status.
@@ -3003,7 +3564,10 @@ func (r *AdminReconciler) reconcileDataLoading(
 func (r *AdminReconciler) reconcileStorage(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileStorage")
+	defer func() { end(err) }()
+
 	if cluster.Spec.Storage == nil || !cluster.Spec.Storage.DiskMonitoring {
 		return nil
 	}
@@ -3798,19 +4362,8 @@ func (r *AdminReconciler) updateRestartAnnotation(
 func (r *AdminReconciler) restartStatefulSet(ctx context.Context, namespace, name string) error {
 	logger := util.LoggerFromContext(ctx)
 
-	sts := &appsv1.StatefulSet{}
-	if err := r.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sts); err != nil {
-		return fmt.Errorf("getting statefulset %s/%s: %w", namespace, name, err)
-	}
-
-	// Patch the pod template annotation to trigger a rolling update.
-	if sts.Spec.Template.Annotations == nil {
-		sts.Spec.Template.Annotations = make(map[string]string)
-	}
-	sts.Spec.Template.Annotations[util.AnnotationRestartTrigger] = time.Now().UTC().Format(time.RFC3339Nano)
-
-	if err := r.client.Update(ctx, sts); err != nil {
-		return fmt.Errorf("updating statefulset %s/%s: %w", namespace, name, err)
+	if err := util.PatchStatefulSetRestartTrigger(ctx, r.client, namespace, name); err != nil {
+		return err
 	}
 
 	logger.Info("patched statefulset pod template for rolling restart", "sts", name)
@@ -4004,6 +4557,11 @@ func (r *AdminReconciler) executeLogRotate(ctx context.Context, dbClient db.Clie
 //
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;delete;get;list;watch;update;patch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;get;list;watch;update;patch
 func (r *AdminReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cbv1alpha1.CloudberryCluster{}).

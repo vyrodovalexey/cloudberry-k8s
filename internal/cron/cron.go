@@ -29,8 +29,15 @@ var bounds = []fieldBounds{
 	{name: "hour", min: 0, max: 23},
 	{name: "day-of-month", min: 1, max: 31},
 	{name: "month", min: 1, max: 12},
-	{name: "day-of-week", min: 0, max: 6},
+	// Day-of-week accepts 0-7 where both 0 and 7 mean Sunday, matching standard
+	// and Kubernetes CronJob semantics. The value 7 is normalized to 0 when the
+	// allowed-value set is populated (see parsePart).
+	{name: "day-of-week", min: 0, max: 7},
 }
+
+// dayOfWeekFieldName identifies the day-of-week field for Sunday (7→0)
+// normalization.
+const dayOfWeekFieldName = "day-of-week"
 
 // Schedule holds the per-field allowed-value sets of a parsed cron schedule.
 type Schedule struct {
@@ -157,6 +164,14 @@ func parsePart(part string, b fieldBounds, result map[int]bool) error {
 	}
 
 	for v := lo; v <= hi; v += step {
+		// Sunday is representable as both 0 and 7 in day-of-week. Normalize 7 to 0
+		// so NextAfter/matches (which compare against time.Weekday Sunday==0) treat
+		// the two spellings identically. This also handles ranges such as "5-7"
+		// (Fri,Sat,Sun → {5,6,0}).
+		if b.name == dayOfWeekFieldName && v == 7 {
+			result[0] = true
+			continue
+		}
 		result[v] = true
 	}
 	return nil

@@ -211,21 +211,6 @@ func TestSegmentInfo(t *testing.T) {
 	assert.Equal(t, "u", seg.Status)
 }
 
-func TestClusterState(t *testing.T) {
-	state := ClusterState{
-		IsUp:              true,
-		Version:           "7.7",
-		SegmentsUp:        4,
-		SegmentsDown:      0,
-		SegmentsTotal:     4,
-		MirroringInSync:   true,
-		ActiveConnections: 10,
-		MaxConnections:    100,
-	}
-	assert.True(t, state.IsUp)
-	assert.True(t, state.MirroringInSync)
-}
-
 func TestVacuumOptions(t *testing.T) {
 	opts := VacuumOptions{Full: true, Analyze: true, Table: "my_table"}
 	assert.True(t, opts.Full)
@@ -255,9 +240,6 @@ func (m *mockDBClient) Ping(_ context.Context) error { return m.pingErr }
 func (m *mockDBClient) Close()                       { m.closeCalls++ }
 func (m *mockDBClient) GetSegmentConfiguration(_ context.Context) ([]SegmentInfo, error) {
 	return []SegmentInfo{}, nil
-}
-func (m *mockDBClient) GetClusterState(_ context.Context) (*ClusterState, error) {
-	return &ClusterState{IsUp: true}, nil
 }
 func (m *mockDBClient) SetParameter(_ context.Context, _, _ string, _ ParameterScope) error {
 	return nil
@@ -377,7 +359,20 @@ func (m *mockDBClient) ListSessionsWithResourceGroup(_ context.Context) ([]Sessi
 func (m *mockDBClient) ListUserDatabases(_ context.Context) ([]string, error) {
 	return []string{"postgres"}, nil
 }
-func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) SetupExporterRole(_ context.Context, _ string) error    { return nil }
+func (m *mockDBClient) SetupPXFExtensions(_ context.Context) (int, error)      { return 2, nil }
+func (m *mockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error { return nil }
+func (m *mockDBClient) ListPXFExtensions(_ context.Context) ([]string, error) {
+	return []string{"pxf", "pxf_fdw"}, nil
+}
+func (m *mockDBClient) ListExternalTables(_ context.Context) ([]ExternalTableInfo, error) {
+	return nil, nil
+}
+func (m *mockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*PXFSourceSample, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetQueryDetail(_ context.Context, pid int32) (*QueryDetail, error) {
 	return &QueryDetail{PID: pid, State: "active", Query: "SELECT 1"}, nil
 }
@@ -429,12 +424,6 @@ func TestMockDBClient_AllMethods(t *testing.T) {
 		segments, err := client.GetSegmentConfiguration(ctx)
 		assert.NoError(t, err)
 		assert.NotNil(t, segments)
-	})
-
-	t.Run("GetClusterState", func(t *testing.T) {
-		state, err := client.GetClusterState(ctx)
-		assert.NoError(t, err)
-		assert.True(t, state.IsUp)
 	})
 
 	t.Run("SetParameter", func(t *testing.T) {

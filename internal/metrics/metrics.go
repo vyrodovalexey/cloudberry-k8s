@@ -19,7 +19,12 @@ const (
 	labelOperation = "operation"
 	labelResult    = "result"
 	labelType      = "type"
-	labelJob       = "job"
+	// labelKind distinguishes the workload-management object class
+	// (resource_group, resource_queue, rule) on
+	// cloudberry_api_workload_operations_total. Semantics differ from labelType,
+	// so it is a dedicated label.
+	labelKind = "kind"
+	labelJob  = "job"
 	// labelJobName is the non-reserved label carrying the Kubernetes Job name
 	// for backup_job_status. The reserved Prometheus label `job` is overwritten
 	// by the scrape config's job_name during scrape, so a dedicated label is
@@ -32,7 +37,37 @@ const (
 	labelRoute      = "route"
 	labelMethod     = "method"
 	labelCode       = "code"
+	// labelSegmentHost is the per-segment-primary-pod identity carried by the
+	// pxf_service_up gauge (M.1): the segment-primary pod name whose "pxf"
+	// container readiness the gauge reports.
+	labelSegmentHost = "segment_host"
 )
+
+// HONESTY: intentionally-absent PXF / gpfdist metrics.
+//
+// The following metrics from the metrics spec are DELIBERATELY NOT registered and
+// NEVER emitted because there is NO honest source for them in the shipped runtime
+// (PXF 2.1.0 / gpfdist). Synthesizing a value would violate the metrics-honesty
+// constraint, so each stays absent + documented here rather than fabricated:
+//
+//   - M.4  pxf_bytes_transferred_total   — PXF 2.1.0 exposes no per-transfer byte
+//     counter the operator can observe; no honest source.
+//   - M.5  pxf_records_total             — PXF 2.1.0 exposes no per-record counter;
+//     SUBSTITUTED by the honest data_loading_rows_total (harvested from the load
+//     Job's real DATALOAD_ROWS marker), which is registered and emitted instead.
+//   - M.7  pxf_active_connections        — PXF 2.1.0 exposes no live connection
+//     gauge the operator can observe; no honest source.
+//   - M.15 gpfdist_connections_active    — gpfdist exposes no scrapable active
+//     connection count; no honest source.
+//   - M.16 gpfdist_bytes_served_total    — gpfdist exposes no scrapable served-byte
+//     counter; no honest source.
+//
+// M.6 pxf_errors_total is likewise NOT registered as a new synthetic metric: the
+// HONEST error signals are folded into the existing data_loading_errors_total
+// (incremented on a real Job Failed terminal state) plus actuator non-2xx
+// responses surfaced under their native http_server_requests_seconds_* names from
+// the PXF Spring Boot Actuator scrape (M.2/M.3). No fabricated error_type label is
+// invented — there is no honest source to populate it.
 
 // Recorder defines the interface for recording metrics.
 type Recorder interface {
@@ -110,17 +145,88 @@ type Recorder interface {
 	RecordRestoreValidation(cluster, namespace, result string)
 	// SetDataLoadingJobsActive sets the number of active data loading jobs.
 	SetDataLoadingJobsActive(cluster, namespace string, count float64)
-	// RecordDataLoadingRows records the number of rows loaded by a job.
-	//
-	// DOCUMENTED NO-OP IN PRODUCTION (C-6): this method currently has ZERO
-	// production call sites — intentionally. The data-loading job mutation
-	// endpoints return 501 NOT_IMPLEMENTED (see internal/api
-	// msgDataLoadingNotImplemented), so there is no real row count to record
-	// and faking one would violate the metrics-honesty rule. The method (and
-	// its registered cloudberry_data_loading_rows_total family) is kept and
-	// test-covered so the wiring lands together with the data-loading Job
-	// feature (rows will come from Job status/completion records).
+	// SetPXFServersConfigured sets the number of configured external PXF servers
+	// for a cluster. The source is len(pxf.servers) from the spec — a
+	// config-derived count, NOT a live-reachability/health measure (honest).
+	SetPXFServersConfigured(cluster, namespace string, count float64)
+	// IncPXFServersChanged increments the counter of observed PXF servers
+	// ConfigMap Data changes. It is an HONEST signal — incremented ONLY when the
+	// rendered ConfigMap Data actually changed (a server added/removed/updated),
+	// never on a labels-only change, a no-op reconcile, a create, or when PXF is
+	// disabled.
+	IncPXFServersChanged(cluster, namespace string)
+	// SetPXFStatus sets the HONEST observed PXF status gauge
+	// (0=Stopped, 1=Running, 2=Error). It is derived ONLY from the real
+	// segment-primary "pxf" container readiness aggregation and MUST be set only
+	// when the status is OBSERVABLE — callers skip it when the status is absent,
+	// so the gauge never claims a state that was not observed.
+	SetPXFStatus(cluster, namespace string, value float64)
+	// SetPXFExtensionsInstalled sets the count of PXF client extensions actually
+	// present in pg_extension, observed via a live probe. It is set only when the
+	// probe was observable (extensions seen); an unobservable/empty probe is
+	// skipped so the gauge never synthesizes a zero.
+	SetPXFExtensionsInstalled(cluster, namespace string, count float64)
+	// SetPXFServiceUp sets the HONEST per-segment-host PXF availability gauge
+	// (M.1) — up=1 when that segment-primary pod's real "pxf" container is
+	// observably Ready, 0 otherwise. The value is the per-host disaggregation of
+	// the same Status.ContainerStatuses readiness behind SetPXFStatus
+	// (util.PXFReadyByHost); it is emitted only for OBSERVED pods, so killing a
+	// segment's pxf container drives that host's gauge to 0 without ever
+	// fabricating a state for an unobserved host.
+	SetPXFServiceUp(cluster, namespace, segmentHost string, up float64)
+	// RecordDataLoadingRows records the number of rows loaded by a job. The count
+	// is harvested EXCLUSIVELY from the spawned data-loading Job pod's
+	// DATALOAD_ROWS termination marker (the rowcount captured from the INSERT) —
+	// it is never synthesized. sourceType is derived from the job's server/source
+	// type (s3/hdfs/hive/jdbc/gpfdist/file). Wired from the controller's
+	// terminal-state Job handling in reconcileDataLoadingJobs.
 	RecordDataLoadingRows(cluster, namespace, job, sourceType string, count float64)
+	// RecordDataLoadingBytes records the number of bytes loaded by a job (M.10).
+	// The byte count is harvested EXCLUSIVELY from the spawned data-loading Job
+	// pod's DATALOAD_BYTES termination marker (a real staged-input measurement) —
+	// it is NEVER synthesized. The controller calls it ONLY when bytes were
+	// actually harvested (haveBytes==true); a load that could not measure bytes
+	// emits no marker and this metric stays honestly absent for that job.
+	// sourceType matches data_loading_rows_total (s3/hdfs/hive/jdbc/gpfdist/file).
+	RecordDataLoadingBytes(cluster, namespace, job, sourceType string, bytes float64)
+	// RecordGpfdistReconcile records the OUTCOME of a control-plane gpfdist
+	// resource reconcile (a real K8s create/update/delete). operation is one of
+	// the bounded set {pvc, deployment, service, delete}; result is "success" or
+	// "error". It is incremented ONLY at the real K8s write outcome (never on a
+	// no-op/skip), so a persistently-failing gpfdist provisioning is visible.
+	RecordGpfdistReconcile(cluster, namespace, operation, result string)
+	// RecordPXFExtensionSetup records the OUTCOME of a PXF client-extension setup
+	// attempt (setupPXFExtensions DB round-trip). result is one of the bounded
+	// set {installed, absent, error}: "installed" when >=1 extension was created,
+	// "absent" when the DB was reachable but zero extensions were installed
+	// (pxf unavailable in the image / DB in recovery), "error" on a hard
+	// connectivity/setup failure. It reflects the real attempt outcome only.
+	RecordPXFExtensionSetup(cluster, namespace, result string)
+	// RecordDataLoaderRoleSetup records the OUTCOME of an EnsureDataLoaderRole
+	// attempt (the dedicated data-loader login role provisioning DB round-trip).
+	// result is one of the bounded set {success, error}: "success" when the role
+	// was ensured/granted, "error" on a hard connectivity/setup failure. It
+	// reflects the real attempt outcome only.
+	RecordDataLoaderRoleSetup(cluster, namespace, result string)
+	// RecordExporterRoleSetup records the OUTCOME of a setupExporterRole attempt
+	// (the metrics-exporter DB login role provisioning DB round-trip). result is
+	// one of the bounded set {success, error}: "success" when the role was
+	// created/granted, "error" on a hard connectivity/setup failure. It reflects
+	// the real attempt outcome only.
+	RecordExporterRoleSetup(cluster, namespace, result string)
+	// SetDataLoadingJobStatus sets the data loading Job status gauge
+	// (0=idle/pending, 1=running, 2=success, 3=failed). The value is derived
+	// from the spawned Job's Kubernetes status.
+	SetDataLoadingJobStatus(cluster, namespace, job string, status float64)
+	// SetDataLoadingJobLastSuccess sets the Unix timestamp of the last successful
+	// data loading Job run (from the Job's completion time, on success only).
+	SetDataLoadingJobLastSuccess(cluster, namespace, job string, ts float64)
+	// ObserveDataLoadingJobDuration records the wall-clock duration of a terminal
+	// data loading Job run (computed from the Job's start/completion timestamps).
+	ObserveDataLoadingJobDuration(cluster, namespace, job string, d time.Duration)
+	// RecordDataLoadingErrors increments the failed-run counter for a data
+	// loading job (recorded when its Job reaches a terminal Failed state).
+	RecordDataLoadingErrors(cluster, namespace, job string)
 	// SetDiskUsagePercent sets the disk usage percentage for a cluster.
 	SetDiskUsagePercent(cluster, namespace string, percent float64)
 	// SetRecommendationsTotal sets the total recommendations by type.
@@ -203,6 +309,10 @@ type Recorder interface {
 	// RecordRollingRestart records a rolling restart operation event.
 	// result is "started", "completed", or "failed".
 	RecordRollingRestart(cluster, namespace, result string)
+	// RecordPXFRestart records an operator-driven PXF restart operation event.
+	// The restart is a segment-primary pod roll (STS template annotation bump),
+	// not an in-place sidecar restart. result is "started" or "failed".
+	RecordPXFRestart(cluster, namespace, result string)
 	// RecordRecoveryOperation records a recovery operation event.
 	// recoveryType is "incremental", "full", or "differential";
 	// result is "started", "completed", or "failed".
@@ -260,6 +370,21 @@ type Recorder interface {
 	// RecordAPIClusterOperation records a cluster CRUD operation via the API.
 	// operation is "create" or "delete"; result is "success" or "error".
 	RecordAPIClusterOperation(operation, result string)
+	// RecordAPILifecycleRequest records a cluster lifecycle/maintenance action
+	// REQUESTED via the API (request-side complement of the controller-side
+	// counters). operation is one of the bounded set {start, stop, restart,
+	// reload, activate-standby, rebalance, vacuum, analyze, reindex,
+	// config-update}; result is "accepted" or "error".
+	RecordAPILifecycleRequest(operation, result string)
+	// RecordAPIWorkloadOperation records a workload-management DDL operation
+	// performed via the API. kind is one of {resource_group, resource_queue,
+	// rule}; operation is one of {create, update, delete, assign}; result is
+	// "success" or "error".
+	RecordAPIWorkloadOperation(kind, operation, result string)
+	// RecordPXFSync records the OUTCOME of a PXF servers sync request (a separate
+	// dimension from IncPXFServersChanged, which counts only real changes).
+	// result is "success" or "error".
+	RecordPXFSync(cluster, namespace, result string)
 	// RecordLogStreamSession records a completed backup-Job log stream session.
 	// result is "success" or "error".
 	RecordLogStreamSession(result string)
@@ -328,6 +453,20 @@ type PrometheusRecorder struct {
 	restoreValidationTotal     *prometheus.CounterVec
 	dataLoadingJobsGauge       *prometheus.GaugeVec
 	dataLoadingRows            *prometheus.CounterVec
+	dataLoadingBytes           *prometheus.CounterVec
+	pxfServersConfigured       *prometheus.GaugeVec
+	pxfServersChanged          *prometheus.CounterVec
+	pxfStatus                  *prometheus.GaugeVec
+	pxfExtensionsInstalled     *prometheus.GaugeVec
+	pxfServiceUp               *prometheus.GaugeVec
+	dataLoadingJobStatus       *prometheus.GaugeVec
+	dataLoadingJobLastSuccess  *prometheus.GaugeVec
+	dataLoadingJobDuration     *prometheus.HistogramVec
+	dataLoadingErrors          *prometheus.CounterVec
+	gpfdistReconcileTotal      *prometheus.CounterVec
+	pxfExtensionSetupTotal     *prometheus.CounterVec
+	dataLoaderRoleSetupTotal   *prometheus.CounterVec
+	exporterRoleSetupTotal     *prometheus.CounterVec
 
 	diskUsagePercent      *prometheus.GaugeVec
 	recommendationsTotal  *prometheus.GaugeVec
@@ -369,6 +508,7 @@ type PrometheusRecorder struct {
 	webhookAdmissionTotal   *prometheus.CounterVec
 	upgradeOperationsTotal  *prometheus.CounterVec
 	rollingRestartTotal     *prometheus.CounterVec
+	pxfRestartTotal         *prometheus.CounterVec
 	recoveryOperationsTotal *prometheus.CounterVec
 
 	apiRequestsTotal        *prometheus.CounterVec
@@ -391,12 +531,15 @@ type PrometheusRecorder struct {
 	backupOnDeleteTotal    *prometheus.CounterVec
 	scalePhaseDuration     *prometheus.HistogramVec
 
-	migrateOperationsTotal    *prometheus.CounterVec
-	apiClusterOperationsTotal *prometheus.CounterVec
-	logStreamSessionsTotal    *prometheus.CounterVec
-	logStreamBytesTotal       prometheus.Counter
-	oidcDiscoveryTotal        *prometheus.CounterVec
-	authTokenVerifyDuration   prometheus.Histogram
+	migrateOperationsTotal     *prometheus.CounterVec
+	apiClusterOperationsTotal  *prometheus.CounterVec
+	apiLifecycleRequestsTotal  *prometheus.CounterVec
+	apiWorkloadOperationsTotal *prometheus.CounterVec
+	pxfSyncTotal               *prometheus.CounterVec
+	logStreamSessionsTotal     *prometheus.CounterVec
+	logStreamBytesTotal        prometheus.Counter
+	oidcDiscoveryTotal         *prometheus.CounterVec
+	authTokenVerifyDuration    prometheus.Histogram
 }
 
 // initCoreMetrics initializes core reconciliation and cluster metrics.
@@ -636,6 +779,139 @@ func (r *PrometheusRecorder) initBackupMetrics() {
 		Name:      "data_loading_rows_total",
 		Help:      "Total number of rows loaded by data loading jobs.",
 	}, []string{labelCluster, labelNamespace, labelJob, labelSourceType})
+	// The following four families are HONEST, Job-status-derived data-loading
+	// metrics: their values come exclusively from the spawned data-loading Job's
+	// Kubernetes status and the DATALOAD_ROWS termination marker (never
+	// synthesized). No pxf_* runtime/health metric is registered — those require
+	// live PXF probing and remain Planned (metrics-honesty constraint).
+	r.dataLoadingJobStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_job_status",
+		Help:      "Data loading Job status (0=idle/pending, 1=running, 2=success, 3=failed).",
+	}, []string{labelCluster, labelNamespace, labelJob})
+	r.dataLoadingJobLastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_job_last_success_timestamp",
+		Help:      "Unix timestamp of the last successful data loading Job run.",
+	}, []string{labelCluster, labelNamespace, labelJob})
+	r.dataLoadingJobDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_job_duration_seconds",
+		Help:      "Duration of data loading Job runs in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+	}, []string{labelCluster, labelNamespace, labelJob})
+	r.dataLoadingErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_errors_total",
+		Help:      "Total number of failed data loading Job runs.",
+	}, []string{labelCluster, labelNamespace, labelJob})
+	// pxfServersConfigured is an HONEST, CONFIG-DERIVED gauge: its value is
+	// len(pxf.servers) from the spec, set during reconcile. It reports how many
+	// external PXF servers are DECLARED, NOT how many are live/reachable. No
+	// runtime/health PXF metric (e.g. service_up) is registered — those require
+	// live probing and remain Planned (metrics-honesty constraint).
+	r.pxfServersConfigured = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_servers_configured",
+		Help:      "Number of external PXF servers configured in the spec (len(pxf.servers)).",
+	}, []string{labelCluster, labelNamespace})
+	// pxfServersChanged is an HONEST, OBSERVED counter: it increments ONLY when
+	// the rendered "<cluster>-pxf-servers" ConfigMap Data actually changed (a
+	// server was added/removed/updated). It never increments on a labels-only
+	// change, a no-op reconcile, a create, or when PXF is disabled — so the
+	// series counts only real server-config diffs that were applied.
+	r.pxfServersChanged = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_servers_changed_total",
+		Help:      "Total number of applied PXF servers ConfigMap Data changes (server added/removed/updated).",
+	}, []string{labelCluster, labelNamespace})
+	// pxfStatus is an HONEST, OBSERVED gauge: 0=Stopped, 1=Running, 2=Error,
+	// derived ONLY from the real segment-primary "pxf" container readiness
+	// aggregation. It is set only when the status is OBSERVABLE — the controller
+	// skips it for the absent/unobservable case, so the series never claims a
+	// state that was not observed.
+	r.pxfStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_status",
+		Help:      "Observed PXF status (0=Stopped, 1=Running, 2=Error) from pxf readiness; observable only.",
+	}, []string{labelCluster, labelNamespace})
+	// pxfExtensionsInstalled is an HONEST, OBSERVED gauge: the number of PXF
+	// client extensions actually present in pg_extension, from a live probe. It
+	// is set only when the probe observed extensions, so it never synthesizes a
+	// zero for an unreachable DB.
+	r.pxfExtensionsInstalled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_extensions_installed",
+		Help:      "Number of PXF client extensions observed in pg_extension (live probe); set only when observed.",
+	}, []string{labelCluster, labelNamespace})
+	// pxfServiceUp (M.1) is an HONEST, OBSERVED per-segment-host gauge: 1 when the
+	// segment-primary pod's "pxf" container is observably Ready, 0 otherwise. It
+	// is the per-host disaggregation of pxfStatus (util.PXFReadyByHost) and is set
+	// only for pods actually observed during reconcile, so it never claims a state
+	// for an unobserved host.
+	r.pxfServiceUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_service_up",
+		Help: "Per-segment-host PXF availability (1=pxf container Ready, 0=not) " +
+			"from real pod readiness; observed hosts only.",
+	}, []string{labelCluster, labelNamespace, labelSegmentHost})
+	// dataLoadingBytes (M.10) is an HONEST counter: its value is harvested
+	// EXCLUSIVELY from the load Job's real DATALOAD_BYTES termination marker (a
+	// staged-input byte measurement, e.g. wc -c), emitted by the builder ONLY when
+	// a real byte count is truthfully available. When a load path cannot compute a
+	// real byte count the marker is absent and this series stays absent for that
+	// job — a byte count is NEVER synthesized.
+	r.dataLoadingBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "data_loading_bytes_total",
+		Help: "Total bytes loaded by data loading jobs " +
+			"(from the real DATALOAD_BYTES marker; absent when unmeasured).",
+	}, []string{labelCluster, labelNamespace, labelJob, labelSourceType})
+	// gpfdistReconcileTotal is an HONEST control-plane counter: it increments
+	// ONLY on the real K8s create/update/delete outcome of a gpfdist resource
+	// (PVC/Deployment/Service or the disable-path delete), success or error —
+	// never on a no-op/skip. operation/result are bounded enums, so cardinality
+	// stays low. NEW family (needs Grafana panel).
+	r.gpfdistReconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "gpfdist_reconcile_total",
+		Help: "Total gpfdist control-plane resource reconcile outcomes " +
+			"(operation=pvc/deployment/service/delete, result=success/error).",
+	}, []string{labelCluster, labelNamespace, labelOperation, labelResult})
+	// pxfExtensionSetupTotal is an HONEST control-plane counter: it increments
+	// ONLY on the real outcome of a PXF client-extension setup attempt —
+	// "installed" when >=1 extension was CREATE EXTENSIONed, "absent" when the DB
+	// was reachable but zero were installed (pxf absent in the image / DB in
+	// recovery), "error" on a hard failure. result is a bounded enum, so
+	// cardinality stays low. NEW family (needs Grafana panel).
+	r.pxfExtensionSetupTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_extension_setup_total",
+		Help: "Total PXF client-extension setup attempt outcomes " +
+			"(result=installed/absent/error).",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	// dataLoaderRoleSetupTotal is an HONEST control-plane counter: it increments
+	// ONLY on the real outcome of an EnsureDataLoaderRole attempt — "success"
+	// when the dedicated data-loader login role was ensured/granted, "error" on
+	// a hard failure. result is a bounded enum, so cardinality stays low. NEW
+	// family (needs Grafana panel).
+	r.dataLoaderRoleSetupTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "dataloader_role_setup_total",
+		Help: "Total data-loader role setup attempt outcomes " +
+			"(result=success/error).",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	// exporterRoleSetupTotal is an HONEST control-plane counter: it increments
+	// ONLY on the real outcome of a setupExporterRole attempt — "success" when
+	// the metrics-exporter DB login role was created/granted, "error" on a hard
+	// failure. result is a bounded enum, so cardinality stays low. NEW family
+	// (needs Grafana panel).
+	r.exporterRoleSetupTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "exporter_role_setup_total",
+		Help: "Total metrics-exporter role setup attempt outcomes " +
+			"(result=success/error).",
+	}, []string{labelCluster, labelNamespace, labelResult})
 }
 
 // initStorageMetrics initializes storage management and recommendation metrics.
@@ -839,6 +1115,11 @@ func (r *PrometheusRecorder) initLifecycleMetrics() {
 		Name:      "rolling_restart_total",
 		Help:      "Total number of rolling restart operations.",
 	}, []string{labelCluster, labelNamespace, labelResult})
+	r.pxfRestartTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_restart_total",
+		Help:      "Total number of operator-driven PXF restart operations.",
+	}, []string{labelCluster, labelNamespace, labelResult})
 	r.recoveryOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "recovery_operations_total",
@@ -951,6 +1232,21 @@ func (r *PrometheusRecorder) initAPIBusinessMetrics() {
 		Name:      "api_cluster_operations_total",
 		Help:      "Total number of cluster create/delete operations via the API.",
 	}, []string{labelOperation, labelResult})
+	r.apiLifecycleRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_cluster_lifecycle_requests_total",
+		Help:      "Total number of cluster lifecycle/maintenance actions requested via the API.",
+	}, []string{labelOperation, labelResult})
+	r.apiWorkloadOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "api_workload_operations_total",
+		Help:      "Total number of workload-management DDL operations via the API.",
+	}, []string{labelKind, labelOperation, labelResult})
+	r.pxfSyncTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "pxf_sync_total",
+		Help:      "Total number of PXF servers sync requests by outcome.",
+	}, []string{labelCluster, labelNamespace, labelResult})
 	r.logStreamSessionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "log_stream_sessions_total",
@@ -1015,7 +1311,14 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.backupLastSuccessTimestamp, r.backupLastStatus, r.restoreDuration,
 		r.backupRetentionDeleted, r.backupJobStatus,
 		r.restoreTotal, r.restoreValidationTotal,
-		r.dataLoadingJobsGauge, r.dataLoadingRows,
+		r.dataLoadingJobsGauge, r.dataLoadingRows, r.dataLoadingBytes,
+		r.pxfServersConfigured,
+		r.pxfServersChanged,
+		r.pxfStatus, r.pxfExtensionsInstalled, r.pxfServiceUp,
+		r.dataLoadingJobStatus, r.dataLoadingJobLastSuccess,
+		r.dataLoadingJobDuration, r.dataLoadingErrors,
+		r.gpfdistReconcileTotal, r.pxfExtensionSetupTotal,
+		r.dataLoaderRoleSetupTotal, r.exporterRoleSetupTotal,
 		r.diskUsagePercent, r.recommendationsTotal,
 		r.recommendationScanDur, r.tableBloatRatio,
 		r.scaleOperationsTotal, r.redistributionProgressVec,
@@ -1033,7 +1336,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.certRotationTotal, r.certExpirySeconds, r.clusterCertIssuance,
 		r.vaultOperationsTotal, r.vaultOperationDuration,
 		r.webhookAdmissionTotal,
-		r.upgradeOperationsTotal, r.rollingRestartTotal,
+		r.upgradeOperationsTotal, r.rollingRestartTotal, r.pxfRestartTotal,
 		r.recoveryOperationsTotal,
 		r.apiRequestsTotal, r.apiRequestDuration,
 		r.apiRequestsInFlight, r.rateLimitRejectionTotal,
@@ -1043,6 +1346,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.sessionTerminationsTotal,
 		r.storageExpansionsTotal, r.backupOnDeleteTotal, r.scalePhaseDuration,
 		r.migrateOperationsTotal, r.apiClusterOperationsTotal,
+		r.apiLifecycleRequestsTotal, r.apiWorkloadOperationsTotal, r.pxfSyncTotal,
 		r.logStreamSessionsTotal, r.logStreamBytesTotal,
 		r.oidcDiscoveryTotal, r.authTokenVerifyDuration,
 	}
@@ -1242,12 +1546,102 @@ func (r *PrometheusRecorder) SetDataLoadingJobsActive(cluster, namespace string,
 	r.dataLoadingJobsGauge.WithLabelValues(cluster, namespace).Set(count)
 }
 
-// RecordDataLoadingRows records the number of rows loaded by a job.
+// SetPXFServersConfigured sets the number of configured external PXF servers
+// (source = len(pxf.servers), config-derived).
+func (r *PrometheusRecorder) SetPXFServersConfigured(cluster, namespace string, count float64) {
+	r.pxfServersConfigured.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// IncPXFServersChanged increments the applied PXF servers ConfigMap Data change
+// counter. Callers increment it only when the Data actually changed.
+func (r *PrometheusRecorder) IncPXFServersChanged(cluster, namespace string) {
+	r.pxfServersChanged.WithLabelValues(cluster, namespace).Inc()
+}
+
+// SetPXFStatus sets the observed PXF status gauge (0=Stopped, 1=Running,
+// 2=Error). Callers set it only when the status is observable.
+func (r *PrometheusRecorder) SetPXFStatus(cluster, namespace string, value float64) {
+	r.pxfStatus.WithLabelValues(cluster, namespace).Set(value)
+}
+
+// SetPXFExtensionsInstalled sets the observed PXF extensions-installed count.
+// Callers set it only when the live probe observed extensions.
+func (r *PrometheusRecorder) SetPXFExtensionsInstalled(cluster, namespace string, count float64) {
+	r.pxfExtensionsInstalled.WithLabelValues(cluster, namespace).Set(count)
+}
+
+// SetPXFServiceUp sets the per-segment-host PXF availability gauge (M.1). Callers
+// set it only for OBSERVED segment-primary pods (real pxf container readiness).
+func (r *PrometheusRecorder) SetPXFServiceUp(cluster, namespace, segmentHost string, up float64) {
+	r.pxfServiceUp.WithLabelValues(cluster, namespace, segmentHost).Set(up)
+}
+
+// RecordDataLoadingRows records the number of rows loaded by a job (sourced from
+// the Job's DATALOAD_ROWS termination marker).
 func (r *PrometheusRecorder) RecordDataLoadingRows(
 	cluster, namespace, job, sourceType string,
 	count float64,
 ) {
 	r.dataLoadingRows.WithLabelValues(cluster, namespace, job, sourceType).Add(count)
+}
+
+// RecordDataLoadingBytes records the number of bytes loaded by a job (M.10),
+// sourced from the Job's DATALOAD_BYTES termination marker. Callers invoke it
+// only when a real byte count was harvested (never synthesized).
+func (r *PrometheusRecorder) RecordDataLoadingBytes(
+	cluster, namespace, job, sourceType string,
+	bytes float64,
+) {
+	r.dataLoadingBytes.WithLabelValues(cluster, namespace, job, sourceType).Add(bytes)
+}
+
+// RecordGpfdistReconcile records a gpfdist control-plane resource reconcile
+// outcome (real K8s create/update/delete). operation ∈ {pvc,deployment,service,
+// delete}; result ∈ {success,error}.
+func (r *PrometheusRecorder) RecordGpfdistReconcile(cluster, namespace, operation, result string) {
+	r.gpfdistReconcileTotal.WithLabelValues(cluster, namespace, operation, result).Inc()
+}
+
+// RecordPXFExtensionSetup records a PXF client-extension setup attempt outcome.
+// result ∈ {installed,absent,error}.
+func (r *PrometheusRecorder) RecordPXFExtensionSetup(cluster, namespace, result string) {
+	r.pxfExtensionSetupTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordDataLoaderRoleSetup records a data-loader role setup attempt outcome.
+func (r *PrometheusRecorder) RecordDataLoaderRoleSetup(cluster, namespace, result string) {
+	r.dataLoaderRoleSetupTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordExporterRoleSetup records a metrics-exporter role setup attempt outcome.
+func (r *PrometheusRecorder) RecordExporterRoleSetup(cluster, namespace, result string) {
+	r.exporterRoleSetupTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// SetDataLoadingJobStatus sets the data loading Job status gauge
+// (0=idle/pending, 1=running, 2=success, 3=failed).
+func (r *PrometheusRecorder) SetDataLoadingJobStatus(cluster, namespace, job string, status float64) {
+	r.dataLoadingJobStatus.WithLabelValues(cluster, namespace, job).Set(status)
+}
+
+// SetDataLoadingJobLastSuccess sets the Unix timestamp of the last successful
+// data loading Job run.
+func (r *PrometheusRecorder) SetDataLoadingJobLastSuccess(cluster, namespace, job string, ts float64) {
+	r.dataLoadingJobLastSuccess.WithLabelValues(cluster, namespace, job).Set(ts)
+}
+
+// ObserveDataLoadingJobDuration records the duration of a terminal data loading
+// Job run.
+func (r *PrometheusRecorder) ObserveDataLoadingJobDuration(
+	cluster, namespace, job string,
+	d time.Duration,
+) {
+	r.dataLoadingJobDuration.WithLabelValues(cluster, namespace, job).Observe(d.Seconds())
+}
+
+// RecordDataLoadingErrors increments the failed-run counter for a data loading job.
+func (r *PrometheusRecorder) RecordDataLoadingErrors(cluster, namespace, job string) {
+	r.dataLoadingErrors.WithLabelValues(cluster, namespace, job).Inc()
 }
 
 // SetDiskUsagePercent sets the disk usage percentage for a cluster.
@@ -1437,6 +1831,11 @@ func (r *PrometheusRecorder) RecordRollingRestart(cluster, namespace, result str
 	r.rollingRestartTotal.WithLabelValues(cluster, namespace, result).Inc()
 }
 
+// RecordPXFRestart records an operator-driven PXF restart operation event.
+func (r *PrometheusRecorder) RecordPXFRestart(cluster, namespace, result string) {
+	r.pxfRestartTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
 // RecordRecoveryOperation records a recovery operation event.
 func (r *PrometheusRecorder) RecordRecoveryOperation(cluster, namespace, recoveryType, result string) {
 	r.recoveryOperationsTotal.WithLabelValues(cluster, namespace, recoveryType, result).Inc()
@@ -1521,6 +1920,22 @@ func (r *PrometheusRecorder) RecordMigrateOperation(result string) {
 // RecordAPIClusterOperation records a cluster CRUD operation via the API.
 func (r *PrometheusRecorder) RecordAPIClusterOperation(operation, result string) {
 	r.apiClusterOperationsTotal.WithLabelValues(operation, result).Inc()
+}
+
+// RecordAPILifecycleRequest records a cluster lifecycle/maintenance action
+// requested via the API.
+func (r *PrometheusRecorder) RecordAPILifecycleRequest(operation, result string) {
+	r.apiLifecycleRequestsTotal.WithLabelValues(operation, result).Inc()
+}
+
+// RecordAPIWorkloadOperation records a workload-management DDL operation via the API.
+func (r *PrometheusRecorder) RecordAPIWorkloadOperation(kind, operation, result string) {
+	r.apiWorkloadOperationsTotal.WithLabelValues(kind, operation, result).Inc()
+}
+
+// RecordPXFSync records the outcome of a PXF servers sync request.
+func (r *PrometheusRecorder) RecordPXFSync(cluster, namespace, result string) {
+	r.pxfSyncTotal.WithLabelValues(cluster, namespace, result).Inc()
 }
 
 // RecordLogStreamSession records a completed backup-Job log stream session.
@@ -1669,8 +2084,50 @@ func (n *NoopRecorder) RecordRestoreValidation(_, _, _ string) {}
 // SetDataLoadingJobsActive is a no-op implementation for testing.
 func (n *NoopRecorder) SetDataLoadingJobsActive(_, _ string, _ float64) {}
 
+// SetPXFServersConfigured is a no-op implementation for testing.
+func (n *NoopRecorder) SetPXFServersConfigured(_, _ string, _ float64) {}
+
+// IncPXFServersChanged is a no-op implementation for testing.
+func (n *NoopRecorder) IncPXFServersChanged(_, _ string) {}
+
+// SetPXFStatus is a no-op implementation for testing.
+func (n *NoopRecorder) SetPXFStatus(_, _ string, _ float64) {}
+
+// SetPXFExtensionsInstalled is a no-op implementation for testing.
+func (n *NoopRecorder) SetPXFExtensionsInstalled(_, _ string, _ float64) {}
+
+// SetPXFServiceUp is a no-op implementation for testing.
+func (n *NoopRecorder) SetPXFServiceUp(_, _, _ string, _ float64) {}
+
 // RecordDataLoadingRows is a no-op implementation for testing.
 func (n *NoopRecorder) RecordDataLoadingRows(_, _, _, _ string, _ float64) {}
+
+// RecordDataLoadingBytes is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDataLoadingBytes(_, _, _, _ string, _ float64) {}
+
+// RecordGpfdistReconcile is a no-op implementation for testing.
+func (n *NoopRecorder) RecordGpfdistReconcile(_, _, _, _ string) {}
+
+// RecordPXFExtensionSetup is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPXFExtensionSetup(_, _, _ string) {}
+
+// RecordDataLoaderRoleSetup is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDataLoaderRoleSetup(_, _, _ string) {}
+
+// RecordExporterRoleSetup is a no-op implementation for testing.
+func (n *NoopRecorder) RecordExporterRoleSetup(_, _, _ string) {}
+
+// SetDataLoadingJobStatus is a no-op implementation for testing.
+func (n *NoopRecorder) SetDataLoadingJobStatus(_, _, _ string, _ float64) {}
+
+// SetDataLoadingJobLastSuccess is a no-op implementation for testing.
+func (n *NoopRecorder) SetDataLoadingJobLastSuccess(_, _, _ string, _ float64) {}
+
+// ObserveDataLoadingJobDuration is a no-op implementation for testing.
+func (n *NoopRecorder) ObserveDataLoadingJobDuration(_, _, _ string, _ time.Duration) {}
+
+// RecordDataLoadingErrors is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDataLoadingErrors(_, _, _ string) {}
 
 // SetDiskUsagePercent is a no-op implementation for testing.
 func (n *NoopRecorder) SetDiskUsagePercent(_, _ string, _ float64) {}
@@ -1777,6 +2234,9 @@ func (n *NoopRecorder) RecordUpgradeOperation(_, _, _ string) {}
 // RecordRollingRestart is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRollingRestart(_, _, _ string) {}
 
+// RecordPXFRestart is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPXFRestart(_, _, _ string) {}
+
 // RecordRecoveryOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRecoveryOperation(_, _, _, _ string) {}
 
@@ -1830,6 +2290,15 @@ func (n *NoopRecorder) RecordMigrateOperation(_ string) {}
 
 // RecordAPIClusterOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordAPIClusterOperation(_, _ string) {}
+
+// RecordAPILifecycleRequest is a no-op implementation for testing.
+func (n *NoopRecorder) RecordAPILifecycleRequest(_, _ string) {}
+
+// RecordAPIWorkloadOperation is a no-op implementation for testing.
+func (n *NoopRecorder) RecordAPIWorkloadOperation(_, _, _ string) {}
+
+// RecordPXFSync is a no-op implementation for testing.
+func (n *NoopRecorder) RecordPXFSync(_, _, _ string) {}
 
 // RecordLogStreamSession is a no-op implementation for testing.
 func (n *NoopRecorder) RecordLogStreamSession(_ string) {}

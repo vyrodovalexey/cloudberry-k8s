@@ -1,0 +1,243 @@
+# =============================================================================
+# Scenario 97 — Hadoop Profiles Test: HDFS / Hive / HBase + HA + Vault PKI
+# =============================================================================
+# NUMBERING NOTE: this is Scenario 97 (Hadoop Profiles), NOT 96 (Object Store
+# Profiles, already shipped). It follows the 93→94→95→96 precedent.
+#
+# Full Hadoop-profile cluster (modeled on scenario93-acceptance-test.yaml) with:
+#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - HA coordinator with standby
+#   - 2 segments with mirroring (group layout)
+#   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth
+#   - Query monitoring: postgres-exporter on segments+mirrors
+#     + cloudberry-query-exporter
+#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - deletionPolicy Retain
+#   - dataLoading.pxf servers:
+#       * hadoop-cluster (hdfs) carrying fs.defaultFS + hive.metastore.uris
+#         + hbase.zookeeper.quorum (the combined Hadoop server)
+#       * hive-warehouse (hive type)   — dedicated Hive server
+#       * hbase-store   (hbase type)   — dedicated HBase server
+#   - dataLoading.jobs:
+#       * read: hdfs:text, hdfs:json, hive (auto-detect), HBase  [live-readable]
+#       * writable FF.7: hdfs:sequencefile (mode: writable)
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: hadoop-test
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    scenario: "97"
+spec:
+  version: "2.1.0"
+  image: "cloudberry-official-pxf:2.1.0"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    storage:
+      size: "2Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      enabled: true
+      certSecret:
+        name: hadoop-test-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "http://host.docker.internal:8090/realms/test"
+      clientID: "cloudberry-operator"
+      clientSecret:
+        secretRef:
+          name: oidc-client-secret
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://host.docker.internal:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "cloudberry-query-exporter:1.0.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "cloudberry-pxf:2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        # Combined Hadoop server: HDFS + Hive metastore + HBase ZK quorum.
+        - name: hadoop-cluster
+          type: hdfs
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            dfs.replication: "1"
+          hive:
+            hive.metastore.uris: "thrift://hive-metastore:9083"
+          hbase:
+            hbase.zookeeper.quorum: "hbase:2181"
+        # Dedicated Hive server (hive type).
+        - name: hive-warehouse
+          type: hive
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            hive.metastore.uris: "thrift://hive-metastore:9083"
+        # Dedicated HBase server (hbase type).
+        - name: hbase-store
+          type: hbase
+          config:
+            fs.defaultFS: "hdfs://namenode:8020"
+            hbase.zookeeper.quorum: "hbase:2181"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+    jobs:
+      # --- READ jobs (live-readable on hadoop-cluster) ---
+      - name: hdfs-text-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hdfs:text"
+          resource: "/data-lake/events/data.csv"
+          targetTable: "public.s97_hp_1"
+      - name: hdfs-json-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hdfs:json"
+          resource: "/data-lake/events/data.json"
+          targetTable: "public.s97_hp_4"
+      - name: hive-autodetect-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hive"
+          resource: "warehouse.fact_sales"
+          targetTable: "public.s97_hv_1"
+      - name: hbase-load
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "HBase"
+          resource: "pxf_hbase_test"
+          targetTable: "public.s97_hb_1"
+      # --- WRITE job (FF.7: hdfs:sequencefile writable export) ---
+      - name: hdfs-sequencefile-export
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: hadoop-cluster
+          profile: "hdfs:sequencefile"
+          mode: writable
+          resource: "/data-lake/exports/seq"
+          targetTable: "public.ff7_export_src"
+
+  deletionPolicy: Retain

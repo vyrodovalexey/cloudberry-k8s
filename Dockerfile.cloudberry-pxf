@@ -1,0 +1,236 @@
+# =============================================================================
+# Dockerfile.cloudberry-pxf — Apache Cloudberry PXF 2.1.0 Sidecar Image
+# =============================================================================
+# Builds a Kubernetes-ready PXF (Platform Extension Framework) sidecar image
+# from the official apache/cloudberry-pxf source. The image runs the PXF Java
+# server (REST on :5888) alongside Cloudberry segment pods.
+#
+# Multi-stage build:
+#   1. BUILDER  — compiles PXF (extensions, CLI, server) against the official
+#                 Cloudberry RPM (provides pg_config + cloudberry-env.sh).
+#   2. RUNTIME  — lightweight sidecar with JRE + PXF server + CLI.
+#
+# The builder also stages the C extension artifacts (.so, .control, .sql) into
+# /pxf-extensions so a derived DB image can COPY them into $GPHOME.
+#
+# Architecture note: linux/amd64 only (matches the Cloudberry RPM).
+#
+# Build:
+#   docker build --platform linux/amd64 -f Dockerfile.cloudberry-pxf \
+#       -t cloudberry-pxf:2.1.0 .
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Build arguments
+# ---------------------------------------------------------------------------
+ARG PXF_VERSION=2.1.0-incubating
+ARG GO_VERSION=1.26.4
+ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
+
+# =============================================================================
+# Stage 1: BUILDER — compile PXF from source
+# =============================================================================
+FROM --platform=linux/amd64 rockylinux/rockylinux:9 AS builder
+
+ARG PXF_VERSION
+ARG GO_VERSION
+ARG CB_RPM_URL
+
+# ---- Install build dependencies --------------------------------------------
+# The Cloudberry RPM provides pg_config + cloudberry-env.sh needed by the C
+# extensions (external-table, fdw). JDK 11 + maven for the Java server.
+# Go for the CLI. gcc/make/unzip/git/which/curl for the build system.
+RUN dnf -y --allowerasing install \
+        apr bash bzip2 ca-certificates curl \
+        gcc gcc-c++ git glibc-langpack-en hostname iproute \
+        java-11-openjdk-devel \
+        keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
+        libcurl-devel openssl-devel \
+        lz4 make maven ncurses net-tools openldap openssh-clients openssh-server openssl \
+        pam perl procps-ng python3 readline rsync shadow-utils sqlite sqlite-libs \
+        sudo unzip which zlib zlib-devel \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# ---- Install Cloudberry RPM (provides pg_config, cloudberry-env.sh) ---------
+RUN dnf -y install "${CB_RPM_URL}" \
+    && dnf clean all && rm -rf /var/cache/dnf \
+    && test -d /usr/local/cloudberry-db \
+    && test -x /usr/local/cloudberry-db/bin/pg_config
+
+ENV GPHOME=/usr/local/cloudberry-db
+
+# ---- Install Go toolchain ---------------------------------------------------
+RUN curl -fSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm -f /tmp/go.tar.gz
+
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/root/go
+ENV PATH="${GOROOT}/bin:${GOPATH}/bin:${GPHOME}/bin:${PATH}"
+
+# ---- Set JAVA_HOME -----------------------------------------------------------
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+
+# ---- Download PXF source -----------------------------------------------------
+WORKDIR /build/pxf
+RUN curl -fSL "https://github.com/apache/cloudberry-pxf/archive/refs/tags/${PXF_VERSION}.tar.gz" \
+        -o /tmp/pxf-src.tar.gz \
+    && tar -xzf /tmp/pxf-src.tar.gz -C /build/pxf --strip-components=1 \
+    && rm -f /tmp/pxf-src.tar.gz
+
+# ---- Build PXF ---------------------------------------------------------------
+# Source the Cloudberry environment so pg_config is on PATH, then build all
+# modules: external-table (C ext), fdw (C ext), cli (Go), server (Java/Gradle).
+ENV PXF_HOME=/usr/local/cloudberry-pxf
+ENV PXF_BASE=/tmp/pxf-base
+
+# Build extensions + CLI (these work fine with default locale).
+# For the server, use stage-notest to skip tests that have UTF-8 encoding
+# issues in the pxf-json module when LANG is not set to UTF-8 in the build env.
+RUN bash -c '\
+    set -euo pipefail; \
+    export LANG=en_US.UTF-8; \
+    if [ -f "${GPHOME}/cloudberry-env.sh" ]; then \
+        source "${GPHOME}/cloudberry-env.sh"; \
+    elif [ -f "${GPHOME}/greenplum_path.sh" ]; then \
+        source "${GPHOME}/greenplum_path.sh"; \
+    fi; \
+    echo "pg_config: $(which pg_config)"; \
+    echo "pg_config --pgxs: $(pg_config --pgxs)"; \
+    echo "JAVA_HOME=${JAVA_HOME}"; \
+    echo "Go version: $(go version)"; \
+    echo "Building PXF extensions (external-table + fdw)..."; \
+    make extensions; \
+    echo "Building PXF CLI..."; \
+    make cli; \
+    echo "Building PXF server (stage-notest to skip locale-sensitive tests)..."; \
+    make -C server stage-notest; \
+    echo "===> PXF build complete <==="; \
+'
+
+# ---- Install PXF into PXF_HOME + GPHOME extensions --------------------------
+# Install each module individually to avoid re-running server tests.
+# The server's install-server target uses stage-notest internally.
+RUN bash -c '\
+    set -euo pipefail; \
+    export LANG=en_US.UTF-8; \
+    if [ -f "${GPHOME}/cloudberry-env.sh" ]; then \
+        source "${GPHOME}/cloudberry-env.sh"; \
+    elif [ -f "${GPHOME}/greenplum_path.sh" ]; then \
+        source "${GPHOME}/greenplum_path.sh"; \
+    fi; \
+    mkdir -p "${PXF_HOME}"; \
+    echo "Installing external-table extension..."; \
+    make -C external-table install; \
+    echo "Installing fdw extension..."; \
+    make -C fdw install; \
+    echo "Installing CLI..."; \
+    make -C cli install; \
+    echo "Installing server..."; \
+    make -C server install-server; \
+    echo "===> PXF install complete <==="; \
+    echo "PXF_HOME contents:"; \
+    ls -la "${PXF_HOME}/" || true; \
+    ls -la "${PXF_HOME}/bin/" || true; \
+'
+
+# ---- Stage extension files for the DB image (DELIVERABLE 2) -----------------
+# The `make install` puts the C extension artifacts into $GPHOME's lib/extension
+# dirs. We copy them to a known staging directory so a derived DB image can
+# COPY --from=builder /pxf-extensions/...
+RUN mkdir -p /pxf-extensions/lib/postgresql /pxf-extensions/share/postgresql/extension \
+    && bash -c '\
+    set -euo pipefail; \
+    PKGLIBDIR=$(${GPHOME}/bin/pg_config --pkglibdir); \
+    SHAREDIR=$(${GPHOME}/bin/pg_config --sharedir); \
+    echo "PKGLIBDIR=${PKGLIBDIR}"; \
+    echo "SHAREDIR=${SHAREDIR}"; \
+    # Copy pxf (external-table) extension artifacts \
+    if [ -f "${PKGLIBDIR}/pxf.so" ]; then \
+        cp -v "${PKGLIBDIR}/pxf.so" /pxf-extensions/lib/postgresql/; \
+    fi; \
+    if [ -f "${SHAREDIR}/extension/pxf.control" ]; then \
+        cp -v "${SHAREDIR}/extension/pxf.control" /pxf-extensions/share/postgresql/extension/; \
+    fi; \
+    for f in "${SHAREDIR}"/extension/pxf--*.sql; do \
+        [ -e "$f" ] && cp -v "$f" /pxf-extensions/share/postgresql/extension/; \
+    done; \
+    # Copy pxf_fdw extension artifacts \
+    if [ -f "${PKGLIBDIR}/pxf_fdw.so" ]; then \
+        cp -v "${PKGLIBDIR}/pxf_fdw.so" /pxf-extensions/lib/postgresql/; \
+    fi; \
+    if [ -f "${SHAREDIR}/extension/pxf_fdw.control" ]; then \
+        cp -v "${SHAREDIR}/extension/pxf_fdw.control" /pxf-extensions/share/postgresql/extension/; \
+    fi; \
+    for f in "${SHAREDIR}"/extension/pxf_fdw--*.sql; do \
+        [ -e "$f" ] && cp -v "$f" /pxf-extensions/share/postgresql/extension/; \
+    done; \
+    echo "===> PXF extension staging complete <==="; \
+    ls -la /pxf-extensions/lib/postgresql/ || true; \
+    ls -la /pxf-extensions/share/postgresql/extension/ || true; \
+'
+
+# =============================================================================
+# Stage 2: RUNTIME — lightweight PXF sidecar
+# =============================================================================
+FROM --platform=linux/amd64 rockylinux/rockylinux:9
+
+ARG PXF_VERSION
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-pxf" \
+      org.opencontainers.image.description="Apache Cloudberry PXF ${PXF_VERSION} sidecar for Kubernetes" \
+      org.opencontainers.image.version="${PXF_VERSION}" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/apache/cloudberry-pxf" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="rockylinux/rockylinux:9"
+
+# ---- Runtime dependencies ----------------------------------------------------
+# JRE for the PXF Java server; curl for health checks; bash for entrypoint.
+# --allowerasing: RockyLinux 9 minimal ships curl-minimal which conflicts with
+# the full curl package; allow dnf to replace it.
+RUN dnf -y --allowerasing install \
+        bash ca-certificates curl gettext hostname java-11-openjdk-headless \
+        procps-ng shadow-utils which \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# ---- Create gpadmin user (UID 1000, matching the DB image) -------------------
+RUN groupadd -g 1000 gpadmin \
+    && useradd -u 1000 -g 1000 -m -s /bin/bash gpadmin
+
+# ---- Copy PXF_HOME from builder (server JARs + CLI + configs) ----------------
+COPY --from=builder /usr/local/cloudberry-pxf /usr/local/cloudberry-pxf
+
+# ---- Copy PXF extension artifacts for DELIVERABLE 2 (DB image derivation) ---
+# These are the C extension files (.so, .control, .sql) that a derived DB image
+# can COPY --from=cloudberry-pxf:2.1.0 /pxf-extensions/... into $GPHOME.
+COPY --from=builder /pxf-extensions /pxf-extensions
+
+# ---- Environment variables ---------------------------------------------------
+ENV PXF_HOME=/usr/local/cloudberry-pxf \
+    PXF_BASE=/pxf-base \
+    JAVA_HOME=/usr/lib/jvm/jre-11-openjdk \
+    LANG=en_US.UTF-8
+
+ENV PATH="${PXF_HOME}/bin:${JAVA_HOME}/bin:${PATH}"
+
+# ---- Create PXF_BASE directory (will be an emptyDir in K8s) ------------------
+RUN mkdir -p /pxf-base \
+    && chown -R gpadmin:gpadmin /pxf-base /usr/local/cloudberry-pxf
+
+# ---- Entrypoint script -------------------------------------------------------
+# The operator sidecar does NOT set command/args — it relies on the image's own
+# ENTRYPOINT. The script: ensures PXF_BASE exists, runs `pxf prepare` (idempotent),
+# starts PXF, then tails the log to keep the container alive.
+COPY --chmod=755 hack/docker-entrypoint-pxf.sh /usr/local/bin/docker-entrypoint-pxf.sh
+
+USER 1000:1000
+WORKDIR /home/gpadmin
+
+EXPOSE 5888
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=5 \
+    CMD curl -sf http://localhost:5888/actuator/health || exit 1
+
+ENTRYPOINT ["docker-entrypoint-pxf.sh"]

@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -10,10 +11,99 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
+
+// findSpan returns the first ended span with the given name, or nil.
+func findSpan(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	for _, s := range spans {
+		if s.Name() == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// TestSecretWatcher_CheckForChanges_Span asserts the C-01 contract: the
+// vault.watch.check span is created on every checkForChanges invocation, carries
+// codes.Error when ReadSecret fails, and — crucially — does NOT double-count the
+// vault read/error metric (the metric is emitted once inside ReadSecret; the
+// watcher must add zero extra ops). T-C.
+func TestSecretWatcher_CheckForChanges_Span(t *testing.T) {
+	t.Run("success path: span present, no error status", func(t *testing.T) {
+		sr, restore := telemetry.InstallSpanRecorder()
+		defer restore()
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/secret/data/ok", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"data":{"key":"value"}}}`))
+		})
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		rec := newCapturingRecorder()
+		client := newRecordingVaultClient(t, rec, server.URL)
+
+		watcher := NewSecretWatcher(client, "secret/data/ok", time.Minute,
+			func(map[string]interface{}) {}, slog.Default())
+		watcher.checkForChanges(context.Background())
+
+		span := findSpan(sr.Ended(), "vault.watch.check")
+		require.NotNil(t, span, "vault.watch.check span must be created")
+		assert.NotEqual(t, codes.Error, span.Status().Code,
+			"successful check must not mark the span errored")
+	})
+
+	t.Run("read error: span carries error status and read/error metric fires exactly once", func(t *testing.T) {
+		sr, restore := telemetry.InstallSpanRecorder()
+		defer restore()
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/secret/data/missing", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		})
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		rec := newCapturingRecorder()
+		client := newRecordingVaultClient(t, rec, server.URL)
+
+		// Baseline: NewClient's token auth already recorded one op. Capture it so
+		// we can prove checkForChanges adds exactly one (the read/error from
+		// ReadSecret) and no second, double-counted op.
+		rec.mu.Lock()
+		opsBefore := rec.ops
+		rec.mu.Unlock()
+
+		watcher := NewSecretWatcher(client, "secret/data/missing", time.Minute,
+			func(map[string]interface{}) {}, slog.Default())
+		watcher.checkForChanges(context.Background())
+
+		span := findSpan(sr.Ended(), "vault.watch.check")
+		require.NotNil(t, span, "vault.watch.check span must be created on read error")
+		assert.Equal(t, codes.Error, span.Status().Code,
+			"read failure must mark the span errored")
+
+		// Double-count guard: exactly ONE additional vault op (the read/error
+		// emitted inside ReadSecret); checkForChanges must NOT record another.
+		rec.mu.Lock()
+		opsAfter := rec.ops
+		lastOp := rec.lastOp
+		lastResult := rec.lastResult
+		rec.mu.Unlock()
+		assert.Equal(t, 1, opsAfter-opsBefore,
+			"failed check must record the vault read/error metric exactly once (no double-count)")
+		assert.Equal(t, vaultOpRead, lastOp)
+		assert.Equal(t, metricResultError, lastResult)
+	})
+}
 
 // capturingRecorder captures Vault operation metric invocations. It embeds
 // metrics.NoopRecorder so only the relevant methods are overridden.

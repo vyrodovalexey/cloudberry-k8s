@@ -45,7 +45,7 @@ func (s *DataLoadingSuite) reqFor(cluster *cbv1alpha1.CloudberryCluster) ctrl.Re
 }
 
 func (s *DataLoadingSuite) TestFunctional_DataLoadingS3Job_ReconcilesSucessfully() {
-	// Arrange: cluster with S3 data loading job.
+	// Arrange: cluster with a PXF s3 data loading job.
 	cluster := testutil.NewClusterBuilder("test-dl-s3", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
@@ -53,18 +53,28 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingS3Job_ReconcilesSucessfully
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "cloudberry-pxf:7.1.0",
+			Servers: []cbv1alpha1.PxfServerSpec{
+				{
+					Name: "s3-datalake", Type: "s3",
+					Config:            map[string]string{"fs.s3a.endpoint": "http://minio:9000"},
+					CredentialSecrets: []cbv1alpha1.SecretReference{{Name: "s3-creds"}},
+				},
+			},
+		},
 		Jobs: []cbv1alpha1.DataLoadingJob{
 			{
-				Name:        "s3-csv-loader",
-				Type:        "s3",
-				Enabled:     true,
-				Schedule:    "*/30 * * * *",
-				TargetTable: "public.events",
-				S3Source: &cbv1alpha1.S3SourceSpec{
-					Bucket:   "data-lake",
-					Path:     "/events/",
-					Endpoint: "http://minio:9000",
-					Format:   "csv",
+				Name:     "s3-csv-loader",
+				Type:     "pxf",
+				Enabled:  true,
+				Schedule: "*/30 * * * *",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server:      "s3-datalake",
+					Profile:     "s3:text",
+					Resource:    "s3a://data-lake/events/",
+					TargetTable: "public.events",
 				},
 			},
 		},
@@ -86,29 +96,48 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingS3Job_ReconcilesSucessfully
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	assert.Equal(s.T(), int32(1), updated.Status.DataLoadingJobs)
+	require.NotNil(s.T(), updated.Status.DataLoading)
+	assert.Equal(s.T(), "Configured", updated.Status.DataLoading.Phase)
+	assert.Equal(s.T(), int32(1), updated.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(s.T(), int32(1), updated.Status.DataLoading.ActiveJobs)
+	require.Len(s.T(), updated.Status.DataLoading.Jobs, 1)
+	assert.Equal(s.T(),
+		cbv1alpha1.DataLoadingJobStatus{Name: "s3-csv-loader", Enabled: true},
+		updated.Status.DataLoading.Jobs[0])
 }
 
 func (s *DataLoadingSuite) TestFunctional_DataLoadingKafkaJob_ReconcilesSucessfully() {
-	// Arrange: cluster with Kafka data loading job.
-	cluster := testutil.NewClusterBuilder("test-dl-kafka", "default").
+	// Arrange: cluster with a PXF jdbc data loading job.
+	cluster := testutil.NewClusterBuilder("test-dl-jdbc", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
 		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "cloudberry-pxf:7.1.0",
+			Servers: []cbv1alpha1.PxfServerSpec{
+				{
+					Name: "mysql-oltp", Type: "jdbc",
+					Config: map[string]string{
+						"jdbc.driver": "com.mysql.cj.jdbc.Driver",
+						"jdbc.url":    "jdbc:mysql://mysql:3306/db",
+					},
+				},
+			},
+		},
 		Jobs: []cbv1alpha1.DataLoadingJob{
 			{
-				Name:        "kafka-consumer",
-				Type:        "kafka",
-				Enabled:     true,
-				TargetTable: "public.stream_data",
-				KafkaSource: &cbv1alpha1.KafkaSourceSpec{
-					Brokers:     []string{"kafka:9092"},
-					Topic:       "cloudberry-data",
-					GroupID:     "cloudberry-loader",
-					Format:      "json",
-					StartOffset: "earliest",
+				Name:    "jdbc-sync",
+				Type:    "pxf",
+				Enabled: true,
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server:      "mysql-oltp",
+					Profile:     "jdbc",
+					Resource:    "production.orders",
+					TargetTable: "public.stream_data",
 				},
 			},
 		},
@@ -133,25 +162,24 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingKafkaJob_ReconcilesSucessfu
 }
 
 func (s *DataLoadingSuite) TestFunctional_DataLoadingRabbitMQJob_ReconcilesSucessfully() {
-	// Arrange: cluster with RabbitMQ data loading job.
-	cluster := testutil.NewClusterBuilder("test-dl-rmq", "default").
+	// Arrange: cluster with a gpload data loading job.
+	cluster := testutil.NewClusterBuilder("test-dl-gpload", "default").
 		WithFinalizer().
 		WithPhase(cbv1alpha1.ClusterPhaseRunning).
 		WithPendingGeneration().
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
+		Gpfdist: &cbv1alpha1.GpfdistSpec{Enabled: true},
 		Jobs: []cbv1alpha1.DataLoadingJob{
 			{
-				Name:        "rabbitmq-consumer",
-				Type:        "rabbitmq",
-				Enabled:     true,
-				TargetTable: "public.queue_data",
-				RabbitMQSource: &cbv1alpha1.RabbitMQSourceSpec{
-					Host:  "rabbitmq",
-					Port:  5672,
-					VHost: "cloudberry",
-					Queue: "data-queue",
+				Name:    "csv-load",
+				Type:    "gpload",
+				Enabled: true,
+				GploadJob: &cbv1alpha1.GploadJobSpec{
+					TargetTable: "public.queue_data",
+					Format:      "csv",
+					FilePaths:   []string{"/data/incoming/*.csv"},
 				},
 			},
 		},
@@ -184,16 +212,16 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingMixedJobs_CountsActiveCorre
 		Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
-		StreamingServer: &cbv1alpha1.StreamingServerSpec{
-			Host: "streaming.example.com",
-			Port: 5432,
+		Pxf: &cbv1alpha1.PxfSpec{
+			Enabled: true,
+			Image:   "cloudberry-pxf:7.1.0",
 		},
 		Jobs: []cbv1alpha1.DataLoadingJob{
-			{Name: "active-s3", Type: "s3", Enabled: true, TargetTable: "public.t1"},
-			{Name: "inactive-kafka", Type: "kafka", Enabled: false, TargetTable: "public.t2"},
-			{Name: "active-rmq", Type: "rabbitmq", Enabled: true, TargetTable: "public.t3"},
-			{Name: "inactive-s3", Type: "s3", Enabled: false, TargetTable: "public.t4"},
-			{Name: "active-kafka", Type: "kafka", Enabled: true, TargetTable: "public.t5"},
+			{Name: "active-pxf-1", Type: "pxf", Enabled: true},
+			{Name: "inactive-pxf-1", Type: "pxf", Enabled: false},
+			{Name: "active-gpload", Type: "gpload", Enabled: true},
+			{Name: "inactive-pxf-2", Type: "pxf", Enabled: false},
+			{Name: "active-pxf-2", Type: "pxf", Enabled: true},
 		},
 	}
 	s.env = testutil.NewTestK8sEnv(cluster)
@@ -213,6 +241,19 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingMixedJobs_CountsActiveCorre
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	assert.Equal(s.T(), int32(3), updated.Status.DataLoadingJobs)
+
+	// The lightweight DataLoading status reports counts, phase, and per-job state.
+	require.NotNil(s.T(), updated.Status.DataLoading)
+	assert.Equal(s.T(), "Configured", updated.Status.DataLoading.Phase)
+	assert.Equal(s.T(), int32(5), updated.Status.DataLoading.ConfiguredJobs)
+	assert.Equal(s.T(), int32(3), updated.Status.DataLoading.ActiveJobs)
+	require.Len(s.T(), updated.Status.DataLoading.Jobs, 5)
+	assert.Equal(s.T(),
+		cbv1alpha1.DataLoadingJobStatus{Name: "active-pxf-1", Enabled: true},
+		updated.Status.DataLoading.Jobs[0])
+	assert.Equal(s.T(),
+		cbv1alpha1.DataLoadingJobStatus{Name: "inactive-pxf-1", Enabled: false},
+		updated.Status.DataLoading.Jobs[1])
 }
 
 func (s *DataLoadingSuite) TestFunctional_DataLoadingDisabled_SkipsReconcile() {
@@ -238,4 +279,6 @@ func (s *DataLoadingSuite) TestFunctional_DataLoadingDisabled_SkipsReconcile() {
 	updated, err := s.env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
 	require.NoError(s.T(), err)
 	assert.Equal(s.T(), int32(0), updated.Status.DataLoadingJobs)
+	// Disabled/absent data loading is a no-op: lightweight status stays unset.
+	assert.Nil(s.T(), updated.Status.DataLoading)
 }

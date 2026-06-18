@@ -48,9 +48,6 @@ func (m *scenario5MockDBClient) Close()                       { m.closed = true 
 func (m *scenario5MockDBClient) GetSegmentConfiguration(_ context.Context) ([]db.SegmentInfo, error) {
 	return nil, nil
 }
-func (m *scenario5MockDBClient) GetClusterState(_ context.Context) (*db.ClusterState, error) {
-	return nil, nil
-}
 func (m *scenario5MockDBClient) SetParameter(_ context.Context, _, _ string, _ db.ParameterScope) error {
 	return nil
 }
@@ -202,6 +199,33 @@ func (m *scenario5MockDBClient) ListUserDatabases(_ context.Context) ([]string, 
 // SetupExporterRole implements db.Client.
 func (m *scenario5MockDBClient) SetupExporterRole(_ context.Context, _ string) error {
 	return nil
+}
+
+// SetupPXFExtensions implements db.Client.
+func (m *scenario5MockDBClient) SetupPXFExtensions(_ context.Context) (int, error) {
+	return 2, nil
+}
+
+// EnsureDataLoaderRole implements db.Client.
+func (m *scenario5MockDBClient) EnsureDataLoaderRole(_ context.Context, _ string) error {
+	return nil
+}
+
+// ListPXFExtensions implements db.Client.
+func (m *scenario5MockDBClient) ListPXFExtensions(_ context.Context) ([]string, error) {
+	return nil, nil
+}
+
+// ListExternalTables implements db.Client.
+func (m *scenario5MockDBClient) ListExternalTables(_ context.Context) ([]db.ExternalTableInfo, error) {
+	return nil, nil
+}
+
+// ReadPXFSourceSample implements db.Client.
+func (m *scenario5MockDBClient) ReadPXFSourceSample(
+	_ context.Context, _, _, _ string, _ int,
+) (*db.PXFSourceSample, error) {
+	return nil, nil
 }
 
 // GetQueryDetail implements db.Client.

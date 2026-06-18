@@ -633,6 +633,30 @@ The validating webhook enforces the following rules for mirroring transitions on
 3. **Layout change while enabled**: Rejected. You must disable mirroring before changing the layout.
 4. **Spread layout warning**: If enabling spread mirroring with marginal segment count (`count <= primariesPerHost + 1`), the webhook admits the request but returns a warning about limited fault tolerance.
 
+### 1.10 Data Loading (PXF) Fields
+
+The `spec.dataLoading` block (PXF, gpfdist/gpload, jobs) is documented in full in
+**[specification 12 — Data Loading](12-data-loading-spec.md)**. The PXF
+security-related fields added in **Scenario 111 — Security (SE.1–SE.6, SL.6)** are
+summarized here for cross-reference:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `spec.dataLoading.pxf.dataLoaderRole` (`PxfSpec.DataLoaderRole`) | `string`, optional | SE.6 — the dedicated, minimal-privilege database role to create and target the `pxf` protocol GRANTs at. **Empty (default) ⇒ `gpadmin`** (existing behavior, unchanged). A non-empty value triggers `CREATE ROLE <role> NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` granted **only** `SELECT,INSERT ON PROTOCOL pxf`. |
+| `spec.dataLoading.pxf.servers[].kerberos` (`PxfServerSpec.Kerberos` → `PxfKerberosSpec`) | object, optional | SE.4 — Kerberos (keytab) authentication for a Hadoop-family server (`hdfs`/`hive`/`hbase` only; the webhook rejects it on other types). |
+| `…kerberos.principal` | `string`, **required** | Kerberos service principal PXF authenticates as (e.g. `pxf/_HOST@REALM`). |
+| `…kerberos.keytabSecret` (`{name,key}`) | object, **required** | Secret + key holding the keytab bytes, mounted on the PXF sidecar + `pxf-cred-init` at `$PXF_BASE/keytabs/<server>/<key>`. |
+| `…kerberos.krb5ConfigMap` | `string`, optional | ConfigMap whose `krb5.conf` key is mounted at `/etc/krb5.conf` (`KRB5_CONFIG`); when unset the image default is used. |
+| `…kerberos.realm` | `string`, optional | Records the Kerberos realm for documentation/diagnostics; not required to render a working config. |
+
+**Honesty note:** SE.4 Kerberos and SE.2/SE.3 TLS are **config-correct** but
+**CONFIG-ONLY** for live authenticated / encrypted access — the operator renders
+the configuration and never fakes a live `kinit` or TLS handshake (the test env
+has no KDC and no TLS-speaking source). SE.1/SL.6 (init-container secret
+rendering), SE.5 (segment↔sidecar `localhost`-only NetworkPolicy), and SE.6
+(dedicated role) are **REAL**. See specification 12 §Security Considerations and
+§Scenario 111 for the full per-control matrix.
+
 ## 2. Sample Manifests
 
 ### 2.1 Minimal Cluster

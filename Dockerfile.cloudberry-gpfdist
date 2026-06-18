@@ -1,0 +1,70 @@
+# =============================================================================
+# Dockerfile.cloudberry-gpfdist — Thin gpfdist file-server image
+# =============================================================================
+# A thin wrapper over cloudberry-official-pxf:2.1.0 that provides a ready-to-run
+# gpfdist file server for Scenario 101 (gpfdist Deployment + gpload-csv).
+#
+# gpfdist is already present in the base image at $GPHOME/bin/gpfdist and is on
+# PATH via the Cloudberry environment. This Dockerfile only:
+#   - Creates the /data directory for serving files
+#   - Creates the /var/log directory for gpfdist logs
+#   - Sets a sane ENTRYPOINT that runs gpfdist with configurable options
+#
+# Build:
+#   docker build --platform linux/amd64 -f Dockerfile.cloudberry-gpfdist \
+#       -t cloudberry-gpfdist:2.1.0 .
+#
+# Run:
+#   docker run -p 8080:8080 -v /path/to/data:/data cloudberry-gpfdist:2.1.0
+#   docker run -p 8080:8080 cloudberry-gpfdist:2.1.0 gpfdist -d /data -p 8080 -l /var/log/gpfdist.log
+# =============================================================================
+
+# Base image ARG (must be declared before FROM).
+# Default matches the bare local tag used by `make docker-build-gpfdist`.
+# In CI this is overridden via --build-arg to reference the image loaded into
+# the local Docker daemon by the earlier chain step.
+ARG CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
+
+FROM --platform=linux/amd64 ${CB_OFFICIAL_PXF_IMAGE}
+
+# OCI labels
+LABEL org.opencontainers.image.title="cloudberry-gpfdist" \
+      org.opencontainers.image.description="Cloudberry gpfdist file server for external table data loading" \
+      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.vendor="Apache Software Foundation" \
+      org.opencontainers.image.source="https://github.com/cloudberry-contrib/cloudberry-k8s" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="cloudberry-official-pxf:2.1.0"
+
+USER root
+
+# Ensure gpfdist (and gpload) are on the default PATH so the operator can invoke
+# them with `command: ["gpfdist"]` without requiring a login shell. The base
+# image installs Cloudberry DB under $GPHOME (/usr/local/cloudberry-db-2.1.0)
+# but only adds it to PATH via the login profile (greenplum_path.sh). We symlink
+# the key binaries into /usr/local/bin and also set ENV PATH for good measure.
+ENV GPHOME=/usr/local/cloudberry-db-2.1.0
+ENV PATH="${GPHOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${GPHOME}/lib:${LD_LIBRARY_PATH}"
+
+RUN ln -sf "${GPHOME}/bin/gpfdist" /usr/local/bin/gpfdist \
+    && ln -sf "${GPHOME}/bin/gpload" /usr/local/bin/gpload
+
+# Create data and log directories with correct ownership
+RUN mkdir -p /data/incoming /var/log \
+    && chown -R gpadmin:gpadmin /data /var/log
+
+# Switch to non-root user (gpadmin = UID 1000 in the base image)
+USER 1000:1000
+
+WORKDIR /data
+
+EXPOSE 8080
+
+# Health check: gpfdist serves HTTP; a simple TCP check on the port suffices
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD bash -lc 'curl -sf http://localhost:8080/ >/dev/null 2>&1 || exit 1'
+
+# Default entrypoint: run gpfdist serving /data on port 8080 with logging.
+# The -l flag writes to a log file; gpfdist also logs to stdout.
+ENTRYPOINT ["bash", "-lc", "exec gpfdist -d /data -p 8080 -l /var/log/gpfdist.log"]
