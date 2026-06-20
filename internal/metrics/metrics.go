@@ -233,8 +233,21 @@ type Recorder interface {
 	SetRecommendationsTotal(cluster, namespace, recType string, count float64)
 	// ObserveRecommendationScanDuration records the duration of a recommendation scan.
 	ObserveRecommendationScanDuration(cluster, namespace string, duration time.Duration)
+	// IncRecommendationScanTruncated increments when a recommendation scan hits
+	// the scanDuration deadline (C.10) and records only partial per-type counts.
+	IncRecommendationScanTruncated(cluster, namespace string)
+	// RecordDiskUsageScan records the OUTCOME of a disk-usage scan operation.
+	// result is a bounded enum: "success", "error", or "skipped".
+	RecordDiskUsageScan(cluster, namespace, result string)
+	// RecordRecommendationScan records the OUTCOME of a recommendation scan
+	// operation. result is a bounded enum: "success", "error", or "skipped".
+	// Truncation remains a separate signal (IncRecommendationScanTruncated).
+	RecordRecommendationScan(cluster, namespace, result string)
 	// SetTableBloatRatio sets the bloat ratio for a table.
 	SetTableBloatRatio(cluster, namespace, table string, ratio float64)
+	// SetRecommendationScanCronJob sets 1 when the recommendation-scan CronJob is
+	// provisioned for a cluster, 0 when it is absent/removed.
+	SetRecommendationScanCronJob(cluster, namespace string, active float64)
 	// RecordScaleOperation records a scale operation event.
 	RecordScaleOperation(cluster, namespace, operation string)
 	// SetRedistributionProgress sets the data redistribution progress.
@@ -393,6 +406,9 @@ type Recorder interface {
 	// RecordOIDCDiscovery records an OIDC provider discovery attempt.
 	// result is "success" or "error".
 	RecordOIDCDiscovery(result string)
+	// RecordOIDCUserinfo records an OIDC UserInfo endpoint fetch attempt.
+	// result is a bounded enum: "success" or "error".
+	RecordOIDCUserinfo(result string)
 	// ObserveAuthTokenVerifyDuration records the latency of a Bearer token
 	// verification (JWKS fetch + signature check).
 	ObserveAuthTokenVerifyDuration(d time.Duration)
@@ -468,10 +484,14 @@ type PrometheusRecorder struct {
 	dataLoaderRoleSetupTotal   *prometheus.CounterVec
 	exporterRoleSetupTotal     *prometheus.CounterVec
 
-	diskUsagePercent      *prometheus.GaugeVec
-	recommendationsTotal  *prometheus.GaugeVec
-	recommendationScanDur *prometheus.HistogramVec
-	tableBloatRatio       *prometheus.GaugeVec
+	diskUsagePercent            *prometheus.GaugeVec
+	recommendationsTotal        *prometheus.GaugeVec
+	recommendationScanDur       *prometheus.HistogramVec
+	recommendationScanTruncated *prometheus.CounterVec
+	diskUsageScanTotal          *prometheus.CounterVec
+	recommendationScanTotal     *prometheus.CounterVec
+	tableBloatRatio             *prometheus.GaugeVec
+	recommendationScanCronJob   *prometheus.GaugeVec
 
 	scaleOperationsTotal       *prometheus.CounterVec
 	redistributionProgressVec  *prometheus.GaugeVec
@@ -539,6 +559,7 @@ type PrometheusRecorder struct {
 	logStreamSessionsTotal     *prometheus.CounterVec
 	logStreamBytesTotal        prometheus.Counter
 	oidcDiscoveryTotal         *prometheus.CounterVec
+	oidcUserinfoTotal          *prometheus.CounterVec
 	authTokenVerifyDuration    prometheus.Histogram
 }
 
@@ -932,11 +953,32 @@ func (r *PrometheusRecorder) initStorageMetrics() {
 		Help:      "Duration of recommendation scans in seconds.",
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{labelCluster, labelNamespace})
+	r.recommendationScanTruncated = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "recommendation_scan_truncated_total",
+		Help: "Number of recommendation scans truncated at the configured " +
+			"scanDuration deadline (C.10).",
+	}, []string{labelCluster, labelNamespace})
+	r.diskUsageScanTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "disk_usage_scan_total",
+		Help:      "Total number of disk-usage scans by outcome (success/error/skipped).",
+	}, []string{labelCluster, labelNamespace, labelResult})
+	r.recommendationScanTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "recommendation_scan_total",
+		Help:      "Total number of recommendation scans by outcome (success/error/skipped).",
+	}, []string{labelCluster, labelNamespace, labelResult})
 	r.tableBloatRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Name:      "table_bloat_ratio",
 		Help:      "Bloat ratio for top tables.",
 	}, []string{labelCluster, labelNamespace, "table"})
+	r.recommendationScanCronJob = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "recommendation_scan_cronjob",
+		Help:      "1 when the recommendation-scan CronJob is provisioned for a cluster, 0 otherwise.",
+	}, []string{labelCluster, labelNamespace})
 	r.scaleOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "scale_operations_total",
@@ -1262,6 +1304,11 @@ func (r *PrometheusRecorder) initAPIBusinessMetrics() {
 		Name:      "oidc_discovery_total",
 		Help:      "Total number of OIDC provider discovery attempts.",
 	}, []string{labelResult})
+	r.oidcUserinfoTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "oidc_userinfo_total",
+		Help:      "Total number of OIDC UserInfo endpoint fetch attempts by result.",
+	}, []string{labelResult})
 	r.authTokenVerifyDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Name:      "auth_token_verify_duration_seconds",
@@ -1320,7 +1367,10 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.gpfdistReconcileTotal, r.pxfExtensionSetupTotal,
 		r.dataLoaderRoleSetupTotal, r.exporterRoleSetupTotal,
 		r.diskUsagePercent, r.recommendationsTotal,
-		r.recommendationScanDur, r.tableBloatRatio,
+		r.recommendationScanDur, r.recommendationScanTruncated,
+		r.diskUsageScanTotal, r.recommendationScanTotal,
+		r.tableBloatRatio,
+		r.recommendationScanCronJob,
 		r.scaleOperationsTotal, r.redistributionProgressVec,
 		r.dataSkewCoefficient, r.pvcSizeBytes,
 		r.mirroringOperationsTotal, r.maintenanceOperationsTotal,
@@ -1348,7 +1398,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.migrateOperationsTotal, r.apiClusterOperationsTotal,
 		r.apiLifecycleRequestsTotal, r.apiWorkloadOperationsTotal, r.pxfSyncTotal,
 		r.logStreamSessionsTotal, r.logStreamBytesTotal,
-		r.oidcDiscoveryTotal, r.authTokenVerifyDuration,
+		r.oidcDiscoveryTotal, r.oidcUserinfoTotal, r.authTokenVerifyDuration,
 	}
 	for _, c := range collectors {
 		reg.MustRegister(c)
@@ -1665,9 +1715,32 @@ func (r *PrometheusRecorder) ObserveRecommendationScanDuration(
 	r.recommendationScanDur.WithLabelValues(cluster, namespace).Observe(duration.Seconds())
 }
 
+// IncRecommendationScanTruncated increments the truncated-scan counter when a
+// recommendation scan hits the scanDuration deadline (C.10) and records only
+// partial per-type counts.
+func (r *PrometheusRecorder) IncRecommendationScanTruncated(cluster, namespace string) {
+	r.recommendationScanTruncated.WithLabelValues(cluster, namespace).Inc()
+}
+
+// RecordDiskUsageScan records the outcome of a disk-usage scan operation.
+func (r *PrometheusRecorder) RecordDiskUsageScan(cluster, namespace, result string) {
+	r.diskUsageScanTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
+// RecordRecommendationScan records the outcome of a recommendation scan operation.
+func (r *PrometheusRecorder) RecordRecommendationScan(cluster, namespace, result string) {
+	r.recommendationScanTotal.WithLabelValues(cluster, namespace, result).Inc()
+}
+
 // SetTableBloatRatio sets the bloat ratio for a table.
 func (r *PrometheusRecorder) SetTableBloatRatio(cluster, namespace, table string, ratio float64) {
 	r.tableBloatRatio.WithLabelValues(cluster, namespace, table).Set(ratio)
+}
+
+// SetRecommendationScanCronJob sets 1 when the recommendation-scan CronJob is
+// provisioned for a cluster, 0 when it is absent/removed.
+func (r *PrometheusRecorder) SetRecommendationScanCronJob(cluster, namespace string, active float64) {
+	r.recommendationScanCronJob.WithLabelValues(cluster, namespace).Set(active)
 }
 
 // RecordScaleOperation records a scale operation event.
@@ -1953,6 +2026,11 @@ func (r *PrometheusRecorder) RecordOIDCDiscovery(result string) {
 	r.oidcDiscoveryTotal.WithLabelValues(result).Inc()
 }
 
+// RecordOIDCUserinfo records an OIDC UserInfo endpoint fetch attempt.
+func (r *PrometheusRecorder) RecordOIDCUserinfo(result string) {
+	r.oidcUserinfoTotal.WithLabelValues(result).Inc()
+}
+
 // ObserveAuthTokenVerifyDuration records the latency of a Bearer token verification.
 func (r *PrometheusRecorder) ObserveAuthTokenVerifyDuration(d time.Duration) {
 	r.authTokenVerifyDuration.Observe(d.Seconds())
@@ -2138,8 +2216,20 @@ func (n *NoopRecorder) SetRecommendationsTotal(_, _, _ string, _ float64) {}
 // ObserveRecommendationScanDuration is a no-op implementation for testing.
 func (n *NoopRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {}
 
+// IncRecommendationScanTruncated is a no-op implementation for testing.
+func (n *NoopRecorder) IncRecommendationScanTruncated(_, _ string) {}
+
+// RecordDiskUsageScan is a no-op implementation for testing.
+func (n *NoopRecorder) RecordDiskUsageScan(_, _, _ string) {}
+
+// RecordRecommendationScan is a no-op implementation for testing.
+func (n *NoopRecorder) RecordRecommendationScan(_, _, _ string) {}
+
 // SetTableBloatRatio is a no-op implementation for testing.
 func (n *NoopRecorder) SetTableBloatRatio(_, _, _ string, _ float64) {}
+
+// SetRecommendationScanCronJob is a no-op implementation for testing.
+func (n *NoopRecorder) SetRecommendationScanCronJob(_, _ string, _ float64) {}
 
 // RecordScaleOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordScaleOperation(_, _, _ string) {}
@@ -2308,6 +2398,9 @@ func (n *NoopRecorder) AddLogStreamBytes(_ float64) {}
 
 // RecordOIDCDiscovery is a no-op implementation for testing.
 func (n *NoopRecorder) RecordOIDCDiscovery(_ string) {}
+
+// RecordOIDCUserinfo is a no-op implementation for testing.
+func (n *NoopRecorder) RecordOIDCUserinfo(_ string) {}
 
 // ObserveAuthTokenVerifyDuration is a no-op implementation for testing.
 func (n *NoopRecorder) ObserveAuthTokenVerifyDuration(_ time.Duration) {}

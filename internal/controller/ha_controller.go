@@ -493,9 +493,16 @@ func (r *HAReconciler) reportMirrorReplicationLag(
 }
 
 // monitorStandby checks the standby coordinator health and replication lag.
-func (r *HAReconciler) monitorStandby(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (r *HAReconciler) monitorStandby(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (err error) {
+	ctx, end := startControllerSpan(ctx, haControllerName, "monitorStandby")
+	defer func() { end(err) }()
+
 	if r.dbFactory == nil {
-		return fmt.Errorf("database client factory is not configured")
+		err = fmt.Errorf("database client factory is not configured")
+		return err
 	}
 
 	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
@@ -794,7 +801,10 @@ func (r *HAReconciler) executeRebalanceViaDB(
 	cluster *cbv1alpha1.CloudberryCluster,
 	skewThreshold, parallelism int32,
 	excludeTables []string,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, haControllerName, "executeRebalanceViaDB")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 
 	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
@@ -816,7 +826,8 @@ func (r *HAReconciler) executeRebalanceViaDB(
 		return nil
 	}
 
-	return r.dispatchRebalanceTables(ctx, logger, dbClient, tablesToRebalance, parallelism)
+	err = r.dispatchRebalanceTables(ctx, logger, dbClient, tablesToRebalance, parallelism)
+	return err
 }
 
 // interTableDelay is the pause between dispatching rebalance goroutines to
@@ -1019,14 +1030,18 @@ const standbyActivationMetricType = "standby-activation"
 func (r *HAReconciler) handleStandbyActivation(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, end := startControllerSpan(ctx, haControllerName, "handleStandbyActivation")
+	defer func() { end(err) }()
+
 	logger := util.LoggerFromContext(ctx)
 	logger.Info("handling standby activation")
 
 	// Remove the action annotation using MergePatch to avoid conflicts with
 	// stale objects. Removing it first guarantees at-most-once promotion.
-	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationAction); err != nil {
-		return ctrl.Result{}, fmt.Errorf("removing standby activation annotation: %w", err)
+	if annErr := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationAction); annErr != nil {
+		err = fmt.Errorf("removing standby activation annotation: %w", annErr)
+		return ctrl.Result{}, err
 	}
 
 	// Idempotency/safety gate: only promote when a standby is configured and
@@ -1040,7 +1055,7 @@ func (r *HAReconciler) handleStandbyActivation(
 	}
 
 	if r.dbFactory == nil {
-		err := fmt.Errorf("database client factory is not configured")
+		err = fmt.Errorf("database client factory is not configured")
 		r.recordStandbyActivationFailure(cluster, err)
 		return ctrl.Result{RequeueAfter: requeueAfterError}, err
 	}

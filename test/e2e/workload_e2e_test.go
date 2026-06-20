@@ -1213,24 +1213,36 @@ func (w *nonClosingClientWrapper) GetStorageDiskUsage(ctx context.Context) ([]db
 	return w.delegate.GetStorageDiskUsage(ctx)
 }
 
-func (w *nonClosingClientWrapper) GetBloatRecommendations(ctx context.Context) ([]db.Recommendation, error) {
-	return w.delegate.GetBloatRecommendations(ctx)
+func (w *nonClosingClientWrapper) GetDiskUsagePercent(ctx context.Context) (int32, error) {
+	return w.delegate.GetDiskUsagePercent(ctx)
 }
 
-func (w *nonClosingClientWrapper) GetSkewRecommendations(ctx context.Context) ([]db.Recommendation, error) {
-	return w.delegate.GetSkewRecommendations(ctx)
+func (w *nonClosingClientWrapper) GetClusterDataSizeBytes(ctx context.Context) (int64, error) {
+	return w.delegate.GetClusterDataSizeBytes(ctx)
 }
 
-func (w *nonClosingClientWrapper) GetAgeRecommendations(ctx context.Context) ([]db.Recommendation, error) {
-	return w.delegate.GetAgeRecommendations(ctx)
+func (w *nonClosingClientWrapper) GetBloatRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	return w.delegate.GetBloatRecommendations(ctx, th)
 }
 
-func (w *nonClosingClientWrapper) GetIndexBloatRecommendations(ctx context.Context) ([]db.Recommendation, error) {
-	return w.delegate.GetIndexBloatRecommendations(ctx)
+func (w *nonClosingClientWrapper) GetSkewRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	return w.delegate.GetSkewRecommendations(ctx, th)
+}
+
+func (w *nonClosingClientWrapper) GetAgeRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	return w.delegate.GetAgeRecommendations(ctx, th)
+}
+
+func (w *nonClosingClientWrapper) GetIndexBloatRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	return w.delegate.GetIndexBloatRecommendations(ctx, th)
 }
 
 func (w *nonClosingClientWrapper) TriggerRecommendationScan(ctx context.Context) error {
 	return w.delegate.TriggerRecommendationScan(ctx)
+}
+
+func (w *nonClosingClientWrapper) GetTables(ctx context.Context) ([]db.TableStorageInfo, error) {
+	return w.delegate.GetTables(ctx)
 }
 
 func (w *nonClosingClientWrapper) GetTableDetails(ctx context.Context, schema, table string) (*db.TableDetail, error) {

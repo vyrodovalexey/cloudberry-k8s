@@ -868,9 +868,39 @@ func (m *mockMetricsRecorder) ObserveRecommendationScanDuration(cluster, namespa
 	})
 }
 
+func (m *mockMetricsRecorder) IncRecommendationScanTruncated(cluster, namespace string) {
+	m.record("IncRecommendationScanTruncated", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordDiskUsageScan(cluster, namespace, result string) {
+	m.record("RecordDiskUsageScan", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordRecommendationScan(cluster, namespace, result string) {
+	m.record("RecordRecommendationScan", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "result": result,
+	})
+}
+
+func (m *mockMetricsRecorder) RecordOIDCUserinfo(result string) {
+	m.record("RecordOIDCUserinfo", map[string]interface{}{
+		"result": result,
+	})
+}
+
 func (m *mockMetricsRecorder) SetTableBloatRatio(cluster, namespace, table string, ratio float64) {
 	m.record("SetTableBloatRatio", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "table": table, "ratio": ratio,
+	})
+}
+
+func (m *mockMetricsRecorder) SetRecommendationScanCronJob(cluster, namespace string, active float64) {
+	m.record("SetRecommendationScanCronJob", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "active": active,
 	})
 }
 

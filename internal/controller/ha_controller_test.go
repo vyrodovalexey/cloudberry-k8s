@@ -42,6 +42,10 @@ type mockDBClient struct {
 	triggerFTSProbeErr error
 	maxConnections     int32
 	maxConnectionsErr  error
+	diskUsagePercent   int32
+	diskUsageErr       error
+	clusterDataSize    int64
+	clusterDataSizeErr error
 }
 
 func (m *mockDBClient) Ping(_ context.Context) error { return nil }
@@ -109,19 +113,28 @@ func (m *mockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJ
 func (m *mockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInfo, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetDiskUsagePercent(_ context.Context) (int32, error) {
+	return m.diskUsagePercent, m.diskUsageErr
+}
+func (m *mockDBClient) GetClusterDataSizeBytes(_ context.Context) (int64, error) {
+	return m.clusterDataSize, m.clusterDataSizeErr
+}
+func (m *mockDBClient) GetBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetSkewRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetAgeRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
 func (m *mockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
+func (m *mockDBClient) GetTables(_ context.Context) ([]db.TableStorageInfo, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetTableDetails(_ context.Context, _, _ string) (*db.TableDetail, error) {
 	return nil, nil
 }

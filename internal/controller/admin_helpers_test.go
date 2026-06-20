@@ -111,3 +111,48 @@ func TestAdminReconciler_RecordSlowQueries_EmptySessions(t *testing.T) {
 	r.recordSlowQueries(cluster, nil)
 	require.Zero(t, rec.slowQueries)
 }
+
+// TestMergeAnnotations covers mergeAnnotations including the existing==nil
+// allocation branch, key collisions (desired wins), and preservation of
+// third-party annotations absent from desired (H-4).
+func TestMergeAnnotations(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing map[string]string
+		desired  map[string]string
+		want     map[string]string
+	}{
+		{
+			name:     "nil existing allocates and returns desired",
+			existing: nil,
+			desired:  map[string]string{"a": "1"},
+			want:     map[string]string{"a": "1"},
+		},
+		{
+			name:     "nil existing and nil desired yields empty non-nil map",
+			existing: nil,
+			desired:  nil,
+			want:     map[string]string{},
+		},
+		{
+			name:     "collision: desired value overrides existing",
+			existing: map[string]string{"a": "old"},
+			desired:  map[string]string{"a": "new"},
+			want:     map[string]string{"a": "new"},
+		},
+		{
+			name:     "preserve third-party annotations absent from desired",
+			existing: map[string]string{"x": "old", "a": "keep"},
+			desired:  map[string]string{"a": "new"},
+			want:     map[string]string{"x": "old", "a": "new"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeAnnotations(tt.existing, tt.desired)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

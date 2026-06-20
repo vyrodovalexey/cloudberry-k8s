@@ -229,6 +229,47 @@ func TestAPIBusinessMetrics(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+// TestRecordDiskUsageScan verifies the real Prometheus recorder emits the
+// disk-usage scan counter with success/error/skipped result labels.
+func TestRecordDiskUsageScan(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	r := NewPrometheusRecorder(reg)
+
+	for _, result := range []string{"success", "error", "skipped"} {
+		r.RecordDiskUsageScan("c1", "ns1", result)
+		assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_disk_usage_scan_total",
+			map[string]string{"cluster": "c1", "namespace": "ns1", "result": result}))
+	}
+}
+
+// TestRecordRecommendationScan verifies the real Prometheus recorder emits the
+// recommendation scan counter with success/error/skipped result labels.
+func TestRecordRecommendationScan(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	r := NewPrometheusRecorder(reg)
+
+	for _, result := range []string{"success", "error", "skipped"} {
+		r.RecordRecommendationScan("c1", "ns1", result)
+		assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_recommendation_scan_total",
+			map[string]string{"cluster": "c1", "namespace": "ns1", "result": result}))
+	}
+}
+
+// TestRecordOIDCUserinfo verifies the real Prometheus recorder emits the OIDC
+// UserInfo counter with success/error result labels.
+func TestRecordOIDCUserinfo(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	r := NewPrometheusRecorder(reg)
+
+	r.RecordOIDCUserinfo("success")
+	r.RecordOIDCUserinfo("error")
+
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_oidc_userinfo_total",
+		map[string]string{"result": "success"}))
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_oidc_userinfo_total",
+		map[string]string{"result": "error"}))
+}
+
 // TestNoopRecorderNewMethods exercises every new no-op method (compile-time
 // interface assertion lives in metrics_test.go) so wiring later is covered.
 func TestNoopRecorderNewMethods(t *testing.T) {
@@ -254,4 +295,7 @@ func TestNoopRecorderNewMethods(t *testing.T) {
 	n.AddLogStreamBytes(1)
 	n.RecordOIDCDiscovery("success")
 	n.ObserveAuthTokenVerifyDuration(time.Second)
+	n.RecordDiskUsageScan("c", "ns", "success")
+	n.RecordRecommendationScan("c", "ns", "success")
+	n.RecordOIDCUserinfo("success")
 }

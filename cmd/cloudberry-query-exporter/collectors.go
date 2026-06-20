@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -20,10 +21,26 @@ const collectorQueryTimeout = 5 * time.Second
 // Prometheus label name constants to avoid string duplication.
 const (
 	labelDatname    = "datname"
-	labelUsename    = "usename"
 	labelRsgname    = "rsgname"
 	labelHostname   = "hostname"
 	labelTablespace = "tablespace"
+	// labelCollector is the BOUNDED-enum label identifying which scrape
+	// collector produced an error/duration observation (P3a). Values come from
+	// the collector* name constants below — never free-form strings.
+	labelCollector = "collector"
+)
+
+// Bounded-enum collector names for the scrape error/duration metrics (P3a).
+// One constant per top-level collector; these are the ONLY values that ever
+// appear in the `collector` label, keeping cardinality bounded.
+const (
+	collectorQueryActivity   = "query_activity"
+	collectorResgroupStatus  = "resgroup_status"
+	collectorResgroupIOStats = "resgroup_iostats"
+	collectorSpillFiles      = "spill_files"
+	collectorSegmentHealth   = "segment_health"
+	collectorDistTxns        = "dist_txns"
+	collectorTableSkew       = "table_skew"
 )
 
 // SQL queries for query activity metrics (57a).
@@ -143,6 +160,14 @@ type metricCollectors struct {
 
 	// 57g - Data distribution / skew metrics.
 	tableSkewCoefficient *prometheus.GaugeVec
+
+	// P3a - Scrape self-observability metrics.
+	// collectorErrorsTotal counts collector failures per scrape so a
+	// permanently-failing collector is visible in Grafana; collectorDuration
+	// observes per-collector latency on every scrape. Both labeled by the
+	// bounded `collector` enum only.
+	collectorErrorsTotal *prometheus.CounterVec
+	collectorDuration    *prometheus.HistogramVec
 }
 
 // newMetricCollectors creates and registers all extended Prometheus metrics.
@@ -162,13 +187,13 @@ func newMetricCollectors(reg prometheus.Registerer) *metricCollectors {
 		queriesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "queries_total",
-			Help:      "Total number of queries observed, by database, user, and state.",
-		}, []string{labelDatname, labelUsename, "state"}),
+			Help:      "Total number of queries observed, by database and state.",
+		}, []string{labelDatname, "state"}),
 		queriesSlowTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "queries_slow_total",
-			Help:      "Total number of slow queries observed, by database and user.",
-		}, []string{labelDatname, labelUsename}),
+			Help:      "Total number of slow queries observed, by database.",
+		}, []string{labelDatname}),
 		queryDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "query_duration_seconds",
@@ -337,6 +362,19 @@ func newMetricCollectors(reg prometheus.Registerer) *metricCollectors {
 			Name:      "table_skew_coefficient",
 			Help:      "Data distribution skew coefficient per table.",
 		}, []string{"schemaname", "tablename"}),
+
+		// P3a - Scrape self-observability metrics.
+		collectorErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "collector_errors_total",
+			Help:      "Total number of collector errors per scrape, by collector.",
+		}, []string{labelCollector}),
+		collectorDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "collector_duration_seconds",
+			Help:      "Duration of each scrape collector in seconds, by collector.",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10},
+		}, []string{labelCollector}),
 	}
 
 	mc.register(reg)
@@ -389,9 +427,26 @@ func (mc *metricCollectors) register(reg prometheus.Registerer) {
 		mc.oldestTxnAge,
 		// 57g
 		mc.tableSkewCoefficient,
+		// P3a - scrape self-observability.
+		mc.collectorErrorsTotal,
+		mc.collectorDuration,
 	}
 	for _, c := range allCollectors {
 		reg.MustRegister(c)
+	}
+}
+
+// instrument runs a single top-level collector, observing its duration on
+// collectorDuration{collector} and incrementing collectorErrorsTotal{collector}
+// exactly once if it returns an error. It preserves best-effort scrape
+// semantics: an error is recorded and logged but never aborts the scrape.
+func (mc *metricCollectors) instrument(name string, logger *slog.Logger, fn func() error) {
+	start := time.Now()
+	err := fn()
+	mc.collectorDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+	if err != nil {
+		mc.collectorErrorsTotal.WithLabelValues(name).Inc()
+		logger.Warn("collector reported an error", "collector", name, "error", err)
 	}
 }
 
@@ -403,13 +458,27 @@ func (mc *metricCollectors) collectAll(
 	slowThreshold time.Duration,
 	logger *slog.Logger,
 ) {
-	mc.collectQueryActivity(ctx, conn, slowThreshold, logger)
-	mc.collectResgroupStatus(ctx, conn, logger)
-	mc.collectResgroupIOStats(ctx, conn, logger)
-	mc.collectSpillFiles(ctx, conn, logger)
-	mc.collectSegmentHealth(ctx, conn, logger)
-	mc.collectDistributedTransactions(ctx, conn, logger)
-	mc.collectTableSkew(ctx, conn, logger)
+	mc.instrument(collectorQueryActivity, logger, func() error {
+		return mc.collectQueryActivity(ctx, conn, slowThreshold, logger)
+	})
+	mc.instrument(collectorResgroupStatus, logger, func() error {
+		return mc.collectResgroupStatus(ctx, conn, logger)
+	})
+	mc.instrument(collectorResgroupIOStats, logger, func() error {
+		return mc.collectResgroupIOStats(ctx, conn, logger)
+	})
+	mc.instrument(collectorSpillFiles, logger, func() error {
+		return mc.collectSpillFiles(ctx, conn, logger)
+	})
+	mc.instrument(collectorSegmentHealth, logger, func() error {
+		return mc.collectSegmentHealth(ctx, conn, logger)
+	})
+	mc.instrument(collectorDistTxns, logger, func() error {
+		return mc.collectDistributedTransactions(ctx, conn, logger)
+	})
+	mc.instrument(collectorTableSkew, logger, func() error {
+		return mc.collectTableSkew(ctx, conn, logger)
+	})
 }
 
 // collectQueryActivity collects query activity metrics from pg_stat_activity (57a).
@@ -418,14 +487,13 @@ func (mc *metricCollectors) collectQueryActivity(
 	conn *pgx.Conn,
 	slowThreshold time.Duration,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, queryActivitySQL)
 	if err != nil {
-		logger.Warn("failed to collect query activity metrics", "error", err)
-		return
+		return fmt.Errorf("collecting query activity metrics: %w", err)
 	}
 	defer rows.Close()
 
@@ -451,11 +519,15 @@ func (mc *metricCollectors) collectQueryActivity(
 
 		stateVal := safeDeref(state, "unknown")
 		datnameVal := safeDeref(datname, "unknown")
-		usenameVal := safeDeref(usename, "unknown")
+		// usename is intentionally NOT used as a metric label (H-1): DB
+		// role/username is unbounded in a multi-tenant cluster and would blow up
+		// TSDB cardinality. It is still selected/scanned for potential debug use
+		// but never attached to a metric series.
+		_ = usename
 		durationVal := safeDerefFloat(duration, 0)
 
 		// Count queries by state.
-		mc.queriesTotal.WithLabelValues(datnameVal, usenameVal, stateVal).Inc()
+		mc.queriesTotal.WithLabelValues(datnameVal, stateVal).Inc()
 
 		// Track idle-in-transaction sessions.
 		if stateVal == "idle in transaction" {
@@ -477,14 +549,13 @@ func (mc *metricCollectors) collectQueryActivity(
 
 			// Track slow queries.
 			if durationVal > slowThreshold.Seconds() {
-				mc.queriesSlowTotal.WithLabelValues(datnameVal, usenameVal).Inc()
+				mc.queriesSlowTotal.WithLabelValues(datnameVal).Inc()
 			}
 		}
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating query activity rows", "error", rowErr)
-		return
+		return fmt.Errorf("iterating query activity rows: %w", rowErr)
 	}
 
 	mc.queriesIdleInTransaction.Set(float64(idleInTxnCount))
@@ -496,6 +567,7 @@ func (mc *metricCollectors) collectQueryActivity(
 		"blocked", blockedCount,
 		"max_duration_seconds", maxDuration,
 	)
+	return nil
 }
 
 // collectResgroupStatus collects resource group metrics (57b).
@@ -503,9 +575,11 @@ func (mc *metricCollectors) collectResgroupStatus(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
-	mc.collectResgroupStatusSummary(ctx, conn, logger)
-	mc.collectResgroupStatusPerHost(ctx, conn, logger)
+) error {
+	return errors.Join(
+		mc.collectResgroupStatusSummary(ctx, conn, logger),
+		mc.collectResgroupStatusPerHost(ctx, conn, logger),
+	)
 }
 
 // collectResgroupStatusSummary collects aggregate resource group status.
@@ -513,17 +587,14 @@ func (mc *metricCollectors) collectResgroupStatusSummary(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, resgroupStatusSQL)
 	if err != nil {
-		logger.Warn("failed to collect resource group status metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_resgroup_status may not be available in this Cloudberry version",
-		)
-		return
+		return fmt.Errorf("collecting resource group status metrics "+
+			"(gp_toolkit.gp_resgroup_status may not be available): %w", err)
 	}
 	defer rows.Close()
 
@@ -555,8 +626,9 @@ func (mc *metricCollectors) collectResgroupStatusSummary(
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating resource group status rows", "error", rowErr)
+		return fmt.Errorf("iterating resource group status rows: %w", rowErr)
 	}
+	return nil
 }
 
 // collectResgroupStatusPerHost collects per-host resource group metrics.
@@ -564,17 +636,14 @@ func (mc *metricCollectors) collectResgroupStatusPerHost(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, resgroupStatusPerHostSQL)
 	if err != nil {
-		logger.Warn("failed to collect resource group per-host metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_resgroup_status_per_host may not be available",
-		)
-		return
+		return fmt.Errorf("collecting resource group per-host metrics "+
+			"(gp_toolkit.gp_resgroup_status_per_host may not be available): %w", err)
 	}
 	defer rows.Close()
 
@@ -603,8 +672,9 @@ func (mc *metricCollectors) collectResgroupStatusPerHost(
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating resource group per-host rows", "error", rowErr)
+		return fmt.Errorf("iterating resource group per-host rows: %w", rowErr)
 	}
+	return nil
 }
 
 // collectResgroupIOStats collects resource group I/O metrics (57c).
@@ -612,17 +682,14 @@ func (mc *metricCollectors) collectResgroupIOStats(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, resgroupIOStatsSQL)
 	if err != nil {
-		logger.Warn("failed to collect resource group I/O metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_resgroup_iostats_per_host may not be available",
-		)
-		return
+		return fmt.Errorf("collecting resource group I/O metrics "+
+			"(gp_toolkit.gp_resgroup_iostats_per_host may not be available): %w", err)
 	}
 	defer rows.Close()
 
@@ -651,8 +718,9 @@ func (mc *metricCollectors) collectResgroupIOStats(
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating resource group I/O rows", "error", rowErr)
+		return fmt.Errorf("iterating resource group I/O rows: %w", rowErr)
 	}
+	return nil
 }
 
 // collectSpillFiles collects spill file metrics (57d).
@@ -660,17 +728,18 @@ func (mc *metricCollectors) collectSpillFiles(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
-	mc.collectSpillFileSummary(ctx, conn, logger)
-	mc.collectSpillFilePerSegment(ctx, conn, logger)
+) error {
+	return errors.Join(
+		mc.collectSpillFileSummary(ctx, conn),
+		mc.collectSpillFilePerSegment(ctx, conn, logger),
+	)
 }
 
 // collectSpillFileSummary collects aggregate spill file metrics.
 func (mc *metricCollectors) collectSpillFileSummary(
 	ctx context.Context,
 	conn *pgx.Conn,
-	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
@@ -679,15 +748,13 @@ func (mc *metricCollectors) collectSpillFileSummary(
 
 	err := conn.QueryRow(queryCtx, spillFileSummarySQL).Scan(&activeCount, &totalBytes)
 	if err != nil {
-		logger.Warn("failed to collect spill file summary metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_workfile_usage_per_query may not be available",
-		)
-		return
+		return fmt.Errorf("collecting spill file summary metrics "+
+			"(gp_toolkit.gp_workfile_usage_per_query may not be available): %w", err)
 	}
 
 	mc.spillFilesActive.Set(float64(activeCount))
 	mc.spillFilesBytes.Set(float64(totalBytes))
+	return nil
 }
 
 // collectSpillFilePerSegment collects per-segment spill file metrics.
@@ -695,17 +762,14 @@ func (mc *metricCollectors) collectSpillFilePerSegment(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, spillFilePerSegmentSQL)
 	if err != nil {
-		logger.Warn("failed to collect spill file per-segment metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_workfile_usage_per_segment may not be available",
-		)
-		return
+		return fmt.Errorf("collecting spill file per-segment metrics "+
+			"(gp_toolkit.gp_workfile_usage_per_segment may not be available): %w", err)
 	}
 	defer rows.Close()
 
@@ -725,8 +789,9 @@ func (mc *metricCollectors) collectSpillFilePerSegment(
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating spill file per-segment rows", "error", rowErr)
+		return fmt.Errorf("iterating spill file per-segment rows: %w", rowErr)
 	}
+	return nil
 }
 
 // collectSegmentHealth collects segment health metrics (57e).
@@ -734,9 +799,11 @@ func (mc *metricCollectors) collectSegmentHealth(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
-	mc.collectSegmentStatus(ctx, conn, logger)
-	mc.collectClusterUptime(ctx, conn, logger)
+) error {
+	return errors.Join(
+		mc.collectSegmentStatus(ctx, conn, logger),
+		mc.collectClusterUptime(ctx, conn),
+	)
 }
 
 // collectSegmentStatus collects segment configuration status.
@@ -744,7 +811,7 @@ func (mc *metricCollectors) collectSegmentStatus(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
@@ -754,8 +821,7 @@ func (mc *metricCollectors) collectSegmentStatus(
 		&primaryTotal, &mirrorTotal, &upCount, &downCount, &notSynced, &notPreferred,
 	)
 	if err != nil {
-		logger.Warn("failed to collect segment health metrics", "error", err)
-		return
+		return fmt.Errorf("collecting segment health metrics: %w", err)
 	}
 
 	mc.segmentsTotal.WithLabelValues("primary").Set(float64(primaryTotal))
@@ -773,14 +839,14 @@ func (mc *metricCollectors) collectSegmentStatus(
 		"not_synced", notSynced,
 		"not_preferred", notPreferred,
 	)
+	return nil
 }
 
 // collectClusterUptime collects the cluster uptime metric.
 func (mc *metricCollectors) collectClusterUptime(
 	ctx context.Context,
 	conn *pgx.Conn,
-	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
@@ -788,29 +854,30 @@ func (mc *metricCollectors) collectClusterUptime(
 
 	err := conn.QueryRow(queryCtx, clusterUptimeSQL).Scan(&uptimeSeconds)
 	if err != nil {
-		logger.Warn("failed to collect cluster uptime metric", "error", err)
-		return
+		return fmt.Errorf("collecting cluster uptime metric: %w", err)
 	}
 
 	mc.clusterUptime.Set(uptimeSeconds)
+	return nil
 }
 
 // collectDistributedTransactions collects distributed transaction metrics (57f).
 func (mc *metricCollectors) collectDistributedTransactions(
 	ctx context.Context,
 	conn *pgx.Conn,
-	logger *slog.Logger,
-) {
-	mc.collectDistributedXacts(ctx, conn, logger)
-	mc.collectOldestTransaction(ctx, conn, logger)
+	_ *slog.Logger,
+) error {
+	return errors.Join(
+		mc.collectDistributedXacts(ctx, conn),
+		mc.collectOldestTransaction(ctx, conn),
+	)
 }
 
 // collectDistributedXacts collects distributed transaction state counts.
 func (mc *metricCollectors) collectDistributedXacts(
 	ctx context.Context,
 	conn *pgx.Conn,
-	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
@@ -818,24 +885,21 @@ func (mc *metricCollectors) collectDistributedXacts(
 
 	err := conn.QueryRow(queryCtx, distributedXactsSQL).Scan(&active, &committed, &aborted)
 	if err != nil {
-		logger.Warn("failed to collect distributed transaction metrics",
-			"error", err,
-			"hint", "gp_distributed_xacts may not be available",
-		)
-		return
+		return fmt.Errorf("collecting distributed transaction metrics "+
+			"(gp_distributed_xacts may not be available): %w", err)
 	}
 
 	mc.distTxnActive.Set(float64(active))
 	mc.distTxnCommitted.Add(float64(committed))
 	mc.distTxnAborted.Add(float64(aborted))
+	return nil
 }
 
 // collectOldestTransaction collects the age of the oldest active transaction.
 func (mc *metricCollectors) collectOldestTransaction(
 	ctx context.Context,
 	conn *pgx.Conn,
-	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
@@ -843,11 +907,11 @@ func (mc *metricCollectors) collectOldestTransaction(
 
 	err := conn.QueryRow(queryCtx, oldestTransactionSQL).Scan(&oldestAge)
 	if err != nil {
-		logger.Warn("failed to collect oldest transaction age metric", "error", err)
-		return
+		return fmt.Errorf("collecting oldest transaction age metric: %w", err)
 	}
 
 	mc.oldestTxnAge.Set(oldestAge)
+	return nil
 }
 
 // collectTableSkew collects data distribution skew metrics (57g).
@@ -856,17 +920,14 @@ func (mc *metricCollectors) collectTableSkew(
 	ctx context.Context,
 	conn *pgx.Conn,
 	logger *slog.Logger,
-) {
+) error {
 	queryCtx, cancel := context.WithTimeout(ctx, collectorQueryTimeout)
 	defer cancel()
 
 	rows, err := conn.Query(queryCtx, tableSkewSQL)
 	if err != nil {
-		logger.Warn("failed to collect table skew metrics",
-			"error", err,
-			"hint", "gp_toolkit.gp_skew_coefficients may not be available",
-		)
-		return
+		return fmt.Errorf("collecting table skew metrics "+
+			"(gp_toolkit.gp_skew_coefficients may not be available): %w", err)
 	}
 	defer rows.Close()
 
@@ -888,11 +949,11 @@ func (mc *metricCollectors) collectTableSkew(
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {
-		logger.Warn("error iterating table skew rows", "error", rowErr)
-		return
+		return fmt.Errorf("iterating table skew rows: %w", rowErr)
 	}
 
 	logger.Debug("table skew metrics collected", "tables_measured", count)
+	return nil
 }
 
 // safeDeref returns the dereferenced string pointer value, or the fallback if nil.

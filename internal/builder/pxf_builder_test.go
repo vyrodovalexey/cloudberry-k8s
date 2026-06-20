@@ -204,10 +204,32 @@ func TestBuildPXFSidecarContainers_Env(t *testing.T) {
 	require.NotNil(t, c.LivenessProbe.HTTPGet)
 	assert.Equal(t, pxfStatusPath, c.LivenessProbe.HTTPGet.Path)
 	assert.Equal(t, int32(5888), c.LivenessProbe.HTTPGet.Port.IntVal)
+	// Liveness must not rely on the pathologically tight 1s default timeout; a
+	// slightly more tolerant timeout absorbs transient GC/load spikes.
+	assert.GreaterOrEqual(t, c.LivenessProbe.TimeoutSeconds, int32(3),
+		"liveness timeoutSeconds must be more tolerant than the 1s default")
 	require.NotNil(t, c.ReadinessProbe)
 	require.NotNil(t, c.ReadinessProbe.HTTPGet)
 	assert.Equal(t, pxfStatusPath, c.ReadinessProbe.HTTPGet.Path)
 	assert.Equal(t, int32(5888), c.ReadinessProbe.HTTPGet.Port.IntVal)
+
+	// StartupProbe protects PXF's slow (~50s) Spring Boot cold start: it reuses
+	// the SAME /actuator/health handler on the pxf port but with a generous
+	// startup budget (failureThreshold * periodSeconds) so a mid-boot health
+	// check never trips liveness into a SIGKILL/CrashLoopBackOff. This is what
+	// removes the need for the manual StatefulSet startupProbe patch.
+	require.NotNil(t, c.StartupProbe, "PXF sidecar must define a StartupProbe")
+	require.NotNil(t, c.StartupProbe.HTTPGet)
+	assert.Equal(t, pxfStatusPath, c.StartupProbe.HTTPGet.Path)
+	assert.Equal(t, int32(5888), c.StartupProbe.HTTPGet.Port.IntVal)
+	assert.Equal(t, int32(5), c.StartupProbe.PeriodSeconds,
+		"startup probe period")
+	assert.Equal(t, int32(24), c.StartupProbe.FailureThreshold,
+		"startup probe failureThreshold (=120s boot budget at 5s period)")
+	// Sanity: the startup budget must comfortably cover the ~50s boot.
+	startupBudget := c.StartupProbe.PeriodSeconds * c.StartupProbe.FailureThreshold
+	assert.GreaterOrEqual(t, startupBudget, int32(100),
+		"startup budget must cover the slow Spring Boot cold start")
 
 	// VolumeMounts.
 	mounts := map[string]string{}

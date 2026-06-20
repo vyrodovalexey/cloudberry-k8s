@@ -84,14 +84,38 @@ const (
 
 	// pxfLivenessInitialDelaySeconds is the liveness probe initial delay. PXF is
 	// a JVM service with a non-trivial cold start, so the liveness probe is given
-	// a generous delay to avoid premature restarts.
+	// a generous delay to avoid premature restarts. Note: with a StartupProbe in
+	// place (see pxfStartup* below) the liveness probe is HELD OFF until startup
+	// succeeds, so this delay is now effectively a secondary guard.
 	pxfLivenessInitialDelaySeconds int32 = 60
 	// pxfLivenessPeriodSeconds is the liveness probe period.
 	pxfLivenessPeriodSeconds int32 = 20
+	// pxfLivenessTimeoutSeconds is the liveness probe per-check timeout. The
+	// Kubernetes default is a pathologically tight 1s; PXF's Spring Boot actuator
+	// /actuator/health can momentarily exceed 1s under GC/load, so a single slow
+	// response would otherwise count as a liveness failure and risk a needless
+	// SIGKILL. A slightly more tolerant 5s absorbs those transient spikes without
+	// weakening the probe's intent (a truly hung JVM still fails every period).
+	pxfLivenessTimeoutSeconds int32 = 5
 	// pxfReadinessInitialDelaySeconds is the readiness probe initial delay.
 	pxfReadinessInitialDelaySeconds int32 = 30
 	// pxfReadinessPeriodSeconds is the readiness probe period.
 	pxfReadinessPeriodSeconds int32 = 10
+
+	// pxfStartup* configure the StartupProbe that protects PXF's slow Spring Boot
+	// cold start. PXF (a JVM/Spring Boot service) takes ~50s to boot; during that
+	// window /actuator/health is not yet UP. Without a StartupProbe, a restart
+	// (e.g. to load a new connector jar, or under load) lets the LivenessProbe
+	// fire mid-boot, fail, and have the kubelet SIGKILL the container -> a
+	// CrashLoopBackOff that never lets PXF finish booting. The StartupProbe holds
+	// the liveness/readiness probes OFF until it first succeeds, giving boot a
+	// generous budget: failureThreshold * periodSeconds = 24 * 5s = 120s, which
+	// comfortably covers the ~50s boot plus headroom. Once startup succeeds the
+	// normal liveness/readiness cadence takes over. (This replaces the manual
+	// StatefulSet startupProbe patch applied during acceptance testing.)
+	pxfStartupInitialDelaySeconds int32 = 10
+	pxfStartupPeriodSeconds       int32 = 5
+	pxfStartupFailureThreshold    int32 = 24
 
 	// pxfConnectorsDataKey is the ConfigMap data key listing custom connectors
 	// as deterministic "name=jarUrl" lines.
@@ -321,10 +345,22 @@ func (b *DefaultBuilder) BuildPXFSidecarContainers(
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
+		// StartupProbe gates BOTH liveness and readiness until PXF's slow Spring
+		// Boot cold start completes, so a mid-boot health check never trips
+		// liveness into a SIGKILL/CrashLoopBackOff. It reuses the SAME health
+		// handler (HTTP GET /actuator/health on the pxf port); only the timing is
+		// startup-tolerant (see pxfStartup* constants: ~120s budget).
+		StartupProbe: &corev1.Probe{
+			ProbeHandler:        probeHandler,
+			InitialDelaySeconds: pxfStartupInitialDelaySeconds,
+			PeriodSeconds:       pxfStartupPeriodSeconds,
+			FailureThreshold:    pxfStartupFailureThreshold,
+		},
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler:        probeHandler,
 			InitialDelaySeconds: pxfLivenessInitialDelaySeconds,
 			PeriodSeconds:       pxfLivenessPeriodSeconds,
+			TimeoutSeconds:      pxfLivenessTimeoutSeconds,
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler:        probeHandler,

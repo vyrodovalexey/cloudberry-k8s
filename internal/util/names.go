@@ -134,6 +134,14 @@ func BackupCronJobName(cluster string) string {
 	return SanitizeK8sName(fmt.Sprintf("%s-backup-schedule", cluster))
 }
 
+// RecommendationScanCronJobName returns the scheduled storage recommendation-scan
+// CronJob name ("<cluster>-recommendation-scan"). It is the single source of
+// truth for the recommendation-scan workload name shared by the builder (create)
+// and the controller (ensure/GC), mirroring BackupCronJobName (spec 13 §C.5).
+func RecommendationScanCronJobName(cluster string) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-recommendation-scan", cluster))
+}
+
 // DataLoadJobName returns the deterministic data-loading Job/CronJob name for a
 // named job ("<cluster>-dataload-<job>"). It is the single source of truth for
 // the data-loading workload name shared by the builder (create) and the

@@ -286,6 +286,21 @@ func TestPgxClient_GetQueryHistory_ScanError(t *testing.T) {
 	assert.Contains(t, err.Error(), "scanning query history row")
 }
 
+func TestPgxClient_GetQueryHistory_RowError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "COUNT(*)") {
+			return singleRowResponseTyped([]fieldDesc{int8Field("count")}, []string{"1"})
+		}
+		// Emit a valid row then an ErrorResponse mid-stream to trigger rows.Err().
+		return rowErrorResponse(historyRowFields(), historyRowValues())
+	})
+	defer cleanup()
+
+	_, _, err := client.GetQueryHistory(context.Background(), QueryHistoryFilter{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iterating query history rows")
+}
+
 // ============================================================================
 // GetQueryHistoryDetail
 // ============================================================================
@@ -389,6 +404,19 @@ func TestPgxClient_ExportQueryHistoryCSV_ScanError(t *testing.T) {
 	err := client.ExportQueryHistoryCSV(context.Background(), QueryHistoryFilter{}, &buf)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "scanning query history row for export")
+}
+
+func TestPgxClient_ExportQueryHistoryCSV_RowError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(_ string) []byte {
+		// Emit a valid row then an ErrorResponse mid-stream to trigger rows.Err().
+		return rowErrorResponse(historyRowFields(), historyRowValues())
+	})
+	defer cleanup()
+
+	var buf bytes.Buffer
+	err := client.ExportQueryHistoryCSV(context.Background(), QueryHistoryFilter{}, &buf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iterating query history rows for export")
 }
 
 // failingWriter fails after allowing a fixed number of successful writes.

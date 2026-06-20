@@ -281,6 +281,7 @@ helm-install-test: ## Install operator via Helm in cloudberry-test namespace wit
 		--set oidc.clientID=cloudberry-operator \
 		--set oidc.existingSecret=oidc-client-secret \
 		--set oidc.existingSecretKey=client-secret \
+		-f $(HELM_CHART)/values-local-test.yaml \
 		--wait --timeout 5m
 
 .PHONY: helm-install-test-scenario82

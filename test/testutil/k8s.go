@@ -159,6 +159,8 @@ type MockDBClient struct {
 	AnalyzeFunc                       func(ctx context.Context, table string) error
 	ReindexFunc                       func(ctx context.Context, opts db.ReindexOptions) error
 	GetDiskUsageFunc                  func(ctx context.Context, database string) ([]db.DiskUsage, error)
+	GetDiskUsagePercentFunc           func(ctx context.Context) (int32, error)
+	GetClusterDataSizeBytesFunc       func(ctx context.Context) (int64, error)
 	GetReplicationLagFunc             func(ctx context.Context) (int64, error)
 	PromoteStandbyFunc                func(ctx context.Context) error
 	GetMaxConnectionsFunc             func(ctx context.Context) (int32, error)
@@ -201,7 +203,18 @@ type MockDBClient struct {
 	ExportQueryHistoryCSVFunc         func(ctx context.Context, filter db.QueryHistoryFilter, w io.Writer) error
 	CleanupQueryHistoryFunc           func(ctx context.Context, retention time.Duration) (int64, error)
 	MoveQueryToResourceGroupFunc      func(ctx context.Context, pid int32, targetGroup string) error
-	Closed                            bool
+	// Scenario-117 recommendation-scan hooks: each returns the configured
+	// per-type recommendations (or an error) so the controller's
+	// count/metric/invariant behavior can be exercised. When nil the default is
+	// (empty, nil) — an honest zero-rec scan.
+	GetBloatRecommendationsFunc      func(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error)
+	GetSkewRecommendationsFunc       func(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error)
+	GetAgeRecommendationsFunc        func(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error)
+	GetIndexBloatRecommendationsFunc func(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error)
+	// GetTablesFunc, when set, lets tests stub the per-table storage listing
+	// (Scenario 119 P.2). When nil the default is (empty, nil).
+	GetTablesFunc func(ctx context.Context) ([]db.TableStorageInfo, error)
+	Closed        bool
 }
 
 // Ping implements db.Client.
@@ -496,29 +509,69 @@ func (m *MockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInf
 	return []db.DiskUsageInfo{}, nil
 }
 
+// GetDiskUsagePercent implements db.Client. By default it returns (0, nil);
+// Scenario-116 tests set GetDiskUsagePercentFunc to inject a measured value or
+// an error (e.g. db.ErrDiskUsageUnavailable).
+func (m *MockDBClient) GetDiskUsagePercent(ctx context.Context) (int32, error) {
+	if m.GetDiskUsagePercentFunc != nil {
+		return m.GetDiskUsagePercentFunc(ctx)
+	}
+	return 0, nil
+}
+
+// GetClusterDataSizeBytes implements db.Client. By default it returns (0, nil);
+// Scenario-116 tests set GetClusterDataSizeBytesFunc to inject a logical cluster
+// data size used by the portable disk-usage fallback proxy.
+func (m *MockDBClient) GetClusterDataSizeBytes(ctx context.Context) (int64, error) {
+	if m.GetClusterDataSizeBytesFunc != nil {
+		return m.GetClusterDataSizeBytesFunc(ctx)
+	}
+	return 0, nil
+}
+
 // GetBloatRecommendations implements db.Client.
-func (m *MockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *MockDBClient) GetBloatRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	if m.GetBloatRecommendationsFunc != nil {
+		return m.GetBloatRecommendationsFunc(ctx, th)
+	}
 	return []db.Recommendation{}, nil
 }
 
 // GetSkewRecommendations implements db.Client.
-func (m *MockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *MockDBClient) GetSkewRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	if m.GetSkewRecommendationsFunc != nil {
+		return m.GetSkewRecommendationsFunc(ctx, th)
+	}
 	return []db.Recommendation{}, nil
 }
 
 // GetAgeRecommendations implements db.Client.
-func (m *MockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *MockDBClient) GetAgeRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	if m.GetAgeRecommendationsFunc != nil {
+		return m.GetAgeRecommendationsFunc(ctx, th)
+	}
 	return []db.Recommendation{}, nil
 }
 
 // GetIndexBloatRecommendations implements db.Client.
-func (m *MockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *MockDBClient) GetIndexBloatRecommendations(ctx context.Context, th db.RecommendationThresholds) ([]db.Recommendation, error) {
+	if m.GetIndexBloatRecommendationsFunc != nil {
+		return m.GetIndexBloatRecommendationsFunc(ctx, th)
+	}
 	return []db.Recommendation{}, nil
 }
 
 // TriggerRecommendationScan implements db.Client.
 func (m *MockDBClient) TriggerRecommendationScan(_ context.Context) error {
 	return nil
+}
+
+// GetTables implements db.Client.
+func (m *MockDBClient) GetTables(ctx context.Context) ([]db.TableStorageInfo, error) {
+	if m.GetTablesFunc != nil {
+		return m.GetTablesFunc(ctx)
+	}
+	return []db.TableStorageInfo{}, nil
 }
 
 // GetTableDetails implements db.Client.

@@ -411,6 +411,10 @@ func (in *CloudberryClusterStatus) DeepCopyInto(out *CloudberryClusterStatus) {
 		*out = new(DataLoadingStatus)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.LastRecommendationScanTime != nil {
+		in, out := &in.LastRecommendationScanTime, &out.LastRecommendationScanTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

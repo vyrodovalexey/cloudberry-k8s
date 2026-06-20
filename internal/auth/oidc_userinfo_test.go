@@ -29,6 +29,13 @@ type authObsRecorder struct {
 	discoveries    []string
 	verifyDuration int
 	attempts       []string
+	userinfos      []string
+}
+
+func (r *authObsRecorder) RecordOIDCUserinfo(result string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.userinfos = append(r.userinfos, result)
 }
 
 func (r *authObsRecorder) RecordOIDCDiscovery(result string) {
@@ -215,6 +222,58 @@ func TestOIDCProvider_IDTokenSourceRegression(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, PermissionAdmin, identity.Permission)
 	assert.Equal(t, int32(0), f.userinfoCalls.Load(), "userinfo must not be called for id_token source")
+}
+
+// TestOIDCProvider_RecordUserinfo verifies the recordUserinfo helper: it is a
+// nil-safe no-op without a recorder and forwards the result to a configured
+// recorder (covers the non-nil branch at oidc.go:285).
+func TestOIDCProvider_RecordUserinfo(t *testing.T) {
+	// Nil recorder: must not panic and must be a no-op.
+	t.Run("nil recorder is safe", func(t *testing.T) {
+		p := &OIDCProvider{}
+		assert.NotPanics(t, func() {
+			p.recordUserinfo("success")
+			p.recordUserinfo("error")
+		})
+	})
+
+	// Non-nil recorder: results are forwarded.
+	t.Run("forwards results to recorder", func(t *testing.T) {
+		rec := &authObsRecorder{}
+		p := &OIDCProvider{}
+		p.SetRecorder(rec)
+
+		p.recordUserinfo("success")
+		p.recordUserinfo("error")
+
+		assert.Equal(t, []string{"success", "error"}, rec.userinfos)
+	})
+}
+
+// TestOIDCProvider_UserinfoMetricViaAuthenticate drives the real UserInfo
+// fetch path end-to-end with a configured recorder, asserting the success and
+// error outcomes are recorded through recordUserinfo.
+func TestOIDCProvider_UserinfoMetricViaAuthenticate(t *testing.T) {
+	rec := &authObsRecorder{}
+
+	// Success: userinfo endpoint returns 200 with admin roles.
+	f := newUserinfoFixture(t)
+	f.provider.SetRecorder(rec)
+	_, err := f.provider.Authenticate(context.Background(), f.bearerRequest(t, nil))
+	require.NoError(t, err)
+
+	// Error: userinfo endpoint returns 500 (fetch fails -> "error" recorded).
+	fErr := newUserinfoFixture(t)
+	fErr.provider.SetRecorder(rec)
+	fErr.userinfoCode.Store(http.StatusInternalServerError)
+	_, err = fErr.provider.Authenticate(context.Background(), fErr.bearerRequest(t,
+		map[string]interface{}{
+			"realm_access": map[string]interface{}{"roles": []interface{}{"viewer"}},
+		}))
+	require.NoError(t, err)
+
+	assert.Contains(t, rec.userinfos, "success")
+	assert.Contains(t, rec.userinfos, "error")
 }
 
 // TestLazyOIDCProvider_DiscoveryMetric verifies C-8: discovery attempts are

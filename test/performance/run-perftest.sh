@@ -206,7 +206,7 @@ parse_args() {
 
 # Validate the scenario name
 validate_scenario() {
-    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "scenario87" "scenario88" "scenario105" "custom")
+    local valid_scenarios=("smoke" "baseline" "stress" "endurance" "scenario87" "scenario88" "scenario105" "scenario113" "scenario114" "scenario115" "scenario116" "scenario117" "scenario118" "scenario119" "scenario120" "scenario121" "scenario122" "custom")
     local found=false
 
     for s in "${valid_scenarios[@]}"; do
@@ -237,6 +237,36 @@ get_config_file() {
             ;;
         scenario105)
             echo "scenarios/scenario105-pxf-status.yaml"
+            ;;
+        scenario113)
+            echo "scenarios/scenario113-storage-recommendation.yaml"
+            ;;
+        scenario114)
+            echo "scenarios/scenario114-storage-defaults.yaml"
+            ;;
+        scenario115)
+            echo "scenarios/scenario115-recommendation-scan.yaml"
+            ;;
+        scenario116)
+            echo "scenarios/scenario116-disk-usage.yaml"
+            ;;
+        scenario117)
+            echo "scenarios/scenario117-recommendation-scan.yaml"
+            ;;
+        scenario118)
+            echo "scenarios/scenario118-scan-duration.yaml"
+            ;;
+        scenario119)
+            echo "scenarios/scenario119-storage-api.yaml"
+            ;;
+        scenario120)
+            echo "scenarios/scenario120-usage-report.yaml"
+            ;;
+        scenario121)
+            echo "scenarios/scenario121-storage-cli.yaml"
+            ;;
+        scenario122)
+            echo "scenarios/scenario122-disabled-states.yaml"
             ;;
         custom)
             echo "load.yaml"
@@ -453,6 +483,46 @@ print_test_summary() {
             echo -e "  ${CYAN}Scenario 105: PXF status read-polling at 50 RPS for 2 minutes${NC}"
             echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
             ;;
+        scenario113)
+            echo -e "  ${CYAN}Scenario 113: Storage-recommendation webhook baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario114)
+            echo -e "  ${CYAN}Scenario 114: Storage-recommendation mutating-webhook defaults at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario115)
+            echo -e "  ${CYAN}Scenario 115: Recommendation-scan CronJob builder baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario116)
+            echo -e "  ${CYAN}Scenario 116: Disk-usage measurement baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario117)
+            echo -e "  ${CYAN}Scenario 117: Recommendation-scan (4-type threshold-aware) baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario118)
+            echo -e "  ${CYAN}Scenario 118: Scan-duration enforcement (C.10 cap + truncation) baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario119)
+            echo -e "  ${CYAN}Scenario 119: Storage REST API (disk-usage, tables, recommendations, usage-report) at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario120)
+            echo -e "  ${CYAN}Scenario 120: Usage-report with per-table enrichment at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario121)
+            echo -e "  ${CYAN}Scenario 121: Storage CLI (all 6 endpoints: disk-usage, tables, detail, recommendations, scan, usage-report) at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
+        scenario122)
+            echo -e "  ${CYAN}Scenario 122: Disabled-states clear-on-disable (clearRecommendations + clearStorageSignals) baseline at 50 RPS for 2 minutes${NC}"
+            echo -e "  Expected: p95 < 300ms, p99 < 1000ms, errors < 0.5%"
+            ;;
     esac
     echo ""
 }
@@ -662,6 +732,66 @@ analyze_results() {
             evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
             ;;
         scenario105)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario113)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario114)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario115)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario116)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario117)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario118)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario119)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario120)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario121)
+            evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
+            evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
+            evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
+            evaluate_slo "Error Rate %" "$error_rate" "0.5" "< 0.5%"
+            ;;
+        scenario122)
             evaluate_slo "p50 Latency" "$p50" "100000" "< 100ms"
             evaluate_slo "p95 Latency" "$p95" "300000" "< 300ms"
             evaluate_slo "p99 Latency" "$p99" "1000000" "< 1000ms"
@@ -1121,6 +1251,56 @@ run_hey() {
             concurrency=10
             ;;
         scenario105)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario113)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario114)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario115)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario116)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario117)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario118)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario119)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario120)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario121)
+            duration=120
+            rps=50
+            concurrency=10
+            ;;
+        scenario122)
             duration=120
             rps=50
             concurrency=10

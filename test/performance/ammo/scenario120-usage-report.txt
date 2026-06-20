@@ -1,0 +1,10 @@
+[Host: localhost:8190]
+[User-Agent: yandex-tank/scenario120-perftest]
+[Authorization: Basic YWRtaW46YWRtaW4=]
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2026-05
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2026-05
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2026-04
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2026-05
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default
+/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2026-05

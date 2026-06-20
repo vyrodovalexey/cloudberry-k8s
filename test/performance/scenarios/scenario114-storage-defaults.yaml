@@ -1,0 +1,63 @@
+# =============================================================================
+# Scenario 114 — Storage Recommendation Mutating Webhook Defaults Performance
+# =============================================================================
+#
+# Purpose: Measure the mutating webhook admission latency and throughput for
+#          CloudberryCluster CRs with storage.recommendationScan defaults
+#          (D.1–D.6). The mutating webhook (setStorageManagementDefaults) is on
+#          the admission hot path; this scenario confirms the defaulting pass
+#          does not regress the operator's health/metrics baseline.
+#
+# Profile: Ramp to 50 RPS over 30s, hold for 2 minutes
+# Expected: p95 < 300ms, p99 < 1000ms, error rate < 0.5%
+# Duration: ~3 minutes (ramp-up + constant)
+#
+# NOTE: This scenario uses the operator's health/metrics endpoints as a proxy
+# for mutating webhook admission performance. For actual defaulting latency,
+# use the Go benchmarks in internal/webhook/scenario114_benchmark_test.go or
+# the kubectl dry-run approach in test/perf/scenario114_*.
+#
+# SLO Targets (health/metrics baseline regression check):
+#   - p50 latency:  < 100ms
+#   - p95 latency:  < 300ms
+#   - p99 latency:  < 1000ms
+#   - Error rate:   < 0.5%
+#
+# Usage:
+#   ./run-perftest.sh --scenario scenario114
+#   ./run-perftest.sh --scenario scenario114 --hey --port-forward
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/scenario114-health-baseline.txt
+  load_profile:
+    load_type: rps
+    # Warmup: ramp from 1 to 25 RPS over 30 seconds
+    # Ramp: increase from 25 to 50 RPS over 30 seconds
+    # Sustain: hold 50 RPS for 2 minutes (120 seconds)
+    schedule: line(1, 25, 30s) line(25, 50, 30s) const(50, 120s)
+  timeout: 5s
+  instances: 100
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    # Stop if average response time exceeds 2 seconds for 20 seconds
+    - time(2000, 20s)
+    # Stop if 5xx error rate exceeds 5% for 10 seconds
+    - http(5xx, 5%, 10s)
+    # Stop if 4xx error rate exceeds 30% for 10 seconds
+    - http(4xx, 30%, 10s)
+    # Stop if network errors exceed 5% for 10 seconds
+    - net(xx, 5%, 10s)
+    # Stop if 99th percentile exceeds 3 seconds for 20 seconds
+    - quantile(99, 3000, 20s)
+
+console:
+  enabled: true
+  short_only: false

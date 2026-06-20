@@ -57,9 +57,10 @@ import (
 //       HC.5  raise diskMinFreeMB    → lower diskMinFreeMB / free scratch
 //
 // HONESTY per HC:
-//   - HC.1 is a DB-PROXY probe; if pxf_version() still resolves with PXF stopped
-//     the honest proof is "the job fails when PXF is down". Marked config-only if
-//     stopping PXF on a segment is not cleanly reproducible.
+//   - HC.1 is a DB-PROXY probe; the pg_proc pxf_read catalog row still resolves
+//     with the PXF agent stopped, so the honest proof is "the job fails when PXF
+//     is down". Marked config-only if stopping PXF on a segment is not cleanly
+//     reproducible.
 //   - HC.2 is the DETERMINISTIC, fully live-provable headline (drop/create table).
 //   - HC.5: the most deterministic mechanism is patching diskMinFreeMB above the
 //     emptyDir free space (no fill needed); filling the scratch is the fallback.
@@ -663,9 +664,10 @@ func (s *Scenario104E2ESuite) TestE2E_Scenario104_LiveHC2_TableExists() {
 
 // TestE2E_Scenario104_LiveHC1_PXFReadiness (104-HC1-L-fail / -restore) stops PXF
 // on a segment → the s3-load init's DB-proxy HC.1 (or the subsequent load) fails
-// → Job Failed + Event; restart PXF → restore. HONEST: HC.1 is a DB proxy; if
-// pxf_version() still resolves with PXF stopped, the proof is "the job fails when
-// PXF is down". Config-only if stopping PXF is not cleanly reproducible.
+// → Job Failed + Event; restart PXF → restore. HONEST: HC.1 is a DB proxy; the
+// pg_proc pxf_read catalog row still resolves with PXF stopped, so the proof is
+// "the job fails when PXF is down". Config-only if stopping PXF is not cleanly
+// reproducible.
 func (s *Scenario104E2ESuite) TestE2E_Scenario104_LiveHC1_PXFReadiness() {
 	s.scenario104PrepareLive()
 
@@ -701,8 +703,8 @@ func (s *Scenario104E2ESuite) TestE2E_Scenario104_LiveHC1_PXFReadiness() {
 	failed := s.scenario104WaitJobFailed(runJob)
 	if !failed {
 		s.T().Logf("scenario104 HC.1: the s3-load Job did NOT fail with PXF stopped — HONEST " +
-			"DB-proxy nuance: pxf_version() may still resolve when the agent is down. The " +
-			"behavioral proof requires PXF to be genuinely unreachable from the coordinator.")
+			"DB-proxy nuance: the pg_proc pxf_read catalog row may still resolve when the agent " +
+			"is down. The behavioral proof requires PXF to be genuinely unreachable from the coordinator.")
 	} else {
 		assert.True(s.T(), s.scenario104InitFailedEventPresent(),
 			"HC.1: a DataLoadingHealthCheckFailed Event must be emitted when PXF is down")

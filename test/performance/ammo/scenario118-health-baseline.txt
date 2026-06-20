@@ -1,0 +1,7 @@
+[Host: localhost:8190]
+[User-Agent: yandex-tank/scenario118-perftest]
+/healthz
+/readyz
+/healthz
+/readyz
+/healthz

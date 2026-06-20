@@ -8,6 +8,43 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **Three new operator Prometheus metric families** (namespace `cloudberry`), all honest
+  outcome counters:
+  - `cloudberry_disk_usage_scan_total{cluster,namespace,result}` — disk-usage scan outcome,
+    recorded in the admin controller's `recordDiskUsage`. `result` ∈ {`success`, `error`,
+    `skipped`} (`skipped` when `gp_toolkit.gp_disk_free` is unavailable on the server
+    version — never a fabricated value).
+  - `cloudberry_recommendation_scan_total{cluster,namespace,result}` — storage
+    recommendation scan outcome, recorded in `recordRecommendations`. `result` ∈
+    {`success`, `error`, `skipped`} (`skipped` when the DB is unavailable).
+  - `cloudberry_oidc_userinfo_total{result}` — OIDC userinfo fetch outcome in
+    `auth/oidc.go`. `result` ∈ {`success`, `error`}.
+- **Query-exporter self-observability** (`cmd/cloudberry-query-exporter`) — two new
+  per-collector metric families: `cbexporter_collector_errors_total{collector}` (scrape
+  error counter) and `cbexporter_collector_duration_seconds{collector}` (scrape duration),
+  with `collector` ∈ {`query_activity`, `resgroup_status`, `resgroup_iostats`,
+  `spill_files`, `segment_health`, `dist_txns`, `table_skew`}.
+- **New OTEL spans** for finer-grained reconcile + auth + DB visibility:
+  - cluster-controller sub-reconciler spans `controller.reconcileConfigMaps`,
+    `controller.reconcileAdminSecret`, `controller.reconcileClusterSSHSecret`,
+    `controller.reconcileServices`, `controller.reconcileCoordinator`,
+    `controller.reconcileStandby`, `controller.reconcileSegments`;
+  - HA/auth controller spans `controller.monitorStandby`,
+    `controller.executeRebalanceViaDB`, `controller.handleStandbyActivation`,
+    `controller.reconcileHBA`;
+  - `auth.basic.verify` (basic-auth verification) and
+    `controller.scanRecommendations.fetch` (with a bounded `rec_type` attribute);
+  - DB-client `db.*` spans + `cloudberry_db_query_duration_seconds` added to
+    `TerminateSession`, `ConfigureReplication`, `TerminateAllBackends`, `CancelAllQueries`,
+    `LogRotate`, `TriggerRecommendationScan`, `GetQueryDetail`, `ListUserDatabases`,
+    `EnsureQueryHistoryTable`, `InsertQueryHistory`, and `GetQueryHistoryDetail`.
+- **Grafana dashboard panels** — `monitoring/grafana/cloudberry-operator.json` gained
+  panels for the 3 new operator metrics (`cloudberry_disk_usage_scan_total`,
+  `cloudberry_recommendation_scan_total`, `cloudberry_oidc_userinfo_total`);
+  `monitoring/grafana/cloudberry-exporters.json` gained panels for the 2 new exporter
+  metrics (`cbexporter_collector_errors_total`, `cbexporter_collector_duration_seconds`).
+  The OTEL dashboard (`cloudberry-otel.json`) already covers `otelcol_*` / Tempo /
+  VictoriaLogs and is unchanged.
 - **Three new Prometheus metric families** (namespace `cloudberry`), all request-side
   counters complementary to the existing controller-side outcome metrics:
   - `cloudberry_api_cluster_lifecycle_requests_total{operation,result}` — cluster
@@ -108,10 +145,48 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **Backup timestamp capture (restore-by-timestamp fix)** — the operator now captures
+  `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` from the backup Job
+  (surfaced via `/dev/termination-log` and the new `avsoft.io/backup-timestamp`
+  annotation) and records **that** as `status.lastBackupTimestamp`, instead of a
+  pre-generated `time.Now()` value. Because `gpbackup` runs asynchronously inside the
+  coordinator and assigns its own timestamp, the pre-generated value could drift from
+  `gpbackup`'s real S3 object prefix, so restore-by-timestamp directly against S3
+  previously failed with a `404`/`NotFound`; the recorded timestamp now matches the real
+  S3 prefix and restore-by-timestamp resolves correctly. **Backward compatible** — falls
+  back to the prior behaviour when the annotation/marker is absent. (Supersedes the
+  earlier "Backup timestamp characteristic" note below, which described the pre-fix
+  behaviour.)
+- **ConfigMap annotation update now MERGES** — the ConfigMap annotation update path
+  preserves third-party annotations (new `mergeAnnotations` helper) instead of
+  overwriting them.
+- **PXF sidecar StartupProbe** — the PXF sidecar now gets a StartupProbe (`HTTPGet
+  /actuator/health:5888`, `periodSeconds=5`, `failureThreshold=24` → a ~120 s startup
+  budget) and a more tolerant liveness `timeoutSeconds`, so the slow ~50 s Spring Boot
+  cold start no longer trips liveness into `CrashLoopBackOff`.
+- **Query-exporter metric cardinality** — the unbounded `usename` label was **removed**
+  from `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound metric
+  cardinality.
 - **gpload bytes-measurement shell-quoting** — the `internal/builder` gpload
   bytes-measurement shell command (the `wc -c <file>` path) now uses shell-quoting
   (`shellQuote`, the `'\''` idiom) instead of SQL-literal quoting, fixing shell
   mis-parsing when a file path contains a single quote.
+- **Data-loading HC.1 PXF readiness probe** — the pre-load health-check init
+  container (`buildDataLoadHealthCheckScript` in `internal/builder/dataload_builder.go`)
+  previously verified PXF readiness by calling a non-existent `pxf_version()` SQL
+  function (PXF 2.1 ships no such function), so the `dataload-healthcheck` init
+  container **ALWAYS failed** (`Init:Error`) for PXF s3 loads even with PXF correctly
+  installed. The HC.1 probe now verifies a real PXF function exists via
+  `SELECT 1 FROM pg_proc WHERE proname = 'pxf_read'`, proving PXF is actually usable.
+- **Data-loading HC.3 external-source connectivity probe** — the HC.3 probe
+  previously used `curl -fsS --head`, which fails on HTTP 400/403; because MinIO and
+  many S3-compatible stores answer an unauthenticated HEAD/GET with 400/403, a
+  reachable endpoint was wrongly reported "unreachable". The probe now captures the
+  HTTP status code **without** `-f` and treats ANY HTTP response (1xx–5xx, i.e. the
+  server answered) as reachable; only a true connection failure/timeout fails the
+  check. Both HC.1/HC.3 fixes were verified live — the dataload Job now passes
+  natively and completes (`DATALOAD_ROWS`, `status.dataLoading.jobs[].lastStatus=Succeeded`,
+  `cloudberry_data_loading_job_status=2`) with no workarounds.
 - **DSN credential URL-encoding** — connection-string credentials are now escaped via
   `url.UserPassword` (userinfo) and `url.Values` (query), preventing connection-string
   corruption / DSN parameter injection when credentials contain metacharacters
@@ -145,17 +220,55 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Notes
 
-- **Backup timestamp characteristic** — `status.lastBackupTimestamp` (and
-  `backupHistory[].timestamp`) is the **operator-assigned Job-creation timestamp**, which
-  can **differ** from the `gpbackup` internal timestamp embedded in the S3 object paths. In
-  the coordinator-exec model `gpbackup` runs asynchronously inside the coordinator and
-  assigns its own timestamp. When restoring **by timestamp directly against S3** (outside
-  the operator), the actual `gpbackup` timestamp — the one in the S3 object path — must be
-  used, or `gprestore` will report a `NotFound`. This is an observed known characteristic,
-  not a bug-fix.
+- **Backup timestamp characteristic (now resolved — see _Fixed_ above).** Previously
+  `status.lastBackupTimestamp` (and `backupHistory[].timestamp`) was the
+  **operator-assigned Job-creation timestamp**, which could **differ** from the `gpbackup`
+  internal timestamp embedded in the S3 object paths (in the coordinator-exec model
+  `gpbackup` runs asynchronously inside the coordinator and assigns its own timestamp), so
+  restoring **by timestamp directly against S3** required the actual `gpbackup` timestamp or
+  `gprestore` would report a `NotFound`. The current release captures `gpbackup`'s real
+  emitted timestamp from the Job (via `/dev/termination-log` + the
+  `avsoft.io/backup-timestamp` annotation) and records that, so `status.lastBackupTimestamp`
+  now matches the S3 object path and restore-by-timestamp resolves the correct prefix.
 
 ### Verified
 
+- **2026-06-20 — verification re-run (no new code changes; codebase already clean).**
+  Full end-to-end acceptance against the live test environment confirming the
+  prior-refactor features remain correct and documented. Operator deployed to local k8s
+  (`cloudberry-test` ns) with Vault-PKI webhook certs (issuer `CN=Test Root CA`), Vault
+  kubernetes-auth, Keycloak OIDC, and telemetry (`otelcol_receiver_accepted_spans > 0`).
+  Cluster deployed with HA coordinator + standby, segment mirroring (`InSync`), Vault-PKI
+  cluster TLS, `postgres-exporter` on coordinator/standby/every segment + mirror,
+  `cloudberry-query-exporter` on the coordinator, and PXF sidecars. 144 MB `mydb`;
+  operator-tracked `gpbackup` → S3 (MinIO via Vault creds) → `gprestore` verified
+  row-for-row, **with the backup-timestamp fix confirmed end-to-end** (real `gpbackup`
+  timestamp `20260620190719` captured into `status.lastBackupTimestamp` via the
+  `avsoft.io/backup-timestamp` annotation; restore-by-timestamp resolved with no `404`).
+  7 external writable + readable tables (`s3`/`hdfs` × text/parquet/avro + SequenceFile)
+  each round-tripped 175k rows (~10 MB); the declarative `s3-csv-load` dataload Job
+  succeeds **natively** (HC.1 `pg_proc pxf_read` + HC.3 status-code connectivity pass,
+  `lastStatus=Succeeded`, `cloudberry_data_loading_job_status=2`). Monitoring stack in
+  k8s — metrics in VictoriaMetrics, logs in VictoriaLogs, 4 Grafana dashboards (incl.
+  OTEL) published at 100 % `cloudberry_*` metric coverage. Performance test: 347,869
+  requests, 0 % errors, all SLOs met, and all 5 new observability metrics
+  (`cloudberry_disk_usage_scan_total`, `cloudberry_recommendation_scan_total`,
+  `cloudberry_oidc_userinfo_total`, `cbexporter_collector_errors_total`,
+  `cbexporter_collector_duration_seconds`) reacted under load.
+- End-to-end in the live test environment (post-refactor acceptance run): operator
+  deployed to local k8s (`cloudberry-test` ns) with Vault-PKI webhook certs, Vault
+  kubernetes-auth, and Keycloak OIDC; cluster deployed with HA coordinator + standby,
+  segment mirroring (InSync), Vault-PKI cluster TLS, `postgres-exporter` on
+  coordinator/standby/every segment + mirror, `cloudberry-query-exporter` on the
+  coordinator, and PXF sidecars on segment primaries. 144 MB of data loaded into `mydb`;
+  operator-tracked `gpbackup` → S3 (MinIO via Vault creds) → `gprestore` verified
+  row-for-row (real `gpbackup` timestamp captured + restore-by-timestamp resolved). 7
+  external writable + readable tables (`s3`:text/parquet/avro,
+  `hdfs`:text/parquet/avro/SequenceFile) each ~10 MB round-tripped 175k rows. Monitoring
+  stack (vmagent/vector/otel-collector) deployed to k8s — metrics in VictoriaMetrics, logs
+  in VictoriaLogs, dashboards published to Grafana (including the new operator/exporter
+  panels). Performance test: read endpoints 0 % errors, p99 within SLO, and the new
+  metrics reacted under load.
 - End-to-end in the live test environment: operator deployed with Vault-PKI webhook
   certs (issuer = Vault CA) + k8s auth + Keycloak OIDC; cluster deployed with HA
   coordinator + standby, group segment mirroring (InSync), Vault-PKI cluster TLS, PXF

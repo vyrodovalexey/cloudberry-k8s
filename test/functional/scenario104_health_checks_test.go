@@ -220,10 +220,13 @@ func (s *Scenario104Suite) TestFunctional_Scenario104_PxfScriptChecks() {
 	require.NotNil(s.T(), init)
 	script := init.Args[0]
 
-	// HC.1 DB-proxy PXF-readiness (NOT a direct sidecar curl).
+	// HC.1 DB-proxy PXF-readiness (NOT a direct sidecar curl). PXF 2.1 has no
+	// pxf_version(); readiness is proven via a real PXF function in pg_proc.
 	assert.Contains(s.T(), script, "pg_extension")
 	assert.Contains(s.T(), script, "extname='pxf'")
-	assert.Contains(s.T(), script, "pxf_version()")
+	assert.Contains(s.T(), script, "pg_proc")
+	assert.Contains(s.T(), script, "proname = 'pxf_read'")
+	assert.NotContains(s.T(), script, "pxf_version()")
 	assert.Contains(s.T(), script, "HC.1 FAIL")
 	assert.NotContains(s.T(), script, "actuator/health",
 		"HC.1 is a DB proxy, NOT a direct sidecar curl")
@@ -233,8 +236,12 @@ func (s *Scenario104Suite) TestFunctional_Scenario104_PxfScriptChecks() {
 	assert.Contains(s.T(), script, "tbl='"+cases.Scenario104TargetTable+"'")
 	assert.Contains(s.T(), script, "HC.2 FAIL")
 
-	// HC.3 external connectivity (s3).
-	assert.Contains(s.T(), script, `curl -fsS -m 10 --head "${AWS_S3_ENDPOINT}"`)
+	// HC.3 external connectivity (s3): status-code probe accepts ANY HTTP
+	// response (S3-compatible stores answer unauthenticated GET with 400/403).
+	assert.Contains(s.T(), script,
+		`code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "${AWS_S3_ENDPOINT}/" || true)`)
+	assert.Contains(s.T(), script, `grep -Eq '^[1-5][0-9][0-9]$'`)
+	assert.NotContains(s.T(), script, "--head")
 	assert.Contains(s.T(), script, "HC.3 FAIL")
 
 	// HC.5 disk-space.

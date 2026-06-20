@@ -152,15 +152,24 @@ func (r *AuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 }
 
 // reconcileHBA ensures the pg_hba.conf ConfigMap is in the desired state.
-func (r *AuthReconciler) reconcileHBA(ctx context.Context, cluster *cbv1alpha1.CloudberryCluster) error {
+func (r *AuthReconciler) reconcileHBA(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (err error) {
+	ctx, end := startControllerSpan(ctx, authControllerName, "reconcileHBA")
+	defer func() { end(err) }()
+
 	desired := r.builder.BuildPgHBAConfConfigMap(cluster)
 
 	existing := desired.DeepCopy()
-	err := r.client.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	err = r.client.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	if apierrors.IsNotFound(err) {
 		if createErr := r.client.Create(ctx, desired); createErr != nil {
-			return fmt.Errorf("creating pg_hba.conf configmap: %w", createErr)
+			err = fmt.Errorf("creating pg_hba.conf configmap: %w", createErr)
+			return err
 		}
+		// The NotFound from Get is not an operation error: a create completed.
+		err = nil
 		return nil
 	}
 	if err != nil {
@@ -175,7 +184,8 @@ func (r *AuthReconciler) reconcileHBA(ctx context.Context, cluster *cbv1alpha1.C
 		existing.Data = desired.Data
 		existing.Annotations = desired.Annotations
 		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
-			return fmt.Errorf("updating pg_hba.conf configmap: %w", updateErr)
+			err = fmt.Errorf("updating pg_hba.conf configmap: %w", updateErr)
+			return err
 		}
 		util.LoggerFromContext(ctx).Info("pg_hba.conf updated")
 	}

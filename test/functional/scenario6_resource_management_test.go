@@ -129,19 +129,28 @@ func (m *scenario6MockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.Dat
 func (m *scenario6MockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInfo, error) {
 	return nil, nil
 }
-func (m *scenario6MockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *scenario6MockDBClient) GetDiskUsagePercent(_ context.Context) (int32, error) {
+	return 0, nil
+}
+func (m *scenario6MockDBClient) GetClusterDataSizeBytes(_ context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *scenario6MockDBClient) GetBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *scenario6MockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *scenario6MockDBClient) GetSkewRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *scenario6MockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *scenario6MockDBClient) GetAgeRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
-func (m *scenario6MockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *scenario6MockDBClient) GetIndexBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return nil, nil
 }
 func (m *scenario6MockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
+func (m *scenario6MockDBClient) GetTables(_ context.Context) ([]db.TableStorageInfo, error) {
+	return nil, nil
+}
 func (m *scenario6MockDBClient) GetTableDetails(_ context.Context, _, _ string) (*db.TableDetail, error) {
 	return nil, nil
 }

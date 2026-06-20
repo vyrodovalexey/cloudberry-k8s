@@ -1035,7 +1035,7 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario76-sched
 - `cronJobName` — `{cluster}-backup-schedule`;
 - `backupHistory[]` — each entry carries `timestamp`, `type`, `status`, `size`, and `duration`.
 
-> **14-digit timestamp guarantee.** `lastBackupTimestamp` is always a valid 14-digit `YYYYMMDDHHMMSS`. On-demand Jobs (`{cluster}-backup-<TS>`) keep the timestamp embedded in the Job name; for CronJob-spawned Jobs (`{cluster}-backup-schedule-<hash>`), whose names don't embed a parseable timestamp, the operator derives it from the Job's `CompletionTime` (UTC).
+> **14-digit timestamp guarantee.** `lastBackupTimestamp` is always a valid 14-digit `YYYYMMDDHHMMSS`. The operator prefers `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` captured from the Job (via `/dev/termination-log` and the `avsoft.io/backup-timestamp` annotation), so the recorded value matches `gpbackup`'s S3 object prefix and restore-by-timestamp resolves correctly. When that marker/annotation is absent the operator falls back to the prior source: on-demand Jobs (`{cluster}-backup-<TS>`) keep the timestamp embedded in the Job name, and CronJob-spawned Jobs (`{cluster}-backup-schedule-<hash>`), whose names don't embed a parseable timestamp, derive it from the Job's `CompletionTime` (UTC).
 
 > **Steady-state status refresh.** Backup status (`lastBackup*`, `backupHistory`) is refreshed on the operator's periodic reconcile **even when the cluster spec generation is unchanged**. The CronJob's Job completes asynchronously (no spec change), and the next periodic reconcile discovers it and updates the status — this is what makes scheduled-backup status population work.
 
@@ -2064,16 +2064,18 @@ The `gpbackupOptions` fields:
 `POST /backups/{timestamp}/restore` (Admin). The `{timestamp}` is the 14-digit
 `YYYYMMDDHHMMSS` backup timestamp.
 
-> **Operator timestamp vs. `gpbackup` timestamp.** `status.lastBackupTimestamp` (and each
-> `backupHistory[].timestamp`) is the **operator-assigned Job-creation timestamp**, which
-> can **differ** from the `gpbackup` internal timestamp embedded in the S3 object paths. In
-> the coordinator-exec model `gpbackup` runs asynchronously inside the coordinator and
-> assigns its own timestamp. The operator's `POST /backups/{timestamp}/restore` resolves the
-> correct backup from its recorded history, so restoring **through the operator** is
-> unaffected. But when you restore **by timestamp directly against S3** (a manual
-> `gprestore` outside the operator), you must pass the actual `gpbackup` timestamp — the one
-> in the S3 object path — or `gprestore` will report a `NotFound`. This is an observed known
-> characteristic, not a bug.
+> **Operator timestamp now matches the `gpbackup` timestamp.** The operator captures
+> `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` from the backup Job
+> (surfaced via `/dev/termination-log` and the `avsoft.io/backup-timestamp` annotation) and
+> records **that** as `status.lastBackupTimestamp` (and each `backupHistory[].timestamp`).
+> Because `gpbackup` runs asynchronously inside the coordinator and assigns its own
+> timestamp, an earlier pre-generated `time.Now()` value could **drift** from `gpbackup`'s
+> real S3 object prefix, so restoring **by timestamp directly against S3** (a manual
+> `gprestore` outside the operator) could fail with `NotFound`. With the real timestamp
+> recorded, `status.lastBackupTimestamp` now matches the S3 object path, so both the
+> operator's `POST /backups/{timestamp}/restore` **and** a manual `gprestore` against S3
+> resolve the correct backup. The behaviour is **backward compatible** — when the
+> annotation/marker is absent the operator falls back to the prior timestamp source.
 
 ```bash
 curl -sk -X POST -H "Authorization: Bearer $TOKEN" \
@@ -4866,6 +4868,17 @@ rate(cloudberry_exporter_health_check_total[5m])
 
 > **Note**: Query operations (cancel, move) and exporter health monitoring are verified by Scenario 63. See `test/functional/scenario63_all_rest_api_test.go` and `test/e2e/scenario63_all_rest_api_e2e_test.go` for the full test suite.
 
+### cloudberry-query-exporter Self-Observability Metrics
+
+The `cloudberry-query-exporter` sidecar exposes its own per-collector scrape health on its `/metrics` endpoint, so a failing or slow collector is observable independently of the metrics it emits:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cbexporter_collector_errors_total` | Counter | `collector` | Per-collector scrape error counter. `collector` is one of `query_activity`, `resgroup_status`, `resgroup_iostats`, `spill_files`, `segment_health`, `dist_txns`, `table_skew` |
+| `cbexporter_collector_duration_seconds` | Histogram | `collector` | Per-collector scrape duration, same `collector` label set |
+
+> **Cardinality note**: the unbounded `usename` label was **removed** from `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound the metric series count.
+
 ## Resource Group Management
 
 Resource groups allow you to control how database resources (CPU, memory, concurrency) are allocated across different workloads and roles. You can create resource groups with specific limits, assign database roles to them, and manage their lifecycle through the CLI or REST API.
@@ -6254,7 +6267,11 @@ skipped.
 > sidecar's `PXF_LOG_LEVEL` reflects `pxf.logLevel` and is rebuilt from spec each
 > reconcile. Because every segment-primary sidecar mounts the **same**
 > `<cluster>-pxf-servers` ConfigMap and renders byte-identical configs, **config
-> sync is structural — no explicit `pxf sync` is needed**.
+> sync is structural — no explicit `pxf sync` is needed**. The sidecar carries a
+> **StartupProbe** (`HTTPGet /actuator/health:5888`, `periodSeconds=5`,
+> `failureThreshold=24` → a ~120 s budget) plus a more tolerant liveness
+> `timeoutSeconds`, so the slow ~50 s Spring Boot cold start completes before
+> liveness is evaluated and never trips the sidecar into `CrashLoopBackOff`.
 >
 > **The ingestion runtime is now implemented.** For every enabled
 > `dataLoading.jobs[]` entry the operator **creates and launches** a one-off
@@ -6591,13 +6608,19 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 > **both** PXF/native and gpload Jobs; a failed check **blocks the load** and the
 > Job fails. It runs five gated checks: **HC.1** PXF readiness (PXF jobs — a
 > `psql` **DB-proxy** probe against the coordinator: `SELECT 1` / the `pxf`
-> extension present / `pxf_version()`; it is **not** a direct probe of the
+> extension present / a real PXF function registered
+> (`SELECT 1 FROM pg_proc WHERE proname = 'pxf_read'` — PXF 2.1 ships no
+> `pxf_version()` function, so the probe checks for `pxf_read` to prove PXF is
+> actually usable); it is **not** a direct probe of the
 > segment's PXF sidecar, which the load pod cannot reach — the segment-pod sidecar
 > liveness probe uses `/actuator/health`, and the legacy `/pxf/v15/Status` path
 > 404s and is not used; the live proof is "stop PXF on a segment → the job
 > fails"), **HC.2** the target table exists (`to_regclass`, all jobs), **HC.3**
-> object-store source connectivity (`curl --head ${AWS_S3_ENDPOINT}`; s3-family
-> only, skipped for jdbc/hive/hbase/hdfs), **HC.4** gpfdist reachability
+> object-store source connectivity (captures the HTTP status code from
+> `${AWS_S3_ENDPOINT}/` **without** `curl -f` and accepts ANY HTTP response —
+> 1xx–5xx — as reachable, since MinIO and many S3-compatible stores answer an
+> unauthenticated request with 400/403; only a true connection failure/timeout
+> fails; s3-family only, skipped for jdbc/hive/hbase/hdfs), **HC.4** gpfdist reachability
 > (`curl http://<cluster>-gpfdist-svc:8080/`, gpload jobs when gpfdist enabled),
 > **HC.5** scratch disk space (`df` on `/dataload-scratch` ≥ `diskMinFreeMB`, all
 > jobs). Configure with `dataLoading.healthChecks { enabled (default true; a nil
@@ -6941,6 +6964,8 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_backup_job_status` | Gauge | Per-Job backup status: `0`=pending, `1`=running, `2`=succeeded, `3`=failed (labels: `cluster`, `namespace`, `job`, `operation` = `backup`/`restore`/`cleanup`) |
 | `cloudberry_recommendations_total` | Gauge | Storage recommendations by type, set during a recommendation scan (labels: `cluster`, `namespace`, `type`) |
 | `cloudberry_recommendation_scan_duration_seconds` | Histogram | Recommendation scan duration in seconds (labels: `cluster`, `namespace`) |
+| `cloudberry_disk_usage_scan_total` | Counter | Disk-usage scan outcome recorded by the admin controller's `recordDiskUsage` (labels: `cluster`, `namespace`, `result` = `success`/`error`/`skipped`). `skipped` when `gp_toolkit.gp_disk_free` is unavailable on the server version — never a fabricated value |
+| `cloudberry_recommendation_scan_total` | Counter | Storage-recommendation scan outcome recorded by `recordRecommendations` (labels: `cluster`, `namespace`, `result` = `success`/`error`/`skipped`). `skipped` when the DB is unavailable |
 | `cloudberry_table_bloat_ratio` | Gauge | Dead-tuple bloat ratio for the top-N most-bloated tables, populated from storage recommendation scans (labels: `cluster`, `namespace`, `table`) |
 | `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |
 
@@ -6959,6 +6984,7 @@ Every REST API request is recorded by a metrics middleware. The `route` label is
 | `cloudberry_log_stream_sessions_total` | Counter | `result` | Backup-Job log streaming sessions (`success`/`error`) |
 | `cloudberry_log_stream_bytes_total` | Counter | — | Bytes streamed to log stream clients |
 | `cloudberry_oidc_discovery_total` | Counter | `result` | OIDC provider discovery attempts |
+| `cloudberry_oidc_userinfo_total` | Counter | `result` | OIDC userinfo fetch outcome (`success`/`error`), recorded in `auth/oidc.go` |
 | `cloudberry_auth_token_verify_duration_seconds` | Histogram | — | Bearer token verification latency (JWKS fetch + signature check) |
 | `cloudberry_session_terminations_total` | Counter | `cluster`, `namespace`, `result` | Session terminations requested via the API (`pg_terminate_backend`) |
 

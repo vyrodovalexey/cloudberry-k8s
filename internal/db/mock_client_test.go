@@ -62,12 +62,17 @@ type fullMockDBClient struct {
 	stopDataLoadErr        error
 	listDataLoadErr        error
 	getStorageDiskErr      error
+	diskUsagePercent       int32
+	getDiskUsagePercentErr error
+	clusterDataSizeBytes   int64
+	getClusterDataSizeErr  error
 	getBloatErr            error
 	getSkewErr             error
 	getAgeErr              error
 	getIndexBloatErr       error
 	triggerRecScanErr      error
 	getTableDetailsErr     error
+	getTablesErr           error
 	getUsageReportErr      error
 	initMirrorsErr         error
 	configRepErr           error
@@ -109,6 +114,7 @@ type fullMockDBClient struct {
 	ageRecs            []Recommendation
 	indexBloatRecs     []Recommendation
 	tableDetail        *TableDetail
+	tables             []TableStorageInfo
 	usageReport        []UsageReportEntry
 	mirrorSyncInfos    []MirrorSyncInfo
 	terminatedBackends int32
@@ -225,20 +231,29 @@ func (m *fullMockDBClient) ListDataLoadingJobs(_ context.Context) ([]DataLoading
 func (m *fullMockDBClient) GetStorageDiskUsage(_ context.Context) ([]DiskUsageInfo, error) {
 	return m.storageDiskUsages, m.getStorageDiskErr
 }
-func (m *fullMockDBClient) GetBloatRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *fullMockDBClient) GetDiskUsagePercent(_ context.Context) (int32, error) {
+	return m.diskUsagePercent, m.getDiskUsagePercentErr
+}
+func (m *fullMockDBClient) GetClusterDataSizeBytes(_ context.Context) (int64, error) {
+	return m.clusterDataSizeBytes, m.getClusterDataSizeErr
+}
+func (m *fullMockDBClient) GetBloatRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return m.bloatRecs, m.getBloatErr
 }
-func (m *fullMockDBClient) GetSkewRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *fullMockDBClient) GetSkewRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return m.skewRecs, m.getSkewErr
 }
-func (m *fullMockDBClient) GetAgeRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *fullMockDBClient) GetAgeRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return m.ageRecs, m.getAgeErr
 }
-func (m *fullMockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *fullMockDBClient) GetIndexBloatRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return m.indexBloatRecs, m.getIndexBloatErr
 }
 func (m *fullMockDBClient) TriggerRecommendationScan(_ context.Context) error {
 	return m.triggerRecScanErr
+}
+func (m *fullMockDBClient) GetTables(_ context.Context) ([]TableStorageInfo, error) {
+	return m.tables, m.getTablesErr
 }
 func (m *fullMockDBClient) GetTableDetails(_ context.Context, s, t string) (*TableDetail, error) {
 	if m.tableDetail != nil {

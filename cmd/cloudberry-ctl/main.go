@@ -2871,7 +2871,41 @@ func printBackupJobLogsFallback(cmd *cobra.Command, job string, cause error) {
 		cause, ns, job)
 }
 
-// newStorageCmd creates the storage management command group.
+// resolveTableDetail resolves the schema and table for the L.3
+// "storage tables detail" command. Flags take precedence when non-empty;
+// otherwise it falls back to the positional args (args[0]=schema,
+// args[1]=table). Both must resolve to a non-empty value, else a clear usage
+// error is returned BEFORE any HTTP call so no half-built /tables// request is
+// issued.
+func resolveTableDetail(flagSchema, flagTable string, args []string) (schema, table string, err error) {
+	schema = flagSchema
+	table = flagTable
+	if schema == "" && len(args) >= 1 {
+		schema = args[0]
+	}
+	if table == "" && len(args) >= 2 {
+		table = args[1]
+	}
+	if schema == "" || table == "" {
+		return "", "", errors.New(
+			"schema and table are required " +
+				"(use --schema/--table or positional args)")
+	}
+	return schema, table, nil
+}
+
+// newStorageCmd builds the "storage" command group: the storage-recommendations
+// CLI family (L.1–L.6), a thin client over the Scenario 119/120 storage API
+// endpoints P.1–P.6. This family is DISTINCT from the data-loading L.1–L.16 CLI
+// family (Scenario 108 / spec 12). The six commands are:
+//
+//	L.1  storage disk-usage                  GET  .../storage/disk-usage
+//	L.2  storage tables list                 GET  .../storage/tables
+//	L.3  storage tables detail --schema --table
+//	                                         GET  .../storage/tables/{schema}/{table}
+//	L.4  storage recommendations list        GET  .../storage/recommendations
+//	L.5  storage recommendations scan        POST .../storage/recommendations/scan
+//	L.6  storage usage-report --month        GET  .../storage/usage-report?month=YYYY-MM
 func newStorageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "storage",
@@ -2882,6 +2916,36 @@ func newStorageCmd() *cobra.Command {
 		Use:   "tables",
 		Short: "Table storage management",
 	}
+
+	// L.3 detail: accepts the --schema/--table flags (canonical form per the
+	// spec) AND legacy positional [schema] [table] args for backward
+	// compatibility. Flags take precedence when set; otherwise the resolution
+	// falls back to the positional args. The variables are declared in the
+	// enclosing scope so the RunE closure captures them (same shape as
+	// usageReportMonth below).
+	var detailSchema, detailTable string
+	detailCmd := &cobra.Command{
+		Use:   "detail [schema] [table]",
+		Short: "Show table detail",
+		Args:  cobra.MaximumNArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			schema, table, err := resolveTableDetail(detailSchema, detailTable, args)
+			if err != nil {
+				return err
+			}
+			path := appendNamespaceQuery(
+				fmt.Sprintf("/clusters/%s/storage/tables/%s/%s",
+					url.PathEscape(globals.cluster),
+					url.PathEscape(schema), url.PathEscape(table)),
+				globals.namespace)
+			return runAPIGet(path)
+		},
+	}
+	detailCmd.Flags().StringVar(&detailSchema, "schema", "", "Table schema")
+	detailCmd.Flags().StringVar(&detailTable, "table", "", "Table name")
 
 	tablesCmd.AddCommand(
 		&cobra.Command{
@@ -2894,21 +2958,7 @@ func newStorageCmd() *cobra.Command {
 				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/tables", globals.namespace))
 			},
 		},
-		&cobra.Command{
-			Use:   "detail [schema] [table]",
-			Short: "Show table detail",
-			Args:  cobra.ExactArgs(2),
-			RunE: func(_ *cobra.Command, args []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				path := appendNamespaceQuery(
-					fmt.Sprintf("/clusters/%s/storage/tables/%s/%s",
-						url.PathEscape(globals.cluster), url.PathEscape(args[0]), url.PathEscape(args[1])),
-					globals.namespace)
-				return runAPIGet(path)
-			},
-		},
+		detailCmd,
 	)
 
 	recommendationsCmd := &cobra.Command{
@@ -2947,6 +2997,38 @@ func newStorageCmd() *cobra.Command {
 		},
 	)
 
+	// usage-report (C.13): retrieve the monthly usage report. The optional
+	// --month flag threads through as the ?month= query param the API already
+	// honors (r.URL.Query().Get("month")), scoping/labeling the report; omitting
+	// it returns the current/unscoped report. Both namespace and month are
+	// encoded through a single url.Values builder (mirroring newQueryListCmd) so
+	// the query string is always well-formed.
+	var usageReportMonth string
+	usageReportCmd := &cobra.Command{
+		Use:   "usage-report",
+		Short: "Show usage report",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := requireCluster(); err != nil {
+				return err
+			}
+			params := url.Values{}
+			if globals.namespace != "" {
+				params.Set("namespace", globals.namespace)
+			}
+			if usageReportMonth != "" {
+				params.Set("month", usageReportMonth)
+			}
+			path := fmt.Sprintf("/clusters/%s/storage/usage-report",
+				url.PathEscape(globals.cluster))
+			if len(params) > 0 {
+				path += "?" + params.Encode()
+			}
+			return runAPIGet(path)
+		},
+	}
+	usageReportCmd.Flags().StringVar(&usageReportMonth, "month", "",
+		"Month (YYYY-MM) to scope the usage report")
+
 	cmd.AddCommand(
 		&cobra.Command{
 			Use:   "disk-usage",
@@ -2960,16 +3042,7 @@ func newStorageCmd() *cobra.Command {
 		},
 		tablesCmd,
 		recommendationsCmd,
-		&cobra.Command{
-			Use:   "usage-report",
-			Short: "Show usage report",
-			RunE: func(_ *cobra.Command, _ []string) error {
-				if err := requireCluster(); err != nil {
-					return err
-				}
-				return runAPIGet(ctl.ClusterSubresourcePath(globals.cluster, "storage/usage-report", globals.namespace))
-			},
-		},
+		usageReportCmd,
 	)
 
 	return cmd

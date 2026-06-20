@@ -2343,6 +2343,16 @@ type mockDBClient struct {
 	indexBloatRecs    []db.Recommendation
 	indexBloatRecsErr error
 
+	// Storage API endpoint fakes (Scenario 119 P.1/P.2/P.3/P.6).
+	tables              []db.TableStorageInfo
+	tablesErr           error
+	tableDetail         *db.TableDetail
+	tableDetailErr      error
+	usageReport         []db.UsageReportEntry
+	usageReportErr      error
+	storageDiskUsage    []db.DiskUsageInfo
+	storageDiskUsageErr error
+
 	// Query-monitoring handler fakes.
 	queryDetailErr   error
 	moveQueryErr     error
@@ -2425,26 +2435,41 @@ func (m *mockDBClient) ListDataLoadingJobs(_ context.Context) ([]db.DataLoadingJ
 	return nil, nil
 }
 func (m *mockDBClient) GetStorageDiskUsage(_ context.Context) ([]db.DiskUsageInfo, error) {
-	return nil, nil
+	return m.storageDiskUsage, m.storageDiskUsageErr
 }
-func (m *mockDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetDiskUsagePercent(_ context.Context) (int32, error) {
+	return 0, nil
+}
+func (m *mockDBClient) GetClusterDataSizeBytes(_ context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *mockDBClient) GetBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return m.bloatRecs, m.bloatRecsErr
 }
-func (m *mockDBClient) GetSkewRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetSkewRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return m.skewRecs, m.skewRecsErr
 }
-func (m *mockDBClient) GetAgeRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetAgeRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return m.ageRecs, m.ageRecsErr
 }
-func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return m.indexBloatRecs, m.indexBloatRecsErr
 }
 func (m *mockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
-func (m *mockDBClient) GetTableDetails(_ context.Context, _, _ string) (*db.TableDetail, error) {
-	return nil, nil
+func (m *mockDBClient) GetTables(_ context.Context) ([]db.TableStorageInfo, error) {
+	return m.tables, m.tablesErr
+}
+func (m *mockDBClient) GetTableDetails(_ context.Context, schema, table string) (*db.TableDetail, error) {
+	if m.tableDetailErr != nil {
+		return nil, m.tableDetailErr
+	}
+	if m.tableDetail != nil {
+		return m.tableDetail, nil
+	}
+	return &db.TableDetail{Schema: schema, Table: table}, nil
 }
 func (m *mockDBClient) GetUsageReport(_ context.Context, _ string) ([]db.UsageReportEntry, error) {
-	return nil, nil
+	return m.usageReport, m.usageReportErr
 }
 func (m *mockDBClient) InitializeMirrors(_ context.Context, _ db.MirrorInitOptions) error {
 	return nil
