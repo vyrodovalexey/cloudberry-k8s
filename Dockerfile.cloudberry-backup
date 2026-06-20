@@ -37,7 +37,7 @@
 # Stage 1: Build apache/cloudberry-backup from source
 # =============================================================================
 ARG GO_VERSION=1.26.4
-FROM rockylinux/rockylinux:9.6 AS builder
+FROM rockylinux/rockylinux:10.1 AS builder
 
 # Install build dependencies (sorted alphanumerically)
 # gcc + sqlite-devel are required because the history package uses mattn/go-sqlite3 (CGO).
@@ -259,7 +259,7 @@ RUN git clone --depth 1 --branch ${GPBACKMAN_VERSION} \
 # =============================================================================
 # Stage 2: Runtime image
 # =============================================================================
-FROM rockylinux/rockylinux:9.6-minimal
+FROM rockylinux/rockylinux:10.1-minimal
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-backup" \
