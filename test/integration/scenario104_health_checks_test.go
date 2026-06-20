@@ -269,13 +269,17 @@ func (s *Scenario104HealthCheckSuite) TestIntegration_Scenario104_PxfInitWellFor
 	script := init.Args[0]
 
 	for _, want := range []string{
-		"pg_extension", "pxf_version()", "HC.1 FAIL", // HC.1 DB-proxy
+		"pg_extension", "proname = 'pxf_read'", "HC.1 FAIL", // HC.1 DB-proxy
 		"to_regclass('${tbl}')", "HC.2 FAIL", // HC.2 target table
-		`curl -fsS -m 10 --head "${AWS_S3_ENDPOINT}"`, "HC.3 FAIL", // HC.3 s3
+		`code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "${AWS_S3_ENDPOINT}/" || true)`,
+		`grep -Eq '^[1-5][0-9][0-9]$'`, "HC.3 FAIL", // HC.3 s3 connectivity
 		"df -Pk " + cases.Scenario104ScratchMount, "HC.5 FAIL", // HC.5 disk
 	} {
 		assert.Containsf(s.T(), script, want, "pxf init script must carry %q", want)
 	}
+	// PXF 2.1 has no pxf_version(); the old --head probe is gone too.
+	assert.NotContains(s.T(), script, "pxf_version()")
+	assert.NotContains(s.T(), script, "--head")
 	assert.NotContains(s.T(), script, "gpfdist-svc",
 		"HC.4 is gpload-only; the pxf init must not carry the gpfdist-svc probe")
 	assert.NotContains(s.T(), script, "actuator/health",

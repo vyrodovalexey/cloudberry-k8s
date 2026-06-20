@@ -469,7 +469,7 @@ func TestCollectSpillFileSummary_Error(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
-	mc.collectSpillFileSummary(context.Background(), conn, testLogger())
+	_ = mc.collectSpillFileSummary(context.Background(), conn)
 
 	assert.Zero(t, testGauge(t, mc.spillFilesActive))
 	assert.Zero(t, testGauge(t, mc.spillFilesBytes))
@@ -566,7 +566,7 @@ func TestCollectClusterUptime_Error(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
-	mc.collectClusterUptime(context.Background(), conn, testLogger())
+	_ = mc.collectClusterUptime(context.Background(), conn)
 
 	assert.Zero(t, testGauge(t, mc.clusterUptime),
 		"uptime must not be published from a failed query")
@@ -599,7 +599,7 @@ func TestCollectDistributedXacts_Error(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
-	mc.collectDistributedXacts(context.Background(), conn, testLogger())
+	_ = mc.collectDistributedXacts(context.Background(), conn)
 
 	assert.Zero(t, testGauge(t, mc.distTxnActive))
 	assert.Zero(t, readMetricValue(t, mc.distTxnCommitted))
@@ -614,7 +614,7 @@ func TestCollectOldestTransaction_Error(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	mc := newMetricCollectors(reg)
-	mc.collectOldestTransaction(context.Background(), conn, testLogger())
+	_ = mc.collectOldestTransaction(context.Background(), conn)
 
 	assert.Zero(t, testGauge(t, mc.oldestTxnAge))
 }

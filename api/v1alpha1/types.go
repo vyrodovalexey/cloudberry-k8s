@@ -2242,13 +2242,35 @@ type CloudberryClusterStatus struct {
 	// +optional
 	DataLoading *DataLoadingStatus `json:"dataLoading,omitempty"`
 
-	// DiskUsagePercent is the current disk usage percentage.
+	// DiskUsagePercent is the current disk usage percentage. It deliberately
+	// omits omitempty so a 0 value is always serialized in the status
+	// MergePatch, ensuring the disabled-state reset (C.2: diskMonitoring off →
+	// 0) reliably persists to 0 rather than retaining a previous non-zero value.
 	// +optional
-	DiskUsagePercent int32 `json:"diskUsagePercent,omitempty"`
+	DiskUsagePercent int32 `json:"diskUsagePercent"`
 
-	// RecommendationCount is the number of active recommendations.
+	// RecommendationCount is the number of active recommendations. It
+	// deliberately omits omitempty so a 0 value is always serialized in the
+	// status MergePatch, ensuring the disabled-state reset (C.4:
+	// recommendationScan disabled → 0) reliably persists to 0 rather than
+	// retaining a previous non-zero value.
 	// +optional
-	RecommendationCount int32 `json:"recommendationCount,omitempty"`
+	RecommendationCount int32 `json:"recommendationCount"`
+
+	// RecommendationScanTruncated is true when the most recent recommendation
+	// scan hit the scanDuration deadline (C.10) and recorded only partial
+	// per-type counts (the types that completed before the deadline). It is set
+	// on every scan so it always reflects the latest run and is never sticky.
+	// It deliberately omits omitempty so a false value is always serialized in
+	// the status MergePatch, ensuring a previous true reliably clears to false
+	// on the next non-truncated scan (the "never sticky" guarantee).
+	// +optional
+	RecommendationScanTruncated bool `json:"recommendationScanTruncated"`
+
+	// LastRecommendationScanTime is the timestamp of the most recent
+	// recommendation scan (set each scan, capped or complete).
+	// +optional
+	LastRecommendationScanTime *metav1.Time `json:"lastRecommendationScanTime,omitempty"`
 
 	// ObservedGeneration is the most recent generation observed.
 	// +optional

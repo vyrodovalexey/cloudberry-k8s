@@ -43,6 +43,16 @@ const (
 	// psqlCommandFlag is the psql flag for executing a SQL command.
 	psqlCommandFlag = "-c"
 
+	// psqlHostFlag/psqlUserFlag/psqlDBFlag are the psql connection flags shared by
+	// the maintenance and recommendation-scan job containers.
+	psqlHostFlag = "-h"
+	psqlUserFlag = "-U"
+	psqlDBFlag   = "-d"
+
+	// databasePostgres is the default maintenance database connected to by the
+	// psql-driven maintenance and recommendation-scan job containers.
+	databasePostgres = "postgres"
+
 	// secretKeyPassword is the key used for password data in Kubernetes Secrets.
 	secretKeyPassword = "password"
 
@@ -204,6 +214,11 @@ type ResourceBuilder interface {
 	// BuildBackupCronJob builds the scheduled backup CronJob.
 	// Returns nil when no schedule is configured.
 	BuildBackupCronJob(cluster *cbv1alpha1.CloudberryCluster) *batchv1.CronJob
+	// BuildRecommendationScanCronJob builds the scheduled storage
+	// recommendation-scan CronJob (spec 13 §Reconciliation C.5). Returns nil when
+	// storage management is absent, disk monitoring is off, the recommendation
+	// scan is disabled, or no schedule is configured.
+	BuildRecommendationScanCronJob(cluster *cbv1alpha1.CloudberryCluster) *batchv1.CronJob
 	// BuildBackupJob builds an on-demand gpbackup Job.
 	BuildBackupJob(cluster *cbv1alpha1.CloudberryCluster, opts *BackupJobOptions) *batchv1.Job
 	// BuildRestoreJob builds a gprestore Job.
@@ -912,9 +927,9 @@ func (b *DefaultBuilder) BuildMaintenanceJob(
 							Image: cluster.Spec.Image,
 							Command: []string{
 								"psql",
-								"-h", coordinatorSvc,
-								"-U", util.DefaultAdminUser,
-								"-d", "postgres",
+								psqlHostFlag, coordinatorSvc,
+								psqlUserFlag, util.DefaultAdminUser,
+								psqlDBFlag, databasePostgres,
 								psqlCommandFlag, sql,
 							},
 							Env: []corev1.EnvVar{

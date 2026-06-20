@@ -112,16 +112,23 @@ var csvHeader = []string{
 }
 
 // EnsureQueryHistoryTable creates the query history table and indexes if they don't exist.
-func (c *pgxClient) EnsureQueryHistoryTable(ctx context.Context) error {
-	if _, err := c.pool.Exec(ctx, queryHistoryDDL); err != nil {
-		return fmt.Errorf("ensuring query history table: %w", err)
+func (c *pgxClient) EnsureQueryHistoryTable(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "EnsureQueryHistoryTable")
+	defer func() { end(err) }()
+
+	if _, execErr := c.pool.Exec(ctx, queryHistoryDDL); execErr != nil {
+		err = fmt.Errorf("ensuring query history table: %w", execErr)
+		return err
 	}
 	c.logger.Info("query history table ensured")
 	return nil
 }
 
 // InsertQueryHistory inserts a single query history entry into the table.
-func (c *pgxClient) InsertQueryHistory(ctx context.Context, entry *QueryHistoryEntry) error {
+func (c *pgxClient) InsertQueryHistory(ctx context.Context, entry *QueryHistoryEntry) (err error) {
+	ctx, end := c.startOperation(ctx, "InsertQueryHistory")
+	defer func() { end(err) }()
+
 	query := `INSERT INTO cloudberry_query_history
 		(query_id, pid, username, database_name, query_text, query_start, query_end,
 		 duration_ms, state, rows_affected, cpu_time_ms, memory_bytes, spill_bytes,
@@ -129,7 +136,7 @@ func (c *pgxClient) InsertQueryHistory(ctx context.Context, entry *QueryHistoryE
 		 error_message)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
-	if _, err := c.pool.Exec(ctx, query,
+	if _, execErr := c.pool.Exec(ctx, query,
 		entry.QueryID, entry.PID, entry.Username, entry.DatabaseName,
 		entry.QueryText, entry.QueryStart, entry.QueryEnd,
 		entry.DurationMs, entry.State, entry.RowsAffected,
@@ -137,8 +144,9 @@ func (c *pgxClient) InsertQueryHistory(ctx context.Context, entry *QueryHistoryE
 		entry.DiskReadBytes, entry.DiskWriteBytes,
 		entry.WaitEvents, entry.ResourceGroup, entry.ExplainPlan,
 		entry.ErrorMessage,
-	); err != nil {
-		return fmt.Errorf("inserting query history entry: %w", err)
+	); execErr != nil {
+		err = fmt.Errorf("inserting query history entry: %w", execErr)
+		return err
 	}
 
 	if c.recorder != nil {
@@ -217,11 +225,17 @@ func (c *pgxClient) GetQueryHistory(
 }
 
 // GetQueryHistoryDetail returns detailed information for a specific historical query.
-func (c *pgxClient) GetQueryHistoryDetail(ctx context.Context, queryID string) (*QueryHistoryEntry, error) {
+func (c *pgxClient) GetQueryHistoryDetail(
+	ctx context.Context,
+	queryID string,
+) (entry *QueryHistoryEntry, err error) {
+	ctx, end := c.startOperation(ctx, "GetQueryHistoryDetail")
+	defer func() { end(err) }()
+
 	query := fmt.Sprintf("SELECT %s FROM cloudberry_query_history WHERE query_id = $1", queryHistoryColumns)
 
 	var e QueryHistoryEntry
-	err := c.pool.QueryRow(ctx, query, queryID).Scan(
+	err = c.pool.QueryRow(ctx, query, queryID).Scan(
 		&e.ID, &e.QueryID, &e.PID, &e.Username, &e.DatabaseName,
 		&e.QueryText, &e.QueryStart, &e.QueryEnd, &e.DurationMs,
 		&e.State, &e.RowsAffected, &e.CPUTimeMs, &e.MemoryBytes,

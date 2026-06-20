@@ -411,15 +411,16 @@ func (m *scenario55MetricsRecorder) SetDiskUsagePercent(_, _ string, _ float64) 
 func (m *scenario55MetricsRecorder) SetRecommendationsTotal(_, _, _ string, _ float64)     {}
 func (m *scenario55MetricsRecorder) ObserveRecommendationScanDuration(_, _ string, _ time.Duration) {
 }
-func (m *scenario55MetricsRecorder) SetTableBloatRatio(_, _, _ string, _ float64)     {}
-func (m *scenario55MetricsRecorder) RecordScaleOperation(_, _, _ string)              {}
-func (m *scenario55MetricsRecorder) SetRedistributionProgress(_, _ string, _ float64) {}
-func (m *scenario55MetricsRecorder) SetDataSkewCoefficient(_, _ string, _ float64)    {}
-func (m *scenario55MetricsRecorder) SetPVCSizeBytes(_, _, _ string, _ float64)        {}
-func (m *scenario55MetricsRecorder) RecordMirroringOperation(_, _, _ string)          {}
-func (m *scenario55MetricsRecorder) RecordMaintenanceOperation(_, _, _, _ string)     {}
-func (m *scenario55MetricsRecorder) RecordPasswordRotation()                          {}
-func (m *scenario55MetricsRecorder) RecordQueryHistoryInsert(_, _ string)             {}
+func (m *scenario55MetricsRecorder) SetTableBloatRatio(_, _, _ string, _ float64)        {}
+func (m *scenario55MetricsRecorder) SetRecommendationScanCronJob(_, _ string, _ float64) {}
+func (m *scenario55MetricsRecorder) RecordScaleOperation(_, _, _ string)                 {}
+func (m *scenario55MetricsRecorder) SetRedistributionProgress(_, _ string, _ float64)    {}
+func (m *scenario55MetricsRecorder) SetDataSkewCoefficient(_, _ string, _ float64)       {}
+func (m *scenario55MetricsRecorder) SetPVCSizeBytes(_, _, _ string, _ float64)           {}
+func (m *scenario55MetricsRecorder) RecordMirroringOperation(_, _, _ string)             {}
+func (m *scenario55MetricsRecorder) RecordMaintenanceOperation(_, _, _, _ string)        {}
+func (m *scenario55MetricsRecorder) RecordPasswordRotation()                             {}
+func (m *scenario55MetricsRecorder) RecordQueryHistoryInsert(_, _ string)                {}
 func (m *scenario55MetricsRecorder) ObserveQueryHistorySearchDuration(_, _ string, _ time.Duration) {
 }
 func (m *scenario55MetricsRecorder) RecordQueryHistoryExport(_, _, _ string)                 {}

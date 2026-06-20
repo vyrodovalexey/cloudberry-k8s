@@ -72,6 +72,9 @@ const (
 	// ComponentDataLoad is the component label value for data-loading Job/CronJob
 	// resources (the ingestion runtime that builds and launches load Jobs).
 	ComponentDataLoad = "dataload"
+	// ComponentRecommendationScan is the component label value for the scheduled
+	// storage recommendation-scan CronJob (spec 13 §Reconciliation C.5).
+	ComponentRecommendationScan = "recommendation-scan"
 	// ComponentGpfdist is the component label value for the gpfdist file-server
 	// Deployment/Service/PVC (the high-throughput parallel file distributor that
 	// gpload jobs read from over gpfdist://).
@@ -134,6 +137,18 @@ const (
 	// AnnotationBackupSizeBytes records the size in bytes of a completed backup Job,
 	// used to drive the cloudberry_backup_size_bytes gauge.
 	AnnotationBackupSizeBytes = "avsoft.io/backup-size-bytes"
+	// AnnotationBackupTimestamp records the REAL gpbackup-generated 14-digit
+	// YYYYMMDDHHMMSS timestamp captured from gpbackup's stdout ("Backup
+	// Timestamp = <ts>") on a SUCCEEDED full/incremental backup Job. gpbackup
+	// generates its own timestamp at runtime and offers no flag to pin it (only
+	// --from-timestamp for incrementals), so the operator-chosen Job-name
+	// timestamp drifts from the real S3 object prefix. The admin controller
+	// patches this annotation from the backup pod's termination message
+	// ("BACKUP_TIMESTAMP=<ts>") and PREFERS it over the Job-name/CompletionTime
+	// value when recording status.lastBackupTimestamp / BackupHistory, so a
+	// later restore-by-timestamp resolves the correct S3 prefix. Absent (older
+	// Jobs / capture failure) the operator falls back to the previous behavior.
+	AnnotationBackupTimestamp = "avsoft.io/backup-timestamp"
 	// AnnotationExpectedRowCounts carries the expected per-table row counts
 	// (a JSON object of fully-qualified table -> count) captured from the gpbackup
 	// history metadata of the restored timestamp. When present on a restore Job

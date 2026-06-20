@@ -7101,11 +7101,11 @@ type Scenario104Case struct {
 	// "init-script", "init-container", "volume", "event", "metric", or "live".
 	Artifact string
 	// Expected is a short outcome token / human description of the asserted
-	// outcome (e.g. "init script carries pxf_version()", "Job Failed + Event").
+	// outcome (e.g. "init script carries the PXF-readiness probe", "Job Failed + Event").
 	Expected string
 	// Contains is the byte-stable substring the built artifact must carry for a
-	// builder row (e.g. "pxf_version()", "df -Pk /dataload-scratch") — empty for
-	// rows asserted structurally or for live/reconcile rows.
+	// builder row (e.g. "proname = 'pxf_read'", "df -Pk /dataload-scratch") — empty
+	// for rows asserted structurally or for live/reconcile rows.
 	Contains string
 	// Description explains the case + names the HONEST signal. Live-only rows are
 	// marked [LIVE-ONLY]; HC.1 carries the DB-proxy honesty note; rows that may
@@ -7186,18 +7186,18 @@ func Scenario104Cases() []Scenario104Case {
 			ID: "104-HC1-B", Req: "HC.1", Layer: Scenario104LayerBuilder,
 			Artifact: Scenario104ArtifactInitScript,
 			Expected: "pxf job init script carries the DB-proxy PXF-readiness probe",
-			Contains: "pxf_version()",
+			Contains: "proname = 'pxf_read'",
 			Description: "the dataload-healthcheck init script for a pxf job (pxf enabled) carries " +
 				"the DB-proxy PXF-readiness probe substrings (pg_extension, extname='pxf', " +
-				"pxf_version(), HC.1 FAIL) — NOT a direct sidecar curl (impossible from the " +
-				"load pod per spec §3341).",
+				"pg_proc proname = 'pxf_read' — PXF 2.1 has no pxf_version(), HC.1 FAIL) — NOT a " +
+				"direct sidecar curl (impossible from the load pod per spec §3341).",
 		},
 		{
 			ID: "104-HC1-B-gate", Req: "HC.1", Layer: Scenario104LayerBuilder,
 			Artifact: Scenario104ArtifactInitScript,
 			Expected: "non-pxf job OR pxf disabled → no HC.1 block",
 			Description: "a gpload job (or a pxf-disabled cluster) emits NO HC.1 lines " +
-				"(pxf_version()/pg_extension/HC.1 FAIL absent) — HC.1 is pxf-only.",
+				"(pg_proc pxf_read/pg_extension/HC.1 FAIL absent) — HC.1 is pxf-only.",
 		},
 		{
 			ID: "104-HC1-L-fail", Req: "HC.1", Layer: Scenario104LayerLive,
@@ -7249,18 +7249,19 @@ func Scenario104Cases() []Scenario104Case {
 		{
 			ID: "104-HC3-B", Req: "HC.3", Layer: Scenario104LayerBuilder,
 			Artifact: Scenario104ArtifactInitScript,
-			Expected: "pxf s3 job → init curl-head probe + AWS_* SecretKeyRef env",
-			Contains: `curl -fsS -m 10 --head "${AWS_S3_ENDPOINT}"`,
-			Description: "a pxf s3 job's init script carries the HC.3 curl-head reachability probe " +
-				"against AWS_S3_ENDPOINT (HC.3 FAIL); the init container carries AWS_* via " +
-				"SecretKeyRef (NO plaintext) + AWS_S3_ENDPOINT.",
+			Expected: "pxf s3 job → init status-code connectivity probe + AWS_* SecretKeyRef env",
+			Contains: `code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "${AWS_S3_ENDPOINT}/" || true)`,
+			Description: "a pxf s3 job's init script carries the HC.3 status-code connectivity probe " +
+				"against AWS_S3_ENDPOINT — any HTTP response (incl. 400/403 from S3-compatible " +
+				"stores) is reachable (HC.3 FAIL only on connection failure); the init container " +
+				"carries AWS_* via SecretKeyRef (NO plaintext) + AWS_S3_ENDPOINT.",
 		},
 		{
 			ID: "104-HC3-B-skip", Req: "HC.3", Layer: Scenario104LayerBuilder,
 			Artifact: Scenario104ArtifactInitScript,
 			Expected: "non-object-store server (jdbc/hive) → HC.3 skipped",
 			Description: "a non-object-store pxf job (jdbc/hive) is NOT auto-probed for HC.3 " +
-				"connectivity (no --head AWS_S3_ENDPOINT line; no HC.3 FAIL block).",
+				"connectivity (no AWS_S3_ENDPOINT curl line; no HC.3 FAIL block).",
 		},
 		{
 			ID: "104-HC3-L-fail", Req: "HC.3", Layer: Scenario104LayerLive,

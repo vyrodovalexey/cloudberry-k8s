@@ -58,10 +58,13 @@ const (
 	gpfdistOpService    = "service"
 	gpfdistOpDelete     = "delete"
 
-	// metricResultSuccess / metricResultError are the bounded `result` label
-	// values shared by the control-plane outcome counters (B-1).
+	// metricResultSuccess / metricResultError / metricResultSkipped are the
+	// bounded `result` label values shared by the control-plane outcome
+	// counters (B-1). "skipped" marks an honest no-work outcome (e.g. the DB
+	// was unavailable so the scan never ran).
 	metricResultSuccess = "success"
 	metricResultError   = "error"
+	metricResultSkipped = "skipped"
 
 	// pxfExtensionResult* are the bounded `result` label values for the
 	// cloudberry_pxf_extension_setup_total counter (B-2): the install succeeded
@@ -876,6 +879,15 @@ func (r *AdminReconciler) ensureGpfdistService(
 		return fmt.Errorf("getting gpfdist service %s: %w", name, err)
 	default:
 		desired := r.builder.BuildGpfdistService(cluster)
+		// H-2 (defensive): copy ONLY the operator-owned Ports + Selector onto the
+		// LIVE object, deliberately preserving the live, API-server-assigned
+		// immutable fields (Spec.ClusterIP, Spec.Type). This is safe TODAY
+		// because BuildGpfdistService uses ServiceTypeClusterIP, where the single
+		// port carries no allocated NodePort. WARNING: if the gpfdist Service ever
+		// becomes NodePort/LoadBalancer, this blind Ports overwrite would CLEAR
+		// the allocated NodePort(s); that case must first merge desired ports onto
+		// the live ports (preserving each live Port.NodePort by name/port) before
+		// the Update.
 		existing.Spec.Ports = desired.Spec.Ports
 		existing.Spec.Selector = desired.Spec.Selector
 		updateErr := r.client.Update(ctx, existing)

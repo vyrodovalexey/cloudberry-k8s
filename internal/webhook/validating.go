@@ -482,6 +482,23 @@ func validateBackupGprestore(gr *cbv1alpha1.GprestoreOptions) error {
 }
 
 // validateStorageManagement validates storage management configuration.
+//
+// Scenario 113 — Validation Rules (Negative Tests). The threshold checks below
+// are the storage-recommendations rule family W.1–W.4 (distinct from, and not
+// to be confused with, the data-loading W.1–W.25 rule family validated in
+// validateDataLoading). The webhook is intentionally authoritative for these
+// rules (Option A): the checks are gated on scan.Enabled so that thresholds on
+// a disabled recommendation scan are NOT rejected — a behavior that static
+// kubebuilder Minimum/Maximum markers cannot express. Keeping the validation
+// here also preserves the descriptive, field-specific error messages instead of
+// a generic apiserver enum/range error.
+//
+// Rule IDs (stable, for Scenario 113 traceability):
+//   - W.1: storage.recommendationScan.bloatThreshold      (0..100)
+//   - W.2: storage.recommendationScan.skewThreshold       (0..100)
+//   - W.3: storage.recommendationScan.indexBloatThreshold (0..100)
+//   - W.4: storage.recommendationScan.ageThreshold        (>= 0)
+//   - W.5: storage.recommendationScan.scanDuration        (parses as Go duration)
 func validateStorageManagement(cluster *cbv1alpha1.CloudberryCluster) error {
 	if cluster.Spec.Storage == nil {
 		return nil
@@ -492,29 +509,46 @@ func validateStorageManagement(cluster *cbv1alpha1.CloudberryCluster) error {
 		return nil
 	}
 
+	// W.1: bloatThreshold must be between 0 and 100.
 	if scan.BloatThreshold < 0 || scan.BloatThreshold > 100 {
 		return fmt.Errorf(
 			"storage.recommendationScan.bloatThreshold must be between 0 and 100, got %d",
 			scan.BloatThreshold,
 		)
 	}
+	// W.2: skewThreshold must be between 0 and 100.
 	if scan.SkewThreshold < 0 || scan.SkewThreshold > 100 {
 		return fmt.Errorf(
 			"storage.recommendationScan.skewThreshold must be between 0 and 100, got %d",
 			scan.SkewThreshold,
 		)
 	}
+	// W.3: indexBloatThreshold must be between 0 and 100.
 	if scan.IndexBloatThreshold < 0 || scan.IndexBloatThreshold > 100 {
 		return fmt.Errorf(
 			"storage.recommendationScan.indexBloatThreshold must be between 0 and 100, got %d",
 			scan.IndexBloatThreshold,
 		)
 	}
+	// W.4: ageThreshold must be non-negative.
 	if scan.AgeThreshold < 0 {
 		return fmt.Errorf(
 			"storage.recommendationScan.ageThreshold must be non-negative, got %d",
 			scan.AgeThreshold,
 		)
+	}
+	// W.5: scanDuration, when set, must parse as a Go duration (defense-in-depth
+	// for the controller's C.10 scan-duration cap; mirrors the W.23c
+	// flushInterval time.ParseDuration precedent). The webhook only checks
+	// parseability — the runtime clamp/fallback policy lives in the controller's
+	// resolveScanDuration.
+	if scan.ScanDuration != "" {
+		if _, err := time.ParseDuration(scan.ScanDuration); err != nil {
+			return fmt.Errorf(
+				"storage.recommendationScan.scanDuration %q must be a valid Go duration",
+				scan.ScanDuration,
+			)
+		}
 	}
 
 	return nil

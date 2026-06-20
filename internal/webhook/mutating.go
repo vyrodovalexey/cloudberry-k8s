@@ -532,7 +532,26 @@ func setDataLoadingJobTemplateDefaults(dl *cbv1alpha1.DataLoadingSpec) {
 	}
 }
 
-// setStorageManagementDefaults sets storage management defaults.
+// setStorageManagementDefaults sets storage management (recommendation-scan)
+// defaults. These are the storage-recommendations defaults D.1–D.6 for
+// Scenario 114 (Mutating Webhook Defaults); they are distinct from, and must
+// not be confused with, the data-loading defaults D.1–D.14 applied in
+// setDataLoadingDefaults.
+//
+// The six rule IDs map to the recommendation-scan fields as follows:
+//   - D.1 schedule            -> "0 3 * * 0"
+//   - D.2 bloatThreshold      -> defaultBloatThreshold (20)
+//   - D.3 skewThreshold       -> defaultSkewThreshold (50)
+//   - D.4 ageThreshold        -> defaultAgeThreshold (500000000)
+//   - D.5 indexBloatThreshold -> defaultIndexBloatThreshold (30)
+//   - D.6 scanDuration        -> "2h"
+//
+// Defaults are applied only when the recommendation scan is present and enabled
+// (scan != nil && scan.Enabled), and only when the corresponding field is
+// unset/zero. Explicit user-supplied values are always preserved; this
+// enabled-gated behavior is why the webhook stays authoritative rather than
+// relying on static +kubebuilder:default CRD markers, which cannot honor the
+// scan.Enabled gate.
 func setStorageManagementDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	if cluster.Spec.Storage == nil {
 		// Storage management is optional; no defaults needed when not specified.
@@ -542,22 +561,22 @@ func setStorageManagementDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	scan := cluster.Spec.Storage.RecommendationScan
 	if scan != nil && scan.Enabled {
 		if scan.Schedule == "" {
-			scan.Schedule = "0 3 * * 0"
+			scan.Schedule = "0 3 * * 0" // D.1 schedule
 		}
 		if scan.BloatThreshold == 0 {
-			scan.BloatThreshold = defaultBloatThreshold
+			scan.BloatThreshold = defaultBloatThreshold // D.2 bloatThreshold
 		}
 		if scan.SkewThreshold == 0 {
-			scan.SkewThreshold = defaultSkewThreshold
+			scan.SkewThreshold = defaultSkewThreshold // D.3 skewThreshold
 		}
 		if scan.AgeThreshold == 0 {
-			scan.AgeThreshold = defaultAgeThreshold
+			scan.AgeThreshold = defaultAgeThreshold // D.4 ageThreshold
 		}
 		if scan.IndexBloatThreshold == 0 {
-			scan.IndexBloatThreshold = defaultIndexBloatThreshold
+			scan.IndexBloatThreshold = defaultIndexBloatThreshold // D.5 indexBloatThreshold
 		}
 		if scan.ScanDuration == "" {
-			scan.ScanDuration = "2h"
+			scan.ScanDuration = "2h" // D.6 scanDuration
 		}
 	}
 }

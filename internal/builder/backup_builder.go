@@ -174,9 +174,30 @@ const (
 	// validation script emits so its log lines can be matched deterministically.
 	validateMarkerPrefix = "post-restore-validate: "
 
+	// gpbackupTool is the gpbackup tool name used to gate the real-timestamp
+	// capture wrapper on backup Jobs only.
+	gpbackupTool = "gpbackup"
 	// gprestoreTool is the gprestore tool name used to gate the statistics
 	// exit-code tolerance wrapper on restore Jobs only.
 	gprestoreTool = "gprestore"
+
+	// backupTimestampMarker is written to the backup Job pod's termination log
+	// (and echoed to stdout) carrying the REAL 14-digit gpbackup timestamp that
+	// the script captures from gpbackup's stdout ("Backup Timestamp = <ts>").
+	// gpbackup generates its own timestamp at runtime with no flag to pin it, so
+	// the operator-chosen Job-name timestamp drifts from the real S3 object
+	// prefix; the admin controller parses this marker into the
+	// avsoft.io/backup-timestamp annotation and PREFERS it for
+	// status.lastBackupTimestamp so a later restore-by-timestamp resolves the
+	// correct S3 prefix. Mirrors the migration_builder grep-capture pattern and
+	// the restorePartialMarker termination-message convention.
+	backupTimestampMarker = "BACKUP_TIMESTAMP="
+	// gpbackupTimestampGrep extracts the 14-digit gpbackup timestamp from a
+	// captured "Backup Timestamp = <ts>" line. It is the SAME grep pattern the
+	// migration builder uses (migration_builder.go writeMigrationBackupPhase) so
+	// the two capture paths stay consistent.
+	gpbackupTimestampGrep = "grep -oE 'Backup Timestamp = [0-9]{14}' | " +
+		"grep -oE '[0-9]{14}' | head -1"
 	// withStatsFlag is the gpbackup/gprestore --with-stats flag.
 	withStatsFlag = "--with-stats"
 	// restorePartialMarker is written to the restore Job pod's termination log
@@ -695,9 +716,54 @@ func renderToolScript(cluster *cbv1alpha1.CloudberryCluster, tool string, args [
 		b.WriteString("exit \"${rc}\"\n")
 		return b.String()
 	}
+	if tool == gpbackupTool {
+		// Capture gpbackup's REAL runtime timestamp from its stdout and surface
+		// it on the termination log so the controller records the true S3 prefix
+		// (see writeGpbackupTimestampCapture / backupTimestampMarker).
+		writeGpbackupTimestampCapture(&b, tool, args)
+		return b.String()
+	}
 	writeToolInvocation(&b, tool, args)
 	b.WriteString("\n")
 	return b.String()
+}
+
+// writeGpbackupTimestampCapture renders the gpbackup invocation so its combined
+// stdout/stderr is tee'd to the Job log AND captured, then extracts the REAL
+// 14-digit "Backup Timestamp = <ts>" gpbackup printed and writes it to
+// /dev/termination-log as "BACKUP_TIMESTAMP=<ts>" (the marker the admin
+// controller parses into the avsoft.io/backup-timestamp annotation).
+//
+// gpbackup generates its own timestamp at runtime with no flag to force it, so
+// the operator's Job-name timestamp drifts from the real S3 object prefix; this
+// capture makes the true timestamp flow Job->operator->status so a later
+// restore-by-timestamp resolves the correct prefix. It reuses the SAME grep
+// pattern as the migration builder (migration_builder.go).
+//
+// Failure-safety: the tool runs under `set -o pipefail` (set at the top of the
+// rendered script), so `<tool> ... | tee` preserves gpbackup's exit code and a
+// real backup failure still fails the Job. The timestamp extraction and the
+// termination-log write are best-effort (`|| true`): a missing marker simply
+// makes the controller fall back to the previous Job-name/CompletionTime
+// behavior (backward compatible) and never masks a backup failure.
+func writeGpbackupTimestampCapture(b *strings.Builder, tool string, args []string) {
+	// Run gpbackup, tee its combined output to the Job log, and capture it.
+	// `set -o pipefail` (set at the top of the rendered script) re-raises
+	// gpbackup's own exit code through the tee, so a real backup failure still
+	// fails the Job.
+	b.WriteString("CBK_BACKUP_LOG=$(")
+	writeToolInvocation(b, tool, args)
+	b.WriteString(" 2>&1 | tee /dev/stderr)\n")
+	// Extract the REAL gpbackup timestamp (best-effort) and surface it on the
+	// termination log for the controller to pick up.
+	fmt.Fprintf(b,
+		"CBK_BACKUP_TS=$(printf '%%s' \"${CBK_BACKUP_LOG}\" | %s || true)\n",
+		gpbackupTimestampGrep)
+	fmt.Fprintf(b,
+		"if [ -n \"${CBK_BACKUP_TS:-}\" ]; then "+
+			"printf '%%s' \"%s${CBK_BACKUP_TS}\" > /dev/termination-log 2>/dev/null || true; "+
+			"echo \"%s${CBK_BACKUP_TS}\"; fi\n",
+		backupTimestampMarker, backupTimestampMarker)
 }
 
 // writeToolInvocation writes "<tool> 'arg1' 'arg2' ..." (no trailing newline).
@@ -853,9 +919,40 @@ func coordinatorExecScript(cluster *cbv1alpha1.CloudberryCluster, tool string, a
 		b.WriteString("exit \"${rc}\"\n")
 		return b.String()
 	}
+	if tool == gpbackupTool {
+		// Capture the REAL gpbackup timestamp from the coordinator-exec output
+		// (tee'd to the Job log) and surface it on the termination log so the
+		// controller records the true S3 prefix. pipefail (set at the top of the
+		// rendered script) preserves gpbackup's exit code through the tee, so a
+		// genuine backup failure still fails the Job; the capture/extraction is
+		// best-effort and never masks a failure.
+		writeCoordinatorBackupTimestampCapture(&b, remoteExec, cleanup)
+		return b.String()
+	}
 	b.WriteString(remoteExec + "\n")
 	b.WriteString(cleanup)
 	return b.String()
+}
+
+// writeCoordinatorBackupTimestampCapture wraps the S3 coordinator-exec gpbackup
+// invocation so its combined output is captured (and tee'd to the Job log),
+// then extracts the REAL 14-digit gpbackup timestamp and writes it to
+// /dev/termination-log as "BACKUP_TIMESTAMP=<ts>" (the marker the admin
+// controller parses into the avsoft.io/backup-timestamp annotation). It mirrors
+// writeGpbackupTimestampCapture for the in-pod path and reuses the SAME grep
+// pattern as the migration builder. The staged coordinator config cleanup
+// always runs afterwards.
+func writeCoordinatorBackupTimestampCapture(b *strings.Builder, remoteExec, cleanup string) {
+	fmt.Fprintf(b, "CBK_BACKUP_LOG=$(%s 2>&1 | tee /dev/stderr)\n", remoteExec)
+	b.WriteString(cleanup)
+	fmt.Fprintf(b,
+		"CBK_BACKUP_TS=$(printf '%%s' \"${CBK_BACKUP_LOG}\" | %s || true)\n",
+		gpbackupTimestampGrep)
+	fmt.Fprintf(b,
+		"if [ -n \"${CBK_BACKUP_TS:-}\" ]; then "+
+			"printf '%%s' \"%s${CBK_BACKUP_TS}\" > /dev/termination-log 2>/dev/null || true; "+
+			"echo \"%s${CBK_BACKUP_TS}\"; fi\n",
+		backupTimestampMarker, backupTimestampMarker)
 }
 
 // dropLeadingPluginConfig returns args with a leading

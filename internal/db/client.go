@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,21 @@ const (
 	severityInfo     = "info"
 	severityWarning  = "warning"
 	severityCritical = "critical"
+)
+
+// PostgreSQL SQLSTATE codes used to detect a missing relation/column so the
+// disk-usage measurement can fall back honestly instead of fabricating a value.
+const (
+	sqlStateUndefinedTable  = "42P01" // undefined_table
+	sqlStateUndefinedColumn = "42703" // undefined_column
+)
+
+// ErrDiskUsageUnavailable is returned by GetDiskUsagePercent when
+// gp_toolkit.gp_disk_free (or its expected columns) is not available on this
+// server version. Callers MUST skip the measurement, NOT substitute a value
+// (S.1/R.2: never fabricate a disk-usage percentage).
+var ErrDiskUsageUnavailable = errors.New(
+	"disk usage unavailable: gp_toolkit.gp_disk_free not accessible",
 )
 
 // Transient per-database connection pool bounds. Redistribution opens a
@@ -143,19 +159,55 @@ type Client interface {
 	ListDataLoadingJobs(ctx context.Context) ([]DataLoadingJobStatus, error)
 	// GetStorageDiskUsage returns disk usage information per tablespace/segment.
 	GetStorageDiskUsage(ctx context.Context) ([]DiskUsageInfo, error)
-	// GetBloatRecommendations returns bloat recommendations.
-	GetBloatRecommendations(ctx context.Context) ([]Recommendation, error)
-	// GetSkewRecommendations returns data skew recommendations.
-	GetSkewRecommendations(ctx context.Context) ([]Recommendation, error)
-	// GetAgeRecommendations returns XID age recommendations.
-	GetAgeRecommendations(ctx context.Context) ([]Recommendation, error)
-	// GetIndexBloatRecommendations returns index bloat recommendations.
-	GetIndexBloatRecommendations(ctx context.Context) ([]Recommendation, error)
+	// GetTables returns per-table storage info (size, bloat, skew, row count) for
+	// all user tables. Best-effort: bloat is derived from dead-tuple percentage on
+	// the always-present pg_stat_user_tables; skew is sourced from
+	// gp_toolkit.gp_skew_coefficients when available and HONESTLY left 0 when the
+	// view/columns are absent (no fabrication). A connectivity/query error is
+	// surfaced so the handler can fall back to an empty list.
+	GetTables(ctx context.Context) ([]TableStorageInfo, error)
+	// GetDiskUsagePercent returns the worst-case (MAX across segments) filesystem
+	// usage percentage of the segment data volumes, sourced from
+	// gp_toolkit.gp_disk_free. It returns ErrDiskUsageUnavailable when the view or
+	// its columns are not available so the caller can SKIP the measurement
+	// (S.1/R.2: never fabricate a percentage).
+	//
+	// This is the PREFERRED, TRUE filesystem-usage path. When it returns
+	// ErrDiskUsageUnavailable the caller should fall back to the portable
+	// logical-capacity proxy built on GetClusterDataSizeBytes (see that method
+	// and recordDiskUsage for the documented difference in what is measured).
+	GetDiskUsagePercent(ctx context.Context) (int32, error)
+	// GetClusterDataSizeBytes returns the total LOGICAL on-disk size of all
+	// databases in the cluster, computed as
+	// SELECT sum(pg_database_size(datname)) FROM pg_database. pg_database_size is
+	// always available (no extension, no gp_toolkit dependency), so this method
+	// works on every Cloudberry/Greenplum/PostgreSQL version — verified live on
+	// Cloudberry 2.1.0.
+	//
+	// IMPORTANT — what this measures: this is the LOGICAL size of stored data
+	// (the sum of database sizes), NOT the filesystem capacity/usage of the
+	// underlying volumes. It is the numerator of the PORTABLE FALLBACK proxy used
+	// by recordDiskUsage when gp_toolkit.gp_disk_free is unavailable: the
+	// controller divides this by the CRD-provisioned PVC capacity to derive a
+	// real, growing usage percentage. The gp_disk_free path (GetDiskUsagePercent)
+	// remains the TRUE filesystem usage and is always preferred when present.
+	GetClusterDataSizeBytes(ctx context.Context) (int64, error)
+	// GetBloatRecommendations returns bloat recommendations gated on th.Bloat (C.6).
+	GetBloatRecommendations(ctx context.Context, th RecommendationThresholds) ([]Recommendation, error)
+	// GetSkewRecommendations returns data skew recommendations gated on th.Skew (C.7).
+	GetSkewRecommendations(ctx context.Context, th RecommendationThresholds) ([]Recommendation, error)
+	// GetAgeRecommendations returns XID age recommendations gated on th.Age (C.8).
+	GetAgeRecommendations(ctx context.Context, th RecommendationThresholds) ([]Recommendation, error)
+	// GetIndexBloatRecommendations returns index bloat recommendations gated on th.IndexBloat (C.9).
+	GetIndexBloatRecommendations(ctx context.Context, th RecommendationThresholds) ([]Recommendation, error)
 	// TriggerRecommendationScan triggers a recommendation scan.
 	TriggerRecommendationScan(ctx context.Context) error
 	// GetTableDetails returns detailed information about a specific table.
 	GetTableDetails(ctx context.Context, schema, table string) (*TableDetail, error)
-	// GetUsageReport returns a usage report for the given month.
+	// GetUsageReport returns a usage report for the given month: one entry per
+	// non-template database (size + connections), each enriched with a bounded
+	// per-table breakdown for the connected database only (Scenario 120 C.11).
+	// The month is a scope/label; the report is computed on demand (no history).
 	GetUsageReport(ctx context.Context, month string) ([]UsageReportEntry, error)
 	// InitializeMirrors performs base backup from primaries to initialize
 	// mirror segments. This is the pg_basebackup equivalent for Cloudberry.
@@ -500,29 +552,88 @@ type Recommendation struct {
 	Ratio float64 `json:"ratio,omitempty"`
 }
 
-// TableDetail represents detailed information about a database table.
-type TableDetail struct {
+// RecommendationThresholds carries the per-type CRD gates from
+// spec.storage.recommendationScan into the threshold-aware recommendation
+// queries (C.6–C.9). Each Get*Recommendations reads ONLY its own field, but the
+// four methods take the whole struct so their signatures are uniform and the
+// controller threads a single value to all four. Units mirror the CRD field
+// types:
+//   - Bloat      — dead-tuple percentage 0..100 (C.6, BloatThreshold).
+//   - Skew       — skew-coefficient percentage 0..100 (C.7, SkewThreshold).
+//   - Age        — absolute XID age, age(relfrozenxid) (C.8, AgeThreshold).
+//   - IndexBloat — index bloat estimate percentage 0..100 (C.9, IndexBloatThreshold).
+type RecommendationThresholds struct {
+	Bloat      int32
+	Skew       int32
+	Age        int64
+	IndexBloat int32
+}
+
+// TableStorageInfo represents one row of the storage/tables listing.
+type TableStorageInfo struct {
 	Schema       string `json:"schema"`
 	Table        string `json:"table"`
 	SizeBytes    int64  `json:"sizeBytes"`
 	SizeHuman    string `json:"sizeHuman"`
-	RowCount     int64  `json:"rowCount"`
 	BloatPercent int32  `json:"bloatPercent"`
 	SkewPercent  int32  `json:"skewPercent"`
-	LastVacuum   string `json:"lastVacuum"`
-	LastAnalyze  string `json:"lastAnalyze"`
+	RowCount     int64  `json:"rowCount"`
+}
+
+// IndexSizeInfo is one index's on-disk size for a table detail.
+type IndexSizeInfo struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"sizeBytes"`
+	SizeHuman string `json:"sizeHuman"`
+}
+
+// TableDetail represents detailed information about a database table.
+type TableDetail struct {
+	Schema       string          `json:"schema"`
+	Table        string          `json:"table"`
+	SizeBytes    int64           `json:"sizeBytes"`
+	SizeHuman    string          `json:"sizeHuman"`
+	RowCount     int64           `json:"rowCount"`
+	BloatPercent int32           `json:"bloatPercent"`
+	SkewPercent  int32           `json:"skewPercent"`
+	LastVacuum   string          `json:"lastVacuum"`
+	LastAnalyze  string          `json:"lastAnalyze"`
+	IndexSizes   []IndexSizeInfo `json:"indexSizes,omitempty"`
+}
+
+// TableUsage is one table's storage consumption within a usage-report database
+// entry. It provides the per-table breakdown that, alongside the per-database
+// size, satisfies the Scenario 120 C.11 "per-table + per-database storage
+// consumption" content requirement.
+type TableUsage struct {
+	Schema    string `json:"schema"`
+	Table     string `json:"table"`
+	SizeBytes int64  `json:"sizeBytes"`
+	SizeHuman string `json:"sizeHuman"`
 }
 
 // UsageReportEntry represents a single entry in a usage report.
+//
+// Scenario 120 (C.11) enriches each entry with a bounded per-table breakdown
+// in Tables. Because the pgx pool is connected to a single database, Tables is
+// populated only for the entry matching the connected database (c.config.Database);
+// other database entries carry an empty Tables slice — honestly, the operator
+// cannot size tables in a database it is not connected to.
+//
+// GrowthBytes/GrowthHuman/QueryCount remain an honest 0/empty: the report is
+// computed ON DEMAND from live catalog sizes and the operator does not persist
+// month-over-month snapshots, so there is no baseline from which to derive growth
+// or a historical query count without fabricating one.
 type UsageReportEntry struct {
-	Month       string `json:"month"`
-	Database    string `json:"database"`
-	SizeBytes   int64  `json:"sizeBytes"`
-	SizeHuman   string `json:"sizeHuman"`
-	GrowthBytes int64  `json:"growthBytes"`
-	GrowthHuman string `json:"growthHuman"`
-	QueryCount  int64  `json:"queryCount"`
-	Connections int64  `json:"connections"`
+	Month       string       `json:"month"`
+	Database    string       `json:"database"`
+	SizeBytes   int64        `json:"sizeBytes"`
+	SizeHuman   string       `json:"sizeHuman"`
+	GrowthBytes int64        `json:"growthBytes"`
+	GrowthHuman string       `json:"growthHuman"`
+	QueryCount  int64        `json:"queryCount"`
+	Connections int64        `json:"connections"`
+	Tables      []TableUsage `json:"tables,omitempty"` // C.11 per-table breakdown (connected DB only)
 }
 
 // MirrorInitOptions defines options for initializing mirror segments.
@@ -1081,10 +1192,13 @@ func (c *pgxClient) CancelQuery(ctx context.Context, pid int32) (result bool, er
 }
 
 // TerminateSession terminates a session by PID.
-func (c *pgxClient) TerminateSession(ctx context.Context, pid int32) (bool, error) {
-	var result bool
-	if err := c.pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", pid).Scan(&result); err != nil {
-		return false, fmt.Errorf("terminating session for PID %d: %w", pid, err)
+func (c *pgxClient) TerminateSession(ctx context.Context, pid int32) (result bool, err error) {
+	ctx, end := c.startOperation(ctx, "TerminateSession")
+	defer func() { end(err) }()
+
+	if scanErr := c.pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", pid).Scan(&result); scanErr != nil {
+		err = fmt.Errorf("terminating session for PID %d: %w", pid, scanErr)
+		return false, err
 	}
 	c.logger.Info("session terminated", "pid", pid, "result", result)
 	return result, nil
@@ -1207,9 +1321,15 @@ func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) (usages [
 	ctx, end := c.startOperation(ctx, "GetDiskUsage")
 	defer func() { end(err) }()
 
+	// Filter on datallowconn = true (connectable databases) rather than
+	// datistemplate = false: on Cloudberry 2.1.0 the real connectable postgres
+	// database is flagged datistemplate = true, so a datistemplate = false filter
+	// would exclude every database and return an empty result. datallowconn = true
+	// includes postgres + user databases (template0 has datallowconn = false);
+	// template1 is excluded explicitly so only real user-facing databases appear.
 	query := `SELECT datname, pg_database_size(datname) as size_bytes,
 		pg_size_pretty(pg_database_size(datname)) as size_human
-		FROM pg_database WHERE datistemplate = false`
+		FROM pg_database WHERE datallowconn = true AND datname NOT IN ('template0','template1')`
 
 	if database != "" {
 		query += fmt.Sprintf(" AND datname = %s", quoteLiteral(database))
@@ -1698,24 +1818,276 @@ func (c *pgxClient) GetStorageDiskUsage(ctx context.Context) (usages []DiskUsage
 	return usages, nil
 }
 
-// GetBloatRecommendations returns bloat recommendations by querying table statistics
-// for dead tuple ratios that indicate bloat.
-func (c *pgxClient) GetBloatRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+// tableStorageQuery lists the largest user tables with their on-disk size, live
+// row count, and dead-tuple bloat percentage. It joins the always-present
+// pg_stat_user_tables to pg_class/pg_namespace for the relation OID. The bloat
+// percentage is cast FLOOR(...)::int because Cloudberry 2.1.0 returns the
+// n_dead_tup*100/(...) division as a NUMERIC (e.g. with a fractional scale) on
+// real churned data, which pgx cannot scan into a plain int32 — the same lesson
+// applied in GetBloatRecommendations. The divide-by-zero case is guarded by the
+// CASE expression. Largest tables come first and the result is capped to keep
+// the listing bounded on huge catalogs.
+const tableStorageQuery = `SELECT s.schemaname, s.relname,
+	pg_total_relation_size(c.oid) AS size_bytes,
+	pg_size_pretty(pg_total_relation_size(c.oid)) AS size_human,
+	s.n_live_tup AS row_count,
+	CASE WHEN s.n_live_tup + s.n_dead_tup > 0
+		THEN FLOOR(s.n_dead_tup * 100.0 / (s.n_live_tup + s.n_dead_tup))::int
+		ELSE 0
+	END AS bloat_percent
+	FROM pg_stat_user_tables s
+	JOIN pg_class c ON c.relname = s.relname
+	JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
+	ORDER BY size_bytes DESC
+	LIMIT 200`
+
+// tableSkewQuery returns the per-relation distribution skew coefficient from
+// gp_toolkit.gp_skew_coefficients. The coefficient is declared NUMERIC and is
+// cast to ::float8 so pgx can scan it cleanly. This view requires gp_toolkit and
+// may be absent on some server versions; callers honor an
+// isUndefinedRelationOrColumn fallback and leave skew at 0 (no fabrication).
+const tableSkewQuery = `SELECT skcnamespace, skcrelname, skccoeff::float8 AS skccoeff
+	FROM gp_toolkit.gp_skew_coefficients`
+
+// usageReportTablesQuery lists the largest user tables (per-table storage
+// consumption, Scenario 120 C.11) in the currently-connected database. It mirrors
+// tableStorageQuery's pg_class/pg_namespace join, includes ordinary ('r') and
+// materialized-view ('m') relations, excludes the catalog/internal schemas, casts
+// the computed size to bigint so pgx scans it cleanly, orders largest-first, and
+// is bounded by LIMIT to keep cardinality sane. It is best-effort: callers honor
+// an isUndefinedRelationOrColumn fallback and report an empty per-table list
+// rather than failing the whole report (no fabrication).
+const usageReportTablesQuery = `SELECT n.nspname AS schema, c.relname AS tbl,
+	pg_total_relation_size(c.oid)::bigint AS size_bytes,
+	pg_size_pretty(pg_total_relation_size(c.oid)) AS size_human
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relkind IN ('r', 'm')
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'gp_toolkit', 'pg_ext_aux')
+	ORDER BY size_bytes DESC
+	LIMIT 50`
+
+// GetTables returns per-table storage info (size, bloat, skew, row count) for
+// all user tables. Bloat is derived from the always-present pg_stat_user_tables;
+// skew is enriched from gp_toolkit.gp_skew_coefficients when present and left at
+// 0 (honest fallback) when the view/columns are absent.
+func (c *pgxClient) GetTables(ctx context.Context) (tables []TableStorageInfo, err error) {
+	ctx, end := c.startOperation(ctx, "GetTables")
+	defer func() { end(err) }()
+
+	rows, queryErr := c.pool.Query(ctx, tableStorageQuery)
+	if queryErr != nil {
+		err = fmt.Errorf("querying tables: %w", queryErr)
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var t TableStorageInfo
+		if scanErr := rows.Scan(
+			&t.Schema, &t.Table, &t.SizeBytes, &t.SizeHuman,
+			&t.RowCount, &t.BloatPercent,
+		); scanErr != nil {
+			err = fmt.Errorf("scanning table storage row: %w", scanErr)
+			return nil, err
+		}
+		tables = append(tables, t)
+	}
+
+	if rowErr := rows.Err(); rowErr != nil {
+		err = fmt.Errorf("iterating table storage rows: %w", rowErr)
+		return nil, err
+	}
+
+	// Best-effort skew enrichment: gp_toolkit.gp_skew_coefficients may be absent.
+	if skew := c.collectTableSkew(ctx); len(skew) > 0 {
+		for i := range tables {
+			tables[i].SkewPercent = skew[tableSkewKey(tables[i].Schema, tables[i].Table)]
+		}
+	}
+
+	c.logger.Info("retrieved tables", "count", len(tables))
+	return tables, nil
+}
+
+// tableSkewKey builds the lookup key used to merge skew coefficients into the
+// table listing by (schema, table).
+func tableSkewKey(schema, table string) string {
+	return schema + "." + table
+}
+
+// collectTableSkew returns a map of "schema.table" -> skew percentage from
+// gp_toolkit.gp_skew_coefficients. It is best-effort: when the view/columns are
+// absent (SQLSTATE 42P01/42703) or any query/scan error occurs it returns an
+// empty map so the caller honestly reports skew 0 rather than fabricating a
+// value. Errors are logged at debug and never surfaced to the caller.
+func (c *pgxClient) collectTableSkew(ctx context.Context) map[string]int32 {
+	skew := map[string]int32{}
+
+	rows, queryErr := c.pool.Query(ctx, tableSkewQuery)
+	if queryErr != nil {
+		if !isUndefinedRelationOrColumn(queryErr) {
+			c.logger.Debug("skew enrichment query failed, leaving skew 0", "error", queryErr)
+		}
+		return skew
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table string
+		var coeff float64
+		if scanErr := rows.Scan(&schema, &table, &coeff); scanErr != nil {
+			c.logger.Debug("skew enrichment scan failed, leaving skew 0", "error", scanErr)
+			return skew
+		}
+		skew[tableSkewKey(schema, table)] = clampPercent(int32(coeff))
+	}
+
+	if rowErr := rows.Err(); rowErr != nil {
+		c.logger.Debug("skew enrichment iteration failed, leaving skew 0", "error", rowErr)
+	}
+
+	return skew
+}
+
+// diskUsagePercentQuery computes the worst-case (MAX across segments) filesystem
+// usage percentage of the segment data volumes from gp_toolkit.gp_disk_free.
+//
+// gp_disk_free exposes per-segment volume capacity figures. Column naming varies
+// across Cloudberry/Greenplum versions, so the query is written defensively:
+//   - df_total / df_free are the canonical per-segment total/free byte figures.
+//   - usage% = 100*(df_total - df_free)/df_total, guarded against df_total = 0
+//     to avoid divide-by-zero.
+//   - MAX selects the most-full volume (worst case) — the right signal for a
+//     "running out of disk" alert.
+//   - COALESCE(..., 0) yields 0 (not NULL) when the view returns no rows.
+//
+// Integer division in SQL truncates toward zero, which is acceptable for an
+// int32 percentage and matches Status.DiskUsagePercent (no float drift).
+const diskUsagePercentQuery = `SELECT COALESCE(MAX(
+	CASE WHEN df_total > 0
+		THEN (100 * (df_total - df_free)) / df_total
+		ELSE 0
+	END), 0)::int AS usage_percent
+FROM gp_toolkit.gp_disk_free`
+
+// isUndefinedRelationOrColumn reports whether err is a PostgreSQL error
+// indicating the relation (42P01) or a column (42703) does not exist. Such
+// errors mean gp_toolkit.gp_disk_free is not available on this server version.
+func isUndefinedRelationOrColumn(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == sqlStateUndefinedTable || pgErr.Code == sqlStateUndefinedColumn
+}
+
+// clampPercent constrains a raw percentage into the inclusive 0..100 range so a
+// malformed view (e.g. df_free > df_total) can never publish an out-of-range
+// gauge or status value.
+func clampPercent(pct int32) int32 {
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+// GetDiskUsagePercent returns the worst-case (MAX across segments) filesystem
+// usage percentage of the segment data volumes, sourced from
+// gp_toolkit.gp_disk_free (see diskUsagePercentQuery for the aggregation).
+//
+// It is the measurement primitive behind Scenario 116 R.2/S.1/M.1: the caller
+// (recordDiskUsage) writes the returned value into Status.DiskUsagePercent and
+// publishes the cloudberry_disk_usage_percent gauge from the SAME value.
+//
+// Honest fallback (NO fabrication): when the view or its columns are not
+// available on this server version (SQLSTATE 42P01 / 42703), it returns
+// ErrDiskUsageUnavailable so the caller can SKIP the measurement instead of
+// substituting a misleading value. Any other query error is wrapped and
+// returned. The result is clamped to 0..100.
+func (c *pgxClient) GetDiskUsagePercent(ctx context.Context) (percent int32, err error) {
+	ctx, end := c.startOperation(ctx, "GetDiskUsagePercent")
+	defer func() { end(err) }()
+
+	var pct int32
+	if scanErr := c.pool.QueryRow(ctx, diskUsagePercentQuery).Scan(&pct); scanErr != nil {
+		if isUndefinedRelationOrColumn(scanErr) {
+			// View/columns absent on this version: skip honestly, do not fabricate.
+			err = ErrDiskUsageUnavailable
+			return 0, err
+		}
+		err = fmt.Errorf("querying disk usage percent: %w", scanErr)
+		return 0, err
+	}
+
+	percent = clampPercent(pct)
+	c.logger.Info("retrieved disk usage percent", "percent", percent)
+	return percent, nil
+}
+
+// clusterDataSizeQuery sums the logical on-disk size of every database in the
+// cluster. pg_database_size is a core function available on all server versions
+// (no gp_toolkit / CREATE EXTENSION required), so this query is fully portable
+// and was verified live on Cloudberry 2.1.0. COALESCE guards the (impossible in
+// practice) empty-catalog case so the scan always yields a non-NULL bigint.
+const clusterDataSizeQuery = `SELECT COALESCE(sum(pg_database_size(datname)), 0)::bigint
+FROM pg_database`
+
+// GetClusterDataSizeBytes returns the total LOGICAL on-disk size of all
+// databases in the cluster (sum of pg_database_size). See the Client interface
+// documentation for the important distinction between this LOGICAL size and true
+// filesystem usage: this value is the numerator of the PORTABLE FALLBACK proxy
+// used by recordDiskUsage when gp_toolkit.gp_disk_free is unavailable. It is
+// always available (verified live on Cloudberry 2.1.0).
+func (c *pgxClient) GetClusterDataSizeBytes(ctx context.Context) (sizeBytes int64, err error) {
+	ctx, end := c.startOperation(ctx, "GetClusterDataSizeBytes")
+	defer func() { end(err) }()
+
+	if scanErr := c.pool.QueryRow(ctx, clusterDataSizeQuery).Scan(&sizeBytes); scanErr != nil {
+		err = fmt.Errorf("querying cluster data size: %w", scanErr)
+		return 0, err
+	}
+
+	c.logger.Info("retrieved cluster data size", "bytes", sizeBytes)
+	return sizeBytes, nil
+}
+
+// GetBloatRecommendations returns bloat recommendations by querying table
+// statistics for dead-tuple ratios that indicate bloat.
+//
+// RT.1/C.6: the query GATES on th.Bloat — only tables whose dead-tuple
+// percentage (dead_pct) is >= the CRD bloatThreshold are returned. The
+// threshold is bound as a parameter ($1), never string-interpolated, so the gate
+// is injection-safe. r.Ratio is still populated with dead_pct so recordRecommendations
+// can feed the cloudberry_table_bloat_ratio gauge (M.4). pg_stat_user_tables is a
+// core catalog and is always present, so no honest-fallback path is needed here.
+func (c *pgxClient) GetBloatRecommendations(
+	ctx context.Context, th RecommendationThresholds,
+) (recs []Recommendation, err error) {
 	ctx, end := c.startOperation(ctx, "GetBloatRecommendations")
 	defer func() { end(err) }()
 
+	// dead_pct is cast to ::int in BOTH the projection and the WHERE gate.
+	// Cloudberry 2.1.0 returns the n_dead_tup*100/(...) division as NUMERIC
+	// (e.g. with a -16 scale) on real churned data, which pgx cannot scan into
+	// a plain int64. FLOOR(...)::int forces a clean integer so the row scans
+	// into deadPct (int64) and the gate compares an int to $1 (int).
 	query := `SELECT schemaname, relname,
 		n_dead_tup,
 		CASE WHEN n_live_tup + n_dead_tup > 0
-			THEN (n_dead_tup * 100) / (n_live_tup + n_dead_tup)
+			THEN FLOOR(n_dead_tup * 100.0 / (n_live_tup + n_dead_tup))::int
 			ELSE 0
 		END AS dead_pct
 		FROM pg_stat_user_tables
-		WHERE n_dead_tup > 0
-		ORDER BY n_dead_tup DESC
+		WHERE n_live_tup + n_dead_tup > 0
+			AND FLOOR(n_dead_tup * 100.0 / (n_live_tup + n_dead_tup))::int >= $1
+		ORDER BY dead_pct DESC
 		LIMIT 50`
 
-	rows, queryErr := c.pool.Query(ctx, query)
+	rows, queryErr := c.pool.Query(ctx, query, th.Bloat)
 	if queryErr != nil {
 		err = fmt.Errorf("querying bloat recommendations: %w", queryErr)
 		return nil, err
@@ -1747,23 +2119,47 @@ func (c *pgxClient) GetBloatRecommendations(ctx context.Context) (recs []Recomme
 	return recs, nil
 }
 
-// GetSkewRecommendations returns data skew recommendations by querying
-// table size distribution across segments.
-func (c *pgxClient) GetSkewRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+// GetSkewRecommendations returns data skew recommendations sourced from
+// gp_toolkit.gp_skew_coefficients, the authoritative per-relation distribution
+// skew view in Cloudberry/Greenplum.
+//
+// RT.2/C.7: the query GATES on th.Skew — only relations whose skew coefficient
+// (skccoeff) is >= the CRD skewThreshold are returned. The threshold is bound as
+// a parameter ($1), never string-interpolated. r.Ratio carries skccoeff.
+//
+// Honest fallback (NO fabrication): gp_skew_coefficients only exists after
+// CREATE EXTENSION gp_toolkit and may be absent on some server versions. When the
+// query fails with SQLSTATE 42P01 (undefined table) or 42703 (undefined column),
+// skew is treated as UNMEASURABLE: the method LOGS at debug, SKIPS, and returns
+// (nil, nil) — it does NOT substitute the old row-count proxy (which fabricates
+// skew from sheer row count). To the caller's counter, "no skew rows" and "skew
+// unmeasurable" are honestly indistinguishable (skew count 0). This is a
+// best-effort skew source: only gp_toolkit yields a true coefficient.
+func (c *pgxClient) GetSkewRecommendations(
+	ctx context.Context, th RecommendationThresholds,
+) (recs []Recommendation, err error) {
 	ctx, end := c.startOperation(ctx, "GetSkewRecommendations")
 	defer func() { end(err) }()
 
-	// Query pg_stat_user_tables for tables with significant size variation.
-	// In Cloudberry/Greenplum, gp_toolkit.gp_skew_coefficients provides skew data.
-	// Fall back to pg_stat_user_tables if gp_toolkit is not available.
-	query := `SELECT schemaname, relname, n_live_tup
-		FROM pg_stat_user_tables
-		WHERE n_live_tup > 1000
-		ORDER BY n_live_tup DESC
+	// skccoeff is declared NUMERIC in gp_toolkit.gp_skew_coefficients, which pgx
+	// cannot scan into a plain float64; cast it to ::float8 so the coeff scan is
+	// clean. The gate is left as skccoeff >= $1 (NUMERIC vs int compares fine in
+	// SQL) and remains the last ">=" in the query for the threshold parser.
+	query := `SELECT skcnamespace, skcrelname, skccoeff::float8 AS skccoeff
+		FROM gp_toolkit.gp_skew_coefficients
+		WHERE skccoeff >= $1
+		ORDER BY skccoeff DESC
 		LIMIT 50`
 
-	rows, queryErr := c.pool.Query(ctx, query)
+	rows, queryErr := c.pool.Query(ctx, query, th.Skew)
 	if queryErr != nil {
+		if isUndefinedRelationOrColumn(queryErr) {
+			// gp_toolkit.gp_skew_coefficients absent on this version: skip
+			// honestly, do not fabricate. Count 0 skew.
+			c.logger.Debug("gp_skew_coefficients unavailable, skipping skew recommendations",
+				"error", queryErr)
+			return nil, nil
+		}
 		err = fmt.Errorf("querying skew recommendations: %w", queryErr)
 		return nil, err
 	}
@@ -1771,13 +2167,18 @@ func (c *pgxClient) GetSkewRecommendations(ctx context.Context) (recs []Recommen
 
 	for rows.Next() {
 		var r Recommendation
-		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value); scanErr != nil {
+		var coeff float64
+		if scanErr := rows.Scan(&r.Schema, &r.Table, &coeff); scanErr != nil {
 			err = fmt.Errorf("scanning skew recommendation row: %w", scanErr)
 			return nil, err
 		}
 		r.Type = "skew"
-		r.Severity = severityInfo
-		r.Description = fmt.Sprintf("Table has %d rows; verify distribution key for even data spread", r.Value)
+		r.Value = int64(coeff)
+		r.Ratio = coeff
+		r.Severity = classifySeverity(int64(coeff), 20, 50)
+		r.Description = fmt.Sprintf(
+			"Table %s.%s has skew coefficient %.1f; verify distribution key for even data spread",
+			r.Schema, r.Table, coeff)
 		recs = append(recs, r)
 	}
 
@@ -1790,21 +2191,47 @@ func (c *pgxClient) GetSkewRecommendations(ctx context.Context) (recs []Recommen
 	return recs, nil
 }
 
-// GetAgeRecommendations returns XID age recommendations by querying
-// tables with high dead tuple counts that need vacuuming.
-func (c *pgxClient) GetAgeRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+// GetAgeRecommendations returns transaction-ID (XID) age recommendations
+// sourced from the REAL relation freeze age, age(relfrozenxid), on pg_class.
+//
+// RT.3/C.8: the query GATES on th.Age — only ordinary/materialized relations
+// (relkind IN ('r','m')) in user schemas whose age(relfrozenxid) is >= the CRD
+// ageThreshold are returned. The threshold (int64) is bound as a parameter ($1),
+// never string-interpolated. r.Value carries the true XID age. This measures
+// wraparound risk honestly; it does NOT use the old dead-tuple proxy (which
+// measures vacuum debt, not freeze age).
+//
+// Honest fallback (NO fabrication): pg_class.relfrozenxid and the age() function
+// are core catalog and are always present, so a view-missing fallback is not
+// normally hit. Should the query nonetheless fail with 42P01/42703, the method
+// SKIPS + logs and returns (nil, nil) rather than reverting to a misleading
+// dead-tuple proxy.
+func (c *pgxClient) GetAgeRecommendations(
+	ctx context.Context, th RecommendationThresholds,
+) (recs []Recommendation, err error) {
 	ctx, end := c.startOperation(ctx, "GetAgeRecommendations")
 	defer func() { end(err) }()
 
-	query := `SELECT schemaname, relname, n_dead_tup,
-		COALESCE(EXTRACT(EPOCH FROM (now() - last_autovacuum))::bigint, 0) AS secs_since_vacuum
-		FROM pg_stat_user_tables
-		WHERE n_dead_tup > 10000
-		ORDER BY n_dead_tup DESC
+	// age(relfrozenxid) yields a signed 32-bit integer; cast it to ::bigint so it
+	// scans cleanly into r.Value (int64) regardless of the driver's integer
+	// width handling. The gate keeps the same ::bigint cast and stays the last
+	// ">=" in the query for the threshold parser.
+	query := `SELECT n.nspname, c.relname, age(c.relfrozenxid)::bigint AS xid_age
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r','m')
+			AND n.nspname NOT IN ('pg_catalog','information_schema','gp_toolkit','pg_ext_aux')
+			AND age(c.relfrozenxid)::bigint >= $1
+		ORDER BY xid_age DESC
 		LIMIT 50`
 
-	rows, queryErr := c.pool.Query(ctx, query)
+	rows, queryErr := c.pool.Query(ctx, query, th.Age)
 	if queryErr != nil {
+		if isUndefinedRelationOrColumn(queryErr) {
+			c.logger.Debug("XID age catalog unavailable, skipping age recommendations",
+				"error", queryErr)
+			return nil, nil
+		}
 		err = fmt.Errorf("querying age recommendations: %w", queryErr)
 		return nil, err
 	}
@@ -1812,14 +2239,15 @@ func (c *pgxClient) GetAgeRecommendations(ctx context.Context) (recs []Recommend
 
 	for rows.Next() {
 		var r Recommendation
-		var secsSinceVacuum int64
-		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value, &secsSinceVacuum); scanErr != nil {
+		if scanErr := rows.Scan(&r.Schema, &r.Table, &r.Value); scanErr != nil {
 			err = fmt.Errorf("scanning age recommendation row: %w", scanErr)
 			return nil, err
 		}
 		r.Type = "age"
-		r.Severity = classifySeverity(r.Value, 100000, 500000)
-		r.Description = fmt.Sprintf("Table has %d dead tuples; consider running VACUUM", r.Value)
+		r.Severity = classifySeverity(r.Value, 100000000, 500000000)
+		r.Description = fmt.Sprintf(
+			"Table %s.%s has XID age %d; consider running VACUUM to prevent wraparound",
+			r.Schema, r.Table, r.Value)
 		recs = append(recs, r)
 	}
 
@@ -1832,22 +2260,76 @@ func (c *pgxClient) GetAgeRecommendations(ctx context.Context) (recs []Recommend
 	return recs, nil
 }
 
-// GetIndexBloatRecommendations returns index bloat recommendations by querying
-// index statistics for unused or oversized indexes.
-func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) (recs []Recommendation, err error) {
+// indexBloatEstimateQuery estimates per-index bloat percentage from core
+// catalogs (pg_class/pg_index/pg_namespace) and gates it on $1 (th.IndexBloat).
+// It assumes an 8 KiB page and a nominal average index entry width of 32 bytes
+// at a 90% fill factor, yielding ideal_pages = ceil(reltuples * 32 / (8192*0.9)).
+// Indexes with no pages or no tuples are skipped (cannot estimate). The estimate
+// is clamped to 0..100 via the GREATEST/LEAST guards.
+const indexBloatEstimateQuery = `WITH idx AS (
+	SELECT n.nspname AS schemaname,
+		t.relname AS relname,
+		i.relname AS indexrelname,
+		i.relpages::float8 AS relpages,
+		i.reltuples::float8 AS reltuples
+	FROM pg_index x
+	JOIN pg_class i ON i.oid = x.indexrelid
+	JOIN pg_class t ON t.oid = x.indrelid
+	JOIN pg_namespace n ON n.oid = i.relnamespace
+	WHERE i.relkind = 'i'
+		AND n.nspname NOT IN ('pg_catalog','information_schema','gp_toolkit','pg_ext_aux')
+		AND i.relpages > 0
+		AND i.reltuples > 0
+)
+SELECT schemaname, relname, indexrelname,
+	LEAST(100.0, GREATEST(0.0,
+		100.0 * (relpages - CEIL(reltuples * 32.0 / (8192.0 * 0.9))) / relpages
+	))::float8 AS bloat_pct
+FROM idx
+WHERE LEAST(100.0, GREATEST(0.0,
+		100.0 * (relpages - CEIL(reltuples * 32.0 / (8192.0 * 0.9))) / relpages
+	))::float8 >= $1
+ORDER BY bloat_pct DESC
+LIMIT 50`
+
+// GetIndexBloatRecommendations returns index bloat recommendations gated on a
+// portable index bloat-percentage ESTIMATE.
+//
+// RT.4/C.9: the query GATES on th.IndexBloat — only indexes whose estimated
+// bloat percentage is >= the CRD indexBloatThreshold are returned. The threshold
+// is bound as a parameter ($1), never string-interpolated. r.Ratio carries the
+// estimated bloat percentage.
+//
+// The estimate is self-contained on core catalogs (pg_class / pg_index /
+// pg_namespace) so it is portable across Cloudberry/Greenplum versions and does
+// not depend on an optional stats view. It approximates bloat as the fraction of
+// the index's actual pages (relpages) in excess of the IDEAL pages needed to
+// store reltuples at a nominal 90% fill factor for an average row width, i.e.
+//
+//	bloat_pct ≈ 100 * (relpages - ideal_pages) / relpages
+//
+// where ideal_pages = ceil(reltuples / tuples_per_page) and tuples_per_page is
+// derived from the 8 KiB page size and an estimated index-entry width. This is a
+// documented heuristic, NOT an exact bloat measurement, but it honestly tracks
+// over-sized indexes rather than the old "index size > 0" gate (which flagged
+// every index). Indexes with too few pages/tuples to estimate are excluded.
+//
+// Honest fallback (NO fabrication): should the estimate rely on a catalog column
+// absent on this version (42P01/42703), the method SKIPS + logs and returns
+// (nil, nil) rather than reverting to the raw size gate.
+func (c *pgxClient) GetIndexBloatRecommendations(
+	ctx context.Context, th RecommendationThresholds,
+) (recs []Recommendation, err error) {
 	ctx, end := c.startOperation(ctx, "GetIndexBloatRecommendations")
 	defer func() { end(err) }()
 
-	query := `SELECT schemaname, relname, indexrelname,
-		pg_relation_size(indexrelid) AS index_size,
-		idx_scan
-		FROM pg_stat_user_indexes
-		WHERE pg_relation_size(indexrelid) > 0
-		ORDER BY pg_relation_size(indexrelid) DESC
-		LIMIT 50`
-
-	rows, queryErr := c.pool.Query(ctx, query)
+	rows, queryErr := c.pool.Query(ctx, indexBloatEstimateQuery, th.IndexBloat)
 	if queryErr != nil {
+		if isUndefinedRelationOrColumn(queryErr) {
+			c.logger.Debug("index bloat estimate catalog unavailable, skipping",
+				"error", queryErr)
+			return nil, nil
+		}
 		err = fmt.Errorf("querying index bloat recommendations: %w", queryErr)
 		return nil, err
 	}
@@ -1856,21 +2338,18 @@ func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) (recs []Re
 	for rows.Next() {
 		var r Recommendation
 		var indexName string
-		var idxScan int64
-		if scanErr := rows.Scan(&r.Schema, &r.Table, &indexName, &r.Value, &idxScan); scanErr != nil {
+		var bloatPct float64
+		if scanErr := rows.Scan(&r.Schema, &r.Table, &indexName, &bloatPct); scanErr != nil {
 			err = fmt.Errorf("scanning index bloat recommendation row: %w", scanErr)
 			return nil, err
 		}
 		r.Type = "index_bloat"
-		if idxScan == 0 {
-			r.Severity = severityWarning
-			r.Description = fmt.Sprintf("Index %s on %s.%s is %d bytes and has never been scanned",
-				indexName, r.Schema, r.Table, r.Value)
-		} else {
-			r.Severity = severityInfo
-			r.Description = fmt.Sprintf("Index %s on %s.%s is %d bytes with %d scans",
-				indexName, r.Schema, r.Table, r.Value, idxScan)
-		}
+		r.Value = int64(bloatPct)
+		r.Ratio = bloatPct
+		r.Severity = classifySeverity(int64(bloatPct), 30, 60)
+		r.Description = fmt.Sprintf(
+			"Index %s on %s.%s has estimated bloat %.1f%%; consider REINDEX",
+			indexName, r.Schema, r.Table, bloatPct)
 		recs = append(recs, r)
 	}
 
@@ -1885,10 +2364,14 @@ func (c *pgxClient) GetIndexBloatRecommendations(ctx context.Context) (recs []Re
 
 // TriggerRecommendationScan triggers a recommendation scan by running ANALYZE
 // on all user tables to refresh statistics.
-func (c *pgxClient) TriggerRecommendationScan(ctx context.Context) error {
+func (c *pgxClient) TriggerRecommendationScan(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "TriggerRecommendationScan")
+	defer func() { end(err) }()
+
 	c.logger.Info("triggering recommendation scan via ANALYZE")
-	if _, err := c.pool.Exec(ctx, "ANALYZE"); err != nil {
-		return fmt.Errorf("running ANALYZE for recommendation scan: %w", err)
+	if _, execErr := c.pool.Exec(ctx, "ANALYZE"); execErr != nil {
+		err = fmt.Errorf("running ANALYZE for recommendation scan: %w", execErr)
+		return err
 	}
 	c.logger.Info("recommendation scan completed")
 	return nil
@@ -1900,6 +2383,12 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 	ctx, end := c.startOperation(ctx, "GetTableDetails")
 	defer func() { end(err) }()
 
+	// bloat_percent is cast FLOOR(...)::int (not plain integer division) because
+	// Cloudberry 2.1.0 returns the n_dead_tup*100/(...) division as a NUMERIC with
+	// a fractional scale on real churned data, which pgx cannot scan into a plain
+	// int32 — the Scenario 117 NUMERIC-cast lesson, identical to
+	// GetBloatRecommendations / tableStorageQuery. The divide-by-zero case is
+	// guarded by the CASE expression.
 	query := `SELECT
 		s.schemaname,
 		s.relname,
@@ -1907,7 +2396,7 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 		pg_size_pretty(pg_total_relation_size(c.oid)) AS size_human,
 		s.n_live_tup AS row_count,
 		CASE WHEN s.n_live_tup + s.n_dead_tup > 0
-			THEN ((s.n_dead_tup * 100) / (s.n_live_tup + s.n_dead_tup))::int
+			THEN FLOOR(s.n_dead_tup * 100.0 / (s.n_live_tup + s.n_dead_tup))::int
 			ELSE 0
 		END AS bloat_percent,
 		COALESCE(s.last_vacuum::text, s.last_autovacuum::text, 'never') AS last_vacuum,
@@ -1918,6 +2407,10 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 		WHERE s.schemaname = $1 AND s.relname = $2`
 
 	detail = &TableDetail{}
+	// Scan order MUST match the SELECT projection exactly: schema, table,
+	// size_bytes, size_human, row_count, bloat_percent, last_vacuum, last_analyze.
+	// SkewPercent has no projection here and is enriched best-effort below
+	// (gp_toolkit), staying honestly 0 when the view is unavailable.
 	if scanErr := c.pool.QueryRow(ctx, query, schema, table).Scan(
 		&detail.Schema, &detail.Table, &detail.SizeBytes, &detail.SizeHuman,
 		&detail.RowCount, &detail.BloatPercent, &detail.LastVacuum, &detail.LastAnalyze,
@@ -1926,23 +2419,101 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 		return nil, err
 	}
 
+	// Best-effort skew enrichment (honest 0 when gp_toolkit absent).
+	if skew := c.collectTableSkew(ctx); len(skew) > 0 {
+		detail.SkewPercent = skew[tableSkewKey(detail.Schema, detail.Table)]
+	}
+
+	// Best-effort index sizes: a server without the catalog still returns the
+	// base detail (empty IndexSizes), never an error.
+	detail.IndexSizes = c.collectIndexSizes(ctx, schema, table)
+
 	c.logger.Info("retrieved table details", "schema", schema, "table", table)
 	return detail, nil
 }
 
-// GetUsageReport returns a usage report for the given month by querying
-// current database sizes and connection statistics.
+// indexSizesQuery returns each index's on-disk size for a given table. It joins
+// pg_index to pg_class (index + table) and pg_namespace, filtering by
+// schema/table. Largest indexes come first.
+const indexSizesQuery = `SELECT i.relname AS index_name,
+	pg_relation_size(i.oid) AS size_bytes,
+	pg_size_pretty(pg_relation_size(i.oid)) AS size_human
+	FROM pg_index x
+	JOIN pg_class i ON i.oid = x.indexrelid
+	JOIN pg_class t ON t.oid = x.indrelid
+	JOIN pg_namespace n ON n.oid = t.relnamespace
+	WHERE n.nspname = $1 AND t.relname = $2
+	ORDER BY size_bytes DESC`
+
+// collectIndexSizes returns the on-disk size of every index on schema.table.
+// It is best-effort: on any query/scan error it logs at debug and returns an
+// empty slice so GetTableDetails still surfaces the base detail.
+func (c *pgxClient) collectIndexSizes(ctx context.Context, schema, table string) []IndexSizeInfo {
+	indexes := []IndexSizeInfo{}
+
+	rows, queryErr := c.pool.Query(ctx, indexSizesQuery, schema, table)
+	if queryErr != nil {
+		c.logger.Debug("index sizes query failed, leaving empty",
+			"schema", schema, "table", table, "error", queryErr)
+		return indexes
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var idx IndexSizeInfo
+		if scanErr := rows.Scan(&idx.Name, &idx.SizeBytes, &idx.SizeHuman); scanErr != nil {
+			c.logger.Debug("index size scan failed, leaving empty",
+				"schema", schema, "table", table, "error", scanErr)
+			return []IndexSizeInfo{}
+		}
+		indexes = append(indexes, idx)
+	}
+
+	if rowErr := rows.Err(); rowErr != nil {
+		c.logger.Debug("index size iteration failed, leaving empty",
+			"schema", schema, "table", table, "error", rowErr)
+	}
+
+	return indexes
+}
+
+// GetUsageReport returns a monthly usage report (Scenario 120 C.11) by querying
+// current catalog sizes and connection statistics. It produces one entry per
+// non-template database (size + connections) and enriches the entry for the
+// connected database (c.config.Database) with a bounded per-table breakdown.
+//
+// The month is a scope/LABEL stamped on every entry; the report is computed ON
+// DEMAND from live sizes. The operator does not persist month-over-month
+// snapshots, so GrowthBytes/GrowthHuman/QueryCount stay an honest 0/empty rather
+// than fabricated from a manufactured baseline. The per-table breakdown is
+// available only for the connected database — the pgx pool is single-database, so
+// tables in other databases cannot be sized without a separate connection and are
+// honestly left empty.
 func (c *pgxClient) GetUsageReport(ctx context.Context, month string) (entries []UsageReportEntry, err error) {
 	ctx, end := c.startOperation(ctx, "GetUsageReport")
 	defer func() { end(err) }()
 
-	query := `SELECT datname,
-		pg_database_size(datname) AS size_bytes,
-		pg_size_pretty(pg_database_size(datname)) AS size_human,
-		COALESCE(numbackends, 0) AS connections
+	// Both pg_database (d) and pg_stat_database (s) expose a datname column, so
+	// every ambiguous reference is qualified with the d. (pg_database) alias and
+	// connections is read from s.numbackends. Leaving datname unqualified fails
+	// live with "column reference \"datname\" is ambiguous" (SQLSTATE 42702).
+	//
+	// The database filter targets CONNECTABLE databases (datallowconn = true)
+	// rather than non-template databases (datistemplate = false). On Cloudberry
+	// 2.1.0 the real, connectable "postgres" database is flagged
+	// datistemplate = true, so a datistemplate = false filter excludes every
+	// database and yields an empty report. datallowconn = true correctly
+	// includes "postgres" plus any user databases and is portable across
+	// Cloudberry/Greenplum/PostgreSQL. template0 (datallowconn = false) is
+	// excluded inherently; template1 is dropped explicitly so the usage report
+	// covers only real user-facing databases.
+	query := `SELECT d.datname,
+		pg_database_size(d.datname) AS size_bytes,
+		pg_size_pretty(pg_database_size(d.datname)) AS size_human,
+		COALESCE(s.numbackends, 0) AS connections
 		FROM pg_database d
 		LEFT JOIN pg_stat_database s ON d.datname = s.datname
-		WHERE d.datistemplate = false
+		WHERE d.datallowconn = true AND d.datname NOT IN ('template0','template1')
 		ORDER BY size_bytes DESC`
 
 	rows, queryErr := c.pool.Query(ctx, query)
@@ -1967,8 +2538,74 @@ func (c *pgxClient) GetUsageReport(ctx context.Context, month string) (entries [
 		return nil, err
 	}
 
+	// Best-effort per-table enrichment (C.11): the breakdown is attached only to
+	// the entry for the connected database, since the pool is single-database.
+	// A tables-query failure must never fail the whole report.
+	c.attachUsageReportTables(ctx, entries)
+
 	c.logger.Info("retrieved usage report", "month", month, "count", len(entries))
 	return entries, nil
+}
+
+// attachUsageReportTables enriches the connected-database entry with its
+// per-table breakdown. It is a no-op when no entry matches the connected
+// database name (e.g. the catalog row is filtered) so the report still surfaces
+// the per-database content honestly.
+func (c *pgxClient) attachUsageReportTables(ctx context.Context, entries []UsageReportEntry) {
+	connected := c.config.Database
+	if connected == "" {
+		return
+	}
+	tables := c.collectUsageReportTables(ctx)
+	if len(tables) == 0 {
+		return
+	}
+	for i := range entries {
+		if entries[i].Database == connected {
+			entries[i].Tables = tables
+			return
+		}
+	}
+}
+
+// collectUsageReportTables returns the largest user tables in the currently-
+// connected database (per-table storage consumption, Scenario 120 C.11). It is
+// best-effort: when the catalog relations/columns are absent (SQLSTATE
+// 42P01/42703) or any query/scan error occurs, it logs at debug and returns an
+// empty slice so GetUsageReport still surfaces the per-database content rather
+// than failing — honest empty, never a fabricated value.
+func (c *pgxClient) collectUsageReportTables(ctx context.Context) (tables []TableUsage) {
+	ctx, end := c.startOperation(ctx, "collectUsageReportTables")
+	var err error
+	defer func() { end(err) }()
+
+	rows, queryErr := c.pool.Query(ctx, usageReportTablesQuery)
+	if queryErr != nil {
+		err = queryErr
+		if !isUndefinedRelationOrColumn(queryErr) {
+			c.logger.Debug("usage-report tables query failed, leaving empty", "error", queryErr)
+		}
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var t TableUsage
+		if scanErr := rows.Scan(&t.Schema, &t.Table, &t.SizeBytes, &t.SizeHuman); scanErr != nil {
+			err = scanErr
+			c.logger.Debug("usage-report tables scan failed, leaving empty", "error", scanErr)
+			return nil
+		}
+		tables = append(tables, t)
+	}
+
+	if rowErr := rows.Err(); rowErr != nil {
+		err = rowErr
+		c.logger.Debug("usage-report tables iteration failed, leaving empty", "error", rowErr)
+		return nil
+	}
+
+	return tables
 }
 
 // InitializeMirrors performs base backup from primaries to initialize mirror segments.
@@ -2004,11 +2641,15 @@ func (c *pgxClient) InitializeMirrors(ctx context.Context, opts MirrorInitOption
 // ConfigureReplication sets up WAL streaming replication between primary and mirror segments.
 // The current implementation logs the intent, as WAL replication is configured
 // automatically by Cloudberry when mirrors are added via gpaddmirrors.
-func (c *pgxClient) ConfigureReplication(ctx context.Context, opts ReplicationOptions) error {
+func (c *pgxClient) ConfigureReplication(ctx context.Context, opts ReplicationOptions) (err error) {
+	ctx, end := c.startOperation(ctx, "ConfigureReplication")
+	defer func() { end(err) }()
+
 	c.logger.Info("configuring replication", "mode", opts.Mode)
 
-	if err := c.Ping(ctx); err != nil {
-		return fmt.Errorf("database not reachable for replication configuration: %w", err)
+	if pingErr := c.Ping(ctx); pingErr != nil {
+		err = fmt.Errorf("database not reachable for replication configuration: %w", pingErr)
+		return err
 	}
 
 	// WAL replication is configured automatically by Cloudberry when mirrors
@@ -2086,15 +2727,18 @@ func (c *pgxClient) TriggerFTSProbe(ctx context.Context) (err error) {
 // TerminateAllBackends terminates all non-system backend connections.
 // It calls pg_terminate_backend for each session except the current one
 // and system processes. Returns the number of backends terminated.
-func (c *pgxClient) TerminateAllBackends(ctx context.Context) (int32, error) {
+func (c *pgxClient) TerminateAllBackends(ctx context.Context) (terminated int32, err error) {
+	ctx, end := c.startOperation(ctx, "TerminateAllBackends")
+	defer func() { end(err) }()
+
 	query := `SELECT count(pg_terminate_backend(pid))
 		FROM pg_stat_activity
 		WHERE pid != pg_backend_pid()
 		AND backend_type = 'client backend'`
 
-	var terminated int32
-	if err := c.pool.QueryRow(ctx, query).Scan(&terminated); err != nil {
-		return 0, fmt.Errorf("terminating all backends: %w", err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&terminated); scanErr != nil {
+		err = fmt.Errorf("terminating all backends: %w", scanErr)
+		return 0, err
 	}
 
 	c.logger.Info("terminated all backends", "count", terminated)
@@ -2103,16 +2747,19 @@ func (c *pgxClient) TerminateAllBackends(ctx context.Context) (int32, error) {
 
 // CancelAllQueries cancels all active queries (non-idle sessions)
 // except the current backend. Returns the number of queries canceled.
-func (c *pgxClient) CancelAllQueries(ctx context.Context) (int32, error) {
+func (c *pgxClient) CancelAllQueries(ctx context.Context) (canceled int32, err error) {
+	ctx, end := c.startOperation(ctx, "CancelAllQueries")
+	defer func() { end(err) }()
+
 	query := `SELECT count(pg_cancel_backend(pid))
 		FROM pg_stat_activity
 		WHERE pid != pg_backend_pid()
 		AND state = 'active'
 		AND backend_type = 'client backend'`
 
-	var canceled int32
-	if err := c.pool.QueryRow(ctx, query).Scan(&canceled); err != nil {
-		return 0, fmt.Errorf("canceling all queries: %w", err)
+	if scanErr := c.pool.QueryRow(ctx, query).Scan(&canceled); scanErr != nil {
+		err = fmt.Errorf("canceling all queries: %w", scanErr)
+		return 0, err
 	}
 
 	c.logger.Info("canceled all active queries", "count", canceled)
@@ -2122,9 +2769,13 @@ func (c *pgxClient) CancelAllQueries(ctx context.Context) (int32, error) {
 // LogRotate triggers a log file rotation by calling pg_rotate_logfile().
 // This signals the PostgreSQL/Cloudberry logger process to switch to a new
 // log file immediately. The function returns true on success.
-func (c *pgxClient) LogRotate(ctx context.Context) error {
-	if _, err := c.pool.Exec(ctx, "SELECT pg_rotate_logfile()"); err != nil {
-		return fmt.Errorf("rotating log file: %w", err)
+func (c *pgxClient) LogRotate(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "LogRotate")
+	defer func() { end(err) }()
+
+	if _, execErr := c.pool.Exec(ctx, "SELECT pg_rotate_logfile()"); execErr != nil {
+		err = fmt.Errorf("rotating log file: %w", execErr)
+		return err
 	}
 	c.logger.Info("log file rotation triggered")
 	return nil
@@ -2330,8 +2981,12 @@ func (c *pgxClient) RedistributeData(ctx context.Context, opts RedistributionOpt
 }
 
 // ListUserDatabases returns all non-template, non-system databases.
-func (c *pgxClient) ListUserDatabases(ctx context.Context) ([]string, error) {
-	return c.listUserDatabases(ctx)
+func (c *pgxClient) ListUserDatabases(ctx context.Context) (databases []string, err error) {
+	ctx, end := c.startOperation(ctx, "ListUserDatabases")
+	defer func() { end(err) }()
+
+	databases, err = c.listUserDatabases(ctx)
+	return databases, err
 }
 
 // listUserDatabases returns all non-template, non-system databases.
@@ -3478,9 +4133,12 @@ func pxfSampleRowToStrings(values []any) []string {
 // GetQueryDetail returns detailed execution information for a specific query by PID.
 // It queries pg_stat_activity for session info, pg_locks for lock information,
 // and pg_stat_user_tables for recently accessed tables.
-func (c *pgxClient) GetQueryDetail(ctx context.Context, pid int32) (*QueryDetail, error) {
+func (c *pgxClient) GetQueryDetail(ctx context.Context, pid int32) (detail *QueryDetail, err error) {
+	ctx, end := c.startOperation(ctx, "GetQueryDetail")
+	defer func() { end(err) }()
+
 	// 1. Get session info from pg_stat_activity.
-	detail := &QueryDetail{}
+	detail = &QueryDetail{}
 	sessionQuery := `SELECT pid, COALESCE(usename, ''), COALESCE(datname, ''),
 		COALESCE(state, ''), COALESCE(query, ''),
 		COALESCE(query_start, now()),
@@ -3489,7 +4147,7 @@ func (c *pgxClient) GetQueryDetail(ctx context.Context, pid int32) (*QueryDetail
 		COALESCE(backend_type, '')
 		FROM pg_stat_activity WHERE pid = $1`
 
-	err := c.pool.QueryRow(ctx, sessionQuery, pid).Scan(
+	err = c.pool.QueryRow(ctx, sessionQuery, pid).Scan(
 		&detail.PID, &detail.Username, &detail.Database,
 		&detail.State, &detail.Query, &detail.QueryStart,
 		&detail.Duration, &detail.WaitEventType, &detail.WaitEvent,

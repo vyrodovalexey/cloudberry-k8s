@@ -295,19 +295,28 @@ func (m *mockDBClient) ListDataLoadingJobs(_ context.Context) ([]DataLoadingJobS
 func (m *mockDBClient) GetStorageDiskUsage(_ context.Context) ([]DiskUsageInfo, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetBloatRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *mockDBClient) GetDiskUsagePercent(_ context.Context) (int32, error) {
+	return 0, nil
+}
+func (m *mockDBClient) GetClusterDataSizeBytes(_ context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *mockDBClient) GetBloatRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetSkewRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *mockDBClient) GetSkewRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetAgeRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *mockDBClient) GetAgeRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return nil, nil
 }
-func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context) ([]Recommendation, error) {
+func (m *mockDBClient) GetIndexBloatRecommendations(_ context.Context, _ RecommendationThresholds) ([]Recommendation, error) {
 	return nil, nil
 }
 func (m *mockDBClient) TriggerRecommendationScan(_ context.Context) error { return nil }
+func (m *mockDBClient) GetTables(_ context.Context) ([]TableStorageInfo, error) {
+	return nil, nil
+}
 func (m *mockDBClient) GetTableDetails(_ context.Context, s, t string) (*TableDetail, error) {
 	return &TableDetail{Schema: s, Table: t}, nil
 }
@@ -607,25 +616,25 @@ func TestMockDBClient_AllMethods(t *testing.T) {
 	})
 
 	t.Run("GetBloatRecommendations", func(t *testing.T) {
-		recs, err := client.GetBloatRecommendations(ctx)
+		recs, err := client.GetBloatRecommendations(ctx, RecommendationThresholds{})
 		assert.NoError(t, err)
 		assert.Nil(t, recs)
 	})
 
 	t.Run("GetSkewRecommendations", func(t *testing.T) {
-		recs, err := client.GetSkewRecommendations(ctx)
+		recs, err := client.GetSkewRecommendations(ctx, RecommendationThresholds{})
 		assert.NoError(t, err)
 		assert.Nil(t, recs)
 	})
 
 	t.Run("GetAgeRecommendations", func(t *testing.T) {
-		recs, err := client.GetAgeRecommendations(ctx)
+		recs, err := client.GetAgeRecommendations(ctx, RecommendationThresholds{})
 		assert.NoError(t, err)
 		assert.Nil(t, recs)
 	})
 
 	t.Run("GetIndexBloatRecommendations", func(t *testing.T) {
-		recs, err := client.GetIndexBloatRecommendations(ctx)
+		recs, err := client.GetIndexBloatRecommendations(ctx, RecommendationThresholds{})
 		assert.NoError(t, err)
 		assert.Nil(t, recs)
 	})

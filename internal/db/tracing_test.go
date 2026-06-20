@@ -436,7 +436,7 @@ func readMethods() []readInvoke {
 				{"public", "users", "50000", "25"},
 			})
 		}, func(ctx context.Context, c *pgxClient) error {
-			_, err := c.GetBloatRecommendations(ctx)
+			_, err := c.GetBloatRecommendations(ctx, RecommendationThresholds{})
 			return err
 		}},
 	}

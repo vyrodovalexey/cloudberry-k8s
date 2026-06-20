@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +42,13 @@ import (
 
 const (
 	adminControllerName = "admin-controller"
+
+	// dbOpTimeout is the shared budget for short, best-effort DB operations
+	// issued from reconcile (session/connection inspection, disk-usage scan,
+	// exporter-role checks). It bounds DB connectivity issues so they do not
+	// block the reconcile worker. Extracted (S-1) to avoid duplicating the
+	// 10s literal across call sites.
+	dbOpTimeout = 10 * time.Second
 
 	// requeueAfterShort is used when waiting for a rolling restart phase to complete.
 	requeueAfterShort = 5 * time.Second
@@ -72,6 +80,14 @@ const (
 	// retentionDeletedMarker); the controller parses it to patch the
 	// avsoft.io/backup-retention-deleted annotation.
 	retentionDeletedMarkerPrefix = "RETENTION_DELETED="
+
+	// backupTimestampMarkerPrefix is the stdout/termination-message prefix the
+	// backup script emits with gpbackup's REAL runtime timestamp (see the
+	// builder's backupTimestampMarker / writeGpbackupTimestampCapture); the
+	// controller parses it to patch the avsoft.io/backup-timestamp annotation
+	// and PREFERS that value for status.lastBackupTimestamp so a later
+	// restore-by-timestamp resolves the correct S3 prefix.
+	backupTimestampMarkerPrefix = "BACKUP_TIMESTAMP="
 
 	// Human-readable backup Job statuses recorded in cluster.Status.LastBackupStatus
 	// and the BackupHistory entries.
@@ -347,6 +363,11 @@ func (r *AdminReconciler) handleAdminEarlyReturns(
 		// be re-created and its terminal status/metrics refreshed on the periodic
 		// requeue, even when the generation is unchanged (mirrors backup status).
 		r.refreshDataLoadingStatusOnSteadyState(ctx, cluster)
+		// Storage management (recommendation-scan CronJob C.5 + StorageConfigured
+		// condition R.5) must likewise converge on the steady-state path: without
+		// this, enabling disk monitoring on an already-settled cluster would never
+		// create the CronJob or set the condition (mirrors backup/data-loading).
+		r.refreshStorageOnSteadyState(ctx, cluster)
 		return ctrl.Result{RequeueAfter: r.requeueDefault()}, true, nil
 	}
 
@@ -534,6 +555,103 @@ func (r *AdminReconciler) refreshDataLoadingStatusOnSteadyState(
 	// included) so a status-only change never bumps the spec generation.
 	if err := r.patchDataLoadingStatus(ctx, cluster); err != nil {
 		logger.Warn("failed to patch data loading status on steady-state reconcile", "error", err)
+	}
+}
+
+// refreshStorageOnSteadyState converges the storage-management resources — the
+// scheduled recommendation-scan CronJob (C.5) and the StorageConfigured
+// condition (R.5) — on the steady-state periodic requeue, even when the spec
+// generation is unchanged. This is required because the generation gate in
+// handleAdminEarlyReturns short-circuits spec-driven reconciliation (which
+// normally runs reconcileStorage via reconcileSubComponents). Without this,
+// once a cluster settles (ObservedGeneration == Generation) with disk
+// monitoring enabled, the recommendation-scan CronJob and the StorageConfigured
+// condition would never be created (Scenario 115, live). It mirrors
+// refreshBackupStatusOnSteadyState exactly: idempotent (the ensure/remove
+// helpers are Get->Create/Update-on-drift / Get->Delete-IgnoreNotFound), and
+// non-fatal (errors are logged and ignored so a storage hiccup never blocks the
+// requeue).
+func (r *AdminReconciler) refreshStorageOnSteadyState(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	// R.1: diskMonitoring gate. Storage absent or disk monitoring off => the
+	// recommendation-scan CronJob must be GC'd on the steady-state path too, not
+	// just on the spec-driven reconcile. Once the cluster settles and the
+	// cluster-controller advances ObservedGeneration to match Generation, the
+	// generation gate short-circuits the spec-driven reconcileStorage (which is
+	// what normally drives the enabled->disabled GC). removeRecommendationScanCronJob
+	// is idempotent and tolerates NotFound, so it is a no-op for clusters that
+	// never had a scan configured and converges to no-CronJob otherwise.
+	if cluster.Spec.Storage == nil || !cluster.Spec.Storage.DiskMonitoring {
+		// C.2 reset-on-disable + C.4 clear-on-disable: the whole storage block is
+		// off, so reset the disk-usage status/gauge and clear any stale
+		// recommendation count/gauges BEFORE the CronJob GC (this steady-state
+		// path OWNS the storage-off GC per R5). clearStorageSignals persists the
+		// cleared status only when there is an actual stale value (R6).
+		r.clearStorageSignals(ctx, cluster, logger)
+		if err := r.removeRecommendationScanCronJob(ctx, cluster); err != nil {
+			logger.Warn("failed to remove recommendation-scan cronjob on steady-state reconcile", "error", err)
+		}
+		return
+	}
+
+	// R.2/S.1/M.1: measure disk usage on the steady-state path too so growth is
+	// tracked on settled clusters. recordDiskUsage sets Status.DiskUsagePercent
+	// from the current measured value and publishes the gauge from that same
+	// value. It persists the measured value via patchStatus; the end-of-function
+	// patchStatus below (for the StorageConfigured condition) is an idempotent
+	// MergePatch that also carries the in-memory DiskUsagePercent, so the status
+	// stays consistent. Best-effort and non-fatal (skips on DB error).
+	r.recordDiskUsage(ctx, cluster, logger)
+
+	// R.3/R.4/S.2/M.2/M.4: run the four threshold-aware recommendation scans on the
+	// steady-state path too so the per-type recommendations_total gauges and
+	// Status.RecommendationCount track changes (cleared/boundary cases) on settled
+	// clusters, not just on a spec-driven reconcile. recordRecommendations sets the
+	// in-memory Status.RecommendationCount; the end-of-function patchStatus below
+	// flushes it. Best-effort and non-fatal (skips on DB error). Gated on the scan
+	// being enabled so a disabled scan never publishes counts (DISABLED no-op).
+	if cluster.Spec.Storage.RecommendationScan != nil &&
+		cluster.Spec.Storage.RecommendationScan.Enabled {
+		r.recordRecommendations(ctx, cluster, logger)
+	} else {
+		// C.4 clear-on-disable (steady-state parity with the spec-driven path):
+		// diskMonitoring is ON but the scan is nil/disabled, so reset the count +
+		// per-type gauges. Mutually exclusive with recordRecommendations (clear
+		// never runs on the enabled path). The end-of-function patchStatus below
+		// flushes the zeroed count.
+		r.clearRecommendations(cluster)
+	}
+
+	// C.5: converge the scheduled recommendation-scan CronJob. ensureRecommendationScanCronJob
+	// is idempotent (Get->Create/Update-on-drift, and delete-if-exists when the
+	// builder returns nil for a disabled scan / empty schedule), and it keeps the
+	// cloudberry_recommendation_scan_cronjob gauge current, so calling it on every
+	// steady-state requeue is safe — exactly like ensureBackupCronJob.
+	if err := r.ensureRecommendationScanCronJob(ctx, cluster); err != nil {
+		logger.Warn("failed to ensure recommendation-scan cronjob on steady-state reconcile", "error", err)
+		return
+	}
+
+	// R.5: storage reconcile succeeded => StorageConfigured=True, set the same
+	// way reconcileStorage does so the condition converges on the steady-state
+	// path too.
+	cluster.Status.Conditions = util.SetCondition(
+		cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionStorageConfigured),
+		metav1.ConditionTrue,
+		"StorageReconciled",
+		"Storage management is configured",
+	)
+
+	// Persist the refreshed condition. MergePatch (via patchStatus) is used so
+	// already-set fields written by other controllers are not clobbered, and a
+	// status-only change does not bump the spec generation (status subresource).
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
+		logger.Warn("failed to patch storage status on steady-state reconcile", "error", err)
 	}
 }
 
@@ -1013,7 +1131,7 @@ func (r *AdminReconciler) cleanupWorkload(
 
 	// 1. Drop user-created resource groups from DB (best-effort, with timeout).
 	if r.dbFactory != nil {
-		dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+		dbCtx, dbCancel := context.WithTimeout(ctx, dbOpTimeout)
 		dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
 		if err == nil {
 			r.dropAllUserResourceGroups(dbCtx, cluster, dbClient, logger)
@@ -1525,7 +1643,7 @@ func (r *AdminReconciler) setupExporterRole(
 	logger *slog.Logger,
 ) {
 	// Use a short timeout so DB connection issues don't block the entire reconcile.
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	dbCtx, cancel := context.WithTimeout(ctx, dbOpTimeout)
 	defer cancel()
 
 	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
@@ -1561,7 +1679,7 @@ func (r *AdminReconciler) updateQueryStatusFromDB(
 	cluster *cbv1alpha1.CloudberryCluster,
 	logger *slog.Logger,
 ) {
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	dbCtx, cancel := context.WithTimeout(ctx, dbOpTimeout)
 	defer cancel()
 
 	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
@@ -2145,6 +2263,137 @@ func (r *AdminReconciler) ensureBackupCronJob(
 	return nil
 }
 
+// ensureRecommendationScanCronJob creates/updates the scheduled storage
+// recommendation-scan CronJob when the scan is enabled with a schedule
+// (spec 13 §Reconciliation C.5), or GCs it (delete-if-exists) when the builder
+// returns nil — the nil-means-delete contract shared with ensureBackupCronJob.
+// It is called UNCONDITIONALLY from reconcileStorage so the create path and the
+// enabled->disabled GC are both driven deterministically every reconcile. The
+// cloudberry_recommendation_scan_cronjob gauge is set 1 when provisioned, 0 when
+// removed.
+func (r *AdminReconciler) ensureRecommendationScanCronJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	desired := r.builder.BuildRecommendationScanCronJob(cluster)
+
+	if desired == nil {
+		// Scan disabled / no schedule: delete the CronJob if it exists.
+		r.metrics.SetRecommendationScanCronJob(cluster.Name, cluster.Namespace, 0)
+		return r.removeRecommendationScanCronJob(ctx, cluster)
+	}
+
+	existing := &batchv1.CronJob{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		if createErr := r.client.Create(ctx, desired); createErr != nil {
+			return fmt.Errorf("creating recommendation-scan cronjob %s: %w", desired.Name, createErr)
+		}
+		r.metrics.SetRecommendationScanCronJob(cluster.Name, cluster.Namespace, 1)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting recommendation-scan cronjob %s: %w", desired.Name, err)
+	}
+
+	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		existing.Spec = desired.Spec
+		existing.Labels = desired.Labels
+		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
+			return fmt.Errorf("updating recommendation-scan cronjob %s: %w", desired.Name, updateErr)
+		}
+	}
+	r.metrics.SetRecommendationScanCronJob(cluster.Name, cluster.Namespace, 1)
+	return nil
+}
+
+// removeRecommendationScanCronJob deletes the scheduled recommendation-scan
+// CronJob if it exists, tolerating NotFound so the disabled/GC path is a no-op
+// for clusters that never had a scan configured (spec 13 §C.5 nil-means-delete).
+func (r *AdminReconciler) removeRecommendationScanCronJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) error {
+	cronName := util.RecommendationScanCronJobName(cluster.Name)
+	existing := &batchv1.CronJob{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: cronName, Namespace: cluster.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("getting recommendation-scan cronjob %s: %w", cronName, err)
+	}
+	if delErr := r.client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
+		return fmt.Errorf("deleting recommendation-scan cronjob %s: %w", cronName, delErr)
+	}
+	return nil
+}
+
+// clearRecommendations resets the recommendation count + per-type gauges to 0
+// when the recommendation scan is disabled (C.4 clear-on-disable). Without this,
+// an enabled->disabled scan leaves a STALE Status.RecommendationCount and stale
+// cloudberry_recommendations_total{type} gauges, because recordRecommendations
+// (which OWNS both) is gated behind the scan being enabled and never runs on the
+// disabled path. It is best-effort, non-fatal, and IDEMPOTENT (zeroing an
+// already-zero count/gauge is a no-op), and it must ONLY be called on the
+// disabled path — never on the enabled path (that would zero a fresh scan).
+//
+// It reuses the canonical recommendationTypes slice (all four: bloat/skew/age/
+// index_bloat) — the same source recordRecommendations publishes from, so it
+// cannot drift. It also clears RecommendationScanTruncated (a disabled scan can
+// never be truncated; the flag stays non-sticky, consistent with C.10).
+//
+// It does NOT clear the per-table cloudberry_table_bloat_ratio{table} gauge:
+// that is a per-table cardinality signal (M.4) the operator does not enumerate
+// on disable, so there is no precise label set to zero here. The CronJob GC and
+// the on-disable count clear are the primary disabled-state signals (honest,
+// documented limitation).
+func (r *AdminReconciler) clearRecommendations(cluster *cbv1alpha1.CloudberryCluster) {
+	cluster.Status.RecommendationCount = 0
+	cluster.Status.RecommendationScanTruncated = false // never sticky on disable
+	for _, recType := range recommendationTypes {
+		r.metrics.SetRecommendationsTotal(cluster.Name, cluster.Namespace, recType, 0)
+	}
+}
+
+// clearStorageSignals resets BOTH disabled-state storage signals on the
+// diskMonitoring:false / whole-storage-off path so the two early-return sites
+// (reconcileStorage R.1 + refreshStorageOnSteadyState storage-off block) behave
+// identically:
+//   - C.2 reset-on-disable: Status.DiskUsagePercent is reset to 0 and
+//     cloudberry_disk_usage_percent is published 0, so a reader sees an explicit
+//     "monitoring off" signal rather than a frozen stale reading. (0 here is a
+//     disabled signal, NOT "empty"; the live check asserts the gauge does not
+//     ADVANCE after the flip.)
+//   - C.4 clear-on-disable: clearRecommendations resets the recommendation count
+//   - per-type gauges (the whole storage block off => no recommendations).
+//
+// To avoid status-patch churn on the never-configured common case (R6), the
+// cleared status is persisted ONLY when there is an actual stale value to clear.
+func (r *AdminReconciler) clearStorageSignals(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) {
+	staleDisk := cluster.Status.DiskUsagePercent != 0
+	staleRecs := cluster.Status.RecommendationCount != 0
+
+	// C.2 reset-on-disable: zero the disk-usage status + gauge.
+	cluster.Status.DiskUsagePercent = 0
+	r.metrics.SetDiskUsagePercent(cluster.Name, cluster.Namespace, 0)
+
+	// C.4 clear-on-disable: zero the recommendation count + per-type gauges.
+	r.clearRecommendations(cluster)
+
+	// R6: only patch when a real stale value was actually cleared, so the
+	// common Storage==nil / never-configured case does not churn the status.
+	if staleDisk || staleRecs {
+		if perr := patchStatus(ctx, r.client, cluster); perr != nil {
+			logger.Warn("failed to persist cleared storage signals on disabled storage", "error", perr)
+		}
+	}
+}
+
 // refreshBackupStatus inspects backup/restore Jobs owned by the cluster and
 // updates the backup-related status fields and history from the latest Job.
 func (r *AdminReconciler) refreshBackupStatus(
@@ -2163,6 +2412,12 @@ func (r *AdminReconciler) refreshBackupStatus(
 	// GPRESTORE_PARTIAL termination marker) BEFORE metrics/status are derived,
 	// so the same reconcile already reports the "partial" result.
 	r.reconcileRestorePartialAnnotations(ctx, cluster, jobs.Items)
+
+	// Annotate succeeded backup Jobs with gpbackup's REAL runtime timestamp (the
+	// BACKUP_TIMESTAMP termination marker) BEFORE status is derived, so the
+	// recorded status.lastBackupTimestamp / BackupHistory reference the true S3
+	// object prefix and a later restore-by-timestamp resolves it correctly.
+	r.reconcileBackupTimestampAnnotations(ctx, cluster, jobs.Items)
 
 	// Emit per-Job status metrics for every observed backup/restore/cleanup Job
 	// and record terminal metrics (restore duration, retention deletions) as Jobs
@@ -2953,14 +3208,28 @@ func backupJobSizeHuman(job *batchv1.Job) string {
 // backupTimestampFromJob extracts a gpbackup-style 14-digit YYYYMMDDHHMMSS
 // timestamp for a backup/restore Job.
 //
-// On-demand Jobs encode the timestamp in their name
-// ("{cluster}-backup-<timestamp>"), which is parsed by prefix-trimming. CronJob
-// spawned Jobs are named "{cluster}-backup-schedule-<hash>" by Kubernetes, from
-// which a real 14-digit timestamp cannot be parsed; for these we fall back to the
-// Job's CompletionTime (else StartTime) formatted as YYYYMMDDHHMMSS in UTC. This
-// guarantees status.lastBackupTimestamp (and BackupHistoryEntry.Timestamp) is
-// always a valid 14-digit value.
+// PREFERRED source (correctness fix): the REAL gpbackup runtime timestamp
+// captured on the avsoft.io/backup-timestamp annotation (patched from the
+// backup pod's "BACKUP_TIMESTAMP=<ts>" termination marker — see
+// reconcileBackupTimestampAnnotations). gpbackup generates its own timestamp at
+// runtime with no flag to pin it, so the operator's Job-name timestamp drifts
+// from the real S3 object prefix; preferring the captured value makes
+// status.lastBackupTimestamp resolve the correct prefix on a later
+// restore-by-timestamp.
+//
+// FALLBACK (backward compatible, annotation absent): on-demand Jobs encode the
+// timestamp in their name ("{cluster}-backup-<timestamp>"), which is parsed by
+// prefix-trimming. CronJob spawned Jobs are named
+// "{cluster}-backup-schedule-<hash>" by Kubernetes, from which a real 14-digit
+// timestamp cannot be parsed; for these we fall back to the Job's CompletionTime
+// (else StartTime) formatted as YYYYMMDDHHMMSS in UTC. This guarantees
+// status.lastBackupTimestamp (and BackupHistoryEntry.Timestamp) is always a
+// valid 14-digit value.
 func backupTimestampFromJob(cluster *cbv1alpha1.CloudberryCluster, job *batchv1.Job) string {
+	// Prefer gpbackup's REAL captured timestamp when present and valid.
+	if ts := backupTimestampFromAnnotation(job); ts != "" {
+		return ts
+	}
 	prefixes := []string{
 		util.BackupJobName(cluster.Name, ""),
 		util.RestoreJobName(cluster.Name, ""),
@@ -3558,9 +3827,20 @@ func (r *AdminReconciler) patchDataLoadingStatus(
 	return patchErr
 }
 
-// reconcileStorage reconciles storage management configuration and status.
-//
-//nolint:unparam // error return reserved for future DB operations
+// reconcileStorage reconciles storage management configuration and status
+// (spec 13 §Reconciliation). It implements:
+//   - R.1: gate on diskMonitoring (early-return no-op when storage is absent or
+//     disk monitoring is off).
+//   - C.1: accept/parse the recommendationScan config (schedule + thresholds).
+//   - C.3: accept the threshold set (bloat/skew/age/indexBloat/scanDuration)
+//     unchanged (passed to the CronJob as env vars by the builder).
+//   - C.5: create/update (or GC) the scheduled recommendation-scan CronJob via
+//     ensureRecommendationScanCronJob.
+//   - R.2: measure worst-case segment-volume filesystem usage (recordDiskUsage).
+//   - S.1: populate status.diskUsagePercent with the current measured value.
+//   - M.1: publish cloudberry_disk_usage_percent from the same measured value so
+//     the gauge matches the status.
+//   - R.5: set the StorageConfigured=True status condition.
 func (r *AdminReconciler) reconcileStorage(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
@@ -3568,7 +3848,15 @@ func (r *AdminReconciler) reconcileStorage(
 	ctx, end := startControllerSpan(ctx, adminControllerName, "reconcileStorage")
 	defer func() { end(err) }()
 
+	// R.1: diskMonitoring gate. Storage absent or disk monitoring off => no-op
+	// for measurement. The whole storage block off means NO recommendations can
+	// be produced, so clear any stale disk-usage (C.2 reset-on-disable) + stale
+	// recommendation count/gauges (C.4 clear-on-disable) before returning. The
+	// CronJob GC on this storage-off path is owned by refreshStorageOnSteadyState
+	// (see R5) — not duplicated here to avoid a behavior shift. clearStorageSignals
+	// persists only when there is an actual stale value (R6).
 	if cluster.Spec.Storage == nil || !cluster.Spec.Storage.DiskMonitoring {
+		r.clearStorageSignals(ctx, cluster, util.LoggerFromContext(ctx))
 		return nil
 	}
 
@@ -3581,30 +3869,47 @@ func (r *AdminReconciler) reconcileStorage(
 			cluster.Spec.Storage.UsageReport.Enabled,
 	)
 
-	// Update disk usage metrics.
-	r.metrics.SetDiskUsagePercent(
-		cluster.Name, cluster.Namespace, float64(cluster.Status.DiskUsagePercent),
-	)
+	// R.2: measure disk usage, populate Status.DiskUsagePercent (S.1), and publish
+	// the gauge from the measured value (M.1). Best-effort and non-fatal.
+	r.recordDiskUsage(ctx, cluster, logger)
 
-	// Process recommendation scan configuration.
-	recommendationCount := int32(0)
+	// C.1/C.3: process the recommendationScan config (schedule + thresholds).
 	if cluster.Spec.Storage.RecommendationScan != nil &&
 		cluster.Spec.Storage.RecommendationScan.Enabled {
 		logger.Info("recommendation scan is configured",
 			"schedule", cluster.Spec.Storage.RecommendationScan.Schedule,
 			"bloatThreshold", cluster.Spec.Storage.RecommendationScan.BloatThreshold,
 			"skewThreshold", cluster.Spec.Storage.RecommendationScan.SkewThreshold,
+			"ageThreshold", cluster.Spec.Storage.RecommendationScan.AgeThreshold,
+			"indexBloatThreshold", cluster.Spec.Storage.RecommendationScan.IndexBloatThreshold,
 		)
-		recommendationCount = cluster.Status.RecommendationCount
-		// Publish per-table bloat ratios for the top-N most-bloated tables so the
-		// cloudberry_table_bloat_ratio gauge is populated. Best-effort and
-		// non-fatal: a DB/connection failure only skips this scan.
-		r.recordTableBloatRatios(ctx, cluster, logger)
+		// R.3/R.4/S.2/M.2/M.4: run all four threshold-aware recommendation scans,
+		// count per type, publish recommendations_total{type} + table_bloat_ratio,
+		// and set Status.RecommendationCount to the CURRENT total (not stale).
+		// Best-effort and non-fatal: a DB/connection failure only skips the scan.
+		r.recordRecommendations(ctx, cluster, logger)
+	} else {
+		// C.4 clear-on-disable: diskMonitoring is ON but the scan is nil/disabled.
+		// No recommendations are produced; reset the count + per-type gauges so a
+		// prior enabled->disabled scan does not leave a stale signal. This else is
+		// mutually exclusive with recordRecommendations (the idempotency guard:
+		// clear never runs on the enabled path). The controller's end-of-reconcile
+		// status patch persists the zeroed count — no extra patch needed here.
+		r.clearRecommendations(cluster)
 	}
 
-	// Update status fields.
-	cluster.Status.RecommendationCount = recommendationCount
+	// C.5: materialize the scheduled recommendation-scan CronJob. Called
+	// UNCONDITIONALLY so create AND the enabled->disabled GC are both driven
+	// every reconcile (the builder returns nil when the scan is disabled / has
+	// no schedule, which triggers the delete-if-exists path). A create/update
+	// error surfaces as a reconcile error (the no-false-positive control).
+	if csErr := r.ensureRecommendationScanCronJob(ctx, cluster); csErr != nil {
+		return csErr
+	}
 
+	// R.5: storage reconcile succeeded => StorageConfigured=True. recordRecommendations
+	// now OWNS Status.RecommendationCount (set to the current scan total), so it is
+	// not re-assigned here; the controller's end-of-reconcile status patch persists it.
 	cluster.Status.Conditions = util.SetCondition(
 		cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionStorageConfigured),
@@ -3615,7 +3920,7 @@ func (r *AdminReconciler) reconcileStorage(
 
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonStorageReconciled,
 		fmt.Sprintf("Storage management reconciled: diskMonitoring=%t, recommendations=%d",
-			cluster.Spec.Storage.DiskMonitoring, recommendationCount))
+			cluster.Spec.Storage.DiskMonitoring, cluster.Status.RecommendationCount))
 
 	return nil
 }
@@ -3624,43 +3929,281 @@ func (r *AdminReconciler) reconcileStorage(
 // the cloudberry_table_bloat_ratio gauge, keeping metric cardinality in check.
 const maxBloatRatioTables = 20
 
-// recordTableBloatRatios queries the most-bloated tables and publishes their
-// dead-tuple bloat ratio to the cloudberry_table_bloat_ratio gauge for the
-// top-N tables (capped by maxBloatRatioTables to bound cardinality). It is
-// best-effort and non-fatal: a missing dbFactory or any DB error simply skips
-// the scan. A child span is created so a slow bloat scan is visible in traces.
-func (r *AdminReconciler) recordTableBloatRatios(
+// Recommendation type labels for cloudberry_recommendations_total{type}.
+const (
+	recTypeBloat      = "bloat"
+	recTypeSkew       = "skew"
+	recTypeAge        = "age"
+	recTypeIndexBloat = "index_bloat"
+)
+
+// recommendationTypes is the canonical, ordered set of recommendation types.
+// recordRecommendations publishes cloudberry_recommendations_total for EVERY
+// type in this slice on each scan (0 when none) so a cleared / out-of-threshold
+// type's gauge resets to 0 rather than going stale (117a-CLEAR / 117b-BOUNDARY).
+var recommendationTypes = []string{recTypeBloat, recTypeSkew, recTypeAge, recTypeIndexBloat}
+
+// Scan-duration cap policy constants (C.10).
+const (
+	// defaultScanDuration is the fallback cap used when scanDuration is empty,
+	// unparseable, or non-positive. It preserves the historical hardcoded 10s
+	// behavior so already-deployed CRs with an empty scanDuration are unaffected.
+	defaultScanDuration = 10 * time.Second
+	// maxScanDuration is the ceiling guard so a typo like "2000h" cannot pin the
+	// reconcile worker for days.
+	maxScanDuration = 24 * time.Hour
+	// connectTimeout is the FIXED budget for establishing the DB client
+	// (dbFactory.NewClient) in recordRecommendations. It is intentionally
+	// SEPARATE from the scanDuration cap: connection establishment (~10-40ms in
+	// practice) must not consume the scan budget, otherwise a tiny scanDuration
+	// (e.g. "1ms"/"50ms") would trip on NewClient FIRST and the C.10 truncation
+	// signal — which must key off the QUERY phase — would never be observable.
+	// It preserves the prior 10s connection behavior.
+	connectTimeout = 10 * time.Second
+)
+
+// resolveScanDuration derives the C.10 scan-context cap from the configured
+// scanDuration, parsing it with time.ParseDuration and applying a defensive
+// fallback/clamp policy:
+//
+//   - empty, unparseable, or <= 0 -> defaultScanDuration (10s). This defends in
+//     depth (the field is a free string at the type level and a controller call
+//     outside the webhook path must never run unbounded) while preserving the
+//     prior hardcoded 10s behavior for the empty case.
+//   - > maxScanDuration (24h)     -> clamped down to 24h (ceiling guard).
+//   - otherwise                   -> the parsed value VERBATIM, so a tiny "10ms"
+//     deterministically trips the deadline (no production floor that would mask
+//     the configured cap).
+//
+// The webhook (W.5) rejects an unparseable value upstream; this helper is the
+// runtime guard that guarantees a sane, bounded deadline regardless.
+func resolveScanDuration(scan *cbv1alpha1.RecommendationScanSpec, logger *slog.Logger) time.Duration {
+	if scan == nil || scan.ScanDuration == "" {
+		return defaultScanDuration
+	}
+	parsed, err := time.ParseDuration(scan.ScanDuration)
+	if err != nil {
+		logger.Warn("invalid scanDuration, falling back to default cap",
+			"scanDuration", scan.ScanDuration, "default", defaultScanDuration, "error", err)
+		return defaultScanDuration
+	}
+	if parsed <= 0 {
+		return defaultScanDuration
+	}
+	if parsed > maxScanDuration {
+		return maxScanDuration
+	}
+	return parsed
+}
+
+// recordRecommendations runs all FOUR threshold-aware recommendation scans
+// (bloat/skew/age/index_bloat) for an enabled recommendationScan, COUNTS the
+// active recommendations per type, and publishes the results in a single pass:
+//
+//   - R.3 — it PROCESSES the recommendationScan config: it reads the four CRD
+//     thresholds (bloat/skew/age/indexBloat) into a db.RecommendationThresholds
+//     and threads that into each DB query.
+//   - S.2/R.4 — it sets cluster.Status.RecommendationCount to the CURRENT total
+//     active count (sum across the four types), NOT the stale prior value.
+//   - M.2 — it sets cloudberry_recommendations_total{type} for EACH type from the
+//     per-type count, including 0 for absent/cleared types so the gauge resets.
+//   - M.4 — it publishes per-table bloat ratios (cloudberry_table_bloat_ratio)
+//     from the SAME bloat scan, so the bloat query runs ONCE per reconcile.
+//   - duration — it observes recommendation_scan_duration_seconds over the scan.
+//
+// Best-effort and non-fatal: a missing dbFactory, a NewClient failure, or any
+// single Get* error SKIPS that contribution WITHOUT fabricating a count for the
+// failing type and WITHOUT failing the reconcile. HONEST per-type fallback
+// mirrors Scenario 116: a missing gp_toolkit view (skew) or absent catalog
+// column returns no rows, so that type counts 0 + a debug log, never a fabricated
+// value (RT.1–RT.4 / C.6–C.9).
+//
+// M.2 == count INVARIANT: Status.RecommendationCount == sum over types of the
+// value passed to SetRecommendationsTotal{type}. Both derive from the SAME
+// per-type counts computed in this single pass — the stale status count is never
+// read to publish the metric.
+func (r *AdminReconciler) recordRecommendations(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
 	logger *slog.Logger,
 ) {
 	if r.dbFactory == nil {
-		logger.Debug("skipping table bloat ratio scan, no DB factory configured")
+		logger.Debug("skipping recommendation scan, no DB factory configured")
 		return
 	}
 
-	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "recordTableBloatRatios")
+	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "recordRecommendations")
 	defer span.End()
 
-	// Use a short timeout so DB connection issues don't block the reconcile.
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	// R.3: build the per-type thresholds from the CRD recommendationScan spec.
+	scan := cluster.Spec.Storage.RecommendationScan
 
-	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	// CONNECTION budget (FIXED, SEPARATE from the scan cap): establishing the DB
+	// client is bounded by connectTimeout (the prior 10s behavior), NOT by the
+	// configured scanDuration. Keeping connection establishment out of the scan
+	// budget is what makes the C.10 truncation signal observable: a tiny
+	// scanDuration (e.g. "1ms"/"50ms") would otherwise trip on NewClient FIRST
+	// and the truncation detection (which must key off the QUERY phase) would
+	// never be reached.
+	connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+	defer connectCancel()
+
+	dbClient, err := r.dbFactory.NewClient(connectCtx, cluster)
 	if err != nil {
-		logger.Debug("skipping table bloat ratio scan, DB not available", "error", err)
+		// DB unavailable: the scan never ran. Record an honest "skipped"
+		// outcome (B-2) so the previously-silent early return is visible.
+		r.metrics.RecordRecommendationScan(cluster.Name, cluster.Namespace, metricResultSkipped)
+		logger.Debug("skipping recommendation scan, DB not available", "error", err)
 		return
 	}
 	defer dbClient.Close()
 
-	recs, err := dbClient.GetBloatRecommendations(dbCtx)
-	if err != nil {
-		telemetry.SetSpanError(span, err)
-		logger.Warn("failed to fetch bloat recommendations for metrics", "error", err)
-		return
+	th := db.RecommendationThresholds{
+		Bloat:      scan.BloatThreshold,
+		Skew:       scan.SkewThreshold,
+		Age:        scan.AgeThreshold,
+		IndexBloat: scan.IndexBloatThreshold,
 	}
 
-	// recs are ordered by dead tuples DESC by the query; publish the top-N.
+	// SCAN budget (C.10): bound ONLY the four Get* queries by the configured
+	// scanDuration. scanCtx is derived from the parent ctx (NOT connectCtx, whose
+	// connectTimeout deadline is unrelated to the query budget) so a single
+	// shared scanDuration deadline caps the TOTAL of all four queries (one shared
+	// budget, NOT 4x the cap); a deadline-trip on query N short-circuits the
+	// rest, which observe the canceled ctx and error out fast. Because the
+	// connection is already established above, a tiny cap now deterministically
+	// truncates the QUERY phase (the intended C.10 behavior), independent of
+	// connection time.
+	scanCtx, scanCancel := context.WithTimeout(ctx, resolveScanDuration(scan, logger))
+	defer scanCancel()
+
+	start := time.Now()
+	counts, bloatRecs := r.scanRecommendations(scanCtx, span, dbClient, th, logger)
+	// M.3: observe the actual (capped) elapsed time of the scan loop — under a
+	// truncated run this reflects the capped run, not an unbounded scan.
+	r.metrics.ObserveRecommendationScanDuration(cluster.Name, cluster.Namespace, time.Since(start))
+
+	// C.10 truncation signal (118b): if the SCAN context hit its deadline mid-run
+	// the scan was capped. Record the truncation on the status (for kubectl
+	// visibility) and on the counter metric (for alerting). The flag is set on
+	// EVERY scan so it is always current and never sticky. The per-type counts
+	// below are HONEST: only the types that completed before the deadline are
+	// counted; un-run types contribute 0 (no fabrication).
+	truncated := errors.Is(scanCtx.Err(), context.DeadlineExceeded)
+	cluster.Status.RecommendationScanTruncated = truncated
+	if truncated {
+		r.metrics.IncRecommendationScanTruncated(cluster.Name, cluster.Namespace)
+		logger.Warn("recommendation scan truncated at scanDuration cap",
+			"scanDuration", scan.ScanDuration)
+	}
+	now := metav1.Now()
+	cluster.Status.LastRecommendationScanTime = &now
+
+	// M.2 + S.2/R.4: publish the per-type gauge for ALL types (0s included) and
+	// sum the SAME per-type counts into the status total, preserving the
+	// M.2 == count invariant.
+	total := int32(0)
+	for _, recType := range recommendationTypes {
+		r.metrics.SetRecommendationsTotal(cluster.Name, cluster.Namespace, recType, counts[recType])
+		total += int32(counts[recType])
+	}
+	cluster.Status.RecommendationCount = total
+
+	// M.4: publish per-table bloat ratios from the bloat recs already fetched in
+	// the single pass above (no second bloat query).
+	r.publishTableBloatRatios(cluster, bloatRecs, logger)
+
+	// B-2: a completed scan (even if truncated at the scanDuration cap) is a
+	// "success" outcome. Truncation stays its own orthogonal signal
+	// (IncRecommendationScanTruncated above) and is intentionally NOT conflated
+	// with this result enum.
+	r.metrics.RecordRecommendationScan(cluster.Name, cluster.Namespace, metricResultSuccess)
+
+	logger.Debug("recorded recommendations", "total", total,
+		"bloat", int32(counts[recTypeBloat]), "skew", int32(counts[recTypeSkew]),
+		"age", int32(counts[recTypeAge]), "indexBloat", int32(counts[recTypeIndexBloat]))
+}
+
+// scanRecommendations runs the four threshold-aware Get* scans once, returning
+// the per-type active counts and the bloat recs (reused for M.4). A single Get*
+// error is logged (and recorded on the span) and SKIPPED — that type contributes
+// 0 to the counts without failing the scan or fabricating a value.
+func (r *AdminReconciler) scanRecommendations(
+	dbCtx context.Context,
+	span trace.Span,
+	dbClient db.Client,
+	th db.RecommendationThresholds,
+	logger *slog.Logger,
+) (map[string]float64, []db.Recommendation) {
+	counts := map[string]float64{}
+	var bloatRecs []db.Recommendation
+
+	fetchers := []struct {
+		recType string
+		fetch   func(context.Context, db.RecommendationThresholds) ([]db.Recommendation, error)
+	}{
+		{recTypeBloat, dbClient.GetBloatRecommendations},
+		{recTypeSkew, dbClient.GetSkewRecommendations},
+		{recTypeAge, dbClient.GetAgeRecommendations},
+		{recTypeIndexBloat, dbClient.GetIndexBloatRecommendations},
+	}
+
+	for _, f := range fetchers {
+		recs, fetchErr := r.fetchRecommendationType(dbCtx, span, f.recType, th, f.fetch, logger)
+		if fetchErr != nil {
+			continue
+		}
+		for i := range recs {
+			counts[recs[i].Type]++
+		}
+		if f.recType == recTypeBloat {
+			bloatRecs = recs
+		}
+	}
+
+	return counts, bloatRecs
+}
+
+// fetchRecommendationType runs a single per-type recommendation fetch inside a
+// dedicated child span (O-3) so a slow or failing individual recommendation
+// query is localizable in a trace. The span carries only the bounded `rec_type`
+// enum attribute (never resource-derived strings). A fetch error is recorded on
+// BOTH the child span and the parent span (preserving the prior parent
+// behavior) and returned so the caller skips that type honestly.
+func (r *AdminReconciler) fetchRecommendationType(
+	dbCtx context.Context,
+	parentSpan trace.Span,
+	recType string,
+	th db.RecommendationThresholds,
+	fetch func(context.Context, db.RecommendationThresholds) ([]db.Recommendation, error),
+	logger *slog.Logger,
+) ([]db.Recommendation, error) {
+	childCtx, childSpan := telemetry.StartSpan(dbCtx, adminControllerName,
+		"controller.scanRecommendations.fetch",
+		trace.WithAttributes(attribute.String("rec_type", recType)))
+	defer childSpan.End()
+
+	recs, fetchErr := fetch(childCtx, th)
+	if fetchErr != nil {
+		telemetry.SetSpanError(childSpan, fetchErr)
+		telemetry.SetSpanError(parentSpan, fetchErr)
+		logger.Warn("recommendation fetch failed, skipping type",
+			"type", recType, "error", fetchErr)
+		return nil, fetchErr
+	}
+	return recs, nil
+}
+
+// publishTableBloatRatios publishes the dead-tuple bloat ratio of the top-N
+// most-bloated tables to the cloudberry_table_bloat_ratio gauge (M.4), capped by
+// maxBloatRatioTables to bound metric cardinality. The recs are the already
+// fetched bloat recommendations (ordered by dead_pct DESC), so no extra query is
+// issued.
+func (r *AdminReconciler) publishTableBloatRatios(
+	cluster *cbv1alpha1.CloudberryCluster,
+	recs []db.Recommendation,
+	logger *slog.Logger,
+) {
 	limit := len(recs)
 	if limit > maxBloatRatioTables {
 		limit = maxBloatRatioTables
@@ -3674,6 +4217,232 @@ func (r *AdminReconciler) recordTableBloatRatios(
 		r.metrics.SetTableBloatRatio(cluster.Name, cluster.Namespace, table, rec.Ratio)
 	}
 	logger.Debug("published table bloat ratios", "tables", limit)
+}
+
+// recordDiskUsage measures disk usage and populates Status.DiskUsagePercent with
+// the CURRENT measured value (S.1), persists it via patchStatus, and publishes
+// the cloudberry_disk_usage_percent gauge FROM the measured value so the metric
+// matches the status (M.1). It is the measurement step of R.2.
+//
+// It uses a ROBUST, PORTABLE fallback chain so it produces a real value on
+// Cloudberry 2.1.0 (where gp_toolkit.gp_disk_free does NOT exist) while still
+// preferring the TRUE filesystem source when it is present:
+//
+//  1. PREFERRED (true filesystem usage): GetDiskUsagePercent reads
+//     gp_toolkit.gp_disk_free and returns the worst-case
+//     100*(df_total-df_free)/df_total across segment volumes. This is the real
+//     filesystem usage of the data volumes.
+//  2. FALLBACK (portable LOGICAL-vs-provisioned proxy): when GetDiskUsagePercent
+//     returns db.ErrDiskUsageUnavailable (view/columns absent), the percent is
+//     computed as clamp(100 * usedBytes / provisionedBytes), where usedBytes is
+//     the LOGICAL cluster data size (GetClusterDataSizeBytes) and provisionedBytes
+//     is the CRD-provisioned PVC capacity (see computeProvisionedCapacityBytes).
+//     This measures LOGICAL stored data against PROVISIONED capacity — NOT the
+//     raw filesystem usage — and is documented as such so the signal is honest.
+//
+// It is best-effort and non-fatal: a missing dbFactory, a NewClient failure, or
+// BOTH measurement sources failing simply SKIPS the measurement WITHOUT
+// fabricating a value or overwriting the prior status (so a transient DB outage
+// never reports a misleading "disk empty" signal). A child span makes a slow
+// query visible in traces.
+//
+// M.1==S.1 invariant: both the persisted status and the published gauge derive
+// from the single measured local pct; the stale Status.DiskUsagePercent is never
+// read to publish the metric.
+func (r *AdminReconciler) recordDiskUsage(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	logger *slog.Logger,
+) {
+	if r.dbFactory == nil {
+		logger.Debug("skipping disk usage measurement, no DB factory configured")
+		return
+	}
+
+	ctx, span := telemetry.StartSpan(ctx, adminControllerName, "recordDiskUsage")
+	defer span.End()
+
+	// Use a short timeout so DB connection issues don't block the reconcile.
+	dbCtx, cancel := context.WithTimeout(ctx, dbOpTimeout)
+	defer cancel()
+
+	dbClient, err := r.dbFactory.NewClient(dbCtx, cluster)
+	if err != nil {
+		// DB unavailable: the scan never ran. Record an honest "skipped"
+		// outcome (B-1) so the gap is visible for alerting.
+		r.metrics.RecordDiskUsageScan(cluster.Name, cluster.Namespace, metricResultSkipped)
+		logger.Debug("skipping disk usage measurement, DB not available", "error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	pct, ok := r.measureDiskUsagePercent(dbCtx, span, cluster, dbClient, logger)
+	if !ok {
+		// Both the gp_disk_free path and the logical-proxy fallback failed:
+		// SKIP, do not fabricate (S.1/R.2). This is a real failure to obtain a
+		// measurement, recorded as result="error" (B-1).
+		r.metrics.RecordDiskUsageScan(cluster.Name, cluster.Namespace, metricResultError)
+		return
+	}
+
+	r.publishDiskUsage(ctx, cluster, pct, logger)
+	r.metrics.RecordDiskUsageScan(cluster.Name, cluster.Namespace, metricResultSuccess)
+}
+
+// measureDiskUsagePercent runs the fallback chain and returns the measured disk
+// usage percentage (0..100). It first tries the PREFERRED true filesystem source
+// (db.GetDiskUsagePercent / gp_toolkit.gp_disk_free); only when that returns
+// db.ErrDiskUsageUnavailable does it fall back to the PORTABLE logical-size vs
+// provisioned-capacity proxy. ok is false (and the caller skips honestly) when
+// the preferred path fails for any other reason or the fallback cannot be
+// computed.
+func (r *AdminReconciler) measureDiskUsagePercent(
+	dbCtx context.Context,
+	span trace.Span,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+	logger *slog.Logger,
+) (int32, bool) {
+	pct, err := dbClient.GetDiskUsagePercent(dbCtx)
+	if err == nil {
+		return pct, true
+	}
+	if !errors.Is(err, db.ErrDiskUsageUnavailable) {
+		// A real query/connectivity error on the preferred path: skip, do not
+		// fabricate (S.1/R.2).
+		telemetry.SetSpanError(span, err)
+		logger.Warn("failed to measure disk usage, skipping", "error", err)
+		return 0, false
+	}
+
+	// gp_toolkit.gp_disk_free is absent on this server version (e.g. Cloudberry
+	// 2.1.0). Fall back to the portable LOGICAL-vs-provisioned proxy.
+	logger.Debug("gp_disk_free unavailable, using logical-size proxy", "error", err)
+	return r.measureLogicalDiskUsageProxy(dbCtx, span, cluster, dbClient, logger)
+}
+
+// measureLogicalDiskUsageProxy computes the PORTABLE fallback percentage:
+// clamp(100 * usedBytes / provisionedBytes), where usedBytes is the LOGICAL
+// cluster data size (sum of pg_database_size, always available) and
+// provisionedBytes is the CRD-provisioned PVC capacity. This is honestly a
+// LOGICAL-size-vs-provisioned-capacity proxy, NOT raw filesystem usage. ok is
+// false when the used size cannot be read or the provisioned capacity is
+// unknown/zero, so the caller skips without fabricating.
+func (r *AdminReconciler) measureLogicalDiskUsageProxy(
+	dbCtx context.Context,
+	span trace.Span,
+	cluster *cbv1alpha1.CloudberryCluster,
+	dbClient db.Client,
+	logger *slog.Logger,
+) (int32, bool) {
+	usedBytes, err := dbClient.GetClusterDataSizeBytes(dbCtx)
+	if err != nil {
+		telemetry.SetSpanError(span, err)
+		logger.Warn("failed to measure cluster data size, skipping", "error", err)
+		return 0, false
+	}
+
+	provisionedBytes := computeProvisionedCapacityBytes(cluster)
+	if provisionedBytes <= 0 {
+		// No usable provisioned capacity (unparseable/zero spec.segments.storage.size):
+		// skip without fabricating a percentage.
+		logger.Warn("cannot compute disk usage proxy, provisioned capacity unknown",
+			"usedBytes", usedBytes)
+		return 0, false
+	}
+
+	pct := clampUsagePercent(usedBytes, provisionedBytes)
+	logger.Debug("computed logical disk usage proxy",
+		"usedBytes", usedBytes, "provisionedBytes", provisionedBytes, "percent", pct)
+	return pct, true
+}
+
+// clampUsagePercent computes 100 * used / provisioned, truncated to an int32 and
+// clamped to the inclusive 0..100 range. The ratio is computed in float64 to
+// avoid any int64 overflow from a 100*used multiplication on extreme (petabyte+)
+// sizes; the float precision loss is immaterial for an integer percentage.
+// provisioned <= 0 yields 0 (defensive; the caller already guards this).
+func clampUsagePercent(used, provisioned int64) int32 {
+	if provisioned <= 0 {
+		return 0
+	}
+	pct := int32((float64(used) / float64(provisioned)) * 100.0)
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+// computeProvisionedCapacityBytes returns the total PVC capacity (in bytes)
+// provisioned for the cluster's SEGMENT data volumes, derived from the CRD spec.
+//
+// Formula (documented, consistent):
+//
+//	provisioned = perVolumeBytes * volumeCount
+//	perVolumeBytes = parse(spec.segments.storage.size)   // resource.Quantity
+//	volumeCount    = primaries + mirrors
+//	primaries      = spec.segments.count
+//	mirrors        = spec.segments.count                 // only when mirroring enabled
+//
+// Rationale for which components are counted:
+//   - PRIMARIES: spec.segments.count primary segments, each with its OWN PVC of
+//     spec.segments.storage.size — always counted.
+//   - MIRRORS: when spec.segments.mirroring.Enabled is true, each primary has a
+//     mirror with its own PVC of the SAME spec.segments.storage.size, so mirrors
+//     double the provisioned segment capacity — counted only when mirroring is on.
+//   - The coordinator/standby volumes are intentionally NOT counted: the
+//     numerator (sum of pg_database_size) reflects user data that lives on the
+//     SEGMENTS, so the denominator is kept to the segment data volumes for a
+//     consistent, comparable ratio.
+//
+// Returns 0 when spec.segments.storage.size is empty/unparseable or the segment
+// count is non-positive, signaling the caller to skip the proxy honestly.
+func computeProvisionedCapacityBytes(cluster *cbv1alpha1.CloudberryCluster) int64 {
+	seg := cluster.Spec.Segments
+	if seg.Count <= 0 || seg.Storage.Size == "" {
+		return 0
+	}
+
+	qty, err := resource.ParseQuantity(seg.Storage.Size)
+	if err != nil {
+		return 0
+	}
+	perVolumeBytes, ok := qty.AsInt64()
+	if !ok || perVolumeBytes <= 0 {
+		return 0
+	}
+
+	volumeCount := int64(seg.Count)
+	if seg.Mirroring != nil && seg.Mirroring.Enabled {
+		volumeCount += int64(seg.Count)
+	}
+
+	return perVolumeBytes * volumeCount
+}
+
+// publishDiskUsage persists the measured disk usage percentage into the cluster
+// status (S.1) and publishes the cloudberry_disk_usage_percent gauge FROM the
+// SAME value (M.1), keeping metric == status as a single source of truth.
+func (r *AdminReconciler) publishDiskUsage(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	pct int32,
+	logger *slog.Logger,
+) {
+	// S.1: status carries the CURRENT measured value (tracks growth, never sticky).
+	cluster.Status.DiskUsagePercent = pct
+	if perr := patchStatus(ctx, r.client, cluster); perr != nil {
+		// Non-fatal: still publish the metric from the measured value below so
+		// the gauge stays current even if the status patch transiently fails.
+		logger.Warn("failed to persist disk usage status", "error", perr)
+	}
+
+	// M.1: publish FROM the measured value so metric == status (single source).
+	r.metrics.SetDiskUsagePercent(cluster.Name, cluster.Namespace, float64(pct))
+	logger.Debug("recorded disk usage", "percent", pct)
 }
 
 // configChanges holds the classified parameter changes.
@@ -3736,7 +4505,12 @@ func (r *AdminReconciler) updateConfigMap(
 		}
 
 		existing.Data = desired.Data
-		existing.Annotations = desired.Annotations
+		// H-4: MERGE desired annotations into the live object instead of a
+		// wholesale replace, so third-party / controller-runtime annotations
+		// (e.g. kubectl.kubernetes.io/last-applied-configuration) on the live
+		// ConfigMap survive the update. Operator-owned data is still fully
+		// owned via existing.Data = desired.Data above.
+		existing.Annotations = mergeAnnotations(existing.Annotations, desired.Annotations)
 		if updateErr := r.client.Update(ctx, existing); updateErr != nil {
 			if apierrors.IsConflict(updateErr) && attempt < maxRetries-1 {
 				r.logger.Debug("configmap update conflict, retrying", "attempt", attempt+1)
@@ -3752,6 +4526,22 @@ func (r *AdminReconciler) updateConfigMap(
 		return nil
 	}
 	return nil
+}
+
+// mergeAnnotations copies every key/value from desired into existing,
+// allocating the map when existing is nil, and returns the merged map. Keys
+// present on existing but absent from desired are PRESERVED (H-4): this keeps
+// third-party / controller-runtime annotations on the live object intact while
+// still applying every operator-desired annotation. Desired values win on key
+// collisions.
+func mergeAnnotations(existing, desired map[string]string) map[string]string {
+	if existing == nil {
+		existing = make(map[string]string, len(desired))
+	}
+	for k, v := range desired {
+		existing[k] = v
+	}
+	return existing
 }
 
 // applyConfigChange updates status and emits events based on whether the change

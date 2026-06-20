@@ -465,16 +465,19 @@ func (r *ClusterReconciler) reconcileStatefulSets(
 func (r *ClusterReconciler) reconcileConfigMaps(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileConfigMaps")
+	defer func() { end(err) }()
+
 	// PostgreSQL configuration.
 	desiredPgConf := r.builder.BuildPostgresqlConfConfigMap(cluster)
-	if err := r.createOrUpdateConfigMap(ctx, desiredPgConf); err != nil {
+	if err = r.createOrUpdateConfigMap(ctx, desiredPgConf); err != nil {
 		return fmt.Errorf("postgresql.conf configmap: %w", err)
 	}
 
 	// pg_hba.conf.
 	desiredHBA := r.builder.BuildPgHBAConfConfigMap(cluster)
-	if err := r.createOrUpdateConfigMap(ctx, desiredHBA); err != nil {
+	if err = r.createOrUpdateConfigMap(ctx, desiredHBA); err != nil {
 		return fmt.Errorf("pg_hba.conf configmap: %w", err)
 	}
 
@@ -487,10 +490,13 @@ func (r *ClusterReconciler) reconcileConfigMaps(
 func (r *ClusterReconciler) reconcileAdminSecret(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileAdminSecret")
+	defer func() { end(err) }()
+
 	secretName := util.AdminPasswordSecretName(cluster.Name)
 	existing := &corev1.Secret{}
-	err := r.client.Get(ctx, types.NamespacedName{
+	err = r.client.Get(ctx, types.NamespacedName{
 		Name:      secretName,
 		Namespace: cluster.Namespace,
 	}, existing)
@@ -511,6 +517,7 @@ func (r *ClusterReconciler) reconcileAdminSecret(
 
 	desired := r.builder.BuildAdminPasswordSecret(cluster, password)
 	if createErr := r.client.Create(ctx, desired); createErr != nil {
+		err = createErr
 		return fmt.Errorf("creating admin password secret %s: %w", secretName, createErr)
 	}
 
@@ -533,10 +540,13 @@ func (r *ClusterReconciler) reconcileAdminSecret(
 func (r *ClusterReconciler) reconcileClusterSSHSecret(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileClusterSSHSecret")
+	defer func() { end(err) }()
+
 	secretName := util.ClusterSSHSecretName(cluster.Name)
 	existing := &corev1.Secret{}
-	err := r.client.Get(ctx, types.NamespacedName{
+	err = r.client.Get(ctx, types.NamespacedName{
 		Name:      secretName,
 		Namespace: cluster.Namespace,
 	}, existing)
@@ -551,6 +561,7 @@ func (r *ClusterReconciler) reconcileClusterSSHSecret(
 
 	privateKeyPEM, authorizedKey, genErr := builder.GenerateClusterSSHKeyPair()
 	if genErr != nil {
+		err = genErr
 		return fmt.Errorf("generating cluster ssh keypair: %w", genErr)
 	}
 
@@ -558,8 +569,10 @@ func (r *ClusterReconciler) reconcileClusterSSHSecret(
 	if createErr := r.client.Create(ctx, desired); createErr != nil {
 		if apierrors.IsAlreadyExists(createErr) {
 			// Lost a race with a concurrent reconcile — the Secret now exists.
+			err = nil
 			return nil
 		}
+		err = createErr
 		return fmt.Errorf("creating cluster ssh secret %s: %w", secretName, createErr)
 	}
 
@@ -574,7 +587,10 @@ func (r *ClusterReconciler) reconcileClusterSSHSecret(
 func (r *ClusterReconciler) reconcileServices(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileServices")
+	defer func() { end(err) }()
+
 	services := []*corev1.Service{
 		r.builder.BuildCoordinatorService(cluster),
 		r.builder.BuildSegmentService(cluster),
@@ -587,7 +603,7 @@ func (r *ClusterReconciler) reconcileServices(
 	}
 
 	for _, svc := range services {
-		if err := r.createOrUpdateService(ctx, svc); err != nil {
+		if err = r.createOrUpdateService(ctx, svc); err != nil {
 			return fmt.Errorf("service %s: %w", svc.Name, err)
 		}
 	}
@@ -599,22 +615,30 @@ func (r *ClusterReconciler) reconcileServices(
 func (r *ClusterReconciler) reconcileCoordinator(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileCoordinator")
+	defer func() { end(err) }()
+
 	desired, err := r.builder.BuildCoordinatorStatefulSet(cluster)
 	if err != nil {
 		return fmt.Errorf("building coordinator StatefulSet for cluster %s: %w", cluster.Name, err)
 	}
-	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+	err = r.applyClusterTLSChecksum(ctx, cluster, desired)
+	if err != nil {
 		return err
 	}
-	return r.createOrUpdateStatefulSet(ctx, desired)
+	err = r.createOrUpdateStatefulSet(ctx, desired)
+	return err
 }
 
 // reconcileStandby ensures the standby StatefulSet is in the desired state.
 func (r *ClusterReconciler) reconcileStandby(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileStandby")
+	defer func() { end(err) }()
+
 	desired, err := r.builder.BuildStandbyStatefulSet(cluster)
 	if err != nil {
 		return fmt.Errorf("building standby StatefulSet for cluster %s: %w", cluster.Name, err)
@@ -622,10 +646,12 @@ func (r *ClusterReconciler) reconcileStandby(
 	if desired == nil {
 		return nil
 	}
-	if err := r.applyClusterTLSChecksum(ctx, cluster, desired); err != nil {
+	err = r.applyClusterTLSChecksum(ctx, cluster, desired)
+	if err != nil {
 		return err
 	}
-	return r.createOrUpdateStatefulSet(ctx, desired)
+	err = r.createOrUpdateStatefulSet(ctx, desired)
+	return err
 }
 
 // reconcileSegments ensures segment StatefulSets are in the desired state.
@@ -635,7 +661,10 @@ func (r *ClusterReconciler) reconcileStandby(
 func (r *ClusterReconciler) reconcileSegments(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-) error {
+) (err error) {
+	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileSegments")
+	defer func() { end(err) }()
+
 	// Check for scale-out/scale-in by comparing desired vs actual replicas.
 	existingSts := &appsv1.StatefulSet{}
 	getErr := r.client.Get(ctx, types.NamespacedName{
@@ -644,16 +673,19 @@ func (r *ClusterReconciler) reconcileSegments(
 	}, existingSts)
 
 	if handled, scaleErr := r.detectAndHandleScale(ctx, cluster, existingSts, getErr); handled {
-		return scaleErr
+		err = scaleErr
+		return err
 	}
 
 	// Check for mirroring enable transition.
 	if r.isMirroringEnableNeeded(ctx, cluster) {
-		return r.handleEnableMirroring(ctx, cluster)
+		err = r.handleEnableMirroring(ctx, cluster)
+		return err
 	}
 	// Check for mirroring disable transition.
 	if r.isMirroringDisableNeeded(ctx, cluster) {
-		return r.handleDisableMirroring(ctx, cluster)
+		err = r.handleDisableMirroring(ctx, cluster)
+		return err
 	}
 
 	// Ensure the rendered "<cluster>-pxf-servers" ConfigMap exists BEFORE the
@@ -665,19 +697,20 @@ func (r *ClusterReconciler) reconcileSegments(
 	// the time segment pods first start — avoiding the empty-/pxf-base/servers
 	// race that previously required a manual rollout-restart. No-op when PXF is
 	// disabled (the builder returns nil).
-	if err := r.ensurePxfServersConfigMap(ctx, cluster); err != nil {
+	if err = r.ensurePxfServersConfigMap(ctx, cluster); err != nil {
 		return fmt.Errorf("ensuring PXF servers ConfigMap for cluster %s: %w", cluster.Name, err)
 	}
 
 	// SE.5: ensure the cluster NetworkPolicy that confines the PXF port (5888)
 	// on the segment-primary pods. No-op when PXF is disabled (builder nil).
-	if err := r.ensurePxfNetworkPolicy(ctx, cluster); err != nil {
+	if err = r.ensurePxfNetworkPolicy(ctx, cluster); err != nil {
 		return fmt.Errorf("ensuring PXF NetworkPolicy for cluster %s: %w", cluster.Name, err)
 	}
 
 	// Normal reconciliation — primary segments (build + scale-down safety + apply
 	// extracted to keep this function's cyclomatic complexity in budget).
-	if err := r.reconcileSegmentPrimary(ctx, cluster, existingSts, getErr); err != nil {
+	err = r.reconcileSegmentPrimary(ctx, cluster, existingSts, getErr)
+	if err != nil {
 		return err
 	}
 
@@ -689,11 +722,12 @@ func (r *ClusterReconciler) reconcileSegments(
 	if mirrorSts == nil {
 		return nil
 	}
-	if err := r.applyClusterTLSChecksum(ctx, cluster, mirrorSts); err != nil {
+	err = r.applyClusterTLSChecksum(ctx, cluster, mirrorSts)
+	if err != nil {
 		return err
 	}
 	r.preserveMirrorReplicasIfNeeded(ctx, mirrorSts, getErr)
-	if err := r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
+	if err = r.createOrUpdateStatefulSet(ctx, mirrorSts); err != nil {
 		return fmt.Errorf("mirror segments: %w", err)
 	}
 

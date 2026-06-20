@@ -366,6 +366,18 @@ curl -u admin:password -X PUT \
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
 | `GET` | `/clusters/{name}/storage/pvcs` | Basic | List all PVCs for a cluster with sizes |
+| `GET` | `/clusters/{name}/storage/disk-usage` | Basic | Disk usage: percent + per-database + per-segment breakdown |
+| `GET` | `/clusters/{name}/storage/tables` | Basic | List tables with size, bloat, skew, row count |
+| `GET` | `/clusters/{name}/storage/tables/{schema}/{table}` | Basic | Table detail incl. index sizes |
+| `GET` | `/clusters/{name}/storage/recommendations` | Basic | List storage recommendations (4 types) |
+| `POST` | `/clusters/{name}/storage/recommendations/scan` | Operator | Trigger a best-effort recommendation scan |
+| `GET` | `/clusters/{name}/storage/usage-report` | Basic | Monthly usage report (soft-gated) |
+
+> All six storage endpoints below are **best-effort**: when the database is
+> unreachable (or a query fails) the read returns an HONEST empty payload with
+> **HTTP 200**, never a `500`. A missing cluster is the only hard error
+> (`404 CLUSTER_NOT_FOUND`). See
+> [spec 13 §Scenario 119](../specifications/13-storage-recommendations-spec.md#scenario-119--all-api-endpoints).
 
 #### List Cluster PVCs
 
@@ -446,6 +458,217 @@ curl -u admin:password \
     "code": "INTERNAL_ERROR",
     "message": "failed to list PVCs"
   }
+}
+```
+
+#### Get Disk Usage
+
+Returns the cluster disk usage: the current `diskUsagePercent` (sourced only from `status.diskUsagePercent`, so it matches the `cloudberry_disk_usage_percent` metric), the per-database `diskUsage` breakdown, and the per-tablespace/segment `diskUsageBySegment` breakdown. The breakdowns are best-effort (empty when the database is unreachable).
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/disk-usage?namespace=cloudberry-test"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "cluster": "my-cluster",
+  "diskUsagePercent": 42,
+  "diskUsage": [
+    { "database": "mydb", "sizeBytes": 1048576, "sizeHuman": "1024 kB" }
+  ],
+  "diskUsageBySegment": [
+    { "tablespace": "pg_default", "sizeBytes": 1048576, "sizeHuman": "1024 kB", "usagePercent": 42 }
+  ]
+}
+```
+
+#### List Tables
+
+Lists user tables with their on-disk size, bloat percentage, distribution-skew percentage, and live row count. Bloat comes from `pg_stat_user_tables`; skew is best-effort from `gp_toolkit.gp_skew_coefficients` and is honestly `0` when that view is unavailable.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/tables?namespace=cloudberry-test"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "cluster": "my-cluster",
+  "tables": [
+    {
+      "schema": "public",
+      "table": "orders",
+      "sizeBytes": 8388608,
+      "sizeHuman": "8192 kB",
+      "bloatPercent": 12,
+      "skewPercent": 0,
+      "rowCount": 100000
+    }
+  ],
+  "total": 1
+}
+```
+
+#### Get Table Detail
+
+Returns detailed storage information for a single table, including size, row count, bloat and skew percentages, last vacuum/analyze timestamps, and per-index sizes. When the database is unreachable or the table is not found, the response falls back to the minimal `{schema, table}` shape (HTTP 200).
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/tables/public/orders?namespace=cloudberry-test"
+```
+
+The `cloudberry-ctl` equivalent (Scenario 121, L.3) uses the `--schema`/`--table` flags; the legacy positional `[schema] [table]` form is still accepted (flags win when set):
+
+```bash
+cloudberry-ctl storage tables detail --cluster my-cluster --schema public --table orders
+# positional form (backward compatible):
+cloudberry-ctl storage tables detail --cluster my-cluster public orders
+```
+
+A missing schema/table produces the clear usage error `schema and table are required (use --schema/--table or positional args)` before any request is issued.
+
+**Response (200 OK):**
+
+```json
+{
+  "schema": "public",
+  "table": "orders",
+  "sizeBytes": 8388608,
+  "sizeHuman": "8192 kB",
+  "rowCount": 100000,
+  "bloatPercent": 12,
+  "skewPercent": 0,
+  "lastVacuum": "2026-06-01 03:00:00+00",
+  "lastAnalyze": "2026-06-01 03:05:00+00",
+  "indexSizes": [
+    { "name": "orders_pkey", "sizeBytes": 1048576, "sizeHuman": "1024 kB" }
+  ]
+}
+```
+
+#### List Recommendations
+
+Lists storage recommendations across the four threshold-aware types (`bloat`, `skew`, `age`, `index_bloat`). `recommendationCount` is the LIVE total when the database is reachable, otherwise it falls back to the cached `status.recommendationCount`.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/recommendations?namespace=cloudberry-test"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "cluster": "my-cluster",
+  "recommendations": [
+    {
+      "type": "bloat",
+      "target": "public.orders",
+      "value": 100000,
+      "ratio": 25,
+      "severity": "warning",
+      "description": "table public.orders has 25% dead tuples"
+    }
+  ],
+  "recommendationCount": 1,
+  "total": 1
+}
+```
+
+#### Trigger Recommendation Scan
+
+Triggers a best-effort recommendation scan. Requires **Operator** permission and `spec.storage.recommendationScan.enabled: true`. Each POST advances the `cloudberry_recommendation_scan_duration_seconds` count, independent of the cron schedule.
+
+```bash
+curl -u admin:password -X POST \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/recommendations/scan?namespace=cloudberry-test"
+```
+
+**Response (202 Accepted):**
+
+```json
+{
+  "status": "scan initiated",
+  "cluster": "my-cluster"
+}
+```
+
+**Error (400 Bad Request — scan not enabled):**
+
+```json
+{
+  "error": {
+    "code": "RECOMMENDATION_SCAN_NOT_ENABLED",
+    "message": "recommendation scanning is not enabled for this cluster"
+  }
+}
+```
+
+#### Get Usage Report
+
+Returns a monthly resource usage report. The endpoint is **soft-gated** on `spec.storage.usageReport.enabled`: because it is a read, a disabled report returns HTTP 200 with an empty `entries` list and `usageReportEnabled: false` (rather than a 400). An optional `month` query parameter selects/labels the report month.
+
+Each entry carries per-database size + connections **and** a `tables[]` per-table breakdown (Scenario 120 C.11). Because the database connection pool is single-database, `tables[]` is attached only to the entry for the connected database; other database entries omit it. The breakdown is best-effort and bounded (`LIMIT 50`, largest-first): on an honest catalog fallback or query error it is empty rather than failing the report. `growthBytes`/`growthHuman`/`queryCount` stay an honest `0`/empty — the report is computed on demand from live catalog sizes with no persisted month-over-month history.
+
+```bash
+curl -u admin:password \
+  "http://operator:8090/api/v1alpha1/clusters/my-cluster/storage/usage-report?namespace=cloudberry-test&month=2026-05"
+```
+
+The `cloudberry-ctl` equivalent (Scenario 121, L.6) threads the optional `--month` flag through as the `?month=` query param; omitting it returns the current/unscoped report:
+
+```bash
+cloudberry-ctl storage usage-report --cluster my-cluster --month 2026-05
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | No | Kubernetes namespace (defaults to operator's configured namespace) |
+| `month` | string | No | Report month (`YYYY-MM`); echoed back in the response |
+
+**Response (200 OK — enabled):**
+
+```json
+{
+  "cluster": "my-cluster",
+  "month": "2026-05",
+  "entries": [
+    {
+      "month": "2026-05",
+      "database": "mydb",
+      "sizeBytes": 1048576,
+      "sizeHuman": "1024 kB",
+      "growthBytes": 0,
+      "growthHuman": "",
+      "queryCount": 0,
+      "connections": 3,
+      "tables": [
+        { "schema": "public", "table": "orders", "sizeBytes": 8388608, "sizeHuman": "8192 kB" }
+      ]
+    }
+  ],
+  "total": 1,
+  "usageReportEnabled": true
+}
+```
+
+**Response (200 OK — disabled, soft gate):**
+
+```json
+{
+  "cluster": "my-cluster",
+  "month": "",
+  "entries": [],
+  "total": 0,
+  "usageReportEnabled": false
 }
 ```
 

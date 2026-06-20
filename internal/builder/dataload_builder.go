@@ -1247,12 +1247,15 @@ func dataLoadHealthCheckObjectStoreJob(job cbv1alpha1.DataLoadingJob) bool {
 // and `exit 1` so the init fails (blocking the main load container):
 //
 //   - HC.1 (pxf jobs, pxf enabled): a DB-PROXY PXF-readiness probe via psql
-//     (baseline SELECT 1, pxf extension present, pxf_version() readiness). The
+//     (baseline SELECT 1, pxf extension present, and a real PXF function —
+//     pg_proc.pxf_read — registered, since PXF 2.1 has no pxf_version()). The
 //     load pod CANNOT reach a segment's localhost-only PXF sidecar (spec §3341),
 //     so this is the honest DB-side proxy, not a direct sidecar curl.
 //   - HC.2 (ALL jobs): to_regclass(targetTable) target-table existence.
-//   - HC.3 (pxf object-store jobs with AWS_S3_ENDPOINT): curl --head reachability
-//     of the external source endpoint; SKIPPED for jdbc/hive/hbase.
+//   - HC.3 (pxf object-store jobs with AWS_S3_ENDPOINT): connectivity probe of
+//     the external source endpoint that accepts ANY HTTP status (S3-compatible
+//     stores answer unauthenticated requests with 400/403); SKIPPED for
+//     jdbc/hive/hbase.
 //   - HC.4 (gpload jobs, gpfdist enabled): curl reachability of the gpfdist Service.
 //   - HC.5 (ALL jobs): df free-space on the shared scratch volume vs diskMinFreeMB.
 //
@@ -1303,9 +1306,12 @@ func writeDataLoadHealthCheckHC1(
 	b.WriteString("psql -v ON_ERROR_STOP=1 -tAc " +
 		"\"SELECT 1 FROM pg_extension WHERE extname='pxf'\" | grep -q 1 " +
 		"|| { echo 'HC.1 FAIL: pxf extension absent'; exit 1; }\n")
-	// PXF readiness via pxf_version(); guarded so a down DB/pxf fails while a
-	// differently-named readiness function does not spuriously pass.
-	b.WriteString("psql -v ON_ERROR_STOP=1 -tAc \"SELECT pxf_version()\" >/dev/null 2>&1 " +
+	// PXF readiness: PXF 2.1 provides NO pxf_version() SQL function, so verify a
+	// real PXF function (pxf_read) exists in the catalog. This proves PXF is
+	// actually usable (functions registered), not just that the extension row is
+	// present; guarded so a down DB / half-installed pxf fails clearly.
+	b.WriteString("psql -v ON_ERROR_STOP=1 -tAc " +
+		"\"SELECT 1 FROM pg_proc WHERE proname = 'pxf_read'\" | grep -q 1 " +
 		"|| { echo 'HC.1 FAIL: PXF not ready'; exit 1; }\n")
 }
 
@@ -1335,11 +1341,19 @@ func writeDataLoadHealthCheckHC3(b *strings.Builder, job cbv1alpha1.DataLoadingJ
 	}
 	b.WriteString("echo 'HC.3: verifying external source connectivity'\n")
 	b.WriteString("if [ -z \"${AWS_S3_ENDPOINT:-}\" ]; then echo 'HC.3 SKIP: no s3 endpoint'; else\n")
+	// CONNECTIVITY check only: S3-compatible stores (e.g. MinIO) answer an
+	// unauthenticated HEAD/GET with HTTP 400/403, so `curl -f` (which fails on any
+	// 4xx) wrongly reports a reachable endpoint as "unreachable". Instead capture
+	// the status code WITHOUT -f and accept ANY HTTP response (the server
+	// answered); only a true connection failure / timeout (curl writes 000 or an
+	// empty code) is a FAIL. The capture is split from the test so an expected
+	// non-zero curl exit does not abort the script under `set -euo pipefail`.
 	fmt.Fprintf(b,
-		"  curl -fsS -m %d --head \"${AWS_S3_ENDPOINT}\" >/dev/null "+
-			"|| curl -fsS -m %d --head \"${AWS_S3_ENDPOINT}/\" >/dev/null "+
-			"|| { echo 'HC.3 FAIL: external source endpoint unreachable'; exit 1; }\n",
-		dataLoadHealthCheckTimeoutSeconds, dataLoadHealthCheckTimeoutSeconds)
+		"  code=$(curl -sS -m %d -o /dev/null -w '%%{http_code}' "+
+			"\"${AWS_S3_ENDPOINT}/\" || true)\n",
+		dataLoadHealthCheckTimeoutSeconds)
+	b.WriteString("  echo \"${code}\" | grep -Eq '^[1-5][0-9][0-9]$' " +
+		"|| { echo 'HC.3 FAIL: external source endpoint unreachable'; exit 1; }\n")
 	b.WriteString("fi\n")
 }
 

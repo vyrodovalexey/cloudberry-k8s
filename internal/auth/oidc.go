@@ -55,6 +55,13 @@ const (
 	RoleClaimSourceUserinfo = "userinfo"
 )
 
+// Bounded `result` label values for the OIDC outcome counters
+// (cloudberry_oidc_discovery_total / cloudberry_oidc_userinfo_total).
+const (
+	oidcResultSuccess = "success"
+	oidcResultError   = "error"
+)
+
 // OIDCProvider implements Provider for OIDC/JWT authentication.
 type OIDCProvider struct {
 	provider   *gooidc.Provider
@@ -254,15 +261,28 @@ func (p *OIDCProvider) fetchUserinfoClaims(
 	}))
 	if err != nil {
 		telemetry.SetSpanError(span, err)
+		p.recordUserinfo(oidcResultError)
 		return nil, fmt.Errorf("querying userinfo endpoint: %w", err)
 	}
 
 	var claims map[string]interface{}
 	if err := userinfo.Claims(&claims); err != nil {
 		telemetry.SetSpanError(span, err)
+		p.recordUserinfo(oidcResultError)
 		return nil, fmt.Errorf("extracting userinfo claims: %w", err)
 	}
+	p.recordUserinfo(oidcResultSuccess)
 	return claims, nil
+}
+
+// recordUserinfo records the outcome of a UserInfo fetch on the optional
+// metrics recorder (B-5). It is nil-safe: when no recorder is configured the
+// call is a no-op.
+func (p *OIDCProvider) recordUserinfo(result string) {
+	if p.recorder == nil {
+		return
+	}
+	p.recorder.RecordOIDCUserinfo(result)
 }
 
 // Type returns the provider type name.
@@ -513,9 +533,9 @@ func (p *LazyOIDCProvider) recordDiscovery(err error) {
 	if p.recorder == nil {
 		return
 	}
-	result := "success"
+	result := oidcResultSuccess
 	if err != nil {
-		result = "error"
+		result = oidcResultError
 	}
 	p.recorder.RecordOIDCDiscovery(result)
 }

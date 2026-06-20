@@ -4497,12 +4497,51 @@ func (s *Server) handleGetDiskUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	usage := s.collectDiskUsage(r.Context(), cluster)
+	breakdown := s.collectStorageBreakdown(r.Context(), cluster)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		responseKeyCluster: cluster.Name,
+		// diskUsagePercent is sourced ONLY from Status.DiskUsagePercent so the
+		// M.1==S.1 invariant (Scenario 116) is preserved; the breakdown below is
+		// purely additive.
 		"diskUsagePercent": cluster.Status.DiskUsagePercent,
 		"diskUsage":        usage,
+		// diskUsageBySegment is the per-tablespace/segment breakdown
+		// (Scenario 119 P.1), best-effort and honestly empty when unavailable.
+		"diskUsageBySegment": breakdown,
 	})
+}
+
+// collectStorageBreakdown queries the per-tablespace/segment disk usage via the
+// DB client when available. It mirrors collectDiskUsage's best-effort/non-fatal
+// handling: a nil dbFactory, a NewClient error, or a query error yields an empty
+// slice (never a 500). The returned slice is never nil.
+func (s *Server) collectStorageBreakdown(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) []db.DiskUsageInfo {
+	if s.dbFactory == nil {
+		return []db.DiskUsageInfo{}
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for storage breakdown",
+			"cluster", cluster.Name, "error", dbErr)
+		return []db.DiskUsageInfo{}
+	}
+	defer dbClient.Close()
+
+	breakdown, bErr := dbClient.GetStorageDiskUsage(ctx)
+	if bErr != nil {
+		s.logger.Error("failed to query storage disk usage breakdown",
+			"cluster", cluster.Name, "error", bErr)
+		return []db.DiskUsageInfo{}
+	}
+	if breakdown == nil {
+		return []db.DiskUsageInfo{}
+	}
+	return breakdown
 }
 
 // collectDiskUsage queries per-database disk usage via the DB client when
@@ -4544,37 +4583,130 @@ func (s *Server) collectDiskUsage(
 	return usage
 }
 
-// handleListTables lists tables in a cluster.
+// handleListTables lists tables in a cluster with their on-disk size, bloat,
+// skew, and row count (Scenario 119 P.2). It is best-effort: when the DB is
+// unavailable it returns an honest empty list with HTTP 200, never a 500.
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
 
+	tables := s.collectTables(r.Context(), cluster)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"tables":         []interface{}{},
-		responseKeyTotal: 0,
+		responseKeyCluster: cluster.Name,
+		"tables":           tables,
+		responseKeyTotal:   len(tables),
 	})
 }
 
-// handleGetTableDetail returns detailed information about a specific table.
+// collectTables queries per-table storage info via the DB client when
+// available. It mirrors collectDiskUsage's best-effort/non-fatal handling: a nil
+// dbFactory, a NewClient error, or a query error yields an empty slice (never a
+// 500). The returned slice is never nil.
+func (s *Server) collectTables(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) []db.TableStorageInfo {
+	if s.dbFactory == nil {
+		return []db.TableStorageInfo{}
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for table listing",
+			"cluster", cluster.Name, "error", dbErr)
+		return []db.TableStorageInfo{}
+	}
+	defer dbClient.Close()
+
+	tables, tErr := dbClient.GetTables(ctx)
+	if tErr != nil {
+		s.logger.Error("failed to query tables",
+			"cluster", cluster.Name, "error", tErr)
+		return []db.TableStorageInfo{}
+	}
+	if tables == nil {
+		return []db.TableStorageInfo{}
+	}
+	return tables
+}
+
+// handleGetTableDetail returns detailed information about a specific table
+// including size, row count, bloat, skew, and per-index sizes (Scenario 119
+// P.3). It is best-effort: when the DB is unavailable or the query fails it
+// falls back to the minimal {schema, table} shape with HTTP 200, never a 500.
 func (s *Server) handleGetTableDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	schema := r.PathValue("schema")
 	table := r.PathValue("table")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
 
+	if detail := s.collectTableDetail(r.Context(), cluster, schema, table); detail != nil {
+		writeJSON(w, http.StatusOK, detail)
+		return
+	}
+
+	// Honest minimal fallback (DB unavailable / table not found / query error).
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"schema": schema,
 		"table":  table,
 	})
 }
 
-// handleListRecommendations lists storage recommendations for a cluster.
+// collectTableDetail queries the full table detail via the DB client when
+// available. It returns nil when the DB factory is unavailable, the client
+// cannot be created, or the query fails, so the handler can fall back to the
+// minimal honest shape (best-effort/non-fatal, mirroring collectDiskUsage).
+func (s *Server) collectTableDetail(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	schema, table string,
+) *db.TableDetail {
+	if s.dbFactory == nil {
+		return nil
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for table detail",
+			"cluster", cluster.Name, "error", dbErr)
+		return nil
+	}
+	defer dbClient.Close()
+
+	detail, dErr := dbClient.GetTableDetails(ctx, schema, table)
+	if dErr != nil {
+		s.logger.Error("failed to query table detail",
+			"cluster", cluster.Name, "schema", schema, "table", table, "error", dErr)
+		return nil
+	}
+	return detail
+}
+
+// recommendationOut is the on-wire shape of a single storage recommendation
+// returned by the list endpoint (Scenario 119 P.4). target is "schema.table".
+type recommendationOut struct {
+	Type        string  `json:"type"`
+	Target      string  `json:"target"`
+	Value       int64   `json:"value"`
+	Ratio       float64 `json:"ratio,omitempty"`
+	Severity    string  `json:"severity"`
+	Description string  `json:"description"`
+}
+
+// handleListRecommendations lists storage recommendations for a cluster
+// (Scenario 119 P.4). It runs the four threshold-aware Get*Recommendations via
+// the shared collector and surfaces the live combined list. Best-effort: when
+// the DB is unavailable it returns an empty list with recommendationCount
+// falling back to the cached Status.RecommendationCount, never a 500.
 func (s *Server) handleListRecommendations(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
@@ -4583,12 +4715,91 @@ func (s *Server) handleListRecommendations(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	recs, dbReachable := s.collectRecommendations(r.Context(), cluster)
+
+	out := make([]recommendationOut, 0, len(recs))
+	for i := range recs {
+		out = append(out, recommendationOut{
+			Type:        recs[i].Type,
+			Target:      recs[i].Schema + "." + recs[i].Table,
+			Value:       recs[i].Value,
+			Ratio:       recs[i].Ratio,
+			Severity:    recs[i].Severity,
+			Description: recs[i].Description,
+		})
+	}
+
+	// recommendationCount is the LIVE total when the DB was reachable; otherwise
+	// it falls back to the cached Status.RecommendationCount (honest cached value).
+	count := len(out)
+	if !dbReachable {
+		count = int(cluster.Status.RecommendationCount)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		responseKeyCluster:    cluster.Name,
-		"recommendations":     []interface{}{},
-		"recommendationCount": cluster.Status.RecommendationCount,
-		responseKeyTotal:      0,
+		"recommendations":     out,
+		"recommendationCount": count,
+		responseKeyTotal:      len(out),
 	})
+}
+
+// recommendationThresholds builds the per-type CRD gates from the cluster's
+// recommendationScan spec. A nil spec yields zero-value thresholds (the open
+// 0-gate), so a direct call without an enabled spec scans rather than panics.
+func recommendationThresholds(cluster *cbv1alpha1.CloudberryCluster) db.RecommendationThresholds {
+	if cluster.Spec.Storage == nil || cluster.Spec.Storage.RecommendationScan == nil {
+		return db.RecommendationThresholds{}
+	}
+	scan := cluster.Spec.Storage.RecommendationScan
+	return db.RecommendationThresholds{
+		Bloat:      scan.BloatThreshold,
+		Skew:       scan.SkewThreshold,
+		Age:        scan.AgeThreshold,
+		IndexBloat: scan.IndexBloatThreshold,
+	}
+}
+
+// collectRecommendations runs the four threshold-aware recommendation queries
+// against the cluster's DB and returns the combined list. The boolean reports
+// whether the DB was reachable (a client was created): when false the caller
+// falls back to the cached Status.RecommendationCount. Best-effort/non-fatal: a
+// nil dbFactory or NewClient error returns (empty, false); a per-fetch error is
+// logged and skipped (the DB was still reachable, so reachable stays true).
+func (s *Server) collectRecommendations(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) (recs []db.Recommendation, dbReachable bool) {
+	recs = []db.Recommendation{}
+	if s.dbFactory == nil {
+		return recs, false
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for recommendations",
+			"cluster", cluster.Name, "error", dbErr)
+		return recs, false
+	}
+	defer dbClient.Close()
+
+	th := recommendationThresholds(cluster)
+	for _, fetch := range []func(context.Context, db.RecommendationThresholds) ([]db.Recommendation, error){
+		dbClient.GetBloatRecommendations,
+		dbClient.GetSkewRecommendations,
+		dbClient.GetAgeRecommendations,
+		dbClient.GetIndexBloatRecommendations,
+	} {
+		fetched, fetchErr := fetch(ctx, th)
+		if fetchErr != nil {
+			s.logger.Error("recommendation fetch failed",
+				"cluster", cluster.Name, "error", fetchErr)
+			continue
+		}
+		recs = append(recs, fetched...)
+	}
+
+	return recs, true
 }
 
 // handleTriggerRecommendationScan triggers a recommendation scan.
@@ -4634,15 +4845,22 @@ func (s *Server) runRecommendationScan(
 	}
 	defer dbClient.Close()
 
+	// Build the per-type thresholds from the cluster's recommendationScan spec so
+	// each Get* gates on its CRD threshold (C.6–C.9). The HTTP handler verifies
+	// RecommendationScan is non-nil and enabled before calling, but the shared
+	// builder guards defensively (zero-value thresholds) so a direct call with an
+	// absent spec scans with the open 0-gate rather than panicking.
+	th := recommendationThresholds(cluster)
+
 	start := time.Now()
 	counts := map[string]float64{}
-	for _, fetch := range []func(context.Context) ([]db.Recommendation, error){
+	for _, fetch := range []func(context.Context, db.RecommendationThresholds) ([]db.Recommendation, error){
 		dbClient.GetBloatRecommendations,
 		dbClient.GetSkewRecommendations,
 		dbClient.GetAgeRecommendations,
 		dbClient.GetIndexBloatRecommendations,
 	} {
-		recs, fetchErr := fetch(ctx)
+		recs, fetchErr := fetch(ctx, th)
 		if fetchErr != nil {
 			s.logger.Error("recommendation fetch failed",
 				"cluster", cluster.Name, "error", fetchErr)
@@ -4659,20 +4877,75 @@ func (s *Server) runRecommendationScan(
 	}
 }
 
-// handleGetUsageReport returns a usage report for a cluster.
+// handleGetUsageReport returns a usage report for a cluster (Scenario 119 P.6;
+// Scenario 120 C.11/C.13), gated on spec.storage.usageReport.enabled. Because
+// this is a READ, a disabled report is a SOFT gate: it returns HTTP 200 with an
+// empty entries list and usageReportEnabled:false (rather than the *_NOT_ENABLED
+// 400 reserved for mutating/action endpoints). When enabled, entries are queried
+// best-effort and an honest empty list is returned on any DB error (never a 500).
+//
+// The optional ?month= query param (C.13) scopes/labels the report. Each entry
+// carries per-database size/connections AND, for the connected database, a
+// bounded per-table breakdown (db.UsageReportEntry.Tables, C.11); that enriched
+// content flows through the JSON envelope automatically with no handler change.
 func (s *Server) handleGetUsageReport(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if _, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace")); err != nil {
+	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
+	if err != nil {
 		writeClusterNotFound(w, name)
 		return
 	}
 
+	enabled := cluster.Spec.Storage != nil &&
+		cluster.Spec.Storage.UsageReport != nil &&
+		cluster.Spec.Storage.UsageReport.Enabled
 	month := r.URL.Query().Get("month")
+
+	entries := []db.UsageReportEntry{}
+	if enabled {
+		entries = s.collectUsageReport(r.Context(), cluster, month)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"month":          month,
-		"entries":        []interface{}{},
-		responseKeyTotal: 0,
+		responseKeyCluster:   cluster.Name,
+		"month":              month,
+		"entries":            entries,
+		responseKeyTotal:     len(entries),
+		"usageReportEnabled": enabled,
 	})
+}
+
+// collectUsageReport queries the usage report for the given month via the DB
+// client when available. It mirrors collectDiskUsage's best-effort/non-fatal
+// handling: a nil dbFactory, a NewClient error, or a query error yields an empty
+// slice (never a 500). The returned slice is never nil.
+func (s *Server) collectUsageReport(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	month string,
+) []db.UsageReportEntry {
+	if s.dbFactory == nil {
+		return []db.UsageReportEntry{}
+	}
+
+	dbClient, dbErr := s.dbFactory.NewClient(ctx, cluster)
+	if dbErr != nil {
+		s.logger.Error("failed to create database client for usage report",
+			"cluster", cluster.Name, "error", dbErr)
+		return []db.UsageReportEntry{}
+	}
+	defer dbClient.Close()
+
+	entries, eErr := dbClient.GetUsageReport(ctx, month)
+	if eErr != nil {
+		s.logger.Error("failed to query usage report",
+			"cluster", cluster.Name, "error", eErr)
+		return []db.UsageReportEntry{}
+	}
+	if entries == nil {
+		return []db.UsageReportEntry{}
+	}
+	return entries
 }
 
 // setClusterAnnotation sets an action annotation on a cluster.

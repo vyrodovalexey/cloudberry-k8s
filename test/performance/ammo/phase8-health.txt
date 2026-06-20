@@ -1,0 +1,13 @@
+[Host: localhost:18090]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest-phase8]
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz
+/healthz
+/readyz
+/healthz
+/healthz
+/readyz

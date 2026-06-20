@@ -969,7 +969,7 @@ func TestPgxClient_GetBloatRecommendations_Mock(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetBloatRecommendations(context.Background())
+	recs, err := client.GetBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 2)
 	assert.Equal(t, "bloat", recs[0].Type)
@@ -985,25 +985,28 @@ func TestPgxClient_GetBloatRecommendations_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetBloatRecommendations(context.Background())
+	_, err := client.GetBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "querying bloat recommendations")
 }
 
 func TestPgxClient_GetSkewRecommendations_Mock(t *testing.T) {
-	skewFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_live_tup")}
+	// New threshold-aware shape: gp_toolkit.gp_skew_coefficients returns
+	// skcnamespace, skcrelname, skccoeff (float8). r.Ratio carries the coefficient.
+	skewFields := []fieldDesc{textField("skcnamespace"), textField("skcrelname"), float8Field("skccoeff")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(skewFields, [][]string{
-			{"public", "large_table", "5000000"},
+			{"public", "large_table", "5"},
 		})
 	})
 	defer cleanup()
 
-	recs, err := client.GetSkewRecommendations(context.Background())
+	recs, err := client.GetSkewRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, "skew", recs[0].Type)
 	assert.Equal(t, severityInfo, recs[0].Severity)
+	assert.InDelta(t, 5.0, recs[0].Ratio, 0.001)
 }
 
 func TestPgxClient_GetSkewRecommendations_Error(t *testing.T) {
@@ -1012,24 +1015,27 @@ func TestPgxClient_GetSkewRecommendations_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetSkewRecommendations(context.Background())
+	_, err := client.GetSkewRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "querying skew recommendations")
 }
 
 func TestPgxClient_GetAgeRecommendations_Mock(t *testing.T) {
-	ageFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_dead_tup"), int8Field("secs_since_vacuum")}
+	// New threshold-aware shape: nspname, relname, age(relfrozenxid) (int8).
+	// Severity tiers are warning>=100000000, critical>=500000000.
+	ageFields := []fieldDesc{textField("nspname"), textField("relname"), int8Field("xid_age")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(ageFields, [][]string{
-			{"public", "old_table", "150000", "86400"},
+			{"public", "old_table", "150000000"},
 		})
 	})
 	defer cleanup()
 
-	recs, err := client.GetAgeRecommendations(context.Background())
+	recs, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, "age", recs[0].Type)
+	assert.Equal(t, int64(150000000), recs[0].Value)
 	assert.Equal(t, severityWarning, recs[0].Severity)
 }
 
@@ -1039,27 +1045,30 @@ func TestPgxClient_GetAgeRecommendations_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetAgeRecommendations(context.Background())
+	_, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "querying age recommendations")
 }
 
 func TestPgxClient_GetIndexBloatRecommendations_Mock(t *testing.T) {
-	idxFields := []fieldDesc{textField("schemaname"), textField("relname"), textField("indexrelname"), int8Field("index_size"), int8Field("idx_scan")}
+	// New threshold-aware shape: schemaname, relname, indexrelname, bloat_pct (float8).
+	// Severity tiers are warning>=30, critical>=60. r.Ratio carries bloat_pct.
+	idxFields := []fieldDesc{textField("schemaname"), textField("relname"), textField("indexrelname"), float8Field("bloat_pct")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(idxFields, [][]string{
-			{"public", "users", "users_pkey", "1048576", "0"},
-			{"public", "events", "events_idx", "2097152", "100"},
+			{"public", "events", "events_idx", "65"},
+			{"public", "users", "users_pkey", "35"},
 		})
 	})
 	defer cleanup()
 
-	recs, err := client.GetIndexBloatRecommendations(context.Background())
+	recs, err := client.GetIndexBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 2)
 	assert.Equal(t, "index_bloat", recs[0].Type)
-	assert.Equal(t, severityWarning, recs[0].Severity) // idx_scan == 0
-	assert.Equal(t, severityInfo, recs[1].Severity)    // idx_scan > 0
+	assert.Equal(t, severityCritical, recs[0].Severity) // bloat_pct 65 >= 60
+	assert.Equal(t, severityWarning, recs[1].Severity)  // bloat_pct 35 >= 30
+	assert.InDelta(t, 65.0, recs[0].Ratio, 0.001)
 }
 
 func TestPgxClient_GetIndexBloatRecommendations_Error(t *testing.T) {
@@ -1068,7 +1077,7 @@ func TestPgxClient_GetIndexBloatRecommendations_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetIndexBloatRecommendations(context.Background())
+	_, err := client.GetIndexBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "querying index bloat recommendations")
 }
@@ -2213,7 +2222,7 @@ func TestPgxClient_GetBloatRecommendations_ScanError(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetBloatRecommendations(context.Background())
+	_, err := client.GetBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "scanning bloat recommendation row")
 }
@@ -2227,7 +2236,7 @@ func TestPgxClient_GetSkewRecommendations_ScanError(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetSkewRecommendations(context.Background())
+	_, err := client.GetSkewRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "scanning skew recommendation row")
 }
@@ -2241,7 +2250,7 @@ func TestPgxClient_GetAgeRecommendations_ScanError(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetAgeRecommendations(context.Background())
+	_, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "scanning age recommendation row")
 }
@@ -2255,7 +2264,7 @@ func TestPgxClient_GetIndexBloatRecommendations_ScanError(t *testing.T) {
 	})
 	defer cleanup()
 
-	_, err := client.GetIndexBloatRecommendations(context.Background())
+	_, err := client.GetIndexBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "scanning index bloat recommendation row")
 }
@@ -2361,14 +2370,14 @@ func TestPgxClient_GetBloatRecommendations_Empty(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetBloatRecommendations(context.Background())
+	recs, err := client.GetBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	assert.Empty(t, recs)
 }
 
 // TestPgxClient_GetSkewRecommendations_Empty tests empty skew recommendations.
 func TestPgxClient_GetSkewRecommendations_Empty(t *testing.T) {
-	skewFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_live_tup")}
+	skewFields := []fieldDesc{textField("skcnamespace"), textField("skcrelname"), float8Field("skccoeff")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		buf := mustEncode(buildRowDesc(skewFields))
 		buf = append(buf, mustEncode(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 0")})...)
@@ -2376,14 +2385,14 @@ func TestPgxClient_GetSkewRecommendations_Empty(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetSkewRecommendations(context.Background())
+	recs, err := client.GetSkewRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	assert.Empty(t, recs)
 }
 
 // TestPgxClient_GetAgeRecommendations_Empty tests empty age recommendations.
 func TestPgxClient_GetAgeRecommendations_Empty(t *testing.T) {
-	ageFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_dead_tup"), int8Field("secs")}
+	ageFields := []fieldDesc{textField("nspname"), textField("relname"), int8Field("xid_age")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		buf := mustEncode(buildRowDesc(ageFields))
 		buf = append(buf, mustEncode(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 0")})...)
@@ -2391,14 +2400,14 @@ func TestPgxClient_GetAgeRecommendations_Empty(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetAgeRecommendations(context.Background())
+	recs, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	assert.Empty(t, recs)
 }
 
 // TestPgxClient_GetIndexBloatRecommendations_Empty tests empty index bloat recommendations.
 func TestPgxClient_GetIndexBloatRecommendations_Empty(t *testing.T) {
-	idxFields := []fieldDesc{textField("schemaname"), textField("relname"), textField("indexrelname"), int8Field("index_size"), int8Field("idx_scan")}
+	idxFields := []fieldDesc{textField("schemaname"), textField("relname"), textField("indexrelname"), float8Field("bloat_pct")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		buf := mustEncode(buildRowDesc(idxFields))
 		buf = append(buf, mustEncode(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 0")})...)
@@ -2406,7 +2415,7 @@ func TestPgxClient_GetIndexBloatRecommendations_Empty(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetIndexBloatRecommendations(context.Background())
+	recs, err := client.GetIndexBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	assert.Empty(t, recs)
 }
@@ -2496,7 +2505,7 @@ func TestPgxClient_GetBloatRecommendations_InfoSeverity(t *testing.T) {
 	})
 	defer cleanup()
 
-	recs, err := client.GetBloatRecommendations(context.Background())
+	recs, err := client.GetBloatRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, severityInfo, recs[0].Severity)
@@ -2504,15 +2513,16 @@ func TestPgxClient_GetBloatRecommendations_InfoSeverity(t *testing.T) {
 
 // TestPgxClient_GetAgeRecommendations_CriticalSeverity tests critical severity.
 func TestPgxClient_GetAgeRecommendations_CriticalSeverity(t *testing.T) {
-	ageFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_dead_tup"), int8Field("secs_since_vacuum")}
+	// XID age >= 500000000 → critical.
+	ageFields := []fieldDesc{textField("nspname"), textField("relname"), int8Field("xid_age")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(ageFields, [][]string{
-			{"public", "very_old_table", "600000", "172800"},
+			{"public", "very_old_table", "600000000"},
 		})
 	})
 	defer cleanup()
 
-	recs, err := client.GetAgeRecommendations(context.Background())
+	recs, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, severityCritical, recs[0].Severity)
@@ -2520,15 +2530,16 @@ func TestPgxClient_GetAgeRecommendations_CriticalSeverity(t *testing.T) {
 
 // TestPgxClient_GetAgeRecommendations_InfoSeverity tests info severity.
 func TestPgxClient_GetAgeRecommendations_InfoSeverity(t *testing.T) {
-	ageFields := []fieldDesc{textField("schemaname"), textField("relname"), int8Field("n_dead_tup"), int8Field("secs_since_vacuum")}
+	// XID age below the warning tier (100000000) → info.
+	ageFields := []fieldDesc{textField("nspname"), textField("relname"), int8Field("xid_age")}
 	client, cleanup := newMockPgxClient(t, func(query string) []byte {
 		return multiRowResponseTyped(ageFields, [][]string{
-			{"public", "small_table", "50000", "3600"},
+			{"public", "small_table", "50000"},
 		})
 	})
 	defer cleanup()
 
-	recs, err := client.GetAgeRecommendations(context.Background())
+	recs, err := client.GetAgeRecommendations(context.Background(), RecommendationThresholds{})
 	assert.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, severityInfo, recs[0].Severity)

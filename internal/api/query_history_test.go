@@ -550,6 +550,35 @@ func TestHandleGetQueryHistoryDetail_NoDBFactory(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 
+func TestHandleGetQueryHistoryDetail_MonitoringDisabled(t *testing.T) {
+	cluster := newTestCluster("test-cluster", "default")
+	cluster.Spec.QueryMonitoring = &cbv1alpha1.QueryMonitoringSpec{Enabled: false}
+
+	// DB must never be touched when monitoring is disabled.
+	dbClient := &queryHistoryMockDBClient{
+		getQueryHistoryDetailFunc: func(_ context.Context, _ string) (*db.QueryHistoryEntry, error) {
+			t.Fatal("GetQueryHistoryDetail must not be called when monitoring is disabled")
+			return nil, nil
+		},
+	}
+	s := newQueryHistoryTestServer(dbClient, cluster)
+
+	req := httptest.NewRequest(http.MethodGet,
+		apiPrefix+"/clusters/test-cluster/queries/history/q-1?namespace=default",
+		nil)
+	req.SetPathValue("name", "test-cluster")
+	req.SetPathValue("qid", "q-1")
+	rec := httptest.NewRecorder()
+	s.handleGetQueryHistoryDetail(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp map[string]interface{}
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, false, resp["monitoringEnabled"])
+}
+
 func TestHandleGetQueryHistoryDetail_DBConnectionError(t *testing.T) {
 	cluster := newTestCluster("test-cluster", "default")
 

@@ -92,7 +92,11 @@ func TestHealthCheckScript_HC1_PXFReadiness(t *testing.T) {
 
 	assert.Contains(t, script, "pg_extension")
 	assert.Contains(t, script, "extname='pxf'")
-	assert.Contains(t, script, "pxf_version()")
+	// PXF 2.1 has no pxf_version(); readiness is proven via a real PXF function
+	// (pxf_read) in pg_proc.
+	assert.Contains(t, script, "pg_proc")
+	assert.Contains(t, script, "proname = 'pxf_read'")
+	assert.NotContains(t, script, "pxf_version()")
 	assert.Contains(t, script, "HC.1 FAIL")
 	// The honest DB-proxy uses psql against the coordinator (no direct sidecar curl).
 	assert.Contains(t, script, "SELECT 1")
@@ -207,16 +211,23 @@ func TestHealthCheckScript_HC2_TargetTablePxfExact(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestHealthCheckScript_HC3_S3Connectivity (104-HC3-B) asserts a pxf s3 job emits
-// the curl-head reachability probe against AWS_S3_ENDPOINT, and that the init
-// container carries AWS_* via SecretKeyRef (NO plaintext) + AWS_S3_ENDPOINT.
+// the status-code-based connectivity probe against AWS_S3_ENDPOINT (any HTTP
+// response = reachable, since S3-compatible stores answer with 400/403), and
+// that the init container carries AWS_* via SecretKeyRef (NO plaintext) +
+// AWS_S3_ENDPOINT.
 func TestHealthCheckScript_HC3_S3Connectivity(t *testing.T) {
 	b := NewBuilder()
 	job := pxfTestJob() // s3:parquet
 	cluster := hcCluster([]cbv1alpha1.DataLoadingJob{job})
 
-	// Script substrings.
+	// Script substrings: connectivity probe captures the HTTP status without -f
+	// and accepts ANY HTTP status (1xx-5xx); only a connection failure FAILs.
 	script := buildDataLoadHealthCheckScript(cluster, job)
-	assert.Contains(t, script, `curl -fsS -m 10 --head "${AWS_S3_ENDPOINT}"`)
+	assert.Contains(t, script,
+		`code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "${AWS_S3_ENDPOINT}/" || true)`)
+	assert.Contains(t, script, `grep -Eq '^[1-5][0-9][0-9]$'`)
+	assert.NotContains(t, script, "--head")
+	assert.NotContains(t, script, "curl -fsS")
 	assert.Contains(t, script, "HC.3 FAIL")
 
 	// Init-container env: AWS_ACCESS_KEY_ID via SecretKeyRef, NO plaintext value,
@@ -239,14 +250,14 @@ func TestHealthCheckScript_HC3_S3Connectivity(t *testing.T) {
 }
 
 // TestHealthCheckScript_HC3_SkipNonObjectStore (104-HC3-B-skip) asserts a jdbc
-// pxf job is NOT auto-probed for HC.3 connectivity (no curl --head endpoint
-// line; no HC.3 SKIP/FAIL block emitted).
+// pxf job is NOT auto-probed for HC.3 connectivity (no AWS_S3_ENDPOINT
+// connectivity line; no HC.3 SKIP/FAIL block emitted).
 func TestHealthCheckScript_HC3_SkipNonObjectStore(t *testing.T) {
 	job := jdbcPxfJob()
 	cluster := hcCluster([]cbv1alpha1.DataLoadingJob{job})
 
 	script := buildDataLoadHealthCheckScript(cluster, job)
-	assert.NotContains(t, script, `--head "${AWS_S3_ENDPOINT}"`)
+	assert.NotContains(t, script, `"${AWS_S3_ENDPOINT}/"`)
 	assert.NotContains(t, script, "HC.3 FAIL")
 	assert.NotContains(t, script, "HC.3 SKIP")
 }

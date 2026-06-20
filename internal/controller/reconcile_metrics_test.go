@@ -199,7 +199,7 @@ type bloatDBClient struct {
 	err  error
 }
 
-func (m *bloatDBClient) GetBloatRecommendations(_ context.Context) ([]db.Recommendation, error) {
+func (m *bloatDBClient) GetBloatRecommendations(_ context.Context, _ db.RecommendationThresholds) ([]db.Recommendation, error) {
 	return m.recs, m.err
 }
 

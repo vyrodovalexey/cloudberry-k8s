@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -74,8 +75,18 @@ func (p *BasicAuthProvider) Authenticate(ctx context.Context, r *http.Request) (
 		return nil, util.NewAuthenticationError(AuthMethodBasicName, "missing or malformed Authorization header")
 	}
 
+	// Span around the credential-store lookup + bcrypt compare (O-4). The
+	// store's GetPassword may hit a DB-backed credential store, so this is real
+	// I/O worth localizing. No username/PII is recorded as a span attribute
+	// (cardinality + privacy). The span is marked as an error ONLY on a
+	// store/permission failure — a normal invalid-credentials rejection is an
+	// expected outcome, not a span error.
+	ctx, span := telemetry.StartSpan(ctx, authTracerName, "auth.basic.verify")
+	defer span.End()
+
 	storedHash, err := p.store.GetPassword(ctx, username)
 	if err != nil {
+		telemetry.SetSpanError(span, err)
 		return nil, fmt.Errorf("retrieving credentials: %w", err)
 	}
 
@@ -93,6 +104,7 @@ func (p *BasicAuthProvider) Authenticate(ctx context.Context, r *http.Request) (
 
 	permission, err := p.store.GetPermissionLevel(ctx, username)
 	if err != nil {
+		telemetry.SetSpanError(span, err)
 		return nil, fmt.Errorf("retrieving permission level: %w", err)
 	}
 
