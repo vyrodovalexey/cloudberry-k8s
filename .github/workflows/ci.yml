@@ -515,7 +515,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env[matrix.image_env] }}
           tags: |
@@ -785,7 +785,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env[matrix.image_key] }}
           tags: |
@@ -856,7 +856,7 @@ jobs:
 
       # Step b: Build cloudberry-official (standalone, amd64) — load + push
       - id: meta-cloudberry
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.DOCKER_IMAGE_CLOUDBERRY }}
           tags: |
@@ -884,7 +884,7 @@ jobs:
 
       # Step c: Build cloudberry-official-pxf (depends on pxf + official) — load + push
       - id: meta-official-pxf
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.DOCKER_IMAGE_OFFICIAL_PXF }}
           tags: |
@@ -915,7 +915,7 @@ jobs:
 
       # Step d: Build cloudberry-gpfdist (depends on official-pxf) — load + push
       - id: meta-gpfdist
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.DOCKER_IMAGE_GPFDIST }}
           tags: |
