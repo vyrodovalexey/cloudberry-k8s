@@ -107,6 +107,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - Deletion lifecycle events: `Deleting` → `BackupOnDelete` → `BackupOnDeleteCompleted`/`BackupOnDeleteFailed` → `PVCsRetained`/`PVCsDeleted` → `Deleted`
 
 **High Availability**
+
 - Segment mirroring with group and spread layouts
 - Enable/disable mirroring on existing clusters with state machine tracking (NotConfigured → Initializing → Syncing → InSync)
   - Pre-flight validation: cluster must be Running, sufficient nodes for layout
@@ -129,49 +130,267 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Data skew coefficient metric (`cloudberry_data_skew_coefficient`)
 
 **Authentication & Authorization**
-- Dual-mode authentication: Basic + OIDC (Keycloak)
-- JWT validation with JWKS caching and role claim extraction
-- Five-tier permission model: Self Only, Basic, Operator Basic, Operator, Admin
-- `pg_hba.conf` management via CRD
-- SSL/TLS support with configurable minimum TLS version
-- Webhook TLS certificate management (Vault PKI or self-signed with automatic rotation)
-- **Cluster TLS auto-issuance from Vault PKI**: when a cluster CR enables both `vault.enabled` and `auth.ssl.enabled` with a `certSecret` that does not exist, the operator issues the server certificate from the webhook's Vault PKI mount/role, creates a generic Secret (`tls.crt`/`tls.key`/`ca.crt`), and renews it at 2/3 lifetime — user-provided Secrets are never touched (events: `ClusterTLSIssued`/`ClusterTLSRenewed`/`ClusterTLSFailed`)
-- **Cluster pods roll automatically on TLS certificate rotation**: the cluster controller stamps the `avsoft.io/tls-cert-checksum` annotation (checksum of the TLS Secret data) on the coordinator/standby/segment pod templates, so a rotated certificate rolls the pods exactly once — stable across no-op reconciles, preserved by reconcile paths that don't recompute it. **Upgrade note**: the first reconcile after upgrading to a version with this annotation triggers a one-time rolling restart of existing TLS-enabled cluster pods
-- HashiCorp Vault integration for secrets management with token, Kubernetes, and AppRole auth methods (`CLOUDBERRY_VAULT_ROLE_ID`/`CLOUDBERRY_VAULT_SECRET_ID`); Vault token renewal and re-authentication are automatic (Vault `LifetimeWatcher` renews the login token in the background and re-authenticates on expiry); re-authentication is **generation-gated** (a reactive re-login after a 401/403 burst suppresses the redundant lifecycle re-login — no re-auth storms), and when both operator Vault and `webhook.certSource=vault-pki` are enabled the webhook PKI **reuses the shared Vault client** (single token lifecycle)
-- **Vault KV-v2 logical paths**: `ReadSecret` takes the logical KV path (e.g. `secret/cloudberry/backup-s3`) and injects the `data/` request segment automatically for KV-v2 mounts — including under least-privilege policies granting only `<mount>/data/*` (a 403 on the verbatim path triggers a single fallback read, with no re-auth for path-shape 403s); explicit `secret/data/...` paths keep working (the webhook warns and suggests the logical form)
-- Test users (`basic_user`/`opbasic_user`/`operator_user`) are **disabled by default** and only seeded when `CLOUDBERRY_ENABLE_TEST_USERS=true` (a WARN log is emitted when enabled — never enable in production, the credentials are publicly known)
-- Configuration precedence (highest wins): environment variable > command-line flag > config file > default
+
+The operator provides authentication, authorization, TLS, and secrets management
+for both its own API surface and the Cloudberry clusters it manages. It supports
+dual-mode authentication, a tiered permission model, declarative `pg_hba.conf`
+management, automatic TLS certificate issuance and rotation, and deep HashiCorp
+Vault integration.
+
+### Authentication modes
+
+Two authentication modes run side by side:
+
+- **Basic** — username/password credentials.
+- **OIDC (Keycloak)** — JWT validation with JWKS caching and role-claim
+  extraction. Tokens are validated against the cached JWKS, and roles are read
+  from the token claims to drive authorization.
+#### Permission model
+
+Five tiers, from most to least restricted:
+
+| Tier | Scope |
+|------|-------|
+| **Self Only** | Acts only on the caller's own resources. |
+| **Basic** | Read, status, and log access. |
+| **Operator Basic** | Limited operational reads. |
+| **Operator** | Create, update, start, stop, and sync operations. |
+| **Admin** | Full control, including delete. |
+
+#### Cluster connection security
+
+- **`pg_hba.conf` management** — host-based access rules are managed
+  declaratively through the cluster CR.
+- **SSL/TLS** — configurable, with a settable minimum TLS version.
+### TLS certificate management
+
+#### Webhook certificates
+
+The operator manages its own webhook TLS certificate, sourced either from Vault
+PKI or as a self-signed certificate with automatic rotation.
+
+#### Cluster TLS auto-issuance from Vault PKI
+
+When a cluster CR enables both `vault.enabled` and `auth.ssl.enabled` with a
+`certSecret` that does not yet exist, the operator:
+
+1. Issues the server certificate from the webhook's Vault PKI mount and role.
+2. Creates a generic Secret containing `tls.crt`, `tls.key`, and `ca.crt`.
+3. Renews the certificate at 2/3 of its lifetime.
+   User-provided Secrets are never touched. Lifecycle events:
+   `ClusterTLSIssued`, `ClusterTLSRenewed`, `ClusterTLSFailed`.
+
+#### Automatic pod rolls on rotation
+
+The cluster controller stamps an `avsoft.io/tls-cert-checksum` annotation
+(a checksum of the TLS Secret data) onto the coordinator, standby, and segment
+pod templates. A rotated certificate therefore rolls the affected pods exactly
+once — the checksum is stable across no-op reconciles and preserved by reconcile
+paths that don't recompute it.
+
+> **Upgrade note:** the first reconcile after upgrading to a version that
+> includes this annotation triggers a one-time rolling restart of existing
+> TLS-enabled cluster pods.
+
+#### HashiCorp Vault integration
+
+Vault backs secrets management, with three supported auth methods: token,
+Kubernetes, and AppRole (`CLOUDBERRY_VAULT_ROLE_ID` /
+`CLOUDBERRY_VAULT_SECRET_ID`).
+
+##### Token lifecycle
+
+Token renewal and re-authentication are automatic. A Vault `LifetimeWatcher`
+renews the login token in the background and re-authenticates on expiry.
+Re-authentication is **generation-gated**: a reactive re-login after a 401/403
+burst suppresses the redundant lifecycle re-login, so there are no re-auth
+storms. When both operator Vault and `webhook.certSource=vault-pki` are enabled,
+the webhook PKI reuses the shared Vault client, keeping a single token lifecycle.
+
+##### KV-v2 logical paths
+
+`ReadSecret` takes the logical KV path (for example,
+`secret/cloudberry/backup-s3`) and injects the `data/` request segment
+automatically for KV-v2 mounts. This works even under least-privilege policies
+that grant only `<mount>/data/*`: a 403 on the verbatim path triggers a single
+fallback read, with no re-auth for path-shape 403s. Explicit `secret/data/...`
+paths keep working — the webhook warns and suggests the logical form.
+
+
+### Configuration precedence
+
+Highest wins:
+
+```
+environment variable  >  command-line flag  >  config file  >  default
+```
 
 **Observability**
-- Prometheus metrics for cluster health, reconciliation, FTS, connections, scale operations, mirroring operations, and PVC sizes
-- Reconciliation metrics: `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, `cloudberry_reconcile_duration_seconds` with cluster/namespace/result labels
-- Operational metrics wired to real operations: `cloudberry_pvc_size_bytes` (PVC expansion), `cloudberry_redistribution_progress` (data redistribution), `cloudberry_backup_total` / `cloudberry_restore_total` (**transition-gated** — one increment per actual Job state change, so `rate()` and alerts are correct), per-database `cloudberry_disk_usage_bytes`, and storage recommendation metrics (`cloudberry_recommendations_total`, `cloudberry_recommendation_scan_duration_seconds`)
-- Maintenance metrics: `cloudberry_maintenance_operations_total` with cluster/namespace/operation/`result` (`started`, `success`, `failed`) labels
-- Security metrics: `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`, `cloudberry_vault_operations_total`, `cloudberry_vault_operation_duration_seconds`, and `cloudberry_auth_attempts_total` (a missing/malformed `Authorization` header increments `{method="unknown",result="failure"}`)
-- Admission and lifecycle metrics: `cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`, `cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`
-- REST API server metrics: `cloudberry_api_requests_total` / `cloudberry_api_request_duration_seconds` (labelled by low-cardinality route **template**, never the raw path), `cloudberry_api_requests_in_flight` (panic-safe — decremented even when a handler panics), and `cloudberry_api_rate_limit_rejections_total`
-- Database client metrics: `cloudberry_db_connect_total` / `cloudberry_db_connect_duration_seconds`, `cloudberry_db_query_duration_seconds{operation}`, and live pool gauges sampled per scrape (`cloudberry_db_pool_acquired_conns` / `_idle_conns` / `_max_conns`). 15 mutating/DDL `db.Client` methods record `cloudberry_db_query_duration_seconds` with their method name as the `operation` label (`SetParameter`, `ReloadConfig`, `CreateRole`, `AlterRole`, `DropRole`, `Vacuum`, `Analyze`, `Reindex`, `CreateResourceGroup`, `AlterResourceGroup`, `DropResourceGroup`, `AssignRoleResourceGroup`, `CreateResourceQueue`, `DropResourceQueue`, `MoveQueryToResourceGroup`); **22 read-path methods now record it too** (`GetSegmentConfiguration`, `GetMirrorSyncStatus`, `GetReplicationLag`, `GetActiveQueryCount`, `GetMaxConnections`, `GetResourceGroupUsage`, `ListSessionsWithResourceGroup`, `ListSessions`, `GetDiskUsage`, `GetStorageDiskUsage`, `ListResourceGroups`, `ListResourceQueues`, `CancelQuery`, `TriggerFTSProbe`, `ShowParameter`, `GetBloatRecommendations`, `GetSkewRecommendations`, `GetAgeRecommendations`, `GetIndexBloatRecommendations`, `GetTableDetails`, `GetUsageReport`, `GetRedistributionProgress`), completing the read/write symmetry
-- Idle daemon and session metrics: `cloudberry_idle_daemon_up`, `cloudberry_idle_scan_failures_total`, `cloudberry_idle_reconnect_attempts_total`, `cloudberry_session_terminations_total`
-- Controller operation metrics: `cloudberry_storage_expansions_total`, `cloudberry_backup_on_delete_total`, `cloudberry_scale_phase_duration_seconds{direction,phase}`, `cloudberry_cluster_cert_issuance_total`
-- API business metrics: `cloudberry_migrate_operations_total`, `cloudberry_api_cluster_operations_total`, `cloudberry_log_stream_sessions_total` / `cloudberry_log_stream_bytes_total`, `cloudberry_oidc_discovery_total`, `cloudberry_auth_token_verify_duration_seconds`
-- Request-side API/DDL counters (the request-side view, complementary to the controller-side outcome metrics): `cloudberry_api_cluster_lifecycle_requests_total{operation,result}` (cluster lifecycle/maintenance actions via the REST API — `operation` ∈ {`start`, `stop`, `restart`, `reload`, `activate-standby`, `rebalance`, `vacuum`, `analyze`, `reindex`, `config-update`}; `result` ∈ {`accepted`, `error`}), `cloudberry_api_workload_operations_total{kind,operation,result}` (workload-management DDL — `kind` ∈ {`resource_group`, `resource_queue`, `rule`}; `operation` ∈ {`create`, `update`, `delete`, `assign`}; `result` ∈ {`success`, `error`}), and `cloudberry_pxf_sync_total{cluster,namespace,result}` (PXF sync **request** outcomes — `result` ∈ {`success`, `error`} — separate from the honest `cloudberry_pxf_servers_changed_total` force-pair counter). The recovery API endpoint also records the request-side outcome on `cloudberry_recovery_operations_total` with `result` ∈ {`requested`, `error`} (alongside the controller-side `started`/`completed`/`failed`/`noop`)
-- Control-plane setup metrics (honest outcome counters incremented only at the real outcome): `cloudberry_gpfdist_reconcile_total{cluster,namespace,operation,result}` (operator-side gpfdist provisioning reconcile outcome — `operation` ∈ {`pvc`, `deployment`, `service`, `delete`}; `result` ∈ {`success`, `error`}), `cloudberry_pxf_extension_setup_total{cluster,namespace,result}` (PXF client-extension setup attempt outcome — `result` ∈ {`installed`, `absent`, `error`}), `cloudberry_dataloader_role_setup_total{cluster,namespace,result}` (the outcome of the dedicated least-privilege data-loader role setup — `EnsureDataLoaderRole`, security control SE.6; `result` ∈ {`success`, `error`}), and `cloudberry_exporter_role_setup_total{cluster,namespace,result}` (the outcome of the monitoring exporter role provisioning — `setupExporterRole`'s DB round-trip in `admin_controller.go`; `result` ∈ {`success`, `error`}) — the latter two are the siblings of `cloudberry_pxf_extension_setup_total`, so all three best-effort role-setup DB round-trips are now metered (each previously only logged a `Warn` on failure)
-- Storage-scan and OIDC outcome counters: `cloudberry_disk_usage_scan_total{cluster,namespace,result}` (disk-usage scan outcome recorded in the admin controller's `recordDiskUsage` — `result` ∈ {`success`, `error`, `skipped`}; `skipped` when `gp_toolkit.gp_disk_free` is unavailable on the server version, never a fabricated value), `cloudberry_recommendation_scan_total{cluster,namespace,result}` (storage-recommendation scan outcome recorded in `recordRecommendations` — `result` ∈ {`success`, `error`, `skipped`}, `skipped` when the DB is unavailable), and `cloudberry_oidc_userinfo_total{result}` (OIDC userinfo fetch outcome in `auth/oidc.go` — `result` ∈ {`success`, `error`})
-- Query-exporter (`cmd/cloudberry-query-exporter`) self-observability: `cbexporter_collector_errors_total{collector}` and `cbexporter_collector_duration_seconds{collector}` — per-collector scrape error counter + duration, `collector` ∈ {`query_activity`, `resgroup_status`, `resgroup_iostats`, `spill_files`, `segment_health`, `dist_txns`, `table_skew`}. The unbounded `usename` label was **removed** from `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound metric cardinality
-- Honest metric semantics: `cloudberry_connections_max` reports the **real** `max_connections` queried from the database; `cloudberry_pvc_size_bytes` is published in steady state on every reconcile (not only on expansion); `cloudberry_scale_operations_total` distinguishes `rebalance` from `rebalance-failed`
-- Workload and query-history metrics wired through: slow queries, workload rule actions, active connections, and query-history insert/retention/size
-- Exporter sidecars: `postgres-exporter` (port 9187) runs on both the coordinator and standby coordinator pods for monitoring continuity on promotion; `cloudberry-query-exporter` is coordinator-only (its cluster-global queries would otherwise duplicate metric series on a non-promoted standby); a per-segment `postgres-exporter` is available opt-in (default off) for both primary and mirror segments via the independent `queryMonitoring.exporters.postgresExporter.segments` and `queryMonitoring.exporters.postgresExporter.mirrors` flags for deep per-segment diagnostics; the `postgres-exporter` is Cloudberry-tailored (conditional resource-group query, disabled incompatible built-in collectors, recovery-safe WAL query) so scrapes run cleanly (`pg_exporter_last_scrape_error=0`) on coordinator, standby, and segments
-- OpenTelemetry (OTLP) distributed tracing with gRPC/HTTP exporters; spans use **low-cardinality names** across namespaced families: API server spans renamed to the route template (`GET /api/v1alpha1/clusters/{name}` — never the raw path), `db.*` (per db.Client operation — including the 15 mutating/DDL spans `db.SetParameter`, `db.ReloadConfig`, `db.CreateRole`, `db.AlterRole`, `db.DropRole`, `db.Vacuum`, `db.Analyze`, `db.Reindex`, `db.CreateResourceGroup`, `db.AlterResourceGroup`, `db.DropResourceGroup`, `db.AssignRoleResourceGroup`, `db.CreateResourceQueue`, `db.DropResourceQueue`, `db.MoveQueryToResourceGroup`, plus the 22 read-path spans `db.GetSegmentConfiguration`, `db.GetMirrorSyncStatus`, `db.GetReplicationLag`, `db.GetActiveQueryCount`, `db.GetMaxConnections`, `db.GetResourceGroupUsage`, `db.ListSessionsWithResourceGroup`, `db.ListSessions`, `db.GetDiskUsage`, `db.GetStorageDiskUsage`, `db.ListResourceGroups`, `db.ListResourceQueues`, `db.CancelQuery`, `db.TriggerFTSProbe`, `db.ShowParameter`, `db.GetBloatRecommendations`, `db.GetSkewRecommendations`, `db.GetAgeRecommendations`, `db.GetIndexBloatRecommendations`, `db.GetTableDetails`, `db.GetUsageReport`, `db.GetRedistributionProgress`, plus the session/replication/maintenance/history spans `db.TerminateSession`, `db.ConfigureReplication`, `db.TerminateAllBackends`, `db.CancelAllQueries`, `db.LogRotate`, `db.TriggerRecommendationScan`, `db.GetQueryDetail`, `db.ListUserDatabases`, `db.EnsureQueryHistoryTable`, `db.InsertQueryHistory`, `db.GetQueryHistoryDetail` (each also recording `cloudberry_db_query_duration_seconds`) — completing the read/write symmetry), `controller.*` (per controller sub-operation, e.g. `controller.clusterTLS`, the cluster-controller sub-operation spans `controller.reconcileCoreResources` and `controller.reconcileStatefulSets`, plus the AdminReconciler sub-reconciler spans `controller.reconcilePxf`, `controller.reconcileDataLoading`, `controller.reconcileStorage`, `controller.reconcileResourceGroups`, `controller.ensureExporterCoreResources`, the cluster-controller sub-reconciler spans `controller.reconcileConfigMaps`, `controller.reconcileAdminSecret`, `controller.reconcileClusterSSHSecret`, `controller.reconcileServices`, `controller.reconcileCoordinator`, `controller.reconcileStandby`, `controller.reconcileSegments`, the HA/auth controller spans `controller.monitorStandby`, `controller.executeRebalanceViaDB`, `controller.handleStandbyActivation`, `controller.reconcileHBA`, and `controller.scanRecommendations.fetch` (with a bounded `rec_type` attribute)), `idle.*` (`idle.scan`), `auth.*` (`auth.authenticate`, `auth.oidc.verify`, `auth.oidc.userinfo`, `auth.basic.verify`), `webhook.*` (`webhook.validate`/`webhook.mutate`), `vault.watch.check` (the `SecretWatcher.checkForChanges` read, span-only — error status on a read failure), `certmanager.issueVaultPKICert` (the Vault PKI cert-issuance call, error status on failure), and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`)
-- Span error recording via `SetSpanError()` — sets error status and exception events on OTEL spans
-- Structured logging (slog) with JSON output including cluster, namespace, controller, and reconcileID fields
-- Structured error types with sentinel errors (`ErrNotFound`, `ErrInvalidInput`, `ErrRetryExhausted`) supporting `errors.Is()` classification
-- Retry with exponential backoff for transient failures (configurable max retries, backoff, jitter)
-- Webhook validation rejects invalid cluster specs at admission time (segments, OIDC, storage)
-- Automatic pod deletion detection and recovery with degraded state reporting
-- The REST API server is an **essential component**: an API startup/runtime failure shuts the operator down (non-zero exit) instead of leaving it running degraded without its API
-- OIDC lazy discovery is **singleflight** with a 10-second per-attempt timeout (concurrent Bearer requests share one bounded discovery instead of piling up); per-request OIDC identity details (username/email/roles) are logged at Debug, not Info (PII hygiene)
+
+The operator exposes Prometheus metrics, OpenTelemetry distributed tracing, and
+structured logging across its controllers, REST API, database client, and
+exporter sidecars. Metric and span semantics follow two principles throughout:
+**low cardinality** (route templates and method names as labels, never raw paths
+or unbounded user identifiers) and **honesty** (counters increment only at a
+real outcome; values are never fabricated, and unobservable signals are reported
+as `skipped` rather than guessed).
+
+### Metrics
+
+#### Reconciliation and cluster health
+
+Cluster health, FTS, connections, and reconciliation are covered by
+`cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, and
+`cloudberry_reconcile_duration_seconds` (labelled by cluster, namespace, and
+result).
+
+#### Operational metrics
+
+Wired to real operations:
+
+| Metric | Source |
+|--------|--------|
+| `cloudberry_pvc_size_bytes` | PVC expansion; published every reconcile in steady state, not only on expansion |
+| `cloudberry_redistribution_progress` | Data redistribution |
+| `cloudberry_backup_total` / `cloudberry_restore_total` | **Transition-gated** — one increment per actual Job state change, so `rate()` and alerts stay correct |
+| `cloudberry_disk_usage_bytes` | Per-database disk usage |
+| `cloudberry_recommendations_total` / `cloudberry_recommendation_scan_duration_seconds` | Storage recommendations |
+| `cloudberry_maintenance_operations_total` | Maintenance ops (`result` ∈ `started`/`success`/`failed`) |
+| `cloudberry_scale_operations_total` | Distinguishes `rebalance` from `rebalance-failed` |
+
+#### Security metrics
+
+`cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`,
+`cloudberry_vault_operations_total`,
+`cloudberry_vault_operation_duration_seconds`, and
+`cloudberry_auth_attempts_total` (a missing or malformed `Authorization` header
+increments `{method="unknown",result="failure"}`).
+
+#### Admission and lifecycle
+
+`cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`,
+`cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`.
+
+#### REST API server
+
+`cloudberry_api_requests_total` and `cloudberry_api_request_duration_seconds`
+are labelled by the low-cardinality **route template**, never the raw path.
+`cloudberry_api_requests_in_flight` is panic-safe (decremented even when a
+handler panics), and `cloudberry_api_rate_limit_rejections_total` tracks rate
+limiting.
+
+Request-side counters complement the controller-side outcome metrics:
+
+- `cloudberry_api_cluster_lifecycle_requests_total{operation,result}` — lifecycle
+  and maintenance actions (start/stop/restart/reload/activate-standby/rebalance/
+  vacuum/analyze/reindex/config-update; `result` ∈ `accepted`/`error`).
+- `cloudberry_api_workload_operations_total{kind,operation,result}` —
+  workload-management DDL.
+- `cloudberry_pxf_sync_total{cluster,namespace,result}` — PXF sync request
+  outcomes, separate from the honest `cloudberry_pxf_servers_changed_total`
+  force-pair counter.
+
+#### Database client
+
+Connection and query metrics: `cloudberry_db_connect_total`,
+`cloudberry_db_connect_duration_seconds`,
+`cloudberry_db_query_duration_seconds{operation}`, and live pool gauges sampled
+per scrape (`cloudberry_db_pool_acquired_conns` / `_idle_conns` / `_max_conns`).
+
+Query duration is recorded with the method name as the `operation` label across
+the full client surface — 15 mutating/DDL methods and 22 read-path methods —
+giving complete read/write symmetry.
+
+#### Control-plane setup
+
+Honest outcome counters incremented only at the real outcome:
+
+- `cloudberry_gpfdist_reconcile_total{operation,result}` — gpfdist provisioning.
+- `cloudberry_pxf_extension_setup_total{result}` — `installed`/`absent`/`error`.
+- `cloudberry_dataloader_role_setup_total{result}` — least-privilege data-loader role.
+- `cloudberry_exporter_role_setup_total{result}` — monitoring exporter role.
+#### Scan and OIDC outcomes
+
+- `cloudberry_disk_usage_scan_total{result}` — `skipped` when
+  `gp_toolkit.gp_disk_free` is unavailable on the server version (never a
+  fabricated value).
+- `cloudberry_recommendation_scan_total{result}` — `skipped` when the DB is unavailable.
+- `cloudberry_oidc_userinfo_total{result}` and `cloudberry_oidc_discovery_total`.
+#### Other families
+
+Idle daemon and sessions (`cloudberry_idle_daemon_up`,
+`cloudberry_idle_scan_failures_total`, `cloudberry_session_terminations_total`),
+controller operations (`cloudberry_storage_expansions_total`,
+`cloudberry_scale_phase_duration_seconds{direction,phase}`,
+`cloudberry_cluster_cert_issuance_total`), and API business metrics
+(`cloudberry_migrate_operations_total`, `cloudberry_log_stream_sessions_total` /
+`cloudberry_log_stream_bytes_total`, `cloudberry_auth_token_verify_duration_seconds`).
+
+`cloudberry_connections_max` reports the **real** `max_connections` queried from
+the database.
+
+### Exporter sidecars
+
+| Exporter | Placement | Notes |
+|----------|-----------|-------|
+| `postgres-exporter` (port 9187) | Coordinator **and** standby coordinator | Runs on both for monitoring continuity across promotion. |
+| `cloudberry-query-exporter` | Coordinator only | Its cluster-global queries would duplicate series on a non-promoted standby. |
+| Per-segment `postgres-exporter` | Primary and mirror segments | Opt-in (default off) via `queryMonitoring.exporters.postgresExporter.segments` and `.mirrors`. |
+
+The `postgres-exporter` is Cloudberry-tailored — conditional resource-group
+query, incompatible built-in collectors disabled, recovery-safe WAL query — so
+scrapes run cleanly (`pg_exporter_last_scrape_error=0`) on coordinator, standby,
+and segments.
+
+The query exporter reports its own health via
+`cbexporter_collector_errors_total{collector}` and
+`cbexporter_collector_duration_seconds{collector}` (per-collector error count
+and duration). The unbounded `usename` label was removed from
+`cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound cardinality.
+
+### Distributed tracing
+
+OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans use
+**low-cardinality names** organized into namespaced families:
+
+- **API server** — named by route template (`GET /api/v1alpha1/clusters/{name}`,
+  never the raw path).
+- **`db.*`** — one span per `db.Client` operation, covering the full
+  mutating/DDL and read-path surface (each also recording
+  `cloudberry_db_query_duration_seconds`), for complete read/write symmetry.
+- **`controller.*`** — per controller sub-operation and sub-reconciler
+  (e.g. `controller.reconcileCoordinator`, `controller.reconcilePxf`,
+  `controller.handleStandbyActivation`).
+- **`auth.*`**, **`webhook.*`**, **`idle.*`** — authentication, admission, and
+  idle-scan spans.
+- **`vault.watch.check`**, **`certmanager.issueVaultPKICert`**, **`operator.*`**
+  — Vault read, PKI issuance, and startup spans (error status set on failure).
+  Errors are recorded via `SetSpanError()`, which sets error status and exception
+  events on the span.
+
+### Logging and error handling
+
+- **Structured logging** — slog with JSON output including cluster, namespace,
+  controller, and reconcileID fields. Per-request OIDC identity details
+  (username/email/roles) are logged at Debug, not Info, for PII hygiene.
+- **Structured errors** — sentinel errors (`ErrNotFound`, `ErrInvalidInput`,
+  `ErrRetryExhausted`) support `errors.Is()` classification.
+- **Retries** — exponential backoff for transient failures (configurable max
+  retries, backoff, jitter).
+### Operational guarantees
+
+- Webhook validation rejects invalid cluster specs at admission time (segments,
+  OIDC, storage).
+- Pod deletion is detected automatically, with recovery and degraded-state
+  reporting.
+- The REST API server is an **essential component**: a startup or runtime
+  failure shuts the operator down (non-zero exit) rather than leaving it running
+  degraded without its API.
+- OIDC lazy discovery is **singleflight** with a 10-second per-attempt timeout,
+  so concurrent Bearer requests share one bounded discovery instead of piling up.
 
 **Security Hardening**
+
 - SQL injection prevention with parameterized queries (pgx native config builder)
 - SQL injection prevention in distribution key handling via `sanitizeDistKey()` helper
 - SQL injection prevention in `updateNumsegments` with parameterized query
@@ -195,71 +414,230 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Dependency security update: bumped `golang.org/x/crypto` to v0.52.0 (Go toolchain pinned to 1.26.4)
 
 **Administration**
+
 - Configuration management with automatic hot-reload vs rolling restart detection
-  - Reload-safe parameters applied without pod restarts
-  - Restart-required parameters (shared_buffers, max_connections, wal_level, etc.) trigger rolling restart
-  - Rolling restart order: mirrors → primaries → standby → coordinator
-  - Rolling restart state tracked via `avsoft.io/rolling-restart` annotation
+- Reload-safe parameters applied without pod restarts
+- Restart-required parameters (shared_buffers, max_connections, wal_level, etc.) trigger rolling restart
+- Rolling restart order: mirrors → primaries → standby → coordinator
+- Rolling restart state tracked via `avsoft.io/rolling-restart` annotation
 - Cluster-wide, coordinator-only, per-database, and per-role parameters
 - Maintenance operations via Kubernetes Jobs: vacuum, vacuum-analyze, vacuum-full, analyze, reindex, backup-on-delete
-  - Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
-  - `PGPASSWORD` sourced from admin password Secret
+- Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
+- `PGPASSWORD` sourced from admin password Secret
 - Backup and restore to S3-compatible storage (AWS S3 / MinIO) via the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`)
-  - `backup.image` is defaulted by the mutating webhook to the official backup image (`cloudberry-backup:2.1.0`) when unset; a backup-capable image **must** contain `kubectl` (coordinator-exec model) and the `gpbackup`/`gprestore` toolchain
-  - Restores default to `--with-stats=false` (statistics restore is opt-in); with `withStats: true`, a `gprestore` exit code 2 (data restored, statistics failed) is treated as success-with-warning — `RestorePartial` Warning event and `cloudberry_restore_total{result="partial"}`
-  - S3 credentials from a Kubernetes Secret or HashiCorp Vault: `vaultSecret.path` takes the **logical** KV path (e.g. `secret/cloudberry/backup-s3` — the operator injects `data/` for KV-v2 mounts, including under least-privilege `secret/data/*` policies; the explicit `secret/data/...` form still works with a webhook warning), materialized at reconcile time into the owner-referenced Secret `<cluster>-backup-s3-vault-creds` consumed via `secretKeyRef`; materialization failures emit a `Warning`/`BackupVaultCredentialsFailed` Event and mark the reconcile outcome `result="error"`
-  - Full S3 config: bucket, folder, region, encryption, `forcePathStyle`, multipart tuning, retention, schedule (CronJob)
-  - Live data cycle runs `gpbackup`/`gprestore` inside the coordinator pod (MPP coordinator→segment SSH dispatch); verified end-to-end by Scenario 71 for both Secret and Vault credential variants
-  - Backup infrastructure verified by Scenario 72: toolchain image (`gpbackup`/`gprestore`/`gpbackup_s3_plugin`), backup RBAC (`cloudberry-backup-sa` + `cloudberry-backup-role`), the `<cluster>-backup-s3-config` ConfigMap, and the `jobTemplate` pod-template overrides (resources, nodeSelector, tolerations, serviceAccountName, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished)
-  - On-demand backup with per-request `gpbackupOptions` verified by Scenario 73: `POST /clusters/{name}/backups` accepts compression level/type, jobs, with-stats, without-globals, include-schemas, and a `noCompression` override (emits `--no-compression` and ignores `--compression-level`); the on-demand request creates a Kubernetes Job directly (not via the CronJob). A non-empty `databases` array is **required** (`400 INVALID_REQUEST` otherwise — `gpbackup` hard-requires `--dbname`); scheduled CronJob backups, which carry no request body, default the target database to `postgres`
-  - Single-data-file backup + full-option restore verified by Scenario 74: a `singleDataFile`/`copyQueueSize` backup emits `--single-data-file --copy-queue-size 4` (no `--jobs`), requires `gpbackup_helper` on every segment, and writes one consolidated data file per segment; the full-option restore resolves `gprestore`'s mutual-exclusivity rules (include-table over include-schema, run-analyze over with-stats, `--copy-queue-size` instead of `--jobs` for single-data-file restores, and redirect-schema pre-creation) so `mydb_restored` is populated, objects land in the `restored` schema, and ANALYZE runs
-  - Compression matrix (gzip vs zstd) verified by Scenario 75: two on-demand backups of the same data at `--compression-level 6` — one `--compression-type gzip`, one `--compression-type zstd` — both succeed and both restore cleanly into separate redirect DBs, with the on-disk sizes differing (zstd smaller). The `zstd` CLI now ships in the cluster image (`cloudberry-official:2.1.0`), required because `gpbackup` pipes segment `COPY` output through `zstd --compress`; data files are named `…_<oid>.gz` (gzip) vs `…_<oid>.zst` (zstd)
-  - Scheduled backup via CronJob + status population verified by Scenario 76: setting `spec.backup.schedule` reconciles a CronJob `{cluster}-backup-schedule` (`ownerReferences` → the cluster, `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` = 3, pod `restartPolicy: Never`) that fires on schedule and spawns a Job; after the backup succeeds the operator populates `status.backup` (`lastBackupTime`, `lastBackupTimestamp` 14-digit, `lastBackupStatus`, `lastBackupType`, `lastBackupJobName`, `cronJobName`, and `backupHistory[]` with `size`+`duration`). The 14-digit `lastBackupTimestamp` is guaranteed (CronJob Jobs derive it from `CompletionTime` in UTC), and backup status is refreshed on the periodic reconcile even in steady state (unchanged spec generation)
-  - **Real gpbackup timestamp capture (restore-by-timestamp fix):** the operator now captures `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` line from the backup Job (surfaced via `/dev/termination-log` and the new `avsoft.io/backup-timestamp` annotation) and records **that** as `status.lastBackupTimestamp`, instead of a pre-generated `time.Now()` value. Because `gpbackup` runs asynchronously inside the coordinator and assigns its own timestamp, the pre-generated value could **drift** from `gpbackup`'s real S3 object prefix, so a restore-by-timestamp directly against S3 previously failed with a `404`/`NotFound`; with the real timestamp recorded, restore-by-timestamp now resolves the correct S3 prefix. The change is **backward compatible** — when the annotation/marker is absent the operator falls back to the prior behaviour
-  - Pre-backup health checks verified by Scenario 77: every backup Job's `pre-backup-check` init container blocks the backup when any of four checks fails — **77a** segments-up (`gp_segment_configuration` `status='d'`), **77b** long-running transaction (older than 1 hour), **77c** S3 reachability (a **fail-closed SigV4-signed HEAD** to `${S3_ENDPOINT}/${S3_BUCKET}` returns non-2xx/3xx — replacing the prior best-effort `aws s3 ls`), and **77d** local disk space (< 1 GiB free). On a fault the `gpbackup` container never starts, the operator sets `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`BackupFailed` Event (one per failed Job; restore failures excluded); healing the fault lets a fresh backup reach `Success`
-  - Incremental backup lifecycle verified by Scenario 78: **78a** `gpbackup.incremental: true` (or a per-request `type=incremental`) always renders `--incremental --leaf-partition-data` once each on the Job *and* CronJob (leaf-partition-data forced even when unset; de-duplicated when set); **78b** a full → modify AO table → incremental WITHOUT `--from-timestamp` auto-forms against the most recent compatible backup (same bucket+folder) and `status.lastBackupType` becomes `incremental`; **78c** an explicit `--from-timestamp <full-ts>` (`gpbackupOptions.fromTimestamp`) pins the base. Each backup Job/CronJob is labelled `avsoft.io/backup-type` (`full|incremental`) and the operator derives `status.lastBackupType`/`backupHistory[].type` from the **Job's** label (spec fallback). **78d** restoring from the latest incremental validates the full set (full + all incrementals) and restores; a missing intermediate makes `gprestore` refuse (restore Job fails) — the operator records `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`RestoreFailed` Event (distinct from `BackupFailed`)
-  - Retention cleanup (all policies) verified by Scenario 79: after **each successful backup** the operator creates one idempotent cleanup Job `<cluster>-cleanup-<ts>` (label `avsoft.io/backup-operation=cleanup`) that enforces all three policies via the **real** `gpbackman` CLI (`woblerr/gpbackman` — no `delete --keep-full`/`--older-than`; it ships v0.8.1 in `cloudberry-backup:2.1.0`). **79a** `fullCount` and **79b** `incrementalCount` enumerate `gpbackman backup-info --type full|incremental` and delete the oldest excess with `gpbackman backup-delete --timestamp <ts> --cascade` (re-enumerating after each delete so cascade neither over- nor under-counts); **79c** `maxAge` (`"30d"`) runs `gpbackman backup-clean --older-than-days 30 --cascade`. **79d** the cleanup script prints `RETENTION_DELETED=<n>` (also to `/dev/termination-log`); the operator patches `avsoft.io/backup-retention-deleted=<n>` onto the Succeeded cleanup Job and the metrics loop turns it into the counter `cloudberry_backup_retention_deleted_total` (incremented per deletion)
-  - Post-restore validation verified by Scenario 80: after **each Succeeded restore** the operator creates one idempotent validation Job `<cluster>-validate-<ts>` (label `avsoft.io/backup-operation=validate`) whose script runs four checks — **80a** row-count compare of ACTUAL restored per-table counts against the EXPECTED counts captured from gpbackup history (passed via the restore Job's `avsoft.io/expected-row-counts` JSON annotation), emitting `ROW_COUNT_MATCH`/`ROW_COUNT_MISMATCH` and failing (`exit 1`) on any discrepancy (empty map → best-effort `ROW_COUNT_PROBE_SKIPPED`, no fail); **80b** an optional `ANALYZE` (`ANALYZE_OK`) when `backup.validation.runAnalyze` (falls back to `gprestore.runAnalyze`) refreshes planner stats; **80c** a must-pass invalid-index scan (`relkind='i' AND NOT indisvalid` → `exit 1`); and **80d** a configurable health-check query (`backup.validation.healthCheckQuery`, default `SELECT 1`). The operator records the terminal status into `cloudberry_restore_validation_total{cluster,namespace,result}` (`result=success|failed`) and emits a de-duplicated `Warning`/`ValidationFailed` Event on a Failed Job — **80e** a deliberate mismatch (data-only restore into a pre-populated table) is FLAGGED (Failed + Warning + `{result="failed"}`), and a failed validation does **not** retroactively fail the Succeeded restore
-  - Local (PVC-backed) backup destination verified by Scenario 81: with `destination.type: local` the operator mounts the named PVC (`local.persistentVolumeClaim`) as the `backup-data` volume at `local.path` (default `/backups`) on the backup/restore Job and runs `gpbackup`/`gprestore` with `--backup-dir <path>` and **NO** S3 plugin — `backupDestinationArgs(cluster)` seeds `--backup-dir` for local (and `--plugin-config` for s3); `buildGpbackupArgs`/`buildGprestoreArgs`/`renderToolScript` are destination-aware so a local Job has **no** `--plugin-config`, **no** `s3-plugin-config` volume, **no** `/etc/gpbackup` render (the S3-config envsubst is skipped so the local Job does not crash under `set -euo pipefail`), and **no** `S3_*`/`AWS_*` env. The operator creates **no** S3 ConfigMap and **no** Vault/Secret S3 credentials for local; the pre-backup `df` disk-space check (Scenario 77d, < 1 GiB free blocks) and gpbackman retention (`--backup-dir <path>` instead of `--plugin-config`) are local-aware. **MPP note:** `gpbackup --backup-dir` writes per-segment backup sets on the coordinator and every segment host; an RWO PVC on one Job pod holds one set, so the live data cycle targets a segment-visible `--backup-dir` via coordinator-exec while the PVC mount proves the operator wiring
-  - Backup security and encryption verified by Scenario 82: **82a** the `<cluster>-backup-s3-config` ConfigMap (`BuildBackupS3ConfigMap`) holds **only** `${...}` placeholders — no real credentials on disk/ConfigMap; creds reach the pod **only** as `valueFrom.secretKeyRef` env (`buildS3CredentialEnv`); **82b** `renderToolScript` runs `envsubst < /etc/gpbackup/s3-plugin-config.yaml.tpl > /tmp/s3-config.yaml` at runtime so the resolved config (with creds) exists **only** in the ephemeral pod filesystem (the ConfigMap stays placeholders-only); **82c** backup/restore/validate/cleanup Jobs run as `cloudberry-backup-sa` with **minimal RBAC** — Helm values `backup.rbac.scopeSecrets=true` + `backup.rbac.secretNames=[…]` scope `secrets:[get]` to a `resourceNames` allow-list so the SA is **denied** `get` on unrelated Secrets while still reading the backup-relevant ones (the S3 credential Secret + `<cluster>-ssh-keys`/`<cluster>-admin-password`/`<cluster>-backup-s3-vault-creds`); default `scopeSecrets=false` keeps namespace-wide get for backward compatibility (production should opt in, unioning per-cluster Secret names); **82d** `S3Destination.encryption` is an enum (`on|off`, default `on`, CRD-enforced) — `buildS3Env` sets `S3_ENCRYPTION` and the template line `encryption: ${S3_ENCRYPTION}` flips so the rendered config carries `encryption: on`/`off` (the S3 plugin TLS/SSL option; verified via the option, not literal HTTPS, in the HTTP-only test env); **82e** new `spec.backup.jobTemplate.imagePullSecrets` are applied to the backup Job pod spec (and restore/validate/cleanup/CronJob pods) via `applyJobTemplatePod` → `addImagePullSecrets`, so Jobs can pull from a private registry. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario82-security-encryption.yaml`; live cycle `test/e2e/scripts/scenario82-security-encryption.sh`
-  - Backup failure handling verified by Scenario 83: backup Jobs are bounded by `spec.backup.jobTemplate.backoffLimit` (default `2`) and `activeDeadlineSeconds` (default `7200`), both seeded by `buildJobSpec` and overridable per cluster (the override reaches every backup/restore/cleanup/validation Job and the CronJob `jobTemplate`). **83a** a force-failure (unreachable/bad-creds S3, caught fast by the 77c pre-backup HEAD) retries up to `backoffLimit` (up to 3 pod attempts) and ends with the Job condition `reason=BackoffLimitExceeded`; **83b** a backup outliving a low `activeDeadlineSeconds` is killed by Kubernetes at the deadline (`reason=DeadlineExceeded`). The operator now classifies a Job as `Failed` when `Status.Failed > 0` **OR** it carries a terminal Failed condition (`jobHasFailedCondition` — `batchv1.JobFailed`/`ConditionTrue`), applied to `backupJobStatus`/`backupJobStatusCode`/`validationJobResult` after the Succeeded precedence — so a deadline-killed Job (failed-pod count may be `0`) is reliably recorded `Failed`. A Failed backup sets `status.backup.lastBackupStatus=Failed`, `cloudberry_backup_last_status=1`, and emits the de-duplicated `Warning`/`BackupFailed` Event (Scenario 77); a success sets the metric to `0`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario83-backup-failure.yaml`; live cycle `test/e2e/scripts/scenario83-backup-failure.sh`
-  - Prometheus backup/restore metrics verified by Scenario 84: the `gpbackup_exporter` is the **operator `/metrics` endpoint** — the operator derives nine metrics (namespace `cloudberry`) from the observed backup/restore/cleanup Jobs + their `avsoft.io/*` annotations and exposes them on `/metrics` (vmagent scrapes them into VictoriaMetrics via the `prometheus.io/scrape` annotations; the Grafana operator dashboard renders a panel for each). The nine: `backup_total{type,result}`, `backup_duration_seconds{type}`, `backup_size_bytes{timestamp}`, `backup_last_success_timestamp`, `backup_last_status` (`0=success, 1=failed, 2=in-progress`), `restore_total{result}`, `restore_duration_seconds`, `backup_retention_deleted_total`, and `backup_job_status{job,operation}` (`0=pending, 1=running, 2=succeeded, 3=failed`). The outcome label on `backup_total`/`restore_total` is **`result`** (`success`|`failed`), **not** `status` — query `{result="success"}`/`{result="failed"}` (not renamed in code; dashboards/PromQL across 76–83 use `result`); both counters are **transition-gated** (one increment per actual Job state change — no inflation from periodic no-op reconciles). All nine were already wired across Scenarios 76–83 (`internal/metrics/metrics.go` `initBackupMetrics`; recorded by `recordLatestBackupMetrics`/`recordBackupJobMetrics`/`applyBackupJobToStatus` in `internal/controller/admin_controller.go`), so Scenario 84 is a verification/doc/dashboard scenario with no operator code change. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`; live cycle `test/e2e/scripts/scenario84-metrics.sh`
-  - All backup API endpoints verified by Scenario 85: the **seven** OIDC/JWT-authed backup/restore REST endpoints under `/api/v1alpha1/clusters/{name}/backups`, each with its own RBAC — **85a** `GET /backups` (Basic) lists the operator's recorded backup history (`status.backup.backupHistory`, derived from observed Jobs — **not** a live `gpbackman` query); **85b** `POST /backups` (Operator) creates a backup Job whose `gpbackup` args match `CreateBackupRequest.gpbackupOptions` (`mergeGpbackupOptions` → `buildGpbackupArgs`), **including the fix that `leafPartitionData` now emits `--leaf-partition-data` on FULL backups too, exactly once** (`appendLeafPartitionDataArgs` guarded on `!isEffectivelyIncremental` so the incremental force-pair is never duplicated); **85c** `GET /backups/{timestamp}` (Basic) returns the matching history entry (`400` non-14-digit, `404 BACKUP_NOT_FOUND` unknown); **85d** `DELETE /backups/{timestamp}` (Admin) creates a `gpbackman` cleanup Job; **85e** `POST /backups/{timestamp}/restore` (Admin) creates a restore Job whose `gprestore` args match `RestoreRequest.gprestoreOptions` (`dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`, …) with `dataOnly`+`metadataOnly` rejected `400`, and include-schema/include-table + run-analyze/with-stats resolved to the more specific flag; **85f** `GET /backups/jobs` (Basic) lists backup/restore/cleanup Job statuses; **85g** `GET /backups/schedule` (Basic) returns the CronJob status + computed `nextScheduleTime`. Handlers in `internal/api/server.go` (`handle*Backup*`), DTOs/mapping in `internal/api/backup.go` (`buildBackupJobOptions`/`buildRestoreJobOptions`/`restoreOptionsConflict`). Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`; live cycle `test/e2e/scripts/scenario85-api-endpoints.sh`
-  - All backup CLI commands verified by Scenario 86: the **eleven** `cloudberry-ctl backup …` commands map to the operator backup REST API over an OIDC bearer token (`--operator-url`/`CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + token via `--password`/`CLOUDBERRY_PASSWORD`) — **86a** `backup create` (all `gpbackupOptions` flags: `--type`, `--database`, `--compression-level`/`--compression-type`, `--jobs`, `--single-data-file`/`--copy-queue-size`, `--include-schema`/`--exclude-table`, `--incremental`/`--from-timestamp`/`--leaf-partition-data`, `--with-stats`, `--without-globals`) → `POST /backups`; **86b** `backup list` → `GET /backups`; **86c** `backup status --timestamp` → `GET /backups/{ts}`; **86d** `backup delete --timestamp` → `DELETE /backups/{ts}`; **86e** `backup restore --timestamp` (all `gprestoreOptions` flags incl. **`--resize-cluster`** — restores into a cluster with a different segment count) → `POST /backups/{ts}/restore`; **86f** `backup schedule` → `GET /backups/schedule`; **86g/h/i** `backup schedule set --cron`/`suspend`/`resume` → `PATCH /backups/schedule`; **86j** `backup jobs` → `GET /backups/jobs`; **86k** `backup jobs logs --job <name>` now **STREAMS** the Job's pod logs (`--follow`/`--tail`) via a **new** operator endpoint `GET /clusters/{name}/backups/jobs/{job}/logs` (Permission Basic, `text/plain`, `?follow`/`?tailLines`) that finds the Job's pod and streams its container logs — with a `kubectl logs` fallback when the endpoint is unavailable. The operator gained a typed Kubernetes clientset (injected via `Server.WithClientset`) to read pod logs; the CLI streams via `OperatorClient.GetStream`. Commands in `cmd/cloudberry-ctl/main.go` (`newBackup*`), endpoint `handleBackupJobLogs` in `internal/api/server.go`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`; live cycle `test/e2e/scripts/scenario86-cli-commands.sh`
+- `backup.image` is defaulted by the mutating webhook to the official backup image (`cloudberry-backup:2.1.0`) when unset; a backup-capable image **must** contain `kubectl` (coordinator-exec model) and the `gpbackup`/`gprestore` toolchain
+- Restores default to `--with-stats=false` (statistics restore is opt-in); with `withStats: true`, a `gprestore` exit code 2 (data restored, statistics failed) is treated as success-with-warning — `RestorePartial` Warning event and `cloudberry_restore_total{result="partial"}`
+- S3 credentials from a Kubernetes Secret or HashiCorp Vault: `vaultSecret.path` takes the **logical** KV path (e.g. `secret/cloudberry/backup-s3` — the operator injects `data/` for KV-v2 mounts, including under least-privilege `secret/data/*` policies; the explicit `secret/data/...` form still works with a webhook warning), materialized at reconcile time into the owner-referenced Secret `<cluster>-backup-s3-vault-creds` consumed via `secretKeyRef`; materialization failures emit a `Warning`/`BackupVaultCredentialsFailed` Event and mark the reconcile outcome `result="error"`
+- Full S3 config: bucket, folder, region, encryption, `forcePathStyle`, multipart tuning, retention, schedule (CronJob)
+- Live data cycle runs `gpbackup`/`gprestore` inside the coordinator pod (MPP coordinator→segment SSH dispatch); verified end-to-end by Scenario 71 for both Secret and Vault credential variants
+- Backup infrastructure verified by Scenario 72: toolchain image (`gpbackup`/`gprestore`/`gpbackup_s3_plugin`), backup RBAC (`cloudberry-backup-sa` + `cloudberry-backup-role`), the `<cluster>-backup-s3-config` ConfigMap, and the `jobTemplate` pod-template overrides (resources, nodeSelector, tolerations, serviceAccountName, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished)
+- On-demand backup with per-request `gpbackupOptions` verified by Scenario 73: `POST /clusters/{name}/backups` accepts compression level/type, jobs, with-stats, without-globals, include-schemas, and a `noCompression` override (emits `--no-compression` and ignores `--compression-level`); the on-demand request creates a Kubernetes Job directly (not via the CronJob). A non-empty `databases` array is **required** (`400 INVALID_REQUEST` otherwise — `gpbackup` hard-requires `--dbname`); scheduled CronJob backups, which carry no request body, default the target database to `postgres`
+- Single-data-file backup + full-option restore verified by Scenario 74: a `singleDataFile`/`copyQueueSize` backup emits `--single-data-file --copy-queue-size 4` (no `--jobs`), requires `gpbackup_helper` on every segment, and writes one consolidated data file per segment; the full-option restore resolves `gprestore`'s mutual-exclusivity rules (include-table over include-schema, run-analyze over with-stats, `--copy-queue-size` instead of `--jobs` for single-data-file restores, and redirect-schema pre-creation) so `mydb_restored` is populated, objects land in the `restored` schema, and ANALYZE runs
+- Compression matrix (gzip vs zstd) verified by Scenario 75: two on-demand backups of the same data at `--compression-level 6` — one `--compression-type gzip`, one `--compression-type zstd` — both succeed and both restore cleanly into separate redirect DBs, with the on-disk sizes differing (zstd smaller). The `zstd` CLI now ships in the cluster image (`cloudberry-official:2.1.0`), required because `gpbackup` pipes segment `COPY` output through `zstd --compress`; data files are named `…_<oid>.gz` (gzip) vs `…_<oid>.zst` (zstd)
+- Scheduled backup via CronJob + status population verified by Scenario 76: setting `spec.backup.schedule` reconciles a CronJob `{cluster}-backup-schedule` (`ownerReferences` → the cluster, `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` = 3, pod `restartPolicy: Never`) that fires on schedule and spawns a Job; after the backup succeeds the operator populates `status.backup` (`lastBackupTime`, `lastBackupTimestamp` 14-digit, `lastBackupStatus`, `lastBackupType`, `lastBackupJobName`, `cronJobName`, and `backupHistory[]` with `size`+`duration`). The 14-digit `lastBackupTimestamp` is guaranteed (CronJob Jobs derive it from `CompletionTime` in UTC), and backup status is refreshed on the periodic reconcile even in steady state (unchanged spec generation)
+- **Real gpbackup timestamp capture (restore-by-timestamp fix):** the operator now captures `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` line from the backup Job (surfaced via `/dev/termination-log` and the new `avsoft.io/backup-timestamp` annotation) and records **that** as `status.lastBackupTimestamp`, instead of a pre-generated `time.Now()` value. Because `gpbackup` runs asynchronously inside the coordinator and assigns its own timestamp, the pre-generated value could **drift** from `gpbackup`'s real S3 object prefix, so a restore-by-timestamp directly against S3 previously failed with a `404`/`NotFound`; with the real timestamp recorded, restore-by-timestamp now resolves the correct S3 prefix. The change is **backward compatible** — when the annotation/marker is absent the operator falls back to the prior behaviour
+- Pre-backup health checks verified by Scenario 77: every backup Job's `pre-backup-check` init container blocks the backup when any of four checks fails — **77a** segments-up (`gp_segment_configuration` `status='d'`), **77b** long-running transaction (older than 1 hour), **77c** S3 reachability (a **fail-closed SigV4-signed HEAD** to `${S3_ENDPOINT}/${S3_BUCKET}` returns non-2xx/3xx — replacing the prior best-effort `aws s3 ls`), and **77d** local disk space (< 1 GiB free). On a fault the `gpbackup` container never starts, the operator sets `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`BackupFailed` Event (one per failed Job; restore failures excluded); healing the fault lets a fresh backup reach `Success`
+- Incremental backup lifecycle verified by Scenario 78: **78a** `gpbackup.incremental: true` (or a per-request `type=incremental`) always renders `--incremental --leaf-partition-data` once each on the Job *and* CronJob (leaf-partition-data forced even when unset; de-duplicated when set); **78b** a full → modify AO table → incremental WITHOUT `--from-timestamp` auto-forms against the most recent compatible backup (same bucket+folder) and `status.lastBackupType` becomes `incremental`; **78c** an explicit `--from-timestamp <full-ts>` (`gpbackupOptions.fromTimestamp`) pins the base. Each backup Job/CronJob is labelled `avsoft.io/backup-type` (`full|incremental`) and the operator derives `status.lastBackupType`/`backupHistory[].type` from the **Job's** label (spec fallback). **78d** restoring from the latest incremental validates the full set (full + all incrementals) and restores; a missing intermediate makes `gprestore` refuse (restore Job fails) — the operator records `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`RestoreFailed` Event (distinct from `BackupFailed`)
+- Retention cleanup (all policies) verified by Scenario 79: after **each successful backup** the operator creates one idempotent cleanup Job `<cluster>-cleanup-<ts>` (label `avsoft.io/backup-operation=cleanup`) that enforces all three policies via the **real** `gpbackman` CLI (`woblerr/gpbackman` — no `delete --keep-full`/`--older-than`; it ships v0.8.1 in `cloudberry-backup:2.1.0`). **79a** `fullCount` and **79b** `incrementalCount` enumerate `gpbackman backup-info --type full|incremental` and delete the oldest excess with `gpbackman backup-delete --timestamp <ts> --cascade` (re-enumerating after each delete so cascade neither over- nor under-counts); **79c** `maxAge` (`"30d"`) runs `gpbackman backup-clean --older-than-days 30 --cascade`. **79d** the cleanup script prints `RETENTION_DELETED=<n>` (also to `/dev/termination-log`); the operator patches `avsoft.io/backup-retention-deleted=<n>` onto the Succeeded cleanup Job and the metrics loop turns it into the counter `cloudberry_backup_retention_deleted_total` (incremented per deletion)
+- Post-restore validation verified by Scenario 80: after **each Succeeded restore** the operator creates one idempotent validation Job `<cluster>-validate-<ts>` (label `avsoft.io/backup-operation=validate`) whose script runs four checks — **80a** row-count compare of ACTUAL restored per-table counts against the EXPECTED counts captured from gpbackup history (passed via the restore Job's `avsoft.io/expected-row-counts` JSON annotation), emitting `ROW_COUNT_MATCH`/`ROW_COUNT_MISMATCH` and failing (`exit 1`) on any discrepancy (empty map → best-effort `ROW_COUNT_PROBE_SKIPPED`, no fail); **80b** an optional `ANALYZE` (`ANALYZE_OK`) when `backup.validation.runAnalyze` (falls back to `gprestore.runAnalyze`) refreshes planner stats; **80c** a must-pass invalid-index scan (`relkind='i' AND NOT indisvalid` → `exit 1`); and **80d** a configurable health-check query (`backup.validation.healthCheckQuery`, default `SELECT 1`). The operator records the terminal status into `cloudberry_restore_validation_total{cluster,namespace,result}` (`result=success|failed`) and emits a de-duplicated `Warning`/`ValidationFailed` Event on a Failed Job — **80e** a deliberate mismatch (data-only restore into a pre-populated table) is FLAGGED (Failed + Warning + `{result="failed"}`), and a failed validation does **not** retroactively fail the Succeeded restore
+- Local (PVC-backed) backup destination verified by Scenario 81: with `destination.type: local` the operator mounts the named PVC (`local.persistentVolumeClaim`) as the `backup-data` volume at `local.path` (default `/backups`) on the backup/restore Job and runs `gpbackup`/`gprestore` with `--backup-dir <path>` and **NO** S3 plugin — `backupDestinationArgs(cluster)` seeds `--backup-dir` for local (and `--plugin-config` for s3); `buildGpbackupArgs`/`buildGprestoreArgs`/`renderToolScript` are destination-aware so a local Job has **no** `--plugin-config`, **no** `s3-plugin-config` volume, **no** `/etc/gpbackup` render (the S3-config envsubst is skipped so the local Job does not crash under `set -euo pipefail`), and **no** `S3_*`/`AWS_*` env. The operator creates **no** S3 ConfigMap and **no** Vault/Secret S3 credentials for local; the pre-backup `df` disk-space check (Scenario 77d, < 1 GiB free blocks) and gpbackman retention (`--backup-dir <path>` instead of `--plugin-config`) are local-aware. **MPP note:** `gpbackup --backup-dir` writes per-segment backup sets on the coordinator and every segment host; an RWO PVC on one Job pod holds one set, so the live data cycle targets a segment-visible `--backup-dir` via coordinator-exec while the PVC mount proves the operator wiring
+- Backup security and encryption verified by Scenario 82: **82a** the `<cluster>-backup-s3-config` ConfigMap (`BuildBackupS3ConfigMap`) holds **only** `${...}` placeholders — no real credentials on disk/ConfigMap; creds reach the pod **only** as `valueFrom.secretKeyRef` env (`buildS3CredentialEnv`); **82b** `renderToolScript` runs `envsubst < /etc/gpbackup/s3-plugin-config.yaml.tpl > /tmp/s3-config.yaml` at runtime so the resolved config (with creds) exists **only** in the ephemeral pod filesystem (the ConfigMap stays placeholders-only); **82c** backup/restore/validate/cleanup Jobs run as `cloudberry-backup-sa` with **minimal RBAC** — Helm values `backup.rbac.scopeSecrets=true` + `backup.rbac.secretNames=[…]` scope `secrets:[get]` to a `resourceNames` allow-list so the SA is **denied** `get` on unrelated Secrets while still reading the backup-relevant ones (the S3 credential Secret + `<cluster>-ssh-keys`/`<cluster>-admin-password`/`<cluster>-backup-s3-vault-creds`); default `scopeSecrets=false` keeps namespace-wide get for backward compatibility (production should opt in, unioning per-cluster Secret names); **82d** `S3Destination.encryption` is an enum (`on|off`, default `on`, CRD-enforced) — `buildS3Env` sets `S3_ENCRYPTION` and the template line `encryption: ${S3_ENCRYPTION}` flips so the rendered config carries `encryption: on`/`off` (the S3 plugin TLS/SSL option; verified via the option, not literal HTTPS, in the HTTP-only test env); **82e** new `spec.backup.jobTemplate.imagePullSecrets` are applied to the backup Job pod spec (and restore/validate/cleanup/CronJob pods) via `applyJobTemplatePod` → `addImagePullSecrets`, so Jobs can pull from a private registry. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario82-security-encryption.yaml`; live cycle `test/e2e/scripts/scenario82-security-encryption.sh`
+- Backup failure handling verified by Scenario 83: backup Jobs are bounded by `spec.backup.jobTemplate.backoffLimit` (default `2`) and `activeDeadlineSeconds` (default `7200`), both seeded by `buildJobSpec` and overridable per cluster (the override reaches every backup/restore/cleanup/validation Job and the CronJob `jobTemplate`). **83a** a force-failure (unreachable/bad-creds S3, caught fast by the 77c pre-backup HEAD) retries up to `backoffLimit` (up to 3 pod attempts) and ends with the Job condition `reason=BackoffLimitExceeded`; **83b** a backup outliving a low `activeDeadlineSeconds` is killed by Kubernetes at the deadline (`reason=DeadlineExceeded`). The operator now classifies a Job as `Failed` when `Status.Failed > 0` **OR** it carries a terminal Failed condition (`jobHasFailedCondition` — `batchv1.JobFailed`/`ConditionTrue`), applied to `backupJobStatus`/`backupJobStatusCode`/`validationJobResult` after the Succeeded precedence — so a deadline-killed Job (failed-pod count may be `0`) is reliably recorded `Failed`. A Failed backup sets `status.backup.lastBackupStatus=Failed`, `cloudberry_backup_last_status=1`, and emits the de-duplicated `Warning`/`BackupFailed` Event (Scenario 77); a success sets the metric to `0`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario83-backup-failure.yaml`; live cycle `test/e2e/scripts/scenario83-backup-failure.sh`
+- Prometheus backup/restore metrics verified by Scenario 84: the `gpbackup_exporter` is the **operator `/metrics` endpoint** — the operator derives nine metrics (namespace `cloudberry`) from the observed backup/restore/cleanup Jobs + their `avsoft.io/*` annotations and exposes them on `/metrics` (vmagent scrapes them into VictoriaMetrics via the `prometheus.io/scrape` annotations; the Grafana operator dashboard renders a panel for each). The nine: `backup_total{type,result}`, `backup_duration_seconds{type}`, `backup_size_bytes{timestamp}`, `backup_last_success_timestamp`, `backup_last_status` (`0=success, 1=failed, 2=in-progress`), `restore_total{result}`, `restore_duration_seconds`, `backup_retention_deleted_total`, and `backup_job_status{job,operation}` (`0=pending, 1=running, 2=succeeded, 3=failed`). The outcome label on `backup_total`/`restore_total` is **`result`** (`success`|`failed`), **not** `status` — query `{result="success"}`/`{result="failed"}` (not renamed in code; dashboards/PromQL across 76–83 use `result`); both counters are **transition-gated** (one increment per actual Job state change — no inflation from periodic no-op reconciles). All nine were already wired across Scenarios 76–83 (`internal/metrics/metrics.go` `initBackupMetrics`; recorded by `recordLatestBackupMetrics`/`recordBackupJobMetrics`/`applyBackupJobToStatus` in `internal/controller/admin_controller.go`), so Scenario 84 is a verification/doc/dashboard scenario with no operator code change. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`; live cycle `test/e2e/scripts/scenario84-metrics.sh`
+- All backup API endpoints verified by Scenario 85: the **seven** OIDC/JWT-authed backup/restore REST endpoints under `/api/v1alpha1/clusters/{name}/backups`, each with its own RBAC — **85a** `GET /backups` (Basic) lists the operator's recorded backup history (`status.backup.backupHistory`, derived from observed Jobs — **not** a live `gpbackman` query); **85b** `POST /backups` (Operator) creates a backup Job whose `gpbackup` args match `CreateBackupRequest.gpbackupOptions` (`mergeGpbackupOptions` → `buildGpbackupArgs`), **including the fix that `leafPartitionData` now emits `--leaf-partition-data` on FULL backups too, exactly once** (`appendLeafPartitionDataArgs` guarded on `!isEffectivelyIncremental` so the incremental force-pair is never duplicated); **85c** `GET /backups/{timestamp}` (Basic) returns the matching history entry (`400` non-14-digit, `404 BACKUP_NOT_FOUND` unknown); **85d** `DELETE /backups/{timestamp}` (Admin) creates a `gpbackman` cleanup Job; **85e** `POST /backups/{timestamp}/restore` (Admin) creates a restore Job whose `gprestore` args match `RestoreRequest.gprestoreOptions` (`dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`, …) with `dataOnly`+`metadataOnly` rejected `400`, and include-schema/include-table + run-analyze/with-stats resolved to the more specific flag; **85f** `GET /backups/jobs` (Basic) lists backup/restore/cleanup Job statuses; **85g** `GET /backups/schedule` (Basic) returns the CronJob status + computed `nextScheduleTime`. Handlers in `internal/api/server.go` (`handle*Backup*`), DTOs/mapping in `internal/api/backup.go` (`buildBackupJobOptions`/`buildRestoreJobOptions`/`restoreOptionsConflict`). Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`; live cycle `test/e2e/scripts/scenario85-api-endpoints.sh`
+- All backup CLI commands verified by Scenario 86: the **eleven** `cloudberry-ctl backup …` commands map to the operator backup REST API over an OIDC bearer token (`--operator-url`/`CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + token via `--password`/`CLOUDBERRY_PASSWORD`) — **86a** `backup create` (all `gpbackupOptions` flags: `--type`, `--database`, `--compression-level`/`--compression-type`, `--jobs`, `--single-data-file`/`--copy-queue-size`, `--include-schema`/`--exclude-table`, `--incremental`/`--from-timestamp`/`--leaf-partition-data`, `--with-stats`, `--without-globals`) → `POST /backups`; **86b** `backup list` → `GET /backups`; **86c** `backup status --timestamp` → `GET /backups/{ts}`; **86d** `backup delete --timestamp` → `DELETE /backups/{ts}`; **86e** `backup restore --timestamp` (all `gprestoreOptions` flags incl. **`--resize-cluster`** — restores into a cluster with a different segment count) → `POST /backups/{ts}/restore`; **86f** `backup schedule` → `GET /backups/schedule`; **86g/h/i** `backup schedule set --cron`/`suspend`/`resume` → `PATCH /backups/schedule`; **86j** `backup jobs` → `GET /backups/jobs`; **86k** `backup jobs logs --job <name>` now **STREAMS** the Job's pod logs (`--follow`/`--tail`) via a **new** operator endpoint `GET /clusters/{name}/backups/jobs/{job}/logs` (Permission Basic, `text/plain`, `?follow`/`?tailLines`) that finds the Job's pod and streams its container logs — with a `kubectl logs` fallback when the endpoint is unavailable. The operator gained a typed Kubernetes clientset (injected via `Server.WithClientset`) to read pod logs; the CLI streams via `OperatorClient.GetStream`. Commands in `cmd/cloudberry-ctl/main.go` (`newBackup*`), endpoint `handleBackupJobLogs` in `internal/api/server.go`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`; live cycle `test/e2e/scripts/scenario86-cli-commands.sh`
 - Session management: list active sessions from `pg_stat_activity`, cancel queries via `pg_cancel_backend()`, terminate sessions via `pg_terminate_backend()` (with PID validation and graceful degradation when DB is unavailable)
 - Resource group management: create, list, assign, and delete resource groups for workload isolation
-  - Create groups with concurrency, CPU, and memory limits
-  - Assign database roles to resource groups (`ALTER ROLE ... RESOURCE GROUP`)
-  - Query live resource groups from the database with CRD spec fallback
+- Create groups with concurrency, CPU, and memory limits
+- Assign database roles to resource groups (`ALTER ROLE ... RESOURCE GROUP`)
+- Query live resource groups from the database with CRD spec fallback
 - API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated (persisted to K8s Secret `cloudberry-operator-admin-password`)
-- Data loading (PXF model) — **declarative contract + ingestion runtime implemented; native loads AND operator-driven `pxf://` loads row-count-verified**:
-  - The full `dataLoading` CRD (PXF servers/extensions/custom connectors, `gpfdist`, `jobs[]` of `type: pxf|gpload`, `jobTemplate`) is accepted and persisted
-  - Validating webhook enforces the `W.1`–`W.25` PXF + gpload rules (incl. the W.10 profile allowlist) **plus the W.10b write-capability rule** and applies 14 mutating-webhook defaults — gated on `dataLoading.enabled: true`, verified by Scenario 89 (W.1–W.16), Scenario 96 (W.10b), Scenario 99 (W.17), Scenario 101 (W.18–W.22 gpload field rules), Scenario 102 (W.23/W.24/W.23c custom-connector + streaming rules), and Scenario 103 (W.25 `loadMethod` + the W.17 fdw-read tweak)
-  - **Ingestion runtime (Implemented):** for every enabled `dataLoading.jobs[]` entry the operator **creates and launches** a one-off `Job` (no `schedule`) or a `CronJob` (when `schedule` set), named `<cluster>-dataload-<job>` (container `dataload`, image `cluster.Spec.Image`, coordinator-exec `psql`). It generates the **external-table DDL** (`CREATE EXTERNAL TABLE (LIKE <target>) … LOCATION … FORMAT … LOG ERRORS`), runs `INSERT…SELECT` → harvests the `DATALOAD_ROWS` marker → `DROP` → `ANALYZE`, and best-effort-installs the PXF extensions (`CREATE EXTENSION pxf/pxf_fdw`, non-fatal). Verified by Scenario 92
-  - **Per-type PXF server file-mapping + extensions + GRANTs (Implemented):** each PXF server type renders the correct `*-site.xml` set (**SL.1–6**) into the `<cluster>-pxf-servers` ConfigMap — `s3`→`s3-site.xml`; `hdfs`→`core-site.xml`+`hdfs-site.xml` always (+ optional `hive`/`hbase`/`mapred`/`yarn` site files, `config` map prefix-split `fs.*`→core/`dfs.*`→hdfs/…); `jdbc`→`jdbc-site.xml`; `hive`→`core`+`hive`; `hbase`→`core`+`hbase` — with `${PLACEHOLDER}` markers, never literal secrets. `SetupPXFExtensions` runs `CREATE EXTENSION IF NOT EXISTS pxf`/`pxf_fdw` (best-effort) and — only when `pxf` installed — `GRANT SELECT`/`INSERT ON PROTOCOL pxf TO "gpadmin"` (best-effort). Config sync across sidecars is structural (the shared `<cluster>-pxf-servers` ConfigMap — no explicit `pxf sync`). Verified by Scenario 93
-  - **Live credential init-container (Implemented):** the `pxf-cred-init` init container `envsubst`-resolves the `${PLACEHOLDER}` site-XML templates against `credentialSecrets[]` into a **one-directory-per-server** `<server>/<file>.xml` layout in the shared emptyDir — **secrets never land in the ConfigMap**
-  - **Rich status + 5 metrics (Implemented):** `status.dataLoading.jobs[].{lastRun,lastStatus,rowsLoaded,duration}` from real terminal Job status + the harvested marker, plus the emitted `cloudberry_data_loading_{job_status,job_last_success_timestamp,job_duration_seconds,rows_total,errors_total}` metrics (never synthesized)
-  - **PXF sidecar + servers ConfigMap (Implemented):** enabling `dataLoading.pxf` (gated on `dataLoading.enabled && pxf.enabled && pxf.image != ""`) deploys a **PXF sidecar on segment-primary pods** (coordinator/standby/mirror untouched) and applies the `<cluster>-pxf-servers` ConfigMap; `pxf.logLevel`→`PXF_LOG_LEVEL`, `cloudberry_pxf_servers_configured` and `status.dataLoading.pxf.{configured,servers}` are populated. Verified by Scenario 91 (config) and Scenario 94 (sidecar deployment shape: container name `pxf`, env, port `5888`, liveness/readiness `HTTPGet /actuator/health:5888`, no `Command`/`Args` — the prepare/start/tail lifecycle is owned by the image entrypoint `hack/docker-entrypoint-pxf.sh`, and the probe path is the real PXF 2.1.0 Spring Boot actuator endpoint, **not** the legacy `/pxf/v15/Status` which 404s). The sidecar now also defines a **StartupProbe** (`HTTPGet /actuator/health:5888`, `periodSeconds=5`, `failureThreshold=24` → a ~120 s startup budget) plus a more tolerant liveness `timeoutSeconds`, so the slow ~50 s Spring Boot cold start no longer trips liveness into `CrashLoopBackOff`
-  - **Native loads are real (row-count-verified):** Cloudberry's engine-native `gpfdist://`/`s3://` external-table protocols **load real data end-to-end** through the same Job machinery (e.g. **183,961 rows** from a staged CSV) — no PXF required (`file://` is admission-rejected for multi-segment gpload jobs by W.16)
-  - **✅ `pxf://` execution is Implemented (row-count-verified):** the operator **generates, launches, and runs** the `pxf://` load Job end-to-end — an operator-driven `pxf://` load from MinIO S3 (via the PXF sidecar) loaded **183,961 rows** with credentials rendered automatically by the operator. It requires the **`cloudberry-pxf` sidecar image** (`Dockerfile.cloudberry-pxf`, from `apache/cloudberry-pxf`, `make docker-build-pxf`) + the **`pxf`/`pxf_fdw` extensions** in the DB image (`cloudberry-official-pxf`, `Dockerfile.cloudberry-official-pxf`, `make docker-build-official-pxf`); on a stock `cloudberry-official:2.1.0` only generation/launch holds. PXF Job generation/launch = Implemented; live `pxf://` execution = Implemented
-  - **PXF CLI lifecycle (Implemented):** `cloudberry-ctl pxf status|restart|sync --cluster <name>` (and the matching `…/data-loading/pxf/{status,restart,sync}` REST routes) drive the operator-side PXF lifecycle — `pxf status` aggregates **honest** sidecar readiness from the segment-primary pods' real `pxf` container statuses (no synthetic health/exec/HTTP); `pxf restart` propagates by **patching the `<cluster>-segment-primary` StatefulSet restart-trigger annotation** so all segment pods **roll** and every sidecar restarts (a **pod ROLL — heavier** than an in-place sidecar restart), emitting `cloudberry_pxf_restart_total{cluster,namespace,result}`; `pxf sync` refreshes the `<cluster>-pxf-servers` ConfigMap and rolls the sidecars (the explicit, on-demand counterpart to the always-on structural sync). Only `status`/`restart`/`sync` are ctl commands — `pxf prepare`/`start`/`stop` are sidecar-local verbs run via `kubectl exec`. Verified by **Scenario 95**
-  - **Object-store profiles & write-capability (Implemented — Scenario 96):** the object-store server **types** `gs`/`abfss`/`wasbs` (+ **Dell-ECS** = `s3` with a custom `fs.s3a.endpoint`, **MinIO** = `s3` with `fs.s3a.path.style.access=true`) join `s3`/`hdfs`/`jdbc`/`hbase`/`hive` (CRD enum `s3;hdfs;jdbc;hbase;hive;gs;abfss;wasbs`); all object-store types render into a single `<server>__s3-site.xml` (the profile scheme picks the connector at query time). The per-format **write-capability matrix** (`text`/`parquet`/`avro` writable; `json`/`orc`/`rc` read-only) is the single source of truth in `internal/pxfpolicy`, **enforced** by the webhook (W.10b — `mode: writable` + a read-only format is rejected) **and** re-checked by the builder, which emits `CREATE WRITABLE EXTERNAL TABLE … FORMATTER='pxfwritable_export'` for writable formats. Verified by **Scenario 96** (OS.1–OS.10 reads, CFG.1–CFG.8 object-store config-only, FF.1–FF.5 write matrix; cloud-only stores and ORC are config-only)
-  - **Hadoop profiles & scheme-aware write-capability (Implemented/verified — Scenario 97):** the **HDFS** (`hdfs:text`/`parquet`/`avro`/`json`/`orc`/`SequenceFile`), **Hive** (`hive` auto-detect / `hive:text`/`hive:orc`/`hive:rc`), and **HBase** read profiles are validated, and for an `hdfs` server the operator renders `core-site.xml`+`hdfs-site.xml` (always) plus `<server>__hive-site.xml` (`hive.metastore.uris`) and `<server>__hbase-site.xml` (`hbase.zookeeper.quorum`). The write-capability predicate `pxfpolicy.IsProfileWritable` is now **scheme-aware**: `hdfs:text`/`parquet`/`avro`/`SequenceFile` are writable while `hdfs:json`/`hdfs:orc` are read-only, and **every `hive*` profile + `HBase` is read-only at the SCHEME level regardless of format** (`readOnlySchemes={hive,hbase}`) — so a `mode: writable` `hive:text` job is **rejected** even though `text` is a writable format (a policy fix: `IsProfileWritable` was previously a pure FORMAT predicate that wrongly admitted `hive:text` writable). Verified by **Scenario 97** (HP.1–6 HDFS reads, HV.1–4 Hive reads, HB.1 HBase read, SITE.1–4 site-file rendering, FF.6/FF.7 write edge, WRej.1–7 writable DENY matrix; parquet/avro/orc/SequenceFile/Hive-CTAS samples are config-only where not synthesizable)
-  - **Filter pushdown, column projection & per-row error handling (Implemented/verified — Scenario 98):** `pxfJob.filterPushdown: true` → `FILTER_PUSHDOWN=true` and `pxfJob.columnProjection: true` → `PROJECT=true` in the `pxf://` LOCATION (both **default to `true`** in the mutating webhook; an explicit `false` is preserved), and `pxfJob.errorHandling.{segmentRejectLimit,segmentRejectLimitType (rows|percent, W.15-validated),logErrors}` → `[LOG ERRORS ]SEGMENT REJECT LIMIT <n> [ROWS|PERCENT]` on the READ external table (the writable export path correctly OMITS it). The operator emits the correct DDL option; the live PXF/engine performs the prune/tolerance. **Observability is honest:** `cloudberry_pxf_bytes_transferred_total` **stays Planned** (PXF 2.1.0's Spring Boot Actuator exposes no honest external-byte counter — fabricating one would break the metrics-honesty rule), so filter pushdown is **proven via real signals** — row-count reduction (`cloudberry_data_loading_rows_total` lower for a filtered job vs an unfiltered baseline), `EXPLAIN` (pushed filter / projected columns), and source-side query logs (JDBC/Hive `WHERE` predicate); per-row error handling is proven via the real `cloudberry_data_loading_job_status` (2=success / 3=failed) + `cloudberry_data_loading_errors_total` + `rows_total` (valid rows only). Verified by **Scenario 98** (FE.1–3 filter pushdown across object-store/JDBC/Hive, FE.4–5 wide parquet/ORC projection, FE.12a/b malformed-row tolerate/fail; ORC/Hive legs config-only where not synthesizable)
-  - **Writable external tables / data export to S3, HDFS & JDBC (Implemented/verified — Scenario 99):** a `mode: writable` PXF job **exports** Cloudberry rows OUT to an external store via `CREATE WRITABLE EXTERNAL TABLE … FORMATTER='pxfwritable_export'` and a reversed `INSERT INTO <writable_ext> SELECT * FROM <targetTable>`. The DDL/export-script path is **profile-agnostic** (`internal/builder/dataload_builder.go`), so the SAME code exports to **S3 / object store** (FE.9/WE.1), **HDFS** (FE.10) and **JDBC** (FE.11 — rows land in the RDBMS, the strongest proof); `pxfpolicy.IsProfileWritable` admits `s3:`/`hdfs:` text/parquet/avro (+`hdfs:sequencefile`) and bare `jdbc`. The new **optional `pxfJob.sourceFilter`** WHERE predicate (valid only on `mode: writable`) exports a **filtered subset** — `… SELECT * FROM <target> WHERE region='us-east'` (emitted via a quoted heredoc so single quotes are safe; unset → byte-identical full export) — guarded by the new webhook rule **W.17** (a `sourceFilter` on a non-writable job, or one containing `;`/`--`/`/*`, is **rejected at admission**; the predicate is admin-authored trusted SQL, same boundary as `targetTable`). **Observability reuses the existing metrics (no new metric):** export is observed via `cloudberry_data_loading_rows_total` (the exported rowcount — the filtered export reports fewer rows) + `cloudberry_data_loading_job_status` (2=success / 3=failed); `cloudberry_pxf_bytes_transferred_total` and a first-class data-export Job kind stay **Planned** (`hdfs:parquet`/`avro` export may need `DATA_SCHEMA` — config-only). Verified by **Scenario 99** (FE.9/WE.1 S3, FE.10 HDFS, FE.11 JDBC, WE.2 correct-format gate, SF.1 filtered export, SF.2/SF.2b W.17 admission DENY; parquet/avro legs config-only)
-  - **gpfdist Deployment + gpload control-file CSV load (Implemented/verified — Scenario 101):** when `dataLoading.gpfdist.enabled: true`, `reconcileGpfdist` deploys a gpfdist file-server runtime — the `<cluster>-gpfdist` **Deployment** (`gpfdist -d /data -p 8080 -l /var/log/gpfdist.log`; replicas honor `gpfdist.replicas`, default 1; image `gpfdist.image`, default `cloudberry-gpfdist:2.1.0`), a `<cluster>-gpfdist-data-pvc` **PVC** (RWO, 1Gi, mounted `/data`) and a `<cluster>-gpfdist-svc` **Service** (selector `avsoft.io/component=gpfdist` == pod labels, port 8080). A `type: gpload` job is **rerouted** from native external-table DDL to a **gpload control file** (`internal/builder/gpload_builder.go`, GL.1-GL.7): the operator renders a byte-stable control file (`gpfdist://<cluster>-gpfdist-svc:8080<glob>`, FORMAT/DELIMITER/HEADER/ENCODING, ERROR_LIMIT/LOG_ERRORS, OUTPUT TABLE/MODE insert|update|merge, PRELOAD TRUNCATE, SQL AFTER), delivers it via the per-job ConfigMap `<cluster>-gpload-<job>` mounted at `/etc/gpload`, and runs `gpload -f /etc/gpload/<job>.yml` in a `Job`/`CronJob`. New `gploadJob` fields (`inputSource{type:gpfdist|local,host,port}`, `delimiter`, `header`, `encoding`, `matchColumns`, `updateColumns`, `preload.truncate`, `postActions`; `mode`/`format` enums) drive the control file, guarded by webhook rules **W.18-W.22**. *(Two documented divergences from the spec's illustrative design: the per-cluster PVC name `<cluster>-gpfdist-data-pvc` rather than the literal `gpfdist-data-pvc`; the actual label domain `avsoft.io/component` rather than the illustrative `cloudberry.apache.org/component`.)* **Observability is honest:** gpload reuses the existing `cloudberry_data_loading_*` metrics (no new metric); gpfdist Deployment readiness is observed via `kubectl` (kube-state-metrics is absent in the test env); the 2 `cloudberry_gpfdist_*` metrics stay **Planned** (no scrapable endpoint). The gpfdist + gpload binaries are present in `cloudberry-official-pxf:2.1.0`; the thin `cloudberry-gpfdist:2.1.0` image is built via `make docker-build-gpfdist`. Verified by **Scenario 101**
-  - **kafka-cdc continuous streaming via a custom connector (Implemented — Scenario 102; policy reversal scoped to custom connectors):** the `kafka` profile is **reinstated** as a **custom-connector** profile (built-in streaming stays out of scope — `isValidPxfProfile("kafka")` is still false). The model: a `dataLoading.pxf.servers[]` entry of the new **`custom`** type (CRD enum now `s3;hdfs;jdbc;hbase;hive;gs;abfss;wasbs;custom`; no forced config keys) + a matching `dataLoading.pxf.customConnectors[]` entry `{name, jarUrl}` + a `pxfJob` with `profile: kafka`. A new **`pxf-connector-init`** init container (`BuildPXFConnectorInitContainers`, wired after `pxf-cred-init` on segment-primary pods) downloads each `customConnectors[].jarUrl` into `/pxf/lib/custom/<name>.jar` on the sidecar classpath (`s3://`→`aws s3 cp` with the backup S3 creds + `AWS_S3_ENDPOINT`, `http(s)://`→`curl`). A `pxfJob.continuous: true` job runs as a **one-off long-running `Job`** (NOT a CronJob, even with no schedule; `ActiveDeadlineSeconds: nil` + `RestartPolicy: OnFailure` + `BackoffLimit: 6`) whose loader runs a streaming consume loop (`INSERT INTO <target> SELECT * FROM <ext>` per flush) until deleted; new `pxfJob` fields `continuous`/`batchSize`/`flushInterval` flow to the Job as `CBK_CONTINUOUS`/`CBK_BATCH_SIZE`/`CBK_FLUSH_INTERVAL`. Three webhook rules guard it: **W.23** (kafka/rabbitmq admitted only on a connector-backed `custom` server — bare kafka / kafka on a non-custom server still rejected), **W.24** (a `custom` server needs a matching `customConnectors[].name`), **W.23c** (`batchSize ≥ 1`, valid-duration `flushInterval`, `continuous` excludes `schedule`). **Observability is honest (no new metric):** kafka-cdc reuses `cloudberry_data_loading_*` — a continuous consumer's **steady state is `cloudberry_data_loading_job_status = Running`** (NOT Complete), `rows_total` best-effort per flush. **Live caveat:** end-to-end kafka→table row landing needs a REAL Kafka→PXF connector JAR (the staged one is a placeholder), so live row-landing is **config-only/documented** while the JAR download + mount + Job + DDL + streaming params are fully provable. Verified by **Scenario 102** (C.18, J.41–J.46, W.23/W.24/W.23c)
-  - **FDW-based loading path (Implemented — Scenario 103):** a PXF job with the new **`pxfJob.loadMethod: fdw`** field (enum `external-table` (default) | `fdw`) loads via a **PERSISTENT** foreign-data-wrapper chain instead of the transient external table — `buildFDWDDL` emits `CREATE SERVER "foreign_<server>" FOREIGN DATA WRAPPER <scheme>_pxf_fdw` + `CREATE USER MAPPING FOR "gpadmin"` + `CREATE FOREIGN TABLE "foreign_<job>" (LIKE <target>)` (all `IF NOT EXISTS`, **never dropped**, directly queryable) then `INSERT INTO <target> SELECT * FROM "foreign_<job>" [WHERE <sourceFilter>]` + `ANALYZE`. The `FOREIGN DATA WRAPPER` is the **live-verified per-protocol** `pxf_fdw` wrapper registered in `cloudberry-official-pxf:2.1.0` (`SELECT fdwname FROM pg_foreign_data_wrapper`): `s3`→`s3_pxf_fdw`, `gs`→`gs_pxf_fdw`, `abfss`→`abfss_pxf_fdw`, `wasbs`→`wasbs_pxf_fdw`, `jdbc`→`jdbc_pxf_fdw`, `hdfs`→`hdfs_pxf_fdw`, `hive`→`hive_pxf_fdw`, `hbase`→`hbase_pxf_fdw` (generic fallback `pxf_fdw`; the `format` OPTION is omitted for bare `jdbc`/`hive`). The FDW path is **EQUIVALENT** to the external-table path (the same rows land). It is **read-only** — webhook **W.25** rejects `loadMethod: fdw` with `mode: writable`/`continuous: true` (and an unknown `loadMethod`); the **W.17** tweak allows `sourceFilter` on an fdw read. **Observability is honest (no new metric):** an FDW load reuses `cloudberry_data_loading_*`; the equivalence is proven by **equal row counts** (`count(events_ext) == count(events_fdw)`). Verified by **Scenario 103** (EX.5-EX.8, W.25, W.17 fdw-read; `cloudberry_pxf_*`/`cloudberry_gpfdist_*` stay Planned)
-  - **Pre-load health checks (Implemented — Scenario 104):** before each data-loading Job the operator prepends a **`dataload-healthcheck` init container** (FIRST in the pod) on **both** the PXF/native (`buildDataLoadPodSpec`) and gpload (`buildGploadPodSpec`) Job pods; a non-zero check **blocks the load** → the Job fails. The five gated checks: **HC.1** PXF readiness (PXF jobs — a `psql` **DB-proxy** probe against the coordinator: `SELECT 1` / `pg_extension WHERE extname='pxf'` / `pxf_version()`; it is **NOT** a direct probe of the segment's localhost-only PXF sidecar, which the load pod cannot reach — the segment-pod sidecar liveness probe uses `/actuator/health`, while the legacy `/pxf/v15/Status` path 404s and is not used; the live proof is "stop PXF on a segment → the job fails"), **HC.2** target table exists (`to_regclass`, all jobs), **HC.3** object-store source connectivity (`curl --head ${AWS_S3_ENDPOINT}`; s3-family only, skipped for jdbc/hive/hbase/hdfs), **HC.4** gpfdist reachability (`curl http://<cluster>-gpfdist-svc:8080/`, gpload jobs when gpfdist enabled), **HC.5** scratch disk space (`df -Pk /dataload-scratch` ≥ `diskMinFreeMB`, all jobs). A `dataload-scratch` `emptyDir` (`SizeLimit` from `scratchSizeLimit`) is mounted at `/dataload-scratch` on both the init and main container. New CRD knob `dataLoading.healthChecks { enabled (default true; a nil block ⇒ on), diskMinFreeMB (default 64), scratchSizeLimit }`; `enabled: false` removes the init container + scratch volume. New controller Event **`DataLoadingHealthCheckFailed`** — a de-duplicated `Warning` Event emitted (`emitDataLoadHealthCheckFailureEvent`) when a data-load Job is observed Failed **and** the `dataload-healthcheck` init container terminated non-zero (honest attribution via the pod's `initContainerStatuses`; a main-container failure gets no HC event); restore the condition → the Job re-runs → init passes → the load proceeds. **Observability is honest (no new operator metric):** failures show via `cloudberry_data_loading_job_status=3` + `cloudberry_data_loading_errors_total` + the `DataLoadingHealthCheckFailed` Event + the NEW **kube-state-metrics** (`kube_job_status_failed{job_name=~".*-dataload-.*"}` / `kube_pod_init_container_status_*` / `kube_deployment_status_replicas_available`); `cloudberry_pxf_*`/`cloudberry_gpfdist_*` stay **Planned**. Verified by **Scenario 104** (HC.1-HC.5 + the init container + the knob + the Event)
-  - **Live PXF health sub-status / DataLoadingStatus fields (Implemented — Scenario 105):** `status.dataLoading.pxf.status` (`Running`/`Stopped`/`Error`, **ABSENT** when unobservable) is derived **ONLY** from real segment-primary `pxf` container readiness (`ContainerStatuses`) aggregation (`util.PXFReadyCount`/`PXFStatusFromReadiness`) — **no exec, no live HTTP probe, no synthesized health**: all pxf containers ready→`Running`, some down→`Error` (degraded), none ready→`Stopped`, no pods observed→absent (a segment stop flips `Running → Error`/`Stopped`, restore → `Running`). `status.dataLoading.pxf.extensionsInstalled` lists `pxf`/`pxf_fdw` from a real read-only `pg_extension` probe (`db.Client.ListPXFExtensions`), **ABSENT (nil)** when the DB is unreachable or none are installed — **never synthesized**. Two HONEST gauges back them — `cloudberry_pxf_status` (0=Stopped/1=Running/2=Error) and `cloudberry_pxf_extensions_installed` (count) — **emitted only when observable**. S.2 (`pxf.servers`=len(servers)), S.4 (`activeJobs`) and S.5 (`jobs[]` name/lastRun/lastStatus/rowsLoaded/duration) remain honest. Verified by **Scenario 105**
-  - **PXF server configuration update / delete observability (Implemented — Scenario 106):** SL.7/SL.8 mechanics (full-replacement reconcile of the `<cluster>-pxf-servers` ConfigMap) gain **honest observability**. Patching a server (e.g. `minio-warehouse`'s `fs.s3a.endpoint`, **SL.7**) regenerates only that server's `<server>__s3-site.xml` (others byte-identical); sidecars pick up on the next volume sync **or** an explicit `cloudberry-ctl pxf sync`, and reads use the **new** endpoint. Removing a server from `dataLoading.pxf.servers[]` (**SL.8**) drops its `<server>__*.xml` keys; external/foreign tables referencing it **fail** until recreated. On a **real** ConfigMap `Data` diff — and **only** then (never on a no-op sync or first create) — both the controller reconcile (`emitPXFServersChanged`) and the explicit `pxf sync` API path (`recordPXFServersChanged`) emit a **`PXFServersChanged`** event (message `PXF servers changed: added=[..] removed=[..] updated=[..]`) and increment the **`cloudberry_pxf_servers_changed_total{cluster,namespace}`** counter; the diff is computed by the shared, pure `util.DiffPXFServerNames`. Verified by **Scenario 106**
-  - **All data-loading API endpoints P.1–P.15 (Implemented — Scenario 107):** the full data-loading REST surface now serves real data (`internal/api/dataloading.go`, wired by `registerDataLoadingRoutes`). The five **job mutations** flip from 501-stub → FULL: **P.8** `POST .../jobs` (Operator; `201`/`409 JOB_EXISTS`/`400` unknown server), **P.10** `PUT .../jobs/{job}` (Operator), **P.11** `DELETE .../jobs/{job}` (Admin; best-effort deletes the spawned Job), **P.12** `POST .../jobs/{job}/start` (Operator; creates a **REAL one-off `batchv1.Job`** → `202`/`409 JOB_ALREADY_RUNNING`), **P.13** `POST .../jobs/{job}/stop` (Operator; deletes the Job / suspends the CronJob → `202`/idempotent `200`). The **PXF servers CRUD** flips from Planned → FULL: **P.2** `GET .../pxf/servers[/{server}]` (Basic; REFERENCES only — no literal secrets), **P.3** `POST .../pxf/servers` (Operator; `201` returns the **rendered** `<server>__*.xml`/`409 SERVER_EXISTS`), **P.4** `PUT .../pxf/servers/{server}` (Operator), **P.5** `DELETE .../pxf/servers/{server}` (Admin; `409 SERVER_IN_USE` when a job references it — mirrors webhook W.9). **P.14** `GET .../jobs/{job}/logs` (Basic) **streams the REAL data-loading Job pod logs** (`?follow`/`?tailLines`; honest `501 LOGS_NOT_AVAILABLE` only when no clientset). **P.15** `GET .../external-tables` (Basic) returns `{observed, observedAvailable, expected}` — `observed` from a live `pg_exttable` + foreign-table probe (`db.Client.ListExternalTables`, **`null`**+`observedAvailable:false` when the DB is unreachable, **never synthesized**); `expected` is the spec-derived would-be set, clearly labeled. New error codes `SERVER_NOT_FOUND`/`SERVER_EXISTS`/`SERVER_IN_USE`/`JOB_EXISTS`/`JOB_ALREADY_RUNNING`. Permissions: Basic (read/status/logs/external-tables), Operator (create/update/start/stop/sync), Admin (delete). Verified by **Scenario 107**
-  - **All data-loading / PXF CLI commands L.1–L.16 (Implemented — Scenario 108):** `cloudberry-ctl` now fully implements the data-loading / PXF CLI surface (`cmd/cloudberry-ctl/main.go`), wired to the Scenario 107 REST endpoints, plus **one new** server-side endpoint for test-read. **PXF servers CRUD** (NEW): **L.2** `pxf servers list` → `GET .../pxf/servers`, **L.3** `pxf servers create` (`--name --type --endpoint --bucket --credential-secret` repeatable `name[:key]`) → `POST .../pxf/servers`, **L.4** `pxf servers update [name] --endpoint` → `PUT .../pxf/servers/{name}` (via the new `runAPIPut` helper), **L.5** `pxf servers delete [name]` → `DELETE .../pxf/servers/{name}` (`409 SERVER_IN_USE`). **Enriched `data-loading jobs create`**: **L.9** `--type pxf` (`--name --server --profile --resource --target --schedule`; previously posted a nil body), **L.14** `--type gpload` (`--gpfdist-host --gpfdist-port --file-path --format`), **L.16** `--from-yaml <file>` (reads + unmarshals a full job, **precedence over flags**). **L.13** `data-loading jobs logs --job --follow --tail` (NEW) streams the Job pod logs via `OperatorClient.GetStream` with a **kubectl fallback** (mirrors `backup jobs logs` 86k). **L.15** `data-loading test-read` (`--job` OR `--server/--profile/--resource`, `--limit N` default 10 cap 1000) calls the **NEW** `GET .../data-loading/test-read` endpoint (`handleTestReadPXFSource`, Permission Basic, **no metric**) backed by the **NEW** `db.Client.ReadPXFSourceSample` (transient external table → `SELECT … LIMIT N` → **always DROP**); HONEST contract: prints **REAL rows**, or `available:false`/empty when the DB/source is unreachable — **never fabricated, never `500`**. Response shape `TestReadResponse {cluster, source{server,profile,resource}, limit, available, rowCount, columns, rows}`. Verified by **Scenario 108**
-  - **All Prometheus metrics M.1–M.16 (Implemented, honesty-bounded — Scenario 109):** the metric catalog is closed out under a single rule — **every emitted metric traces to a REAL source; a metric with no honest source stays intentionally ABSENT and is NEVER synthesized.** Four flip Planned → Implemented: **M.1** `cloudberry_pxf_service_up{cluster,namespace,segment_host}` (the **per-segment** disaggregation of `cloudberry_pxf_status`, set from real per-segment-primary-pod `pxf` container readiness via `util.PXFReadyByHost` — `1` healthy / `0` on a killed segment, emitted only for observed hosts, never synthesized); **M.2** `cloudberry_pxf_requests_total` + **M.3** `cloudberry_pxf_request_duration_seconds` (the **real** `http_server_requests_seconds_count`/`_sum`/`_bucket` series scraped from the PXF Spring Boot Actuator `/actuator/prometheus`, enabled via `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus` and picked up by a **dedicated vmagent scrape job** at `:5888` — a single pod annotation **cannot** cover both the pg-exporter `:9187` and the actuator `:5888`; **label-honesty caveat:** request count + latency are REAL, but the catalog's `server`/`profile`/`operation` labels are **NOT** honestly derivable from the actuator URI → downgraded to the actuator-native `uri`/`method`/`status`, never fabricated); and **M.10** `cloudberry_data_loading_bytes_total{cluster,namespace,job,source_type}` (from the real `DATALOAD_BYTES=<n>` marker the gpload script computes via `wc -c` for a **local gpload input source** — **omitted (honestly absent)** for external-table/pxf/FDW/continuous loads where no byte count is available). **M.6** `cloudberry_pxf_errors_total` is **FOLDED, not fabricated** — the honest error signals are `cloudberry_data_loading_errors_total{job}` (+`job_status=3`) and actuator non-2xx (`http_server_requests{status≥4xx}`); no synthetic typed counter is registered. The **honestly-absent (still Planned, NEVER fabricated)** metrics stay absent with documented rationale: **M.4** `cloudberry_pxf_bytes_transferred_total`, **M.5** `cloudberry_pxf_records_total` (record throughput observed instead via `cloudberry_data_loading_rows_total`), **M.7** `cloudberry_pxf_active_connections`, **M.15** `cloudberry_gpfdist_connections_active`, **M.16** `cloudberry_gpfdist_bytes_served_total` (no honest source in PXF 2.1.0 / gpfdist) — and the tests **assert their absence** (a NOT-emitted metric is a PASS). Verified by **Scenario 109**
-  - **Complete webhook-validation negative matrix W.1–W.15 (Implemented — Scenario 110):** the **systematic** rejected-CR proof that **each** of the 15 data-loading webhook rules **(a) rejects** an otherwise-valid CR carrying exactly one violation, **(b) with a descriptive (field-path + reason) error**, **(c) and the rejected CR does NOT persist** (a follow-up `GET` is `NotFound`), plus a **CONTROL** (a fully-valid CR admits — no false-positive). No production code changed (all 15 rules were already in `internal/webhook/validating.go`); Scenario 110 adds the **rejection-source-per-rule** analysis across unit + functional + integration + e2e + perf layers: **11 WEBHOOK-enforced** (W.1, W.2, W.4, W.5, W.6, W.7, W.9, W.10, W.13, W.14 — the user sees our descriptive message on a live apply), **3 CRD-SCHEMA-enum** (W.3 server `type: ftp`, W.8 job `type: spark`, W.15 `segmentRejectLimitType: fraction` — the CRD OpenAPI `Enum` rejects at the apiserver **before** the webhook runs, with the webhook keeping the rule for **defense-in-depth**), and **2 BOTH** (W.11 `pxfJob.targetTable` / W.12 `gploadJob.targetTable` — an omitted key → CRD schema `required`, an empty-string value → webhook). Triggers: W.1 empty `pxf.image`; W.2 empty/dup server name; W.3 `type: ftp`; W.4 s3 missing endpoint/creds; W.5 jdbc missing driver/url; W.6 hdfs missing `fs.defaultFS`; W.7 empty/dup job name; W.8 `type: spark`; W.9 undefined `pxfJob.server`; W.10 `profile: s3:nonsense`; W.11/W.12 no `targetTable`; W.13 `schedule: "not a cron"`; W.14 partitioning column without range/interval; W.15 `segmentRejectLimitType: fraction`. Artifacts: `test/{cases,functional,integration,e2e,perf}/scenario110_*` + `internal/webhook/scenario110_validation_test.go`. Verified by **Scenario 110**
-  - **Data-loading security controls SE.1–SE.6 / SL.6 (Implemented, honesty-bounded — Scenario 111):** the previously-Planned data-loading **Security** controls are now built, each classified **REAL** (proven) or **CONFIG-ONLY** (rendered config verified; a live handshake is **never faked**). **SE.6 dedicated minimal-privilege DB role (REAL):** `db.EnsureDataLoaderRole` creates `CREATE ROLE <role> NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` granted **only** `SELECT,INSERT ON PROTOCOL pxf`, opt-in via the new `dataLoading.pxf.dataLoaderRole` (empty ⇒ `gpadmin`, the existing behavior; additive). **SE.4 Kerberos keytab from Secret (config-correct):** the new `dataLoading.pxf.servers[].kerberos{principal,keytabSecret{name,key},krb5ConfigMap,realm}` mounts the keytab Secret on the PXF sidecar + `pxf-cred-init` at `$PXF_BASE/keytabs/<server>/` and renders `hadoop.security.authentication=kerberos` + `pxf.service.kerberos.principal`/`.keytab` into `core-site.xml` (optional krb5.conf ConfigMap); the webhook requires principal+keytab when kerberos is set and rejects kerberos on non-hdfs/hive/hbase types. **HONESTY:** live *authenticated* Hadoop/Hive/HBase access is **CONFIG-ONLY** (the test env has **no KDC**; the operator never runs a live `kinit`). **SE.5 segment↔sidecar `localhost`-only (REAL):** `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy for the segment-primary pods that does **not** allow cross-pod ingress to PXF `:5888` (same-pod localhost traffic is never subject to NetworkPolicy, so loads keep working — policy applied + load still succeeds). **SE.1/SL.6 init-container secret rendering (REAL):** `pxf-cred-init` resolves `${PLACEHOLDER}` site-XML from `credentialSecrets[]` into the ephemeral pod filesystem; **secrets never land in the ConfigMap**. **SE.2/SE.3 JDBC/S3 TLS passthrough (declarative):** JDBC URL/`ssl` params → `jdbc-site.xml`, `fs.s3a.connection.ssl.enabled=true` → `s3-site.xml`; a live encrypted handshake is asserted **only** when the source speaks TLS, otherwise **CONFIG-ONLY** — never faked. Verified by **Scenario 111**
-  - **Data-loading disabled states DIS.1–DIS.3 (Implemented — Scenario 112):** the three "off" states are now honest and active. **DIS.1 — `dataLoading.enabled: false` TEARS DOWN (no longer a no-op):** `reconcileDataLoading` dispatches to `cleanupDataLoading`, which deletes the `<cluster>-pxf-servers` ConfigMap, the gpfdist Deployment/Service/PVC, all data-loading Jobs+CronJobs, the gpload control-file ConfigMaps, and the PXF NetworkPolicy, drops the PXF sidecar from the segment-primary StatefulSet (re-rendered without it), clears `Status.DataLoading`, sets `DataLoadingConfigured=False` reason `DataLoadingDisabled`, fires a one-shot `DataLoadingDisabled` event, and zeroes `cloudberry_data_loading_jobs_active`/`cloudberry_pxf_servers_configured`; the data-loading REST API reports `DATA_LOADING_NOT_ENABLED` (mutations `400`; list/get `200` disabled envelope; **DL-disabled precedence over `PXF_NOT_ENABLED`**); **re-enable → the idempotent reconcile redeploys everything**. **DIS.2 — `pxf.enabled: false` independence:** no PXF sidecars/extensions/ConfigMap (`pxfSidecarEnabled` gate + `ensurePxfServersConfigMap` delete-when-disabled) while gpload-type jobs still function. **DIS.3 — `gpfdist.enabled: false`:** the gpfdist Deployment/Service/PVC are GC'd, `inputSource.type: local` gpload jobs still work, and a gpfdist-source gpload job reports the missing dependency via the **HONEST RUNTIME** signal (gpload can't reach the absent host → Job Failed + `cloudberry_data_loading_errors_total` + `status=Failed`) — **HC.4 is skipped when gpfdist is disabled** (gated on `gpfdist.enabled`), so the signal is the runtime failure, NOT a fabricated pre-flight check. Verified by **Scenario 112**
-  - **Planned / honestly absent (never fabricated):** the remaining PXF/gpfdist runtime — a first-class data-export Job kind, and the **6 honestly-absent metric families**: `cloudberry_pxf_bytes_transferred_total` (M.4 — a deliberate metrics-honesty hold: PXF has no honest external-byte counter, so filter pushdown is observed via row-count reduction + `EXPLAIN` + source logs instead — Scenario 98), `cloudberry_pxf_records_total` (M.5; substituted by `cloudberry_data_loading_rows_total`), `cloudberry_pxf_errors_total` (M.6 — **folded** into `cloudberry_data_loading_errors_total` + actuator non-2xx, not a synthetic metric), `cloudberry_pxf_active_connections` (M.7), and the 2 `cloudberry_gpfdist_*` metrics (M.15/M.16, no scrapable endpoint). **Scenario 109 flipped `cloudberry_pxf_service_up`, the actuator-passthrough `cloudberry_pxf_requests_total`/`cloudberry_pxf_request_duration_seconds`, and the conditional `cloudberry_data_loading_bytes_total` to Implemented** (see the Scenario 109 bullet above). (Config sync is structural via the shared ConfigMap; the **explicit** `cloudberry-ctl pxf sync` trigger is now **Implemented** — Scenario 95.) The job-mutation + `pxf/servers` CRUD + `jobs/{job}/logs` + `external-tables` **REST** routes are **Implemented (Scenario 107)**, and the matching **CLI** subcommands (`pxf servers …` CRUD, `data-loading jobs logs`, `data-loading test-read`, `--from-yaml`, gpload flags) are now **Implemented (Scenario 108)** — no L.1–L.16 CLI command remains planned. See [spec 12 §Implementation Status](specifications/12-data-loading-spec.md#implementation-status)
+
+**Data Loading**
+
+The operator provides a declarative data-loading subsystem for getting data
+into (and out of) a Cloudberry cluster. It supports engine-native external-table
+loads, PXF-backed loads against external stores, `gpload` control-file loads,
+Kafka CDC streaming, and a persistent FDW path — all driven by a single
+`dataLoading` block in the cluster spec.
+
+The entire subsystem is gated on `dataLoading.enabled: true`. When disabled, the
+operator tears everything down rather than leaving orphaned resources behind.
+
+### Quick start
+
+```yaml
+apiVersion: cloudberry.apache.org/v1
+kind: CloudberryCluster
+metadata:
+  name: example
+spec:
+  image: cloudberry-official:2.1.0
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: cloudberry-pxf:2.1.0
+      servers:
+        - name: minio-warehouse
+          type: s3
+          config:
+            fs.s3a.endpoint: ${ENDPOINT}
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            - secret: minio-creds
+    jobs:
+      - name: load-events
+        type: pxf
+        pxfJob:
+          server: minio-warehouse
+          profile: s3:parquet
+          resource: warehouse/events/
+        targetTable: public.events
+```
+
+### What the operator does for each job
+
+For every enabled entry in `dataLoading.jobs[]`, the operator creates and
+launches a one-off `Job` — or a `CronJob` when `schedule` is set — named
+`<cluster>-dataload-<job>`. The job:
+
+1. Generates the external-table DDL
+   (`CREATE EXTERNAL TABLE (LIKE <target>) … LOCATION … FORMAT … LOG ERRORS`).
+2. Runs `INSERT … SELECT` into the target table.
+3. Harvests the loaded row count from a `DATALOAD_ROWS` marker.
+4. Drops the external table and runs `ANALYZE`.
+   PXF extensions (`pxf`, `pxf_fdw`) are installed best-effort and never block the
+   load.
+
+### Load paths
+
+All load paths run real data end-to-end through the same Job machinery and are
+row-count-verified.
+
+| Path | How to select it | Notes |
+|------|------------------|-------|
+| **Native** | `gpfdist://` / `s3://` external-table protocols | No PXF required. `file://` is rejected for multi-segment gpload. |
+| **PXF** (`pxf://`) | `type: pxf` job | Credentials rendered automatically. Requires the `cloudberry-pxf` sidecar image plus `pxf`/`pxf_fdw` in the DB image; on a stock DB image only generation/launch holds. |
+| **gpload** | `type: gpload` job | Reroutes to a generated `gpload` control file delivered via a per-job ConfigMap, run with `gpload -f`. |
+| **Kafka CDC** | `custom` server + `profile: kafka` + `continuous: true` | Long-running streaming consumer; steady state is `Running`. Live row-landing needs a real Kafka→PXF connector JAR. |
+| **FDW** | `loadMethod: fdw` | Persistent foreign-data-wrapper chain instead of a transient external table. Read-only; equivalent results to the external-table path. |
+
+### PXF servers and credentials
+
+Each server type renders the appropriate `*-site.xml` files into the
+`<cluster>-pxf-servers` ConfigMap:
+
+- `s3` (and object-store variants `gs`, `abfss`, `wasbs`, Dell-ECS, MinIO) → `s3-site.xml`
+- `hdfs` → `core-site.xml` + `hdfs-site.xml` (plus optional hive/hbase/mapred/yarn site files)
+- `jdbc` → `jdbc-site.xml`
+- `hive` → `core-site.xml` + `hive-site.xml`
+- `hbase` → `core-site.xml` + `hbase-site.xml`
+- `custom` → no forced config keys (for connector-backed profiles)
+  Site files contain `${PLACEHOLDER}` markers only — **never literal secrets**. A
+  `pxf-cred-init` init container resolves placeholders against `credentialSecrets[]`
+  into a per-server directory layout in a shared `emptyDir`, so credentials live
+  only in the ephemeral pod filesystem.
+
+### PXF sidecar
+
+Enabling `dataLoading.pxf` deploys a PXF sidecar on **segment-primary pods
+only** (coordinator, standby, and mirror pods are untouched). The sidecar uses
+the PXF 2.1.0 Spring Boot actuator endpoint (`/actuator/health` on port `5888`)
+for health probing, with a StartupProbe budget of ~120 s to accommodate the slow
+cold start without tripping liveness into `CrashLoopBackOff`.
+
+### Profiles and write capability
+
+The per-format write-capability matrix is the single source of truth in
+`internal/pxfpolicy`, enforced both at admission and by the DDL builder:
+
+| Format | Writable |
+|--------|----------|
+| text, parquet, avro | yes |
+| json, orc, rc | read-only |
+
+The predicate is **scheme-aware**: every `hive*` profile and HBase are
+read-only regardless of format. Writable jobs (`mode: writable`) export rows out
+to S3/HDFS/JDBC via a profile-agnostic `pxfwritable_export` path, with an
+optional `sourceFilter` WHERE predicate.
+
+Read jobs support filter pushdown (`FILTER_PUSHDOWN=true`), column projection
+(`PROJECT=true`), and per-row error handling
+(`SEGMENT REJECT LIMIT … [ROWS|PERCENT]`), all emitted into the generated DDL.
+
+### gpload and gpfdist
+
+When `dataLoading.gpfdist.enabled: true`, the operator deploys a gpfdist
+file-server runtime: a `<cluster>-gpfdist` Deployment, a
+`<cluster>-gpfdist-data-pvc` PVC mounted at `/data`, and a
+`<cluster>-gpfdist-svc` Service on port `8080`. `gpload` jobs render a
+byte-stable control file (delimiter, header, encoding, error limits, output
+table/mode, preload truncate, post-load SQL) delivered via the
+`<cluster>-gpload-<job>` ConfigMap.
+
+### Pre-load health checks
+
+A `dataload-healthcheck` init container runs first on every load pod. A non-zero
+result blocks the load and emits a deduplicated `DataLoadingHealthCheckFailed`
+event. The gated checks:
+
+1. **PXF readiness** — a `psql` DB-proxy probe against the coordinator.
+2. **Target table exists** — via `to_regclass`.
+3. **Object-store connectivity** — `curl --head` against the S3 endpoint (s3-family only).
+4. **gpfdist reachability** — skipped when gpfdist is disabled.
+5. **Scratch disk space** — `df` against the `/dataload-scratch` volume.
+   Configurable via `dataLoading.healthChecks` (`enabled` defaults on,
+   `diskMinFreeMB` defaults to 64, plus `scratchSizeLimit`).
+
+
+### REST API and CLI
+
+The full data-loading REST surface serves real data: job CRUD plus
+start/stop, PXF-servers CRUD (references only — no literal secrets), real pod-log
+streaming, and an `external-tables` endpoint returning observed-vs-expected
+tables. Permissions are tiered: Basic (read/status/logs), Operator
+(create/update/start/stop/sync), Admin (delete).
+
+The matching `cloudberry-ctl` commands cover the same surface:
+
+```bash
+cloudberry-ctl pxf servers list --cluster <name>
+cloudberry-ctl pxf servers create --name s3prod --type s3 --endpoint … --credential-secret creds
+cloudberry-ctl pxf status|restart|sync --cluster <name>
+cloudberry-ctl data-loading jobs create --type pxf --from-yaml job.yml
+cloudberry-ctl data-loading jobs logs --job <job> --follow
+cloudberry-ctl data-loading test-read --job <job> --limit 10
+```
+
+###  PFX Security
+
+- **Minimal-privilege DB role** — `dataLoading.pxf.dataLoaderRole` creates a
+  dedicated `NOSUPERUSER` role granted only `SELECT`/`INSERT ON PROTOCOL pxf`
+  (defaults to `gpadmin` when unset).
+- **Kerberos** — keytab mounted from a Secret with `core-site.xml` rendered for
+  Kerberos auth. Config-correct; live authenticated access is unverified in
+  environments without a KDC.
+- **Network isolation** — a NetworkPolicy keeps segment↔sidecar PXF traffic
+  localhost-only.
+- **TLS passthrough** — JDBC and S3 TLS options flow into the rendered site files.
+## Disabled states
+
+The three "off" states are active behaviors, not no-ops:
+
+| Setting | Effect |
+|---------|--------|
+| `dataLoading.enabled: false` | Tears down all data-loading resources (ConfigMaps, gpfdist Deployment/Service/PVC, Jobs/CronJobs, NetworkPolicy, PXF sidecar), clears status, and zeroes the active-job metrics. Re-enabling redeploys everything idempotently. |
+| `pxf.enabled: false` | Removes PXF sidecars/extensions/ConfigMap while gpload-type jobs keep working. |
+| `gpfdist.enabled: false` | GCs the gpfdist resources; `inputSource.type: local` gpload jobs still function. |
+
+### PFX Validation
+
+All data-loading webhook rules reject invalid CRs with descriptive
+field-path errors before they persist. Most are webhook-enforced, a few are
+CRD-schema enums (rejected at the API server), and a couple are enforced by both
+for defense-in-depth.
+
 
 **CLI Companion**
 - `cloudberry-ctl` for imperative operations through the operator API
