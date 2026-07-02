@@ -628,6 +628,12 @@ func (m *mockMetricsRecorder) RecordConfigReload(cluster, namespace string) {
 	})
 }
 
+func (m *mockMetricsRecorder) InitConfigReload(cluster, namespace string) {
+	m.record("InitConfigReload", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace,
+	})
+}
+
 func (m *mockMetricsRecorder) SetConnectionsActive(cluster, namespace string, count float64) {
 	m.record("SetConnectionsActive", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "count": count,
