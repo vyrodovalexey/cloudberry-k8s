@@ -376,6 +376,11 @@ func (r *HAReconciler) updateFTSProbeStatus(
 	analysis segmentAnalysisResult,
 ) {
 	cluster.Status.FailedSegments = analysis.failedSegments
+	// Always publish the failed-segment count so the gauge reports the current
+	// state (0 included). Without this, a healthy cluster never initializes the
+	// cloudberry_segments_failed series, so dashboards render "No data" instead
+	// of a clear 0 for a deployed, fully-ready cluster.
+	r.metrics.SetSegmentsFailed(cluster.Name, cluster.Namespace, float64(len(analysis.failedSegments)))
 	if analysis.allHealthy {
 		cluster.Status.MirroringStatus = cbv1alpha1.MirroringInSync
 		r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, true)
@@ -384,7 +389,6 @@ func (r *HAReconciler) updateFTSProbeStatus(
 
 	cluster.Status.MirroringStatus = cbv1alpha1.MirroringDegraded
 	r.metrics.SetMirroringInSync(cluster.Name, cluster.Namespace, false)
-	r.metrics.SetSegmentsFailed(cluster.Name, cluster.Namespace, float64(len(analysis.failedSegments)))
 	r.recorder.Event(cluster, corev1.EventTypeWarning, "MirroringDegraded",
 		fmt.Sprintf("%d segments are down", len(analysis.failedSegments)))
 }

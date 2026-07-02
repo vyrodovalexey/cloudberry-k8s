@@ -229,7 +229,7 @@ metadata:
   name: production-cluster
   namespace: cloudberry-prod
 spec:
-  image: "postgres:16"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
 
   coordinator:
     resources:
@@ -534,10 +534,10 @@ A restart performs a stop followed by a full start. Phase transitions: `Running`
                                                             │
                                     ┌───────────────────────┼───────────────┐
                                     │ start                 │               │
-                               ┌────▼──────────┐    ┌──────▼─────┐  ┌──────▼──────────┐
-                               │ Initializing  │    │ Restricted │  │  Maintenance    │
-                               │  → Running    │    │            │  │                 │
-                               └───────────────┘    └────────────┘  └─────────────────┘
+                               ┌────▼──────────┐     ┌──────▼─────┐  ┌──────▼──────────┐
+                               │ Initializing  │     │ Restricted │  │  Maintenance    │
+                               │  → Running    │     │            │  │                 │
+                               └───────────────┘     └────────────┘  └─────────────────┘
 ```
 
 ### Action Annotations Reference
@@ -566,15 +566,15 @@ To upgrade the database version, update `spec.version` and `spec.image`:
 
 ```bash
 kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge -p '
-  {"spec": {"version": "7.2.0", "image": "postgres:17"}}'
+  {"spec": {"version": "7.2.0", "image": "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"}}'
 ```
 
 Or update the CRD manifest directly:
 
 ```yaml
 spec:
-  version: "7.2.0"    # was "7.1.0"
-  image: "postgres:17"  # was "postgres:16"
+  version: "7.2.0"    # 
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"  # 
 ```
 
 The operator detects the upgrade when `spec.version` differs from `status.clusterVersion` and performs a phase-by-phase rolling upgrade.
@@ -1303,7 +1303,7 @@ Set any combination of the three policies on the backup spec:
 spec:
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"   # must include gpbackman (ships v0.8.1)
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.1.0"   # must include gpbackman (ships v0.8.1)
     retention:
       fullCount: 3            # keep the newest 3 FULL backups
       incrementalCount: 10    # keep the newest 10 INCREMENTAL backups
@@ -1572,7 +1572,7 @@ Set `destination.type: local` with the path and PVC under `destination.local`:
 spec:
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.1.0"
     destination:
       type: local
       local:
@@ -3114,7 +3114,7 @@ Alternatively, the cluster TLS Secret (the one referenced by `auth.ssl.certSecre
          minTLSVersion: "1.2"
    ```
 
-The `scenario67` sample uses image `cloudberry-official:2.1.0`, `vault.authMethod: kubernetes`, and enables the per-segment postgres-exporter on every segment and mirror (`queryMonitoring.exporters.postgresExporter.segments: true` and `.mirrors: true`). The resulting pod topology is: coordinator `[cloudberry + postgres-exporter + cloudberry-query-exporter]`; standby, each segment primary, and each segment mirror `[cloudberry + postgres-exporter]`.
+The `scenario67` sample uses image `ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0`, `vault.authMethod: kubernetes`, and enables the per-segment postgres-exporter on every segment and mirror (`queryMonitoring.exporters.postgresExporter.segments: true` and `.mirrors: true`). The resulting pod topology is: coordinator `[cloudberry + postgres-exporter + cloudberry-query-exporter]`; standby, each segment primary, and each segment mirror `[cloudberry + postgres-exporter]`.
 
 #### Verifying SSL Configuration
 
@@ -6705,7 +6705,7 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 >       enabled: true
 >       pxf:
 >         enabled: true
->         image: cloudberry-pxf:2.1.0
+>         image: ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.3-cldb-2.1.0
 >         dataLoaderRole: cb_dataload   # opt-in; empty ⇒ gpadmin (unchanged)
 >   ```
 >
@@ -7115,7 +7115,7 @@ spec:
         port: 9100
       cloudberryQueryExporter:
         enabled: true
-        image: "cloudberry-query-exporter:1.0.0"
+        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.3-cldb-2.1.0"
         port: 9188
         resources:
           requests:

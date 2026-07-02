@@ -106,7 +106,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
   - PVC events: `PVCsRetained` for Retain policy, `PVCsDeleted` for Delete policy
   - Deletion lifecycle events: `Deleting` → `BackupOnDelete` → `BackupOnDeleteCompleted`/`BackupOnDeleteFailed` → `PVCsRetained`/`PVCsDeleted` → `Deleted`
 
-**High Availability**
+### High Availability
 
 - Segment mirroring with group and spread layouts
 - Enable/disable mirroring on existing clusters with state machine tracking (NotConfigured → Initializing → Syncing → InSync)
@@ -129,7 +129,7 @@ The operator follows the standard Kubernetes reconciliation pattern: **Watch** r
 - Rebalance status API and CLI (`--status`, `--tables` flags)
 - Data skew coefficient metric (`cloudberry_data_skew_coefficient`)
 
-**Authentication & Authorization**
+### Authentication & Authorization
 
 The operator provides authentication, authorization, TLS, and secrets management
 for both its own API surface and the Cloudberry clusters it manages. It supports
@@ -137,7 +137,7 @@ dual-mode authentication, a tiered permission model, declarative `pg_hba.conf`
 management, automatic TLS certificate issuance and rotation, and deep HashiCorp
 Vault integration.
 
-### Authentication modes
+#### Authentication modes
 
 Two authentication modes run side by side:
 
@@ -145,7 +145,7 @@ Two authentication modes run side by side:
 - **OIDC (Keycloak)** — JWT validation with JWKS caching and role-claim
   extraction. Tokens are validated against the cached JWKS, and roles are read
   from the token claims to drive authorization.
-#### Permission model
+##### Permission model
 
 Five tiers, from most to least restricted:
 
@@ -157,19 +157,19 @@ Five tiers, from most to least restricted:
 | **Operator** | Create, update, start, stop, and sync operations. |
 | **Admin** | Full control, including delete. |
 
-#### Cluster connection security
+##### Cluster connection security
 
 - **`pg_hba.conf` management** — host-based access rules are managed
   declaratively through the cluster CR.
 - **SSL/TLS** — configurable, with a settable minimum TLS version.
-### TLS certificate management
+#### TLS certificate management
 
-#### Webhook certificates
+##### Webhook certificates
 
 The operator manages its own webhook TLS certificate, sourced either from Vault
 PKI or as a self-signed certificate with automatic rotation.
 
-#### Cluster TLS auto-issuance from Vault PKI
+##### Cluster TLS auto-issuance from Vault PKI
 
 When a cluster CR enables both `vault.enabled` and `auth.ssl.enabled` with a
 `certSecret` that does not yet exist, the operator:
@@ -180,7 +180,7 @@ When a cluster CR enables both `vault.enabled` and `auth.ssl.enabled` with a
    User-provided Secrets are never touched. Lifecycle events:
    `ClusterTLSIssued`, `ClusterTLSRenewed`, `ClusterTLSFailed`.
 
-#### Automatic pod rolls on rotation
+##### Automatic pod rolls on rotation
 
 The cluster controller stamps an `avsoft.io/tls-cert-checksum` annotation
 (a checksum of the TLS Secret data) onto the coordinator, standby, and segment
@@ -217,7 +217,7 @@ fallback read, with no re-auth for path-shape 403s. Explicit `secret/data/...`
 paths keep working — the webhook warns and suggests the logical form.
 
 
-### Configuration precedence
+#### Configuration precedence
 
 Highest wins:
 
@@ -225,7 +225,7 @@ Highest wins:
 environment variable  >  command-line flag  >  config file  >  default
 ```
 
-**Observability**
+### Observability
 
 The operator exposes Prometheus metrics, OpenTelemetry distributed tracing, and
 structured logging across its controllers, REST API, database client, and
@@ -235,16 +235,16 @@ or unbounded user identifiers) and **honesty** (counters increment only at a
 real outcome; values are never fabricated, and unobservable signals are reported
 as `skipped` rather than guessed).
 
-### Metrics
+#### Metrics
 
-#### Reconciliation and cluster health
+##### Reconciliation and cluster health
 
 Cluster health, FTS, connections, and reconciliation are covered by
 `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, and
 `cloudberry_reconcile_duration_seconds` (labelled by cluster, namespace, and
 result).
 
-#### Operational metrics
+##### Operational metrics
 
 Wired to real operations:
 
@@ -258,7 +258,7 @@ Wired to real operations:
 | `cloudberry_maintenance_operations_total` | Maintenance ops (`result` ∈ `started`/`success`/`failed`) |
 | `cloudberry_scale_operations_total` | Distinguishes `rebalance` from `rebalance-failed` |
 
-#### Security metrics
+##### Security metrics
 
 `cloudberry_cert_rotation_total`, `cloudberry_cert_expiry_seconds`,
 `cloudberry_vault_operations_total`,
@@ -266,12 +266,12 @@ Wired to real operations:
 `cloudberry_auth_attempts_total` (a missing or malformed `Authorization` header
 increments `{method="unknown",result="failure"}`).
 
-#### Admission and lifecycle
+##### Admission and lifecycle
 
 `cloudberry_webhook_admission_total`, `cloudberry_upgrade_operations_total`,
 `cloudberry_rolling_restart_total`, `cloudberry_recovery_operations_total`.
 
-#### REST API server
+##### REST API server
 
 `cloudberry_api_requests_total` and `cloudberry_api_request_duration_seconds`
 are labelled by the low-cardinality **route template**, never the raw path.
@@ -290,7 +290,7 @@ Request-side counters complement the controller-side outcome metrics:
   outcomes, separate from the honest `cloudberry_pxf_servers_changed_total`
   force-pair counter.
 
-#### Database client
+##### Database client
 
 Connection and query metrics: `cloudberry_db_connect_total`,
 `cloudberry_db_connect_duration_seconds`,
@@ -301,7 +301,7 @@ Query duration is recorded with the method name as the `operation` label across
 the full client surface — 15 mutating/DDL methods and 22 read-path methods —
 giving complete read/write symmetry.
 
-#### Control-plane setup
+##### Control-plane setup
 
 Honest outcome counters incremented only at the real outcome:
 
@@ -309,14 +309,14 @@ Honest outcome counters incremented only at the real outcome:
 - `cloudberry_pxf_extension_setup_total{result}` — `installed`/`absent`/`error`.
 - `cloudberry_dataloader_role_setup_total{result}` — least-privilege data-loader role.
 - `cloudberry_exporter_role_setup_total{result}` — monitoring exporter role.
-#### Scan and OIDC outcomes
+##### Scan and OIDC outcomes
 
 - `cloudberry_disk_usage_scan_total{result}` — `skipped` when
   `gp_toolkit.gp_disk_free` is unavailable on the server version (never a
   fabricated value).
 - `cloudberry_recommendation_scan_total{result}` — `skipped` when the DB is unavailable.
 - `cloudberry_oidc_userinfo_total{result}` and `cloudberry_oidc_discovery_total`.
-#### Other families
+##### Other families
 
 Idle daemon and sessions (`cloudberry_idle_daemon_up`,
 `cloudberry_idle_scan_failures_total`, `cloudberry_session_terminations_total`),
@@ -329,7 +329,7 @@ controller operations (`cloudberry_storage_expansions_total`,
 `cloudberry_connections_max` reports the **real** `max_connections` queried from
 the database.
 
-### Exporter sidecars
+#### Exporter sidecars
 
 | Exporter | Placement | Notes |
 |----------|-----------|-------|
@@ -348,7 +348,7 @@ The query exporter reports its own health via
 and duration). The unbounded `usename` label was removed from
 `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound cardinality.
 
-### Distributed tracing
+#### Distributed tracing
 
 OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans use
 **low-cardinality names** organized into namespaced families:
@@ -368,7 +368,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
   Errors are recorded via `SetSpanError()`, which sets error status and exception
   events on the span.
 
-### Logging and error handling
+#### Logging and error handling
 
 - **Structured logging** — slog with JSON output including cluster, namespace,
   controller, and reconcileID fields. Per-request OIDC identity details
@@ -377,7 +377,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
   `ErrRetryExhausted`) support `errors.Is()` classification.
 - **Retries** — exponential backoff for transient failures (configurable max
   retries, backoff, jitter).
-### Operational guarantees
+#### Operational guarantees
 
 - Webhook validation rejects invalid cluster specs at admission time (segments,
   OIDC, storage).
@@ -389,7 +389,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - OIDC lazy discovery is **singleflight** with a 10-second per-attempt timeout,
   so concurrent Bearer requests share one bounded discovery instead of piling up.
 
-**Security Hardening**
+### Security Hardening
 
 - SQL injection prevention with parameterized queries (pgx native config builder)
 - SQL injection prevention in distribution key handling via `sanitizeDistKey()` helper
@@ -413,7 +413,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Dependency vulnerability fix: upgraded `golang.org/x/net` (GO-2026-5026)
 - Dependency security update: bumped `golang.org/x/crypto` to v0.52.0 (Go toolchain pinned to 1.26.4)
 
-**Administration**
+### Administration
 
 - Configuration management with automatic hot-reload vs rolling restart detection
 - Reload-safe parameters applied without pod restarts
@@ -453,7 +453,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Query live resource groups from the database with CRD spec fallback
 - API admin password via `CLOUDBERRY_API_ADMIN_PASSWORD` env var or auto-generated (persisted to K8s Secret `cloudberry-operator-admin-password`)
 
-**Data Loading**
+### Data Loading
 
 The operator provides a declarative data-loading subsystem for getting data
 into (and out of) a Cloudberry cluster. It supports engine-native external-table
@@ -464,7 +464,7 @@ Kafka CDC streaming, and a persistent FDW path — all driven by a single
 The entire subsystem is gated on `dataLoading.enabled: true`. When disabled, the
 operator tears everything down rather than leaving orphaned resources behind.
 
-### Quick start
+#### Quick start
 
 ```yaml
 apiVersion: cloudberry.apache.org/v1
@@ -496,7 +496,7 @@ spec:
         targetTable: public.events
 ```
 
-### What the operator does for each job
+#### What the operator does for each job
 
 For every enabled entry in `dataLoading.jobs[]`, the operator creates and
 launches a one-off `Job` — or a `CronJob` when `schedule` is set — named
@@ -510,7 +510,7 @@ launches a one-off `Job` — or a `CronJob` when `schedule` is set — named
    PXF extensions (`pxf`, `pxf_fdw`) are installed best-effort and never block the
    load.
 
-### Load paths
+#### Load paths
 
 All load paths run real data end-to-end through the same Job machinery and are
 row-count-verified.
@@ -523,7 +523,7 @@ row-count-verified.
 | **Kafka CDC** | `custom` server + `profile: kafka` + `continuous: true` | Long-running streaming consumer; steady state is `Running`. Live row-landing needs a real Kafka→PXF connector JAR. |
 | **FDW** | `loadMethod: fdw` | Persistent foreign-data-wrapper chain instead of a transient external table. Read-only; equivalent results to the external-table path. |
 
-### PXF servers and credentials
+#### PXF servers and credentials
 
 Each server type renders the appropriate `*-site.xml` files into the
 `<cluster>-pxf-servers` ConfigMap:
@@ -539,7 +539,7 @@ Each server type renders the appropriate `*-site.xml` files into the
   into a per-server directory layout in a shared `emptyDir`, so credentials live
   only in the ephemeral pod filesystem.
 
-### PXF sidecar
+#### PXF sidecar
 
 Enabling `dataLoading.pxf` deploys a PXF sidecar on **segment-primary pods
 only** (coordinator, standby, and mirror pods are untouched). The sidecar uses
@@ -547,7 +547,7 @@ the PXF 2.1.0 Spring Boot actuator endpoint (`/actuator/health` on port `5888`)
 for health probing, with a StartupProbe budget of ~120 s to accommodate the slow
 cold start without tripping liveness into `CrashLoopBackOff`.
 
-### Profiles and write capability
+#### Profiles and write capability
 
 The per-format write-capability matrix is the single source of truth in
 `internal/pxfpolicy`, enforced both at admission and by the DDL builder:
@@ -566,7 +566,7 @@ Read jobs support filter pushdown (`FILTER_PUSHDOWN=true`), column projection
 (`PROJECT=true`), and per-row error handling
 (`SEGMENT REJECT LIMIT … [ROWS|PERCENT]`), all emitted into the generated DDL.
 
-### gpload and gpfdist
+#### gpload and gpfdist
 
 When `dataLoading.gpfdist.enabled: true`, the operator deploys a gpfdist
 file-server runtime: a `<cluster>-gpfdist` Deployment, a
@@ -576,7 +576,7 @@ byte-stable control file (delimiter, header, encoding, error limits, output
 table/mode, preload truncate, post-load SQL) delivered via the
 `<cluster>-gpload-<job>` ConfigMap.
 
-### Pre-load health checks
+#### Pre-load health checks
 
 A `dataload-healthcheck` init container runs first on every load pod. A non-zero
 result blocks the load and emits a deduplicated `DataLoadingHealthCheckFailed`
@@ -591,7 +591,7 @@ event. The gated checks:
    `diskMinFreeMB` defaults to 64, plus `scratchSizeLimit`).
 
 
-### REST API and CLI
+#### REST API and CLI
 
 The full data-loading REST surface serves real data: job CRUD plus
 start/stop, PXF-servers CRUD (references only — no literal secrets), real pod-log
@@ -610,7 +610,7 @@ cloudberry-ctl data-loading jobs logs --job <job> --follow
 cloudberry-ctl data-loading test-read --job <job> --limit 10
 ```
 
-###  PFX Security
+####  PFX Security
 
 - **Minimal-privilege DB role** — `dataLoading.pxf.dataLoaderRole` creates a
   dedicated `NOSUPERUSER` role granted only `SELECT`/`INSERT ON PROTOCOL pxf`
@@ -621,7 +621,8 @@ cloudberry-ctl data-loading test-read --job <job> --limit 10
 - **Network isolation** — a NetworkPolicy keeps segment↔sidecar PXF traffic
   localhost-only.
 - **TLS passthrough** — JDBC and S3 TLS options flow into the rendered site files.
-## Disabled states
+
+#### Disabled states
 
 The three "off" states are active behaviors, not no-ops:
 
@@ -631,7 +632,7 @@ The three "off" states are active behaviors, not no-ops:
 | `pxf.enabled: false` | Removes PXF sidecars/extensions/ConfigMap while gpload-type jobs keep working. |
 | `gpfdist.enabled: false` | GCs the gpfdist resources; `inputSource.type: local` gpload jobs still function. |
 
-### PFX Validation
+#### PFX Validation
 
 All data-loading webhook rules reject invalid CRs with descriptive
 field-path errors before they persist. Most are webhook-enforced, a few are
@@ -639,7 +640,7 @@ CRD-schema enums (rejected at the API server), and a couple are enforced by both
 for defense-in-depth.
 
 
-**CLI Companion**
+## CLI Companion
 - `cloudberry-ctl` for imperative operations through the operator API
 - Table, JSON, and YAML output formats with deterministic column ordering
 - Shell completion for bash, zsh, and fish
@@ -648,7 +649,7 @@ for defense-in-depth.
 - Response body size limit (10 MiB) and URL-encoded path parameters
 - Stub commands return clear "not yet implemented" errors
 
-## Quick Start
+### Quick Start
 
 ```bash
 # 1. Install the operator via Helm
@@ -663,7 +664,7 @@ metadata:
   name: my-cluster
   namespace: cloudberry-test
 spec:
-  image: "postgres:16"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
   coordinator:
     resources:
       requests:
@@ -694,7 +695,7 @@ kubectl get cloudberryclusters -n cloudberry-test
 cloudberry-ctl cluster status --cluster my-cluster --namespace cloudberry-test
 ```
 
-## Prerequisites
+### Prerequisites
 
 | Requirement | Version |
 |-------------|---------|
@@ -764,7 +765,7 @@ metadata:
   name: production-cluster
   namespace: cloudberry-prod
 spec:
-  image: "postgres:16"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
   coordinator:
     resources:
       requests:
@@ -1051,10 +1052,6 @@ bash test/scenarios/scenario7_load_data.sh
 ```
 
 Scenario 7 populates the `mydb` database with realistic test data including Pareto-skewed distributions and rebalance exclusion patterns. Run this before any performance, scale, or rebalance tests. See [docs/user-guide.md](docs/user-guide.md#test-data-setup) for details.
-
-**Functional test scenarios** cover the full operator lifecycle: cluster bootstrap (1), config hot-reload and rolling restart (2), stop/start modes (3), maintenance operations (4), session management (5), resource groups (6), test data loading (7), scale-out (8), scale-in (9), rebalancing (10), scale-out failure (11), scale-in confirmation (12), PV expansion (13), cluster upgrade with rollback (14), error handling and observability (15), cluster deletion (16), mirroring enable/disable (19), automatic segment failover via FTS (20), bootstrap workload management via CRD (25), webhook validation negative tests for backup configuration (69a–69j), webhook defaults verification for backup configuration (70), full S3 backup configuration with Secret and Vault credential sources (71), backup infrastructure deployment (72), on-demand backup with per-request gpbackup options incl. the `noCompression` override (73), PXF data-loading webhook validation negative tests (89, rules W.1–W.16 + W.10b), PXF data-loading webhook defaults (90), PXF full CRD configuration — segment-primary sidecar + servers ConfigMap rendering with logLevel→PXF_LOG_LEVEL propagation (91), the data-loading ingestion runtime — Job/CronJob generation + launch, external-table DDL → `INSERT…SELECT` → `DATALOAD_ROWS` marker harvest, rich status + 5 metrics, with row-count-verified native loads and operator-driven `pxf://` execution (92, row-count-verified: 183,961 rows from MinIO S3 via the PXF sidecar), PXF server ConfigMap / per-type file-mapping (SL.1–6) / `CREATE EXTENSION pxf`+`pxf_fdw` + `GRANT SELECT`/`INSERT ON PROTOCOL pxf TO gpadmin` / shared-ConfigMap sync (93), PXF sidecar deployment verification — the `pxf` container shape on the segment pod (94), and the PXF CLI lifecycle — `cloudberry-ctl pxf status|restart|sync` operator verbs (honest sidecar-readiness aggregation, restart via the segment-primary StatefulSet restart-trigger pod-roll, explicit ConfigMap-refresh sync, `cloudberry_pxf_restart_total`) plus the sidecar-local `pxf prepare/start/stop` exec verbs (95), and object-store profiles & format write-capability — the `gs`/`abfss`/`wasbs` (+ Dell-ECS / MinIO) object-store server types, the `internal/pxfpolicy` write-capability matrix enforced by the webhook (W.10b) and the builder, and the `pxfwritable_export` writable external-table DDL (96, OS.1–OS.10 / CFG.1–CFG.8 / FF.1–FF.5), and the Hadoop profiles (HDFS/Hive/HBase) with the now scheme-aware write-capability (all `hive*`/`HBase` read-only regardless of format) and the `hive-site.xml`/`hbase-site.xml` rendering (97, HP.1–6 / HV.1–4 / HB.1 / SITE.1–4 / FF.6/FF.7 / WRej.1–7), and filter pushdown / column projection / per-row error handling — the `FILTER_PUSHDOWN=true` / `PROJECT=true` DDL knobs (mutating-defaulted to `true`) and the `[LOG ERRORS ]SEGMENT REJECT LIMIT` clause, runtime-verified via row-count reduction + `EXPLAIN` + source query logs + job-status/errors (no fabricated `bytes_transferred` — it stays Planned) (98, FE.1–5 / FE.12a/b), and writable external tables / data export — `mode: writable` jobs that build `CREATE WRITABLE EXTERNAL TABLE … FORMATTER='pxfwritable_export'` and export Cloudberry rows OUT to **S3 / object store**, **HDFS** and **JDBC** (reversed `INSERT INTO <ext> SELECT * FROM <target>`), plus the new optional `pxfJob.sourceFilter` filtered export (`… WHERE region='us-east'`) guarded by webhook rule **W.17** (sourceFilter only on writable jobs; rejects `;`/`--`/`/*`), observed via `cloudberry_data_loading_rows_total`/`job_status` — no new metric (99, FE.9/WE.1 / FE.10 / FE.11 / WE.2 / SF.1 / SF.2), and gpfdist Deployment + gpload-csv — the gpfdist `Deployment`/`Service`/`PVC` (GP.2–GP.5) and the gpload control-file `Job`/`CronJob` (control file GL.1–GL.7 → `<cluster>-gpload-<job>` ConfigMap mounted at `/etc/gpload` → `gpload -f`), the new `gploadJob` fields and webhook rules W.18–W.22 (101), and kafka-cdc continuous streaming via a custom connector — the `kafka` profile reinstated as a custom-connector profile (`servers[].type: custom` + `customConnectors[]` + `pxfJob.profile: kafka`), the `pxf-connector-init` JAR-download init container (`/pxf/lib/custom`, C.18), the continuous one-off streaming Job (NOT a CronJob, J.43/J.46) with `continuous`/`batchSize`/`flushInterval` (→ `CBK_*` env), and webhook rules W.23/W.24/W.23c — observed via `cloudberry_data_loading_job_status=Running` steady state (no new metric; end-to-end row landing config-only with a placeholder JAR) (102), the FDW-based loading path — `pxfJob.loadMethod: fdw` builds a persistent `CREATE SERVER`/`USER MAPPING`/`FOREIGN TABLE` chain (per-protocol `pxf_fdw` wrapper) loaded by `INSERT…SELECT`, EQUIVALENT to the external-table path (equal row counts), guarded by W.25 + the W.17 fdw-read tweak (103), and the pre-load health checks — the `dataload-healthcheck` init container (FIRST on both PXF and gpload Job pods) running HC.1-HC.5 (PXF DB-proxy readiness, target table exists, object-store connectivity, gpfdist reachability, scratch disk space), the `dataLoading.healthChecks` knob, and the de-duplicated `DataLoadingHealthCheckFailed` Event, observed via `cloudberry_data_loading_job_status=3` + the new kube-state-metrics (no new operator metric) (104), and the DataLoadingStatus PXF fields — the live, honest `status.dataLoading.pxf.status` (`Running`/`Stopped`/`Error`, absent when unobservable) from real segment-primary `pxf` container readiness aggregation (S.1; segment-stop → `Error`/`Stopped`), `pxf.servers` count (S.2), `pxf.extensionsInstalled` from a real read-only `pg_extension` probe (S.3), `activeJobs` (S.4) and per-job `jobs[]` runtime fields (S.5), backed by the honest `cloudberry_pxf_status` / `cloudberry_pxf_extensions_installed` gauges (emitted only when observable) (105), and the PXF server configuration update / delete — patching a server endpoint regenerates only that server's `<server>__s3-site.xml` and reads use the new endpoint (SL.7), removing a server drops its `<server>__*.xml` keys so referencing tables fail until recreated (SL.8), with the honest `PXFServersChanged` event (message `added/removed/updated`) and `cloudberry_pxf_servers_changed_total{cluster,namespace}` counter fired by BOTH the reconcile and the `pxf sync` path **only on a real ConfigMap `Data` diff** — never on a no-op sync or first create (106), and all Prometheus metrics M.1–M.16 under the honesty rule — `cloudberry_pxf_service_up{segment_host}` from real per-segment `pxf` readiness (kill a segment → its series → 0), the actuator-passthrough `cloudberry_pxf_requests_total`/`cloudberry_pxf_request_duration_seconds` (real `http_server_requests_*` from `/actuator/prometheus` via a dedicated `:5888` vmagent job; `server/profile/operation` labels downgraded to actuator-native, never fabricated), the conditional `cloudberry_data_loading_bytes_total` (real `DATALOAD_BYTES` via `wc -c` on local gpload input; omitted otherwise), `cloudberry_data_loading_job_status` cycling 0→1→2→3, and the honestly-absent M.4/M.5/M.7/M.15/M.16 + the folded M.6 (a NOT-emitted metric is a PASS — never fabricated) (109), and the complete webhook-validation negative matrix W.1–W.15 — the systematic rejected-CR proof that each of the 15 data-loading webhook rules rejects an otherwise-valid CR carrying exactly one violation with a descriptive (field-path + reason) error and that the rejected CR does NOT persist (`GET` → NotFound), plus a CONTROL (a valid CR admits — no false-positive), recording the rejection source per rule — **11 webhook-enforced**, **3 CRD-schema-enum** (W.3 `type: ftp`, W.8 `type: spark`, W.15 `segmentRejectLimitType: fraction`; CRD `Enum` rejects at the apiserver before the webhook, which keeps the rule for defense-in-depth), **2 both** (W.11/W.12 `targetTable`: omitted-key→schema `required`, ``""``→webhook) — across unit + functional + integration + e2e + perf layers (no production change; all rules already in `internal/webhook/validating.go`) (110), and data-loading security controls SE.1–SE.6 / SL.6 — dedicated minimal-privilege DB role (`dataLoading.pxf.dataLoaderRole`, `NOSUPERUSER` + pxf-only grants, REAL), Kerberos keytab from Secret (`dataLoading.pxf.servers[].kerberos`, config-correct; live auth CONFIG-ONLY / no-KDC), segment↔sidecar `localhost`-only NetworkPolicy (REAL), `${...}` placeholder secret rendering + no-plaintext-in-ConfigMap (REAL), and JDBC/S3 TLS passthrough (declarative; live TLS CONFIG-ONLY unless the source speaks TLS) — no faked Kerberos/TLS handshake (111), and the data-loading disabled states DIS.1–DIS.3 — DIS.1 `dataLoading.enabled: false` now TEARS DOWN via `cleanupDataLoading` (deletes the `<cluster>-pxf-servers` ConfigMap, gpfdist Deployment/Service/PVC, all Jobs+CronJobs, gpload control-file ConfigMaps, the PXF NetworkPolicy; drops the segment-primary PXF sidecar; clears `Status.DataLoading`; condition `False`/`DataLoadingDisabled`; one-shot `DataLoadingDisabled` event; `cloudberry_data_loading_jobs_active`→0) with the data-loading API reporting `DATA_LOADING_NOT_ENABLED` (mutations `400`; list/get `200` disabled envelope; DL-disabled precedence over `PXF_NOT_ENABLED`) and re-enable redeploying everything idempotently; DIS.2 `pxf.enabled: false` independence (no PXF sidecars/extensions/ConfigMap; gpload jobs still work); DIS.3 `gpfdist.enabled: false` (gpfdist objects GC'd; local gpload jobs still work; a gpfdist-source job reports the missing dependency via the HONEST RUNTIME gpload failure — HC.4 is skipped when gpfdist is disabled, so it is the runtime Job-Failed signal, NOT a fabricated pre-flight check) (112). See [docs/development.md](docs/development.md) for detailed test descriptions.
-
-The project **enforces 90%+ unit test statement coverage per package**. Goroutine-heavy packages (`internal/api`, `internal/controller`, `internal/idle`, `internal/vault`) run [goleak](https://github.com/uber-go/goleak) in their `TestMain` to fail the suite on leaked goroutines. Integration Scenario 89 verifies the backup artifact round-trip (upload → byte-for-byte download → retention delete) against the **real MinIO** object store from the Docker Compose environment, using the same bucket/folder layout and credentials the backup Jobs use. Total coverage: **91.4%** with all 14 internal packages at 90%+. Key coverage: `internal/vault` at 99%, `internal/metrics` at 100%, `internal/api` at ~96%, `internal/db` at ~92%, `internal/certmanager` at ~93%, `internal/controller` at ~90.1%, `internal/auth` at ~97.6%, `internal/idle` at ~97%, `cmd/cloudberry-ctl` at ~91.6%, `cmd/operator` at ~30.0%. All **1,936 tests** pass (functional: 1,063, e2e: 833, integration: 38). See [docs/development.md](docs/development.md) for the full development and testing guide.
 
 ## Monitoring Quick Start
 

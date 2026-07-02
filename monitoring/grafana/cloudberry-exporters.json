@@ -40,7 +40,7 @@
       },
       "targets": [
         {
-          "expr": "pg_up",
+          "expr": "pg_up{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -104,7 +104,7 @@
       },
       "targets": [
         {
-          "expr": "pg_exporter_scrapes_total",
+          "expr": "pg_exporter_scrapes_total{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -149,7 +149,7 @@
       },
       "targets": [
         {
-          "expr": "pg_exporter_last_scrape_duration_seconds",
+          "expr": "pg_exporter_last_scrape_duration_seconds{instance=~\"$instance\"}",
           "legendFormat": "duration",
           "refId": "A"
         }
@@ -193,7 +193,7 @@
       },
       "targets": [
         {
-          "expr": "pg_exporter_last_scrape_error",
+          "expr": "pg_exporter_last_scrape_error{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -448,12 +448,12 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_database_stats_xact_commit[5m])",
+          "expr": "rate(cloudberry_database_stats_xact_commit{instance=~\"$instance\"}[5m])",
           "legendFormat": "commits",
           "refId": "A"
         },
         {
-          "expr": "rate(cloudberry_database_stats_xact_rollback[5m])",
+          "expr": "rate(cloudberry_database_stats_xact_rollback{instance=~\"$instance\"}[5m])",
           "legendFormat": "rollbacks",
           "refId": "B"
         }
@@ -497,22 +497,22 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_database_stats_tup_inserted[5m])",
+          "expr": "rate(cloudberry_database_stats_tup_inserted{instance=~\"$instance\"}[5m])",
           "legendFormat": "inserted",
           "refId": "A"
         },
         {
-          "expr": "rate(cloudberry_database_stats_tup_updated[5m])",
+          "expr": "rate(cloudberry_database_stats_tup_updated{instance=~\"$instance\"}[5m])",
           "legendFormat": "updated",
           "refId": "B"
         },
         {
-          "expr": "rate(cloudberry_database_stats_tup_deleted[5m])",
+          "expr": "rate(cloudberry_database_stats_tup_deleted{instance=~\"$instance\"}[5m])",
           "legendFormat": "deleted",
           "refId": "C"
         },
         {
-          "expr": "rate(cloudberry_database_stats_tup_fetched[5m])",
+          "expr": "rate(cloudberry_database_stats_tup_fetched{instance=~\"$instance\"}[5m])",
           "legendFormat": "fetched",
           "refId": "D"
         }
@@ -556,7 +556,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_database_stats_blks_hit / (cloudberry_database_stats_blks_hit + cloudberry_database_stats_blks_read) * 100",
+          "expr": "cloudberry_database_stats_blks_hit{instance=~\"$instance\"} / (cloudberry_database_stats_blks_hit{instance=~\"$instance\"} + cloudberry_database_stats_blks_read{instance=~\"$instance\"}) * 100",
           "legendFormat": "hit ratio %",
           "refId": "A"
         }
@@ -600,7 +600,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_database_stats_temp_bytes[5m])",
+          "expr": "rate(cloudberry_database_stats_temp_bytes{instance=~\"$instance\"}[5m])",
           "legendFormat": "temp bytes/s",
           "refId": "A"
         }
@@ -644,7 +644,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_database_stats_deadlocks",
+          "expr": "cloudberry_database_stats_deadlocks{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -693,7 +693,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_database_stats_conflicts",
+          "expr": "cloudberry_database_stats_conflicts{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -754,7 +754,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_segment_status_count",
+          "expr": "cloudberry_segment_status_count{instance=~\"$instance\"}",
           "legendFormat": "{{status}}",
           "refId": "A"
         }
@@ -797,7 +797,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_wal_wal_bytes_total[5m])",
+          "expr": "rate(cloudberry_wal_wal_bytes_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "WAL bytes/s",
           "refId": "A"
         }
@@ -841,7 +841,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_replication_lag_bytes",
+          "expr": "cloudberry_replication_lag_bytes{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -897,7 +897,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_locks_count",
+          "expr": "cloudberry_locks_count{instance=~\"$instance\"}",
           "legendFormat": "{{mode}}",
           "refId": "A"
         }
@@ -944,7 +944,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_locks_count",
+          "expr": "cloudberry_locks_count{instance=~\"$instance\"}",
           "legendFormat": "{{locktype}}",
           "refId": "A"
         }
@@ -987,7 +987,7 @@
       },
       "targets": [
         {
-          "expr": "sum(cloudberry_locks_count{state=\"waiting\"})",
+          "expr": "sum(cloudberry_locks_count{instance=~\"$instance\",state=\"waiting\"})",
           "refId": "A"
         }
       ],
@@ -1048,17 +1048,17 @@
       },
       "targets": [
         {
-          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_ins[5m]))",
+          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_ins{instance=~\"$instance\"}[5m]))",
           "legendFormat": "ins {{relname}}",
           "refId": "A"
         },
         {
-          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_upd[5m]))",
+          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_upd{instance=~\"$instance\"}[5m]))",
           "legendFormat": "upd {{relname}}",
           "refId": "B"
         },
         {
-          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_del[5m]))",
+          "expr": "topk(10, rate(cloudberry_table_stats_n_tup_del{instance=~\"$instance\"}[5m]))",
           "legendFormat": "del {{relname}}",
           "refId": "C"
         }
@@ -1102,12 +1102,12 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_table_stats_seq_scan[5m])",
+          "expr": "rate(cloudberry_table_stats_seq_scan{instance=~\"$instance\"}[5m])",
           "legendFormat": "seq {{relname}}",
           "refId": "A"
         },
         {
-          "expr": "rate(cloudberry_table_stats_idx_scan[5m])",
+          "expr": "rate(cloudberry_table_stats_idx_scan{instance=~\"$instance\"}[5m])",
           "legendFormat": "idx {{relname}}",
           "refId": "B"
         }
@@ -1151,12 +1151,12 @@
       },
       "targets": [
         {
-          "expr": "topk(10, cloudberry_table_stats_n_live_tup)",
+          "expr": "topk(10, cloudberry_table_stats_n_live_tup{instance=~\"$instance\"})",
           "legendFormat": "live {{relname}}",
           "refId": "A"
         },
         {
-          "expr": "topk(10, cloudberry_table_stats_n_dead_tup)",
+          "expr": "topk(10, cloudberry_table_stats_n_dead_tup{instance=~\"$instance\"})",
           "legendFormat": "dead {{relname}}",
           "refId": "B"
         }
@@ -1186,7 +1186,7 @@
     },
     {
       "type": "row",
-      "title": "Query Exporter \u2014 Activity",
+      "title": "Query Exporter — Activity",
       "gridPos": {
         "x": 0,
         "y": 62,
@@ -1211,22 +1211,22 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_active_queries",
+          "expr": "cloudberry_active_queries{instance=~\"$instance\"}",
           "legendFormat": "active",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_idle_sessions",
+          "expr": "cloudberry_idle_sessions{instance=~\"$instance\"}",
           "legendFormat": "idle",
           "refId": "B"
         },
         {
-          "expr": "cloudberry_queries_idle_in_transaction",
+          "expr": "cloudberry_queries_idle_in_transaction{instance=~\"$instance\"}",
           "legendFormat": "idle in transaction",
           "refId": "C"
         },
         {
-          "expr": "cloudberry_queries_blocked",
+          "expr": "cloudberry_queries_blocked{instance=~\"$instance\"}",
           "legendFormat": "blocked",
           "refId": "D"
         }
@@ -1269,17 +1269,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.90, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.90, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p90",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -1323,7 +1323,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_max_duration_seconds",
+          "expr": "cloudberry_query_max_duration_seconds{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1377,7 +1377,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_slow_queries",
+          "expr": "cloudberry_slow_queries{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1417,7 +1417,7 @@
     },
     {
       "type": "row",
-      "title": "Query Exporter \u2014 Segments",
+      "title": "Query Exporter — Segments",
       "gridPos": {
         "x": 0,
         "y": 71,
@@ -1442,22 +1442,22 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_segments_up",
+          "expr": "cloudberry_segments_up{instance=~\"$instance\"}",
           "legendFormat": "up",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_segments_down",
+          "expr": "cloudberry_segments_down{instance=~\"$instance\"}",
           "legendFormat": "down",
           "refId": "B"
         },
         {
-          "expr": "cloudberry_segments_not_synced",
+          "expr": "cloudberry_segments_not_synced{instance=~\"$instance\"}",
           "legendFormat": "not synced",
           "refId": "C"
         },
         {
-          "expr": "cloudberry_segments_not_preferred_role",
+          "expr": "cloudberry_segments_not_preferred_role{instance=~\"$instance\"}",
           "legendFormat": "not preferred role",
           "refId": "D"
         }
@@ -1500,7 +1500,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_cluster_uptime_seconds",
+          "expr": "cloudberry_cluster_uptime_seconds{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1546,17 +1546,17 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_distributed_transactions_active",
+          "expr": "cloudberry_distributed_transactions_active{instance=~\"$instance\"}",
           "legendFormat": "active",
           "refId": "A"
         },
         {
-          "expr": "rate(cloudberry_distributed_transactions_committed_total[5m])",
+          "expr": "rate(cloudberry_distributed_transactions_committed_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "committed/s",
           "refId": "B"
         },
         {
-          "expr": "rate(cloudberry_distributed_transactions_aborted_total[5m])",
+          "expr": "rate(cloudberry_distributed_transactions_aborted_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "aborted/s",
           "refId": "C"
         }
@@ -1599,7 +1599,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_oldest_transaction_age_seconds",
+          "expr": "cloudberry_oldest_transaction_age_seconds{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1640,7 +1640,7 @@
     },
     {
       "type": "row",
-      "title": "Query Exporter \u2014 Spill Files",
+      "title": "Query Exporter — Spill Files",
       "gridPos": {
         "x": 0,
         "y": 80,
@@ -1665,12 +1665,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_spill_files_active",
+          "expr": "cloudberry_spill_files_active{instance=~\"$instance\"}",
           "legendFormat": "active files",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_spill_files_bytes",
+          "expr": "cloudberry_spill_files_bytes{instance=~\"$instance\"}",
           "legendFormat": "bytes",
           "refId": "B"
         }
@@ -1743,7 +1743,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_history_total",
+          "expr": "cloudberry_query_history_total{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1789,17 +1789,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_query_history_search_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_history_search_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(cloudberry_query_history_search_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(cloudberry_query_history_search_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_query_history_search_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_history_search_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -1844,7 +1844,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_history_export_total",
+          "expr": "cloudberry_query_history_export_total{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1890,7 +1890,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_query_history_retention_deleted_total[5m])",
+          "expr": "rate(cloudberry_query_history_retention_deleted_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "deleted/s",
           "refId": "A"
         }
@@ -1935,7 +1935,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_history_size_bytes",
+          "expr": "cloudberry_query_history_size_bytes{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -1988,17 +1988,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -2055,7 +2055,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_plan_check_total",
+          "expr": "cloudberry_plan_check_total{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -2101,17 +2101,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_plan_check_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_plan_check_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(cloudberry_plan_check_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(cloudberry_plan_check_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_plan_check_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_plan_check_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -2156,7 +2156,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_plan_check_issues_total[5m])",
+          "expr": "rate(cloudberry_plan_check_issues_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{category}}",
           "refId": "A"
         }
@@ -2213,12 +2213,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_running_queries",
+          "expr": "cloudberry_resgroup_running_queries{instance=~\"$instance\"}",
           "legendFormat": "running {{rsgname}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_resgroup_queued_queries",
+          "expr": "cloudberry_resgroup_queued_queries{instance=~\"$instance\"}",
           "legendFormat": "queued {{rsgname}}",
           "refId": "B"
         }
@@ -2262,7 +2262,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_resgroup_executed_total[5m])",
+          "expr": "rate(cloudberry_resgroup_executed_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{rsgname}}",
           "refId": "A"
         }
@@ -2307,7 +2307,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_resgroup_queue_duration_seconds_total[5m])",
+          "expr": "rate(cloudberry_resgroup_queue_duration_seconds_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{rsgname}}",
           "refId": "A"
         }
@@ -2352,7 +2352,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_cpu_usage_percent",
+          "expr": "cloudberry_resgroup_cpu_usage_percent{instance=~\"$instance\"}",
           "legendFormat": "{{rsgname}} {{hostname}}",
           "refId": "A"
         }
@@ -2397,12 +2397,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_memory_usage_bytes",
+          "expr": "cloudberry_resgroup_memory_usage_bytes{instance=~\"$instance\"}",
           "legendFormat": "used {{rsgname}} {{hostname}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_resgroup_memory_available_bytes",
+          "expr": "cloudberry_resgroup_memory_available_bytes{instance=~\"$instance\"}",
           "legendFormat": "available {{rsgname}} {{hostname}}",
           "refId": "B"
         }
@@ -2447,12 +2447,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_memory_quota_used_bytes",
+          "expr": "cloudberry_resgroup_memory_quota_used_bytes{instance=~\"$instance\"}",
           "legendFormat": "quota used {{rsgname}} {{hostname}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_resgroup_memory_shared_used_bytes",
+          "expr": "cloudberry_resgroup_memory_shared_used_bytes{instance=~\"$instance\"}",
           "legendFormat": "shared used {{rsgname}} {{hostname}}",
           "refId": "B"
         }
@@ -2509,12 +2509,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_io_read_bytes_per_sec",
+          "expr": "cloudberry_resgroup_io_read_bytes_per_sec{instance=~\"$instance\"}",
           "legendFormat": "read {{rsgname}} {{hostname}} {{tablespace}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_resgroup_io_write_bytes_per_sec",
+          "expr": "cloudberry_resgroup_io_write_bytes_per_sec{instance=~\"$instance\"}",
           "legendFormat": "write {{rsgname}} {{hostname}} {{tablespace}}",
           "refId": "B"
         }
@@ -2559,12 +2559,12 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_resgroup_io_read_ops_per_sec",
+          "expr": "cloudberry_resgroup_io_read_ops_per_sec{instance=~\"$instance\"}",
           "legendFormat": "read {{rsgname}} {{hostname}} {{tablespace}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_resgroup_io_write_ops_per_sec",
+          "expr": "cloudberry_resgroup_io_write_ops_per_sec{instance=~\"$instance\"}",
           "legendFormat": "write {{rsgname}} {{hostname}} {{tablespace}}",
           "refId": "B"
         }
@@ -2621,7 +2621,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_queries_total[5m])",
+          "expr": "rate(cloudberry_queries_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{state}} {{datname}} {{usename}}",
           "refId": "A"
         }
@@ -2666,7 +2666,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_queries_slow_total[5m])",
+          "expr": "rate(cloudberry_queries_slow_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{datname}} {{usename}}",
           "refId": "A"
         }
@@ -2711,7 +2711,7 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_queries_canceled_total[5m])",
+          "expr": "rate(cloudberry_queries_canceled_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "{{reason}}",
           "refId": "A"
         }
@@ -2768,7 +2768,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, cloudberry_spill_files_per_segment)",
+          "expr": "topk(10, cloudberry_spill_files_per_segment{instance=~\"$instance\"})",
           "legendFormat": "seg {{segment_id}} {{hostname}}",
           "refId": "A"
         }
@@ -2813,7 +2813,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, cloudberry_spill_files_per_query)",
+          "expr": "topk(10, cloudberry_spill_files_per_query{instance=~\"$instance\"})",
           "legendFormat": "{{datname}} pid={{pid}}",
           "refId": "A"
         }
@@ -2858,7 +2858,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, cloudberry_table_skew_coefficient)",
+          "expr": "topk(10, cloudberry_table_skew_coefficient{instance=~\"$instance\"})",
           "legendFormat": "{{schemaname}}.{{tablename}}",
           "refId": "A"
         }
@@ -2914,7 +2914,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_exporter_up",
+          "expr": "cloudberry_query_exporter_up{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -2979,17 +2979,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(cloudberry_query_exporter_scrape_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -3034,7 +3034,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_total_connections",
+          "expr": "cloudberry_total_connections{instance=~\"$instance\"}",
           "refId": "A"
         }
       ],
@@ -3092,17 +3092,17 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_database_stats_numbackends",
+          "expr": "cloudberry_database_stats_numbackends{instance=~\"$instance\"}",
           "legendFormat": "backends {{datname}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_connections_count",
+          "expr": "cloudberry_connections_count{instance=~\"$instance\"}",
           "legendFormat": "connections",
           "refId": "B"
         },
         {
-          "expr": "cloudberry_connections_max_max_connections",
+          "expr": "cloudberry_connections_max_max_connections{instance=~\"$instance\"}",
           "legendFormat": "max connections",
           "refId": "C"
         }
@@ -3146,12 +3146,12 @@
       },
       "targets": [
         {
-          "expr": "rate(cloudberry_database_stats_tup_returned[5m])",
+          "expr": "rate(cloudberry_database_stats_tup_returned{instance=~\"$instance\"}[5m])",
           "legendFormat": "tup_returned/s {{datname}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_database_stats_temp_files",
+          "expr": "cloudberry_database_stats_temp_files{instance=~\"$instance\"}",
           "legendFormat": "temp_files {{datname}}",
           "refId": "B"
         }
@@ -3195,17 +3195,17 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_replication_write_lag_bytes",
+          "expr": "cloudberry_replication_write_lag_bytes{instance=~\"$instance\"}",
           "legendFormat": "write {{application_name}}",
           "refId": "A"
         },
         {
-          "expr": "cloudberry_replication_flush_lag_bytes",
+          "expr": "cloudberry_replication_flush_lag_bytes{instance=~\"$instance\"}",
           "legendFormat": "flush {{application_name}}",
           "refId": "B"
         },
         {
-          "expr": "cloudberry_replication_replay_lag_bytes",
+          "expr": "cloudberry_replication_replay_lag_bytes{instance=~\"$instance\"}",
           "legendFormat": "replay {{application_name}}",
           "refId": "C"
         }
@@ -3250,12 +3250,12 @@
       },
       "targets": [
         {
-          "expr": "topk(10, rate(cloudberry_table_stats_seq_tup_read[5m]))",
+          "expr": "topk(10, rate(cloudberry_table_stats_seq_tup_read{instance=~\"$instance\"}[5m]))",
           "legendFormat": "seq_tup_read {{relname}}",
           "refId": "A"
         },
         {
-          "expr": "topk(10, rate(cloudberry_table_stats_idx_tup_fetch[5m]))",
+          "expr": "topk(10, rate(cloudberry_table_stats_idx_tup_fetch{instance=~\"$instance\"}[5m]))",
           "legendFormat": "idx_tup_fetch {{relname}}",
           "refId": "B"
         }
@@ -3372,5 +3372,42 @@
         }
       }
     }
-  ]
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "label": "Exporter instance",
+        "description": "Scrape instance feeding this dashboard (operator pod / exporter).",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "definition": "label_values(cloudberry_active_queries, instance)",
+        "query": {
+          "query": "label_values(cloudberry_active_queries, instance)",
+          "refId": "InstanceVariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "hide": 0,
+        "regex": "",
+        "skipUrlSync": false
+      }
+    ]
+  }
 }

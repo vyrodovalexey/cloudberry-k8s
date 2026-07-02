@@ -8,11 +8,11 @@ replicaCount: 1
 # -- Operator image configuration
 image:
   # -- Container image repository
-  repository: cloudberry-operator
+  repository: ghcr.io/vyrodovalexey/cloudberry-k8s-operator
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (defaults to chart appVersion)
-  tag: ""
+  tag: "0.9.3-cldb-2.1.0"
 
 # -- Image pull secrets for private registries
 imagePullSecrets: []

@@ -2350,6 +2350,10 @@ func TestHAReconciler_UpdateFTSProbeStatus_AllHealthy(t *testing.T) {
 	assert.Empty(t, cluster.Status.FailedSegments)
 	assert.NotEmpty(t, tracker.mirroringInSyncCalls)
 	assert.True(t, tracker.mirroringInSyncCalls[0])
+	// A healthy cluster must still publish the failed-segment gauge as 0 so the
+	// cloudberry_segments_failed series exists (dashboards show 0, not "No data").
+	assert.NotEmpty(t, tracker.segmentsFailedCalls)
+	assert.Equal(t, float64(0), tracker.segmentsFailedCalls[0])
 }
 
 func TestHAReconciler_UpdateFTSProbeStatus_Degraded(t *testing.T) {

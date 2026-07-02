@@ -3103,6 +3103,10 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *cbv1alpha
 	r.metrics.SetStandbyUp(cluster.Name, cluster.Namespace, cluster.Status.StandbyReady)
 	r.metrics.SetSegmentsReady(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsReady))
 	r.metrics.SetSegmentsTotal(cluster.Name, cluster.Namespace, float64(cluster.Status.SegmentsTotal))
+	// Materialize the config-reload counter at 0 for this cluster so the
+	// cloudberry_config_reload_total series exists from the start (dashboards
+	// show 0, not "No data", for a deployed cluster that has not reloaded yet).
+	r.metrics.InitConfigReload(cluster.Name, cluster.Namespace)
 
 	return r.client.Status().Update(ctx, cluster)
 }
@@ -3246,6 +3250,9 @@ func (r *ClusterReconciler) recordMetricsSnapshot(cluster *cbv1alpha1.Cloudberry
 		cluster.Name, cluster.Namespace,
 		cluster.Status.MirroringStatus == cbv1alpha1.MirroringInSync,
 	)
+	// Materialize the config-reload counter at 0 so the series exists from the
+	// start (dashboards show 0, not "No data", before the first reload).
+	r.metrics.InitConfigReload(cluster.Name, cluster.Namespace)
 	// cloudberry_connections_max is published by the admin controller's
 	// updateQueryStatusFromDB using the REAL max_connections setting queried
 	// over an already-open DB connection. It is intentionally NOT set here:
