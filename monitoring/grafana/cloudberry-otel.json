@@ -91,12 +91,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_receiver_accepted_spans[5m]))",
+          "expr": "sum(rate(otelcol_receiver_accepted_spans{instance=~\"$instance\"}[5m]))",
           "legendFormat": "received",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(otelcol_exporter_sent_spans[5m]))",
+          "expr": "sum(rate(otelcol_exporter_sent_spans{instance=~\"$instance\"}[5m]))",
           "legendFormat": "exported",
           "refId": "B"
         }
@@ -141,7 +141,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_exporter_send_failed_spans[5m]))",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans{instance=~\"$instance\"}[5m]))",
           "legendFormat": "send failed spans",
           "refId": "A"
         }
@@ -186,12 +186,12 @@
       },
       "targets": [
         {
-          "expr": "sum(otelcol_exporter_queue_size)",
+          "expr": "sum(otelcol_exporter_queue_size{instance=~\"$instance\"})",
           "legendFormat": "queue size",
           "refId": "A"
         },
         {
-          "expr": "sum(otelcol_exporter_queue_capacity)",
+          "expr": "sum(otelcol_exporter_queue_capacity{instance=~\"$instance\"})",
           "legendFormat": "queue capacity",
           "refId": "B"
         }
@@ -236,17 +236,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_processor_batch_batch_send_size_sum[5m]))",
+          "expr": "sum(rate(otelcol_processor_batch_batch_send_size_sum{instance=~\"$instance\"}[5m]))",
           "legendFormat": "batch send size",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(otelcol_processor_batch_timeout_trigger_send[5m]))",
+          "expr": "sum(rate(otelcol_processor_batch_timeout_trigger_send{instance=~\"$instance\"}[5m]))",
           "legendFormat": "timeout trigger send",
           "refId": "B"
         },
         {
-          "expr": "sum(rate(otelcol_processor_batch_batch_size_trigger_send[5m]))",
+          "expr": "sum(rate(otelcol_processor_batch_batch_size_trigger_send{instance=~\"$instance\"}[5m]))",
           "legendFormat": "size trigger send",
           "refId": "C"
         }
@@ -291,7 +291,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_receiver_accepted_spans[5m]))",
+          "expr": "sum(rate(otelcol_receiver_accepted_spans{instance=~\"$instance\"}[5m]))",
           "refId": "A"
         }
       ],
@@ -338,7 +338,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_receiver_refused_spans[5m]))",
+          "expr": "sum(rate(otelcol_receiver_refused_spans{instance=~\"$instance\"}[5m]))",
           "refId": "A"
         }
       ],
@@ -389,7 +389,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_exporter_send_failed_spans[5m]))",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans{instance=~\"$instance\"}[5m]))",
           "refId": "A"
         }
       ],
@@ -440,7 +440,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_exporter_sent_spans[5m]))",
+          "expr": "sum(rate(otelcol_exporter_sent_spans{instance=~\"$instance\"}[5m]))",
           "refId": "A"
         }
       ],
@@ -739,5 +739,42 @@
       },
       "options": {}
     }
-  ]
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "label": "Collector instance",
+        "description": "Scrape instance feeding this dashboard (operator pod / exporter).",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "definition": "label_values(otelcol_receiver_accepted_spans, instance)",
+        "query": {
+          "query": "label_values(otelcol_receiver_accepted_spans, instance)",
+          "refId": "InstanceVariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "hide": 0,
+        "regex": "",
+        "skipUrlSync": false
+      }
+    ]
+  }
 }

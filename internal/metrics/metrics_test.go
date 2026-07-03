@@ -235,6 +235,32 @@ func TestRecordConfigReload(t *testing.T) {
 	recorder.RecordConfigReload("test", "default")
 }
 
+// TestInitConfigReload verifies that InitConfigReload materializes the
+// config-reload counter series at 0 (so dashboards show 0 instead of "No data"
+// for a deployed cluster) without incrementing it, and that a later
+// RecordConfigReload still increments from that initialized series.
+func TestInitConfigReload(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	recorder := NewPrometheusRecorder(reg)
+	labels := map[string]string{"cluster": "c", "namespace": "n"}
+
+	// Before init: the series should not exist yet.
+	_, ok := findMetricValue(t, reg, "cloudberry_config_reload_total", labels)
+	assert.False(t, ok, "series must not exist before InitConfigReload")
+
+	// After init: the series exists and is 0 (not "No data").
+	recorder.InitConfigReload("c", "n")
+	assert.Equal(t, 0.0, valueWithLabels(t, reg, "cloudberry_config_reload_total", labels))
+
+	// Init is idempotent and must not increment the counter.
+	recorder.InitConfigReload("c", "n")
+	assert.Equal(t, 0.0, valueWithLabels(t, reg, "cloudberry_config_reload_total", labels))
+
+	// A real reload still increments from the initialized series.
+	recorder.RecordConfigReload("c", "n")
+	assert.Equal(t, 1.0, valueWithLabels(t, reg, "cloudberry_config_reload_total", labels))
+}
+
 func TestSetConnectionsActive(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	recorder := NewPrometheusRecorder(reg)

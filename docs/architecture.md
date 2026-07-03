@@ -59,60 +59,60 @@ The operator runs two server components:
 │                      Kubernetes Cluster                         │
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                 cloudberry-operator                        │  │
+│  │                 cloudberry-operator                       │  │
 │  │                                                           │  │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐  │  │
-│  │  │   Cluster    │ │     HA       │ │   Auth / Admin   │  │  │
-│  │  │  Controller  │ │  Controller  │ │   Controllers    │  │  │
-│  │  └──────┬───────┘ └──────┬───────┘ └────────┬─────────┘  │  │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐   │  │
+│  │  │   Cluster    │ │     HA       │ │   Auth / Admin   │   │  │
+│  │  │  Controller  │ │  Controller  │ │   Controllers    │   │  │
+│  │  └──────┬───────┘ └──────┬───────┘ └────────┬─────────┘   │  │
 │  │         └────────────────┼──────────────────┘             │  │
 │  │                          │                                │  │
 │  │  ┌───────────────────────┴─────────────────────────────┐  │  │
-│  │  │           Reconciliation Engine                      │  │  │
-│  │  │         (controller-runtime / kubebuilder)           │  │  │
+│  │  │           Reconciliation Engine                     │  │  │
+│  │  │         (controller-runtime / kubebuilder)          │  │  │
 │  │  └─────────────────────────────────────────────────────┘  │  │
 │  │                                                           │  │
 │  │  ┌──────────────────────────────────────────────────────┐ │  │
-│  │  │              REST API Server (:8090)                  │ │  │
-│  │  │  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  │ │  │
-│  │  │  │  Rate    │  │     Auth     │  │   Handlers    │  │ │  │
-│  │  │  │ Limiter  │──│  Middleware  │──│  (CRUD, ops)  │  │ │  │
-│  │  │  └──────────┘  └──────────────┘  └───────────────┘  │ │  │
+│  │  │              REST API Server (:8090)                 │ │  │
+│  │  │  ┌──────────┐  ┌──────────────┐  ┌───────────────┐   │ │  │
+│  │  │  │  Rate    │  │     Auth     │  │   Handlers    │   │ │  │
+│  │  │  │ Limiter  │──│  Middleware  │──│  (CRUD, ops)  │   │ │  │
+│  │  │  └──────────┘  └──────────────┘  └───────────────┘   │ │  │
 │  │  └──────────────────────────────────────────────────────┘ │  │
 │  │                                                           │  │
-│  │  ┌──────────┐  ┌───────────┐  ┌────────────────────────┐ │  │
-│  │  │ Metrics  │  │ Telemetry │  │   Auth Middleware      │ │  │
-│  │  │ (Prom)   │  │  (OTLP)   │  │  (Basic + OIDC/JWT)   │ │  │
-│  │  └──────────┘  └───────────┘  └────────────────────────┘ │  │
+│  │  ┌──────────┐  ┌───────────┐  ┌────────────────────────┐  │  │
+│  │  │ Metrics  │  │ Telemetry │  │   Auth Middleware      │  │  │
+│  │  │ (Prom)   │  │  (OTLP)   │  │  (Basic + OIDC/JWT)    │  │  │
+│  │  └──────────┘  └───────────┘  └────────────────────────┘  │  │
 │  │                                                           │  │
 │  │  ┌──────────────────────────────────────────────────────┐ │  │
-│  │  │  DB Client Factory  │  Webhooks (conditional)       │ │  │
+│  │  │  DB Client Factory  │  Webhooks (conditional)        │ │  │
 │  │  └──────────────────────────────────────────────────────┘ │  │
 │  │                                                           │  │
 │  │  ┌──────────────────────────────────────────────────────┐ │  │
-│  │  │  Cert Manager (Vault PKI / Self-Signed)             │ │  │
+│  │  │  Cert Manager (Vault PKI / Self-Signed)              │ │  │
 │  │  └──────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                  Cloudberry Cluster                        │  │
+│  │                  Cloudberry Cluster                       │  │
 │  │  ┌──────────────┐  ┌──────────────┐                       │  │
 │  │  │ Coordinator  │  │   Standby    │                       │  │
 │  │  │ StatefulSet  │  │ StatefulSet  │  (conditionally       │  │
 │  │  └──────────────┘  └──────────────┘   created)            │  │
 │  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │            Segment StatefulSets                      │  │  │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │  │  │
-│  │  │  │Primary 0 │  │Primary 1 │  │Primary N │          │  │  │
-│  │  │  │Mirror  0 │  │Mirror  1 │  │Mirror  N │          │  │  │
-│  │  │  └──────────┘  └──────────┘  └──────────┘          │  │  │
+│  │  │            Segment StatefulSets                     │  │  │
+│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐           │  │  │
+│  │  │  │Primary 0 │  │Primary 1 │  │Primary N │           │  │  │
+│  │  │  │Mirror  0 │  │Mirror  1 │  │Mirror  N │           │  │  │
+│  │  │  └──────────┘  └──────────┘  └──────────┘           │  │  │
 │  │  └─────────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │    Vault     │  │   Keycloak   │  │   Observability    │    │
-│  │  (optional)  │  │  (OIDC IdP)  │  │      Stack         │    │
-│  └──────────────┘  └──────────────┘  └────────────────────┘    │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐     │
+│  │    Vault     │  │   Keycloak   │  │   Observability    │     │
+│  │  (optional)  │  │  (OIDC IdP)  │  │      Stack         │     │
+│  └──────────────┘  └──────────────┘  └────────────────────┘     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -291,27 +291,27 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
               ┌─────┤  Deleted?        ├─────┐
               │ Yes └──────────────────┘ No  │
               │                              │
-     ┌────────▼─────────┐          ┌────────▼─────────┐
-     │  Handle Deletion  │          │  Ensure Finalizer │
-     │  - Backup if set  │          └────────┬─────────┘
-     │  - Delete PVCs    │                   │
-     │  - Remove finalizer│         ┌────────▼─────────┐
-     └──────────────────┘          │  Action Annotation?│
-                                   └───┬───────────┬───┘
-                                  Yes  │           │ No
-                              ┌────────▼───┐  ┌───▼────────────┐
-                              │Handle Action│  │ Reconcile      │
-                              │start/stop/  │  │ - ConfigMaps   │
-                              │restart      │  │ - Services     │
-                              └────────────┘  │ - Coordinator  │
-                                              │ - Standby      │
-                                              │ - Segments     │
-                                              │ - Update Status│
-                                              └───┬────────────┘
-                                                  │
-                                         ┌────────▼─────────┐
+     ┌────────▼──────────┐          ┌────────▼─────────┐
+     │ Handle Deletion   │          │  Ensure Finalizer│
+     │ - Backup if set   │          └────────┬─────────┘
+     │ - Delete PVCs     │                   │
+     │ - Remove finalizer│          ┌────────▼───────────┐
+     └───────────────────┘          │  Action Annotation?│
+                                    └───┬───────────┬────┘
+                                   Yes  │           │ No
+                              ┌────────▼────┐  ┌─── ▼────────────┐
+                              │Handle Action│  │ Reconcile       │
+                              │start/stop/  │  │ - ConfigMaps    │
+                              │restart      │  │ - Services      │
+                              └─────────────┘  │ - Coordinator   │
+                                               │ - Standby       │
+                                               │ - Segments      │
+                                               │ - Update Status │
+                                               └───┬─────────────┘
+                                                   │
+                                         ┌─────────▼─────────┐
                                          │  Requeue (30s)    │
-                                         └──────────────────┘
+                                         └───────────────────┘
 ```
 
 **Key behaviors:**
@@ -348,41 +348,41 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - **Metrics**: `cloudberry_scale_operations_total{operation="scale-in"}` (counter).
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Scale-Out Flow                                │
-│                                                                  │
-│  reconcileSegments()                                             │
-│    │                                                             │
-│    ├── Get existing primary StatefulSet                          │
-│    ├── Compare spec.segments.count vs sts.spec.replicas          │
-│    ├── Guard: currentCount > 0 (prevent false scale on restart)  │
-│    │                                                             │
-│    └── If desired > current → handleScaleOut()                   │
-│         │                                                        │
+┌───────────────────────────────────────────────────────────────────┐
+│                    Scale-Out Flow                                 │
+│                                                                   │
+│  reconcileSegments()                                              │
+│    │                                                              │
+│    ├── Get existing primary StatefulSet                           │
+│    ├── Compare spec.segments.count vs sts.spec.replicas           │
+│    ├── Guard: currentCount > 0 (prevent false scale on restart)   │
+│    │                                                              │
+│    └── If desired > current → handleScaleOut()                    │
+│         │                                                         │
 │         ├── Pre-flight: cluster.Status.Phase == Running?          │
-│         │   └── No → emit ScaleOutBlocked, return (retry later)  │
-│         │                                                        │
-│         ├── Set avsoft.io/scale-started annotation (timestamp)   │
-│         ├── Set phase = Scaling                                  │
-│         ├── Set DataRedistribution condition (ScaleOutStarted)   │
-│         ├── Emit ScaleOutStarted event                           │
-│         ├── Update primary StatefulSet replicas                  │
-│         ├── Update mirror StatefulSet replicas (if mirroring)    │
-│         ├── Create redistribution Job                            │
-│         └── Set DataRedistribution condition (InProgress)        │
-│                                                                  │
-│  checkScaleProgress() — called when phase == Scaling             │
-│    │                                                             │
+│         │   └── No → emit ScaleOutBlocked, return (retry later)   │
+│         │                                                         │
+│         ├── Set avsoft.io/scale-started annotation (timestamp)    │
+│         ├── Set phase = Scaling                                   │
+│         ├── Set DataRedistribution condition (ScaleOutStarted)    │
+│         ├── Emit ScaleOutStarted event                            │
+│         ├── Update primary StatefulSet replicas                   │
+│         ├── Update mirror StatefulSet replicas (if mirroring)     │
+│         ├── Create redistribution Job                             │
+│         └── Set DataRedistribution condition (InProgress)         │
+│                                                                   │
+│  checkScaleProgress() — called when phase == Scaling              │
+│    │                                                              │
 │    ├── allSegmentStatefulSetsReady()?                             │
-│    │   ├── Yes → transition to Running                           │
-│    │   │         ├── Set phase = Running                         │
-│    │   │         ├── Update segmentsReady/segmentsTotal          │
-│    │   │         ├── Set DataRedistribution (Completed)          │
-│    │   │         ├── Emit ScaleOutCompleted event                │
-│    │   │         ├── Record scale_operations_total metric        │
-│    │   │         └── Remove avsoft.io/scale-started annotation   │
-│    │   │                                                         │
-│    │   └── No  → check timeout                                   │
+│    │   ├── Yes → transition to Running                            │
+│    │   │         ├── Set phase = Running                          │
+│    │   │         ├── Update segmentsReady/segmentsTotal           │
+│    │   │         ├── Set DataRedistribution (Completed)           │
+│    │   │         ├── Emit ScaleOutCompleted event                 │
+│    │   │         ├── Record scale_operations_total metric         │
+│    │   │         └── Remove avsoft.io/scale-started annotation    │
+│    │   │                                                          │
+│    │   └── No  → check timeout                                    │
 │    │              ├── time.Since(scale-started) > 10m?            │
 │    │              │   └── Yes → handleScaleFailure()              │
 │    │              │              ├── Identify unready segments    │
@@ -392,56 +392,56 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │    │              │              ├── Emit ScaleOutFailed event    │
 │    │              │              ├── Remove scale-started ann.    │
 │    │              │              └── Stay in Scaling (no rollback)│
-│    │              └── No  → requeue after 5s                     │
-└─────────────────────────────────────────────────────────────────┘
+│    │              └── No  → requeue after 5s                      │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │                    Scale-In Flow                                  │
-│                                                                  │
-│  reconcileSegments()                                             │
-│    │                                                             │
-│    ├── Get existing primary StatefulSet                          │
-│    ├── Compare spec.segments.count vs sts.spec.replicas          │
-│    ├── Guard: currentCount > 0 (prevent false scale on restart)  │
-│    │                                                             │
-│    └── If desired < current → handleScaleIn()                    │
-│         │                                                        │
+│                                                                   │
+│  reconcileSegments()                                              │
+│    │                                                              │
+│    ├── Get existing primary StatefulSet                           │
+│    ├── Compare spec.segments.count vs sts.spec.replicas           │
+│    ├── Guard: currentCount > 0 (prevent false scale on restart)   │
+│    │                                                              │
+│    └── If desired < current → handleScaleIn()                     │
+│         │                                                         │
 │         ├── Pre-flight: cluster.Status.Phase == Running?          │
-│         │   └── No → emit ScaleInBlocked, return (retry later)   │
-│         │                                                        │
-│         ├── Safety check: newCount < 50% of oldCount?            │
-│         │   └── Yes → require avsoft.io/confirm-scale-in=true    │
-│         │              └── Missing → emit ScaleInBlocked, return │
-│         │                                                        │
-│         ├── Set avsoft.io/scale-started annotation (timestamp)   │
-│         ├── Set phase = Scaling                                  │
-│         ├── Set DataRedistribution condition (ScaleInStarted)    │
-│         ├── Emit ScaleInStarted event                            │
-│         ├── Create redistribution Job (move data off segments)   │
-│         ├── Scale down mirror StatefulSet (mirrors first)        │
-│         ├── Scale down primary StatefulSet                       │
-│         └── Set DataRedistribution condition (InProgress)        │
-│                                                                  │
-│  checkScaleProgress() — called when phase == Scaling             │
-│    │                                                             │
+│         │   └── No → emit ScaleInBlocked, return (retry later)    │
+│         │                                                         │
+│         ├── Safety check: newCount < 50% of oldCount?             │
+│         │   └── Yes → require avsoft.io/confirm-scale-in=true     │
+│         │              └── Missing → emit ScaleInBlocked, return  │
+│         │                                                         │
+│         ├── Set avsoft.io/scale-started annotation (timestamp)    │
+│         ├── Set phase = Scaling                                   │
+│         ├── Set DataRedistribution condition (ScaleInStarted)     │
+│         ├── Emit ScaleInStarted event                             │
+│         ├── Create redistribution Job (move data off segments)    │
+│         ├── Scale down mirror StatefulSet (mirrors first)         │
+│         ├── Scale down primary StatefulSet                        │
+│         └── Set DataRedistribution condition (InProgress)         │
+│                                                                   │
+│  checkScaleProgress() — called when phase == Scaling              │
+│    │                                                              │
 │    ├── allSegmentStatefulSetsReady()?                             │
-│    │   ├── No  → check timeout (same as scale-out)               │
-│    │   └── Yes → determine scale-in vs scale-out                 │
+│    │   ├── No  → check timeout (same as scale-out)                │
+│    │   └── Yes → determine scale-in vs scale-out                  │
 │    │              │                                               │
 │    │              └── If scale-in (desired < previous total):     │
 │    │                   ├── If deletionPolicy=Delete:              │
 │    │                   │   └── cleanupOrphanedPVCs()              │
-│    │                   │       └── Delete PVCs for indices         │
-│    │                   │           [newCount..oldCount-1]          │
+│    │                   │       └── Delete PVCs for indices        │
+│    │                   │           [newCount..oldCount-1]         │
 │    │                   ├── Set phase = Running                    │
 │    │                   ├── Update segmentsReady/segmentsTotal     │
 │    │                   ├── Set DataRedistribution (Completed)     │
 │    │                   ├── Emit ScaleInCompleted event            │
 │    │                   ├── Record scale_operations_total{scale-in}│
 │    │                   └── Remove avsoft.io/scale-started ann.    │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 **Upgrade lifecycle:**
@@ -457,7 +457,7 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - **Conditions**: `UpgradeCompleted` (True/UpgradeSucceeded), `UpgradeFailed` (True/RolledBack).
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │                    Upgrade Flow                                   │
 │                                                                   │
 │  isUpgradeNeeded()                                                │
@@ -468,7 +468,7 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │  handleUpgrade()                                                  │
 │    │                                                              │
 │    ├── Pre-flight: cluster.Status.Phase == Running?               │
-│    │   └── No → emit UpgradeBlocked, return (retry later)        │
+│    │   └── No → emit UpgradeBlocked, return (retry later)         │
 │    │                                                              │
 │    ├── Capture current image from coordinator StatefulSet         │
 │    ├── Store state in avsoft.io/upgrade annotation (JSON)         │
@@ -481,12 +481,12 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │    ├── Parse upgrade state from annotation                        │
 │    ├── Check phase timeout: time.Since(phaseStartedAt) > 10m?     │
 │    │   └── Yes → rollbackUpgrade()                                │
-│    │              ├── Revert ALL StatefulSets to previousImage     │
-│    │              ├── Set phase = Running                          │
-│    │              ├── Restore clusterVersion = previousVersion     │
-│    │              ├── Set UpgradeFailed=True (reason=RolledBack)   │
-│    │              ├── Remove avsoft.io/upgrade annotation          │
-│    │              └── Emit UpgradeRollback event                   │
+│    │              ├── Revert ALL StatefulSets to previousImage    │
+│    │              ├── Set phase = Running                         │
+│    │              ├── Restore clusterVersion = previousVersion    │
+│    │              ├── Set UpgradeFailed=True (reason=RolledBack)  │
+│    │              ├── Remove avsoft.io/upgrade annotation         │
+│    │              └── Emit UpgradeRollback event                  │
 │    │                                                              │
 │    └── Dispatch by phase:                                         │
 │         ├── mirrors     → upgradePhase(mirror STS, next=primaries)│
@@ -494,9 +494,9 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │         ├── standby     → upgradePhase(standby STS, next=coord)   │
 │         ├── coordinator → upgradePhase(coord STS, next=verify)    │
 │         └── verify      → verifyUpgrade()                         │
-│                            ├── Coordinator ready?                  │
-│                            ├── Primaries ready?                    │
-│                            └── Yes → completeUpgrade()             │
+│                            ├── Coordinator ready?                 │
+│                            ├── Primaries ready?                   │
+│                            └── Yes → completeUpgrade()            │
 │                                       ├── Set phase = Running     │
 │                                       ├── Update clusterVersion   │
 │                                       ├── Set UpgradeCompleted    │
@@ -506,10 +506,10 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │  upgradePhase(stsName, componentEnabled, nextPhase)               │
 │    │                                                              │
 │    ├── Component not enabled? → skip, advance to nextPhase        │
-│    ├── Update StatefulSet image via updateStatefulSetImage()       │
+│    ├── Update StatefulSet image via updateStatefulSetImage()      │
 │    ├── StatefulSet ready? → advance to nextPhase                  │
 │    └── Not ready → requeue after 5s                               │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 **Stop/Start/Restart lifecycle:**
@@ -523,7 +523,7 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 - **`storageClassSupportsExpansion()`**: Pre-flight check that verifies the PVC's StorageClass allows volume expansion. Returns `(allowed bool, reason string)`.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │              Storage Expansion Flow                               │
 │                                                                   │
 │  reconcileStorageExpansion()                                      │
@@ -562,8 +562,8 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │      └── Patch PVC spec.resources.requests.storage                │
 │                                                                   │
 │    If blocked:                                                    │
-│      └── Log WARN with PVC name, SC name, reason,                │
-│          current size, desired size                                │
+│      └── Log WARN with PVC name, SC name, reason,                 │
+│          current size, desired size                               │
 │          (no error returned — reconciliation continues)           │
 │                                                                   │
 │  After all PVCs processed:                                        │
@@ -572,7 +572,7 @@ The Cluster Controller is the primary reconciler. It manages the full lifecycle 
 │    │   ├── Emit StorageExpanded event                             │
 │    │   └── Record cloudberry_pvc_size_bytes metric                │
 │    └── If no PVCs expanded: no condition/event changes            │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 All metrics are registered with `ctrlmetrics.Registry` (controller-runtime's metrics registry) to ensure they are exposed on the `/metrics` endpoint.
@@ -582,9 +582,9 @@ All metrics are registered with `ctrlmetrics.Registry` (controller-runtime's met
 The HA Controller manages fault tolerance and recovery:
 
 ```
-┌─────────────────────────────────────────────────┐
-│                 HA Controller                     │
-│                                                   │
+┌──────────────────────────────────────────────────┐
+│                 HA Controller                    │
+│                                                  │
 │  ┌─────────────────────────────────────────────┐ │
 │  │  FTS Probe Loop (every ftsProbeInterval)    │ │
 │  │                                             │ │
@@ -593,7 +593,7 @@ The HA Controller manages fault tolerance and recovery:
 │  │    2. SQL ping (SELECT 1)                   │ │
 │  │    3. If fails after retries → failover     │ │
 │  └─────────────────────────────────────────────┘ │
-│                                                   │
+│                                                  │
 │  ┌─────────────────────────────────────────────┐ │
 │  │  Failover Handler                           │ │
 │  │                                             │ │
@@ -603,7 +603,7 @@ The HA Controller manages fault tolerance and recovery:
 │  │  4. Emit SegmentFailover event              │ │
 │  │  5. Update metrics and CR status            │ │
 │  └─────────────────────────────────────────────┘ │
-│                                                   │
+│                                                  │
 │  ┌─────────────────────────────────────────────┐ │
 │  │  Recovery Acknowledger (NOT implemented)    │ │
 │  │                                             │ │
@@ -615,7 +615,7 @@ The HA Controller manages fault tolerance and recovery:
 │  │  - records metric result="noop"             │ │
 │  │  (no gprecoverseg-equivalent work yet)      │ │
 │  └─────────────────────────────────────────────┘ │
-│                                                   │
+│                                                  │
 │  ┌─────────────────────────────────────────────┐ │
 │  │  Standby Manager                            │ │
 │  │                                             │ │
@@ -626,7 +626,7 @@ The HA Controller manages fault tolerance and recovery:
 │  │    (pg_promote), at-most-once semantics     │ │
 │  │  - Handle reinitialize-standby              │ │
 │  └─────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────┘
 ```
 
 ### Auth Controller
@@ -668,44 +668,44 @@ Manages configuration, rolling restarts, maintenance, and workload management:
 **Workload reconciliation flow:**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Workload Reconciliation Flow                         │
-│                                                                   │
-│  reconcileWorkload()                                              │
-│    │                                                              │
-│    ├── spec.workload.enabled == false? → skip                     │
-│    │                                                              │
-│    ├── dbFactory == nil? → condition-only mode                    │
-│    │   └── Set WorkloadConfigured (condition only, no DB ops)     │
-│    │                                                              │
-│    ├── dbFactory.NewClient() fails?                               │
-│    │   └── Set WorkloadConfigured=False/DBUnavailable             │
-│    │       (reconciliation continues, no error returned)          │
-│    │                                                              │
-│    └── DB available:                                              │
-│         │                                                         │
-│         ├── 1. Resource Group Diff                                │
-│         │   ├── ListResourceGroups() → actual groups from DB      │
+┌────────────────────────────────────────────────────────────────────┐
+│              Workload Reconciliation Flow                          │
+│                                                                    │
+│  reconcileWorkload()                                               │
+│    │                                                               │
+│    ├── spec.workload.enabled == false? → skip                      │
+│    │                                                               │
+│    ├── dbFactory == nil? → condition-only mode                     │
+│    │   └── Set WorkloadConfigured (condition only, no DB ops)      │
+│    │                                                               │
+│    ├── dbFactory.NewClient() fails?                                │
+│    │   └── Set WorkloadConfigured=False/DBUnavailable              │
+│    │       (reconciliation continues, no error returned)           │
+│    │                                                               │
+│    └── DB available:                                               │
+│         │                                                          │
+│         ├── 1. Resource Group Diff                                 │
+│         │   ├── ListResourceGroups() → actual groups from DB       │
 │         │   ├── Build desired map from spec.workload.resourceGroups│
-│         │   ├── For each desired not in actual:                   │
-│         │   │   └── CreateResourceGroup(opts)                     │
-│         │   ├── For each desired in actual with changed params:   │
-│         │   │   └── AlterResourceGroup(opts)                      │
-│         │   └── For each actual not in desired:                   │
-│         │       └── DropResourceGroup(name)                       │
-│         │                                                         │
-│         ├── 2. ConfigMap Storage                                  │
-│         │   ├── Serialize spec.workload.rules → rules.json        │
+│         │   ├── For each desired not in actual:                    │
+│         │   │   └── CreateResourceGroup(opts)                      │
+│         │   ├── For each desired in actual with changed params:    │
+│         │   │   └── AlterResourceGroup(opts)                       │
+│         │   └── For each actual not in desired:                    │
+│         │       └── DropResourceGroup(name)                        │
+│         │                                                          │
+│         ├── 2. ConfigMap Storage                                   │
+│         │   ├── Serialize spec.workload.rules → rules.json         │
 │         │   ├── Serialize spec.workload.idleRules → idle-rules.json│
-│         │   └── Create/Update {cluster}-workload-rules ConfigMap  │
-│         │                                                         │
-│         ├── 3. Metrics Update                                     │
-│         │   └── For each resource group:                          │
-│         │       └── GetResourceGroupUsage() → update CPU/mem      │
+│         │   └── Create/Update {cluster}-workload-rules ConfigMap   │
+│         │                                                          │
+│         ├── 3. Metrics Update                                      │
+│         │   └── For each resource group:                           │
+│         │       └── GetResourceGroupUsage() → update CPU/mem       │
 │         │           metrics gauges                                 │
-│         │                                                         │
-│         └── 4. Set WorkloadConfigured=True/WorkloadReconciled     │
-└─────────────────────────────────────────────────────────────────┘
+│         │                                                          │
+│         └── 4. Set WorkloadConfigured=True/WorkloadReconciled      │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Authentication Architecture
@@ -713,43 +713,43 @@ Manages configuration, rolling restarts, maintenance, and workload management:
 The operator API supports dual-mode authentication:
 
 ```
-┌──────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────────────────┐
 │                  Incoming Request                      │
-│                                                       │
-│  Authorization: Basic base64(user:pass)               │
-│  -- OR --                                             │
-│  Authorization: Bearer <JWT token>                    │
-└──────────────────┬───────────────────────────────────┘
+│                                                        │
+│  Authorization: Basic base64(user:pass)                │
+│  -- OR --                                              │
+│  Authorization: Bearer <JWT token>                     │
+└──────────────────┬─────────────────────────────────────┘
                    │
                    ▼
-┌──────────────────────────────────────────────────────┐
-│               Auth Middleware Chain                    │
+┌───────────────────────────────────────────────────────┐
+│               Auth Middleware Chain                   │
 │                                                       │
 │  1. Extract Authorization header                      │
 │  2. Detect auth type (Basic vs Bearer)                │
 │  3. Route to appropriate provider                     │
 │                                                       │
-│  ┌────────────────┐    ┌───────────────────────────┐ │
-│  │  Basic Auth    │    │  OIDC/JWT Auth            │ │
-│  │  Provider      │    │  Provider                 │ │
-│  │                │    │                           │ │
-│  │  - Validate    │    │  - Verify JWT signature   │ │
-│  │    credentials │    │  - Check issuer/audience  │ │
-│  │  - Check admin │    │  - Check expiry           │ │
-│  │    secret      │    │  - Extract role claims    │ │
-│  │  - Check DB    │    │  - Map roles → perms      │ │
-│  │    roles       │    │                           │ │
-│  └───────┬────────┘    └─────────────┬─────────────┘ │
+│  ┌────────────────┐    ┌───────────────────────────┐  │
+│  │  Basic Auth    │    │  OIDC/JWT Auth            │  │
+│  │  Provider      │    │  Provider                 │  │
+│  │                │    │                           │  │
+│  │  - Validate    │    │  - Verify JWT signature   │  │
+│  │    credentials │    │  - Check issuer/audience  │  │
+│  │  - Check admin │    │  - Check expiry           │  │
+│  │    secret      │    │  - Extract role claims    │  │
+│  │  - Check DB    │    │  - Map roles → perms      │  │
+│  │    roles       │    │                           │  │
+│  └───────┬────────┘    └─────────────┬─────────────┘  │
 │          └──────────┬────────────────┘                │
 │                     ▼                                 │
-│  ┌──────────────────────────────────────────────────┐│
+│  ┌───────────────────────────────────────────────────┐│
 │  │          Permission Resolver                      ││
 │  │                                                   ││
-│  │  Determine effective permission level:             ││
+│  │  Determine effective permission level:            ││
 │  │  Self Only → Basic → Operator Basic →             ││
 │  │  Operator → Admin                                 ││
-│  └──────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────────┘
+│  └───────────────────────────────────────────────────┘│
+└───────────────────────────────────────────────────────┘
 ```
 
 ### Permission Levels
@@ -813,23 +813,23 @@ The operator supports enabling and disabling mirroring on existing clusters. Thi
                     │  Initializing   │                               │
                     │  - Create mirror│                               │
                     │    StatefulSet  │                               │
-                    │  - Init WAL    │                               │
+                    │  - Init WAL     │                               │
                     │    replication  │                               │
                     └────────┬────────┘                               │
                              │ mirrors created,                       │
                              │ replication started                    │
                     ┌────────▼────────┐                               │
                     │    Syncing      │                               │
-                    │  - WAL replay  │                               │
+                    │  - WAL replay   │                               │
                     │  - Lag decreases│                               │
                     └───┬─────────┬───┘                               │
                         │         │                                   │
                    lag=0│         │ timeout (30m)                     │
                         │         │                                   │
-               ┌────────▼───┐ ┌───▼──────────┐                       │
-               │   InSync   │ │   Degraded   │                       │
+               ┌────────▼───┐ ┌───▼───────────┐                       │
+               │   InSync   │ │   Degraded    │                       │
                │            │ │  (manual fix) │                       │
-               └────────┬───┘ └──────────────┘                       │
+               └────────┬───┘ └───────────────┘                       │
                         │                                             │
                         │ spec.mirroring.enabled=false                │
                         │ (cluster must be Running)                   │
@@ -897,7 +897,7 @@ The FTS probe runs on every HA reconciliation cycle and uses a retry mechanism t
 #### FTS Probe Retry Mechanism
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────┐
 │              FTS Probe with Retry                                │
 │                                                                  │
 │  probeSegmentConfigWithRetries()                                 │
@@ -919,7 +919,7 @@ The FTS probe runs on every HA reconciliation cycle and uses a retry mechanism t
 │                                                                  │
 │    All attempts exhausted → return error                         │
 │    (retried on next reconciliation cycle)                        │
-└─────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 #### Automatic Failover Flow
@@ -927,7 +927,7 @@ The FTS probe runs on every HA reconciliation cycle and uses a retry mechanism t
 When the FTS probe detects failed primary segments and mirroring is enabled, the operator triggers Cloudberry's internal failover mechanism:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │              Automatic Failover Flow                              │
 │                                                                   │
 │  runFTSProbe()                                                    │
@@ -936,26 +936,26 @@ When the FTS probe detects failed primary segments and mirroring is enabled, the
 │    ├── probeSegmentConfigWithRetries() — get segment status       │
 │    ├── analyzeSegments() — identify failed segments               │
 │    │                                                              │
-│    └── If failedPrimaries > 0 AND mirroring enabled:             │
-│         │                                                        │
-│         └── handleFailover()                                     │
-│              │                                                   │
-│              ├── 1. TriggerFTSProbe(ctx)                         │
+│    └── If failedPrimaries > 0 AND mirroring enabled:              │
+│         │                                                         │
+│         └── handleFailover()                                      │
+│              │                                                    │
+│              ├── 1. TriggerFTSProbe(ctx)                          │
 │              │      Calls Cloudberry's internal FTS scan          │
 │              │      Cloudberry promotes mirror → primary          │
 │              │      (continues even if trigger fails)             │
-│              │                                                   │
+│              │                                                    │
 │              ├── 2. GetSegmentConfiguration(ctx)                  │
 │              │      Re-read to verify promotion result            │
-│              │                                                   │
+│              │                                                    │
 │              ├── 3. For each failed primary:                      │
 │              │      ├── Check if mirror now holds primary role    │
 │              │      │   (different DBID for same contentID)       │
 │              │      ├── Emit SegmentFailover event                │
 │              │      │   (includes old/new primary hostnames)      │
 │              │      └── Update per-segment status metric          │
-│              │                                                   │
-│              └── 4. RecordFTSFailover() — increment              │
+│              │                                                    │
+│              └── 4. RecordFTSFailover() — increment               │
 │                     cloudberry_fts_failover_total                 │
 │                                                                   │
 │    updateFTSProbeStatus()                                         │
@@ -968,7 +968,7 @@ When the FTS probe detects failed primary segments and mirroring is enabled, the
 │                                                                   │
 │    patchFTSStatus() — MergePatch status to API server             │
 │      (always includes failedSegments, even when empty)            │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 #### Detection → Failover → Verification Lifecycle
@@ -1123,9 +1123,9 @@ Wrapper Errors (preserve inner error chain)
 The `RetryWithBackoff()` function in `internal/util/retry.go` provides a generic retry mechanism used throughout the operator for transient failure recovery.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                  RetryWithBackoff Flow                            │
-│                                                                   │
+┌──────────────────────────────────────────────────────────────────┐
+│                  RetryWithBackoff Flow                           │
+│                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  For attempt = 0 to MaxRetries:                          │    │
 │  │                                                          │    │
@@ -1135,15 +1135,15 @@ The `RetryWithBackoff()` function in `internal/util/retry.go` provides a generic
 │  │     └── error → continue to backoff                      │    │
 │  │  3. Calculate backoff:                                   │    │
 │  │     sleep = min(initialBackoff × multiplier^attempt,     │    │
-│  │                  maxBackoff)                              │    │
+│  │                  maxBackoff)                             │    │
 │  │     sleep += jitter(sleep × jitterFraction)              │    │
 │  │  4. select:                                              │    │
 │  │     ├── ctx.Done() → return "context canceled"           │    │
 │  │     └── time.After(sleep) → next attempt                 │    │
 │  └──────────────────────────────────────────────────────────┘    │
-│                                                                   │
+│                                                                  │
 │  All attempts exhausted → return ErrRetryExhausted + lastErr     │
-└─────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 **Key behaviors:**
@@ -1164,20 +1164,20 @@ When a reconciliation cycle encounters an error, the operator follows this flow:
 └────────┬─────────┘
          │
     ┌────▼────────────┐
-    │  Execute logic   │
+    │  Execute logic  │
     └────┬────────┬───┘
     success       error
          │            │
-    ┌────▼────┐  ┌────▼──────────────────────────┐
+    ┌────▼────┐  ┌────▼───────────────────────────┐
     │ Record  │  │ Record metrics:                │
     │ metrics:│  │   RecordReconcile(             │
     │ success │  │     cluster, ns, "error", dur) │
     │         │  │ Set span error:                │
     └────┬────┘  │   SetSpanError(span, err)      │
-         │       │ Log structured error:           │
-         │       │   slog.Error("reconciliation    │
-         │       │     failed", "cluster", name,   │
-         │       │     "error", err)               │
+         │       │ Log structured error:          │
+         │       │   slog.Error("reconciliation   │
+         │       │     failed", "cluster", name,  │
+         │       │     "error", err)              │
          │       └────────────────────────────────┘
          │
     ┌────▼────────────────┐
@@ -1262,7 +1262,7 @@ The operator embeds a REST API server that starts alongside the controller manag
 ```
 ┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │  Client  │───▶│  Rate Limiter│───▶│  Auth        │───▶│  Permission  │
-│  Request │    │  (per-IP     │    │  Middleware   │    │  Check       │
+│  Request │    │  (per-IP     │    │  Middleware  │    │  Check       │
 │          │    │   token      │    │  (Basic/JWT) │    │              │
 │          │    │   bucket)    │    │              │    │              │
 └──────────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
@@ -1335,8 +1335,8 @@ The API server starts in a background goroutine from the operator `main()` funct
 The idle session enforcement daemon (`internal/idle`) maintains a persistent database connection for scanning and terminating idle sessions. To handle connection failures gracefully, the daemon implements a health check loop with automatic reconnection using exponential backoff.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Idle Daemon Connection Lifecycle                      │
+┌───────────────────────────────────────────────────────────────────┐
+│              Idle Daemon Connection Lifecycle                     │
 │                                                                   │
 │  Start()                                                          │
 │    │                                                              │
@@ -1367,7 +1367,7 @@ The idle session enforcement daemon (`internal/idle`) maintains a persistent dat
 │         │   └── Failure → consecutiveFails++                      │
 │         │                  └── if >= 3 → reconnect(ctx)           │
 │         └── Terminate idle sessions matching rules                │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
@@ -1382,12 +1382,12 @@ The idle session enforcement daemon (`internal/idle`) maintains a persistent dat
 The `executeRebalanceViaDB()` method in the HA Controller processes tables concurrently using a semaphore to limit parallelism. To prevent goroutine leaks when the reconciliation context is canceled (e.g., operator shutdown), the semaphore acquisition uses a `select` statement:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Context-Aware Semaphore Acquisition                   │
+┌───────────────────────────────────────────────────────────────────┐
+│              Context-Aware Semaphore Acquisition                  │
 │                                                                   │
 │  executeRebalanceViaDB(ctx, cluster, threshold, parallelism, ...) │
 │    │                                                              │
-│    ├── Create semaphore channel (capacity = parallelism)           │
+│    ├── Create semaphore channel (capacity = parallelism)          │
 │    │                                                              │
 │    └── For each skewed table:                                     │
 │         │                                                         │
@@ -1395,12 +1395,12 @@ The `executeRebalanceViaDB()` method in the HA Controller processes tables concu
 │         │   ├── case <-ctx.Done():                                │
 │         │   │   └── return ctx.Err()  (no goroutine leak)         │
 │         │   │                                                     │
-│         │   └── case sem <- struct{}{}:                            │
+│         │   └── case sem <- struct{}{}:                           │
 │         │       └── Launch goroutine to redistribute table        │
-│         │           └── defer: release semaphore (<-sem)           │
+│         │           └── defer: release semaphore (<-sem)          │
 │         │                                                         │
 │         └── Wait for all goroutines to complete                   │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 Without the `ctx.Done()` check, goroutines waiting to acquire the semaphore would block indefinitely if the context is canceled, causing a goroutine leak. The `select` ensures prompt cleanup.
@@ -1410,8 +1410,8 @@ Without the `ctx.Done()` check, goroutines waiting to acquire the semaphore woul
 The Admin Controller's `reconcileConfig()` method creates a single shared database client for all parameter operations within a reconciliation cycle:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              reconcileConfig() — Shared DB Client                  │
+┌───────────────────────────────────────────────────────────────────┐
+│              reconcileConfig() — Shared DB Client                 │
 │                                                                   │
 │  1. Detect config changes (hash comparison)                       │
 │  2. Create ONE DB client via DBClientFactory                      │
@@ -1423,7 +1423,7 @@ The Admin Controller's `reconcileConfig()` method creates a single shared databa
 │                                                                   │
 │  Each handler: if sharedClient == nil → skip with debug log       │
 │  (no error returned, graceful degradation)                        │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 This consolidation reduces database connections per reconciliation from 3 to 1 and ensures consistent connection state across all parameter operations.
@@ -1435,7 +1435,7 @@ The `DBClientFactory` interface is defined in `internal/db/factory.go` as a shar
 Both controllers and the API server use the factory instead of creating database clients directly.
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+┌──────────────────┐     ┌───────────────────┐     ┌──────────────────┐
 │   Controller     │────▶│  DBClientFactory  │────▶│   DB Client      │
 │  (HA, Admin)     │     │                   │     │   (pgx)          │
 └──────────────────┘     └────────┬──────────┘     └──────────────────┘
@@ -1443,7 +1443,7 @@ Both controllers and the API server use the factory instead of creating database
 ┌──────────────────┐              │
 │   API Server     │──────────────┘
 │  (Sessions)      │
-└──────────────────┘     ┌───────────────────┐
+└──────────────────┘     ┌────────────────────┐
                          │  Resolves:         │
                          │  - Coordinator     │
                          │    service host    │
@@ -1452,7 +1452,7 @@ Both controllers and the API server use the factory instead of creating database
                          │    from K8s Secret │
                          │  - Username from   │
                          │    spec or default │
-                         └───────────────────┘
+                         └────────────────────┘
 ```
 
 **Key behaviors:**
@@ -1467,12 +1467,12 @@ Both controllers and the API server use the factory instead of creating database
 The API server receives a `DBClientFactory` at startup (injected from `cmd/operator/main.go`). The factory is used by session management handlers to create short-lived database connections:
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
+┌──────────────┐     ┌──────────────┐     ┌───────────────────┐     ┌──────────────┐
 │  HTTP Client │────▶│  API Server  │────▶│  DBClientFactory  │────▶│  PostgreSQL  │
 │  (ctl/curl)  │     │  (handler)   │     │                   │     │  Coordinator │
 └──────────────┘     └──────┬───────┘     └───────────────────┘     └──────────────┘
                             │
-                   ┌────────▼────────┐
+                   ┌────────▼─────────┐
                    │  Session Flow:   │
                    │  1. Resolve      │
                    │     cluster CR   │
@@ -1485,7 +1485,7 @@ The API server receives a `DBClientFactory` at startup (injected from `cmd/opera
                    │      terminate_  │
                    │      backend)    │
                    │  4. Close client │
-                   └─────────────────┘
+                   └──────────────────┘
 ```
 
 **Session operation flow:**
@@ -1546,8 +1546,8 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                  Cert Manager                                │
-│                                                              │
+│                  Cert Manager                               │
+│                                                             │
 │  ┌────────────────────┐    ┌─────────────────────────────┐  │
 │  │  Vault PKI         │    │  Self-Signed (fallback)     │  │
 │  │  (preferred)       │    │                             │  │
@@ -1556,23 +1556,23 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 │  │    via PKI engine  │    │  - CA valid for 10 years    │  │
 │  │    using           │    │  - Server cert validity     │  │
 │  │    WriteSecret     │    │    configurable (default    │  │
-│  │    (write op)      │    │    1 year)                   │  │
+│  │    (write op)      │    │    1 year)                  │  │
 │  └────────┬───────────┘    └──────────────┬──────────────┘  │
-│           └──────────┬───────────────────┘                   │
-│                      ▼                                       │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  Kubernetes Secret (TLS type)                         │   │
-│  │  - ca.crt   (CA certificate PEM)                      │   │
-│  │  - tls.crt  (server certificate PEM)                  │   │
-│  │  - tls.key  (server private key PEM)                  │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                      │                                       │
-│                      ▼                                       │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  CA Bundle Injection                                  │   │
-│  │  → ValidatingWebhookConfiguration.caBundle            │   │
-│  │  → MutatingWebhookConfiguration.caBundle              │   │
-│  └───────────────────────────────────────────────────────┘   │
+│           └──────────┬────────────────────┘                 │
+│                      ▼                                      │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  Kubernetes Secret (TLS type)                         │  │
+│  │  - ca.crt   (CA certificate PEM)                      │  │
+│  │  - tls.crt  (server certificate PEM)                  │  │
+│  │  - tls.key  (server private key PEM)                  │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                      │                                      │
+│                      ▼                                      │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  CA Bundle Injection                                  │  │
+│  │  → ValidatingWebhookConfiguration.caBundle            │  │
+│  │  → MutatingWebhookConfiguration.caBundle              │  │
+│  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1634,7 +1634,7 @@ When Vault integration is enabled, token renewal and re-authentication are **aut
 The operator starts a background goroutine for periodic webhook certificate rotation checks. To ensure clean shutdown, the goroutine is tracked with a `sync.WaitGroup` in `cmd/operator/main.go`:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │              Operator Shutdown with WaitGroup                     │
 │                                                                   │
 │  main()                                                           │
@@ -1645,15 +1645,15 @@ The operator starts a background goroutine for periodic webhook certificate rota
 │    ├── go startCertRotation(ctx, certManager, &backgroundWg)      │
 │    │    └── defer backgroundWg.Done()                             │
 │    │        └── Checks NeedsRotation() every 12 hours             │
-│    │            └── Calls EnsureCertificates() when needed         │
+│    │            └── Calls EnsureCertificates() when needed        │
 │    │                                                              │
 │    ├── ... (start controller manager, API server, etc.)           │
 │    │                                                              │
 │    └── On shutdown signal:                                        │
 │         ├── Cancel context → goroutine exits its ticker loop      │
 │         └── backgroundWg.Wait() → blocks until goroutine returns  │
-│              └── Process exits cleanly                             │
-└─────────────────────────────────────────────────────────────────┘
+│              └── Process exits cleanly                            │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 **Why this matters**: Without the WaitGroup, the operator process could exit while the cert rotation goroutine is still running, potentially leaving a half-written certificate Secret. The WaitGroup ensures the goroutine completes its current operation before the process terminates.
@@ -1663,7 +1663,7 @@ The operator starts a background goroutine for periodic webhook certificate rota
 The `cloudberry-ctl` CLI's `upsertRule` function was refactored to accept a shared `context.Context` and HTTP client instead of creating new ones per invocation. This improves performance during bulk rule imports:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────┐
 │              Before: Per-Rule Client Creation                     │
 │                                                                   │
 │  for each rule in file:                                           │
@@ -1677,7 +1677,7 @@ The `cloudberry-ctl` CLI's `upsertRule` function was refactored to accept a shar
 │  client := newOperatorClient()             ← one HTTP client      │
 │  for each rule in file:                                           │
 │    upsertRule(ctx, client, rule)           ← reuses connection    │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 **Benefits**:

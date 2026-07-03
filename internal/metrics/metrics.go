@@ -99,6 +99,10 @@ type Recorder interface {
 	SetStandbyReplicationLag(cluster, namespace string, bytes float64)
 	// RecordConfigReload records a configuration reload event.
 	RecordConfigReload(cluster, namespace string)
+	// InitConfigReload registers the config-reload counter series at 0 for a
+	// cluster (without incrementing), so dashboards show 0 instead of "No data"
+	// for a deployed cluster that has not reloaded its config yet.
+	InitConfigReload(cluster, namespace string)
 	// SetConnectionsActive sets the number of active connections.
 	SetConnectionsActive(cluster, namespace string, count float64)
 	// SetConnectionsMax sets the maximum number of connections.
@@ -1483,6 +1487,14 @@ func (r *PrometheusRecorder) RecordConfigReload(cluster, namespace string) {
 	r.configReloadTotal.WithLabelValues(cluster, namespace).Inc()
 }
 
+// InitConfigReload registers the config-reload counter series at 0 for a cluster
+// without incrementing it. Calling WithLabelValues materializes the series so it
+// is exported as 0, which lets dashboards render 0 (not "No data") for a deployed
+// cluster that has not yet reloaded its configuration. Idempotent.
+func (r *PrometheusRecorder) InitConfigReload(cluster, namespace string) {
+	r.configReloadTotal.WithLabelValues(cluster, namespace).Add(0)
+}
+
 // SetConnectionsActive sets the number of active connections.
 func (r *PrometheusRecorder) SetConnectionsActive(cluster, namespace string, count float64) {
 	r.connectionsActive.WithLabelValues(cluster, namespace).Set(count)
@@ -2095,6 +2107,9 @@ func (n *NoopRecorder) SetStandbyReplicationLag(_, _ string, _ float64) {}
 
 // RecordConfigReload is a no-op implementation for testing.
 func (n *NoopRecorder) RecordConfigReload(_, _ string) {}
+
+// InitConfigReload is a no-op implementation for testing.
+func (n *NoopRecorder) InitConfigReload(_, _ string) {}
 
 // SetConnectionsActive is a no-op implementation for testing.
 func (n *NoopRecorder) SetConnectionsActive(_, _ string, _ float64) {}
