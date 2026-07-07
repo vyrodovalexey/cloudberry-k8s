@@ -1648,20 +1648,29 @@ func TestPgxClient_RedistributeData_Mock(t *testing.T) {
 	})
 
 	t.Run("redistribution with databases and tables", func(t *testing.T) {
-		tableFields := []fieldDesc{textField("schema_name"), textField("table_name"), textField("dist_key")}
+		// D7: the scale-out path enumerates from gp_distribution_policy the
+		// tables not yet at the target width and issues ALTER TABLE EXPAND TABLE.
+		expandFields := []fieldDesc{
+			textField("schema_name"), textField("table_name"), int4Field("numsegments"),
+		}
 		client, cleanup := newMockPgxClientExtended(t, func(query string) []byte {
 			switch {
 			case strings.Contains(query, "datistemplate"):
 				return multiRowResponse([]string{"datname"}, [][]string{
 					{"testdb"},
 				})
-			case strings.Contains(query, "pg_class") && strings.Contains(query, "relkind"):
-				return multiRowResponseTyped(tableFields, [][]string{
-					{"public", "orders", "customer_id"},
-					{"public", "events", ""},
-					{"public", "excluded_table", "id"},
+			case strings.Contains(query, "gp_segment_configuration"):
+				return singleRowResponseTyped([]fieldDesc{int4Field("count")}, []string{"3"})
+			case strings.Contains(query, "gp_distribution_policy"):
+				return multiRowResponseTyped(expandFields, [][]string{
+					{"public", "orders", "2"},
+					{"public", "events", "2"},
+					{"public", "excluded_table", "2"},
 				})
-			case strings.Contains(query, "ALTER TABLE"):
+			case strings.Contains(query, "gp_dist_random"):
+				// D8 preflight: relations present on all target segments.
+				return singleRowResponseTyped([]fieldDesc{int4Field("count")}, []string{"3"})
+			case strings.Contains(query, "EXPAND TABLE"):
 				return execResponse("ALTER TABLE")
 			default:
 				return execResponse("SELECT 1")
@@ -1677,14 +1686,20 @@ func TestPgxClient_RedistributeData_Mock(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("redistribution table query error continues", func(t *testing.T) {
+	t.Run("redistribution table query error propagates", func(t *testing.T) {
+		// D1: a database-level failure (for example, a rejected TLS connection
+		// or an unusable database) must NOT be silently swallowed. It is
+		// aggregated and returned so the scale controller does not mark the
+		// cluster Running when redistribution actually failed.
 		client, cleanup := newMockPgxClientExtended(t, func(query string) []byte {
 			switch {
 			case strings.Contains(query, "datistemplate"):
 				return multiRowResponse([]string{"datname"}, [][]string{
 					{"testdb"},
 				})
-			case strings.Contains(query, "pg_class"):
+			case strings.Contains(query, "gp_segment_configuration"):
+				return singleRowResponseTyped([]fieldDesc{int4Field("count")}, []string{"3"})
+			case strings.Contains(query, "gp_distribution_policy"):
 				return errorResponseMsg("table query failed")
 			default:
 				return execResponse("SELECT 1")
@@ -1695,23 +1710,33 @@ func TestPgxClient_RedistributeData_Mock(t *testing.T) {
 		err := client.RedistributeData(context.Background(), RedistributionOptions{
 			Parallelism: 2,
 		})
-		assert.NoError(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redistribution failed for 1 of 1 databases")
 	})
 
-	t.Run("redistribution alter table error continues", func(t *testing.T) {
-		tableFields := []fieldDesc{textField("schema_name"), textField("table_name"), textField("dist_key")}
+	t.Run("redistribution expand table error surfaces per-db", func(t *testing.T) {
+		// D7: a failed ALTER TABLE EXPAND TABLE for a table is aggregated and
+		// surfaced (errors.Join) so a silently-empty new segment is not masked.
+		expandFields := []fieldDesc{
+			textField("schema_name"), textField("table_name"), int4Field("numsegments"),
+		}
 		client, cleanup := newMockPgxClientExtended(t, func(query string) []byte {
 			switch {
 			case strings.Contains(query, "datistemplate"):
 				return multiRowResponse([]string{"datname"}, [][]string{
 					{"testdb"},
 				})
-			case strings.Contains(query, "pg_class") && strings.Contains(query, "relkind"):
-				return multiRowResponseTyped(tableFields, [][]string{
-					{"public", "orders", "customer_id"},
+			case strings.Contains(query, "gp_segment_configuration"):
+				return singleRowResponseTyped([]fieldDesc{int4Field("count")}, []string{"3"})
+			case strings.Contains(query, "gp_distribution_policy"):
+				return multiRowResponseTyped(expandFields, [][]string{
+					{"public", "orders", "2"},
 				})
-			case strings.Contains(query, "ALTER TABLE"):
-				return errorResponseMsg("alter failed")
+			case strings.Contains(query, "gp_dist_random"):
+				// D8 preflight passes so the EXPAND error path is reached.
+				return singleRowResponseTyped([]fieldDesc{int4Field("count")}, []string{"3"})
+			case strings.Contains(query, "EXPAND TABLE"):
+				return errorResponseMsg("expand failed")
 			default:
 				return execResponse("SELECT 1")
 			}
@@ -1719,7 +1744,9 @@ func TestPgxClient_RedistributeData_Mock(t *testing.T) {
 		defer cleanup()
 
 		err := client.RedistributeData(context.Background(), RedistributionOptions{})
-		assert.NoError(t, err)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redistribution failed for 1 of 1 databases")
+		assert.Contains(t, err.Error(), "expand failed for 1 of 1 tables")
 	})
 }
 

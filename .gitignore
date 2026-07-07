@@ -38,3 +38,7 @@ md_docs
 *.swp
 *.swo
 *~
+test/e2e/okd4/
+deploy/okd4
+#ssh
+.ssh

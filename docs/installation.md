@@ -6,6 +6,7 @@ This guide covers installing the Cloudberry Operator on a Kubernetes cluster, co
 
 - [Prerequisites](#prerequisites)
 - [Helm Installation](#helm-installation)
+- [OKD4 / OpenShift](#okd4--openshift)
 - [Configuration Options](#configuration-options)
   - [Webhook Certificate Configuration](#webhook-certificate-configuration)
   - [API Admin Password](#api-admin-password)
@@ -146,6 +147,41 @@ kubectl logs -n cloudberry-system deployment/cloudberry-operator
 kubectl get validatingwebhookconfigurations | grep cloudberry
 kubectl get mutatingwebhookconfigurations | grep cloudberry
 ```
+
+## OKD4 / OpenShift
+
+The chart supports **OKD4 / OpenShift** as a first-class deployment target while
+remaining fully backward-compatible with vanilla Kubernetes. Enable it with
+`openshift.enabled=true`:
+
+```bash
+helm upgrade --install cloudberry-operator deploy/helm/cloudberry-operator \
+  --namespace greenplum --create-namespace \
+  --set openshift.enabled=true
+```
+
+With `openshift.enabled=true` the chart:
+
+- Renders an **OKD-aware operator securityContext** — it drops the fixed
+  `runAsUser`/`fsGroup` so OKD assigns a UID from the namespace's allocated range,
+  keeping the operator pod admitted under the built-in **`restricted-v2`** SCC
+  (non-root, read-only root filesystem) — never `anyuid`.
+- Creates a **scoped custom SCC** (`<release>-cloudberry-operator-cluster`) for the
+  database workload pods, bound to a single ServiceAccount. The Cloudberry image
+  needs a fixed UID 1000 (gpadmin) plus a root init container, which `restricted-v2`
+  cannot satisfy. Rather than the broad `anyuid`, this SCC is strictly narrower —
+  limited capabilities (`CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID`), no host
+  namespaces, no privileged container, single-SA binding.
+- Optionally renders an edge-TLS **Route** (`route.enabled=true`, off by default)
+  for the operator API/metrics. The database is never exposed this way.
+
+With `openshift.enabled=false` (the default) the chart renders exactly as it does
+for vanilla Kubernetes; no SCC or Route objects are created.
+
+> **Full walkthrough**: for a complete, self-contained OKD4 example — including the
+> saved Helm values (`okd4-example.yaml`), a full HA `CloudberryCluster` CR with
+> Vault-PKI TLS, PXF, exporters, and MinIO backups, the infra-wiring steps, and a
+> verified nine-step scenario — see **[OKD4 / OpenShift Sample](okd4_sample.md)**.
 
 ## Configuration Options
 

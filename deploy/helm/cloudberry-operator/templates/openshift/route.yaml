@@ -1,0 +1,35 @@
+{{- if and .Values.openshift.enabled .Values.route.enabled }}
+# =============================================================================
+# OpenShift Route — edge-terminated exposure of the operator API / metrics
+# =============================================================================
+# Disabled by default. The database is NEVER exposed. This Route only optionally
+# exposes the operator's REST API or metrics endpoint through the OKD router with
+# edge TLS termination.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "cloudberry-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+  {{- with .Values.route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "cloudberry-operator.fullname" . }}
+    weight: 100
+  port:
+    targetPort: {{ .Values.route.targetPort }}
+  tls:
+    termination: {{ .Values.route.tls.termination }}
+    {{- if eq .Values.route.tls.termination "edge" }}
+    insecureEdgeTerminationPolicy: {{ .Values.route.tls.insecureEdgeTerminationPolicy }}
+    {{- end }}
+  wildcardPolicy: None
+{{- end }}

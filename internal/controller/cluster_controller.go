@@ -20,6 +20,8 @@ import (
 	"k8s.io/client-go/tools/record"
 	"log/slog"
 	"net/url"
+	"strings"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -45,6 +47,11 @@ const (
 	scaleTimeout           = 10 * time.Minute
 	upgradePhaseTimeout    = 10 * time.Minute
 	mirroringEnableTimeout = 30 * time.Minute
+
+	// requeueAfterCoordinatorRecovery is the backoff used after deleting a
+	// wedged coordinator pod (D3) so the StatefulSet can recreate it and the
+	// scale phase can be retried once it accepts connections again.
+	requeueAfterCoordinatorRecovery = 20 * time.Second
 
 	// patchKeyStatus is the JSON key used in MergePatch payloads for status subresource.
 	patchKeyStatus = "status"
@@ -435,6 +442,25 @@ func (r *ClusterReconciler) reconcileStatefulSets(
 ) (err error) {
 	ctx, end := startControllerSpan(ctx, clusterControllerName, "reconcileStatefulSets")
 	defer func() { end(err) }()
+
+	// Scale-window quiescence (scale-out restart bug): while a gpexpand-backed
+	// scale-out is in flight, the coordinator, standby and EXISTING segment
+	// StatefulSet specs MUST NOT be re-applied/rolled. A coordinator (or
+	// existing-segment) restart mid-gpexpand briefly drops those segments and
+	// makes gpexpand abort with "refusing to expand with down/unknown segments".
+	// The ONLY StatefulSet write during scale-out is the segment scale-up, which
+	// was already applied atomically (env + replicas) in applyScaleOutStatefulSets
+	// BEFORE the coordinator-stability gate. So here we skip the coordinator /
+	// standby / existing-segment applies entirely until the scale-out completes.
+	// Normal (non-scale) reconcile behavior is UNCHANGED: outside the scale window
+	// scaleOutInProgress is false and the coordinator still reconciles/rolls for
+	// real config/TLS changes.
+	if scaleOutInProgress(cluster) {
+		util.LoggerFromContext(ctx).Info(
+			"scale-out in progress: suppressing coordinator/standby/existing-segment " +
+				"StatefulSet reconciliation to keep the scale window quiescent")
+		return nil
+	}
 
 	// Reconcile coordinator StatefulSet.
 	if err = r.reconcileCoordinator(ctx, cluster); err != nil {
@@ -1026,12 +1052,19 @@ func (r *ClusterReconciler) handleScaleOut(
 	if err != nil {
 		return fmt.Errorf("marshaling scale state: %w", err)
 	}
-	if err := setAnnotationPatch(ctx, r.client, cluster,
-		annotationScaleState, string(stateJSON)); err != nil {
-		return fmt.Errorf("setting scale-state annotation: %w", err)
+	// CRITICAL ORDERING (BUG 1): persist the scale-state annotation carrying
+	// oldCount, verify it, then build+scale the segment StatefulSets with the
+	// expansion env — all BEFORE the phase flips to Scaling. Extracted to a helper
+	// to keep this function within the cyclomatic-complexity budget.
+	if err := r.applyScaleOutStatefulSets(ctx, cluster, oldCount, string(stateJSON)); err != nil {
+		return err
 	}
 
-	// Set phase to Scaling.
+	logger.Info("scale-out: expansion env injected and segment StatefulSets scaled",
+		"expansionBaseCount", oldCount, "from", oldCount, "to", newCount)
+
+	// Set phase to Scaling (after the annotation + SS env/scale are committed, so a
+	// re-reconcile observing the Scaling phase always sees the env already applied).
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseScaling
 	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
 		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionFalse, "ScaleOutStarted",
@@ -1043,16 +1076,62 @@ func (r *ClusterReconciler) handleScaleOut(
 	r.recorder.Event(cluster, corev1.EventTypeNormal, cbv1alpha1.EventReasonScaleOutStarted,
 		fmt.Sprintf("Scale-out from %d to %d segments initiated", oldCount, newCount))
 
-	// Update primary StatefulSet replicas.
+	// Set redistribution pending.
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "InProgress",
+		"Waiting for new segment pods to be ready")
+	if err := patchStatus(ctx, r.client, cluster); err != nil {
+		return fmt.Errorf("updating redistribution status: %w", err)
+	}
+
+	return nil
+}
+
+// applyScaleOutStatefulSets persists the scale-state annotation (carrying
+// oldCount), fail-closed-verifies it round-trips as a genuine scale-out, then
+// builds and applies the segment StatefulSets so the env update AND the replica
+// increase are written ATOMICALLY (createOrUpdateStatefulSet copies both
+// Spec.Template and Spec.Replicas). This is the BUG-1 ordering guarantee:
+// annotation persist -> SS env write -> SS scale, so the newly-created pods
+// (ordinal >= base) start gpexpand-managed and never self-initdb.
+func (r *ClusterReconciler) applyScaleOutStatefulSets(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	oldCount int32,
+	stateJSON string,
+) error {
+	// 1. Persist the scale-state annotation FIRST (setAnnotationPatch decodes the
+	//    API response back into `cluster`, so cluster.Annotations carries it below).
+	if err := setAnnotationPatch(ctx, r.client, cluster,
+		annotationScaleState, stateJSON); err != nil {
+		return fmt.Errorf("setting scale-state annotation: %w", err)
+	}
+
+	// 2. Fail-closed guard: the annotation must read back as a genuine scale-OUT so
+	//    the segment StatefulSet build injects the expansion env.
+	if base, ok := builder.ScaleOutBaseCount(cluster); !ok || base != oldCount {
+		return fmt.Errorf(
+			"scale-state annotation not persisted with expansion base count before scaling "+
+				"(got base=%d ok=%t, want %d): refusing to scale up without CLOUDBERRY_EXPANSION_BASE_COUNT",
+			base, ok, oldCount)
+	}
+
+	// 3. Build + apply the primary segment StatefulSet (env + replicas atomically).
 	primarySts, buildErr := r.builder.BuildSegmentPrimaryStatefulSet(cluster)
 	if buildErr != nil {
 		return fmt.Errorf("building primary segment StatefulSet for cluster %s: %w", cluster.Name, buildErr)
+	}
+	if !segmentTemplateHasExpansionBaseCount(primarySts) {
+		return fmt.Errorf(
+			"built segment StatefulSet %s is missing CLOUDBERRY_EXPANSION_BASE_COUNT "+
+				"before scale-up: refusing to create new segment pods that would self-initdb",
+			primarySts.Name)
 	}
 	if err := r.createOrUpdateStatefulSet(ctx, primarySts); err != nil {
 		return fmt.Errorf("scaling primary segments: %w", err)
 	}
 
-	// Update mirror StatefulSet replicas if mirroring is enabled.
+	// 4. Mirror StatefulSet (if mirroring enabled) — same atomic env+replicas apply.
 	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
 		mirrorSts, mirrorErr := r.builder.BuildSegmentMirrorStatefulSet(cluster)
 		if mirrorErr != nil {
@@ -1064,16 +1143,27 @@ func (r *ClusterReconciler) handleScaleOut(
 			}
 		}
 	}
-
-	// Set redistribution pending.
-	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
-		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "InProgress",
-		"Waiting for new segment pods to be ready")
-	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		return fmt.Errorf("updating redistribution status: %w", err)
-	}
-
 	return nil
+}
+
+// segmentTemplateHasExpansionBaseCount reports whether the given segment
+// StatefulSet's pod template carries the CLOUDBERRY_EXPANSION_BASE_COUNT env var
+// in any container. It is the BUG-1 fail-closed guard: the operator refuses to
+// scale up new segment pods unless the built template carries the expansion base
+// count, so a newly-created pod can never start without it (and self-initdb an
+// empty stock cluster).
+func segmentTemplateHasExpansionBaseCount(sts *appsv1.StatefulSet) bool {
+	if sts == nil {
+		return false
+	}
+	for i := range sts.Spec.Template.Spec.Containers {
+		for _, e := range sts.Spec.Template.Spec.Containers[i].Env {
+			if e.Name == builder.EnvCloudberryExpansionBaseCount {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // handleScaleIn orchestrates a scale-in operation using a multi-phase state machine:
@@ -2287,33 +2377,39 @@ func (r *ClusterReconciler) checkScaleOutPhases(
 
 	switch state.Phase {
 	case scalePhaseScalingSTS:
-		// Wait for all segment StatefulSets to be ready.
-		if !r.allSegmentStatefulSetsReady(ctx, cluster) {
+		// Scale-out readiness gate (deadlock fix): a gpexpand-managed new segment
+		// pod has an EMPTY datadir and can NEVER become DB-Ready/PXF-Ready until
+		// gpexpand initializes it. Requiring full StatefulSet readiness here would
+		// deadlock. gpexpand only needs the new pod(s) RUNNING and reachable on
+		// ssh:2022 (its inner script TCP-probes 2022). So we wait for the existing
+		// segments to remain Ready and the NEW pods to be Running — NOT Ready —
+		// before running the gpexpand Job. Non-scale readiness gating is unchanged.
+		if !r.scaleOutSegmentPodsProvisioned(ctx, cluster, state.OldCount, state.NewCount) {
 			return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 		}
-		// Advance to registering phase.
-		logger.Info("all segment pods ready, advancing to segment registration")
-		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseRegistering)
-
-	case scalePhaseRegistering:
-		// Register new segments in gp_segment_configuration.
-		if err := r.registerNewSegments(ctx, cluster, state); err != nil {
-			logger.Error("segment registration failed", "error", err)
-			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		// Coordinator-stability gate (scale-out timing fix): gpexpand needs a
+		// STABLE, fully-up coordinator (and standby, if enabled) before it runs.
+		// The scale-out-detecting reconcile may have rolled the coordinator (e.g.
+		// a refreshed TLS-checksum), so we must NOT create the gpexpand Job until
+		// the coordinator has finished any rollout and its pod is Running+Ready.
+		// Otherwise gpexpand connects mid-restart and dies with "the database
+		// system is shutting down" -> "refusing to expand: existing segment(s)
+		// down". Hold the scaling-sts phase (requeue) until it is stable.
+		if !r.coordinatorStableForGpexpand(ctx, cluster) {
+			return ctrl.Result{RequeueAfter: requeueAfterStopping}, nil
 		}
-		// Advance to redistribution phase.
-		logger.Info("segment registration completed, advancing to redistribution")
-		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseRedistributing)
+		// Advance to the gpexpand-backed expanding phase.
+		logger.Info("new segment pods Running (existing Ready), coordinator stable; "+
+			"advancing to gpexpand (expanding phase)",
+			"oldCount", state.OldCount, "newCount", state.NewCount)
+		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseExpanding)
 
-	case scalePhaseRedistributing:
-		// Run data redistribution.
-		if err := r.redistributeData(ctx, cluster); err != nil {
-			logger.Error("data redistribution failed", "error", err)
-			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-		}
-		// Advance to completed.
-		logger.Info("data redistribution completed")
-		return r.advanceScalePhase(ctx, cluster, &state, scalePhaseCompleted)
+	case scalePhaseExpanding, scalePhaseRegistering, scalePhaseRedistributing:
+		// The single Job-backed expanding phase runs the real gpexpand flow
+		// (add+init new segments AND redistribute). The two legacy phase names
+		// (registering/redistributing) from an in-flight pre-upgrade state are
+		// routed here too so the expansion is driven to completion by gpexpand.
+		return r.processScaleOutExpanding(ctx, cluster, &state)
 
 	case scalePhaseCompleted:
 		// Remove scale state annotation and complete.
@@ -2329,6 +2425,427 @@ func (r *ClusterReconciler) checkScaleOutPhases(
 		}
 		return r.completeScaleOperation(ctx, cluster)
 	}
+}
+
+// processScaleOutExpanding runs the Job-backed expanding phase of scale-out. It
+// creates the gpexpand coordinator-exec Job (deterministic name, AlreadyExists
+// tolerant) the first time and, on subsequent reconciles, observes its status
+// and drives the state machine:
+//
+//   - Job not yet created -> create it, record ExpandJobName, requeue.
+//   - Job Succeeded -> advance to the completed phase.
+//   - Job terminally Failed / gpexpand reported incomplete -> a coordinator
+//     wedge (57P03) is routed to recovery (no attempt consumed); otherwise the
+//     bounded attempt counter is incremented and, at the bound, the scale-out
+//     is declared Failed (Warning event + scale-out-failed metric + failedSegments).
+//   - Job still active -> requeue after the poll interval.
+//
+// gpexpand is natively resumable (gpexpand.status / status_detail), so a
+// re-created Job re-adopts the in-progress expansion rather than restarting it.
+func (r *ClusterReconciler) processScaleOutExpanding(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	if state.ExpandJobName == "" {
+		return r.startGpexpandJob(ctx, cluster, state)
+	}
+
+	job := &batchv1.Job{}
+	getErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      state.ExpandJobName,
+		Namespace: cluster.Namespace,
+	}, job)
+	if apierrors.IsNotFound(getErr) {
+		// The tracked Job disappeared (deleted externally or by our own retry
+		// path): recreate it so the resumable expansion continues.
+		logger.Warn("gpexpand job not found; recreating", "job", state.ExpandJobName)
+		state.ExpandJobName = ""
+		return r.startGpexpandJob(ctx, cluster, state)
+	}
+	if getErr != nil {
+		return ctrl.Result{RequeueAfter: requeueAfterError},
+			fmt.Errorf("fetching gpexpand job %s: %w", state.ExpandJobName, getErr)
+	}
+
+	switch {
+	case job.Status.Succeeded > 0:
+		logger.Info("gpexpand job completed; advancing to completed", "job", job.Name)
+		// Redistribution (ALTER TABLE ... EXPAND TABLE) is done — report the
+		// gauge complete (the gpexpand Job runs the redistribution atomically).
+		r.setRedistributionProgress(cluster, 1.0)
+		r.recorder.Event(cluster, corev1.EventTypeNormal, "SegmentsExpanded",
+			fmt.Sprintf("gpexpand added and redistributed %d new segment(s)",
+				state.NewCount-state.OldCount))
+		// D9: best-effort finalize guard. The hardened Job script already drops
+		// the gpexpand schema on a clean success, but an OLD (pre-hardened) Job
+		// or an externally-interrupted run may leave it behind — which blocks a
+		// subsequent gpbackup. Clear it here via pure SQL (no SSH, idempotent).
+		r.finalizeGpexpandSchema(ctx, cluster)
+		return r.advanceScalePhase(ctx, cluster, state, scalePhaseCompleted)
+
+	case jobHasFailedCondition(job) || job.Status.Failed > 0:
+		return r.handleGpexpandJobFailure(ctx, cluster, state, job)
+
+	default:
+		logger.Info("waiting for gpexpand job to complete",
+			"job", job.Name, "active", job.Status.Active)
+		// Coarse in-progress signal while the gpexpand Job (add-segment +
+		// redistribution) is still running.
+		r.setRedistributionProgress(cluster, gpexpandInProgressRatio)
+		return ctrl.Result{RequeueAfter: requeueAfterGpexpandPoll}, nil
+	}
+}
+
+// finalizeGpexpandSchema is the D9 best-effort operator-side finalize guard.
+// After a gpexpand Job reports success it checks — via a single pure-SQL
+// coordinator query (no SSH, no Job) — whether the gpexpand expansion schema
+// still exists and, if so, drops it (DROP SCHEMA IF EXISTS gpexpand CASCADE).
+// This covers the case where an OLD (pre-hardened) Job or an
+// externally-interrupted run left the schema behind, which would otherwise block
+// a subsequent gpbackup with "expansion currently in process". It is strictly
+// best-effort: any error (no factory, connect failure, drop failure) is logged
+// and never blocks scale-out completion, because the schema residue is harmless
+// to data integrity and can be retried on the next scale-out.
+func (r *ClusterReconciler) finalizeGpexpandSchema(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	if r.dbFactory == nil {
+		logger.Debug("no database client factory configured; skipping gpexpand finalize guard")
+		return
+	}
+
+	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
+	if err != nil {
+		logger.Warn("gpexpand finalize guard: could not create db client", "error", err)
+		return
+	}
+	defer dbClient.Close()
+
+	present, err := dbClient.GpexpandSchemaPresent(ctx)
+	if err != nil {
+		logger.Warn("gpexpand finalize guard: schema presence check failed", "error", err)
+		return
+	}
+	if !present {
+		logger.Debug("gpexpand finalize guard: schema already absent; nothing to do")
+		return
+	}
+
+	if finalizeErr := dbClient.FinalizeGpexpand(ctx); finalizeErr != nil {
+		logger.Warn("gpexpand finalize guard: DROP SCHEMA failed", "error", finalizeErr)
+		return
+	}
+
+	logger.Info("gpexpand finalize guard: dropped lingering gpexpand schema")
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "GpexpandFinalized",
+		"Dropped lingering gpexpand expansion schema to unblock subsequent backups")
+}
+
+// gpexpandInProgressRatio is the coarse redistribution-progress value reported
+// on cloudberry_data_redistribution_progress while the gpexpand Job is active.
+// The Job runs the redistribution inside the coordinator pod (atomically with
+// the add-segment phase), so a live per-table percentage is not queried from the
+// controller; the gauge flips to 1.0 on Job success.
+const gpexpandInProgressRatio = 0.5
+
+// setRedistributionProgress records the data-redistribution progress gauge,
+// guarding a nil metrics recorder.
+func (r *ClusterReconciler) setRedistributionProgress(
+	cluster *cbv1alpha1.CloudberryCluster,
+	progress float64,
+) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.SetRedistributionProgress(cluster.Name, cluster.Namespace, progress)
+}
+
+// startGpexpandJob creates the gpexpand coordinator-exec Job (idempotent under
+// its deterministic name), records the Job name on the scale state and requeues
+// to poll the Job. A pre-flight coordinator wedge is routed to recovery so a
+// transient shutdown never wedges the expanding phase.
+//
+// DEFECT B: because the gpexpand Job has a DETERMINISTIC name and Job pod
+// templates are IMMUTABLE, a plain AlreadyExists-tolerant create would silently
+// adopt a STALE Job left by a prior operator version (old script, e.g. the
+// unsupported `-D` flag) or a terminally-FAILED Job. This function first
+// inspects any existing Job of that name and, if it is superseded (terminal
+// Failed, or its script-hash annotation differs from the freshly-built Job's
+// hash, or it predates the current cluster generation), DELETES it (foreground)
+// and waits for the delete to complete before recreating a fresh Job. An
+// in-flight (still-running) Job whose script matches is adopted unchanged.
+func (r *ClusterReconciler) startGpexpandJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	job := r.builder.BuildGpexpandJob(cluster, state.OldCount, state.NewCount, state.StartedAt)
+	if job == nil {
+		logger.Error("gpexpand job builder returned nil; failing scale-out")
+		return r.failScaleOutRedistribution(ctx, cluster, state,
+			fmt.Errorf("gpexpand job could not be built"))
+	}
+
+	// Reconcile any pre-existing Job of the same deterministic name: replace a
+	// stale/failed/superseded one, or wait for an in-progress delete to settle.
+	if res, done := r.ensureFreshGpexpandJob(ctx, cluster, job); done {
+		return res, nil
+	}
+
+	if createErr := r.client.Create(ctx, job); createErr != nil &&
+		!apierrors.IsAlreadyExists(createErr) {
+		logger.Error("failed to create gpexpand job", "job", job.Name, "error", createErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+
+	state.ExpandJobName = job.Name
+	if persistErr := r.persistScaleState(ctx, cluster, state); persistErr != nil {
+		logger.Error("failed to persist gpexpand job name", "error", persistErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "GpexpandStarted",
+		fmt.Sprintf("Started gpexpand job %s to add %d new segment(s)",
+			job.Name, state.NewCount-state.OldCount))
+	logger.Info("gpexpand job created; awaiting completion", "job", job.Name)
+	return ctrl.Result{RequeueAfter: requeueAfterGpexpandPoll}, nil
+}
+
+// ensureFreshGpexpandJob guards the deterministic-named gpexpand Job against the
+// "stale/cached Job reused" defect (DEFECT B). It returns (result, handled):
+//
+//   - handled=false -> no existing Job (or nothing to do); the caller proceeds
+//     to create the fresh Job.
+//   - handled=true  -> an existing Job was dealt with here (a stale/failed Job
+//     was deleted and the caller must requeue, or an in-progress delete is being
+//     waited out); the caller returns (result, nil).
+//
+// A Job is REPLACED (deleted foreground + requeue) when it is terminally Failed
+// OR its script-hash annotation differs from the freshly-built Job (script drift
+// across an operator upgrade). A still-running Job whose script matches is left
+// untouched (handled=false). The delete is foreground and the caller requeues,
+// so recreation only happens after the stale Job (and its pod) is fully gone — no
+// delete/create race.
+func (r *ClusterReconciler) ensureFreshGpexpandJob(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	fresh *batchv1.Job,
+) (result ctrl.Result, handled bool) {
+	logger := util.LoggerFromContext(ctx)
+
+	existing := &batchv1.Job{}
+	getErr := r.client.Get(ctx, types.NamespacedName{
+		Name:      fresh.Name,
+		Namespace: fresh.Namespace,
+	}, existing)
+	if apierrors.IsNotFound(getErr) {
+		return ctrl.Result{}, false
+	}
+	if getErr != nil {
+		logger.Error("failed to get existing gpexpand job", "job", fresh.Name, "error", getErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, true
+	}
+
+	// An already-terminating Job must be waited out before recreating.
+	if existing.DeletionTimestamp != nil {
+		logger.Info("waiting for stale gpexpand job deletion to complete", "job", existing.Name)
+		return ctrl.Result{RequeueAfter: requeueAfterStopping}, true
+	}
+
+	reason, superseded := gpexpandJobSuperseded(existing, fresh)
+	if !superseded {
+		// In-flight (or still-adoptable) Job whose script matches: adopt it. Fall
+		// through to the caller's AlreadyExists-tolerant create/track path.
+		return ctrl.Result{}, false
+	}
+
+	logger.Warn("replacing superseded gpexpand job", "job", existing.Name, "reason", reason)
+	r.recorder.Event(cluster, corev1.EventTypeNormal, "GpexpandJobRecreated",
+		fmt.Sprintf("Deleting superseded gpexpand job %s (%s) and recreating a fresh one",
+			existing.Name, reason))
+
+	policy := metav1.DeletePropagationForeground
+	if delErr := r.client.Delete(ctx, existing,
+		&client.DeleteOptions{PropagationPolicy: &policy}); delErr != nil &&
+		!apierrors.IsNotFound(delErr) {
+		logger.Error("failed to delete superseded gpexpand job", "job", existing.Name, "error", delErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, true
+	}
+	// Requeue so recreation happens only after the stale Job is fully gone
+	// (foreground delete waits for its pods), avoiding a delete/create race.
+	return ctrl.Result{RequeueAfter: requeueAfterStopping}, true
+}
+
+// gpexpandJobSuperseded reports whether an existing gpexpand Job must be replaced
+// by the freshly-built one, and a human-readable reason. A Job is superseded when
+// it has terminally FAILED (backoff/deadline exceeded or Failed>0) or when its
+// script-hash annotation differs from the fresh Job (script drift across an
+// operator upgrade — the immutable pod template still carries the OLD script). A
+// still-running Job with a matching script is NOT superseded.
+func gpexpandJobSuperseded(existing, fresh *batchv1.Job) (string, bool) {
+	if jobHasFailedCondition(existing) || existing.Status.Failed > 0 {
+		return "previous run failed", true
+	}
+	oldHash := existing.Annotations[util.AnnotationGpexpandScriptHash]
+	newHash := fresh.Annotations[util.AnnotationGpexpandScriptHash]
+	if oldHash != newHash {
+		return "script changed (operator upgrade)", true
+	}
+	return "", false
+}
+
+// handleGpexpandJobFailure applies the BOUNDED-retry / wedge-recovery / terminal
+// policy (D8) when the tracked gpexpand Job has failed. A coordinator wedge
+// (57P03) — detected from the Job pod's termination message — is routed to
+// recoverWedgedCoordinator and does NOT consume an attempt. Otherwise the
+// attempt counter is incremented; at the bound the scale-out is declared Failed,
+// below the bound the failed Job is deleted so a fresh (resumable) one is created.
+func (r *ClusterReconciler) handleGpexpandJobFailure(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+	job *batchv1.Job,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+	cause := fmt.Errorf("gpexpand job %s failed: %s", job.Name, gpexpandFailureMessage(ctx, r, cluster, job))
+
+	logger.Error("gpexpand job failed", "job", job.Name, "error", cause,
+		"attempt", state.RedistributeAttempts+1, "maxAttempts", maxRedistributeAttempts)
+
+	// D3: a coordinator wedge (57P03) is recoverable by rolling the pod and does
+	// NOT count as an attempt.
+	if res, handled := r.recoverWedgedCoordinator(
+		ctx, cluster, scalePhaseExpanding, cause); handled {
+		return res, nil
+	}
+
+	// Bound the transient retries.
+	state.RedistributeAttempts++
+	if state.RedistributeAttempts >= maxRedistributeAttempts {
+		logger.Error("gpexpand exhausted max attempts; failing scale-out",
+			"attempts", state.RedistributeAttempts)
+		return r.failScaleOutRedistribution(ctx, cluster, state, cause)
+	}
+
+	// Delete the failed Job so the next reconcile creates a fresh one that
+	// re-adopts the resumable expansion (gpexpand.status), then clear the tracked
+	// name and persist the incremented attempt counter.
+	if delErr := r.client.Delete(ctx, job); delErr != nil && !apierrors.IsNotFound(delErr) {
+		logger.Error("failed to delete failed gpexpand job", "job", job.Name, "error", delErr)
+	}
+	state.ExpandJobName = ""
+	if persistErr := r.persistScaleState(ctx, cluster, state); persistErr != nil {
+		logger.Error("failed to persist scale state attempt counter", "error", persistErr)
+	}
+	return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+}
+
+// gpexpandFailureMessage best-effort reads the gpexpand Job pod's terminated
+// container message (EXPAND_RESULT=incomplete:N / a coordinator-shutdown error)
+// so handleGpexpandJobFailure can classify a wedge and surface a useful cause.
+// Returns a generic message when no pod/message is available yet.
+func gpexpandFailureMessage(
+	ctx context.Context,
+	r *ClusterReconciler,
+	cluster *cbv1alpha1.CloudberryCluster,
+	job *batchv1.Job,
+) string {
+	pods := &corev1.PodList{}
+	if err := r.client.List(ctx, pods,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{"job-name": job.Name},
+	); err != nil {
+		return "gpexpand job failed (pod message unavailable)"
+	}
+	for i := range pods.Items {
+		for j := range pods.Items[i].Status.ContainerStatuses {
+			term := pods.Items[i].Status.ContainerStatuses[j].State.Terminated
+			if term != nil && term.Message != "" {
+				return strings.TrimSpace(term.Message)
+			}
+		}
+	}
+	return "gpexpand job failed (no terminated container message)"
+}
+
+// persistScaleState writes the current scale state back to the annotation,
+// used to durably record the redistribution attempt counter between reconciles.
+func (r *ClusterReconciler) persistScaleState(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+) error {
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshaling scale state: %w", err)
+	}
+	return setAnnotationPatch(ctx, r.client, cluster, annotationScaleState, string(stateJSON))
+}
+
+// failScaleOutRedistribution transitions the cluster to a terminal failed state
+// after a persistently-failing (or non-retriable) redistribution (D8). It sets
+// the ScaleOutFailed condition and Failed phase, records failedSegments for the
+// newly-added content ids, emits a Warning event and the scale-out-failed
+// metric, and clears the scale-state annotation so the operator STOPS retrying.
+func (r *ClusterReconciler) failScaleOutRedistribution(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	state *scaleStateData,
+	cause error,
+) (ctrl.Result, error) {
+	logger := util.LoggerFromContext(ctx)
+
+	// Record the newly-added segments (content ids [OldCount,NewCount)) as
+	// failed so status.failedSegments reflects which segments could not receive
+	// redistributed data.
+	var failedSegments []cbv1alpha1.FailedSegment
+	for i := state.OldCount; i < state.NewCount; i++ {
+		failedSegments = append(failedSegments, cbv1alpha1.FailedSegment{
+			ContentID: i,
+			Hostname:  fmt.Sprintf("%s-%d", util.SegmentPrimaryName(cluster.Name), i),
+			Role:      "primary",
+			Status:    "RedistributionFailed",
+		})
+	}
+
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseFailed
+	cluster.Status.FailedSegments = failedSegments
+	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
+		string(cbv1alpha1.ConditionScaleOutFailed), metav1.ConditionTrue, "RedistributionFailed",
+		fmt.Sprintf("Scale-out redistribution failed after %d attempts: %v",
+			state.RedistributeAttempts, cause))
+	if statusErr := r.client.Status().Update(ctx, cluster); statusErr != nil {
+		logger.Error("failed to update scale-out failure status", "error", statusErr)
+	}
+
+	r.recorder.Event(cluster, corev1.EventTypeWarning, cbv1alpha1.EventReasonScaleOutFailed,
+		fmt.Sprintf("Scale-out failed: data redistribution did not succeed after %d attempts (%v)",
+			state.RedistributeAttempts, cause))
+	if r.metrics != nil {
+		r.metrics.RecordScaleOperation(cluster.Name, cluster.Namespace, "scale-out-failed")
+		r.metrics.SetSegmentsFailed(cluster.Name, cluster.Namespace, float64(len(failedSegments)))
+	}
+
+	// Clear the scale-state and scale-started annotations so the operator STOPS
+	// retrying (no more checkScaleOutPhases loop for this operation).
+	if err := removeAnnotationPatch(ctx, r.client, cluster, annotationScaleState); err != nil {
+		logger.Error("failed to remove scale-state annotation after failure", "error", err)
+	}
+	if err := removeAnnotationPatch(ctx, r.client, cluster, util.AnnotationScaleStarted); err != nil {
+		logger.Error("failed to remove scale-started annotation after failure", "error", err)
+	}
+
+	logger.Error("scale-out redistribution terminally failed; cluster marked Failed",
+		"failedSegments", len(failedSegments))
+	return ctrl.Result{}, nil
 }
 
 // advanceScalePhase updates the scale state to the next phase, recording the
@@ -2623,107 +3140,69 @@ func (r *ClusterReconciler) deregisterSegments(
 	return nil
 }
 
-// registerNewSegments calls the DB client to register new segments in gp_segment_configuration.
-// If no dbFactory is configured, it logs a warning and returns nil.
-func (r *ClusterReconciler) registerNewSegments(
+// recoverWedgedCoordinator handles a coordinator that has wedged in the
+// "cannot connect now" / shutting-down state (SQLSTATE 57P03, D3). This can
+// happen when the coordinator postgres restarts during a scale/StatefulSet
+// change and then rejects every connection indefinitely, deadlocking the scale
+// "registering"/"redistributing" phases. When the supplied error indicates this
+// state, the operator deletes the coordinator pod so its StatefulSet recreates
+// it (self-heal, replacing the previously-manual pod delete) and requeues so the
+// phase is retried once the fresh pod accepts connections.
+//
+// It returns (result, handled): handled is true when the error was the wedged
+// state and a recovery was attempted, so the caller should return the result.
+func (r *ClusterReconciler) recoverWedgedCoordinator(
 	ctx context.Context,
 	cluster *cbv1alpha1.CloudberryCluster,
-	state scaleStateData,
-) error {
+	phase string,
+	cause error,
+) (ctrl.Result, bool) {
 	logger := util.LoggerFromContext(ctx)
 
-	if r.dbFactory == nil {
-		logger.Info("no database client factory configured, skipping segment registration")
-		return nil
+	if !db.IsCoordinatorShuttingDown(cause) {
+		return ctrl.Result{}, false
 	}
 
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("creating db client for segment registration: %w", err)
-	}
-	defer dbClient.Close()
+	podName := util.CoordinatorPodName(cluster.Name)
+	logger.Warn("coordinator is wedged (shutting down); rolling pod to recover",
+		"phase", phase, "pod", podName, "error", cause)
 
-	port := cluster.Spec.Coordinator.Port
-	if port == 0 {
-		port = int32(util.DefaultCoordinatorPort)
-	}
-
-	segmentSvc := util.SegmentServiceName(cluster.Name)
-
-	mirrorEnabled := cluster.Spec.Segments.Mirroring != nil &&
-		cluster.Spec.Segments.Mirroring.Enabled
-
-	if regErr := dbClient.RegisterNewSegments(ctx, db.SegmentRegistrationOptions{
-		OldCount:       state.OldCount,
-		NewCount:       state.NewCount,
-		MirrorEnabled:  mirrorEnabled,
-		SegmentService: segmentSvc,
-		ClusterName:    cluster.Name,
-		Port:           port,
-	}); regErr != nil {
-		return fmt.Errorf("registering new segments: %w", regErr)
+	pod := &corev1.Pod{}
+	key := client.ObjectKey{Name: podName, Namespace: cluster.Namespace}
+	if getErr := r.client.Get(ctx, key, pod); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			// Pod is already gone (being recreated); just wait for it.
+			logger.Info("wedged coordinator pod already absent, awaiting recreation",
+				"pod", podName)
+			return ctrl.Result{RequeueAfter: requeueAfterCoordinatorRecovery}, true
+		}
+		logger.Error("failed to get wedged coordinator pod", "pod", podName, "error", getErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, true
 	}
 
-	r.recorder.Event(cluster, corev1.EventTypeNormal, "SegmentsRegistered",
-		fmt.Sprintf("Registered %d new segments in gp_segment_configuration",
-			state.NewCount-state.OldCount))
+	if delErr := r.client.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+		logger.Error("failed to delete wedged coordinator pod", "pod", podName, "error", delErr)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, true
+	}
 
-	logger.Info("new segments registered successfully",
-		"oldCount", state.OldCount, "newCount", state.NewCount)
-	return nil
+	r.recorder.Event(cluster, corev1.EventTypeWarning, "CoordinatorRecovered",
+		fmt.Sprintf("Deleted wedged coordinator pod %s (shutting-down/57P03) during scale %s to recover",
+			podName, phase))
+	logger.Info("deleted wedged coordinator pod; awaiting recreation",
+		"pod", podName, "phase", phase)
+
+	return ctrl.Result{RequeueAfter: requeueAfterCoordinatorRecovery}, true
 }
 
-// redistributeData calls the DB client to redistribute data across all segments.
-// If no dbFactory is configured, it logs a warning and returns nil.
-func (r *ClusterReconciler) redistributeData(
-	ctx context.Context,
-	cluster *cbv1alpha1.CloudberryCluster,
-) error {
-	logger := util.LoggerFromContext(ctx)
-
-	if r.dbFactory == nil {
-		logger.Info("no database client factory configured, skipping data redistribution")
-		return nil
-	}
-
-	dbClient, err := r.dbFactory.NewClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("creating db client for redistribution: %w", err)
-	}
-	defer dbClient.Close()
-
-	if redistErr := dbClient.RedistributeData(ctx, db.RedistributionOptions{
-		Database:    "postgres",
-		Parallelism: 2,
-	}); redistErr != nil {
-		return fmt.Errorf("redistributing data: %w", redistErr)
-	}
-
-	// Best-effort progress reporting. GetRedistributionProgress returns a
-	// percentage (0-100); convert to a 0.0..1.0 ratio for the gauge. On a
-	// query error we fall back to 1.0 since RedistributeData has completed.
-	progress := 1.0
-	if pct, progErr := dbClient.GetRedistributionProgress(ctx); progErr != nil {
-		logger.Warn("failed to query redistribution progress", "error", progErr)
-	} else if pct < 100 {
-		progress = float64(pct) / 100.0
-	}
-	r.metrics.SetRedistributionProgress(cluster.Name, cluster.Namespace, progress)
-
-	// Update condition to reflect redistribution completion.
-	cluster.Status.Conditions = util.SetCondition(cluster.Status.Conditions,
-		string(cbv1alpha1.ConditionDataRedistribution), metav1.ConditionTrue, "Completed",
-		"Data redistribution completed across all segments")
-	if statusErr := patchStatus(ctx, r.client, cluster); statusErr != nil {
-		logger.Error("failed to update redistribution status", "error", statusErr)
-	}
-
-	r.recorder.Event(cluster, corev1.EventTypeNormal, "RedistributionCompleted",
-		"Data redistribution completed across all segments")
-
-	logger.Info("data redistribution completed")
-	return nil
-}
+// NOTE: the former registerNewSegments / redistributeData controller wrappers
+// (manual gp_segment_configuration INSERT + coordinator-dispatched seeding +
+// SQL EXPAND TABLE) were REMOVED from the scale-out path. They are superseded by
+// the gpexpand coordinator-exec Job (processScaleOutExpanding /
+// builder.BuildGpexpandJob), which is the only supported primitive that
+// physically initializes a late-added segment's datadir from the coordinator
+// template AND redistributes. The db.Client RegisterNewSegments /
+// SeedNewSegmentCatalog / RedistributeData methods remain on the interface
+// (deprecated for scale-out; retained for scale-in and backward compatibility).
 
 // completeScaleOperation finalizes a scale-in or scale-out that has reached
 // the desired replica count. It transitions the cluster back to Running,
@@ -2915,6 +3394,284 @@ func (r *ClusterReconciler) allSegmentStatefulSetsReady(
 	}
 
 	return true
+}
+
+// scaleOutSegmentPodsProvisioned reports whether a scale-out has provisioned
+// enough of the new segment pod(s) for gpexpand to run, WITHOUT requiring the
+// gpexpand-managed new pods to be DB-Ready/PXF-Ready.
+//
+// Rationale (deadlock fix): a newly-added, gpexpand-managed segment pod has an
+// EMPTY datadir — its DB/PXF readiness probes can never pass until gpexpand
+// initializes it from the coordinator template. Requiring full StatefulSet
+// readiness (ReadyReplicas == desired) before running the gpexpand Job therefore
+// deadlocks the scale-out. gpexpand only needs the new pod(s) RUNNING and
+// reachable on ssh:2022 (its inner script TCP-probes 2022 itself), so "pod
+// Running + sshd up" is sufficient to proceed.
+//
+// This gate therefore requires:
+//   - the PRE-existing segment pods (ordinals [0, OldCount)) to remain Ready
+//     (unchanged, non-scale gating — a degraded existing member must still block
+//     the expansion so gpexpand's health precondition holds); and
+//   - the NEW segment pods (ordinals [OldCount, NewCount)) to be RUNNING (their
+//     containers started; not necessarily Ready).
+//
+// It is used ONLY for the scale-out scaling-sts -> expanding transition. All
+// other readiness gating (allSegmentStatefulSetsReady) is unchanged.
+func (r *ClusterReconciler) scaleOutSegmentPodsProvisioned(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	oldCount, newCount int32,
+) bool {
+	logger := util.LoggerFromContext(ctx)
+
+	// 1. Existing segment members must remain Ready. We reuse ReadyReplicas but
+	//    only require the PRE-scale count to be ready, so the not-yet-Ready new
+	//    pods do not count against this gate.
+	primaryName := util.SegmentPrimaryName(cluster.Name)
+	if ready, _ := r.isStatefulSetAtScale(ctx, cluster.Namespace,
+		primaryName, oldCount); !ready {
+		logger.Info("scale-out gate: existing primary segments not yet Ready",
+			"required", oldCount)
+		return false
+	}
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		if ready, _ := r.isStatefulSetAtScale(ctx, cluster.Namespace,
+			util.SegmentMirrorName(cluster.Name), oldCount); !ready {
+			logger.Info("scale-out gate: existing mirror segments not yet Ready",
+				"required", oldCount)
+			return false
+		}
+	}
+
+	// 2. New segment pods must be RUNNING (not necessarily Ready). This is the
+	//    relaxed gate that avoids the empty-datadir readiness deadlock.
+	if !r.segmentPodsRunning(ctx, cluster, util.ComponentSegmentPrimary, oldCount, newCount) {
+		return false
+	}
+	if cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled {
+		if !r.segmentPodsRunning(ctx, cluster, util.ComponentSegmentMirror, oldCount, newCount) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// segmentPodsRunning reports whether every newly-added segment pod for the given
+// component (ordinals [oldCount, newCount)) exists and is in the Running phase.
+// A pod is considered Running when Status.Phase == Running; readiness of its
+// containers is intentionally NOT required (see scaleOutSegmentPodsProvisioned).
+//
+// It lists the component's pods by label once and indexes them by name, so the
+// per-ordinal lookup does not issue N Gets and there is no TOCTOU window between
+// separate reads.
+func (r *ClusterReconciler) segmentPodsRunning(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+	component string,
+	oldCount, newCount int32,
+) bool {
+	logger := util.LoggerFromContext(ctx)
+
+	podList := &corev1.PodList{}
+	if err := r.client.List(ctx, podList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(util.CommonLabels(cluster.Name, component)),
+	); err != nil {
+		logger.Info("scale-out gate: listing segment pods failed; waiting",
+			"component", component, "error", err.Error())
+		return false
+	}
+
+	running := make(map[string]bool, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		running[pod.Name] = pod.Status.Phase == corev1.PodRunning
+	}
+
+	stsName := util.SegmentPrimaryName(cluster.Name)
+	if component == util.ComponentSegmentMirror {
+		stsName = util.SegmentMirrorName(cluster.Name)
+	}
+	for ordinal := oldCount; ordinal < newCount; ordinal++ {
+		podName := fmt.Sprintf("%s-%d", stsName, ordinal)
+		if !running[podName] {
+			logger.Info("scale-out gate: new segment pod not yet Running",
+				"component", component, "pod", podName)
+			return false
+		}
+	}
+	return true
+}
+
+// coordinatorStableForGpexpand reports whether the COORDINATOR (and, when
+// enabled, the STANDBY) is fully stable — Running, Ready, and NOT undergoing a
+// rollout/restart — so it is safe to launch the gpexpand Job.
+//
+// ROOT CAUSE (scale-out timing): a spec change that increases the segment count
+// bumps the cluster generation, and the SAME reconcile that detects the
+// scale-out first runs reconcileStatefulSets -> reconcileCoordinator, which may
+// re-apply the coordinator StatefulSet (e.g. a refreshed TLS-checksum annotation)
+// and trigger a coordinator rollout. handleScaleOut then flips the phase to
+// Scaling. On the next reconciles the scale state machine can reach the
+// scaling-sts -> expanding transition and create the gpexpand Job WHILE the
+// coordinator is still mid-restart, so gpexpand connects to a coordinator that
+// reports "FATAL: the database system is shutting down" and then "refusing to
+// expand: existing segment(s) down".
+//
+// This gate closes that window: gpexpand requires a stable, fully-up coordinator
+// (and all existing segments up) before it runs, so we hold the scaling-sts
+// phase (requeue) until the coordinator — and standby, if any — is stable.
+//
+// Stability for a StatefulSet means: it exists, its controller has observed the
+// latest spec (observedGeneration == generation), the rollout is complete
+// (updatedReplicas == readyReplicas == replicas and currentRevision ==
+// updateRevision), and its active pod is Running + Ready and not terminating
+// (DeletionTimestamp unset). The coordinator/standby run a single replica.
+func (r *ClusterReconciler) coordinatorStableForGpexpand(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) bool {
+	logger := util.LoggerFromContext(ctx)
+
+	if !r.statefulSetStable(ctx, cluster.Namespace,
+		util.CoordinatorName(cluster.Name), util.ComponentCoordinator) {
+		logger.Info("scale-out gate: coordinator not stable (rollout in progress or not Ready); waiting")
+		return false
+	}
+
+	if cluster.Spec.Standby != nil && cluster.Spec.Standby.Enabled {
+		if !r.statefulSetStable(ctx, cluster.Namespace,
+			util.StandbyName(cluster.Name), util.ComponentStandby) {
+			logger.Info("scale-out gate: standby not stable (rollout in progress or not Ready); waiting")
+			return false
+		}
+	}
+
+	return true
+}
+
+// statefulSetStable reports whether the single-replica StatefulSet named `name`
+// is fully rolled AND its pod is Running + Ready + not terminating. It is the
+// per-component building block of coordinatorStableForGpexpand. A missing
+// StatefulSet is treated as NOT stable (the coordinator/standby must exist and
+// be up before gpexpand runs). All reads are performed against the same listed
+// pod set, so there is no TOCTOU window between the roll check and the pod check.
+func (r *ClusterReconciler) statefulSetStable(
+	ctx context.Context,
+	namespace, name, component string,
+) bool {
+	logger := util.LoggerFromContext(ctx)
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}, sts); err != nil {
+		logger.Info("scale-out gate: StatefulSet not retrievable; treating as not stable",
+			"sts", name, "error", err.Error())
+		return false
+	}
+
+	if !statefulSetFullyRolled(sts) {
+		logger.Info("scale-out gate: StatefulSet not fully rolled",
+			"sts", name,
+			"generation", sts.Generation,
+			"observedGeneration", sts.Status.ObservedGeneration,
+			"replicas", sts.Status.Replicas,
+			"readyReplicas", sts.Status.ReadyReplicas,
+			"updatedReplicas", sts.Status.UpdatedReplicas)
+		return false
+	}
+
+	return r.componentPodStable(ctx, namespace, name, component)
+}
+
+// statefulSetFullyRolled reports whether a StatefulSet has finished any pending
+// rollout: its controller has observed the current spec generation, every
+// replica is updated + ready, and the current revision equals the update
+// revision (no pending pod template change). A StatefulSet with a nil/zero
+// desired replica count is NOT considered rolled (the coordinator must be up).
+func statefulSetFullyRolled(sts *appsv1.StatefulSet) bool {
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas == 0 {
+		return false
+	}
+	desired := *sts.Spec.Replicas
+	return sts.Status.ObservedGeneration == sts.Generation &&
+		sts.Status.ReadyReplicas == desired &&
+		sts.Status.UpdatedReplicas == desired &&
+		sts.Status.Replicas == desired &&
+		sts.Status.CurrentRevision == sts.Status.UpdateRevision
+}
+
+// componentPodStable reports whether the active (ordinal-0) pod of a
+// single-replica StatefulSet is Running, Ready, and NOT terminating. It lists
+// the component's pods once (by label) and inspects the ordinal-0 pod, so the
+// readiness/termination checks read a single consistent pod object.
+func (r *ClusterReconciler) componentPodStable(
+	ctx context.Context,
+	namespace, stsName, component string,
+) bool {
+	logger := util.LoggerFromContext(ctx)
+
+	podList := &corev1.PodList{}
+	if err := r.client.List(ctx, podList,
+		client.InNamespace(namespace),
+		client.MatchingLabels(util.CommonLabels(clusterNameFromComponentSts(stsName, component), component)),
+	); err != nil {
+		logger.Info("scale-out gate: listing component pods failed; treating as not stable",
+			"component", component, "error", err.Error())
+		return false
+	}
+
+	podName := fmt.Sprintf("%s-0", stsName)
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Name != podName {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			logger.Info("scale-out gate: component pod is terminating; waiting",
+				"pod", podName)
+			return false
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			logger.Info("scale-out gate: component pod not Running; waiting",
+				"pod", podName, "phase", pod.Status.Phase)
+			return false
+		}
+		if !podIsReady(pod) {
+			logger.Info("scale-out gate: component pod not Ready; waiting", "pod", podName)
+			return false
+		}
+		return true
+	}
+
+	logger.Info("scale-out gate: component pod not found; waiting", "pod", podName)
+	return false
+}
+
+// clusterNameFromComponentSts derives the owning cluster name from a component
+// StatefulSet name by trimming the component-specific suffix. It lets
+// componentPodStable build the CommonLabels selector without threading the
+// cluster name through every caller.
+func clusterNameFromComponentSts(stsName, component string) string {
+	suffix := "-coordinator"
+	if component == util.ComponentStandby {
+		suffix = "-coordinator-standby"
+	}
+	return strings.TrimSuffix(stsName, suffix)
+}
+
+// podIsReady reports whether a pod carries a PodReady condition set to True.
+func podIsReady(pod *corev1.Pod) bool {
+	for i := range pod.Status.Conditions {
+		cond := &pod.Status.Conditions[i]
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // allStatefulSetsAtScale checks whether all cluster StatefulSets have reached
@@ -3280,7 +4037,7 @@ func (r *ClusterReconciler) recordPVCSizesFromSpec(cluster *cbv1alpha1.Cloudberr
 // scaleStateData holds the state of an in-progress scale-out operation.
 type scaleStateData struct {
 	// Phase is the current scale operation phase.
-	Phase string `json:"phase"` // "scaling-sts", "registering", "redistributing", "completed"
+	Phase string `json:"phase"` // "scaling-sts", "expanding", "completed"
 	// OldCount is the previous segment count.
 	OldCount int32 `json:"oldCount"`
 	// NewCount is the new segment count.
@@ -3291,17 +4048,89 @@ type scaleStateData struct {
 	// the cloudberry_scale_phase_duration_seconds histogram; missing (older
 	// in-flight states) falls back to StartedAt.
 	PhaseStartedAt string `json:"phaseStartedAt,omitempty"`
+	// RedistributeAttempts counts how many times the expanding phase has failed
+	// and been retried. It bounds the retry loop (D8) so a persistently failing
+	// expansion transitions the cluster to a terminal failed phase instead of
+	// retrying forever. The JSON key is retained (backward-compatible with
+	// in-flight states) even though the phase is now the gpexpand-backed
+	// "expanding" phase.
+	RedistributeAttempts int32 `json:"redistributeAttempts,omitempty"`
+	// ExpandJobName is the deterministic name of the gpexpand coordinator-exec
+	// Job the controller created for this scale-out. It is tracked so a
+	// re-reconcile observes the SAME Job's status (mirrors the deletion-backup
+	// AnnotationDeletionBackupJob pattern). Empty until the Job is created.
+	ExpandJobName string `json:"expandJobName,omitempty"`
+}
+
+// scaleOutInProgress reports whether a scale-out (gpexpand) operation is
+// currently in flight for the cluster. It reads the scale-state annotation and
+// returns true for every non-terminal scale-out phase (scaling-sts, expanding,
+// and the legacy registering/redistributing names). While this is true the
+// scale window MUST be quiescent for the coordinator, standby and existing
+// segments: their StatefulSet specs must NOT be re-applied/rolled, because a
+// coordinator (or existing-segment) restart mid-gpexpand briefly drops those
+// segments and makes gpexpand abort with "refusing to expand with down/unknown
+// segments" (scale-out restart bug).
+//
+// It returns false once the scale-out has completed (phase "completed") or when
+// the annotation is absent/malformed, so the normal (non-scale) reconcile path —
+// including legitimate coordinator config/TLS rollouts — is UNCHANGED outside the
+// scale window.
+func scaleOutInProgress(cluster *cbv1alpha1.CloudberryCluster) bool {
+	if cluster == nil || cluster.Annotations == nil {
+		return false
+	}
+	raw := cluster.Annotations[annotationScaleState]
+	if raw == "" {
+		return false
+	}
+	var state struct {
+		Phase string `json:"phase"`
+	}
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return false
+	}
+	switch state.Phase {
+	case scalePhaseScalingSTS, scalePhaseExpanding,
+		scalePhaseRegistering, scalePhaseRedistributing:
+		return true
+	default:
+		return false
+	}
 }
 
 // Scale-out phase constants define the ordered phases of a scale-out operation.
+// The gpexpand-Job redesign collapses the former "registering" + "redistributing"
+// phases into a single Job-backed "expanding" phase: the gpexpand Job does both
+// the add-segment (init from the coordinator template) and the redistribution
+// (ALTER TABLE ... EXPAND TABLE) atomically, the way gpexpand intends.
 const (
-	scalePhaseScalingSTS     = "scaling-sts"
+	scalePhaseScalingSTS = "scaling-sts"
+	scalePhaseExpanding  = "expanding"
+	scalePhaseCompleted  = "completed"
+
+	// scalePhaseRegistering / scalePhaseRedistributing are the LEGACY phase
+	// names. They are retained so an in-flight scale-out state annotation
+	// (written by a prior operator version) is still recognized and routed to
+	// the new gpexpand-backed expanding handler rather than falling through to
+	// the "unknown phase" completion path.
 	scalePhaseRegistering    = "registering"
 	scalePhaseRedistributing = "redistributing"
-	scalePhaseCompleted      = "completed"
 
-	// AnnotationScaleState tracks in-progress scale-out state as JSON.
-	annotationScaleState = "avsoft.io/scale-state"
+	// AnnotationScaleState tracks in-progress scale-out state as JSON. Aliased to
+	// the shared util constant so the builder (which reads oldCount to mark new
+	// segment pods gpexpand-managed) and the controller use one source of truth.
+	annotationScaleState = util.AnnotationScaleState
+
+	// maxRedistributeAttempts bounds the number of times the expanding phase's
+	// gpexpand Job may fail and be retried before the scale-out is declared
+	// failed (D8). Combined with the scaleTimeout deadline, this guarantees the
+	// operator never loops forever on an expansion that cannot succeed.
+	maxRedistributeAttempts = int32(5)
+
+	// requeueAfterGpexpandPoll is the poll interval while waiting for the
+	// gpexpand Job to reach a terminal state (mirrors requeueAfterDeletionBackup).
+	requeueAfterGpexpandPoll = 15 * time.Second
 )
 
 // Scale-in phase constants define the ordered phases of a scale-in operation.

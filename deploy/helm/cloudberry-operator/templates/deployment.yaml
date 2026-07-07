@@ -34,13 +34,13 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "cloudberry-operator.serviceAccountName" . }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- include "cloudberry-operator.podSecurityContext" . | nindent 8 }}
       containers:
         - name: operator
           image: {{ include "cloudberry-operator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- include "cloudberry-operator.containerSecurityContext" . | nindent 12 }}
           env:
             - name: CLOUDBERRY_CONFIG_FILE
               value: /etc/cloudberry/config.yaml

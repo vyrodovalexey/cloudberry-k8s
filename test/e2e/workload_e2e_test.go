@@ -1285,6 +1285,10 @@ func (w *nonClosingClientWrapper) RegisterNewSegments(ctx context.Context, opts 
 	return w.delegate.RegisterNewSegments(ctx, opts)
 }
 
+func (w *nonClosingClientWrapper) SeedNewSegmentCatalog(ctx context.Context, opts db.SegmentRegistrationOptions) (int, error) {
+	return w.delegate.SeedNewSegmentCatalog(ctx, opts)
+}
+
 func (w *nonClosingClientWrapper) RedistributeData(ctx context.Context, opts db.RedistributionOptions) error {
 	return w.delegate.RedistributeData(ctx, opts)
 }

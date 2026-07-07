@@ -16,14 +16,16 @@ import (
 var pxfNetworkPolicyTCP = corev1.ProtocolTCP
 
 // BuildPXFClusterNetworkPolicy builds the SE.5 NetworkPolicy that confines the
-// PXF service port (5888) on the segment-primary pods: cross-pod ingress is
-// permitted ONLY for the legitimate cluster ports (PostgreSQL + the
-// postgres/node exporters), and the PXF port is deliberately OMITTED from the
-// allowed-ingress set. Because the operator's data-loading path always reaches
-// PXF over localhost inside the same pod — and intra-pod (loopback) traffic is
-// never subject to a NetworkPolicy — loads keep working while no other pod can
-// reach :5888. Returns nil when PXF is not enabled (gated on pxfSidecarEnabled),
-// so a default cluster produces no policy.
+// PXF service port (5888) on the segment-primary AND segment-mirror pods:
+// cross-pod ingress is permitted ONLY for the legitimate cluster ports
+// (PostgreSQL + the postgres/node exporters), and the PXF port is deliberately
+// OMITTED from the allowed-ingress set. Because the operator's data-loading path
+// always reaches PXF over localhost inside the same pod — and intra-pod
+// (loopback) traffic is never subject to a NetworkPolicy — loads keep working
+// while no other pod can reach :5888. Mirror pods are covered because PXF now
+// runs on mirrors too (D9), so :5888 must stay confined after a failover.
+// Returns nil when PXF is not enabled (gated on pxfSidecarEnabled), so a default
+// cluster produces no policy.
 func (b *DefaultBuilder) BuildPXFClusterNetworkPolicy(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) *networkingv1.NetworkPolicy {
@@ -32,11 +34,21 @@ func (b *DefaultBuilder) BuildPXFClusterNetworkPolicy(
 	}
 
 	labels := util.CommonLabels(cluster.Name, util.ComponentSegmentPrimary)
-	// Select the segment-primary pods via their standard component label so the
-	// policy applies exactly to the pods that host the PXF sidecar.
-	selector := map[string]string{
-		util.LabelCluster:   cluster.Name,
-		util.LabelComponent: util.ComponentSegmentPrimary,
+	// Select BOTH the segment-primary and segment-mirror pods via their standard
+	// component label (an In-set match) so the policy applies to every pod that
+	// hosts a PXF sidecar — the primary and, since D9, the mirror as well.
+	selector := metav1.LabelSelector{
+		MatchLabels: map[string]string{util.LabelCluster: cluster.Name},
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      util.LabelComponent,
+				Operator: metav1.LabelSelectorOpIn,
+				Values: []string{
+					util.ComponentSegmentPrimary,
+					util.ComponentSegmentMirror,
+				},
+			},
+		},
 	}
 
 	return &networkingv1.NetworkPolicy{
@@ -49,7 +61,7 @@ func (b *DefaultBuilder) BuildPXFClusterNetworkPolicy(
 			},
 		},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: selector},
+			PodSelector: selector,
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			// Exactly one ingress rule listing the legitimate ports. The PXF port
 			// (5888) is intentionally absent: with at least one Ingress rule
@@ -64,8 +76,9 @@ func (b *DefaultBuilder) BuildPXFClusterNetworkPolicy(
 }
 
 // pxfAllowedIngressPorts returns the legitimate cross-pod ingress ports for the
-// segment-primary pods under the SE.5 policy: the PostgreSQL/segment port and the
-// postgres + node exporter ports. The PXF port (5888) is deliberately excluded.
+// segment-primary and segment-mirror pods under the SE.5 policy: the
+// PostgreSQL/segment port and the postgres + node exporter ports. The PXF port
+// (5888) is deliberately excluded.
 func pxfAllowedIngressPorts(
 	cluster *cbv1alpha1.CloudberryCluster,
 ) []networkingv1.NetworkPolicyPort {

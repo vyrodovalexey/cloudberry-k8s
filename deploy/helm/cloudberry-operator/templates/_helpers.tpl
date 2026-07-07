@@ -106,3 +106,56 @@ Secret name for OIDC
 {{- printf "%s-oidc" (include "cloudberry-operator.fullname" .) }}
 {{- end }}
 {{- end }}
+
+{{/*
+Custom SecurityContextConstraints name for the CloudberryCluster workload.
+Defaults to "<fullname>-cluster" when openshift.scc.name is empty.
+*/}}
+{{- define "cloudberry-operator.clusterSCCName" -}}
+{{- if .Values.openshift.scc.name -}}
+{{- .Values.openshift.scc.name -}}
+{{- else -}}
+{{- printf "%s-cluster" (include "cloudberry-operator.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+ServiceAccount name that the CloudberryCluster workload pods run under. The
+operator does not set an explicit ServiceAccountName on the DB pod template, so
+the pods use the namespace `default` ServiceAccount unless overridden.
+*/}}
+{{- define "cloudberry-operator.clusterServiceAccountName" -}}
+{{- default "default" .Values.openshift.clusterServiceAccount -}}
+{{- end }}
+
+{{/*
+Pod-level securityContext for the operator Deployment.
+On OpenShift (openshift.enabled=true) the fixed runAsUser/runAsGroup/fsGroup are
+dropped so the platform SCC injects the namespace UID range; runAsNonRoot and the
+seccomp profile are always preserved. On vanilla Kubernetes the value is rendered
+verbatim from .Values.podSecurityContext (byte-identical to prior behavior).
+*/}}
+{{- define "cloudberry-operator.podSecurityContext" -}}
+{{- if .Values.openshift.enabled -}}
+{{- $psc := omit .Values.podSecurityContext "runAsUser" "runAsGroup" "fsGroup" -}}
+{{- toYaml $psc -}}
+{{- else -}}
+{{- toYaml .Values.podSecurityContext -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Container-level securityContext for the operator container.
+On OpenShift the fixed runAsUser is dropped (namespace SCC injects it) while
+allowPrivilegeEscalation:false, readOnlyRootFilesystem, runAsNonRoot and
+capabilities drop:[ALL] are preserved. On vanilla Kubernetes the value is
+rendered verbatim from .Values.securityContext.
+*/}}
+{{- define "cloudberry-operator.containerSecurityContext" -}}
+{{- if .Values.openshift.enabled -}}
+{{- $sc := omit .Values.securityContext "runAsUser" "runAsGroup" -}}
+{{- toYaml $sc -}}
+{{- else -}}
+{{- toYaml .Values.securityContext -}}
+{{- end -}}
+{{- end }}

@@ -2,9 +2,11 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -90,7 +92,37 @@ const (
 	envCloudberryCoordinatorHost = "CLOUDBERRY_COORDINATOR_HOST"
 	// envCloudberrySegmentCount is the environment variable name for the segment count.
 	envCloudberrySegmentCount = "CLOUDBERRY_SEGMENT_COUNT"
+	// envCloudberryExpansionBaseCount is the environment variable name carrying
+	// the pre-scale-out segment count (oldCount) onto the segment StatefulSets
+	// WHILE a scale-out is in progress. The entrypoint marks any segment pod
+	// whose ordinal >= this base as CLOUDBERRY_GPEXPAND_MANAGED (skip self-initdb)
+	// so gpexpand — not the pod — initializes the new segment's datadir from the
+	// coordinator template. Absent (no scale-out in flight) => normal bring-up.
+	// (The operator sets only the base count, NOT CLOUDBERRY_GPEXPAND_MANAGED
+	// directly: it cannot distinguish new from existing pods at the shared
+	// StatefulSet level, so the per-pod decision is made in the entrypoint.)
+	envCloudberryExpansionBaseCount = "CLOUDBERRY_EXPANSION_BASE_COUNT"
+
+	// segmentStartup* configure the StartupProbe attached to the SEGMENT DB
+	// container ONLY while a scale-out is in progress (see buildMainContainer).
+	// The StartupProbe holds off liveness/readiness until postgres first listens,
+	// so a gpexpand-managed NEW segment (empty datadir, postgres not yet started)
+	// is NOT SIGKILLed during the gpexpand datadir-init window. Budget =
+	// FailureThreshold * PeriodSeconds = 120 * 10s = 1200s (20 min), comfortably
+	// covering a basebackup-based gpexpand segment init. Existing segments pass
+	// immediately (port already up), so their normal cadence is unchanged.
+	segmentStartupInitialDelaySeconds int32 = 10
+	segmentStartupPeriodSeconds       int32 = 10
+	segmentStartupTimeoutSeconds      int32 = 5
+	segmentStartupFailureThreshold    int32 = 120
 )
+
+// isSegmentComponent reports whether the component is a primary or mirror
+// segment (the roles whose datadir gpexpand initializes on scale-out).
+func isSegmentComponent(component string) bool {
+	return component == util.ComponentSegmentPrimary ||
+		component == util.ComponentSegmentMirror
+}
 
 // maintenanceSQL maps maintenance operation types to their SQL commands.
 var maintenanceSQL = map[string]string{
@@ -232,6 +264,12 @@ type ResourceBuilder interface {
 	// that captures the real gpbackup timestamp and feeds it to gprestore (spec 11
 	// §Cross-Cluster Migration).
 	BuildMigrationJob(opts *MigrationJobOptions) *batchv1.Job
+	// BuildGpexpandJob builds the coordinator-exec Job that runs the real
+	// gpexpand flow (add+init new segments, redistribute, clean) to seed the
+	// newly-desired segments during a scale-out. The Job name is deterministic
+	// (<cluster>-gpexpand-<old>-<new>) so re-reconciles re-adopt the same Job.
+	BuildGpexpandJob(
+		cluster *cbv1alpha1.CloudberryCluster, oldCount, newCount int32, timestamp string) *batchv1.Job
 }
 
 // DefaultBuilder implements ResourceBuilder.
@@ -319,6 +357,10 @@ func (b *DefaultBuilder) BuildCoordinatorStatefulSet(
 	// every segment for gpbackup/gprestore MPP dispatch.
 	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
 
+	// Add the headless-service DNS search domains so gpexpand's internal
+	// short-hostname rsync/ssh commands resolve cluster-wide.
+	addClusterDNSSearchDomains(cluster, &sts.Spec.Template.Spec)
+
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
 }
@@ -403,6 +445,10 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 
 	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
 
+	// Add the headless-service DNS search domains so gpexpand's internal
+	// short-hostname rsync/ssh commands resolve cluster-wide.
+	addClusterDNSSearchDomains(cluster, &sts.Spec.Template.Spec)
+
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
 }
@@ -483,6 +529,10 @@ func (b *DefaultBuilder) BuildSegmentPrimaryStatefulSet(
 
 	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
 
+	// Add the headless-service DNS search domains so gpexpand's internal
+	// short-hostname rsync/ssh commands resolve cluster-wide.
+	addClusterDNSSearchDomains(cluster, &sts.Spec.Template.Spec)
+
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
 }
@@ -528,10 +578,13 @@ func injectSegmentPostgresExporter(
 	injectSegmentExporterWithComponent(b, cluster, sts, util.ComponentSegmentPrimary)
 }
 
-// injectPXFSidecar appends the PXF sidecar container and its volumes to the
-// primary segment pod template. It is only ever called when pxfSidecarEnabled is
-// true, so it has no internal gate. Scope is the SEGMENT PRIMARY StatefulSet
-// only; the coordinator/standby/mirror builders never call it.
+// injectPXFSidecar appends the PXF sidecar container, its cred/connector init
+// containers, and its volumes to a segment pod template. It is only ever called
+// when pxfSidecarEnabled is true, so it has no internal gate. Scope is BOTH the
+// SEGMENT PRIMARY and SEGMENT MIRROR StatefulSets (so PXF follows the acting
+// primary after a failover, D9); the coordinator/standby builders never call it.
+// The helper is component-agnostic: it operates on any *appsv1.StatefulSet and
+// makes no primary-specific assumptions, so the mirror injection is identical.
 func injectPXFSidecar(
 	b *DefaultBuilder, cluster *cbv1alpha1.CloudberryCluster, sts *appsv1.StatefulSet,
 ) {
@@ -664,6 +717,20 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 		injectMirrorPostgresExporter(b, cluster, sts)
 	}
 
+	// Inject the PXF data-loading sidecar into each MIRROR segment pod too, so
+	// PXF follows the acting primary after a failover (D9): when content-N's
+	// primary role lands on segment-mirror-N, the local :5888 is still present.
+	// Gated by pxfSidecarEnabled so a non-PXF cluster is byte-identical. On a
+	// mirror (postgres in WAL recovery) the sidecar is a PASSIVE, independently
+	// health-checked service (its probes hit PXF's own /actuator/health:5888,
+	// not the local postgres) and only serves localhost:5888 once the mirror is
+	// promoted. Config auto-syncs: the mirror mounts the SAME pxf-servers/
+	// pxf-base/pxf-lib emptyDirs populated by the SAME cred/connector init
+	// containers reading the SAME ConfigMap/Secrets as the primary.
+	if pxfSidecarEnabled(cluster) {
+		injectPXFSidecar(b, cluster, sts)
+	}
+
 	pvc, err := buildPVC(cluster.Spec.Segments.Storage, labels)
 	if err != nil {
 		return nil, fmt.Errorf("building segment mirror PVC: %w", err)
@@ -671,6 +738,10 @@ func (b *DefaultBuilder) BuildSegmentMirrorStatefulSet(
 	sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{pvc}
 
 	addClusterSSHSecret(cluster, &sts.Spec.Template.Spec)
+
+	// Add the headless-service DNS search domains so gpexpand's internal
+	// short-hostname rsync/ssh commands resolve cluster-wide.
+	addClusterDNSSearchDomains(cluster, &sts.Spec.Template.Spec)
 
 	addImagePullSecrets(&sts.Spec.Template.Spec, cluster.Spec.ImagePullSecrets)
 	return sts, nil
@@ -1063,8 +1134,7 @@ func buildCloudberryEnvVars(
 	coordinatorSvc := util.CoordinatorServiceName(cluster.Name)
 	segmentSvc := util.SegmentServiceName(cluster.Name)
 	role := cloudberryRoleForComponent(component)
-	isSegment := component == util.ComponentSegmentPrimary ||
-		component == util.ComponentSegmentMirror
+	isSegment := isSegmentComponent(component)
 	isCoordinator := component == util.ComponentCoordinator
 
 	hasMirroring := cluster.Spec.Segments.Mirroring != nil && cluster.Spec.Segments.Mirroring.Enabled
@@ -1105,6 +1175,15 @@ func buildCloudberryEnvVars(
 				Value: segmentSvc,
 			},
 		)
+		// While a scale-out is in progress, tell the entrypoint the pre-scale
+		// (old) segment count so each NEW pod (ordinal >= base) skips self-initdb
+		// and lets gpexpand initialize its datadir. No-op outside scale-out.
+		if base, ok := scaleOutBaseCount(cluster); ok {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  envCloudberryExpansionBaseCount,
+				Value: strconv.Itoa(int(base)),
+			})
+		}
 	} else {
 		// Coordinator and standby use content ID -1.
 		envVars = append(envVars, corev1.EnvVar{
@@ -1140,6 +1219,53 @@ func buildCloudberryEnvVars(
 	}
 
 	return envVars
+}
+
+// scaleOutBaseCount reports the pre-scale-out (old) segment count when a
+// scale-out is currently in progress, so the segment StatefulSet can carry it as
+// CLOUDBERRY_EXPANSION_BASE_COUNT. It reads the operator's scale-state
+// annotation (util.AnnotationScaleState) off the cluster; the base count is the
+// oldCount recorded there. It returns ok=false when no scale-out is in flight,
+// the annotation is malformed, or the recorded newCount is not greater than the
+// oldCount (nothing being added) — in which case the env is omitted and normal
+// first-boot bring-up is unchanged.
+//
+// Using oldCount (not the desired Count) makes the flag PER-POD correct with a
+// shared StatefulSet template: the entrypoint marks a pod gpexpand-managed iff
+// its ordinal >= base, so only the newly-added segments skip self-initdb while
+// the existing ones (ordinal < base) are untouched.
+// ScaleOutBaseCount is the exported wrapper around scaleOutBaseCount so callers
+// outside the builder package (the controller) can assert that the scale-state
+// annotation was persisted with the expansion base count BEFORE scaling the
+// segment StatefulSet — the fail-closed BUG-1 guard in handleScaleOut.
+func ScaleOutBaseCount(cluster *cbv1alpha1.CloudberryCluster) (int32, bool) {
+	return scaleOutBaseCount(cluster)
+}
+
+// EnvCloudberryExpansionBaseCount is the exported env var name so the controller
+// can verify the built segment StatefulSet template carries it before scale-up.
+const EnvCloudberryExpansionBaseCount = envCloudberryExpansionBaseCount
+
+func scaleOutBaseCount(cluster *cbv1alpha1.CloudberryCluster) (int32, bool) {
+	if cluster == nil || cluster.Annotations == nil {
+		return 0, false
+	}
+	raw := cluster.Annotations[util.AnnotationScaleState]
+	if raw == "" {
+		return 0, false
+	}
+	var state struct {
+		OldCount int32 `json:"oldCount"`
+		NewCount int32 `json:"newCount"`
+	}
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return 0, false
+	}
+	// Only a genuine scale-OUT (adding segments) marks new pods gpexpand-managed.
+	if state.NewCount <= state.OldCount || state.OldCount < 0 {
+		return 0, false
+	}
+	return state.OldCount, true
 }
 
 // buildMainContainer creates the main database container.
@@ -1215,6 +1341,33 @@ func buildMainContainer(
 			RunAsUser:  &runAsUser,
 			RunAsGroup: &runAsGroup,
 		},
+	}
+
+	// Scale-out tolerance (BUG 2): a gpexpand-managed NEW segment pod has an EMPTY
+	// datadir and does not start postgres until gpexpand initializes it — so its
+	// TCP LivenessProbe would fail and the kubelet would SIGKILL the DB container
+	// (CrashLoopBackOff -> pod NOT Running), which would in turn wedge the
+	// operator's "wait for new pods Running" scale-out gate. While a scale-out is
+	// in progress we therefore attach a StartupProbe to the SEGMENT DB container:
+	// the StartupProbe HOLDS OFF liveness/readiness until postgres first listens,
+	// with a budget generous enough to cover the gpexpand datadir init. Existing
+	// segment pods (datadir already initialized) pass startup immediately, so
+	// their normal liveness/readiness cadence is unaffected. No StartupProbe is
+	// added outside a scale-out, so non-scale behavior is unchanged.
+	if isSegmentComponent(component) {
+		if _, scaling := scaleOutBaseCount(cluster); scaling {
+			container.StartupProbe = &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromInt32(port),
+					},
+				},
+				InitialDelaySeconds: segmentStartupInitialDelaySeconds,
+				PeriodSeconds:       segmentStartupPeriodSeconds,
+				TimeoutSeconds:      segmentStartupTimeoutSeconds,
+				FailureThreshold:    segmentStartupFailureThreshold,
+			}
+		}
 	}
 
 	if resources != nil {
@@ -1421,6 +1574,54 @@ func addImagePullSecrets(spec *corev1.PodSpec, secrets []cbv1alpha1.ImagePullSec
 		spec.ImagePullSecrets = append(spec.ImagePullSecrets, corev1.LocalObjectReference{
 			Name: s.Name,
 		})
+	}
+}
+
+// addClusterDNSSearchDomains augments the pod's DNS resolver search list with
+// the cluster's headless-service search domains so a BARE segment pod name
+// (e.g. "<cluster>-segment-primary-2", without any service suffix) resolves
+// cluster-wide.
+//
+// This is the root-cause fix for gpexpand's short-hostname resolution failure:
+// even though the operator feeds gpexpand a correct FQDN input file, gpexpand
+// re-derives the SHORT hostname (pod name only) from gp_segment_configuration
+// for its INTERNAL rsync/ssh commands. In Kubernetes only per-pod FQDNs
+// (<pod>.<headless-svc>.<ns>.svc.cluster.local) resolve, so the bare name fails
+// with "Could not resolve hostname". Adding the segment headless service's
+// search domain makes <pod-name> resolve to
+// <pod-name>.<seg-hl>.<ns>.svc.cluster.local via the DNS resolver's search list.
+//
+// The coordinator/standby headless-service search domains are added too so their
+// short names resolve should gpexpand (or any MPP tool) ever emit them. The
+// primary and mirror segment StatefulSets share the SegmentServiceName headless
+// service (both set it as ServiceName), so one segment search domain covers both.
+//
+// dnsPolicy is deliberately left at its default (ClusterFirst): dnsConfig.searches
+// AUGMENTS — it does not replace — the cluster's own search domains, so existing
+// FQDN resolution is unaffected (safe and backward-compatible). Search entries
+// are deduplicated and appended in a deterministic order for stable pod templates.
+func addClusterDNSSearchDomains(cluster *cbv1alpha1.CloudberryCluster, spec *corev1.PodSpec) {
+	ns := cluster.Namespace
+	domains := []string{
+		fmt.Sprintf("%s.%s.svc.cluster.local", util.SegmentServiceName(cluster.Name), ns),
+		fmt.Sprintf("%s.%s.svc.cluster.local", util.CoordinatorServiceName(cluster.Name), ns),
+		fmt.Sprintf("%s.%s.svc.cluster.local", util.StandbyServiceName(cluster.Name), ns),
+	}
+
+	if spec.DNSConfig == nil {
+		spec.DNSConfig = &corev1.PodDNSConfig{}
+	}
+
+	existing := make(map[string]struct{}, len(spec.DNSConfig.Searches))
+	for _, s := range spec.DNSConfig.Searches {
+		existing[s] = struct{}{}
+	}
+	for _, d := range domains {
+		if _, ok := existing[d]; ok {
+			continue
+		}
+		spec.DNSConfig.Searches = append(spec.DNSConfig.Searches, d)
+		existing[d] = struct{}{}
 	}
 }
 

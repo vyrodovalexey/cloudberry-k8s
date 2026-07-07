@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
@@ -73,7 +74,9 @@ func TestClusterReconciler_CheckScaleOutPhases_ScalingSTS_Ready(t *testing.T) {
 	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
 	replicas := int32(4)
 	primarySts.Spec.Replicas = &replicas
-	primarySts.Status.ReadyReplicas = 4
+	// Existing segments (ordinals 0,1) Ready; the scale-out gate now requires the
+	// PRE-scale count Ready + the NEW pods (ordinals 2,3) merely Running.
+	primarySts.Status.ReadyReplicas = 2
 
 	state := scaleStateData{
 		Phase:     scalePhaseScalingSTS,
@@ -83,9 +86,18 @@ func TestClusterReconciler_CheckScaleOutPhases_ScalingSTS_Ready(t *testing.T) {
 	}
 	stateJSON, _ := json.Marshal(state)
 
+	objs := []client.Object{cluster, primarySts}
+	// New segment pods are RUNNING (not necessarily Ready): sufficient for gpexpand.
+	objs = append(objs, runningSegmentPod(cluster.Name, util.ComponentSegmentPrimary, 2))
+	objs = append(objs, runningSegmentPod(cluster.Name, util.ComponentSegmentPrimary, 3))
+	// The coordinator-stability gate requires a fully-rolled coordinator STS +
+	// Running/Ready coordinator pod before advancing to the gpexpand phase.
+	objs = append(objs, stableCoordinatorSts(cluster.Name, cluster.Namespace))
+	objs = append(objs, readyCoordinatorPod(cluster.Name, cluster.Namespace))
+
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(cluster, primarySts).
+		WithObjects(objs...).
 		WithStatusSubresource(cluster).
 		Build()
 	recorder := record.NewFakeRecorder(20)
@@ -98,6 +110,10 @@ func TestClusterReconciler_CheckScaleOutPhases_ScalingSTS_Ready(t *testing.T) {
 	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter) // Advances to next phase
 }
 
+// TestClusterReconciler_CheckScaleOutPhases_Registering proves the LEGACY
+// "registering" phase (from an in-flight pre-upgrade state) is routed to the new
+// gpexpand-backed expanding handler: it creates the gpexpand Job and requeues on
+// the poll interval (rather than the old immediate advance).
 func TestClusterReconciler_CheckScaleOutPhases_Registering(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -119,14 +135,23 @@ func TestClusterReconciler_CheckScaleOutPhases_Registering(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	m := &metrics.NoopRecorder{}
 
-	// No dbFactory → registerNewSegments is a no-op
 	r := NewClusterReconciler(k8sClient, scheme, recorder, builder.NewBuilder(), m, nil)
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
+	assert.Equal(t, requeueAfterGpexpandPoll, result.RequeueAfter)
+
+	// The gpexpand Job was created and recorded on the scale state.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		client.ObjectKeyFromObject(cluster), updated))
+	var got scaleStateData
+	require.NoError(t, json.Unmarshal([]byte(updated.Annotations[annotationScaleState]), &got))
+	assert.Equal(t, util.GpexpandJobName(cluster.Name, 2, 4), got.ExpandJobName)
 }
 
+// TestClusterReconciler_CheckScaleOutPhases_Redistributing proves the LEGACY
+// "redistributing" phase is likewise routed to the gpexpand expanding handler.
 func TestClusterReconciler_CheckScaleOutPhases_Redistributing(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -152,7 +177,7 @@ func TestClusterReconciler_CheckScaleOutPhases_Redistributing(t *testing.T) {
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.Equal(t, requeueAfterImmediate, result.RequeueAfter)
+	assert.Equal(t, requeueAfterGpexpandPoll, result.RequeueAfter)
 }
 
 func TestClusterReconciler_CheckScaleOutPhases_Completed(t *testing.T) {
@@ -492,45 +517,11 @@ func TestClusterReconciler_CheckScaleInPhases_UnknownPhase(t *testing.T) {
 // ============================================================================
 // Cluster Controller: DB-backed scale operations
 // ============================================================================
-
-func TestClusterReconciler_RegisterNewSegments_WithDBFactory(t *testing.T) {
-	scheme := newTestScheme()
-	cluster := newTestCluster()
-	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(cluster).
-		WithStatusSubresource(cluster).
-		Build()
-	recorder := record.NewFakeRecorder(20)
-	m := &metrics.NoopRecorder{}
-
-	r := NewClusterReconciler(k8sClient, scheme, recorder, builder.NewBuilder(), m, nil, dbFactory)
-
-	state := scaleStateData{OldCount: 2, NewCount: 4}
-	err := r.registerNewSegments(context.Background(), cluster, state)
-	require.NoError(t, err)
-}
-
-func TestClusterReconciler_RedistributeData_WithDBFactory(t *testing.T) {
-	scheme := newTestScheme()
-	cluster := newTestCluster()
-	dbFactory := &mockDBClientFactory{client: &mockDBClient{}}
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(cluster).
-		WithStatusSubresource(cluster).
-		Build()
-	recorder := record.NewFakeRecorder(20)
-	m := &metrics.NoopRecorder{}
-
-	r := NewClusterReconciler(k8sClient, scheme, recorder, builder.NewBuilder(), m, nil, dbFactory)
-
-	err := r.redistributeData(context.Background(), cluster)
-	require.NoError(t, err)
-}
+//
+// NOTE: the registerNewSegments / redistributeData controller wrappers were
+// removed (superseded by the gpexpand coordinator-exec Job, see
+// scale_out_redistribution_bound_test.go). The scale-IN DB path
+// (RedistributeBeforeScaleIn / DeregisterSegments) is still exercised below.
 
 func TestClusterReconciler_RedistributeBeforeScaleIn_WithDBFactory(t *testing.T) {
 	scheme := newTestScheme()

@@ -197,8 +197,19 @@ RUN dnf -y install \
     dnf clean all && rm -rf /var/cache/dnf
 
 # The RPM installs Cloudberry to /usr/local/cloudberry-db (versioned dir +
-# symlink). Confirm GPHOME exists.
-RUN test -d /usr/local/cloudberry-db && test -x /usr/local/cloudberry-db/bin/postgres
+# symlink). Confirm GPHOME exists AND that gpexpand is present — the scale-out
+# path drives a real gpexpand flow from a coordinator-exec Job (segment add+init
+# from the coordinator template + redistribution), so a build missing gpexpand
+# would break scale-out. gpexpand ships in the full /usr/local/cloudberry-db tree.
+# Also assert /usr/sbin/sshd exists: under the scoped restricted-v2 SCC the
+# entrypoint starts a ROOTLESS sshd on port 2022 (gpadmin, no NET_BIND_SERVICE),
+# which gpexpand's segment-init phase SSHes to (redirected to 2022 via the
+# gpadmin ~/.ssh/config `Port` directive). A build missing sshd would break
+# gpexpand-based scale-out.
+RUN test -d /usr/local/cloudberry-db && \
+    test -x /usr/local/cloudberry-db/bin/postgres && \
+    test -x /usr/local/cloudberry-db/bin/gpexpand && \
+    test -x /usr/sbin/sshd
 
 # Bundle the gpbackup toolchain into GPHOME/bin so backups can run.
 COPY --from=gpbackup-builder /out/gpbackup            /usr/local/cloudberry-db/bin/gpbackup
@@ -274,9 +285,21 @@ RUN printf '* soft core unlimited\n\
 * soft nproc 131072\n\
 * hard nproc 131072\n' > /etc/security/limits.d/90-cbdb-limits.conf
 
-# SSH dir (keypair generated at runtime by entrypoint)
-RUN mkdir -p /home/gpadmin/.ssh && chmod 700 /home/gpadmin/.ssh && \
-    chown -R gpadmin:gpadmin /home/gpadmin/.ssh
+# SSH dir (keypair generated at runtime by entrypoint).
+#
+# Bake a gpadmin-writable rootless-sshd host key dir and a default client
+# ~/.ssh/config carrying `Port 2022`, so the runtime step (write_ssh_client_config
+# / start_rootless_sshd) is a no-op re-assert. Under the scoped restricted-v2 SCC
+# the pods run a ROOTLESS sshd on 2022 (no NET_BIND_SERVICE, no root); gpexpand/
+# gpssh/gpsync/gpbackup shell out to the OpenSSH client which honors this
+# per-host `Port`. The only ssh targets in these pods are other cluster pods, so
+# a wildcard `Host *` block is safe.
+RUN mkdir -p /home/gpadmin/.ssh/hostkeys /home/gpadmin/run && \
+    printf 'Host *\n  Port 2022\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n  BatchMode yes\n' \
+        > /home/gpadmin/.ssh/config && \
+    chmod 700 /home/gpadmin/.ssh /home/gpadmin/.ssh/hostkeys && \
+    chmod 600 /home/gpadmin/.ssh/config && \
+    chown -R gpadmin:gpadmin /home/gpadmin/.ssh /home/gpadmin/run
 
 # gpadmin environment
 RUN { \
@@ -289,6 +312,46 @@ RUN { \
       echo 'fi'; \
       echo 'export COORDINATOR_DATA_DIRECTORY="${COORDINATOR_DATA_DIRECTORY:-/data/pgdata/gpseg-1}"'; \
     } >> /home/gpadmin/.bashrc
+
+# -----------------------------------------------------------------------------
+# BAKE the gpexpand pg_ctl shim at BUILD time (as root).
+#
+# ROOT CAUSE it fixes: gpexpand's segment-init phase ssh's into the new segment
+# as gpadmin and runs a hardcoded `pg_ctl -D <datadir> ... start`. In Cloudberry
+# 2.1 the segment content id is the GUC `gp_contentid` in the datadir's
+# internal.auto.conf; the datadir gpexpand basebackups from the coordinator
+# template carries `gp_contentid = -1`, so that intermediate start comes up with
+# the wrong content id and postgres FATALs "contentid not specified".
+#
+# The shim (hack/gpexpand-pgctl-shim.sh) wraps pg_ctl: for start/restart it
+# DERIVES the content id from the `-D <datadir>` gpseg<N> suffix and upserts
+# `gp_contentid = <N>` into that datadir's internal.auto.conf before exec'ing the
+# REAL pg_ctl unchanged (it NEVER injects -C). The derivation is self-contained
+# (no runtime env / no entrypoint cooperation needed), which is why baking the
+# SAME shim into every segment image is correct — each pod's datadir path encodes
+# its own content id.
+#
+# WHY BUILD TIME: at runtime the pod runs as gpadmin (UID 1000) under the
+# restricted-v2 SCC and ${GPHOME}/bin is root-owned, so the shim can NOT be
+# installed at runtime ("permission denied"). Here (root) we rename the real
+# binary to pg_ctl.real ONCE (idempotent guard) and drop the shim in its place.
+# The shim being root-owned is fine — it is only executed. Build assertions
+# below confirm pg_ctl.real exists and pg_ctl is the shim.
+# -----------------------------------------------------------------------------
+COPY --chmod=0755 hack/gpexpand-pgctl-shim.sh /usr/local/cloudberry-db/bin/pg_ctl.cbk-shim
+# The RUN renames the real pg_ctl to pg_ctl.real (idempotent guard), installs the
+# shim in its place, then ASSERTS pg_ctl.real exists, pg_ctl is the shim (marker
+# present), and no `-C ` flag is baked into the shim.
+RUN set -eu; \
+    GPBIN=/usr/local/cloudberry-db/bin; \
+    if [ ! -e "${GPBIN}/pg_ctl.real" ]; then \
+        mv "${GPBIN}/pg_ctl" "${GPBIN}/pg_ctl.real"; \
+    fi; \
+    mv "${GPBIN}/pg_ctl.cbk-shim" "${GPBIN}/pg_ctl"; \
+    chmod 0755 "${GPBIN}/pg_ctl"; \
+    test -x "${GPBIN}/pg_ctl.real"; \
+    grep -q 'cloudberry-k8s gpexpand pg_ctl shim' "${GPBIN}/pg_ctl"; \
+    ! grep -q '\-C ' "${GPBIN}/pg_ctl"
 
 # Entrypoint
 COPY --chmod=755 hack/docker-entrypoint-cloudberry.sh /usr/local/bin/docker-entrypoint.sh
@@ -305,7 +368,9 @@ ENV PGDATA=/data/pgdata \
 USER 1000:1000
 WORKDIR /home/gpadmin
 
-EXPOSE 5432 22
+# 2022 is the ROOTLESS sshd port (restricted-v2 SCC compatible); 22 is no longer
+# the load-bearing SSH listener (kept only as a local/non-OKD fallback).
+EXPOSE 5432 2022
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
     CMD pg_isready -h localhost -p 5432 -U gpadmin -d postgres || exit 1

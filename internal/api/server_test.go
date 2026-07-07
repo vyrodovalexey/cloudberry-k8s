@@ -2487,11 +2487,16 @@ func (m *mockDBClient) LogRotate(_ context.Context) error                     { 
 func (m *mockDBClient) RegisterNewSegments(_ context.Context, _ db.SegmentRegistrationOptions) error {
 	return nil
 }
+func (m *mockDBClient) SeedNewSegmentCatalog(_ context.Context, _ db.SegmentRegistrationOptions) (int, error) {
+	return 0, nil
+}
 func (m *mockDBClient) RedistributeData(_ context.Context, _ db.RedistributionOptions) error {
 	return nil
 }
 func (m *mockDBClient) GetRedistributionProgress(_ context.Context) (int32, error) { return 0, nil }
 func (m *mockDBClient) DeregisterSegments(_ context.Context, _ int32) error        { return nil }
+func (m *mockDBClient) GpexpandSchemaPresent(_ context.Context) (bool, error)      { return false, nil }
+func (m *mockDBClient) FinalizeGpexpand(_ context.Context) error                   { return nil }
 func (m *mockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ db.ScaleInRedistributionOptions) error {
 	return nil
 }

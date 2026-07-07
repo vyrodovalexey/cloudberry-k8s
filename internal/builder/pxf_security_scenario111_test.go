@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
@@ -262,8 +263,9 @@ func TestPXFKeytabPath_DefaultKey(t *testing.T) {
 // ----------------------------------------------------------------------------
 
 // TestBuildPXFClusterNetworkPolicy_Enabled proves the policy is emitted for a
-// PXF cluster, selects the segment-primary pods, allows 5432 + exporter ports,
-// and DELIBERATELY OMITS the PXF port 5888 (cross-pod PXF denied). (111-SE5-U)
+// PXF cluster, selects BOTH the segment-primary and segment-mirror pods (D9),
+// allows 5432 + exporter ports, and DELIBERATELY OMITS the PXF port 5888
+// (cross-pod PXF denied). (111-SE5-U)
 func TestBuildPXFClusterNetworkPolicy_Enabled(t *testing.T) {
 	b := NewBuilder()
 	cluster := newPXFTestCluster()
@@ -276,10 +278,18 @@ func TestBuildPXFClusterNetworkPolicy_Enabled(t *testing.T) {
 	require.Len(t, np.OwnerReferences, 1)
 	assert.Equal(t, cluster.Name, np.OwnerReferences[0].Name)
 
-	// Segment-primary selector.
+	// Cluster-scoped selector: matchLabels pins the cluster and an In-set
+	// matchExpression covers BOTH segment-primary and segment-mirror pods (D9),
+	// so :5888 stays confined on the mirror after a failover moves PXF there.
 	assert.Equal(t, cluster.Name, np.Spec.PodSelector.MatchLabels[util.LabelCluster])
-	assert.Equal(t, util.ComponentSegmentPrimary,
-		np.Spec.PodSelector.MatchLabels[util.LabelComponent])
+	require.Len(t, np.Spec.PodSelector.MatchExpressions, 1)
+	expr := np.Spec.PodSelector.MatchExpressions[0]
+	assert.Equal(t, util.LabelComponent, expr.Key)
+	assert.Equal(t, metav1.LabelSelectorOpIn, expr.Operator)
+	assert.ElementsMatch(t,
+		[]string{util.ComponentSegmentPrimary, util.ComponentSegmentMirror},
+		expr.Values,
+		"policy must select both primary and mirror PXF pods")
 
 	// Ingress-only policy.
 	assert.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)

@@ -52,3 +52,6 @@ deploy/helm/
 .DS_Store
 .yandex-tank/
 .yandextank/
+
+# ssh
+.ssh

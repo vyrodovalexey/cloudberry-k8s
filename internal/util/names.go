@@ -231,6 +231,16 @@ func BackupServiceAccountName(_ string) string {
 	return "cloudberry-backup-sa"
 }
 
+// GpexpandJobName returns the DETERMINISTIC name of the coordinator-exec Job
+// that runs the real gpexpand flow for a scale-out from oldCount to newCount
+// segments. It is derived only from the cluster name + segment counts (NOT a
+// wall-clock timestamp) so a re-reconcile of the same expansion re-adopts the
+// same Job (AlreadyExists-tolerant create), which — combined with gpexpand's
+// native gpexpand.status resume — makes the expansion idempotent.
+func GpexpandJobName(cluster string, oldCount, newCount int32) string {
+	return SanitizeK8sName(fmt.Sprintf("%s-gpexpand-%d-%d", cluster, oldCount, newCount))
+}
+
 // CommonLabels returns the standard labels for a cluster resource.
 func CommonLabels(cluster, component string) map[string]string {
 	return map[string]string{

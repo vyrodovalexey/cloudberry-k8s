@@ -523,9 +523,14 @@ func TestAdminReconciler_ContinueRollingRestart_CompletedPhase(t *testing.T) {
 }
 
 // ============================================================================
-// Cluster Controller: handleScaleOut with registering error
+// Cluster Controller: gpexpand expanding phase (legacy phase-name routing)
 // ============================================================================
 
+// TestClusterReconciler_CheckScaleOutPhases_RegisteringError proves the legacy
+// "registering" phase now routes to the gpexpand Job-backed expanding handler.
+// The DB factory is no longer consulted in the scale-out path (gpexpand owns the
+// catalog insert), so the handler creates the gpexpand Job and requeues on the
+// poll interval regardless of a DB-factory error.
 func TestClusterReconciler_CheckScaleOutPhases_RegisteringError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -538,7 +543,7 @@ func TestClusterReconciler_CheckScaleOutPhases_RegisteringError(t *testing.T) {
 	}
 	stateJSON, _ := json.Marshal(state)
 
-	// Use a DB factory that returns an error
+	// A DB factory that errors: it must NOT be consulted on the scale-out path.
 	dbFactory := &mockDBClientFactory{err: fmt.Errorf("connection refused")}
 
 	k8sClient := fake.NewClientBuilder().
@@ -552,10 +557,13 @@ func TestClusterReconciler_CheckScaleOutPhases_RegisteringError(t *testing.T) {
 	r := NewClusterReconciler(k8sClient, scheme, recorder, builder.NewBuilder(), m, nil, dbFactory)
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
-	require.NoError(t, err) // Error is logged, returns requeue
-	assert.Equal(t, requeueAfterError, result.RequeueAfter)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterGpexpandPoll, result.RequeueAfter)
 }
 
+// TestClusterReconciler_CheckScaleOutPhases_RedistributingError proves the legacy
+// "redistributing" phase likewise routes to the gpexpand expanding handler and
+// creates the Job (DB factory error is irrelevant to the gpexpand path).
 func TestClusterReconciler_CheckScaleOutPhases_RedistributingError(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()
@@ -582,7 +590,7 @@ func TestClusterReconciler_CheckScaleOutPhases_RedistributingError(t *testing.T)
 
 	result, err := r.checkScaleOutPhases(context.Background(), cluster, string(stateJSON))
 	require.NoError(t, err)
-	assert.Equal(t, requeueAfterError, result.RequeueAfter)
+	assert.Equal(t, requeueAfterGpexpandPoll, result.RequeueAfter)
 }
 
 // ============================================================================

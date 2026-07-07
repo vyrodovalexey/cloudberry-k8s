@@ -2,6 +2,14 @@
 
 This guide covers day-to-day operations for managing Cloudberry Database clusters with the Cloudberry Operator.
 
+> **Deployment targets**: the operator runs on any conformant Kubernetes
+> distribution, and also supports **OKD4 / OpenShift** as a first-class target via
+> the chart's `openshift.enabled` flag. For an end-to-end OKD4 walkthrough (scoped
+> SCC, Vault-PKI TLS, PXF, MinIO backups, and a verified nine-step scenario), see
+> the [OKD4 / OpenShift Sample](okd4_sample.md) and the
+> [OKD4 / OpenShift section](installation.md#okd4--openshift) of the installation
+> guide.
+
 ## Table of Contents
 
 - [Creating a CloudberryCluster](#creating-a-cloudberrycluster)
@@ -5749,7 +5757,19 @@ kubectl get statefulsets -n cloudberry-test -l avsoft.io/cluster=my-cluster
 
 ### Data Redistribution
 
-When a scale operation is initiated, the operator creates a redistribution Job. For scale-out, the Job rebalances data across the new segments. For scale-in, the Job moves data off the segments being removed. The Job uses the `redistribute` maintenance operation, which runs an `ANALYZE` command on the coordinator (in a production Cloudberry deployment, this maps to `gpexpand` redistribution).
+When a scale operation is initiated, the operator creates a redistribution Job.
+
+For **scale-out**, the operator runs a real `gpexpand` flow from a coordinator-exec
+Kubernetes Job: it `kubectl exec`s into `<cluster>-coordinator-0` and runs
+`gpexpand -i` (add + initialize the new segment from the coordinator template, via
+`pg_basebackup` over SSH), then `gpexpand -a` (redistribute every table with
+`ALTER TABLE … EXPAND TABLE`), then finalizes the expansion (`gpexpand --clean` /
+`DROP SCHEMA gpexpand CASCADE`) so a subsequent backup is never blocked. This is the
+only supported mechanism that physically seeds a late-added segment so its
+relations/OIDs match the coordinator. On OKD4 the segment SSH dispatch uses a
+rootless sshd on port 2022 (the scoped SCC forbids binding the privileged port 22).
+
+For **scale-in**, the Job moves data off the segments being removed.
 
 **Job properties:**
 - **Name**: `{cluster}-maintenance-{timestamp}`

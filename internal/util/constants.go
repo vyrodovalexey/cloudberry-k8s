@@ -30,6 +30,10 @@ const (
 	// (full|incremental) of a backup Job. It records the type of the backup that
 	// actually ran so status can be derived from the Job rather than the spec.
 	LabelBackupType = "avsoft.io/backup-type"
+	// LabelScaleFrom records the source segment count of a gpexpand scale-out Job.
+	LabelScaleFrom = "avsoft.io/scale-from"
+	// LabelScaleTo records the target segment count of a gpexpand scale-out Job.
+	LabelScaleTo = "avsoft.io/scale-to"
 
 	// BackupOperationBackup is the backup-operation label value for a backup Job.
 	BackupOperationBackup = "backup"
@@ -104,6 +108,11 @@ const (
 	AnnotationConfirmScaleIn = "avsoft.io/confirm-scale-in"
 	// AnnotationScaleStarted tracks when a scale operation started.
 	AnnotationScaleStarted = "avsoft.io/scale-started"
+	// AnnotationScaleState tracks in-progress scale-out state as JSON (phase,
+	// oldCount, newCount, …). The builder reads oldCount from this annotation to
+	// mark the newly-added (ordinal >= oldCount) segment pods as gpexpand-managed
+	// so their entrypoint skips self-initdb and gpexpand initializes the datadir.
+	AnnotationScaleState = "avsoft.io/scale-state"
 	// AnnotationUpgrade tracks in-progress upgrade state as JSON.
 	AnnotationUpgrade = "avsoft.io/upgrade"
 	// AnnotationMirroringState tracks in-progress mirroring enable/disable state as JSON.
@@ -165,6 +174,15 @@ const (
 	// While present and the Job is non-terminal, PVC deletion and finalizer
 	// removal are deferred so the backup runs against intact volumes.
 	AnnotationDeletionBackupJob = "avsoft.io/deletion-backup-job"
+	// AnnotationGpexpandScriptHash records a stable hash of the gpexpand Job's
+	// rendered coordinator-exec script. Because the gpexpand Job has a
+	// DETERMINISTIC name and Job pod templates are IMMUTABLE, an operator upgrade
+	// that changes the script would otherwise silently reuse a stale Job created
+	// by a previous operator version (AlreadyExists-tolerant create). The
+	// controller compares this annotation on an existing Job with the freshly
+	// built Job's hash and force-recreates the Job on drift, so an upgraded
+	// operator never adopts an outdated gpexpand script.
+	AnnotationGpexpandScriptHash = "avsoft.io/gpexpand-script-hash"
 	// BackupTimestampLayout is the shared Go time layout used to stamp
 	// backup/maintenance/rebalance Job names (YYYYMMDD-HHMMSS).
 	BackupTimestampLayout = "20060102-150405"

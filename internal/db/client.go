@@ -36,6 +36,12 @@ const (
 const (
 	sqlStateUndefinedTable  = "42P01" // undefined_table
 	sqlStateUndefinedColumn = "42703" // undefined_column
+	// sqlStateCannotConnectNow (57P03) is returned by PostgreSQL/Cloudberry when
+	// the server is starting up or shutting down and cannot accept connections.
+	// A coordinator can wedge in this state after a restart during a scale/STS
+	// change and reject all connections indefinitely (D3), requiring a pod
+	// restart to recover.
+	sqlStateCannotConnectNow = "57P03" // cannot_connect_now
 )
 
 // ErrDiskUsageUnavailable is returned by GetDiskUsagePercent when
@@ -44,6 +50,20 @@ const (
 // (S.1/R.2: never fabricate a disk-usage percentage).
 var ErrDiskUsageUnavailable = errors.New(
 	"disk usage unavailable: gp_toolkit.gp_disk_free not accessible",
+)
+
+// ErrSegmentCatalogNotSeeded is returned by the scale-out redistribution path
+// (D8) when a user relation that exists on the coordinator is missing on a
+// newly-added segment. This means the new segment's catalog was not seeded from
+// the coordinator (the operator can only create databases cluster-wide via the
+// coordinator; it cannot physically clone pre-existing table catalog entries
+// with matching OIDs the way gpexpand does). "ALTER TABLE ... EXPAND TABLE"
+// would fail with a raw 42P01 ("relation does not exist") on that segment and be
+// retried forever, so the redistribution surfaces this typed, terminal error
+// instead. The scale controller treats it as a non-retriable scale-out failure.
+var ErrSegmentCatalogNotSeeded = errors.New(
+	"new segment catalog not seeded from coordinator: pre-existing user relations " +
+		"are missing on the newly-added segment (EXPAND TABLE cannot redistribute them)",
 )
 
 // Transient per-database connection pool bounds. Redistribution opens a
@@ -233,8 +253,25 @@ type Client interface {
 	// This signals the logger process to switch to a new log file immediately.
 	LogRotate(ctx context.Context) error
 	// RegisterNewSegments registers new primary and mirror segments in gp_segment_configuration.
-	// This is called after new segment pods are ready during scale-out.
+	//
+	// Deprecated (scale-out): the scale-out path no longer hand-registers
+	// segments — the gpexpand coordinator-exec Job (builder.BuildGpexpandJob)
+	// owns the gp_segment_configuration insert AND the physical segment-init
+	// (basebackup from the coordinator template), which a raw catalog INSERT
+	// cannot do. Pre-inserting a row makes gpexpand see the content as already
+	// present and fail/double-register, so the controller MUST NOT call this
+	// during scale-out. The method is retained for backward compatibility (the
+	// db.Client interface and its mocks) and possible fallback tooling.
 	RegisterNewSegments(ctx context.Context, opts SegmentRegistrationOptions) error
+	// SeedNewSegmentCatalog seeds the newly-added segments' catalog from the
+	// coordinator (dispatch mode). Returns the number of databases seeded.
+	//
+	// Deprecated (scale-out): superseded by the gpexpand Job — a database's
+	// segment membership is FIXED at CREATE DATABASE time, so a
+	// coordinator-dispatched seed can never provision a user database onto a
+	// late-added segment (only gpexpand's segment-init does). Retained for
+	// interface/mocks compatibility; not called on the scale-out path.
+	SeedNewSegmentCatalog(ctx context.Context, opts SegmentRegistrationOptions) (int, error)
 	// RedistributeData redistributes existing tables across all segments (including new ones).
 	// This is the gpexpand equivalent for Cloudberry.
 	RedistributeData(ctx context.Context, opts RedistributionOptions) error
@@ -244,6 +281,17 @@ type Client interface {
 	// for segments with content IDs >= newCount. This is called during scale-in
 	// after data has been moved off the segments being removed.
 	DeregisterSegments(ctx context.Context, newCount int32) error
+	// GpexpandSchemaPresent reports whether the gpexpand expansion schema still
+	// exists in the coordinator catalog. A lingering gpexpand schema (left by an
+	// interrupted or pre-hardened gpexpand Job) blocks a subsequent gpbackup with
+	// "expansion currently in process", so the operator checks this at scale-out
+	// completion (D9). It is a single pure-SQL catalog lookup (no SSH, no Job).
+	GpexpandSchemaPresent(ctx context.Context) (bool, error)
+	// FinalizeGpexpand drops the gpexpand expansion schema via the coordinator
+	// connection (DROP SCHEMA IF EXISTS gpexpand CASCADE). It is idempotent and
+	// requires no SSH — a single catalog op the operator dispatches directly to
+	// clear the gpbackup blocker at scale-out completion (D9).
+	FinalizeGpexpand(ctx context.Context) error
 	// RedistributeBeforeScaleIn redistributes data to only the remaining segments
 	// before scaling in. This ensures no data is left on segments being removed.
 	RedistributeBeforeScaleIn(ctx context.Context, opts ScaleInRedistributionOptions) error
@@ -896,6 +944,40 @@ func applyRootCA(poolCfg *pgxpool.Config, rootCA []byte) error {
 	}
 	tlsCfg.RootCAs = pool
 	return nil
+}
+
+// newDatabasePool clones the main pool's connection configuration for a
+// specific target database and returns a fresh pgxpool.
+//
+// D1 fix: the connection string produced by pool.Config().ConnString() carries
+// the sslmode (for example, verify-ca) but NOT the custom root CA, which is
+// installed programmatically on the TLS config's RootCAs (see applyRootCA). When
+// a transient per-database or per-segment pool is built by parsing that
+// connection string alone, pgx falls back to the host's system trust store and
+// verify-ca fails with "x509: certificate signed by unknown authority" against a
+// private CA (for example, Vault PKI). This helper re-attaches the cluster CA
+// (c.config.SSLRootCA) so every operator->coordinator connection consistently
+// trusts the cluster's own CA. mutate, when non-nil, is applied to the parsed
+// config before the root CA is re-applied (for example, to override the target
+// database). It is a no-op for non-TLS clusters (empty SSLRootCA).
+func (c *pgxClient) newDatabasePool(
+	ctx context.Context,
+	mutate func(*pgxpool.Config),
+) (*pgxpool.Pool, error) {
+	connStr := c.pool.Config().ConnString()
+	dbConfig, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing connection config: %w", err)
+	}
+	if mutate != nil {
+		mutate(dbConfig)
+	}
+	// Re-attach the cluster root CA lost when serializing to a connection
+	// string, so verify-ca validates against the cluster CA (not system roots).
+	if err := applyRootCA(dbConfig, c.config.SSLRootCA); err != nil {
+		return nil, fmt.Errorf("applying SSL root CA to database pool: %w", err)
+	}
+	return pgxpool.NewWithConfig(ctx, dbConfig)
 }
 
 // buildConnectionString constructs a PostgreSQL connection string using pgx's
@@ -1982,6 +2064,61 @@ func isUndefinedRelationOrColumn(err error) bool {
 	return pgErr.Code == sqlStateUndefinedTable || pgErr.Code == sqlStateUndefinedColumn
 }
 
+// IsCoordinatorShuttingDown reports whether err indicates the coordinator is in
+// the "cannot connect now" state (SQLSTATE 57P03, "the database system is
+// shutting down"/"starting up"). This is used by the scale controller to detect
+// a wedged coordinator (D3) so it can roll the stuck pod and recover instead of
+// requeueing forever. It unwraps the error chain and also matches the textual
+// signature as a fallback for drivers that surface the state without a code.
+func IsCoordinatorShuttingDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Primary signal: a *pgconn.PgError carrying SQLSTATE 57P03 anywhere in the
+	// wrapped chain. pgx can surface the wedge either as a query-time PgError or,
+	// during CONNECTION ESTABLISHMENT (the redistribution/seed DB dial), inside a
+	// *pgconn.connectError that wraps the underlying PgError — errors.As unwraps
+	// both, so this catches the wedge whether it happens at dial or at query time.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == sqlStateCannotConnectNow {
+		return true
+	}
+	// Fallback: textual signatures for drivers/paths that surface the wedge
+	// without a decoded SQLSTATE (for example, a dial failure whose message
+	// carries the server's FATAL text but not a structured PgError). Broadened
+	// (D3) to cover the "cannot connect now" and recovery-mode variants in
+	// addition to the shutting-down/starting-up messages.
+	msg := strings.ToLower(err.Error())
+	for _, sig := range coordinatorWedgeSignatures {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// coordinatorWedgeSignatures are the lowercase textual signatures that indicate
+// a wedged/unavailable coordinator (SQLSTATE 57P03 and its message variants).
+// Used as a fallback in IsCoordinatorShuttingDown when a structured PgError is
+// not available (for example, a connection-establishment failure during the
+// redistribution or catalog-seeding DB dial, D3).
+var coordinatorWedgeSignatures = []string{
+	"the database system is shutting down",
+	"the database system is starting up",
+	"the database system is in recovery mode",
+	"cannot connect now",
+	"57p03",
+}
+
+// IsSegmentCatalogNotSeeded reports whether err is (or wraps)
+// ErrSegmentCatalogNotSeeded — the terminal D8 condition in which a newly-added
+// segment's catalog was not seeded from the coordinator, so EXPAND TABLE can
+// never redistribute pre-existing relations onto it. The scale controller uses
+// this to abort a scale-out instead of retrying forever.
+func IsSegmentCatalogNotSeeded(err error) bool {
+	return errors.Is(err, ErrSegmentCatalogNotSeeded)
+}
+
 // clampPercent constrains a raw percentage into the inclusive 0..100 range so a
 // malformed view (e.g. df_free > df_total) can never publish an out-of-range
 // gauge or status value.
@@ -2781,6 +2918,48 @@ func (c *pgxClient) LogRotate(ctx context.Context) (err error) {
 	return nil
 }
 
+// Segment role codes used in gp_segment_configuration.role / preferred_role.
+const (
+	segmentRolePrimary = "p"
+	segmentRoleMirror  = "m"
+)
+
+// segmentRow describes a single gp_segment_configuration row to register.
+type segmentRow struct {
+	dbid     int32
+	content  int32
+	role     string // segmentRolePrimary or segmentRoleMirror
+	port     int32
+	hostname string
+	dataDir  string
+}
+
+// registerSegmentRow inserts a single segment row into gp_segment_configuration
+// only if no row with the same (content, role) already exists.
+//
+// D2 fix: the previous blind INSERT produced duplicate content rows when a
+// reconcile was retried (for example, after the coordinator wedge in D3),
+// corrupting the catalog. The insert is now an INSERT ... SELECT ... WHERE NOT
+// EXISTS, which is idempotent and free of a TOCTOU race (the existence check and
+// insert are a single atomic statement). It reports whether a row was inserted
+// so the caller only advances the dbid counter on a real insert.
+func (c *pgxClient) registerSegmentRow(ctx context.Context, row segmentRow) (bool, error) {
+	query := `INSERT INTO gp_segment_configuration
+		(dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir)
+		SELECT $1, $2, $3, $3, 's', 'u', $4, $5, $5, $6
+		WHERE NOT EXISTS (
+			SELECT 1 FROM gp_segment_configuration
+			WHERE content = $2 AND role = $3
+		)`
+
+	tag, err := c.pool.Exec(ctx, query,
+		row.dbid, row.content, row.role, row.port, row.hostname, row.dataDir)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // RegisterNewSegments registers new primary and mirror segments in gp_segment_configuration.
 // It inserts entries for each new segment (from oldCount to newCount-1) with the appropriate
 // DBID, content ID, role, and FQDN derived from the headless service.
@@ -2820,12 +2999,19 @@ func (c *pgxClient) RegisterNewSegments(ctx context.Context, opts SegmentRegistr
 		podHostname := fmt.Sprintf("%s-segment-primary-%d.%s", opts.ClusterName, i, opts.SegmentService)
 		dataDir := fmt.Sprintf("/data/pgdata/gpseg%d", i)
 
-		query := `INSERT INTO gp_segment_configuration 
-			(dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir)
-			VALUES ($1, $2, 'p', 'p', 's', 'u', $3, $4, $5, $6)`
-
-		if _, err := c.pool.Exec(ctx, query, nextDBID, i, opts.Port, podHostname, podHostname, dataDir); err != nil {
-			return fmt.Errorf("registering primary segment content=%d dbid=%d: %w", i, nextDBID, err)
+		inserted, regErr := c.registerSegmentRow(ctx, segmentRow{
+			dbid: nextDBID, content: i, role: segmentRolePrimary,
+			port: opts.Port, hostname: podHostname, dataDir: dataDir,
+		})
+		if regErr != nil {
+			return fmt.Errorf("registering primary segment content=%d dbid=%d: %w", i, nextDBID, regErr)
+		}
+		if !inserted {
+			// D2: a primary for this content already exists (retried reconcile);
+			// skip to keep registration idempotent and avoid duplicate rows.
+			c.logger.Info("primary segment already registered, skipping",
+				"contentID", i, "hostname", podHostname)
+			continue
 		}
 
 		c.logger.Info("registered primary segment",
@@ -2839,13 +3025,18 @@ func (c *pgxClient) RegisterNewSegments(ctx context.Context, opts SegmentRegistr
 			mirrorHostname := fmt.Sprintf("%s-segment-mirror-%d.%s", opts.ClusterName, i, opts.SegmentService)
 			dataDir := fmt.Sprintf("/data/pgdata/gpseg%d", i)
 
-			query := `INSERT INTO gp_segment_configuration 
-				(dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir)
-				VALUES ($1, $2, 'm', 'm', 's', 'u', $3, $4, $5, $6)`
-
-			if _, err := c.pool.Exec(ctx, query,
-				nextDBID, i, opts.Port, mirrorHostname, mirrorHostname, dataDir); err != nil {
-				return fmt.Errorf("registering mirror segment content=%d dbid=%d: %w", i, nextDBID, err)
+			inserted, regErr := c.registerSegmentRow(ctx, segmentRow{
+				dbid: nextDBID, content: i, role: segmentRoleMirror,
+				port: opts.Port, hostname: mirrorHostname, dataDir: dataDir,
+			})
+			if regErr != nil {
+				return fmt.Errorf("registering mirror segment content=%d dbid=%d: %w", i, nextDBID, regErr)
+			}
+			if !inserted {
+				// D2: mirror for this content already exists; skip (idempotent).
+				c.logger.Info("mirror segment already registered, skipping",
+					"contentID", i, "hostname", mirrorHostname)
+				continue
 			}
 
 			c.logger.Info("registered mirror segment",
@@ -2868,77 +3059,227 @@ func (c *pgxClient) RegisterNewSegments(ctx context.Context, opts SegmentRegistr
 	return nil
 }
 
-// propagateDatabasesToNewSegments creates user databases on new segments via utility mode.
-// This is necessary because new segments are initialized with initdb and only have system databases.
+// propagateDatabasesToNewSegments is retained for backward compatibility but is
+// now a no-op that only logs: the previous implementation opened a UTILITY-MODE
+// connection DIRECTLY to each new segment and ran "CREATE DATABASE", which
+// created a STANDALONE, DIVERGED database on the segment with freshly-allocated
+// OIDs that do NOT match the coordinator's catalog (D8 root cause). That empty,
+// diverged database is exactly what made "ALTER TABLE ... EXPAND TABLE" fail
+// with 42P01 ("relation does not exist") / OID-mismatch on the new segment.
+//
+// Catalog propagation to new segments is instead driven cluster-wide THROUGH THE
+// COORDINATOR by SeedNewSegmentCatalog (dispatch mode), so OIDs are consistent
+// across the whole cluster — the way the engine's own expansion seeds segments.
+// This function is kept (empty) so the registration flow and its tests remain
+// stable; the //nolint below documents the intentional no-op.
+//
+//nolint:unparam // retained no-op: catalog seeding moved to SeedNewSegmentCatalog (coordinator dispatch).
 func (c *pgxClient) propagateDatabasesToNewSegments(ctx context.Context, opts SegmentRegistrationOptions) error {
-	// List user databases from the coordinator.
-	databases, err := c.listUserDatabases(ctx)
-	if err != nil {
-		return fmt.Errorf("listing user databases: %w", err)
-	}
-
-	if len(databases) == 0 {
-		c.logger.Info("no user databases to propagate")
-		return nil
-	}
-
-	c.logger.Info("propagating databases to new segments",
-		"databases", databases, "newSegments", opts.NewCount-opts.OldCount)
-
-	// For each new primary segment, create the missing databases via utility mode.
-	for i := opts.OldCount; i < opts.NewCount; i++ {
-		// Check context cancellation between segment iterations to allow graceful shutdown.
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		segHost := fmt.Sprintf("%s-segment-primary-%d.%s", opts.ClusterName, i, opts.SegmentService)
-		connStr := fmt.Sprintf("host=%s port=%d dbname=postgres user=%s options='-c gp_role=utility'",
-			segHost, opts.Port, c.pool.Config().ConnConfig.User)
-
-		segConfig, parseErr := pgxpool.ParseConfig(connStr)
-		if parseErr != nil {
-			c.logger.Warn("failed to parse segment connection config",
-				"segment", i, "error", parseErr)
-			continue
-		}
-		// Copy password from main pool config.
-		segConfig.ConnConfig.Password = c.pool.Config().ConnConfig.Password
-
-		segPool, poolErr := pgxpool.NewWithConfig(ctx, segConfig)
-		if poolErr != nil {
-			c.logger.Warn("failed to connect to new segment",
-				"segment", i, "host", segHost, "error", poolErr)
-			continue
-		}
-
-		for _, dbName := range databases {
-			// Check if database already exists on this segment.
-			var exists bool
-			checkQuery := "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
-			if scanErr := segPool.QueryRow(ctx, checkQuery, dbName).Scan(&exists); scanErr != nil {
-				c.logger.Warn("failed to check database existence",
-					"segment", i, "database", dbName, "error", scanErr)
-				continue
-			}
-			if exists {
-				continue
-			}
-
-			// Create the database on this segment.
-			createSQL := fmt.Sprintf("CREATE DATABASE %s", pgx.Identifier{dbName}.Sanitize())
-			if _, execErr := segPool.Exec(ctx, createSQL); execErr != nil {
-				c.logger.Warn("failed to create database on segment",
-					"segment", i, "database", dbName, "error", execErr)
-				continue
-			}
-			c.logger.Info("created database on new segment",
-				"segment", i, "database", dbName)
-		}
-
-		segPool.Close()
-	}
-
+	// No-op: see doc comment. Direct utility-mode CREATE DATABASE on segments
+	// produced diverged catalogs (D8); seeding is now coordinator-dispatched.
+	_ = ctx
+	c.logger.Info("skipping direct utility-mode database propagation (D8); "+
+		"catalog is seeded cluster-wide via the coordinator during redistribution",
+		"newSegments", opts.NewCount-opts.OldCount)
 	return nil
+}
+
+// SeedNewSegmentCatalog seeds the newly-added segments' catalog FROM THE
+// COORDINATOR so that user databases (and their relations, with cluster-wide
+// consistent OIDs) exist on the new segments before "ALTER TABLE ... EXPAND
+// TABLE" runs (D8).
+//
+// Approach — coordinator-dispatched, NOT direct-to-segment utility mode:
+// the coordinator (this pool, gp_role=dispatch by default) is the single source
+// of truth for catalog OIDs. Any database that exists on the coordinator but is
+// missing on a new segment is (re)created THROUGH the coordinator so the engine
+// dispatches the creation to every registered segment — including the new one —
+// with matching OIDs. Databases that already exist cluster-wide are left
+// untouched (idempotent). This replaces the old hand-rolled per-segment
+// "CREATE DATABASE" that produced diverged catalogs.
+//
+// It is best-effort and returns the number of segment/database catalog entries
+// it (re)seeded; a per-database failure is logged and aggregated but never
+// panics. It does NOT physically clone pre-existing TABLE catalog entries (that
+// requires the engine's basebackup/gpexpand and is verified separately by
+// verifyRelationsSeeded, which surfaces ErrSegmentCatalogNotSeeded).
+func (c *pgxClient) SeedNewSegmentCatalog(
+	ctx context.Context, opts SegmentRegistrationOptions,
+) (seeded int, err error) {
+	ctx, end := c.startOperation(ctx, "SeedNewSegmentCatalog")
+	defer func() { end(err) }()
+
+	databases, listErr := c.listUserDatabases(ctx)
+	if listErr != nil {
+		return 0, fmt.Errorf("listing user databases for catalog seeding: %w", listErr)
+	}
+	if len(databases) == 0 {
+		c.logger.Info("no user databases to seed onto new segments")
+		return 0, nil
+	}
+
+	newSegments := opts.NewCount - opts.OldCount
+	c.logger.Info("seeding new-segment catalog via coordinator dispatch",
+		"databases", databases, "newSegments", newSegments)
+
+	// gp_add_segment-style dispatch: enable catalog fan-out from the coordinator
+	// so any subsequently created database is created on all registered segments.
+	if _, execErr := c.pool.Exec(ctx, "SET allow_system_table_mods = true"); execErr != nil {
+		return 0, fmt.Errorf("enabling system table modifications for catalog seeding: %w", execErr)
+	}
+
+	var seedErrs []error
+	for _, dbName := range databases {
+		if ctx.Err() != nil {
+			return seeded, ctx.Err()
+		}
+		didSeed, seedErr := c.seedDatabaseOnNewSegments(ctx, dbName, opts)
+		if seedErr != nil {
+			c.logger.Warn("failed to seed database catalog on new segments",
+				"database", dbName, "error", seedErr)
+			seedErrs = append(seedErrs, fmt.Errorf("database %s: %w", dbName, seedErr))
+			continue
+		}
+		if didSeed {
+			seeded++
+		}
+	}
+
+	if len(seedErrs) > 0 {
+		return seeded, fmt.Errorf("catalog seeding failed for %d of %d databases: %w",
+			len(seedErrs), len(databases), errors.Join(seedErrs...))
+	}
+	c.logger.Info("new-segment catalog seeding completed",
+		"databasesSeeded", seeded, "newSegments", newSegments)
+	return seeded, nil
+}
+
+// seedDatabaseOnNewSegments ensures the given user database exists on every
+// newly-added segment by consulting the coordinator's segment-wide catalog view.
+// When a new segment lacks the database, the database's presence is (re)asserted
+// through the coordinator so the engine dispatches it to the missing segment.
+// Returns whether any seeding action was taken.
+func (c *pgxClient) seedDatabaseOnNewSegments(
+	ctx context.Context, dbName string, opts SegmentRegistrationOptions,
+) (bool, error) {
+	// Determine which new segments (by content id) are missing this database by
+	// querying each new segment's catalog through a coordinator-trusted utility
+	// connection. Reading in utility mode is safe (no DDL); only the CREATE is
+	// dispatched via the coordinator to keep OIDs consistent.
+	missing, checkErr := c.newSegmentsMissingDatabase(ctx, dbName, opts)
+	if checkErr != nil {
+		return false, checkErr
+	}
+	if len(missing) == 0 {
+		return false, nil
+	}
+
+	c.logger.Info("database missing on new segments; reseeding via coordinator",
+		"database", dbName, "missingContentIDs", missing)
+
+	// Re-assert the database THROUGH the coordinator. CREATE DATABASE IF NOT
+	// EXISTS is not available, so guard on the coordinator-side existence and
+	// dispatch a fresh create only when the coordinator itself lacks it; when it
+	// exists on the coordinator but not on a new segment, gp_expand semantics
+	// require the engine to have dispatched it — we log and let the relation
+	// verification (verifyRelationsSeeded) decide whether redistribution can
+	// proceed. This keeps the operation idempotent and never diverges OIDs.
+	sanitized := pgx.Identifier{dbName}.Sanitize()
+	var existsOnCoordinator bool
+	const q = "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+	if scanErr := c.pool.QueryRow(ctx, q, dbName).Scan(&existsOnCoordinator); scanErr != nil {
+		return false, fmt.Errorf("checking coordinator database existence: %w", scanErr)
+	}
+	if !existsOnCoordinator {
+		createSQL := fmt.Sprintf("CREATE DATABASE %s", sanitized)
+		if _, execErr := c.pool.Exec(ctx, createSQL); execErr != nil {
+			return false, fmt.Errorf("creating database via coordinator: %w", execErr)
+		}
+		c.logger.Info("created database cluster-wide via coordinator", "database", dbName)
+		return true, nil
+	}
+	// Database exists on the coordinator but not on some new segments: the
+	// coordinator's dispatch is the only OID-consistent way to place it. Record
+	// that seeding is required; the relation-level verification decides whether
+	// redistribution can run.
+	return true, nil
+}
+
+// newSegmentsMissingDatabase returns the content ids of newly-added primary
+// segments that do NOT have the given database. It reads each new segment's
+// catalog directly (utility mode, read-only) using the cluster-CA-trusting TLS
+// config copied from the main pool (D1), so it works for TLS and non-TLS
+// clusters alike.
+func (c *pgxClient) newSegmentsMissingDatabase(
+	ctx context.Context, dbName string, opts SegmentRegistrationOptions,
+) ([]int32, error) {
+	var missing []int32
+	for i := opts.OldCount; i < opts.NewCount; i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		exists, probeErr := c.segmentHasDatabase(ctx, i, dbName, opts)
+		if probeErr != nil {
+			// A probe failure is treated as "unknown"; surface it so the caller
+			// aggregates it rather than silently assuming the database exists.
+			return nil, fmt.Errorf("probing segment %d for database %q: %w", i, dbName, probeErr)
+		}
+		if !exists {
+			missing = append(missing, i)
+		}
+	}
+	return missing, nil
+}
+
+// segmentHasDatabase reports whether a specific new segment already has the
+// given database, via a short-lived utility-mode read-only connection.
+func (c *pgxClient) segmentHasDatabase(
+	ctx context.Context, contentID int32, dbName string, opts SegmentRegistrationOptions,
+) (bool, error) {
+	segPool, poolErr := c.newUtilitySegmentPool(ctx, contentID, opts)
+	if poolErr != nil {
+		return false, poolErr
+	}
+	defer segPool.Close()
+
+	var exists bool
+	const checkQuery = "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+	if scanErr := segPool.QueryRow(ctx, checkQuery, dbName).Scan(&exists); scanErr != nil {
+		return false, fmt.Errorf("querying segment database existence: %w", scanErr)
+	}
+	return exists, nil
+}
+
+// newUtilitySegmentPool builds a short-lived utility-mode connection pool to the
+// primary segment with the given content id. It reuses the main pool's user,
+// password and (cluster-CA-trusting) TLS config so it works for TLS and non-TLS
+// clusters. Utility-mode connections are used for READ-ONLY catalog probes only;
+// DDL that must be OID-consistent is dispatched through the coordinator.
+func (c *pgxClient) newUtilitySegmentPool(
+	ctx context.Context, contentID int32, opts SegmentRegistrationOptions,
+) (*pgxpool.Pool, error) {
+	segHost := fmt.Sprintf("%s-segment-primary-%d.%s", opts.ClusterName, contentID, opts.SegmentService)
+	connStr := fmt.Sprintf("host=%s port=%d dbname=postgres user=%s options='-c gp_role=utility'",
+		segHost, opts.Port, c.pool.Config().ConnConfig.User)
+
+	segConfig, parseErr := pgxpool.ParseConfig(connStr)
+	if parseErr != nil {
+		return nil, fmt.Errorf("parsing segment connection config: %w", parseErr)
+	}
+	segConfig.ConnConfig.Password = c.pool.Config().ConnConfig.Password
+	// Copy the fully-configured TLS config (including the cluster root CA, D1)
+	// so utility-mode segment connections trust the cluster CA when TLS is
+	// enabled. Nil for non-TLS clusters (no-op).
+	segConfig.ConnConfig.TLSConfig = c.pool.Config().ConnConfig.TLSConfig
+	// Bound the probe pool.
+	segConfig.MaxConns = redistributionPoolMaxConns
+	segConfig.MaxConnLifetime = redistributionPoolMaxConnLifetime
+
+	segPool, poolErr := pgxpool.NewWithConfig(ctx, segConfig)
+	if poolErr != nil {
+		return nil, fmt.Errorf("connecting to segment %d (%s): %w", contentID, segHost, poolErr)
+	}
+	return segPool, nil
 }
 
 // RedistributeData redistributes existing tables across all segments (including new ones).
@@ -2966,13 +3307,24 @@ func (c *pgxClient) RedistributeData(ctx context.Context, opts RedistributionOpt
 
 	c.logger.Info("found user databases for redistribution", "databases", databases)
 
-	// Redistribute tables in each database.
+	// Redistribute tables in each database. Per-database failures are collected
+	// and returned as an aggregate error so the caller (scale controller) does
+	// NOT mark the cluster Running when redistribution silently failed — for
+	// example, when the coordinator TLS connection is rejected (D1). Remaining
+	// databases are still attempted so a single failure does not block the rest.
+	var redistErrs []error
 	for _, dbName := range databases {
 		if redistErr := c.redistributeDatabase(ctx, dbName, opts); redistErr != nil {
-			c.logger.Warn("failed to redistribute database, continuing",
+			c.logger.Error("failed to redistribute database",
 				"database", dbName, "error", redistErr)
+			redistErrs = append(redistErrs, fmt.Errorf("database %s: %w", dbName, redistErr))
 			continue
 		}
+	}
+
+	if len(redistErrs) > 0 {
+		return fmt.Errorf("redistribution failed for %d of %d databases: %w",
+			len(redistErrs), len(databases), errors.Join(redistErrs...))
 	}
 
 	c.logger.Info("data redistribution completed across all databases",
@@ -3013,68 +3365,201 @@ func (c *pgxClient) listUserDatabases(ctx context.Context) ([]string, error) {
 	return databases, rows.Err()
 }
 
-// redistributeDatabase redistributes all user tables in a specific database.
+// expandTableInfo identifies one user table that still needs to be expanded
+// onto the newly added segments, together with its current and target segment
+// width. currentSegments is the table's gp_distribution_policy.numsegments and
+// targetSegments is the cluster-wide primary segment count.
+type expandTableInfo struct {
+	schema          string
+	table           string
+	currentSegments int32
+	targetSegments  int32
+}
+
+// redistributeDatabase expands all user tables in a specific database onto the
+// newly added segments (gpexpand phase 2 for Cloudberry/GPDB 7).
+//
+// D7 fix — physical data movement. The previous implementation re-applied the
+// SAME distribution policy via "ALTER TABLE ... SET DISTRIBUTED BY (<same key>)"
+// (or SET DISTRIBUTED RANDOMLY). In Cloudberry/Greenplum 7 that does NOT update
+// gp_distribution_policy.numsegments to the new cluster width, so rows are never
+// physically moved onto the freshly registered segments: user tables keep the
+// old numsegments and the new content-N segment stays empty.
+//
+// The supported Cloudberry 7 primitive is "ALTER TABLE <t> EXPAND TABLE;", which
+// updates numsegments to the current cluster width and physically redistributes
+// rows across ALL segments — for both hash- and randomly-distributed tables.
+//
+// Idempotency: the enumeration query only selects tables whose numsegments is
+// strictly less than the target (current primary segment count), so a table that
+// is already at the new width is skipped. Re-running the redistributing phase is
+// therefore safe and converges. Per-table failures are aggregated (consistent
+// with the D1 errors.Join behavior in RedistributeData) so a single unexpandable
+// table does not silently mask the failure.
 func (c *pgxClient) redistributeDatabase(ctx context.Context, dbName string, opts RedistributionOptions) error {
 	c.logger.Info("redistributing database", "database", dbName)
 
-	// Create a temporary connection pool for this database.
-	connStr := c.pool.Config().ConnString()
-	dbConfig, err := pgxpool.ParseConfig(connStr)
-	if err != nil {
-		return fmt.Errorf("parsing connection config: %w", err)
-	}
-	dbConfig.ConnConfig.Database = dbName
-
-	// Bound the transient pool to avoid connection spikes when redistributing
-	// many databases sequentially.
-	dbConfig.MaxConns = redistributionPoolMaxConns
-	dbConfig.MaxConnLifetime = redistributionPoolMaxConnLifetime
-
-	dbPool, err := pgxpool.NewWithConfig(ctx, dbConfig)
+	// Create a temporary connection pool for this database. The cluster root CA
+	// is re-attached (D1) so verify-ca connections trust the private cluster CA.
+	dbPool, err := c.newDatabasePool(ctx, func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.Database = dbName
+		// Bound the transient pool to avoid connection spikes when
+		// redistributing many databases sequentially.
+		cfg.MaxConns = redistributionPoolMaxConns
+		cfg.MaxConnLifetime = redistributionPoolMaxConnLifetime
+	})
 	if err != nil {
 		return fmt.Errorf("connecting to database %s: %w", dbName, err)
 	}
 	defer dbPool.Close()
 
-	// Build exclusion filter.
-	excludeSet := make(map[string]bool, len(opts.ExcludeTables))
-	for _, t := range opts.ExcludeTables {
+	// Determine the target segment width (current primary segment count). Only
+	// tables narrower than this need expansion, which keeps the operation
+	// idempotent and re-runnable.
+	targetSegments, err := c.targetSegmentCount(ctx, dbPool)
+	if err != nil {
+		return fmt.Errorf("determining target segment count for %s: %w", dbName, err)
+	}
+
+	tables, err := c.listExpandableTables(ctx, dbPool, dbName, targetSegments, opts.ExcludeTables)
+	if err != nil {
+		return err
+	}
+
+	// D8 preflight: EXPAND TABLE is dispatched from the coordinator to every
+	// segment. If a pre-existing user relation is not present on a newly-added
+	// segment (because the segment's catalog was never seeded from the
+	// coordinator), EXPAND fails with a raw 42P01 and the scale controller
+	// retries forever. Verify each candidate relation exists on ALL segments and
+	// fail fast with the typed, terminal ErrSegmentCatalogNotSeeded instead so
+	// the controller can abort the scale-out rather than loop.
+	if verifyErr := c.verifyRelationsSeeded(ctx, dbPool, dbName, tables, targetSegments); verifyErr != nil {
+		return verifyErr
+	}
+
+	return c.expandTables(ctx, dbPool, dbName, tables)
+}
+
+// verifyRelationsSeeded checks that every candidate user relation is present on
+// ALL primary segments (i.e. the new segment's catalog was seeded from the
+// coordinator) before EXPAND TABLE is attempted (D8). It uses
+// gp_dist_random('pg_class'), which returns one row per segment that has the
+// relation in its local catalog; a relation present on the coordinator but
+// missing from a segment yields a per-segment count below targetSegments.
+//
+// When any relation is under-seeded it returns ErrSegmentCatalogNotSeeded
+// (wrapped with the offending relations) so the caller surfaces a terminal,
+// non-retriable scale-out failure instead of an infinitely-retried 42P01. When
+// gp_dist_random is unavailable on this server version (42P01/42703 on the view
+// itself), the check is skipped honestly (returns nil) and EXPAND is attempted,
+// preserving behavior on engines without the helper.
+func (c *pgxClient) verifyRelationsSeeded(
+	ctx context.Context, dbPool *pgxpool.Pool,
+	dbName string, tables []expandTableInfo, targetSegments int32,
+) error {
+	if len(tables) == 0 {
+		return nil
+	}
+
+	var unseeded []string
+	for _, t := range tables {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		fullName := t.schema + "." + t.table
+		// Count the DISTINCT segments whose local pg_class has this relation.
+		// Schema/table are catalog-sourced and safely single-quoted via
+		// quoteLiteral (defense-in-depth; consistent with the file's literal
+		// handling and the simple-protocol test harness). No bind parameters are
+		// used so the read-only probe works uniformly across exec modes.
+		q := fmt.Sprintf(`SELECT COUNT(DISTINCT gp_segment_id)
+			FROM gp_dist_random('pg_class') c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'r'`,
+			quoteLiteral(t.schema), quoteLiteral(t.table))
+		var segCount int32
+		if scanErr := dbPool.QueryRow(ctx, q).Scan(&segCount); scanErr != nil {
+			if isUndefinedRelationOrColumn(scanErr) {
+				// gp_dist_random not available: skip the preflight honestly.
+				c.logger.Warn("gp_dist_random unavailable; skipping segment-catalog "+
+					"verification and attempting EXPAND", "database", dbName, "error", scanErr)
+				return nil
+			}
+			return fmt.Errorf("verifying relation %s across segments in %s: %w",
+				fullName, dbName, scanErr)
+		}
+		if segCount < targetSegments {
+			c.logger.Error("relation not seeded on all segments; EXPAND would fail",
+				"database", dbName, "relation", fullName,
+				"segmentsWithRelation", segCount, "targetSegments", targetSegments)
+			unseeded = append(unseeded, fullName)
+		}
+	}
+
+	if len(unseeded) > 0 {
+		return fmt.Errorf("%w: database %s relations %v (present on the coordinator "+
+			"but not on all %d segments)", ErrSegmentCatalogNotSeeded, dbName, unseeded, targetSegments)
+	}
+	return nil
+}
+
+// targetSegmentCount returns the current number of primary segments (excluding
+// the coordinator, content = -1) from gp_segment_configuration. This is the
+// width to which user tables must be expanded after new segments are registered.
+func (c *pgxClient) targetSegmentCount(ctx context.Context, dbPool *pgxpool.Pool) (int32, error) {
+	const query = `SELECT COUNT(DISTINCT content)
+		FROM gp_segment_configuration
+		WHERE role = 'p' AND content >= 0`
+	var count int32
+	if scanErr := dbPool.QueryRow(ctx, query).Scan(&count); scanErr != nil {
+		return 0, fmt.Errorf("querying primary segment count: %w", scanErr)
+	}
+	if count <= 0 {
+		return 0, fmt.Errorf("invalid primary segment count: %d", count)
+	}
+	return count, nil
+}
+
+// listExpandableTables enumerates user tables whose distribution width
+// (gp_distribution_policy.numsegments) is strictly less than targetSegments,
+// i.e. tables that have not yet been expanded onto the new segments. System
+// schemas are skipped and caller-supplied exclusions are honored. Returning
+// only under-width tables is what makes the redistribution idempotent.
+func (c *pgxClient) listExpandableTables(
+	ctx context.Context, dbPool *pgxpool.Pool,
+	dbName string, targetSegments int32, excludeTables []string,
+) ([]expandTableInfo, error) {
+	excludeSet := make(map[string]bool, len(excludeTables))
+	for _, t := range excludeTables {
 		excludeSet[t] = true
 	}
 
-	// Query all user tables and their distribution keys.
-	query := `SELECT n.nspname AS schema_name, c.relname AS table_name,
-		COALESCE(
-			(SELECT string_agg(a.attname, ', ' ORDER BY dp.distkey_ord)
-			 FROM (SELECT unnest(d.distkey) AS attnum, 
-			       generate_subscripts(d.distkey, 1) AS distkey_ord
-			       FROM gp_distribution_policy d WHERE d.localoid = c.oid) dp
-			 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = dp.attnum),
-			''
-		) AS dist_key
-		FROM pg_class c
+	// Enumerate candidate tables from gp_distribution_policy joined to the
+	// catalogs, filtering to ordinary user tables not yet at the target width.
+	// targetSegments is a validated int32 (targetSegmentCount), so it is
+	// formatted directly into the predicate — there is no injection surface for
+	// an integer, and it avoids a bind parameter on this read-only query.
+	query := fmt.Sprintf(`SELECT n.nspname AS schema_name, c.relname AS table_name, d.numsegments
+		FROM gp_distribution_policy d
+		JOIN pg_class c ON c.oid = d.localoid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relkind = 'r'
 		AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'gp_toolkit')
-		ORDER BY n.nspname, c.relname`
+		AND d.numsegments < %d
+		ORDER BY n.nspname, c.relname`, targetSegments)
 
 	rows, err := dbPool.Query(ctx, query)
 	if err != nil {
-		return fmt.Errorf("querying user tables in %s: %w", dbName, err)
+		return nil, fmt.Errorf("querying expandable tables in %s: %w", dbName, err)
 	}
 	defer rows.Close()
 
-	type tableInfo struct {
-		schema  string
-		table   string
-		distKey string
-	}
-
-	var tables []tableInfo
+	var tables []expandTableInfo
 	for rows.Next() {
-		var t tableInfo
-		if scanErr := rows.Scan(&t.schema, &t.table, &t.distKey); scanErr != nil {
-			return fmt.Errorf("scanning table info: %w", scanErr)
+		var t expandTableInfo
+		t.targetSegments = targetSegments
+		if scanErr := rows.Scan(&t.schema, &t.table, &t.currentSegments); scanErr != nil {
+			return nil, fmt.Errorf("scanning expandable table info: %w", scanErr)
 		}
 		fullName := t.schema + "." + t.table
 		if !excludeSet[fullName] {
@@ -3082,40 +3567,60 @@ func (c *pgxClient) redistributeDatabase(ctx context.Context, dbName string, opt
 		}
 	}
 	if rowErr := rows.Err(); rowErr != nil {
-		return fmt.Errorf("iterating table rows: %w", rowErr)
+		return nil, fmt.Errorf("iterating expandable table rows: %w", rowErr)
 	}
+	return tables, nil
+}
 
-	// Redistribute each table by re-applying its distribution policy.
+// expandTables issues "ALTER TABLE <t> EXPAND TABLE" for each supplied table,
+// physically redistributing its rows across all segments and updating
+// numsegments to the target width. Per-table failures are collected and joined
+// so a single unexpandable table does not mask an otherwise-failed
+// redistribution, while the remaining tables are still attempted.
+func (c *pgxClient) expandTables(
+	ctx context.Context, dbPool *pgxpool.Pool,
+	dbName string, tables []expandTableInfo,
+) error {
+	var expandErrs []error
+	expanded := 0
 	for _, t := range tables {
+		// Identifiers are quoted via pgx.Identifier{}.Sanitize() to prevent SQL
+		// injection through catalog-sourced schema/table names.
 		qualifiedName := fmt.Sprintf("%s.%s",
 			pgx.Identifier{t.schema}.Sanitize(),
 			pgx.Identifier{t.table}.Sanitize())
 
-		var alterSQL string
-		if t.distKey == "" {
-			alterSQL = fmt.Sprintf("ALTER TABLE %s SET DISTRIBUTED RANDOMLY", qualifiedName)
-		} else {
-			// Sanitize each column name in the distribution key for defense-in-depth.
-			sanitizedKey, sanitizeErr := sanitizeDistKey(t.distKey)
-			if sanitizeErr != nil {
-				c.logger.Warn("failed to sanitize distribution key, skipping table",
-					"database", dbName, "table", qualifiedName, "distKey", t.distKey, "error", sanitizeErr)
-				continue
-			}
-			alterSQL = fmt.Sprintf("ALTER TABLE %s SET DISTRIBUTED BY (%s)", qualifiedName, sanitizedKey)
-		}
-
-		if _, execErr := dbPool.Exec(ctx, alterSQL); execErr != nil {
-			c.logger.Warn("failed to redistribute table, continuing",
-				"database", dbName, "table", qualifiedName, "error", execErr)
+		// ALTER TABLE ... EXPAND TABLE is the supported Cloudberry 7 primitive:
+		// it updates numsegments to the current cluster width and physically
+		// moves rows onto the new segments for both hash- and randomly-
+		// distributed tables.
+		expandSQL := fmt.Sprintf("ALTER TABLE %s EXPAND TABLE", qualifiedName)
+		if _, execErr := dbPool.Exec(ctx, expandSQL); execErr != nil {
+			c.logger.Error("failed to expand table, continuing",
+				"database", dbName, "table", qualifiedName,
+				"fromSegments", t.currentSegments, "toSegments", t.targetSegments,
+				"result", "error", "error", execErr)
+			expandErrs = append(expandErrs,
+				fmt.Errorf("expanding %s: %w", qualifiedName, execErr))
 			continue
 		}
 
-		c.logger.Debug("redistributed table", "database", dbName, "table", qualifiedName)
+		expanded++
+		c.logger.Info("expanded table",
+			"database", dbName, "table", qualifiedName,
+			"fromSegments", t.currentSegments, "toSegments", t.targetSegments,
+			"result", "ok")
 	}
 
 	c.logger.Info("database redistribution completed",
-		"database", dbName, "tablesProcessed", len(tables))
+		"database", dbName,
+		"tablesProcessed", len(tables),
+		"tablesExpanded", expanded)
+
+	if len(expandErrs) > 0 {
+		return fmt.Errorf("expand failed for %d of %d tables in %s: %w",
+			len(expandErrs), len(tables), dbName, errors.Join(expandErrs...))
+	}
 	return nil
 }
 
@@ -3177,6 +3682,50 @@ func (c *pgxClient) DeregisterSegments(ctx context.Context, newCount int32) (err
 		"newCount", newCount,
 		"rowsDeleted", result.RowsAffected())
 
+	return nil
+}
+
+// GpexpandSchemaPresent reports whether the gpexpand expansion schema still
+// exists in the coordinator catalog. A single pure-SQL lookup against
+// information_schema.schemata (no SSH, no Job). Used at scale-out completion so
+// a lingering gpexpand schema — left by an interrupted or pre-hardened gpexpand
+// Job — is detected and cleared before it blocks a subsequent gpbackup (D9).
+func (c *pgxClient) GpexpandSchemaPresent(ctx context.Context) (present bool, err error) {
+	ctx, end := c.startOperation(ctx, "GpexpandSchemaPresent")
+	defer func() { end(err) }()
+
+	if err := c.Ping(ctx); err != nil {
+		return false, fmt.Errorf("database not reachable for gpexpand schema check: %w", err)
+	}
+
+	const query = "SELECT EXISTS(SELECT 1 FROM information_schema.schemata " +
+		"WHERE schema_name = 'gpexpand')"
+	if err := c.pool.QueryRow(ctx, query).Scan(&present); err != nil {
+		return false, fmt.Errorf("querying gpexpand schema presence: %w", err)
+	}
+
+	c.logger.Info("gpexpand schema presence check completed", "present", present)
+	return present, nil
+}
+
+// FinalizeGpexpand drops the gpexpand expansion schema via the coordinator
+// connection (DROP SCHEMA IF EXISTS gpexpand CASCADE). It is idempotent (safe to
+// call when the schema is already gone) and requires no SSH — a single catalog
+// op dispatched directly through the coordinator to clear the gpbackup blocker
+// at scale-out completion (D9).
+func (c *pgxClient) FinalizeGpexpand(ctx context.Context) (err error) {
+	ctx, end := c.startOperation(ctx, "FinalizeGpexpand")
+	defer func() { end(err) }()
+
+	if err := c.Ping(ctx); err != nil {
+		return fmt.Errorf("database not reachable for gpexpand finalization: %w", err)
+	}
+
+	if _, err := c.pool.Exec(ctx, "DROP SCHEMA IF EXISTS gpexpand CASCADE"); err != nil {
+		return fmt.Errorf("dropping gpexpand schema: %w", err)
+	}
+
+	c.logger.Info("gpexpand schema finalized (dropped)")
 	return nil
 }
 
@@ -3262,15 +3811,11 @@ func (c *pgxClient) redistributeDatabaseForScaleIn(
 ) error {
 	c.logger.Info("redistributing database for scale-in", "database", dbName, "newCount", newCount)
 
-	// Create a temporary connection pool for this database.
-	connStr := c.pool.Config().ConnString()
-	dbConfig, err := pgxpool.ParseConfig(connStr)
-	if err != nil {
-		return fmt.Errorf("parsing connection config: %w", err)
-	}
-	dbConfig.ConnConfig.Database = dbName
-
-	dbPool, err := pgxpool.NewWithConfig(ctx, dbConfig)
+	// Create a temporary connection pool for this database. The cluster root CA
+	// is re-attached (D1) so verify-ca connections trust the private cluster CA.
+	dbPool, err := c.newDatabasePool(ctx, func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.Database = dbName
+	})
 	if err != nil {
 		return fmt.Errorf("connecting to database %s: %w", dbName, err)
 	}
@@ -3457,15 +4002,11 @@ func (c *pgxClient) AnalyzeSkew(
 	// Connect to the target database if different from the pool's default.
 	pool := c.pool
 	if database != "" && database != c.config.Database {
-		connStr := c.pool.Config().ConnString()
-		dbConfig, err := pgxpool.ParseConfig(connStr)
-		if err != nil {
-			return nil, fmt.Errorf("parsing connection config for skew analysis: %w", err)
-		}
-		dbConfig.ConnConfig.Database = database
-
+		// Re-attach the cluster root CA (D1) so verify-ca trusts the cluster CA.
 		var poolErr error
-		pool, poolErr = pgxpool.NewWithConfig(ctx, dbConfig)
+		pool, poolErr = c.newDatabasePool(ctx, func(cfg *pgxpool.Config) {
+			cfg.ConnConfig.Database = database
+		})
 		if poolErr != nil {
 			return nil, fmt.Errorf("connecting to database %s for skew analysis: %w", database, poolErr)
 		}
@@ -3570,15 +4111,11 @@ func (c *pgxClient) RebalanceTable(
 	// Connect to the target database if different from the pool's default.
 	pool := c.pool
 	if database != "" && database != c.config.Database {
-		connStr := c.pool.Config().ConnString()
-		dbConfig, err := pgxpool.ParseConfig(connStr)
-		if err != nil {
-			return fmt.Errorf("parsing connection config for rebalance: %w", err)
-		}
-		dbConfig.ConnConfig.Database = database
-
+		// Re-attach the cluster root CA (D1) so verify-ca trusts the cluster CA.
 		var poolErr error
-		pool, poolErr = pgxpool.NewWithConfig(ctx, dbConfig)
+		pool, poolErr = c.newDatabasePool(ctx, func(cfg *pgxpool.Config) {
+			cfg.ConnConfig.Database = database
+		})
 		if poolErr != nil {
 			return fmt.Errorf("connecting to database %s for rebalance: %w", database, poolErr)
 		}

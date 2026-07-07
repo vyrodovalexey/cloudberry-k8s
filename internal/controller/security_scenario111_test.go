@@ -34,8 +34,9 @@ import (
 
 // TestEnsurePxfNetworkPolicy_CreatesForPxfCluster proves the controller creates
 // the SE.5 NetworkPolicy for a PXF-enabled cluster, with an ownerRef for GC and
-// the segment-primary selector — and that the PXF port 5888 is NOT in the
-// allowed cross-pod ingress set. (111-SE5-F)
+// a selector covering BOTH the segment-primary and segment-mirror pods (D9) —
+// and that the PXF port 5888 is NOT in the allowed cross-pod ingress set.
+// (111-SE5-F)
 func TestEnsurePxfNetworkPolicy_CreatesForPxfCluster(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newPXFDataLoadingCluster()
@@ -57,9 +58,12 @@ func TestEnsurePxfNetworkPolicy_CreatesForPxfCluster(t *testing.T) {
 	require.Len(t, np.OwnerReferences, 1)
 	assert.Equal(t, cluster.Name, np.OwnerReferences[0].Name)
 
-	// Segment-primary selector.
-	assert.Equal(t, util.ComponentSegmentPrimary,
-		np.Spec.PodSelector.MatchLabels[util.LabelComponent])
+	// Selector covers both segment-primary and segment-mirror pods (D9).
+	assert.Equal(t, cluster.Name, np.Spec.PodSelector.MatchLabels[util.LabelCluster])
+	require.Len(t, np.Spec.PodSelector.MatchExpressions, 1)
+	assert.ElementsMatch(t,
+		[]string{util.ComponentSegmentPrimary, util.ComponentSegmentMirror},
+		np.Spec.PodSelector.MatchExpressions[0].Values)
 
 	// 5888 (PXF) is NOT in the allowed ingress ports.
 	for _, rule := range np.Spec.Ingress {

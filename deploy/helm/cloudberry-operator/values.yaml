@@ -326,3 +326,89 @@ extraVolumeMounts: []
 
 # -- Additional volumes
 extraVolumes: []
+
+# =============================================================================
+# OpenShift / OKD4 Support
+# =============================================================================
+# When `openshift.enabled=false` (the default) the chart renders EXACTLY as it
+# does on vanilla Kubernetes — no SCC, no SCC RoleBindings and the operator pod
+# keeps its fixed UID/GID (65532). Set `openshift.enabled=true` for OKD4/OpenShift
+# where the platform's SecurityContextConstraints (SCC) admission requires:
+#   1. the operator pod to run with a namespace-injected UID (drop the fixed UID
+#      65532 so the restricted-v2/nonroot-v2 SCC can assign the namespace range);
+#   2. the CloudberryCluster workload pods (DB container UID 1000 + root-init
+#      chown, set by the operator at runtime — see internal/builder/builder.go)
+#      to be admitted by a SCOPED, minimal custom SCC bound ONLY to the cluster
+#      workload ServiceAccount. This chart NEVER uses the broad built-in `anyuid`.
+openshift:
+  # -- Enable OKD4/OpenShift support (SCC, SCC RoleBindings, OKD-aware operator
+  # securityContext). Backward-compatible: false = vanilla Kubernetes behavior.
+  enabled: false
+
+  # -- Bind the OPERATOR ServiceAccount to a built-in cluster SCC via a
+  # RoleBinding to `system:openshift:scc:<operatorSCC>`. The operator pod runs
+  # non-root / read-only so restricted-v2 (or nonroot-v2) is sufficient — no
+  # custom SCC is needed for the operator itself.
+  operatorSCC: restricted-v2
+
+  # -- Create the minimal, SCOPED custom SecurityContextConstraints for the
+  # CloudberryCluster workload pods. Rendered as a helm pre-install/pre-upgrade
+  # hook (weight -10) so the SCC exists before any cluster pod is admitted.
+  createClusterSCC: true
+
+  # -- ServiceAccount that the CloudberryCluster workload pods run under. The
+  # operator does NOT set an explicit ServiceAccountName on the DB pod template,
+  # so the pods use the namespace `default` ServiceAccount. The custom SCC is
+  # bound ONLY to this ServiceAccount in the release namespace.
+  clusterServiceAccount: default
+
+  # -- Minimal custom SCC settings for the cluster workload. These grant ONLY
+  # what the Cloudberry DB pods need: UID 0 (init-container chown) + UID 1000
+  # (gpadmin DB container) and the file-ownership capabilities the chown init
+  # container uses. NO host namespaces, NO privileged container.
+  scc:
+    # -- Name of the custom SCC (auto-generated as "<fullname>-cluster" if empty).
+    name: ""
+    # -- Selection priority. Kept low (nil/unset renders as null) so it does not
+    # override more specific SCCs; the single-SA RoleBinding scopes selection.
+    priority: 10
+    # -- runAsUser strategy. "RunAsAny" is required because the workload needs
+    # BOTH UID 0 (root init-container chown) and UID 1000 (gpadmin) — a single
+    # MustRunAsRange cannot express a non-contiguous {0,1000} set cleanly, and
+    # this SCC is bound to ONE ServiceAccount only (strictly narrower than the
+    # broad `anyuid` SCC: limited caps, no host access, single-SA binding).
+    runAsUser: RunAsAny
+    # -- Capabilities the chown init containers require (file ownership fixups).
+    allowedCapabilities:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    # -- Capabilities always dropped.
+    requiredDropCapabilities:
+      - KILL
+      - MKNOD
+      - NET_RAW
+
+# =============================================================================
+# OpenShift Route (operator API / metrics external exposure)
+# =============================================================================
+# Disabled by default. The database is NEVER publicly exposed. This Route only
+# optionally exposes the operator's REST API or metrics endpoint via the OKD
+# router with edge TLS termination. Requires `openshift.enabled=true`.
+route:
+  # -- Create an edge-terminated Route for the operator service.
+  enabled: false
+  # -- Route host (defaults to the router-generated host when empty).
+  host: ""
+  # -- Operator service port to expose ("api" or "metrics").
+  targetPort: api
+  # -- TLS configuration (edge termination by default).
+  tls:
+    # -- TLS termination type (edge, reencrypt, passthrough).
+    termination: edge
+    # -- Insecure edge termination policy (Redirect, Allow, None).
+    insecureEdgeTerminationPolicy: Redirect
+  # -- Additional annotations for the Route.
+  annotations: {}

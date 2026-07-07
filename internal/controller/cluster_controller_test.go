@@ -1876,6 +1876,56 @@ func TestClusterReconciler_HandleScaleOut_Success(t *testing.T) {
 	assert.Equal(t, cbv1alpha1.ClusterPhaseScaling, updated.Status.Phase)
 }
 
+// TestClusterReconciler_HandleScaleOut_InjectsExpansionEnv is the BUG-1
+// regression test: handleScaleOut MUST persist the scale-state annotation
+// (carrying oldCount) BEFORE building+scaling the segment StatefulSet, so the new
+// pods start with CLOUDBERRY_EXPANSION_BASE_COUNT set (gpexpand-managed). It
+// asserts the applied StatefulSet carries the env AND the replica increase
+// atomically.
+func TestClusterReconciler_HandleScaleOut_InjectsExpansionEnv(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Count = 3 // desired post-scale count
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(2)
+	primarySts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(20),
+		b, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.handleScaleOut(context.Background(), cluster, 2, 3))
+
+	// The scale-state annotation carrying oldCount must be persisted.
+	require.Contains(t, cluster.Annotations, annotationScaleState)
+
+	// The applied segment StatefulSet must carry the env AND be scaled to 3.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name: util.SegmentPrimaryName(cluster.Name), Namespace: "default",
+	}, sts))
+	require.NotNil(t, sts.Spec.Replicas)
+	assert.Equal(t, int32(3), *sts.Spec.Replicas, "StatefulSet must be scaled up")
+
+	found := ""
+	for i := range sts.Spec.Template.Spec.Containers {
+		for _, e := range sts.Spec.Template.Spec.Containers[i].Env {
+			if e.Name == builder.EnvCloudberryExpansionBaseCount {
+				found = e.Value
+			}
+		}
+	}
+	assert.Equal(t, "2", found,
+		"new segment pods must start with CLOUDBERRY_EXPANSION_BASE_COUNT=<pre-scale count>")
+}
+
 func TestClusterReconciler_HandleScaleOut_NotRunning(t *testing.T) {
 	scheme := newTestScheme()
 	cluster := newTestCluster()

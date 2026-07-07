@@ -473,6 +473,40 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	bash test/monitoring/scripts/publish-dashboards.sh
 
 # =============================================================================
+# OKD4 Deployment targets
+# =============================================================================
+
+# --- OKD4 settings -----------------------------------------------------------
+OKD4_DEPLOY_DIR  := deploy/okd4
+OKD4_NAMESPACE   ?= greenplum
+OKD4_HELM_VALUES := deploy/helm/cloudberry-operator/okd4-example.yaml
+OKD4_CLUSTER_CR  := deploy/helm/cloudberry-operator/config/samples/okd4-cluster.yaml
+
+.PHONY: okd4-images
+okd4-images: ## Sync cloudberry images to ACR (public via skopeo, private need local build+push)
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh images
+
+.PHONY: okd4-deploy
+okd4-deploy: ## Deploy cloudberry-operator on OKD4 (upload + namespace + vault + keycloak + minio + helm install)
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh all --skip-images
+
+.PHONY: okd4-cluster
+okd4-cluster: ## Apply CloudberryCluster CR on OKD4
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh cluster
+
+.PHONY: okd4-validate
+okd4-validate: ## Validate OKD4 deployment (operator + cluster + SCC + TLS)
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh validate
+
+.PHONY: okd4-clean
+okd4-clean: ## Remove cloudberry-operator and cluster from OKD4
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh cleanup
+
+.PHONY: okd4-all
+okd4-all: ## Full OKD4 deployment: images + deploy + cluster + validate
+	bash $(OKD4_DEPLOY_DIR)/deploy.sh all
+
+# =============================================================================
 # Clean targets
 # =============================================================================
 
