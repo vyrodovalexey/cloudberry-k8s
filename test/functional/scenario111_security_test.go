@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -328,10 +329,19 @@ func (s *Scenario111Suite) TestFunctional_Scenario111_SE5_NetworkPolicyApplied()
 		Namespace: cluster.Namespace,
 	}, got))
 
-	// Segment-primary selector.
+	// Selector confines the policy to the cluster's PXF-hosting pods. Since D9
+	// PXF runs on segment-mirror pods too, so the component is matched via an
+	// In-set over {segment-primary, segment-mirror} (a MatchExpressions term),
+	// not a MatchLabels component value.
 	assert.Equal(s.T(), cluster.Name, got.Spec.PodSelector.MatchLabels[util.LabelCluster])
-	assert.Equal(s.T(), util.ComponentSegmentPrimary,
-		got.Spec.PodSelector.MatchLabels[util.LabelComponent])
+	require.Len(s.T(), got.Spec.PodSelector.MatchExpressions, 1,
+		"policy must select PXF-hosting pods via a component In-set")
+	expr := got.Spec.PodSelector.MatchExpressions[0]
+	assert.Equal(s.T(), util.LabelComponent, expr.Key)
+	assert.Equal(s.T(), metav1.LabelSelectorOpIn, expr.Operator)
+	assert.ElementsMatch(s.T(),
+		[]string{util.ComponentSegmentPrimary, util.ComponentSegmentMirror},
+		expr.Values)
 	// Ingress-only.
 	assert.Equal(s.T(), []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		got.Spec.PolicyTypes)

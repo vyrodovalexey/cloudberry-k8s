@@ -405,6 +405,8 @@ func (b *DefaultBuilder) BuildStandbyStatefulSet(cluster *cbv1alpha1.CloudberryC
 					Containers:     []corev1.Container{},
 					Volumes:        buildVolumes(cluster),
 					NodeSelector:   cluster.Spec.Standby.NodeSelector,
+					Tolerations:    convertTolerations(cluster.Spec.Standby.Tolerations),
+					Affinity:       buildStandbyAffinity(cluster),
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
@@ -1466,46 +1468,34 @@ func buildPVC(storage cbv1alpha1.StorageSpec, labels map[string]string) (corev1.
 	return pvc, nil
 }
 
-// buildSegmentAffinity creates anti-affinity rules for segments.
+// buildSegmentAffinity creates the cross-component segment anti-affinity term
+// (segment primary pods repel mirror pods and vice versa) via the shared
+// resolver + merge helpers. antiAffinityComponent is the OPPOSITE role's
+// component label (mirror for the primary STS, primary for the mirror STS).
+//
+// Placement/topology rules (see .opencode/output/antiaffinity-design_core_2026-07-07.md):
+//   - The legacy segments.antiAffinity field still controls whether the segment
+//     term is required or preferred, so existing clusters are unchanged.
+//   - The NEW spec.affinity.type is intentionally NOT allowed to force the
+//     segment cross-component term to required (an all-primaries-vs-all-mirrors
+//     required term would wedge scheduling); the webhook warns and the term
+//     stays best-effort. spec.affinity only contributes its resolved TopologyKey.
+//   - When spec.affinity == nil the output is byte-identical to the historical
+//     default: preferred, weight 100, topologyKey kubernetes.io/hostname.
 func buildSegmentAffinity(
 	cluster *cbv1alpha1.CloudberryCluster,
 	antiAffinityComponent string,
 ) *corev1.Affinity {
-	antiAffinityLabels := map[string]string{
-		util.LabelCluster:   cluster.Name,
-		util.LabelComponent: antiAffinityComponent,
+	resolved := resolveAffinity(cluster.Spec.Affinity)
+	if !resolved.segmentMirror {
+		return nil
 	}
 
-	if cluster.Spec.Segments.AntiAffinity == cbv1alpha1.AntiAffinityRequired {
-		return &corev1.Affinity{
-			PodAntiAffinity: &corev1.PodAntiAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
-					{
-						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: antiAffinityLabels,
-						},
-						TopologyKey: "kubernetes.io/hostname",
-					},
-				},
-			},
-		}
-	}
-
-	return &corev1.Affinity{
-		PodAntiAffinity: &corev1.PodAntiAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
-				{
-					Weight: 100,
-					PodAffinityTerm: corev1.PodAffinityTerm{
-						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: antiAffinityLabels,
-						},
-						TopologyKey: "kubernetes.io/hostname",
-					},
-				},
-			},
-		},
-	}
+	term := crossRoleAntiAffinityTerm(cluster, antiAffinityComponent, resolved.topologyKey)
+	// Only the legacy segments.antiAffinity field may request a required segment
+	// term. spec.affinity.type never upgrades the segment term to required.
+	required := cluster.Spec.Segments.AntiAffinity == cbv1alpha1.AntiAffinityRequired
+	return mergeAntiAffinityTerm(nil, required, term)
 }
 
 // parseResourceList converts a CRD ResourceList to a K8s ResourceList.

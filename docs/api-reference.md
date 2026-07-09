@@ -3091,6 +3091,8 @@ Validates `CloudberryCluster` resources before admission. Enforces:
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
 - `deletionPolicy` is `Retain` or `Delete`
+- `spec.affinity.mode` (when set) is `segment-mirror` or `full`, and `spec.affinity.type` (when set) is `preferred` or `required`
+- **Anti-affinity `type: required` with a `segment-mirror`/`full` mode** is admitted with a non-fatal **warning**: the segment primary↔mirror term is applied as `preferred` (best-effort) regardless, because a hard whole-group primaries-vs-mirrors requirement would wedge scheduling on node-constrained clusters. The coordinator↔backup and coordinator↔standby terms still honor `required` (each targets the single coordinator pod, needs ≥2 nodes)
 - `backup.destination.s3.vaultSecret.path` (when set) must be non-empty and must not start with `/`; the explicit KV-v2 request form (`<mount>/data/<rest>`) is accepted with an admission **warning** suggesting the logical path — the operator injects the `data/` segment automatically for KV-v2 mounts
 
 **Duplicate name rejection example:**
@@ -3123,6 +3125,8 @@ Sets defaults on `CloudberryCluster` resources:
 | `segments.mirroring.enabled` | `true` |
 | `segments.mirroring.layout` | `group` |
 | `segments.antiAffinity` | `preferred` |
+| `affinity.type` (when `spec.affinity` is set) | `preferred` |
+| `affinity.topologyKey` (when `spec.affinity` is set) | `kubernetes.io/hostname` |
 | `auth.basic.enabled` | `true` |
 | `auth.basic.adminUser` | `gpadmin` |
 | `backup.image` (when `backup.enabled`) | `"cloudberry-backup:2.1.0"` — the official backup toolchain image. A backup-capable image must contain `kubectl` (the backup/restore Jobs `kubectl exec` into the coordinator pod) and `gpbackup`/`gprestore`/`gpbackup_s3_plugin`; the base database image is **not** sufficient |

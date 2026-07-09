@@ -128,6 +128,50 @@ spec:
                       type: object
                       additionalProperties:
                         type: string
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+
+                # --- Cross-Role Pod Anti-Affinity ---
+                affinity:
+                  type: object
+                  description: >
+                    Configurable cross-role pod anti-affinity. Fully optional; when
+                    unset the operator emits only the pre-existing default segment
+                    primary<->mirror preferred term (behavior unchanged).
+                  properties:
+                    mode:
+                      type: string
+                      enum: [segment-mirror, full]
+                      description: >
+                        Preset that materializes the toggles below. "segment-mirror"
+                        enables the segment primary<->mirror term only; "full" enables
+                        all three cross-role terms. Explicit toggles override the preset.
+                    segmentMirrorAntiAffinity:
+                      type: boolean
+                      description: >
+                        Keep a segment primary off its mirror's node (cross-component,
+                        always applied as preferred/best-effort). Derived from mode when unset.
+                    coordinatorBackupAntiAffinity:
+                      type: boolean
+                      description: "Keep the backup Job pod off the coordinator node. Derived from mode when unset."
+                    coordinatorStandbyAntiAffinity:
+                      type: boolean
+                      description: "Keep the standby pod off the coordinator node. Derived from mode when unset."
+                    type:
+                      type: string
+                      enum: [preferred, required]
+                      default: preferred
+                      description: >
+                        preferred (soft) or required (hard) for the coordinator<->backup
+                        and coordinator<->standby terms. The segment primary<->mirror term
+                        is ALWAYS preferred regardless of this value (a webhook Warning is
+                        emitted when type=required with a segment-mirror or full mode).
+                    topologyKey:
+                      type: string
+                      default: kubernetes.io/hostname
+                      description: "Node topology key used by every cross-role term."
 
                 # --- Segments ---
                 segments:
@@ -657,6 +701,63 @@ rendering), SE.5 (segment↔sidecar `localhost`-only NetworkPolicy), and SE.6
 (dedicated role) are **REAL**. See specification 12 §Security Considerations and
 §Scenario 111 for the full per-control matrix.
 
+### 1.11 Cross-Role Pod Anti-Affinity (`spec.affinity`)
+
+`spec.affinity` is an **optional** cluster-level block that configures cross-role
+pod anti-affinity across the coordinator, standby, segment primaries, segment
+mirrors, and the backup Job. When it is unset, behavior is **unchanged**: segment
+primaries and their mirrors already run under a **preferred** cross-component
+anti-affinity by default, and the coordinator, standby, and backup pods carry no
+operator-generated anti-affinity.
+
+This block is distinct from `spec.segments.antiAffinity`, which controls the
+same-role segment term's placement (`preferred`|`required`) and continues to work
+exactly as before.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `spec.affinity.mode` | string enum (`segment-mirror`, `full`) | *(unset)* | Preset that materializes the per-field toggles below. `segment-mirror` enables the segment primary↔mirror term only; `full` enables all three cross-role terms. |
+| `spec.affinity.segmentMirrorAntiAffinity` | `*bool` | derived from `mode` | Keep each segment primary off its mirror's node (cross-component). **Always applied as preferred/best-effort** regardless of `type`. |
+| `spec.affinity.coordinatorBackupAntiAffinity` | `*bool` | derived from `mode` | Keep the backup Job pod off the coordinator node. Applied to the backup Job pod (on-demand **and** scheduled). |
+| `spec.affinity.coordinatorStandbyAntiAffinity` | `*bool` | derived from `mode` | Keep the standby pod off the coordinator node. Applied to the standby pod. |
+| `spec.affinity.type` | string enum (`preferred`, `required`) | `preferred` | Scheduling hardness for the coordinator↔backup and coordinator↔standby terms. **Downgraded to preferred (with an admission Warning) for the segment primary↔mirror term** — see below. |
+| `spec.affinity.topologyKey` | string | `kubernetes.io/hostname` | Node topology key used by every cross-role term. |
+
+**Mode → toggle resolution:**
+
+- unset → no cross-role toggles (legacy; only the default segment primary↔mirror preferred term and `segments.antiAffinity` apply).
+- `segment-mirror` → `segmentMirrorAntiAffinity=true`.
+- `full` → `segmentMirrorAntiAffinity=true`, `coordinatorBackupAntiAffinity=true`, `coordinatorStandbyAntiAffinity=true`.
+
+Explicit per-field `*bool` toggles **override** the preset, including an explicit
+`false` that disables a term the preset would otherwise enable.
+
+**`required` → `preferred` downgrade for the segment term (honesty note).**
+`type: required` is **honored** for the coordinator↔backup and coordinator↔standby
+terms — each targets the single coordinator pod, so a hard term is safe (needs ≥2
+nodes). For the segment primary↔mirror term, `type: required` is **downgraded to
+`preferred`** and the mutating/validating webhook returns a non-fatal **admission
+Warning**. A hard all-primaries-vs-all-mirrors requirement is whole-group (not
+per-content) and would wedge scheduling on node-constrained clusters, so the
+operator never emits it. The segment separation is therefore **best-effort**: a
+primary and its mirror are strongly preferred onto different nodes, but on
+node-constrained clusters they may co-locate. Use the `group` mirroring layout and
+size the segment node pool accordingly.
+
+**Additive merge.** Operator-generated anti-affinity terms are appended; any
+user-supplied `affinity` (node affinity, pod affinity, or pre-existing pod
+anti-affinity terms) is preserved, never overwritten.
+
+### 1.12 Standby Tolerations (`spec.standby.tolerations`)
+
+`spec.standby.tolerations` (type `[]Toleration`) allows scheduling the standby
+coordinator pod onto tainted nodes, giving the standby parity with
+`spec.coordinator.tolerations`, `spec.segments.tolerations`, and the backup
+`jobTemplate.tolerations`. Each entry uses the standard Kubernetes toleration
+shape (`key`, `operator`, `value`, `effect`, `tolerationSeconds`). When combined
+with `spec.affinity.mode: full`, the standby pod carries both these tolerations and
+the coordinator↔standby anti-affinity term.
+
 ## 2. Sample Manifests
 
 ### 2.1 Minimal Cluster
@@ -909,6 +1010,82 @@ my-cluster   Running    NotConfigured
 ```
 
 **Note**: If `spec.deletionPolicy` is `Delete`, mirror PVCs are cleaned up automatically. If `Retain` (default), PVCs are preserved for potential re-enable.
+
+### 2.7 Cross-Role Anti-Affinity Examples
+
+**`segment-mirror` mode** (`config/samples/affinity-segment-mirror.yaml`) — keep
+each segment primary off its mirror's node (best-effort/preferred):
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-segment-mirror
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  # Enables ONLY the segment primary<->mirror cross-component term. This is
+  # functionally the cluster default; naming it pins the intent and topologyKey.
+  # The separation is best-effort (preferred): a primary and its mirror are
+  # strongly preferred onto different nodes, but may co-locate when nodes are scarce.
+  affinity:
+    mode: segment-mirror
+    type: preferred
+    topologyKey: kubernetes.io/hostname
+```
+
+**`full` mode with standby tolerations** (`config/samples/affinity-full.yaml`) —
+spread coordinator, standby, segment primaries/mirrors, and the backup Job:
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-full
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  standby:
+    enabled: true
+    storage:
+      size: "5Gi"
+    # Standby tolerations flow through to the standby pod template.
+    tolerations:
+      - key: "cloudberry.io/standby"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  # full composes: segment primary<->mirror (always preferred),
+  # standby<->coordinator, and backup Job<->coordinator. type=required makes the
+  # two coordinator terms hard (each targets the single coordinator pod); the
+  # segment primary<->mirror term stays preferred and the webhook emits a Warning.
+  affinity:
+    mode: full
+    type: required
+    topologyKey: kubernetes.io/hostname
+```
 
 ## 3. Printer Columns
 

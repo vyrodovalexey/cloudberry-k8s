@@ -90,6 +90,15 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
     - [Implications of Disabling Mirroring](#implications-of-disabling-mirroring)
     - [Disabling Mirroring](#disabling-mirroring)
     - [PVC Cleanup Behavior](#pvc-cleanup-behavior)
+  - [Pod Anti-Affinity / Scheduling](#pod-anti-affinity--scheduling)
+    - [Modes](#modes)
+    - [Mode: segment-mirror](#mode-segment-mirror)
+    - [Mode: full](#mode-full)
+    - [Per-Field Toggles](#per-field-toggles)
+    - [preferred vs required (honesty note)](#preferred-vs-required-honesty-note)
+    - [Node-Count Implications](#node-count-implications)
+    - [Standby Tolerations](#standby-tolerations)
+    - [Additive Merge with User Affinity](#additive-merge-with-user-affinity)
 - [Maintenance Operations](#maintenance-operations)
   - [Maintenance Jobs](#maintenance-jobs)
   - [Maintenance Annotations](#maintenance-annotations)
@@ -4054,6 +4063,179 @@ spec:
     ftsProbeRetries: 3     # retries before marking down
     checksums: true        # storage-layer checksums
 ```
+
+### Pod Anti-Affinity / Scheduling
+
+The optional `spec.affinity` block configures **cross-role pod anti-affinity** so
+that the coordinator, standby, segment primaries, segment mirrors, and the backup
+Job can be spread onto distinct nodes for stronger fault isolation.
+
+`spec.affinity` is **opt-in**. When you omit it, scheduling behavior is
+**unchanged**: segment primaries and their mirrors already run under a **preferred**
+cross-component anti-affinity by default, and the coordinator, standby, and backup
+pods carry no operator-generated anti-affinity. This block is separate from
+`spec.segments.antiAffinity` (which controls the same-role segment term's
+`preferred`/`required` placement and is unaffected).
+
+#### Modes
+
+`mode` is a convenience preset that materializes the per-field toggles:
+
+| Mode | Terms enabled |
+|------|---------------|
+| *(unset)* | None added — only the default segment primary↔mirror preferred term applies |
+| `segment-mirror` | Segment primary↔mirror (best-effort/preferred) |
+| `full` | Segment primary↔mirror **+** standby↔coordinator **+** backup Job↔coordinator |
+
+#### Mode: segment-mirror
+
+Keeps each segment primary off its mirror's node. Because the segment term already
+ships by default, naming it here mainly documents intent and pins the `topologyKey`.
+The separation is **best-effort (preferred)** — see the honesty note below.
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-segment-mirror
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  affinity:
+    mode: segment-mirror
+    type: preferred
+    topologyKey: kubernetes.io/hostname
+```
+
+#### Mode: full
+
+Composes all three cross-role terms. With `type: required`, the coordinator↔standby
+and coordinator↔backup terms become **hard** (each targets the single coordinator
+pod, so `required` is safe). The segment primary↔mirror term stays **preferred**
+regardless, and the webhook emits a non-fatal Warning explaining this. The example
+also shows `standby.tolerations`, which flow through to the standby pod.
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-full
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  standby:
+    enabled: true
+    storage:
+      size: "5Gi"
+    tolerations:
+      - key: "cloudberry.io/standby"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  affinity:
+    mode: full
+    type: required
+    topologyKey: kubernetes.io/hostname
+```
+
+#### Per-Field Toggles
+
+Each term has an explicit `*bool` toggle that **overrides the preset**, including an
+explicit `false` that disables a term the preset would otherwise enable:
+
+| Field | Term |
+|-------|------|
+| `segmentMirrorAntiAffinity` | Segment primary↔mirror (always applied as preferred) |
+| `coordinatorBackupAntiAffinity` | Backup Job pod↔coordinator |
+| `coordinatorStandbyAntiAffinity` | Standby pod↔coordinator |
+
+For example, `full` spread but with the backup Job allowed back onto the
+coordinator node:
+
+```yaml
+spec:
+  affinity:
+    mode: full
+    coordinatorBackupAntiAffinity: false   # override the preset for this one term
+    type: required
+```
+
+The coordinator↔backup term is applied on the backup Job pod (both on-demand and
+scheduled backups); the coordinator↔standby term is applied on the standby pod. The
+coordinator StatefulSet is **never re-rolled** to add these terms.
+
+#### preferred vs required (honesty note)
+
+`type: required` is **honored** for the coordinator↔backup and coordinator↔standby
+terms — each targets the single coordinator pod, so a hard term is safe (it needs
+≥2 nodes).
+
+For the **segment primary↔mirror** term, `type: required` is **downgraded to
+`preferred`** and the admission webhook returns a **non-fatal Warning**. A hard
+whole-group "no mirror shares a node with any primary" constraint is not
+per-content and would wedge scheduling (pods stuck `Pending`) on realistic
+clusters, so the operator never emits it.
+
+> **The segment separation is best-effort.** A segment primary and its mirror are
+> strongly preferred onto different nodes, but on node-constrained clusters they
+> may co-locate. For the strongest structural separation, use the `group` mirroring
+> layout and size the segment node pool with adequate node count.
+
+#### Node-Count Implications
+
+| Term | Placement | Minimum nodes to schedule | Wedge risk |
+|------|-----------|---------------------------|------------|
+| Segment primary↔mirror | preferred (forced) | 1 (never wedges) | None |
+| Coordinator↔standby | preferred **or** required | `required` needs ≥ 2 | Low |
+| Coordinator↔backup | preferred **or** required | `required` needs ≥ 2 | Low |
+
+#### Standby Tolerations
+
+`spec.standby.tolerations` lets the standby coordinator schedule onto tainted
+nodes, giving the standby parity with `spec.coordinator.tolerations`,
+`spec.segments.tolerations`, and the backup `jobTemplate.tolerations`. Each entry
+uses the standard toleration shape (`key`, `operator`, `value`, `effect`,
+`tolerationSeconds`):
+
+```yaml
+spec:
+  standby:
+    enabled: true
+    tolerations:
+      - key: "cloudberry.io/standby"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+```
+
+#### Additive Merge with User Affinity
+
+Operator-generated anti-affinity terms are **additive**. Any affinity you supply
+yourself (node affinity, pod affinity, or pre-existing pod anti-affinity terms) is
+**preserved** — the operator appends its cross-role terms and never overwrites
+your rules.
 
 ## Maintenance Operations
 

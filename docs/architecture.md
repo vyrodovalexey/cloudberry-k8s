@@ -194,14 +194,23 @@ CloudberryCluster
 │   ├── standby              # Standby coordinator config
 │   │   ├── enabled          # Enable/disable standby
 │   │   ├── resources        # CPU/memory
-│   │   └── storage          # PVC config
+│   │   ├── storage          # PVC config
+│   │   ├── nodeSelector     # Node label constraints
+│   │   └── tolerations      # Tolerations for tainted nodes
 │   ├── segments             # Segment nodes config
 │   │   ├── count            # Number of primary segments
 │   │   ├── primariesPerHost # Segments per host (default: 2)
 │   │   ├── mirroring        # Mirror config (enabled, layout)
 │   │   ├── resources        # CPU/memory
 │   │   ├── storage          # PVC config
-│   │   └── antiAffinity     # preferred or required
+│   │   └── antiAffinity     # preferred or required (same-role segment spread)
+│   ├── affinity             # Cross-role pod anti-affinity (optional; default off)
+│   │   ├── mode             # segment-mirror | full (preset of the toggles below)
+│   │   ├── segmentMirrorAntiAffinity     # *bool — primary <-> mirror (always preferred)
+│   │   ├── coordinatorBackupAntiAffinity # *bool — backup Job <-> coordinator
+│   │   ├── coordinatorStandbyAntiAffinity# *bool — standby <-> coordinator
+│   │   ├── type             # preferred | required (default preferred)
+│   │   └── topologyKey      # default kubernetes.io/hostname
 │   ├── auth                 # Authentication config
 │   │   ├── basic            # Basic auth (admin user, password secret)
 │   │   ├── oidc             # OIDC config (issuer, client, role mapping)

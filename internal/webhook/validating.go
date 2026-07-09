@@ -215,8 +215,51 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateStorageManagement(cluster); err != nil {
 		return warnings, err
 	}
+	if err := validateAffinity(cluster, &warnings); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
+}
+
+// validateAffinity validates the optional cross-role anti-affinity block. It is
+// a no-op when spec.affinity is nil. It performs belt-and-suspenders enum checks
+// (the CRD also enforces them) and emits a NON-FATAL admission Warning when a
+// required type is requested together with a segment-mirror/full mode, because
+// the segment primary<->mirror separation is always applied as best-effort.
+func validateAffinity(cluster *cbv1alpha1.CloudberryCluster, warnings *admission.Warnings) error {
+	aff := cluster.Spec.Affinity
+	if aff == nil {
+		return nil
+	}
+
+	switch aff.Mode {
+	case "",
+		cbv1alpha1.ClusterAntiAffinityModeSegmentMirror,
+		cbv1alpha1.ClusterAntiAffinityModeFull:
+		// valid
+	default:
+		return fmt.Errorf(
+			"affinity.mode must be segment-mirror or full, got %s", aff.Mode)
+	}
+
+	switch aff.Type {
+	case "", cbv1alpha1.AntiAffinityPreferred, cbv1alpha1.AntiAffinityRequired:
+		// valid
+	default:
+		return fmt.Errorf(
+			"affinity.type must be preferred or required, got %s", aff.Type)
+	}
+
+	segmentModeActive := aff.Mode == cbv1alpha1.ClusterAntiAffinityModeSegmentMirror ||
+		aff.Mode == cbv1alpha1.ClusterAntiAffinityModeFull
+	if aff.Type == cbv1alpha1.AntiAffinityRequired && segmentModeActive {
+		*warnings = append(*warnings,
+			"affinity.type=required: segment primary\u2194mirror separation is applied "+
+				"as best-effort (preferred); per-content required separation is not "+
+				"supported. Coordinator\u2194backup and coordinator\u2194standby terms honor required.")
+	}
+	return nil
 }
 
 // validateSegments validates segment configuration.

@@ -80,6 +80,76 @@ const (
 	AntiAffinityRequired AntiAffinityType = "required"
 )
 
+// ClusterAntiAffinityMode is a preset that materializes a set of cross-role
+// pod anti-affinity toggles. Explicit per-field toggles on ClusterAffinitySpec
+// always override the preset (including an explicit false).
+type ClusterAntiAffinityMode string
+
+const (
+	// ClusterAntiAffinityModeSegmentMirror enables ONLY the segment
+	// primary<->mirror cross-component anti-affinity (best-effort/preferred).
+	ClusterAntiAffinityModeSegmentMirror ClusterAntiAffinityMode = "segment-mirror"
+	// ClusterAntiAffinityModeFull enables segment primary<->mirror,
+	// coordinator<->backup, and coordinator<->standby anti-affinity together.
+	ClusterAntiAffinityModeFull ClusterAntiAffinityMode = "full"
+)
+
+// ClusterAffinitySpec configures configurable cross-role pod anti-affinity for
+// the cluster. It is fully optional; when nil the operator emits exactly the
+// pre-existing default affinity (segment primary<->mirror preferred term only).
+//
+// Resolution order (single source of truth, see internal/builder/affinity.go):
+//  1. Mode materializes a preset set of toggles.
+//  2. Explicit *bool toggles override the preset value (including explicit false).
+//  3. Type/TopologyKey default to preferred / kubernetes.io/hostname.
+//
+// The segment primary<->mirror separation is always applied as best-effort
+// (preferred) regardless of Type, because a hard all-primaries-vs-all-mirrors
+// requirement would wedge scheduling on node-constrained clusters. The
+// coordinator<->backup and coordinator<->standby terms honor Type (preferred or
+// required) since they target the single coordinator pod.
+type ClusterAffinitySpec struct {
+	// Mode selects a preset that materializes the anti-affinity toggles.
+	// "segment-mirror" enables segment primary<->mirror only; "full" enables
+	// all three cross-role terms. Explicit toggles below override the preset.
+	// +kubebuilder:validation:Enum=segment-mirror;full
+	// +optional
+	Mode ClusterAntiAffinityMode `json:"mode,omitempty"`
+
+	// SegmentMirrorAntiAffinity toggles the segment primary<->mirror
+	// cross-component anti-affinity term. When nil the value is derived from
+	// Mode. Overrides Mode when set.
+	// +optional
+	SegmentMirrorAntiAffinity *bool `json:"segmentMirrorAntiAffinity,omitempty"`
+
+	// CoordinatorBackupAntiAffinity toggles the anti-affinity term that keeps
+	// backup Job pods off the coordinator node. When nil the value is derived
+	// from Mode. Overrides Mode when set.
+	// +optional
+	CoordinatorBackupAntiAffinity *bool `json:"coordinatorBackupAntiAffinity,omitempty"`
+
+	// CoordinatorStandbyAntiAffinity toggles the anti-affinity term that keeps
+	// the standby pod off the coordinator node. When nil the value is derived
+	// from Mode. Overrides Mode when set.
+	// +optional
+	CoordinatorStandbyAntiAffinity *bool `json:"coordinatorStandbyAntiAffinity,omitempty"`
+
+	// Type selects preferred (soft) or required (hard) scheduling for the
+	// coordinator<->backup and coordinator<->standby terms. The segment
+	// primary<->mirror term is ALWAYS applied as preferred regardless of Type
+	// (a webhook Warning is emitted when Type is required with a segment-mirror
+	// or full mode).
+	// +kubebuilder:validation:Enum=preferred;required
+	// +kubebuilder:default="preferred"
+	// +optional
+	Type AntiAffinityType `json:"type,omitempty"`
+
+	// TopologyKey is the node topology key used by every cross-role term.
+	// +kubebuilder:default="kubernetes.io/hostname"
+	// +optional
+	TopologyKey string `json:"topologyKey,omitempty"`
+}
+
 // ImagePullPolicy represents the container image pull policy.
 type ImagePullPolicy string
 
@@ -400,6 +470,12 @@ type CloudberryClusterSpec struct {
 	// Segments defines the segment nodes configuration.
 	Segments SegmentsSpec `json:"segments"`
 
+	// Affinity configures configurable cross-role pod anti-affinity. When nil
+	// the operator emits the pre-existing default affinity only (segment
+	// primary<->mirror preferred term).
+	// +optional
+	Affinity *ClusterAffinitySpec `json:"affinity,omitempty"`
+
 	// Auth defines authentication and authorization configuration.
 	// +optional
 	Auth *AuthSpec `json:"auth,omitempty"`
@@ -512,6 +588,10 @@ type StandbySpec struct {
 	// NodeSelector constrains scheduling to nodes with matching labels.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations allow scheduling the standby coordinator on tainted nodes.
+	// +optional
+	Tolerations []Toleration `json:"tolerations,omitempty"`
 }
 
 // SegmentsSpec defines the segment nodes configuration.

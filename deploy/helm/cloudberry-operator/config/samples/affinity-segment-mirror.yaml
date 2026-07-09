@@ -1,0 +1,40 @@
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-segment-mirror
+  namespace: cloudberry-test
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+spec:
+  version: "16"
+  image: "postgres:16"
+  imagePullPolicy: IfNotPresent
+
+  coordinator:
+    replicas: 1
+    port: 5432
+    storage:
+      size: "5Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+
+  # affinity.mode=segment-mirror enables ONLY the segment primary<->mirror
+  # cross-component anti-affinity. This is functionally the cluster default
+  # (the segment term always ships), but naming it here documents the intent
+  # and pins the topologyKey. The separation is best-effort (preferred): a
+  # segment primary and its mirror are strongly preferred onto different nodes,
+  # but on node-constrained clusters they may co-locate.
+  affinity:
+    mode: segment-mirror
+    type: preferred
+    topologyKey: kubernetes.io/hostname
+
+  deletionPolicy: Retain
