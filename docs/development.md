@@ -535,7 +535,7 @@ IMG_OPERATOR=myregistry/cloudberry-operator:v0.2.0 make docker-build-operator
 
 The operator uses a multi-stage Dockerfile:
 
-1. **Builder stage**: `golang:1.26.4-alpine`, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
+1. **Builder stage**: `golang:1.26.5-alpine`, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
 2. **Runtime stage**: `gcr.io/distroless/static-debian12:nonroot` (minimal, non-root)
 
 The final image is under 100MB and runs as user `65532` (nonroot). Version information is injected via build arguments (`VERSION`, `COMMIT`, `BUILD_DATE`) passed through Docker build args.

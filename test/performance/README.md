@@ -21,7 +21,7 @@ Performance and load testing suite for the Cloudberry K8s Operator REST API usin
 - **Docker** (recommended) or native Yandex Tank installation
 - **Running Cloudberry Operator** with REST API accessible on port `:8090` (default)
 - **bash** 4.0+ (for the runner script)
-- **Go** 1.26.4+ (for building the operator from source)
+- **Go** 1.26.5+ (for building the operator from source)
 
 ### Docker (Recommended)
 

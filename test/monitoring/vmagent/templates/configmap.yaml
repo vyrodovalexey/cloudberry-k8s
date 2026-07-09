@@ -92,6 +92,42 @@ data:
             action: replace
             target_label: component
 
+      # -----------------------------------------------------------------
+      # Cloudberry Query Exporter (port 9188 on coordinator pods)
+      # -----------------------------------------------------------------
+      # The coordinator pod annotation prometheus.io/port=9187 targets the
+      # postgres-exporter sidecar. The query-exporter sidecar on :9188
+      # needs a separate scrape job (same pattern as pxf-actuator above).
+      - job_name: 'cloudberry-query-exporter'
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Keep only pods with the query-exporter container port (9188).
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "9188"
+          # Keep only pods that have prometheus.io/scrape=true.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          # Override the scrape address to use port 9188.
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:9188
+            target_label: __address__
+          # Standard metadata labels.
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: replace
+            target_label: component
+
       - job_name: 'kubernetes-service-endpoints'
         # Preserve a scraped target's own `job` label (avoid exported_job).
         honor_labels: true

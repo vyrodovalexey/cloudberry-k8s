@@ -703,7 +703,7 @@ cloudberry-ctl cluster status --cluster my-cluster --namespace cloudberry-test
 |-------------|---------|
 | Kubernetes | >= 1.26 |
 | Helm | >= 3.x |
-| Go (for building) | >= 1.26.4 |
+| Go (for building) | >= 1.26.5 |
 | kubectl | >= 1.26 |
 
 Optional:

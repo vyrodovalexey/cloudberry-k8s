@@ -40,7 +40,7 @@
 # version-matched and include the lib/pq driver fix, the GetDBSize crash fix,
 # the LOCK TABLE / SAVEPOINT / snapshot fixes, and the --version flag support.
 # =============================================================================
-ARG GO_VERSION=1.26.4
+ARG GO_VERSION=1.26.5
 FROM --platform=linux/amd64 golang:${GO_VERSION}-bookworm AS gpbackup-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

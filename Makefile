@@ -387,6 +387,70 @@ monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector
 		--wait --timeout 2m
 	@echo "Monitoring stack deployed to namespace $(NAMESPACE_MONITORING)"
 
+.PHONY: monitoring-verify
+monitoring-verify: ## Verify monitoring stack integration (metrics in VM, logs in VL, otel-collector reachable)
+	@echo "============================================="
+	@echo "=== Monitoring Stack Verification ==="
+	@echo "============================================="
+	@errors=0; \
+	echo ""; \
+	echo "=== Pod Status ==="; \
+	kubectl get pods -n $(NAMESPACE_MONITORING) \
+		-l 'app.kubernetes.io/name in (vmagent,node-exporter,otel-collector,vector,kube-state-metrics)' \
+		--no-headers 2>/dev/null | while read line; do echo "  $$line"; done; \
+	echo ""; \
+	echo "=== VictoriaMetrics: kube-state-metrics series ==="; \
+	kube_count=$$(curl -sf 'http://127.0.0.1:8428/api/v1/query?query=count(kube_pod_info)' 2>/dev/null \
+		| python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('data',{}).get('result',[]); print(r[0]['value'][1] if r else '0')" 2>/dev/null || echo "0"); \
+	if [ "$$kube_count" != "0" ]; then \
+		echo "  ✓ kube_pod_info: $$kube_count series"; \
+	else \
+		echo "  ✗ kube_pod_info: NO DATA"; errors=$$((errors+1)); \
+	fi; \
+	echo ""; \
+	echo "=== VictoriaMetrics: node-exporter metrics ==="; \
+	node_count=$$(curl -sf 'http://127.0.0.1:8428/api/v1/query?query=count(node_cpu_seconds_total)' 2>/dev/null \
+		| python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('data',{}).get('result',[]); print(r[0]['value'][1] if r else '0')" 2>/dev/null || echo "0"); \
+	if [ "$$node_count" != "0" ]; then \
+		echo "  ✓ node_cpu_seconds_total: $$node_count series"; \
+	else \
+		echo "  ✗ node_cpu_seconds_total: NO DATA"; errors=$$((errors+1)); \
+	fi; \
+	echo ""; \
+	echo "=== VictoriaMetrics: vmagent self-metrics ==="; \
+	vm_count=$$(curl -sf 'http://127.0.0.1:8428/api/v1/query?query=count(vmagent_remotewrite_requests_total)' 2>/dev/null \
+		| python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('data',{}).get('result',[]); print(r[0]['value'][1] if r else '0')" 2>/dev/null || echo "0"); \
+	if [ "$$vm_count" != "0" ]; then \
+		echo "  ✓ vmagent_remotewrite_requests_total: $$vm_count series"; \
+	else \
+		echo "  ✗ vmagent_remotewrite_requests_total: NO DATA"; errors=$$((errors+1)); \
+	fi; \
+	echo ""; \
+	echo "=== VictoriaMetrics: total unique metric names ==="; \
+	total=$$(curl -sf 'http://127.0.0.1:8428/api/v1/label/__name__/values' 2>/dev/null \
+		| python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "0"); \
+	echo "  Total unique metric names: $$total"; \
+	echo ""; \
+	echo "=== VictoriaLogs: k8s logs from Vector ==="; \
+	log_count=$$(curl -sf 'http://127.0.0.1:9428/select/logsql/query?query=*&limit=1' 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$log_count" -gt 0 ] 2>/dev/null; then \
+		echo "  ✓ VictoriaLogs receiving k8s logs ($$log_count+ entries)"; \
+	else \
+		echo "  ✗ VictoriaLogs: NO LOGS received"; errors=$$((errors+1)); \
+	fi; \
+	echo ""; \
+	echo "=== otel-collector: Service reachable ==="; \
+	kubectl get svc otel-collector -n $(NAMESPACE_MONITORING) > /dev/null 2>&1 \
+		&& echo "  ✓ otel-collector Service exists (4317/gRPC, 4318/HTTP, 8888/metrics)" \
+		|| { echo "  ✗ otel-collector Service MISSING"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "============================================="; \
+	if [ $$errors -gt 0 ]; then \
+		echo "FAILED: $$errors verification(s) failed"; exit 1; \
+	else \
+		echo "ALL MONITORING VERIFICATIONS PASSED"; \
+	fi
+
 .PHONY: monitoring-undeploy
 monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
 	$(HELM) uninstall kube-state-metrics --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
@@ -471,6 +535,100 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 	bash test/docker-compose/scripts/gen-gpload-csv.sh
 	bash test/docker-compose/scripts/gen-kafka-cdc.sh
 	bash test/monitoring/scripts/publish-dashboards.sh
+
+.PHONY: test-env-full
+test-env-full: test-env-up ## Bring up + configure + verify the full test environment (idempotent)
+	@echo "Waiting for services to start..."
+	@for i in $$(seq 1 90); do \
+		unhealthy=$$($(DOCKER) compose -f test/docker-compose/docker-compose.yml ps --format '{{.Name}} {{.Health}}' 2>/dev/null \
+			| grep -E 'starting' || true); \
+		if [ -z "$$unhealthy" ]; then echo "All healthchecked services ready at attempt $$i"; break; fi; \
+		echo "Attempt $$i: waiting for healthchecks... ($$unhealthy)"; sleep 5; \
+	done
+	$(MAKE) test-env-setup
+	$(MAKE) test-env-verify
+
+.PHONY: test-env-verify
+test-env-verify: ## Verify all test environment services are configured and reachable
+	@echo "============================================="
+	@echo "=== Test Environment Verification ==="
+	@echo "============================================="
+	@errors=0; \
+	echo ""; \
+	echo "=== Vault ==="; \
+	curl -sf -H "X-Vault-Token: myroot" http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1 \
+		&& echo "  ✓ Vault healthy" || { echo "  ✗ Vault NOT healthy"; errors=$$((errors+1)); }; \
+	curl -sf -H "X-Vault-Token: myroot" http://127.0.0.1:8200/v1/sys/mounts/pki > /dev/null 2>&1 \
+		&& echo "  ✓ PKI mount present" || { echo "  ✗ PKI mount MISSING"; errors=$$((errors+1)); }; \
+	curl -sf -H "X-Vault-Token: myroot" http://127.0.0.1:8200/v1/pki/roles/cloudberry-operator > /dev/null 2>&1 \
+		&& echo "  ✓ PKI role cloudberry-operator" || { echo "  ✗ PKI role MISSING"; errors=$$((errors+1)); }; \
+	curl -sf -H "X-Vault-Token: myroot" http://127.0.0.1:8200/v1/secret/data/cloudberry/backup-s3 > /dev/null 2>&1 \
+		&& echo "  ✓ KV backup-s3 secret present" || { echo "  ✗ KV backup-s3 MISSING"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== Keycloak ==="; \
+	curl -sf http://127.0.0.1:8090/realms/test/.well-known/openid-configuration > /dev/null 2>&1 \
+		&& echo "  ✓ OIDC discovery (realm test)" || { echo "  ✗ OIDC discovery FAILED"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== MinIO ==="; \
+	curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null 2>&1 \
+		&& echo "  ✓ MinIO healthy" || { echo "  ✗ MinIO NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== PostgreSQL (pgsource) ==="; \
+	docker exec pgsource pg_isready -U pxfuser -d sourcedb > /dev/null 2>&1 \
+		&& echo "  ✓ pgsource healthy" || { echo "  ✗ pgsource NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== MySQL ==="; \
+	docker exec mysql mysqladmin ping -h 127.0.0.1 -uroot -prootpass --silent 2>/dev/null \
+		&& echo "  ✓ MySQL healthy" || { echo "  ✗ MySQL NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== Kafka ==="; \
+	echo "" | nc -w 3 127.0.0.1 9094 > /dev/null 2>&1 \
+		&& echo "  ✓ Kafka reachable" || { echo "  ✗ Kafka NOT reachable"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== RabbitMQ ==="; \
+	curl -sf -u guest:guest http://127.0.0.1:15672/api/overview > /dev/null 2>&1 \
+		&& echo "  ✓ RabbitMQ management API up" || { echo "  ✗ RabbitMQ NOT responding"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== HDFS ==="; \
+	curl -sf 'http://127.0.0.1:9870/webhdfs/v1/?op=LISTSTATUS' > /dev/null 2>&1 \
+		&& echo "  ✓ HDFS NameNode healthy" || { echo "  ✗ HDFS NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== Hive ==="; \
+	nc -z -w 3 127.0.0.1 9083 > /dev/null 2>&1 \
+		&& echo "  ✓ Hive Metastore reachable" || { echo "  ✗ Metastore NOT reachable"; errors=$$((errors+1)); }; \
+	nc -z -w 3 127.0.0.1 10000 > /dev/null 2>&1 \
+		&& echo "  ✓ HiveServer2 reachable" || { echo "  ✗ HiveServer2 NOT reachable"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== HBase ==="; \
+	echo "ruok" | nc -w 3 127.0.0.1 2181 2>/dev/null | grep -q "imok" \
+		&& echo "  ✓ HBase ZooKeeper healthy" || { echo "  ✗ HBase ZK NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== VictoriaMetrics ==="; \
+	curl -sf http://127.0.0.1:8428/health > /dev/null 2>&1 \
+		&& echo "  ✓ VictoriaMetrics healthy" || { echo "  ✗ VM NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== VictoriaLogs ==="; \
+	curl -sf http://127.0.0.1:9428/health > /dev/null 2>&1 \
+		&& echo "  ✓ VictoriaLogs healthy" || { echo "  ✗ VL NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== Grafana ==="; \
+	curl -sf http://127.0.0.1:3000/api/health > /dev/null 2>&1 \
+		&& echo "  ✓ Grafana healthy" || { echo "  ✗ Grafana NOT healthy"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "=== K8s Prerequisites ==="; \
+	kubectl get namespace cloudberry-test > /dev/null 2>&1 \
+		&& echo "  ✓ Namespace cloudberry-test exists" || { echo "  ✗ Namespace MISSING"; errors=$$((errors+1)); }; \
+	kubectl get secret backup-s3-credentials -n cloudberry-test > /dev/null 2>&1 \
+		&& echo "  ✓ Secret backup-s3-credentials exists" || { echo "  ✗ Secret MISSING"; errors=$$((errors+1)); }; \
+	kubectl get svc minio -n cloudberry-test > /dev/null 2>&1 \
+		&& echo "  ✓ ExternalName Service minio exists" || { echo "  ✗ Service minio MISSING"; errors=$$((errors+1)); }; \
+	echo ""; \
+	echo "============================================="; \
+	if [ $$errors -gt 0 ]; then \
+		echo "FAILED: $$errors verification(s) failed"; exit 1; \
+	else \
+		echo "ALL VERIFICATIONS PASSED"; \
+	fi
 
 # =============================================================================
 # OKD4 Deployment targets

@@ -20,7 +20,7 @@
 # Build args:
 #   CB_BACKUP_VERSION   — cloudberry-backup release version (default: 2.1.0-incubating)
 #   CB_BACKUP_REPO_URL  — base URL for the source tarball download
-#   GO_VERSION          — Go toolchain version installed in the builder stage (default: 1.26.4)
+#   GO_VERSION          — Go toolchain version installed in the builder stage (default: 1.26.5)
 #   GPBACKMAN_VERSION   — gpbackman release tag (default: v0.8.1)
 #
 # Base images:
@@ -36,7 +36,7 @@
 # =============================================================================
 # Stage 1: Build apache/cloudberry-backup from source
 # =============================================================================
-ARG GO_VERSION=1.26.4
+ARG GO_VERSION=1.26.5
 FROM rockylinux/rockylinux:9.6 AS builder
 
 # Install build dependencies (sorted alphanumerically)
