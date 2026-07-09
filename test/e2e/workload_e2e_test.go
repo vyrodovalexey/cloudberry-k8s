@@ -1301,6 +1301,14 @@ func (w *nonClosingClientWrapper) DeregisterSegments(ctx context.Context, newCou
 	return w.delegate.DeregisterSegments(ctx, newCount)
 }
 
+func (w *nonClosingClientWrapper) GpexpandSchemaPresent(ctx context.Context) (bool, error) {
+	return w.delegate.GpexpandSchemaPresent(ctx)
+}
+
+func (w *nonClosingClientWrapper) FinalizeGpexpand(ctx context.Context) error {
+	return w.delegate.FinalizeGpexpand(ctx)
+}
+
 func (w *nonClosingClientWrapper) RedistributeBeforeScaleIn(ctx context.Context, opts db.ScaleInRedistributionOptions) error {
 	return w.delegate.RedistributeBeforeScaleIn(ctx, opts)
 }
