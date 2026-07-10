@@ -11,7 +11,7 @@
 #   - HA coordinator with standby
 #   - 2 segments, primariesPerHost=2, 20Gi PVC/segment, group mirroring
 #   - TLS from Vault PKI (auth.ssl, certSecret okd4-cluster-tls, not pre-created)
-#   - Keycloak OIDC (DL realm) + Vault KV secrets + Vault k8s auth
+#   - Keycloak OIDC (cl realm) + Vault KV secrets + Vault k8s auth
 #   - postgres-exporter (segments + mirrors) + cloudberry-query-exporter
 #   - PXF s3:parquet external load from MinIO cloudberry-test
 #   - Backup → MinIO cloudberry-test with S3 creds from Vault KV
