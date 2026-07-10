@@ -141,9 +141,28 @@ func setClusterDefaults(cluster *cbv1alpha1.CloudberryCluster) {
 	setBackupDefaults(cluster)
 	setDataLoadingDefaults(cluster)
 	setStorageManagementDefaults(cluster)
+	setAffinityDefaults(cluster)
 
 	if cluster.Spec.DeletionPolicy == "" {
 		cluster.Spec.DeletionPolicy = cbv1alpha1.DeletionPolicyRetain
+	}
+}
+
+// setAffinityDefaults fills the optional cross-role anti-affinity defaults. It
+// only defaults Type and TopologyKey; mode->toggle materialization is
+// intentionally left to the build-time resolver (resolveAffinity) so there is a
+// SINGLE source of truth and no double resolution. When spec.affinity is nil it
+// makes no allocation (preserving the byte-identical baseline).
+func setAffinityDefaults(cluster *cbv1alpha1.CloudberryCluster) {
+	aff := cluster.Spec.Affinity
+	if aff == nil {
+		return
+	}
+	if aff.Type == "" {
+		aff.Type = cbv1alpha1.AntiAffinityPreferred
+	}
+	if aff.TopologyKey == "" {
+		aff.TopologyKey = "kubernetes.io/hostname"
 	}
 }
 

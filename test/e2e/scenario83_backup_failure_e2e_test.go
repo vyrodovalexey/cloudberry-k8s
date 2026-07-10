@@ -200,6 +200,7 @@ func (s *Scenario83BackupFailureE2ESuite) TestE2E_Scenario83_LiveBackupFailure()
 	if cluster == "" {
 		cluster = "scenario83-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS83Script)
 	if script == "" {

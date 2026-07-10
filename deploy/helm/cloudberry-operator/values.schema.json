@@ -264,6 +264,80 @@
     "extraEnv": { "type": "array" },
     "extraVolumeMounts": { "type": "array" },
     "extraVolumes": { "type": "array" },
+    "openshift": {
+      "type": "object",
+      "description": "OpenShift/OKD4 support (SCC, SCC RoleBindings, OKD-aware securityContext)",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable OKD4/OpenShift support (backward-compatible: false = vanilla Kubernetes)"
+        },
+        "operatorSCC": {
+          "type": "string",
+          "description": "Built-in SCC the operator SA is bound to (e.g. restricted-v2, nonroot-v2)"
+        },
+        "createClusterSCC": {
+          "type": "boolean",
+          "description": "Create the minimal custom SCC for the CloudberryCluster workload"
+        },
+        "clusterServiceAccount": {
+          "type": "string",
+          "description": "ServiceAccount the CloudberryCluster workload pods run under"
+        },
+        "scc": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Custom SCC name (auto-generated as <fullname>-cluster if empty)"
+            },
+            "priority": {
+              "type": ["integer", "null"],
+              "description": "SCC selection priority"
+            },
+            "runAsUser": {
+              "type": "string",
+              "enum": ["RunAsAny", "MustRunAsRange", "MustRunAs", "MustRunAsNonRoot"],
+              "description": "runAsUser strategy for the custom SCC"
+            },
+            "allowedCapabilities": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "requiredDropCapabilities": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "description": "OpenShift Route for the operator API/metrics (requires openshift.enabled)",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "host": { "type": "string" },
+        "targetPort": {
+          "type": "string",
+          "description": "Operator service port to expose (api or metrics)"
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "termination": {
+              "type": "string",
+              "enum": ["edge", "reencrypt", "passthrough"]
+            },
+            "insecureEdgeTerminationPolicy": {
+              "type": "string",
+              "enum": ["Redirect", "Allow", "None"]
+            }
+          }
+        },
+        "annotations": { "type": "object" }
+      }
+    },
     "backup": {
       "type": "object",
       "description": "Backup RBAC configuration for the cloudberry-backup-sa ServiceAccount",

@@ -142,6 +142,87 @@ func (s *Scenario51SecurityHeadersSuite) TestFunctional_Scenario51_AllHeaders_Un
 	s.assertSecurityHeaders(resp)
 }
 
+// TestFunctional_Scenario51_WWWAuthenticate_On401 verifies the RFC 7235 401
+// contract through the full server chain (T8/C3 hardening): every 401 carries
+// a WWW-Authenticate challenge advertising the configured scheme (Basic here)
+// and a GENERIC body that never discloses the concrete rejection reason or
+// provider configuration state. Successful responses carry no challenge.
+func (s *Scenario51SecurityHeadersSuite) TestFunctional_Scenario51_WWWAuthenticate_On401() {
+	ts, cleanup := s.setupServer()
+	defer cleanup()
+
+	const wantChallenge = `Basic realm="cloudberry"`
+
+	tests := []struct {
+		name     string
+		mutate   func(*http.Request)
+		wantBody string // generic message expected in the 401 envelope
+	}{
+		{
+			name:     "missing auth header",
+			mutate:   func(*http.Request) {},
+			wantBody: "authentication required",
+		},
+		{
+			name: "wrong password",
+			mutate: func(r *http.Request) {
+				r.SetBasicAuth("admin", "definitely-wrong")
+			},
+			wantBody: "authentication failed",
+		},
+		{
+			name: "bearer token with no OIDC configured",
+			mutate: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer some-token")
+			},
+			wantBody: "authentication required",
+		},
+		{
+			name: "unsupported auth scheme",
+			mutate: func(r *http.Request) {
+				r.Header.Set("Authorization", "Digest username=x")
+			},
+			wantBody: "authentication required",
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1alpha1/clusters", nil)
+			require.NoError(s.T(), err)
+			tc.mutate(req)
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(s.T(), err)
+			defer resp.Body.Close()
+
+			require.Equal(s.T(), http.StatusUnauthorized, resp.StatusCode)
+			assert.Equal(s.T(), wantChallenge, resp.Header.Get("WWW-Authenticate"),
+				"every 401 must carry the Basic challenge (only Basic is configured)")
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(s.T(), err)
+			assert.Contains(s.T(), string(body), tc.wantBody,
+				"401 body must be the generic message")
+			for _, leaked := range []string{"oidc", "missing Authorization", "unsupported"} {
+				assert.NotContains(s.T(), strings.ToLower(string(body)), strings.ToLower(leaked),
+					"401 body must not leak the concrete rejection reason")
+			}
+		})
+	}
+
+	// Negative: a successful authenticated response has no challenge header.
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1alpha1/clusters", nil)
+	require.NoError(s.T(), err)
+	req.SetBasicAuth("admin", "admin-secret")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(s.T(), err)
+	defer resp.Body.Close()
+	require.Equal(s.T(), http.StatusOK, resp.StatusCode)
+	assert.Empty(s.T(), resp.Header.Get("WWW-Authenticate"),
+		"successful responses must not carry a WWW-Authenticate challenge")
+}
+
 // TestFunctional_Scenario51_AllHeaders_ForbiddenResponse verifies that all 8
 // security headers are present on a 403 Forbidden response (viewer tries POST).
 func (s *Scenario51SecurityHeadersSuite) TestFunctional_Scenario51_AllHeaders_ForbiddenResponse() {

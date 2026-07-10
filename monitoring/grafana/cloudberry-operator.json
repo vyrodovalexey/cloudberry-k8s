@@ -1034,12 +1034,113 @@
       }
     },
     {
+      "id": 322,
+      "type": "timeseries",
+      "title": "Steady-State Refresh Errors",
+      "description": "Swallowed errors from admin controller steady-state refresh paths (backup/dataloading/storage). Non-zero indicates silent degradation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(cloudberry_steady_state_refresh_errors_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{cluster}}/{{component}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 323,
+      "type": "stat",
+      "title": "Steady-State Refresh Error Total",
+      "description": "Total steady-state refresh errors across all clusters and components.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(cloudberry_steady_state_refresh_errors_total{instance=~\"$instance\"}) by (component)",
+          "legendFormat": "{{component}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
       "id": 20,
       "type": "row",
       "title": "FTS & High Availability",
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 64,
         "w": 24,
         "h": 1
       },
@@ -1056,7 +1157,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 65,
         "w": 8,
         "h": 8
       },
@@ -1101,7 +1202,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 57,
+        "y": 65,
         "w": 8,
         "h": 8
       },
@@ -1151,7 +1252,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 57,
+        "y": 65,
         "w": 8,
         "h": 8
       },
@@ -1199,7 +1300,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 73,
+        "y": 81,
         "w": 12,
         "h": 8
       },
@@ -1247,7 +1348,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -1304,7 +1405,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 65,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -1345,7 +1446,7 @@
       "title": "Query Monitoring",
       "gridPos": {
         "x": 0,
-        "y": 81,
+        "y": 89,
         "w": 24,
         "h": 1
       },
@@ -1362,7 +1463,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 82,
+        "y": 90,
         "w": 8,
         "h": 8
       },
@@ -1406,7 +1507,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 82,
+        "y": 90,
         "w": 8,
         "h": 8
       },
@@ -1450,7 +1551,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 82,
+        "y": 90,
         "w": 8,
         "h": 8
       },
@@ -1601,7 +1702,7 @@
       "title": "Workload Management",
       "gridPos": {
         "x": 0,
-        "y": 122,
+        "y": 130,
         "w": 24,
         "h": 1
       },
@@ -1618,7 +1719,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 123,
+        "y": 131,
         "w": 8,
         "h": 8
       },
@@ -1663,7 +1764,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 123,
+        "y": 131,
         "w": 8,
         "h": 8
       },
@@ -1708,7 +1809,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 123,
+        "y": 131,
         "w": 8,
         "h": 8
       },
@@ -1753,7 +1854,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 131,
+        "y": 139,
         "w": 12,
         "h": 8
       },
@@ -1798,7 +1899,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 131,
+        "y": 139,
         "w": 12,
         "h": 8
       },
@@ -1839,7 +1940,7 @@
       "title": "Backup & Restore",
       "gridPos": {
         "x": 0,
-        "y": 139,
+        "y": 147,
         "w": 24,
         "h": 1
       },
@@ -1856,7 +1957,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 140,
+        "y": 148,
         "w": 8,
         "h": 8
       },
@@ -1901,7 +2002,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 140,
+        "y": 148,
         "w": 8,
         "h": 8
       },
@@ -2184,7 +2285,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 172,
+        "y": 180,
         "w": 12,
         "h": 8
       },
@@ -2235,7 +2336,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 156,
+        "y": 164,
         "w": 12,
         "h": 8
       },
@@ -2281,7 +2382,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 148,
+        "y": 156,
         "w": 8,
         "h": 8
       },
@@ -2345,7 +2446,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 148,
+        "y": 156,
         "w": 8,
         "h": 8
       },
@@ -2523,7 +2624,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 156,
+        "y": 164,
         "w": 12,
         "h": 8
       },
@@ -2735,7 +2836,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 234,
+        "y": 242,
         "w": 8,
         "h": 8
       },
@@ -2767,7 +2868,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 180,
+        "y": 188,
         "w": 24,
         "h": 1
       },
@@ -3634,7 +3735,7 @@
       "title": "Storage & Scaling",
       "gridPos": {
         "x": 0,
-        "y": 181,
+        "y": 189,
         "w": 24,
         "h": 1
       },
@@ -3651,7 +3752,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 182,
+        "y": 190,
         "w": 8,
         "h": 8
       },
@@ -3696,7 +3797,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 182,
+        "y": 190,
         "w": 8,
         "h": 8
       },
@@ -3741,7 +3842,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 182,
+        "y": 190,
         "w": 4,
         "h": 8
       },
@@ -3789,7 +3890,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 182,
+        "y": 190,
         "w": 4,
         "h": 8
       },
@@ -3836,7 +3937,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 190,
+        "y": 198,
         "w": 12,
         "h": 8
       },
@@ -3881,7 +3982,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 190,
+        "y": 198,
         "w": 12,
         "h": 8
       },
@@ -3927,7 +4028,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 198,
+        "y": 206,
         "w": 8,
         "h": 8
       },
@@ -3972,7 +4073,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 198,
+        "y": 206,
         "w": 8,
         "h": 8
       },
@@ -4028,7 +4129,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 198,
+        "y": 206,
         "w": 8,
         "h": 8
       },
@@ -4071,7 +4172,7 @@
       "title": "Maintenance & Mirroring Operations",
       "gridPos": {
         "x": 0,
-        "y": 206,
+        "y": 214,
         "w": 24,
         "h": 1
       },
@@ -4088,7 +4189,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 207,
+        "y": 215,
         "w": 12,
         "h": 8
       },
@@ -4133,7 +4234,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 207,
+        "y": 215,
         "w": 12,
         "h": 8
       },
@@ -4178,7 +4279,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 106,
+        "y": 114,
         "w": 6,
         "h": 8
       },
@@ -4225,7 +4326,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 106,
+        "y": 114,
         "w": 8,
         "h": 8
       },
@@ -4275,7 +4376,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 114,
+        "y": 122,
         "w": 6,
         "h": 8
       },
@@ -4322,7 +4423,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 114,
+        "y": 122,
         "w": 8,
         "h": 8
       },
@@ -4367,7 +4468,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 114,
+        "y": 122,
         "w": 6,
         "h": 8
       },
@@ -4420,7 +4521,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 90,
+        "y": 98,
         "w": 6,
         "h": 8
       },
@@ -4467,7 +4568,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 90,
+        "y": 98,
         "w": 12,
         "h": 8
       },
@@ -4517,7 +4618,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 98,
+        "y": 106,
         "w": 12,
         "h": 8
       },
@@ -4562,7 +4663,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 98,
+        "y": 106,
         "w": 6,
         "h": 8
       },
@@ -4617,7 +4718,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 98,
+        "y": 106,
         "w": 6,
         "h": 8
       },
@@ -4664,7 +4765,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 106,
+        "y": 114,
         "w": 6,
         "h": 8
       },
@@ -4831,7 +4932,7 @@
       "title": "Guest Access",
       "gridPos": {
         "x": 0,
-        "y": 215,
+        "y": 223,
         "w": 24,
         "h": 1
       },
@@ -4848,7 +4949,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 216,
+        "y": 224,
         "w": 6,
         "h": 8
       },
@@ -4895,7 +4996,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 216,
+        "y": 224,
         "w": 6,
         "h": 8
       },
@@ -4950,7 +5051,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 216,
+        "y": 224,
         "w": 12,
         "h": 8
       },
@@ -4990,7 +5091,7 @@
       "title": "Monitor Pause/Resume",
       "gridPos": {
         "x": 0,
-        "y": 224,
+        "y": 232,
         "w": 24,
         "h": 1
       },
@@ -5007,7 +5108,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 225,
+        "y": 233,
         "w": 6,
         "h": 8
       },
@@ -5063,7 +5164,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 225,
+        "y": 233,
         "w": 6,
         "h": 8
       },
@@ -5119,7 +5220,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 225,
+        "y": 233,
         "w": 12,
         "h": 8
       },
@@ -5164,7 +5265,7 @@
       "title": "Security & Lifecycle",
       "gridPos": {
         "x": 0,
-        "y": 233,
+        "y": 241,
         "w": 24,
         "h": 1
       },
@@ -5182,7 +5283,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 234,
+        "y": 242,
         "w": 8,
         "h": 8
       },
@@ -5228,7 +5329,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 234,
+        "y": 242,
         "w": 6,
         "h": 8
       },
@@ -5288,7 +5389,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 242,
+        "y": 250,
         "w": 8,
         "h": 8
       },
@@ -5334,7 +5435,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 242,
+        "y": 250,
         "w": 8,
         "h": 8
       },
@@ -5385,7 +5486,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 242,
+        "y": 250,
         "w": 8,
         "h": 8
       },
@@ -5431,7 +5532,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 250,
+        "y": 258,
         "w": 6,
         "h": 8
       },
@@ -5488,7 +5589,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 250,
+        "y": 258,
         "w": 6,
         "h": 8
       },
@@ -5541,7 +5642,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 250,
+        "y": 258,
         "w": 8,
         "h": 8
       },
@@ -5587,7 +5688,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 258,
+        "y": 266,
         "w": 8,
         "h": 8
       },
@@ -5633,7 +5734,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 258,
+        "y": 266,
         "w": 8,
         "h": 8
       },
@@ -5679,7 +5780,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 258,
+        "y": 266,
         "w": 8,
         "h": 8
       },
@@ -5725,7 +5826,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 266,
+        "y": 274,
         "w": 6,
         "h": 8
       },
@@ -5778,7 +5879,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 266,
+        "y": 274,
         "w": 6,
         "h": 8
       },
@@ -5830,7 +5931,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 266,
+        "y": 274,
         "w": 6,
         "h": 8
       },
@@ -5883,7 +5984,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 266,
+        "y": 274,
         "w": 6,
         "h": 8
       },
@@ -5940,7 +6041,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 274,
+        "y": 282,
         "w": 6,
         "h": 8
       },
@@ -5993,7 +6094,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 274,
+        "y": 282,
         "w": 6,
         "h": 8
       },
@@ -6046,7 +6147,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 274,
+        "y": 282,
         "w": 6,
         "h": 8
       },
@@ -6099,7 +6200,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 274,
+        "y": 282,
         "w": 6,
         "h": 8
       },
@@ -6148,7 +6249,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 282,
+        "y": 290,
         "w": 24,
         "h": 1
       },
@@ -6164,7 +6265,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 283,
+        "y": 291,
         "w": 12,
         "h": 8
       },
@@ -6209,7 +6310,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 283,
+        "y": 291,
         "w": 12,
         "h": 8
       },
@@ -6259,7 +6360,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 291,
+        "y": 299,
         "w": 8,
         "h": 8
       },
@@ -6304,7 +6405,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 291,
+        "y": 299,
         "w": 8,
         "h": 8
       },
@@ -6350,7 +6451,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 299,
+        "y": 307,
         "w": 24,
         "h": 8
       },
@@ -6405,6 +6506,107 @@
       }
     },
     {
+      "id": 324,
+      "type": "timeseries",
+      "title": "API Rate Limit Entries",
+      "description": "Current number of tracked per-client API rate limiter entries. High values may indicate many unique clients or a leak.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 355,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "cloudberry_api_rate_limit_entries{instance=~\"$instance\"}",
+          "legendFormat": "entries",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 325,
+      "type": "stat",
+      "title": "Rate Limit Entries (Current)",
+      "description": "Current number of tracked per-client rate limiter entries.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 355,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "cloudberry_api_rate_limit_entries{instance=~\"$instance\"}",
+          "legendFormat": "entries",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
       "id": 321,
       "type": "timeseries",
       "title": "Storage API Requests (P.1\u2013P.6)",
@@ -6415,7 +6617,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 348,
+        "y": 364,
         "w": 24,
         "h": 8
       },
@@ -6480,7 +6682,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 356,
+        "y": 372,
         "w": 24,
         "h": 8
       },
@@ -6528,7 +6730,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 307,
+        "y": 315,
         "w": 8,
         "h": 8
       },
@@ -6575,7 +6777,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 347,
+        "y": 363,
         "w": 24,
         "h": 1
       },
@@ -6591,7 +6793,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 364,
+        "y": 380,
         "w": 8,
         "h": 8
       },
@@ -6636,7 +6838,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 364,
+        "y": 380,
         "w": 8,
         "h": 8
       },
@@ -6686,7 +6888,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 364,
+        "y": 380,
         "w": 8,
         "h": 8
       },
@@ -6731,7 +6933,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 372,
+        "y": 388,
         "w": 12,
         "h": 8
       },
@@ -6786,7 +6988,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 372,
+        "y": 388,
         "w": 12,
         "h": 8
       },
@@ -6830,7 +7032,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 380,
+        "y": 396,
         "w": 24,
         "h": 1
       },
@@ -6846,7 +7048,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 381,
+        "y": 397,
         "w": 6,
         "h": 8
       },
@@ -6893,7 +7095,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 381,
+        "y": 397,
         "w": 6,
         "h": 8
       },
@@ -6938,7 +7140,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 381,
+        "y": 397,
         "w": 6,
         "h": 8
       },
@@ -6983,7 +7185,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 381,
+        "y": 397,
         "w": 6,
         "h": 8
       },
@@ -7028,7 +7230,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 307,
+        "y": 315,
         "w": 8,
         "h": 8
       },
@@ -7073,7 +7275,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 307,
+        "y": 315,
         "w": 8,
         "h": 8
       },
@@ -7118,7 +7320,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 315,
+        "y": 323,
         "w": 8,
         "h": 8
       },
@@ -7163,7 +7365,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 315,
+        "y": 323,
         "w": 8,
         "h": 8
       },
@@ -7208,7 +7410,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 315,
+        "y": 323,
         "w": 8,
         "h": 8
       },
@@ -7253,7 +7455,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 323,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -7295,7 +7497,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 389,
+        "y": 405,
         "w": 24,
         "h": 1
       },
@@ -7311,7 +7513,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 390,
+        "y": 406,
         "w": 12,
         "h": 8
       },
@@ -7356,7 +7558,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 390,
+        "y": 406,
         "w": 12,
         "h": 8
       },
@@ -7402,7 +7604,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 323,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -7464,7 +7666,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 323,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -7526,7 +7728,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 331,
+        "y": 339,
         "w": 8,
         "h": 8
       },
@@ -7588,7 +7790,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 331,
+        "y": 339,
         "w": 6,
         "h": 8
       },
@@ -7637,7 +7839,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 331,
+        "y": 339,
         "w": 6,
         "h": 8
       },
@@ -7686,7 +7888,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 339,
+        "y": 347,
         "w": 6,
         "h": 8
       },
@@ -7735,7 +7937,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 339,
+        "y": 347,
         "w": 12,
         "h": 8
       },
@@ -7776,7 +7978,7 @@
       "title": "gpfdist, PXF Extension, Data-Loader & Exporter Role Setup",
       "gridPos": {
         "x": 0,
-        "y": 398,
+        "y": 414,
         "w": 24,
         "h": 1
       },
@@ -7794,7 +7996,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 399,
+        "y": 415,
         "w": 12,
         "h": 8
       },
@@ -7966,7 +8168,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 407,
+        "y": 423,
         "w": 12,
         "h": 8
       },
@@ -8168,7 +8370,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 415,
+        "y": 431,
         "w": 12,
         "h": 8
       },
@@ -8355,7 +8557,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 423,
+        "y": 439,
         "w": 12,
         "h": 8
       },
@@ -8541,7 +8743,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 431,
+        "y": 447,
         "w": 8,
         "h": 8
       },
@@ -8586,7 +8788,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 431,
+        "y": 447,
         "w": 6,
         "h": 8
       },
@@ -8639,7 +8841,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 431,
+        "y": 447,
         "w": 8,
         "h": 8
       },
@@ -8684,7 +8886,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 439,
+        "y": 455,
         "w": 8,
         "h": 8
       },
@@ -8844,7 +9046,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 148,
+        "y": 156,
         "w": 8,
         "h": 8
       },
@@ -8917,7 +9119,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 140,
+        "y": 148,
         "w": 8,
         "h": 8
       },
@@ -8979,7 +9181,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 164,
+        "y": 172,
         "w": 12,
         "h": 8
       },
@@ -9056,7 +9258,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 164,
+        "y": 172,
         "w": 12,
         "h": 8
       },
@@ -9133,7 +9335,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 172,
+        "y": 180,
         "w": 12,
         "h": 8
       },

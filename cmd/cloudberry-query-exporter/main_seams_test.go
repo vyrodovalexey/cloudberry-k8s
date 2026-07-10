@@ -357,7 +357,7 @@ func TestCollectLoop_CleanupTickRunsRetentionCleanup(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{
 		dsn:              "host=x",
 		samplingInterval: time.Hour, // never fires during the test
@@ -367,10 +367,7 @@ func TestCollectLoop_CleanupTickRunsRetentionCleanup(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() {
-		collectLoop(ctx, cfg, conn, m, testLogger(), hc)
-		close(done)
-	}()
+	go collectLoop(ctx, cfg, conn, m, testLogger(), hc, done)
 
 	require.Eventually(t, func() bool {
 		mu.Lock()
@@ -392,7 +389,7 @@ func TestCollectLoop_ZeroCleanupIntervalDefaults(t *testing.T) {
 	// than panic in time.NewTicker.
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{
 		dsn:              "",
 		samplingInterval: time.Millisecond,
@@ -402,10 +399,7 @@ func TestCollectLoop_ZeroCleanupIntervalDefaults(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() {
-		collectLoop(ctx, cfg, nil, m, testLogger(), hc)
-		close(done)
-	}()
+	go collectLoop(ctx, cfg, nil, m, testLogger(), hc, done)
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 	select {

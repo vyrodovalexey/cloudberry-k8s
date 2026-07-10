@@ -22,6 +22,17 @@ const (
 
 	// authTracerName is the tracer name for authentication spans.
 	authTracerName = "auth"
+
+	// headerWWWAuthenticate is the RFC 7235 challenge header set on every 401.
+	headerWWWAuthenticate = "WWW-Authenticate"
+	// challengeBasic / challengeBearer advertise the configured scheme(s) in
+	// the WWW-Authenticate challenge.
+	challengeBasic  = `Basic realm="cloudberry"`
+	challengeBearer = "Bearer"
+	// msgAuthRequired is the GENERIC 401 body (C3): the concrete reason
+	// (missing header, unknown scheme, unconfigured provider) is logged and
+	// attached to the span, never disclosed to the client.
+	msgAuthRequired = "authentication required"
 )
 
 // Middleware is an HTTP middleware function.
@@ -69,6 +80,8 @@ func (m *AuthMiddleware) Handler() Middleware {
 				// The Authorization header is missing, malformed, or uses an
 				// unsupported/unconfigured scheme. Record it as a failed attempt
 				// with an "unknown" method since no provider could be selected.
+				// The concrete reason goes to the log/span only — the client
+				// receives the generic body (no config-state disclosure, C3).
 				if m.recorder != nil {
 					m.recorder.RecordAuthAttempt("unknown", "failure")
 				}
@@ -77,7 +90,9 @@ func (m *AuthMiddleware) Handler() Middleware {
 					attribute.String("auth.result", "failure"),
 				)
 				telemetry.SetSpanError(span, err)
-				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error())
+				m.logger.Warn("authentication rejected: no provider resolved",
+					"error", err, "remote_addr", r.RemoteAddr)
+				m.writeUnauthorized(w, msgAuthRequired)
 				return
 			}
 			span.SetAttributes(attribute.String("auth.method", method))
@@ -87,7 +102,7 @@ func (m *AuthMiddleware) Handler() Middleware {
 				m.recordFailure(method, authErr, r.RemoteAddr)
 				span.SetAttributes(attribute.String("auth.result", "failure"))
 				telemetry.SetSpanError(span, authErr)
-				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication failed")
+				m.writeUnauthorized(w, "authentication failed")
 				return
 			}
 
@@ -99,6 +114,32 @@ func (m *AuthMiddleware) Handler() Middleware {
 			next.ServeHTTP(w, r.WithContext(ContextWithIdentity(ctx, identity)))
 		})
 	}
+}
+
+// challengeValue returns the WWW-Authenticate value advertising the
+// configured authentication scheme(s): Basic when a basic provider is wired,
+// Bearer when an OIDC provider is wired, comma-joined when both. With no
+// provider configured it still returns the Basic challenge so every 401
+// carries a syntactically valid RFC 7235 challenge.
+func (m *AuthMiddleware) challengeValue() string {
+	schemes := make([]string, 0, 2)
+	if m.basicProvider != nil {
+		schemes = append(schemes, challengeBasic)
+	}
+	if m.oidcProvider != nil {
+		schemes = append(schemes, challengeBearer)
+	}
+	if len(schemes) == 0 {
+		return challengeBasic
+	}
+	return strings.Join(schemes, ", ")
+}
+
+// writeUnauthorized writes a 401 response with the WWW-Authenticate challenge
+// header and the given (generic) message.
+func (m *AuthMiddleware) writeUnauthorized(w http.ResponseWriter, message string) {
+	w.Header().Set(headerWWWAuthenticate, m.challengeValue())
+	writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", message)
 }
 
 // resolveProvider determines the auth provider based on the Authorization header.
@@ -156,16 +197,16 @@ func (m *AuthMiddleware) GuestHandler(guestAccessEnabled func(r *http.Request) b
 				return
 			}
 
-			// No auth header — check if guest access is allowed.
+			// No auth header — check if guest access is allowed. The generic
+			// body + WWW-Authenticate challenge mirror the Handler 401s (C3).
 			if !guestAccessEnabled(r) {
-				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing Authorization header")
+				m.writeUnauthorized(w, msgAuthRequired)
 				return
 			}
 
 			// Guest access only for read-only methods (GET, HEAD, OPTIONS).
 			if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-				writeErrorResponse(w, http.StatusUnauthorized, "UNAUTHORIZED",
-					"authentication required for write operations")
+				m.writeUnauthorized(w, "authentication required for write operations")
 				return
 			}
 

@@ -2127,6 +2127,12 @@ func applyJobTemplatePod(cluster *cbv1alpha1.CloudberryCluster, podSpec *corev1.
 	}
 	podSpec.ServiceAccountName = sa
 
+	// Additively merge the coordinator anti-affinity term (when enabled) onto the
+	// Job pod. This is independent of jobTemplate so it applies even when the
+	// jobTemplate is nil, and it never overwrites jobTemplate NodeSelector/
+	// Tolerations set below.
+	podSpec.Affinity = buildBackupAntiAffinity(cluster, podSpec.Affinity)
+
 	if tmpl == nil {
 		return
 	}

@@ -1,0 +1,131 @@
+{{- if .Values.openshift.enabled }}
+# =============================================================================
+# OpenShift / OKD4 SecurityContextConstraints wiring
+# =============================================================================
+# 1. Operator pod  → bound to a built-in SCC (restricted-v2 / nonroot-v2) via a
+#    namespaced RoleBinding. The operator runs non-root / read-only so no custom
+#    SCC is required for it.
+# 2. Cluster pods  → a SCOPED, minimal custom SCC bound ONLY to the cluster
+#    workload ServiceAccount. This is strictly narrower than the built-in
+#    `anyuid` SCC (limited caps, no host access, single-SA binding). The custom
+#    SCC is a pre-install/pre-upgrade hook so it exists before cluster pods are
+#    admitted.
+# =============================================================================
+---
+# --- Operator SA → built-in restricted-v2 / nonroot-v2 SCC -------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cloudberry-operator.fullname" . }}-operator-scc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:{{ .Values.openshift.operatorSCC }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cloudberry-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.openshift.createClusterSCC }}
+---
+# --- Minimal custom SCC for the CloudberryCluster workload (NOT anyuid) -------
+# Permits ONLY what the Cloudberry DB pods need: UID 0 (init-container chown) +
+# UID 1000 (gpadmin DB container) via RunAsAny, and the file-ownership caps the
+# chown init container uses. NO host namespaces, NO privileged container.
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "cloudberry-operator.clusterSCCName" . }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: >-
+      Scoped minimal SCC for the CloudberryCluster workload pods. Allows the
+      gpadmin DB container (UID 1000) and root init-container chown (UID 0) with
+      only file-ownership capabilities. Bound to a single ServiceAccount; NOT a
+      substitute for the broad anyuid SCC.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+# No privilege escalation beyond the allowed chown capabilities.
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+# No host namespaces / host access.
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: false
+allowedCapabilities:
+  {{- toYaml .Values.openshift.scc.allowedCapabilities | nindent 2 }}
+requiredDropCapabilities:
+  {{- toYaml .Values.openshift.scc.requiredDropCapabilities | nindent 2 }}
+runAsUser:
+  type: {{ .Values.openshift.scc.runAsUser }}
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+{{- if .Values.openshift.scc.priority }}
+priority: {{ .Values.openshift.scc.priority }}
+{{- end }}
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret
+# Bound ONLY to the cluster workload ServiceAccount in the release namespace.
+users:
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ include "cloudberry-operator.clusterServiceAccountName" . }}
+groups: []
+---
+# --- ClusterRole granting `use` of the custom SCC ----------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cloudberry-operator.clusterSCCName" . }}-use
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resources:
+      - securitycontextconstraints
+    resourceNames:
+      - {{ include "cloudberry-operator.clusterSCCName" . }}
+    verbs:
+      - use
+---
+# --- RoleBinding granting the cluster SA `use` of the custom SCC --------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cloudberry-operator.clusterSCCName" . }}-use
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudberry-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cloudberry-operator.clusterSCCName" . }}-use
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cloudberry-operator.clusterServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

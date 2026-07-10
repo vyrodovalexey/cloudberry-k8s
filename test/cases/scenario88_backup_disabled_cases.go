@@ -4,7 +4,7 @@ package cases
 // Scenario 88 — Backup Disabled / No Schedule: catalog
 // ============================================================================
 //
-// This catalog enumerates the per-sub-case test cases (88a-1..88a-7, 88b-1..88b-5)
+// This catalog enumerates the per-sub-case test cases (88a-1..88a-9, 88b-1..88b-5)
 // for the already-implemented "backup disabled / no schedule" behavior. It is
 // shared by the Scenario 88 functional/integration/e2e suites and documents the
 // cluster precondition (backup enabled/disabled, schedule), the operator REST
@@ -27,6 +27,9 @@ package cases
 //       * handleCreateBackup => 400 BACKUP_NOT_ENABLED when Spec.Backup == nil ||
 //         !Enabled; otherwise (EVEN WITH AN EMPTY SCHEDULE) builds + creates an
 //         on-demand backup Job and returns 202.
+//       * handleRestoreBackup / handleDeleteBackup share the SAME
+//         requireBackupEnabled gate (D-B6 hardening): 400 BACKUP_NOT_ENABLED
+//         and NO Job when Spec.Backup == nil || !Enabled (88a-8 / 88a-9).
 //       * handleListBackups => 200 with {cluster, enabled, backups, total,
 //         lastBackup*}; "enabled" reflects backupEnabled(cluster).
 //       * handleGetBackupSchedule => 200 {cluster, scheduled:false, enabled} when
@@ -170,6 +173,33 @@ var Scenario88BackupDisabledCases = []BackupDisabledCase{
 			"CronJobName), setting Enabled=true AND Schedule=\"0 2 * * *\" and " +
 			"reconciling again recreates the CronJob with that schedule and sets " +
 			"Status.CronJobName == util.BackupCronJobName(name).",
+	},
+	{
+		ID:           "88a-8",
+		Layer:        "api",
+		Enabled:      false,
+		Method:       "POST",
+		PathSuffix:   "/backups/{ts}/restore",
+		ExpectStatus: 400,
+		ExpectCode:   "BACKUP_NOT_ENABLED",
+		Description: "POST /clusters/{name}/backups/{ts}/restore on a disabled OR " +
+			"nil-backup-spec cluster => 400 BACKUP_NOT_ENABLED (D-B6 gate " +
+			"hardening): NO restore Job is created and RecordRestore(\"failed\") " +
+			"is NOT emitted (a validation reject is a client error, not a restore " +
+			"outcome).",
+	},
+	{
+		ID:           "88a-9",
+		Layer:        "api",
+		Enabled:      false,
+		Method:       "DELETE",
+		PathSuffix:   "/backups/{ts}",
+		ExpectStatus: 400,
+		ExpectCode:   "BACKUP_NOT_ENABLED",
+		Description: "DELETE /clusters/{name}/backups/{ts} on a disabled OR " +
+			"nil-backup-spec cluster => 400 BACKUP_NOT_ENABLED (D-B6 gate " +
+			"hardening): NO retention/cleanup Job is ever created for a cluster " +
+			"whose backup destination/credentials are unconfigured.",
 	},
 
 	// ----- 88b — enabled = true, schedule = "" -----

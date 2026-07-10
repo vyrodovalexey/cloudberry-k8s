@@ -331,6 +331,27 @@ wait_for_reconcile() {
   return 1
 }
 
+# wait_for_cronjob_name <expected>: poll (bounded) until .status.cronJobName
+# equals the expected value ("" for cleared). status.cronJobName is an
+# EVENTUALLY-CONSISTENT field: it is written by the admin controller's status
+# patch, which can momentarily lose to a concurrent stale full-status patch
+# from the cluster controller when a spec change wakes both; the admin
+# controller's periodic requeue (default 30s) rewrites it truthfully. A single
+# unretried read therefore flakes by design — poll to the SAME final
+# expectation within a bounded budget instead (never weakens the assertion).
+wait_for_cronjob_name() {
+  local expected="$1" attempt=0 cjn=""
+  while [ "${attempt}" -lt 40 ]; do
+    attempt=$(( attempt + 1 ))
+    cjn="$(status_cronjob_name)"
+    if [ "${cjn}" = "${expected}" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 # latest_job_by_label <operation> <cluster>: NEWEST Job by labels (guarded).
 latest_job_by_label() {
   local op="$1" cluster="$2"
@@ -533,13 +554,11 @@ run_88a_disable() {
     log_info "88a-disable: no CronJob ${CRON_NAME} OK"
   fi
 
-  local cjn
-  cjn="$(status_cronjob_name)"
-  if [ -n "${cjn}" ]; then
-    log_warn "88a-disable: Status.cronJobName non-empty ('${cjn}'); expected empty"
-    ASSERT_FAIL=1
-  else
+  if wait_for_cronjob_name ""; then
     log_info "88a-disable: Status.cronJobName empty OK"
+  else
+    log_warn "88a-disable: Status.cronJobName non-empty ('$(status_cronjob_name)'); expected empty"
+    ASSERT_FAIL=1
   fi
 
   if [ "${ASSERT_FAIL}" -eq 0 ]; then set_result 88a-disable PASS; else set_result 88a-disable FAIL; fi
@@ -627,12 +646,10 @@ run_88a_reenable() {
     ASSERT_FAIL=1
   fi
 
-  local cjn
-  cjn="$(status_cronjob_name)"
-  if [ "${cjn}" = "${CRON_NAME}" ]; then
+  if wait_for_cronjob_name "${CRON_NAME}"; then
     log_info "88a-reenable: Status.cronJobName == ${CRON_NAME} OK"
   else
-    log_warn "88a-reenable: Status.cronJobName='${cjn}' (expected '${CRON_NAME}')"
+    log_warn "88a-reenable: Status.cronJobName='$(status_cronjob_name)' (expected '${CRON_NAME}')"
     ASSERT_FAIL=1
   fi
 
@@ -669,13 +686,11 @@ run_88b_empty() {
     log_info "88b-empty: no CronJob ${CRON_NAME} OK"
   fi
 
-  local cjn
-  cjn="$(status_cronjob_name)"
-  if [ -n "${cjn}" ]; then
-    log_warn "88b-empty: Status.cronJobName non-empty ('${cjn}'); expected empty"
-    ASSERT_FAIL=1
-  else
+  if wait_for_cronjob_name ""; then
     log_info "88b-empty: Status.cronJobName empty OK"
+  else
+    log_warn "88b-empty: Status.cronJobName non-empty ('$(status_cronjob_name)'); expected empty"
+    ASSERT_FAIL=1
   fi
 
   if [ "${ASSERT_FAIL}" -eq 0 ]; then set_result 88b-empty PASS; else set_result 88b-empty FAIL; fi

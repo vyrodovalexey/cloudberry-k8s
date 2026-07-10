@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -215,8 +216,51 @@ func validateCluster(cluster *cbv1alpha1.CloudberryCluster) (admission.Warnings,
 	if err := validateStorageManagement(cluster); err != nil {
 		return warnings, err
 	}
+	if err := validateAffinity(cluster, &warnings); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
+}
+
+// validateAffinity validates the optional cross-role anti-affinity block. It is
+// a no-op when spec.affinity is nil. It performs belt-and-suspenders enum checks
+// (the CRD also enforces them) and emits a NON-FATAL admission Warning when a
+// required type is requested together with a segment-mirror/full mode, because
+// the segment primary<->mirror separation is always applied as best-effort.
+func validateAffinity(cluster *cbv1alpha1.CloudberryCluster, warnings *admission.Warnings) error {
+	aff := cluster.Spec.Affinity
+	if aff == nil {
+		return nil
+	}
+
+	switch aff.Mode {
+	case "",
+		cbv1alpha1.ClusterAntiAffinityModeSegmentMirror,
+		cbv1alpha1.ClusterAntiAffinityModeFull:
+		// valid
+	default:
+		return fmt.Errorf(
+			"affinity.mode must be segment-mirror or full, got %s", aff.Mode)
+	}
+
+	switch aff.Type {
+	case "", cbv1alpha1.AntiAffinityPreferred, cbv1alpha1.AntiAffinityRequired:
+		// valid
+	default:
+		return fmt.Errorf(
+			"affinity.type must be preferred or required, got %s", aff.Type)
+	}
+
+	segmentModeActive := aff.Mode == cbv1alpha1.ClusterAntiAffinityModeSegmentMirror ||
+		aff.Mode == cbv1alpha1.ClusterAntiAffinityModeFull
+	if aff.Type == cbv1alpha1.AntiAffinityRequired && segmentModeActive {
+		*warnings = append(*warnings,
+			"affinity.type=required: segment primary\u2194mirror separation is applied "+
+				"as best-effort (preferred); per-content required separation is not "+
+				"supported. Coordinator\u2194backup and coordinator\u2194standby terms honor required.")
+	}
+	return nil
 }
 
 // validateSegments validates segment configuration.
@@ -281,6 +325,31 @@ func validateStorage(cluster *cbv1alpha1.CloudberryCluster) error {
 	return nil
 }
 
+// tablespacePattern restricts io-limit tablespace targets to SQL identifier
+// characters or the "*" wildcard. The value is embedded in the rendered
+// io_limit DDL string (ALTER RESOURCE GROUP ... SET io_limit), so free-form
+// text is an SQL-injection surface (C1b); the same pattern is enforced by the
+// CRD marker on TablespaceIOLimitSpec.Tablespace as defense-in-depth.
+var tablespacePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$|^\*$`)
+
+// validateResourceGroupIOLimits validates the io-limit entries of one
+// resource group with field-indexed error messages (house style).
+func validateResourceGroupIOLimits(rgIndex int, ioLimits []cbv1alpha1.TablespaceIOLimitSpec) error {
+	for j, ioLimit := range ioLimits {
+		if ioLimit.Tablespace == "" {
+			return fmt.Errorf(
+				"workload.resourceGroups[%d].ioLimits[%d].tablespace is required", rgIndex, j)
+		}
+		if !tablespacePattern.MatchString(ioLimit.Tablespace) {
+			return fmt.Errorf(
+				"workload.resourceGroups[%d].ioLimits[%d].tablespace %q is invalid: "+
+					"must be a SQL identifier ([A-Za-z_][A-Za-z0-9_]*) or \"*\"",
+				rgIndex, j, ioLimit.Tablespace)
+		}
+	}
+	return nil
+}
+
 // validateWorkload validates workload management configuration.
 func validateWorkload(cluster *cbv1alpha1.CloudberryCluster) error {
 	if cluster.Spec.Workload == nil || !cluster.Spec.Workload.Enabled {
@@ -290,6 +359,9 @@ func validateWorkload(cluster *cbv1alpha1.CloudberryCluster) error {
 	for i, rg := range cluster.Spec.Workload.ResourceGroups {
 		if rg.Name == "" {
 			return fmt.Errorf("workload.resourceGroups[%d].name is required", i)
+		}
+		if err := validateResourceGroupIOLimits(i, rg.IOLimits); err != nil {
+			return err
 		}
 	}
 

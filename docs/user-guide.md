@@ -2,6 +2,14 @@
 
 This guide covers day-to-day operations for managing Cloudberry Database clusters with the Cloudberry Operator.
 
+> **Deployment targets**: the operator runs on any conformant Kubernetes
+> distribution, and also supports **OKD4 / OpenShift** as a first-class target via
+> the chart's `openshift.enabled` flag. For an end-to-end OKD4 walkthrough (scoped
+> SCC, Vault-PKI TLS, PXF, MinIO backups, and a verified nine-step scenario), see
+> the [OKD4 / OpenShift Sample](okd4_sample.md) and the
+> [OKD4 / OpenShift section](installation.md#okd4--openshift) of the installation
+> guide.
+
 ## Table of Contents
 
 - [Creating a CloudberryCluster](#creating-a-cloudberrycluster)
@@ -82,6 +90,15 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
     - [Implications of Disabling Mirroring](#implications-of-disabling-mirroring)
     - [Disabling Mirroring](#disabling-mirroring)
     - [PVC Cleanup Behavior](#pvc-cleanup-behavior)
+  - [Pod Anti-Affinity / Scheduling](#pod-anti-affinity--scheduling)
+    - [Modes](#modes)
+    - [Mode: segment-mirror](#mode-segment-mirror)
+    - [Mode: full](#mode-full)
+    - [Per-Field Toggles](#per-field-toggles)
+    - [preferred vs required (honesty note)](#preferred-vs-required-honesty-note)
+    - [Node-Count Implications](#node-count-implications)
+    - [Standby Tolerations](#standby-tolerations)
+    - [Additive Merge with User Affinity](#additive-merge-with-user-affinity)
 - [Maintenance Operations](#maintenance-operations)
   - [Maintenance Jobs](#maintenance-jobs)
   - [Maintenance Annotations](#maintenance-annotations)
@@ -709,6 +726,8 @@ kubectl delete cloudberrycluster my-cluster -n cloudberry-test
 
 When you delete a `CloudberryCluster`, the operator's finalizer intercepts the deletion and performs cleanup before the resource is removed. The cluster phase transitions from its current state to `Deleting` during this process.
 
+Deletion is handled **before** the action-annotation, lifecycle-phase, and generation gates in the reconciler, so it works from **every** phase — a cluster in `Stopped`, `Restricted`, or `Maintenance` deletes cleanly (finalizer removed) instead of getting stuck in `Terminating`.
+
 #### Deletion Policy
 
 The `deletionPolicy` field controls what happens to PVCs when the cluster is deleted:
@@ -1051,7 +1070,7 @@ The live data cycle is driven by `test/e2e/scripts/scenario76-scheduled-backup.s
 
 You can turn scheduled backups off in two ways:
 
-- **Disable backup entirely** — set `backup.enabled: false`. The operator **removes** the per-cluster CronJob `{cluster}-backup-schedule` and **clears** `status.cronJobName`. The API then reports the disabled state: `GET /clusters/{name}/backups` returns `"enabled": false`, `GET /clusters/{name}/backups/schedule` returns `{ enabled:false, scheduled:false }`, and `POST /clusters/{name}/backups` (or `cloudberry-ctl backup create`) is rejected with `400 BACKUP_NOT_ENABLED`. This cleanup runs on **both** the spec-driven reconcile and the steady-state periodic reconcile, so it converges to `cronJobName: ""` even after the cluster settles. Re-enabling (`enabled: true` **plus** a valid `schedule`) recreates the CronJob and re-sets `status.cronJobName`.
+- **Disable backup entirely** — set `backup.enabled: false`. The operator **removes** the per-cluster CronJob `{cluster}-backup-schedule` and **clears** `status.cronJobName`. The API then reports the disabled state: `GET /clusters/{name}/backups` returns `"enabled": false`, `GET /clusters/{name}/backups/schedule` returns `{ enabled:false, scheduled:false }`, and `POST /clusters/{name}/backups` (or `cloudberry-ctl backup create`) is rejected with `400 BACKUP_NOT_ENABLED` — as are `DELETE /clusters/{name}/backups/{timestamp}` and `POST /clusters/{name}/backups/{timestamp}/restore`, so no backup, cleanup, or restore Job is ever created for an unconfigured destination. This cleanup runs on **both** the spec-driven reconcile and the steady-state periodic reconcile, so it converges to `cronJobName: ""` even after the cluster settles. Re-enabling (`enabled: true` **plus** a valid `schedule`) recreates the CronJob and re-sets `status.cronJobName`.
 
   ```bash
   kubectl patch cloudberrycluster mycluster --type=merge -p '{"spec":{"backup":{"enabled":false}}}'
@@ -1303,7 +1322,7 @@ Set any combination of the three policies on the backup spec:
 spec:
   backup:
     enabled: true
-    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.1.0"   # must include gpbackman (ships v0.8.1)
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"   # must include gpbackman (ships v0.8.1)
     retention:
       fullCount: 3            # keep the newest 3 FULL backups
       incrementalCount: 10    # keep the newest 10 INCREMENTAL backups
@@ -1572,7 +1591,7 @@ Set `destination.type: local` with the path and PVC under `destination.local`:
 spec:
   backup:
     enabled: true
-    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.1.0"
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"
     destination:
       type: local
       local:
@@ -1997,6 +2016,13 @@ level (Basic / Operator / Admin).
 > history** (`status.backup.backupHistory`, derived from the backup Jobs the operator has
 > observed) — not a live query against the backup tooling.
 
+> **Backup-enabled gate.** `POST /backups`, `DELETE /backups/{timestamp}`, and
+> `POST /backups/{timestamp}/restore` all require `spec.backup.enabled: true` and
+> return `400 BACKUP_NOT_ENABLED` otherwise, so no backup, cleanup, or restore Job
+> is ever created for a cluster without a configured destination/credentials. The
+> restore reject is a validation error, not a restore outcome —
+> `cloudberry_restore_total{result="failed"}` is not incremented.
+
 #### Authenticate (OIDC bearer token)
 
 Obtain a token from Keycloak (the `POST`/`DELETE`/restore endpoints need an **Admin**- or
@@ -2418,6 +2444,15 @@ The following parameters require a server restart:
 | `ssl` | SSL/TLS mode |
 
 All other parameters are reload-safe and do not require a restart.
+
+> **Known gap — `gp_interconnect_type`.** The interconnect type is
+> postmaster-scoped in Cloudberry but is **not** in the operator's
+> `restartRequiredParams` map, so a live edit is classified reload-safe: the
+> ConfigMap is updated but the setting only takes effect after the pods
+> restart. Trigger a rolling restart manually after changing it on a running
+> cluster. (Set in the CR before first start — as the acceptance sample does
+> with `gp_interconnect_type: tcp` for kind/Docker Desktop, where UDP between
+> pod sandboxes is unreliable — it is in effect from the first pod start.)
 
 ### Rolling Restart Behavior
 
@@ -2854,7 +2889,7 @@ The operator supports running both Basic and OIDC authentication simultaneously.
 | *(missing)* | — (rejected) | — |
 | Other (e.g., `Digest`) | — (rejected) | — |
 
-Requests without a recognized `Authorization` header receive a `401 Unauthorized` response in JSON format.
+Requests without a recognized `Authorization` header receive a `401 Unauthorized` response in JSON format. The 401 body is deliberately **generic** (`{"error":{"code":"UNAUTHORIZED","message":"authentication required"}}` for missing/unrecognized headers, `"authentication failed"` for bad credentials) and every 401 carries an RFC 7235 `WWW-Authenticate` challenge advertising only the configured scheme(s) — `Basic realm="cloudberry"`, `Bearer`, or both, comma-joined. The concrete failure reason (missing header, unsupported scheme, unconfigured provider) is logged and attached to the trace span, never disclosed to the client.
 
 **Enabling dual-mode auth**: Set both `auth.basic.enabled: true` and `auth.oidc.enabled: true` in the cluster spec:
 
@@ -4047,6 +4082,179 @@ spec:
     checksums: true        # storage-layer checksums
 ```
 
+### Pod Anti-Affinity / Scheduling
+
+The optional `spec.affinity` block configures **cross-role pod anti-affinity** so
+that the coordinator, standby, segment primaries, segment mirrors, and the backup
+Job can be spread onto distinct nodes for stronger fault isolation.
+
+`spec.affinity` is **opt-in**. When you omit it, scheduling behavior is
+**unchanged**: segment primaries and their mirrors already run under a **preferred**
+cross-component anti-affinity by default, and the coordinator, standby, and backup
+pods carry no operator-generated anti-affinity. This block is separate from
+`spec.segments.antiAffinity` (which controls the same-role segment term's
+`preferred`/`required` placement and is unaffected).
+
+#### Modes
+
+`mode` is a convenience preset that materializes the per-field toggles:
+
+| Mode | Terms enabled |
+|------|---------------|
+| *(unset)* | None added — only the default segment primary↔mirror preferred term applies |
+| `segment-mirror` | Segment primary↔mirror (best-effort/preferred) |
+| `full` | Segment primary↔mirror **+** standby↔coordinator **+** backup Job↔coordinator |
+
+#### Mode: segment-mirror
+
+Keeps each segment primary off its mirror's node. Because the segment term already
+ships by default, naming it here mainly documents intent and pins the `topologyKey`.
+The separation is **best-effort (preferred)** — see the honesty note below.
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-segment-mirror
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  affinity:
+    mode: segment-mirror
+    type: preferred
+    topologyKey: kubernetes.io/hostname
+```
+
+#### Mode: full
+
+Composes all three cross-role terms. With `type: required`, the coordinator↔standby
+and coordinator↔backup terms become **hard** (each targets the single coordinator
+pod, so `required` is safe). The segment primary↔mirror term stays **preferred**
+regardless, and the webhook emits a non-fatal Warning explaining this. The example
+also shows `standby.tolerations`, which flow through to the standby pod.
+
+```yaml
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: cloudberry-affinity-full
+  namespace: cloudberry-test
+spec:
+  coordinator:
+    storage:
+      size: "5Gi"
+  standby:
+    enabled: true
+    storage:
+      size: "5Gi"
+    tolerations:
+      - key: "cloudberry.io/standby"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+  segments:
+    count: 2
+    primariesPerHost: 1
+    antiAffinity: preferred
+    mirroring:
+      enabled: true
+      layout: group
+    storage:
+      size: "5Gi"
+  affinity:
+    mode: full
+    type: required
+    topologyKey: kubernetes.io/hostname
+```
+
+#### Per-Field Toggles
+
+Each term has an explicit `*bool` toggle that **overrides the preset**, including an
+explicit `false` that disables a term the preset would otherwise enable:
+
+| Field | Term |
+|-------|------|
+| `segmentMirrorAntiAffinity` | Segment primary↔mirror (always applied as preferred) |
+| `coordinatorBackupAntiAffinity` | Backup Job pod↔coordinator |
+| `coordinatorStandbyAntiAffinity` | Standby pod↔coordinator |
+
+For example, `full` spread but with the backup Job allowed back onto the
+coordinator node:
+
+```yaml
+spec:
+  affinity:
+    mode: full
+    coordinatorBackupAntiAffinity: false   # override the preset for this one term
+    type: required
+```
+
+The coordinator↔backup term is applied on the backup Job pod (both on-demand and
+scheduled backups); the coordinator↔standby term is applied on the standby pod. The
+coordinator StatefulSet is **never re-rolled** to add these terms.
+
+#### preferred vs required (honesty note)
+
+`type: required` is **honored** for the coordinator↔backup and coordinator↔standby
+terms — each targets the single coordinator pod, so a hard term is safe (it needs
+≥2 nodes).
+
+For the **segment primary↔mirror** term, `type: required` is **downgraded to
+`preferred`** and the admission webhook returns a **non-fatal Warning**. A hard
+whole-group "no mirror shares a node with any primary" constraint is not
+per-content and would wedge scheduling (pods stuck `Pending`) on realistic
+clusters, so the operator never emits it.
+
+> **The segment separation is best-effort.** A segment primary and its mirror are
+> strongly preferred onto different nodes, but on node-constrained clusters they
+> may co-locate. For the strongest structural separation, use the `group` mirroring
+> layout and size the segment node pool with adequate node count.
+
+#### Node-Count Implications
+
+| Term | Placement | Minimum nodes to schedule | Wedge risk |
+|------|-----------|---------------------------|------------|
+| Segment primary↔mirror | preferred (forced) | 1 (never wedges) | None |
+| Coordinator↔standby | preferred **or** required | `required` needs ≥ 2 | Low |
+| Coordinator↔backup | preferred **or** required | `required` needs ≥ 2 | Low |
+
+#### Standby Tolerations
+
+`spec.standby.tolerations` lets the standby coordinator schedule onto tainted
+nodes, giving the standby parity with `spec.coordinator.tolerations`,
+`spec.segments.tolerations`, and the backup `jobTemplate.tolerations`. Each entry
+uses the standard toleration shape (`key`, `operator`, `value`, `effect`,
+`tolerationSeconds`):
+
+```yaml
+spec:
+  standby:
+    enabled: true
+    tolerations:
+      - key: "cloudberry.io/standby"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+```
+
+#### Additive Merge with User Affinity
+
+Operator-generated anti-affinity terms are **additive**. Any affinity you supply
+yourself (node affinity, pod affinity, or pre-existing pod anti-affinity terms) is
+**preserved** — the operator appends its cross-role terms and never overwrites
+your rules.
+
 ## Maintenance Operations
 
 ### Vacuum
@@ -4876,6 +5084,13 @@ The `cloudberry-query-exporter` sidecar exposes its own per-collector scrape hea
 |--------|------|--------|-------------|
 | `cbexporter_collector_errors_total` | Counter | `collector` | Per-collector scrape error counter. `collector` is one of `query_activity`, `resgroup_status`, `resgroup_iostats`, `spill_files`, `segment_health`, `dist_txns`, `table_skew` |
 | `cbexporter_collector_duration_seconds` | Histogram | `collector` | Per-collector scrape duration, same `collector` label set |
+| `cloudberry_query_exporter_history_errors_total` | Counter | `stage` | Query-history pipeline failures by stage: `snapshot` (pg_stat_activity snapshot), `insert` (history INSERT), `explain` (plan collection). Incremented only on real failures — never on skips or empty results |
+
+> **History write deadlines**: the history INSERT and the hourly retention DELETE
+> target the **distributed** `cloudberry_query_history` table, so they are
+> deadline-bounded (5 s and 60 s respectively) — a degraded interconnect makes them
+> fail fast onto `cloudberry_query_exporter_history_errors_total` instead of wedging
+> the collect loop; an aborted cleanup retries on the next tick.
 
 > **Cardinality note**: the unbounded `usename` label was **removed** from `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound the metric series count.
 
@@ -5052,6 +5267,16 @@ spec:
         excludeInTransaction: true
         terminateMessage: "Session terminated due to inactivity"
 ```
+
+> **`ioLimits.tablespace` validation.** Per-tablespace I/O limits
+> (`resourceGroups[].ioLimits[]`) are applied via
+> `ALTER RESOURCE GROUP … SET io_limit '…'`, and the `tablespace` field is embedded
+> in that DDL string. The webhook and the CRD schema therefore restrict it to a SQL
+> identifier (`[A-Za-z_][A-Za-z0-9_]*`) or the `*` wildcard, and the operator
+> additionally literal-quotes the rendered io-limit value — defense in depth against
+> SQL injection. **Upgrade note:** a CR persisted before this validation whose stored
+> `tablespace` does not match the pattern fails admission on its next update — rename
+> the value to a plain identifier (or `*`) first.
 
 ### Resource Group Reconciliation
 
@@ -5749,7 +5974,19 @@ kubectl get statefulsets -n cloudberry-test -l avsoft.io/cluster=my-cluster
 
 ### Data Redistribution
 
-When a scale operation is initiated, the operator creates a redistribution Job. For scale-out, the Job rebalances data across the new segments. For scale-in, the Job moves data off the segments being removed. The Job uses the `redistribute` maintenance operation, which runs an `ANALYZE` command on the coordinator (in a production Cloudberry deployment, this maps to `gpexpand` redistribution).
+When a scale operation is initiated, the operator creates a redistribution Job.
+
+For **scale-out**, the operator runs a real `gpexpand` flow from a coordinator-exec
+Kubernetes Job: it `kubectl exec`s into `<cluster>-coordinator-0` and runs
+`gpexpand -i` (add + initialize the new segment from the coordinator template, via
+`pg_basebackup` over SSH), then `gpexpand -a` (redistribute every table with
+`ALTER TABLE … EXPAND TABLE`), then finalizes the expansion (`gpexpand --clean` /
+`DROP SCHEMA gpexpand CASCADE`) so a subsequent backup is never blocked. This is the
+only supported mechanism that physically seeds a late-added segment so its
+relations/OIDs match the coordinator. On OKD4 the segment SSH dispatch uses a
+rootless sshd on port 2022 (the scoped SCC forbids binding the privileged port 22).
+
+For **scale-in**, the Job moves data off the segments being removed.
 
 **Job properties:**
 - **Name**: `{cluster}-maintenance-{timestamp}`
@@ -6576,9 +6813,11 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 > export succeeds and lands a valid SequenceFile in HDFS, but **reading it back
 > requires a custom Java `Writable` class** deployed onto the PXF sidecar classpath
 > (PXF must know the concrete key/value `Writable` schema to deserialize the file).
-> Without that classpath-deployed schema class the read leg fails. This is a
-> documented **PXF 2.1.0 limitation**, not an operator defect — the operator emits
-> the correct DDL; the missing piece is the source-specific `Writable` schema class.
+> Without that classpath-deployed schema class the read leg fails — PXF reports
+> **"No fields in record"** (re-confirmed in the 2026-07-10 live acceptance run).
+> This is a documented **PXF 2.1.0 limitation**, not an operator defect — the
+> operator emits the correct DDL; the missing piece is the source-specific
+> `Writable` schema class.
 > Prefer `hdfs:text`/`parquet`/`avro` for a deterministic write **and** read.
 
 > **FDW-based loading path (Scenario 103).** Set **`pxfJob.loadMethod: fdw`** (the
@@ -6746,7 +6985,16 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 >   filesystem; the rendered `<cluster>-pxf-servers` ConfigMap contains only
 >   `${...}` placeholders, **never** plaintext secrets (**REAL**). SE.5 — a
 >   NetworkPolicy keeps the segment↔sidecar PXF `:5888` traffic `localhost`-only,
->   so loads keep working while cross-pod access is blocked (**REAL**). SE.2/SE.3 —
+>   so loads keep working while cross-pod access is blocked (**REAL**). The same
+>   policy carries a second, From-scoped ingress rule admitting — **only from
+>   same-namespace pods carrying this cluster's label** — the MPP interconnect
+>   ephemeral range (TCP `1025–5887` + `5889–65535`, split so cross-pod `:5888`
+>   stays sealed, plus the full UDP `1025–65535` range for the default `udpifc`
+>   interconnect) and TCP `22` for the coordinator→segment SSH dispatch used by
+>   `gpbackup`/`gprestore`/`gpexpand`. Without that rule the default-deny policy
+>   silently hung every distributed query (Motion setup dropped until
+>   `gp_interconnect_setup_timeout`) and every live backup (first
+>   coordinator→segment ssh blocked). SE.2/SE.3 —
 >   JDBC/S3 TLS is wired declaratively (JDBC URL `ssl` params;
 >   `fs.s3a.connection.ssl.enabled=true`); a live encrypted handshake is asserted
 >   **only** when the source speaks TLS, otherwise **CONFIG-ONLY**. See
@@ -6922,7 +7170,14 @@ kubectl logs -n cloudberry-system deployment/cloudberry-operator | \
 
 ### Prometheus Metrics
 
-The operator exposes metrics at the `/metrics` endpoint. Key metrics:
+The operator exposes metrics at the `/metrics` endpoint (default `:8080`).
+
+> **Probing note**: the operator image is distroless (no shell, no curl), so you
+> cannot probe `/metrics` with `kubectl exec`. Use a port-forward instead:
+> `kubectl -n cloudberry-system port-forward deploy/cloudberry-operator 8080:8080`
+> then `curl localhost:8080/metrics`.
+
+Key metrics:
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -6966,6 +7221,7 @@ The operator exposes metrics at the `/metrics` endpoint. Key metrics:
 | `cloudberry_recommendation_scan_duration_seconds` | Histogram | Recommendation scan duration in seconds (labels: `cluster`, `namespace`) |
 | `cloudberry_disk_usage_scan_total` | Counter | Disk-usage scan outcome recorded by the admin controller's `recordDiskUsage` (labels: `cluster`, `namespace`, `result` = `success`/`error`/`skipped`). `skipped` when `gp_toolkit.gp_disk_free` is unavailable on the server version — never a fabricated value |
 | `cloudberry_recommendation_scan_total` | Counter | Storage-recommendation scan outcome recorded by `recordRecommendations` (labels: `cluster`, `namespace`, `result` = `success`/`error`/`skipped`). `skipped` when the DB is unavailable |
+| `cloudberry_steady_state_refresh_errors_total` | Counter | Swallowed (non-fatal) errors on the admin controller's steady-state refresh paths (labels: `cluster`, `namespace`, `component` = `backup`/`dataloading`/`storage`). Refresh errors intentionally don't change reconcile results; this counter makes the silent degradation alertable |
 | `cloudberry_table_bloat_ratio` | Gauge | Dead-tuple bloat ratio for the top-N most-bloated tables, populated from storage recommendation scans (labels: `cluster`, `namespace`, `table`) |
 | `cloudberry_auth_attempts_total` | Counter | Authentication attempts. A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}` (labels: `method`, `result`) |
 
@@ -6979,6 +7235,7 @@ Every REST API request is recorded by a metrics middleware. The `route` label is
 | `cloudberry_api_request_duration_seconds` | Histogram | `route`, `method` | REST API request duration |
 | `cloudberry_api_requests_in_flight` | Gauge | — | Requests currently being served. Panic-safe: the gauge is decremented (and the request recorded) even when a handler panics, so it can never leak upward |
 | `cloudberry_api_rate_limit_rejections_total` | Counter | `route` | Requests rejected by the per-IP rate limiter (HTTP 429) |
+| `cloudberry_api_rate_limit_entries` | Gauge | — | Live per-client rate-limiter entries, sampled on every scrape (limiter memory footprint / cleanup visibility). Per-server providers are summed into one process-wide gauge |
 | `cloudberry_migrate_operations_total` | Counter | `result` | Cross-cluster migrate operations (`started`/`error`) |
 | `cloudberry_api_cluster_operations_total` | Counter | `operation`, `result` | Cluster create/delete operations via the API |
 | `cloudberry_log_stream_sessions_total` | Counter | `result` | Backup-Job log streaming sessions (`success`/`error`) |
@@ -7163,7 +7420,9 @@ Each exporter supports `enabled`, `image`, `port`, and optional `resources` (req
 - During query-monitoring reconciliation, the operator auto-creates the `cloudberry_exporter` database role used by both the `postgresExporter` and `cloudberryQueryExporter`.
 - **Cloudberry-tailored for clean scrapes**: The operator tunes the `postgresExporter` so each scrape succeeds without errors on the coordinator, standby, primary segments, and mirror segments — the healthy state is `pg_up=1` with `pg_exporter_last_scrape_error=0`. Three adjustments make this work:
   - **Resource-group query is conditional**: The custom `cloudberry_resgroup_status` query (resource-group usage from `gp_toolkit.gp_resgroup_status`) is emitted **only** when the cluster declares resource groups (`spec.workload.resourceGroups` non-empty, i.e. `gp_resource_manager='group'`). On clusters using resource **queues** (the default), the `gp_toolkit.gp_resgroup_status` view does not exist, so the operator omits the query to avoid a per-scrape error. Resource-group exporter metrics therefore appear only when resource groups are configured.
-  - **Incompatible built-in collectors disabled**: The operator passes `--no-collector.stat_user_tables` (the built-in collector fails on Cloudberry with "query plan with multiple segworker groups is not supported"; the custom `cloudberry_table_stats` query covers per-table stats instead) and `--disable-settings-metrics` (the built-in `pg_settings` collector fails on Cloudberry's `NULL` `short_desc` values; the custom `cloudberry_connections_max` query covers `max_connections` instead).
+  - **Incompatible built-in collectors disabled**: The operator passes `--no-collector.stat_user_tables` (the built-in collector fails on Cloudberry with "query plan with multiple segworker groups is not supported" — `pg_stat_user_tables` is a distributed view there) and `--disable-settings-metrics` (the built-in `pg_settings` collector fails on Cloudberry's `NULL` `short_desc` values; the custom `cloudberry_connections_max` query covers `max_connections` instead).
+  - **Catalog-only table stats**: The custom `cloudberry_table_stats` query is deliberately **catalog-only** (`pg_class` + `pg_namespace`) — on Cloudberry both `pg_stat_user_tables` and the `dbsize` functions (`pg_relation_size` & co.) dispatch cluster-wide, which a sidecar must never trigger on every scrape (it added per-scrape cluster load and wedged the exporter whenever the interconnect was degraded). The query reports per-table **estimates**: `n_live_tup` from `GREATEST(reltuples, 0)` and `table_size_bytes` from `relpages * block_size`, both refreshed by `ANALYZE`/`VACUUM` (the HELP text says "Estimated"). Tables and materialized views are covered, temp relations excluded; the per-table DML/scan counters (`seq_scan`, `n_tup_ins`, `n_dead_tup`, …) are no longer exported.
+  - **`gp_toolkit` degradation**: when a `gp_toolkit` view is absent in the running Cloudberry build (e.g. resource-group iostats, skew, disk-free), the exporters and the operator's scan paths degrade gracefully — they log a WARN and skip the affected metrics (or record `result="skipped"`) rather than failing the scrape or fabricating values.
   - **Recovery-safe WAL query**: The custom `cloudberry_wal` query uses `pg_is_in_recovery()` to select `pg_last_wal_replay_lsn()` on standby/mirror replicas and `pg_current_wal_lsn()` on primaries, so it runs without the "recovery is in progress" error on the coordinator, standby, primary segments, and mirror segments alike.
 - **Exporter placement**: The active coordinator runs both exporters. The standby coordinator runs the `postgresExporter` sidecar only — making the standby pod `2/2` (`cloudberry` + `postgres-exporter`, with `prometheus.io/scrape` annotations on port 9187). The standby's `postgresExporter` connects to the local standby database via `localhost` and provides instance/replication-scoped and standby-local health metrics, ensuring monitoring continuity if the standby is promoted. The `cloudberryQueryExporter` is intentionally **not** run on the standby because its queries are cluster-global scoped (`gp_segment_configuration`, distributed transactions, cluster-wide `pg_stat_activity`, etc.); running it on a non-promoted standby would duplicate the coordinator's cluster-wide metric series. It runs only on the active coordinator and activates on the promoted node after failover. Primary and mirror **segment** pods optionally run a `postgresExporter` sidecar as well — this is **opt-in** via `postgresExporter.segments` (primary segments) and `postgresExporter.mirrors` (mirror segments), both default off and independently toggleable; see below. The `cloudberryQueryExporter` is never deployed to segments.
 

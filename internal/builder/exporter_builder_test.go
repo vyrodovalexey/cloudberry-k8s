@@ -143,6 +143,64 @@ func TestBuildExporterQueriesConfigMap_ResourceGroupsGate(t *testing.T) {
 	})
 }
 
+// TestBuildExporterQueriesConfigMap_TableStatsCatalogOnly locks the Cycle-2
+// production fix for the cloudberry_table_stats query: on Cloudberry both
+// pg_stat_user_tables AND the dbsize functions (pg_relation_size & co.)
+// dispatch to every segment over the Motion/Interconnect layer, so a sidecar
+// exporter scraping them hangs whenever the interconnect degrades and adds
+// cluster-wide load on every scrape. The replacement must be strictly
+// coordinator-local: pg_class + pg_namespace catalog estimates only.
+func TestBuildExporterQueriesConfigMap_TableStatsCatalogOnly(t *testing.T) {
+	b := NewBuilder()
+	queries := b.BuildExporterQueriesConfigMap(newExporterCluster()).Data["queries.yaml"]
+	require.NotEmpty(t, queries)
+
+	// The distributed sources are gone from every rendered SQL statement (the
+	// names may still appear in YAML comments documenting WHY they are banned;
+	// postgres-exporter ignores comments).
+	assert.NotContains(t, queries, "FROM pg_stat_user_tables",
+		"pg_stat_user_tables is a distributed view on Cloudberry and must not be scraped")
+	assert.NotContains(t, queries, "pg_relation_size(",
+		"dbsize functions dispatch to segments on Cloudberry and must not be scraped")
+
+	// The catalog-only replacement is present.
+	assert.Contains(t, queries, "cloudberry_table_stats",
+		"the table-stats query namespace must be retained")
+	assert.Contains(t, queries, "FROM pg_class c",
+		"replacement must read from the pg_class catalog")
+	assert.Contains(t, queries, "JOIN pg_namespace n ON n.oid = c.relnamespace",
+		"replacement must join pg_namespace for the schema label")
+	assert.Contains(t, queries, "GREATEST(c.reltuples, 0)::bigint AS n_live_tup",
+		"reltuples estimate must clamp the PG14 never-analyzed sentinel (-1) to 0")
+	assert.Contains(t, queries,
+		"(c.relpages::bigint * current_setting('block_size')::bigint) AS table_size_bytes",
+		"size must be the relpages-based catalog estimate")
+
+	// Metric names/labels are unchanged for the retained series: schemaname +
+	// relname stay LABELs, n_live_tup stays a GAUGE, and estimation is spelled
+	// out in the HELP text.
+	assert.Contains(t, queries, "- schemaname:")
+	assert.Contains(t, queries, "- relname:")
+	assert.Contains(t, queries, "- n_live_tup:")
+	assert.Contains(t, queries, "- table_size_bytes:")
+	assert.Contains(t, queries,
+		`description: "Estimated live rows (pg_class.reltuples, refreshed by ANALYZE/VACUUM)"`,
+		"HELP text must state the value is an estimate")
+	assert.Contains(t, queries,
+		`description: "Estimated table size in bytes (pg_class.relpages * block_size, refreshed by ANALYZE/VACUUM)"`,
+		"HELP text must state the value is an estimate")
+
+	// The dropped counters (per-table DML/scan stats needed distributed
+	// dispatch) must not linger anywhere in the rendered config.
+	for _, dropped := range []string{
+		"seq_scan", "seq_tup_read", "idx_scan", "idx_tup_fetch",
+		"n_tup_ins", "n_tup_upd", "n_tup_del", "n_dead_tup",
+	} {
+		assert.NotContains(t, queries, dropped,
+			"dropped distributed-view column %q must not remain in queries.yaml", dropped)
+	}
+}
+
 func TestBuildExporterSidecarContainers_AllEnabled(t *testing.T) {
 	b := NewBuilder()
 	cluster := newExporterCluster()

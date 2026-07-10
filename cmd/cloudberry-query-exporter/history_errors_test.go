@@ -29,7 +29,7 @@ func TestCollectHistory_SnapshotError_AbortsCycle(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	// Pre-seed the previous cycle so a (wrong) completion insert would be
 	// observable: a failed snapshot must NOT mark queries as completed.
 	hc.lastSeenPIDs = map[int32]*sessionSnapshot{
@@ -54,7 +54,7 @@ func TestSnapshotSessions_ScanError_RowSkipped(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	pids, ok := hc.snapshotSessions(context.Background(), conn)
 
 	assert.False(t, ok, "a scan failure mid-snapshot must invalidate the snapshot")
@@ -69,7 +69,7 @@ func TestSnapshotSessions_RowsErrMidStream(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	pids, ok := hc.snapshotSessions(context.Background(), conn)
 
 	assert.False(t, ok)
@@ -89,7 +89,7 @@ func TestCollectExplainPlan_ScanError_ReturnsEmpty(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	plan := hc.collectExplainPlan(context.Background(), conn, "SELECT * FROM t")
 	assert.Empty(t, plan, "a scan failure must yield an empty plan, not a partial one")
 }
@@ -106,7 +106,7 @@ func TestCollectExplainPlan_RowsErr_ReturnsEmpty(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	plan := hc.collectExplainPlan(context.Background(), conn, "SELECT * FROM t")
 	assert.Empty(t, plan)
 }
@@ -114,7 +114,7 @@ func TestCollectExplainPlan_RowsErr_ReturnsEmpty(t *testing.T) {
 func TestCollectExplainPlan_SkipsAllUtilityPrefixes(t *testing.T) {
 	// No connection required: utility statements short-circuit before any
 	// query is issued. A panic here would mean the guard is gone.
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	for _, stmt := range []string{
 		"CREATE TABLE t (i int)", "ALTER TABLE t ADD COLUMN j int",
 		"DROP TABLE t", "COPY t FROM '/tmp/x'", "GRANT ALL ON t TO u",
@@ -141,7 +141,7 @@ func TestCollectHistory_InsertedCountLogged(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	hc.lastSeenPIDs = map[int32]*sessionSnapshot{
 		7: {PID: 7, State: "active", QueryText: "SELECT 1", QueryStart: time.Now().Add(-time.Minute)},
 		8: {PID: 8, State: "active", QueryText: "SELECT 2", QueryStart: time.Now()},

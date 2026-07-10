@@ -55,6 +55,57 @@ spec:
           spec:
             description: CloudberryClusterSpec defines the desired state of CloudberryCluster.
             properties:
+              affinity:
+                description: |-
+                  Affinity configures configurable cross-role pod anti-affinity. When nil
+                  the operator emits the pre-existing default affinity only (segment
+                  primary<->mirror preferred term).
+                properties:
+                  coordinatorBackupAntiAffinity:
+                    description: |-
+                      CoordinatorBackupAntiAffinity toggles the anti-affinity term that keeps
+                      backup Job pods off the coordinator node. When nil the value is derived
+                      from Mode. Overrides Mode when set.
+                    type: boolean
+                  coordinatorStandbyAntiAffinity:
+                    description: |-
+                      CoordinatorStandbyAntiAffinity toggles the anti-affinity term that keeps
+                      the standby pod off the coordinator node. When nil the value is derived
+                      from Mode. Overrides Mode when set.
+                    type: boolean
+                  mode:
+                    description: |-
+                      Mode selects a preset that materializes the anti-affinity toggles.
+                      "segment-mirror" enables segment primary<->mirror only; "full" enables
+                      all three cross-role terms. Explicit toggles below override the preset.
+                    enum:
+                    - segment-mirror
+                    - full
+                    type: string
+                  segmentMirrorAntiAffinity:
+                    description: |-
+                      SegmentMirrorAntiAffinity toggles the segment primary<->mirror
+                      cross-component anti-affinity term. When nil the value is derived from
+                      Mode. Overrides Mode when set.
+                    type: boolean
+                  topologyKey:
+                    default: kubernetes.io/hostname
+                    description: TopologyKey is the node topology key used by every
+                      cross-role term.
+                    type: string
+                  type:
+                    default: preferred
+                    description: |-
+                      Type selects preferred (soft) or required (hard) scheduling for the
+                      coordinator<->backup and coordinator<->standby terms. The segment
+                      primary<->mirror term is ALWAYS applied as preferred regardless of Type
+                      (a webhook Warning is emitted when Type is required with a segment-mirror
+                      or full mode).
+                    enum:
+                    - preferred
+                    - required
+                    type: string
+                type: object
               auth:
                 description: Auth defines authentication and authorization configuration.
                 properties:
@@ -1882,6 +1933,30 @@ spec:
                           name.
                         type: string
                     type: object
+                  tolerations:
+                    description: Tolerations allow scheduling the standby coordinator
+                      on tainted nodes.
+                    items:
+                      description: Toleration defines a Kubernetes toleration.
+                      properties:
+                        effect:
+                          description: Effect is the taint effect.
+                          type: string
+                        key:
+                          description: Key is the taint key.
+                          type: string
+                        operator:
+                          description: Operator is the toleration operator.
+                          type: string
+                        tolerationSeconds:
+                          description: TolerationSeconds is the toleration duration.
+                          format: int64
+                          type: integer
+                        value:
+                          description: Value is the taint value.
+                          type: string
+                      type: object
+                    type: array
                 type: object
               storage:
                 description: Storage defines storage management configuration.
@@ -2082,8 +2157,12 @@ spec:
                                 format: int32
                                 type: integer
                               tablespace:
-                                description: Tablespace is the target tablespace name.
-                                  Use "*" for all tablespaces.
+                                description: |-
+                                  Tablespace is the target tablespace name. Use "*" for all tablespaces.
+                                  Restricted to SQL identifier characters (or the "*" wildcard) because
+                                  the value is embedded in the rendered io_limit DDL string (C1b,
+                                  defense-in-depth alongside webhook validation and literal quoting).
+                                pattern: ^[A-Za-z_][A-Za-z0-9_]*$|^\*$
                                 type: string
                               writeBytesPerSec:
                                 description: WriteBytesPerSec is the maximum write

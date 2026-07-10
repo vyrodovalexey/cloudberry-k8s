@@ -173,6 +173,9 @@ func (m *scenario5MockDBClient) ListResourceQueues(_ context.Context) ([]db.Reso
 func (m *scenario5MockDBClient) RegisterNewSegments(_ context.Context, _ db.SegmentRegistrationOptions) error {
 	return nil
 }
+func (m *scenario5MockDBClient) SeedNewSegmentCatalog(_ context.Context, _ db.SegmentRegistrationOptions) (int, error) {
+	return 0, nil
+}
 func (m *scenario5MockDBClient) RedistributeData(_ context.Context, _ db.RedistributionOptions) error {
 	return nil
 }
@@ -180,6 +183,12 @@ func (m *scenario5MockDBClient) GetRedistributionProgress(_ context.Context) (in
 	return 100, nil
 }
 func (m *scenario5MockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
+	return nil
+}
+func (m *scenario5MockDBClient) GpexpandSchemaPresent(_ context.Context) (bool, error) {
+	return false, nil
+}
+func (m *scenario5MockDBClient) FinalizeGpexpand(_ context.Context) error {
 	return nil
 }
 func (m *scenario5MockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ db.ScaleInRedistributionOptions) error {

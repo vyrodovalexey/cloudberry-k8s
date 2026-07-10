@@ -54,11 +54,14 @@ const (
 	argWebListenAddress = "--web.listen-address=:9187"
 	// argNoCollectorStatUserTables disables the built-in stat_user_tables
 	// collector. On Cloudberry that collector always errors with "query plan
-	// with multiple segworker groups is not supported", and its metrics are
-	// already covered by the custom cloudberry_table_stats query. The
-	// prometheuscommunity/postgres-exporter image exposes per-collector
-	// --no-collector.<name> flags, so disabling it removes the scrape noise
-	// without losing per-table stats.
+	// with multiple segworker groups is not supported" — pg_stat_user_tables
+	// is a distributed view there, dispatched to every segment. The custom
+	// cloudberry_table_stats query replaces it with catalog-only per-table
+	// row/size ESTIMATES (the per-table DML/scan counters are deliberately
+	// dropped: a sidecar exporter must never trigger cluster-wide dispatch
+	// per scrape). The prometheuscommunity/postgres-exporter image exposes
+	// per-collector --no-collector.<name> flags, so disabling it removes the
+	// scrape noise.
 	argNoCollectorStatUserTables = "--no-collector.stat_user_tables"
 	// argDisableSettingsMetrics disables the built-in pg_settings metrics. On
 	// Cloudberry the pg_settings view exposes NULL short_desc values that the
@@ -980,22 +983,27 @@ cloudberry_locks:
         usage: "GAUGE"
         description: "Number of locks in this state"
 
-# ── Table Statistics ────────────────────────────────────────
+# ── Table Statistics (catalog-only, avoids distributed Interconnect hangs) ──
+# NOTE: on Cloudberry pg_stat_user_tables is a DISTRIBUTED view — every scrape
+# dispatches to all segments over the Motion/Interconnect layer, which hangs the
+# sidecar exporter when the interconnect is degraded and adds cluster-wide load
+# on every scrape. The same applies to the dbsize functions (pg_relation_size &
+# co. dispatch from the coordinator too), so this query is strictly catalog-only:
+# pg_class + pg_namespace with relpages/reltuples ESTIMATES that Cloudberry's
+# ANALYZE aggregates cluster-wide onto the coordinator. GREATEST() clamps the
+# PostgreSQL 14 "never analyzed" sentinel (reltuples = -1) to 0.
 cloudberry_table_stats:
   query: |
-    SELECT schemaname,
-           relname,
-           seq_scan,
-           seq_tup_read,
-           COALESCE(idx_scan, 0) AS idx_scan,
-           COALESCE(idx_tup_fetch, 0) AS idx_tup_fetch,
-           n_tup_ins,
-           n_tup_upd,
-           n_tup_del,
-           n_live_tup,
-           n_dead_tup
-    FROM pg_stat_user_tables
-    ORDER BY n_live_tup DESC
+    SELECT n.nspname AS schemaname,
+           c.relname,
+           GREATEST(c.reltuples, 0)::bigint AS n_live_tup,
+           (c.relpages::bigint * current_setting('block_size')::bigint) AS table_size_bytes
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r','m')
+      AND c.relpersistence <> 't'
+      AND n.nspname NOT IN ('pg_catalog','information_schema','gp_toolkit','pg_aoseg','pg_bitmapindex')
+    ORDER BY c.reltuples DESC
     LIMIT 100
   metrics:
     - schemaname:
@@ -1004,33 +1012,12 @@ cloudberry_table_stats:
     - relname:
         usage: "LABEL"
         description: "Table name"
-    - seq_scan:
-        usage: "COUNTER"
-        description: "Sequential scans"
-    - seq_tup_read:
-        usage: "COUNTER"
-        description: "Rows read by sequential scans"
-    - idx_scan:
-        usage: "COUNTER"
-        description: "Index scans"
-    - idx_tup_fetch:
-        usage: "COUNTER"
-        description: "Rows fetched by index scans"
-    - n_tup_ins:
-        usage: "COUNTER"
-        description: "Rows inserted"
-    - n_tup_upd:
-        usage: "COUNTER"
-        description: "Rows updated"
-    - n_tup_del:
-        usage: "COUNTER"
-        description: "Rows deleted"
     - n_live_tup:
         usage: "GAUGE"
-        description: "Estimated live rows"
-    - n_dead_tup:
+        description: "Estimated live rows (pg_class.reltuples, refreshed by ANALYZE/VACUUM)"
+    - table_size_bytes:
         usage: "GAUGE"
-        description: "Estimated dead rows"
+        description: "Estimated table size in bytes (pg_class.relpages * block_size, refreshed by ANALYZE/VACUUM)"
 
 # ── WAL ─────────────────────────────────────────────────────
 # pg_current_wal_lsn() is only available on primaries; standbys and mirrors

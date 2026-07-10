@@ -182,9 +182,12 @@ type MockDBClient struct {
 	CancelAllQueriesFunc              func(ctx context.Context) (int32, error)
 	LogRotateFunc                     func(ctx context.Context) error
 	RegisterNewSegmentsFunc           func(ctx context.Context, opts db.SegmentRegistrationOptions) error
+	SeedNewSegmentCatalogFunc         func(ctx context.Context, opts db.SegmentRegistrationOptions) (int, error)
 	RedistributeDataFunc              func(ctx context.Context, opts db.RedistributionOptions) error
 	GetRedistributionProgressFunc     func(ctx context.Context) (int32, error)
 	DeregisterSegmentsFunc            func(ctx context.Context, newCount int32) error
+	GpexpandSchemaPresentFunc         func(ctx context.Context) (bool, error)
+	FinalizeGpexpandFunc              func(ctx context.Context) error
 	RedistributeBeforeScaleInFunc     func(ctx context.Context, opts db.ScaleInRedistributionOptions) error
 	AnalyzeSkewFunc                   func(ctx context.Context, database string) ([]db.TableSkewInfo, error)
 	ListSessionsWithResourceGroupFunc func(ctx context.Context) ([]db.SessionWithGroup, error)
@@ -648,6 +651,16 @@ func (m *MockDBClient) RegisterNewSegments(ctx context.Context, opts db.SegmentR
 	return nil
 }
 
+// SeedNewSegmentCatalog implements db.Client.
+func (m *MockDBClient) SeedNewSegmentCatalog(
+	ctx context.Context, opts db.SegmentRegistrationOptions,
+) (int, error) {
+	if m.SeedNewSegmentCatalogFunc != nil {
+		return m.SeedNewSegmentCatalogFunc(ctx, opts)
+	}
+	return 0, nil
+}
+
 // RedistributeData implements db.Client.
 func (m *MockDBClient) RedistributeData(ctx context.Context, opts db.RedistributionOptions) error {
 	if m.RedistributeDataFunc != nil {
@@ -668,6 +681,22 @@ func (m *MockDBClient) GetRedistributionProgress(ctx context.Context) (int32, er
 func (m *MockDBClient) DeregisterSegments(ctx context.Context, newCount int32) error {
 	if m.DeregisterSegmentsFunc != nil {
 		return m.DeregisterSegmentsFunc(ctx, newCount)
+	}
+	return nil
+}
+
+// GpexpandSchemaPresent implements db.Client.
+func (m *MockDBClient) GpexpandSchemaPresent(ctx context.Context) (bool, error) {
+	if m.GpexpandSchemaPresentFunc != nil {
+		return m.GpexpandSchemaPresentFunc(ctx)
+	}
+	return false, nil
+}
+
+// FinalizeGpexpand implements db.Client.
+func (m *MockDBClient) FinalizeGpexpand(ctx context.Context) error {
+	if m.FinalizeGpexpandFunc != nil {
+		return m.FinalizeGpexpandFunc(ctx)
 	}
 	return nil
 }

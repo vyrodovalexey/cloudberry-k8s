@@ -1285,6 +1285,10 @@ func (w *nonClosingClientWrapper) RegisterNewSegments(ctx context.Context, opts 
 	return w.delegate.RegisterNewSegments(ctx, opts)
 }
 
+func (w *nonClosingClientWrapper) SeedNewSegmentCatalog(ctx context.Context, opts db.SegmentRegistrationOptions) (int, error) {
+	return w.delegate.SeedNewSegmentCatalog(ctx, opts)
+}
+
 func (w *nonClosingClientWrapper) RedistributeData(ctx context.Context, opts db.RedistributionOptions) error {
 	return w.delegate.RedistributeData(ctx, opts)
 }
@@ -1295,6 +1299,14 @@ func (w *nonClosingClientWrapper) GetRedistributionProgress(ctx context.Context)
 
 func (w *nonClosingClientWrapper) DeregisterSegments(ctx context.Context, newCount int32) error {
 	return w.delegate.DeregisterSegments(ctx, newCount)
+}
+
+func (w *nonClosingClientWrapper) GpexpandSchemaPresent(ctx context.Context) (bool, error) {
+	return w.delegate.GpexpandSchemaPresent(ctx)
+}
+
+func (w *nonClosingClientWrapper) FinalizeGpexpand(ctx context.Context) error {
+	return w.delegate.FinalizeGpexpand(ctx)
 }
 
 func (w *nonClosingClientWrapper) RedistributeBeforeScaleIn(ctx context.Context, opts db.ScaleInRedistributionOptions) error {

@@ -118,6 +118,11 @@ const (
 	// errCodeInvalidRequest is the error code for malformed/invalid requests.
 	errCodeInvalidRequest = "INVALID_REQUEST"
 
+	// errCodeBackupNotEnabled is the error code returned when a backup
+	// lifecycle endpoint (create/delete/restore/schedule) is invoked for a
+	// cluster whose backup is not enabled/configured.
+	errCodeBackupNotEnabled = "BACKUP_NOT_ENABLED"
+
 	// errCodePXFNotEnabled is the error code returned when a PXF lifecycle
 	// endpoint is invoked for a cluster that does not have PXF enabled.
 	errCodePXFNotEnabled = "PXF_NOT_ENABLED"
@@ -208,9 +213,12 @@ type Server struct {
 	clientset   kubernetes.Interface
 	authMW      *auth.AuthMiddleware
 	rateLimiter *RateLimiter
-	dbFactory   db.DBClientFactory
-	credStore   *auth.InMemoryCredentialStore
-	metrics     metrics.Recorder
+	// rateLimitEntriesUnreg unregisters this server's rate-limit entries
+	// gauge provider from the shared recorder; called from Close.
+	rateLimitEntriesUnreg func()
+	dbFactory             db.DBClientFactory
+	credStore             *auth.InMemoryCredentialStore
+	metrics               metrics.Recorder
 	// builder is the ResourceBuilder interface (not the concrete
 	// DefaultBuilder) so handler-level guards (e.g. a nil backup Job from a
 	// builder that refuses to render a broken command) stay testable.
@@ -272,6 +280,14 @@ func NewServer(
 				s.metrics.RecordRateLimitRejection(s.routePattern(r))
 			}
 		}))
+	// Expose the limiter's live entry count as a scrape-time gauge
+	// (cloudberry_api_rate_limit_entries). The recorder owns the collector, so
+	// multiple servers sharing one recorder never double-register (E-4/C-2).
+	if s.metrics != nil {
+		s.rateLimitEntriesUnreg = s.metrics.RegisterRateLimitEntries(func() float64 {
+			return float64(s.rateLimiter.EntriesLen())
+		})
+	}
 
 	if len(credStore) > 0 && credStore[0] != nil {
 		s.credStore = credStore[0]
@@ -281,10 +297,14 @@ func NewServer(
 	return s
 }
 
-// Close releases resources held by the server, including stopping the rate limiter.
+// Close releases resources held by the server, including stopping the rate
+// limiter and unregistering its entries gauge provider.
 func (s *Server) Close() {
 	if s.rateLimiter != nil {
 		s.rateLimiter.Stop()
+	}
+	if s.rateLimitEntriesUnreg != nil {
+		s.rateLimitEntriesUnreg()
 	}
 }
 
@@ -692,7 +712,12 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 	getErr := s.k8sClient.Get(ctx, secretKey, existing)
 	switch {
 	case getErr == nil:
-		// Secret exists — update it with the new password.
+		// Secret exists — update it with the new password. Guard against a
+		// Secret persisted with no data (Data == nil), mirroring the
+		// AlreadyExists-race path in createAdminPasswordSecret.
+		if existing.Data == nil {
+			existing.Data = map[string][]byte{}
+		}
 		existing.Data[util.PasswordSecretKey] = []byte(newPassword)
 		if updateErr := s.k8sClient.Update(ctx, existing); updateErr != nil {
 			s.logger.Error("failed to update admin password secret",
@@ -709,10 +734,11 @@ func (s *Server) handleRotatePassword(w http.ResponseWriter, r *http.Request) {
 	default:
 		// Transient API-server error: do NOT attempt Create (it would fail
 		// with AlreadyExists and mask the real cause, mirroring
-		// resolveAdminPassword's discrimination).
+		// resolveAdminPassword's discrimination). The response body stays
+		// generic — the underlying K8s error text is only logged (C4).
 		s.logger.Error("failed to read admin password secret", "error", getErr)
 		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
-			fmt.Sprintf("failed to read admin password secret: %v", getErr))
+			"failed to read admin password secret")
 		return
 	}
 
@@ -3520,9 +3546,7 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
-		writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
-			"backup is not enabled for this cluster")
+	if !requireBackupEnabled(w, cluster) {
 		return
 	}
 
@@ -3603,6 +3627,19 @@ func (s *Server) handleGetBackup(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("backup %q not found", timestamp))
 }
 
+// requireBackupEnabled writes a 400 BACKUP_NOT_ENABLED response and returns
+// false when backup is not enabled for the cluster. The create/delete/restore
+// backup endpoints share this gate (D-B6) so no Job is ever built for a
+// cluster whose backup destination/credentials are unconfigured.
+func requireBackupEnabled(w http.ResponseWriter, cluster *cbv1alpha1.CloudberryCluster) bool {
+	if cluster.Spec.Backup == nil || !cluster.Spec.Backup.Enabled {
+		writeErrorJSON(w, http.StatusBadRequest, errCodeBackupNotEnabled,
+			"backup is not enabled for this cluster")
+		return false
+	}
+	return true
+}
+
 // handleDeleteBackup deletes a backup by creating a retention/cleanup Job.
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -3610,6 +3647,12 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	cluster, err := s.getCluster(r.Context(), name, r.URL.Query().Get("namespace"))
 	if err != nil {
 		writeClusterNotFound(w, name)
+		return
+	}
+	// Backup-disabled gate (D-B6): consistent with handleCreateBackup, a
+	// cleanup Job must never be created for a cluster whose backup
+	// destination/credentials are not configured.
+	if !requireBackupEnabled(w, cluster) {
 		return
 	}
 	if !isValidBackupTimestamp(timestamp) {
@@ -3646,6 +3689,15 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 			s.metrics.RecordRestore(name, namespace, "failed")
 		}
 		writeClusterNotFound(w, name)
+		return
+	}
+
+	// Backup-disabled gate (D-B6): consistent with handleCreateBackup, a
+	// restore Job must never be created for a cluster whose backup
+	// destination/credentials are not configured. This validation reject is a
+	// client error, NOT a restore outcome — RecordRestore("failed") is
+	// intentionally NOT emitted here (honest metrics).
+	if !requireBackupEnabled(w, cluster) {
 		return
 	}
 
@@ -4029,7 +4081,7 @@ func (s *Server) applyScheduleUpdate(
 ) bool {
 	if req.Schedule != nil {
 		if cluster.Spec.Backup == nil {
-			writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
+			writeErrorJSON(w, http.StatusBadRequest, errCodeBackupNotEnabled,
 				"backup is not configured for this cluster")
 			return false
 		}
@@ -4043,7 +4095,7 @@ func (s *Server) applyScheduleUpdate(
 				return nil
 			})
 		if errors.Is(updateErr, errBackupNotConfigured) {
-			writeErrorJSON(w, http.StatusBadRequest, "BACKUP_NOT_ENABLED",
+			writeErrorJSON(w, http.StatusBadRequest, errCodeBackupNotEnabled,
 				"backup is not configured for this cluster")
 			return false
 		}

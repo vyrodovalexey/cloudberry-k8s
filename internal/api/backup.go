@@ -5,6 +5,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -90,12 +91,26 @@ type backupJobInfo struct {
 
 // decodeOptionalJSON decodes the request body into v, treating an empty body
 // (io.EOF) as a valid empty request so optional bodies are supported.
+//
+// Trailing data after the first JSON value is rejected (D-B7a): a second JSON
+// value (`{} {}`, `{}[]`, `{}garbage`) is always a client bug and silently
+// ignoring it can mask truncated/concatenated payloads.
+//
+// DisallowUnknownFields is intentionally NOT enabled (D-B7b, deferred):
+// rejecting unknown fields would break lenient clients during version skew
+// (e.g. a newer ctl sending future fields to an older operator). Revisit with
+// an API versioning story.
 func decodeOptionalJSON(r *http.Request, v interface{}) error {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		return err
+	}
+	// Require EOF after the first value: any second value is trailing garbage.
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("unexpected trailing data after JSON body")
 	}
 	return nil
 }

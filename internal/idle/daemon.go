@@ -112,20 +112,55 @@ func New(cfg Config) *Daemon {
 // Start begins the daemon's scan loop in a background goroutine.
 // It is safe to call Start multiple times; subsequent calls are no-ops
 // if the daemon is already running.
+//
+// Generation handover (F-10.2): Stop() nils d.cancel BEFORE the old scanLoop
+// drains, so a concurrent Start could previously spawn generation N+1 while
+// generation N was still executing runScanCycle/healthCheck — leaving
+// d.consecutiveFails and the d.config.DBClient swap in attemptReconnect
+// racing without synchronization. Start therefore WAITS for the previous
+// generation's done channel to close before spawning the next one: at most
+// one scanLoop ever runs, and the channel close/receive pair provides the
+// happens-before edge for all generation-owned state. Receiving from an
+// already-closed channel returns immediately, so the common
+// Stop-then-Start-later sequence pays no wait.
 func (d *Daemon) Start(ctx context.Context) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	for {
+		d.mu.Lock()
+		// Already running — no-op.
+		if d.cancel != nil {
+			d.mu.Unlock()
+			return
+		}
+		prevDone := d.done
+		if prevDone == nil {
+			// No previous generation left to drain: start the new one under
+			// the lock so concurrent Starts stay no-ops.
+			scanCtx, cancel := context.WithCancel(ctx)
+			d.cancel = cancel
+			d.done = make(chan struct{})
 
-	// Already running — no-op.
-	if d.cancel != nil {
-		return
+			// Pass the freshly created channel INTO the goroutine (B4):
+			// scanLoop must close the channel of ITS OWN generation. Reading
+			// d.done from the loop would race a Stop()+Start() cycle — the
+			// old goroutine could close the NEW channel (double-close panic)
+			// or leave its own channel unclosed (Stop hangs forever).
+			go d.scanLoop(scanCtx, d.done)
+			d.mu.Unlock()
+			return
+		}
+		d.mu.Unlock()
+
+		// A previous generation exists (its Stop already canceled it, or a
+		// concurrent Stop is doing so): wait for its scanLoop to fully exit
+		// before starting the next generation, then clear the drained
+		// channel and retry.
+		<-prevDone
+		d.mu.Lock()
+		if d.done == prevDone {
+			d.done = nil
+		}
+		d.mu.Unlock()
 	}
-
-	scanCtx, cancel := context.WithCancel(ctx)
-	d.cancel = cancel
-	d.done = make(chan struct{})
-
-	go d.scanLoop(scanCtx)
 }
 
 // Stop gracefully stops the daemon and waits for the scan loop to exit.
@@ -168,8 +203,11 @@ func (d *Daemon) Rules() []IdleRule {
 // scanLoop runs the periodic scan cycle until the context is canceled.
 // It includes a health check mechanism that detects connection failures
 // and attempts to reconnect with exponential backoff.
-func (d *Daemon) scanLoop(ctx context.Context) {
-	defer close(d.done)
+// done is the completion channel of THIS loop generation, handed over by
+// Start; closing it (and never the current d.done field) keeps rapid
+// Stop/Start cycles free of double-close panics and hung Stops (B4).
+func (d *Daemon) scanLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
 
 	ticker := time.NewTicker(d.config.ScanInterval)
 	defer ticker.Stop()

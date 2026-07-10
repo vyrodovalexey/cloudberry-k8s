@@ -52,3 +52,7 @@ deploy/helm/
 .DS_Store
 .yandex-tank/
 .yandextank/
+test/e2e/okd4/
+deploy/okd4
+# ssh
+.ssh

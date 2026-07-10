@@ -547,10 +547,17 @@ func (s *Scenario52NegativeEdgeCaseE2ESuite) TestE2E_Scenario52g_BasicAuthFallba
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
 			"Bearer token should be rejected when OIDC is not available")
 
+		// C3 hardening: the 401 body is GENERIC — it must not disclose which
+		// providers are (un)configured. The client gets the RFC 7235 challenge
+		// advertising only the configured scheme (Basic here, OIDC is nil).
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		assert.Contains(t, strings.ToLower(string(body)), "oidc",
-			"error response should mention OIDC not being configured")
+		assert.NotContains(t, strings.ToLower(string(body)), "oidc",
+			"generic 401 body must not leak provider configuration state")
+		assert.Contains(t, string(body), "authentication required",
+			"401 body should carry the generic authentication-required message")
+		assert.Equal(t, `Basic realm="cloudberry"`, resp.Header.Get("WWW-Authenticate"),
+			"WWW-Authenticate must advertise only the configured Basic scheme")
 	})
 
 	s.logger.Info("scenario 52g E2E: basic auth fallback completed")

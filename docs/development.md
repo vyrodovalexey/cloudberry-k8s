@@ -17,6 +17,7 @@ This guide covers setting up a development environment, building the project, ru
 - [Shared DB Client Pattern in Admin Controller](#shared-db-client-pattern-in-admin-controller)
 - [Context-Aware Rebalance Goroutine Management](#context-aware-rebalance-goroutine-management)
 - [Code Style and Linting](#code-style-and-linting)
+- [Continuous Integration](#continuous-integration)
 - [Code Generation](#code-generation)
 - [Adding New Features](#adding-new-features)
 - [Debugging](#debugging)
@@ -535,7 +536,7 @@ IMG_OPERATOR=myregistry/cloudberry-operator:v0.2.0 make docker-build-operator
 
 The operator uses a multi-stage Dockerfile:
 
-1. **Builder stage**: `golang:1.26.4-alpine`, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
+1. **Builder stage**: `golang:1.26.5-alpine`, compiles with `-trimpath` and `-ldflags="-s -w -X main.version=... -X main.commit=... -X main.buildDate=..."`
 2. **Runtime stage**: `gcr.io/distroless/static-debian12:nonroot` (minimal, non-root)
 
 The final image is under 100MB and runs as user `65532` (nonroot). Version information is injected via build arguments (`VERSION`, `COMMIT`, `BUILD_DATE`) passed through Docker build args.
@@ -4816,6 +4817,23 @@ make vuln
 - All external dependencies must be behind interfaces for testability
 - Use `context.Context` for cancellation and timeout propagation
 - Avoid global state; prefer dependency injection
+
+## Continuous Integration
+
+The GitHub Actions pipeline lives in `.github/workflows/ci.yml`. Its triggers:
+
+| Trigger | Jobs that run |
+|---------|---------------|
+| Pull request | Verification jobs (lint, govulncheck, unit/service tests, SonarCloud scan) plus the PR-only build jobs (`build`, `docker-build*`, `helm-test-pr`) |
+| Push to `main` or `init` | Verification jobs only: lint, govulncheck, unit/service tests, and the SonarCloud scan |
+| Push of a `v*` tag | Verification jobs plus the release/publish jobs: `build-release`, `docker-build-push*`, `trivy-scan`, `helm-package` |
+
+The release/publish jobs are gated on
+`github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')`, so they
+never fire on a branch push; PR-only jobs are gated on
+`github.event_name == 'pull_request'`. The Makefile targets invoked by CI
+(`make lint`, `make test`, `make vuln`, …) are unchanged — a branch push runs
+the same verification you run locally.
 
 ## Code Generation
 

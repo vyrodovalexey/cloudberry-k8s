@@ -85,6 +85,9 @@ type fullMockDBClient struct {
 	redistributeErr        error
 	getRedistProgressErr   error
 	deregisterErr          error
+	gpexpandPresent        bool
+	gpexpandPresentErr     error
+	finalizeGpexpandErr    error
 	redistBeforeScaleInErr error
 	analyzeSkewErr         error
 	rebalanceTableErr      error
@@ -284,6 +287,9 @@ func (m *fullMockDBClient) LogRotate(_ context.Context) error { return m.logRota
 func (m *fullMockDBClient) RegisterNewSegments(_ context.Context, _ SegmentRegistrationOptions) error {
 	return m.registerSegErr
 }
+func (m *fullMockDBClient) SeedNewSegmentCatalog(_ context.Context, _ SegmentRegistrationOptions) (int, error) {
+	return 0, nil
+}
 func (m *fullMockDBClient) RedistributeData(_ context.Context, _ RedistributionOptions) error {
 	return m.redistributeErr
 }
@@ -292,6 +298,12 @@ func (m *fullMockDBClient) GetRedistributionProgress(_ context.Context) (int32, 
 }
 func (m *fullMockDBClient) DeregisterSegments(_ context.Context, _ int32) error {
 	return m.deregisterErr
+}
+func (m *fullMockDBClient) GpexpandSchemaPresent(_ context.Context) (bool, error) {
+	return m.gpexpandPresent, m.gpexpandPresentErr
+}
+func (m *fullMockDBClient) FinalizeGpexpand(_ context.Context) error {
+	return m.finalizeGpexpandErr
 }
 func (m *fullMockDBClient) RedistributeBeforeScaleIn(_ context.Context, _ ScaleInRedistributionOptions) error {
 	return m.redistBeforeScaleInErr
@@ -1274,6 +1286,117 @@ func TestPgxClient_DeregisterSegments_PingError(t *testing.T) {
 
 	err := client.DeregisterSegments(context.Background(), 2)
 	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "database not reachable")
+}
+
+// TestPgxClient_GpexpandSchemaPresent_Present verifies the D9 finalize-guard
+// presence check returns true when information_schema.schemata reports the
+// gpexpand schema exists.
+func TestPgxClient_GpexpandSchemaPresent_Present(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "information_schema.schemata") {
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"t"})
+		}
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+
+	present, err := client.GpexpandSchemaPresent(context.Background())
+	require.NoError(t, err)
+	assert.True(t, present, "schema must be reported present")
+}
+
+// TestPgxClient_GpexpandSchemaPresent_Absent verifies the presence check returns
+// false when the gpexpand schema does not exist (the common, already-clean case).
+func TestPgxClient_GpexpandSchemaPresent_Absent(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "information_schema.schemata") {
+			return singleRowResponseTyped([]fieldDesc{boolField("exists")}, []string{"f"})
+		}
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+
+	present, err := client.GpexpandSchemaPresent(context.Background())
+	require.NoError(t, err)
+	assert.False(t, present, "schema must be reported absent")
+}
+
+// TestPgxClient_GpexpandSchemaPresent_QueryError verifies the presence check
+// surfaces a scan/query error (wrapped) rather than silently returning false.
+func TestPgxClient_GpexpandSchemaPresent_QueryError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "information_schema.schemata") {
+			return errorResponseMsg("catalog unavailable")
+		}
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+
+	_, err := client.GpexpandSchemaPresent(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "querying gpexpand schema presence")
+}
+
+// TestPgxClient_GpexpandSchemaPresent_PingError verifies a closed pool yields the
+// not-reachable error before any query is attempted.
+func TestPgxClient_GpexpandSchemaPresent_PingError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+	client.pool.Close()
+
+	_, err := client.GpexpandSchemaPresent(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database not reachable")
+}
+
+// TestPgxClient_FinalizeGpexpand_Drop verifies the D9 finalize step dispatches
+// DROP SCHEMA IF EXISTS gpexpand CASCADE and succeeds (idempotent).
+func TestPgxClient_FinalizeGpexpand_Drop(t *testing.T) {
+	dropped := false
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "DROP SCHEMA IF EXISTS gpexpand CASCADE") {
+			dropped = true
+			return execResponse("DROP SCHEMA")
+		}
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+
+	err := client.FinalizeGpexpand(context.Background())
+	require.NoError(t, err)
+	assert.True(t, dropped, "DROP SCHEMA gpexpand CASCADE must be dispatched")
+}
+
+// TestPgxClient_FinalizeGpexpand_DropError verifies a DROP failure is wrapped and
+// returned (so the best-effort caller can log it).
+func TestPgxClient_FinalizeGpexpand_DropError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		if strings.Contains(query, "DROP SCHEMA") {
+			return errorResponseMsg("insufficient privilege")
+		}
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+
+	err := client.FinalizeGpexpand(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dropping gpexpand schema")
+}
+
+// TestPgxClient_FinalizeGpexpand_PingError verifies a closed pool yields the
+// not-reachable error before any DROP is attempted.
+func TestPgxClient_FinalizeGpexpand_PingError(t *testing.T) {
+	client, cleanup := newMockPgxClient(t, func(query string) []byte {
+		return execResponse("SELECT 1")
+	})
+	defer cleanup()
+	client.pool.Close()
+
+	err := client.FinalizeGpexpand(context.Background())
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "database not reachable")
 }
 

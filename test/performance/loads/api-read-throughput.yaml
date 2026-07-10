@@ -1,0 +1,38 @@
+# =============================================================================
+# API Read Path Throughput/Latency Profile
+# =============================================================================
+#
+# Purpose: Measure throughput and latency for authenticated GET endpoints
+#          against the acceptance-test cluster. Ramp from 1 to 50 RPS
+#          then hold at 25 RPS for 2 minutes.
+#
+# Endpoints tested:
+#   - GET /api/v1alpha1/clusters (list)
+#   - GET /api/v1alpha1/clusters/acceptance-test (detail)
+#   - GET /api/v1alpha1/clusters/acceptance-test/status
+#   - GET /api/v1alpha1/clusters/acceptance-test/segments
+#   - GET /api/v1alpha1/clusters/acceptance-test/mirroring
+#   - GET /api/v1alpha1/clusters/acceptance-test/standby
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/api-read-acceptance.txt
+  load_profile:
+    load_type: rps
+    schedule: line(1, 50, 60s) const(25, 120s)
+  timeout: 5s
+  instances: 100
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    - time(2000, 30s)
+    - http(5xx, 10%, 15s)
+    - http(4xx, 80%, 15s)
+    - net(xx, 5%, 10s)
+    - quantile(99, 5000, 30s)

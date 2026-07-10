@@ -12,7 +12,7 @@ import (
 
 func TestNewHistoryCollector(t *testing.T) {
 	t.Parallel()
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	require.NotNil(t, hc)
 	assert.True(t, hc.planCollection)
 	assert.Equal(t, time.Second, hc.slowQueryThreshold)
@@ -21,7 +21,7 @@ func TestNewHistoryCollector(t *testing.T) {
 
 func TestEnsureTable_NilConn(t *testing.T) {
 	t.Parallel()
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	err := hc.ensureTable(context.Background(), nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no database connection")
@@ -33,7 +33,7 @@ func TestEnsureTable_Success(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	err := hc.ensureTable(context.Background(), conn)
 	require.NoError(t, err)
 }
@@ -44,7 +44,7 @@ func TestEnsureTable_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	err := hc.ensureTable(context.Background(), conn)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ensuring query history table")
@@ -52,7 +52,7 @@ func TestEnsureTable_Error(t *testing.T) {
 
 func TestCollectHistory_NilConn(t *testing.T) {
 	t.Parallel()
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	// Should be a no-op and not panic.
 	hc.collectHistory(context.Background(), nil)
 }
@@ -71,7 +71,7 @@ func TestSnapshotSessions(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	pids, ok := hc.snapshotSessions(context.Background(), conn)
 	require.True(t, ok)
 	require.Len(t, pids, 2)
@@ -85,7 +85,7 @@ func TestSnapshotSessions_QueryError(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	_, ok := hc.snapshotSessions(context.Background(), conn)
 	assert.False(t, ok)
 }
@@ -116,7 +116,7 @@ func TestCollectHistory_DetectsCompleted(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	// First cycle records active pid.
 	hc.collectHistory(context.Background(), conn)
 	require.Len(t, hc.lastSeenPIDs, 1)
@@ -131,7 +131,7 @@ func TestRecordCompletedQuery_SkipNonActive(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	got := hc.recordCompletedQuery(context.Background(), conn, 1,
 		&sessionSnapshot{State: "idle", QueryText: "SELECT 1"}, time.Now())
 	assert.False(t, got)
@@ -143,7 +143,7 @@ func TestRecordCompletedQuery_SkipEmptyQuery(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	got := hc.recordCompletedQuery(context.Background(), conn, 1,
 		&sessionSnapshot{State: "active", QueryText: ""}, time.Now())
 	assert.False(t, got)
@@ -155,7 +155,7 @@ func TestRecordCompletedQuery_Success(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	got := hc.recordCompletedQuery(context.Background(), conn, 1,
 		&sessionSnapshot{
 			State: "active", QueryText: "SELECT 1",
@@ -170,7 +170,7 @@ func TestRecordCompletedQuery_InsertError(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	got := hc.recordCompletedQuery(context.Background(), conn, 1,
 		&sessionSnapshot{
 			State: "active", QueryText: "SELECT 1",
@@ -190,7 +190,7 @@ func TestRecordCompletedQuery_WithPlanCollection(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Millisecond)
+	hc := newHistoryCollector(testLogger(), true, time.Millisecond, nil)
 	// duration >> threshold so plan collection triggers.
 	got := hc.recordCompletedQuery(context.Background(), conn, 1,
 		&sessionSnapshot{
@@ -206,7 +206,7 @@ func TestCollectExplainPlan_SkipDDL(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	for _, q := range []string{"CREATE TABLE t (x int)", "DROP TABLE t", "VACUUM", "set x = 1"} {
 		plan := hc.collectExplainPlan(context.Background(), conn, q)
 		assert.Empty(t, plan)
@@ -222,7 +222,7 @@ func TestCollectExplainPlan_Success(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	plan := hc.collectExplainPlan(context.Background(), conn, "SELECT * FROM orders")
 	assert.Contains(t, plan, "Seq Scan on orders")
 	assert.Contains(t, plan, "Filter")
@@ -234,7 +234,7 @@ func TestCollectExplainPlan_QueryError(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), true, time.Second)
+	hc := newHistoryCollector(testLogger(), true, time.Second, nil)
 	plan := hc.collectExplainPlan(context.Background(), conn, "SELECT 1")
 	assert.Empty(t, plan)
 }
@@ -245,7 +245,7 @@ func TestInsertHistoryEntry_WithPlan(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	err := hc.insertHistoryEntry(context.Background(), conn, "q-1", 1,
 		&sessionSnapshot{Username: "u", Database: "d", QueryText: "SELECT 1"},
 		time.Now(), 100, "the plan")
@@ -254,7 +254,7 @@ func TestInsertHistoryEntry_WithPlan(t *testing.T) {
 
 func TestCleanupHistory_NilConn(t *testing.T) {
 	t.Parallel()
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	hc.cleanupHistory(context.Background(), nil, time.Hour)
 }
 
@@ -264,7 +264,7 @@ func TestCleanupHistory_Success(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	hc.cleanupHistory(context.Background(), conn, time.Hour)
 }
 
@@ -274,6 +274,6 @@ func TestCleanupHistory_Error(t *testing.T) {
 	})
 	defer cleanup()
 
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	hc.cleanupHistory(context.Background(), conn, time.Hour)
 }

@@ -54,6 +54,10 @@ import (
 // The render shell-quotes each token individually, so a flag/value pair appears
 // as '--flag' 'value'. RBAC: Basic GETs, Operator POST backup, Admin DELETE +
 // restore — exercised through the real withPermission middleware.
+//
+// D-B6 gate hardening (88a-8 / 88a-9, test/cases/scenario88_backup_disabled_cases.go):
+// the 85d/85e write endpoints share handleCreateBackup's requireBackupEnabled
+// gate — a nil/disabled backup spec => 400 BACKUP_NOT_ENABLED and NO Job.
 // ============================================================================
 
 const (
@@ -133,8 +137,12 @@ func (s *Scenario85APISuite) SetupTest() {
 
 // boot builds the API server (real router + auth/RBAC) over a fake client seeded
 // with the cluster + any extra objects, and a credential store with the three
-// permission tiers.
+// permission tiers. Re-booting (table subtests) closes the previous server so
+// its rate-limiter goroutine never leaks.
 func (s *Scenario85APISuite) boot(cluster *cbv1alpha1.CloudberryCluster, extra ...client.Object) {
+	if s.server != nil {
+		s.server.Close()
+	}
 	objs := []client.Object{cluster}
 	objs = append(objs, extra...)
 	env := testutil.NewTestK8sEnv(objs...)
@@ -453,6 +461,80 @@ func (s *Scenario85APISuite) TestFunctional_Scenario85_RestoreBackup_OperatorFor
 	rec := s.do(scenario85OperUser, scenario85OperPass, http.MethodPost,
 		scenario85Path("/backups/"+scenario85TS+"/restore"), `{}`)
 	assert.Equal(s.T(), http.StatusForbidden, rec.Code, "85e: Operator must be forbidden (Admin required)")
+}
+
+// --- 88a-8 / 88a-9: restore + delete share the backup-disabled gate (D-B6) ---
+
+// scenario85DisabledBackupClusters enumerates the two gated cluster shapes for
+// the D-B6 gate: Spec.Backup == nil and Spec.Backup.Enabled == false. See
+// test/cases/scenario88_backup_disabled_cases.go (88a-8, 88a-9).
+func scenario85DisabledBackupClusters() map[string]*cbv1alpha1.CloudberryCluster {
+	nilSpec := scenario85BackupCluster()
+	nilSpec.Spec.Backup = nil
+
+	disabled := scenario85BackupCluster()
+	disabled.Spec.Backup.Enabled = false
+
+	return map[string]*cbv1alpha1.CloudberryCluster{
+		"nil backup spec":      nilSpec,
+		"backup disabled spec": disabled,
+	}
+}
+
+// scenario85JobCount counts Jobs in the scenario namespace (gate proof: the
+// 400 reject must never materialize a restore/cleanup Job).
+func (s *Scenario85APISuite) scenario85JobCount() int {
+	jobs := &batchv1.JobList{}
+	require.NoError(s.T(), s.client.List(s.ctx, jobs, client.InNamespace(scenario85Namespace)))
+	return len(jobs.Items)
+}
+
+// TestFunctional_Scenario85_RestoreBackup_BackupDisabled400 proves the D-B6
+// restore gate through the REAL router + auth middleware (88a-8): POST
+// /backups/{ts}/restore on a nil-spec or disabled cluster => 400
+// BACKUP_NOT_ENABLED and NO restore Job is created.
+func (s *Scenario85APISuite) TestFunctional_Scenario85_RestoreBackup_BackupDisabled400() {
+	for name, cluster := range scenario85DisabledBackupClusters() {
+		s.Run(name, func() {
+			s.boot(cluster)
+			rec := s.do(scenario85AdminUser, scenario85AdminPass, http.MethodPost,
+				scenario85Path("/backups/"+scenario85TS+"/restore"), `{}`)
+
+			require.Equal(s.T(), http.StatusBadRequest, rec.Code,
+				"88a-8: restore on a backup-disabled cluster must be rejected with 400")
+			resp := s.decode(rec)
+			errObj, ok := resp["error"].(map[string]interface{})
+			require.True(s.T(), ok, "error envelope must be present")
+			assert.Equal(s.T(), "BACKUP_NOT_ENABLED", errObj["code"],
+				"88a-8: the reject must carry code BACKUP_NOT_ENABLED")
+			assert.Zero(s.T(), s.scenario85JobCount(),
+				"88a-8: no restore Job may be created when the gate rejects")
+		})
+	}
+}
+
+// TestFunctional_Scenario85_DeleteBackup_BackupDisabled400 proves the D-B6
+// delete gate through the REAL router + auth middleware (88a-9): DELETE
+// /backups/{ts} on a nil-spec or disabled cluster => 400 BACKUP_NOT_ENABLED
+// and NO cleanup Job is created.
+func (s *Scenario85APISuite) TestFunctional_Scenario85_DeleteBackup_BackupDisabled400() {
+	for name, cluster := range scenario85DisabledBackupClusters() {
+		s.Run(name, func() {
+			s.boot(cluster)
+			rec := s.do(scenario85AdminUser, scenario85AdminPass, http.MethodDelete,
+				scenario85Path("/backups/"+scenario85TS), "")
+
+			require.Equal(s.T(), http.StatusBadRequest, rec.Code,
+				"88a-9: delete-backup on a backup-disabled cluster must be rejected with 400")
+			resp := s.decode(rec)
+			errObj, ok := resp["error"].(map[string]interface{})
+			require.True(s.T(), ok, "error envelope must be present")
+			assert.Equal(s.T(), "BACKUP_NOT_ENABLED", errObj["code"],
+				"88a-9: the reject must carry code BACKUP_NOT_ENABLED")
+			assert.Zero(s.T(), s.scenario85JobCount(),
+				"88a-9: no cleanup Job may be created when the gate rejects")
+		})
+	}
 }
 
 // --- 85f: GET /backups/jobs -> job statuses ---

@@ -1,0 +1,34 @@
+# =============================================================================
+# Health/Metrics Endpoints Baseline
+# =============================================================================
+#
+# Purpose: Establish baseline latency for unauthenticated health endpoints.
+#          These bypass rate limiting and auth, so they represent the
+#          minimum overhead of the HTTP server.
+#
+# Endpoints tested:
+#   - GET /healthz (on port 8190 REST API)
+#   - GET /readyz  (on port 8190 REST API)
+#   - GET /healthz (on port 8081 health probe)
+#   - GET /readyz  (on port 8081 health probe)
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/health.txt
+  load_profile:
+    load_type: rps
+    schedule: line(1, 100, 30s) const(100, 60s)
+  timeout: 3s
+  instances: 200
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    - time(1000, 30s)
+    - http(5xx, 5%, 15s)
+    - net(xx, 3%, 10s)

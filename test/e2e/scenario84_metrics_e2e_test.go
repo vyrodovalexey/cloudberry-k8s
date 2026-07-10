@@ -239,6 +239,7 @@ func (s *Scenario84MetricsE2ESuite) TestE2E_Scenario84_LiveMetrics() {
 	if cluster == "" {
 		cluster = "scenario84-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS84Script)
 	if script == "" {

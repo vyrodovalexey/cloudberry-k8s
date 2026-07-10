@@ -418,6 +418,7 @@ func (s *Scenario80PostRestoreValidationE2ESuite) TestE2E_Scenario80_LivePostRes
 	if cluster == "" {
 		cluster = "scenario80-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS80Script)
 	if script == "" {

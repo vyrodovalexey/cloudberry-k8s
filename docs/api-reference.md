@@ -2662,7 +2662,7 @@ cloudberry-ctl auth rotate-password --cluster my-cluster
 {
   "error": {
     "code": "UNAUTHORIZED",
-    "message": "Missing or invalid Authorization header"
+    "message": "authentication required"
   }
 }
 ```
@@ -2698,6 +2698,8 @@ X-Frame-Options: DENY
 X-XSS-Protection: 1; mode=block
 ```
 
+Every `401 Unauthorized` response additionally carries an RFC 7235 `WWW-Authenticate` challenge advertising the configured authentication scheme(s) (`Basic realm="cloudberry"`, `Bearer`, or both).
+
 ## Error Handling
 
 ### Error Response Format
@@ -2721,8 +2723,9 @@ All errors follow a consistent JSON format:
 
 | HTTP Status | Code | Description |
 |-------------|------|-------------|
-| 400 | `INVALID_REQUEST` | Malformed request body or invalid parameters |
-| 401 | `UNAUTHORIZED` | Missing or invalid credentials |
+| 400 | `INVALID_REQUEST` | Malformed request body or invalid parameters (including trailing data after the JSON body; unknown fields are still accepted for client version-skew compatibility) |
+| 400 | `BACKUP_NOT_ENABLED` | Backup lifecycle endpoint (create, delete, restore, schedule update) invoked for a cluster whose `spec.backup` is absent or disabled |
+| 401 | `UNAUTHORIZED` | Missing or invalid credentials. The body is generic (never discloses which auth providers are configured); every 401 carries an RFC 7235 `WWW-Authenticate` challenge listing the configured scheme(s) |
 | 403 | `FORBIDDEN` | Insufficient permissions for the requested operation |
 | 404 | `CLUSTER_NOT_FOUND` | Cluster does not exist |
 | 404 | `SEGMENT_NOT_FOUND` | Segment does not exist |
@@ -2740,14 +2743,21 @@ All errors follow a consistent JSON format:
 
 **401 Unauthorized:**
 
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="cloudberry", Bearer
+```
+
 ```json
 {
   "error": {
     "code": "UNAUTHORIZED",
-    "message": "Missing or invalid Authorization header"
+    "message": "authentication required"
   }
 }
 ```
+
+The 401 body is deliberately **generic** — `authentication required` for a missing/unrecognized `Authorization` header, `authentication failed` for rejected credentials. The concrete reason (missing header, unsupported scheme, unconfigured provider) is logged and attached to the trace span, never returned to the client. The `WWW-Authenticate` challenge advertises only the configured scheme(s): `Basic realm="cloudberry"`, `Bearer`, or both comma-joined.
 
 **403 Forbidden:**
 
@@ -2850,7 +2860,7 @@ When `guestAccess: true` is set in a cluster's `queryMonitoring` spec, certain r
 The API enforces per-IP token bucket rate limiting on all authenticated endpoints. Rate limiting is applied **before** authentication to protect against brute-force credential attacks.
 
 - **Default limit**: 10 requests per minute per client IP. Configurable via the `api-rate-limit` config key / `--api-rate-limit` flag / `CLOUDBERRY_API_RATE_LIMIT` environment variable; set `0` to disable (useful for performance testing)
-- **Observability**: rejections are counted on `cloudberry_api_rate_limit_rejections_total{route}` (route template label)
+- **Observability**: rejections are counted on `cloudberry_api_rate_limit_rejections_total{route}` (route template label), and `cloudberry_api_rate_limit_entries` samples the limiter's live per-client entry count on every scrape (memory footprint / cleanup visibility)
 - **Algorithm**: Token bucket with automatic refill based on elapsed time
 - **IP extraction**: Uses `RemoteAddr` by default. `X-Forwarded-For` and `X-Real-IP` headers are only trusted when the direct connection comes from a configured trusted proxy CIDR range. This prevents header spoofing attacks
 - **Trusted proxies**: Configure trusted proxy CIDR ranges (e.g., `10.0.0.0/8`) to enable proxy header trust. When no trusted proxies are configured (the default), only `RemoteAddr` is used
@@ -3091,6 +3101,8 @@ Validates `CloudberryCluster` resources before admission. Enforces:
 - Vault enabled requires `address`
 - Valid parameter names in `config.parameters`
 - `deletionPolicy` is `Retain` or `Delete`
+- `spec.affinity.mode` (when set) is `segment-mirror` or `full`, and `spec.affinity.type` (when set) is `preferred` or `required`
+- **Anti-affinity `type: required` with a `segment-mirror`/`full` mode** is admitted with a non-fatal **warning**: the segment primary↔mirror term is applied as `preferred` (best-effort) regardless, because a hard whole-group primaries-vs-mirrors requirement would wedge scheduling on node-constrained clusters. The coordinator↔backup and coordinator↔standby terms still honor `required` (each targets the single coordinator pod, needs ≥2 nodes)
 - `backup.destination.s3.vaultSecret.path` (when set) must be non-empty and must not start with `/`; the explicit KV-v2 request form (`<mount>/data/<rest>`) is accepted with an admission **warning** suggesting the logical path — the operator injects the `data/` segment automatically for KV-v2 mounts
 
 **Duplicate name rejection example:**
@@ -3123,6 +3135,8 @@ Sets defaults on `CloudberryCluster` resources:
 | `segments.mirroring.enabled` | `true` |
 | `segments.mirroring.layout` | `group` |
 | `segments.antiAffinity` | `preferred` |
+| `affinity.type` (when `spec.affinity` is set) | `preferred` |
+| `affinity.topologyKey` (when `spec.affinity` is set) | `kubernetes.io/hostname` |
 | `auth.basic.enabled` | `true` |
 | `auth.basic.adminUser` | `gpadmin` |
 | `backup.image` (when `backup.enabled`) | `"cloudberry-backup:2.1.0"` — the official backup toolchain image. A backup-capable image must contain `kubectl` (the backup/restore Jobs `kubectl exec` into the coordinator pod) and `gpbackup`/`gprestore`/`gpbackup_s3_plugin`; the base database image is **not** sufficient |

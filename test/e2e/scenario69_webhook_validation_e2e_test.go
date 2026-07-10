@@ -5,12 +5,14 @@ package e2e
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -133,6 +135,17 @@ func scenario69Cases() []scenario69Case {
 			id: "69d", name: "compressionLevel zero",
 			mutate:  func(b *cbv1alpha1.BackupSpec) { b.Gpbackup.CompressionLevel = 0 },
 			substrs: []string{"compressionLevel"},
+			// GpbackupOptions.CompressionLevel is `int32` with
+			// `json:"compressionLevel,omitempty"` and `+optional`. Setting it to 0
+			// (the zero value) causes JSON marshaling to OMIT the field entirely, so
+			// over the wire a live API server sees an ABSENT optional field — which
+			// the CRD's `Minimum=1` constraint legitimately does not apply to. Hence
+			// the live API server correctly admits it (0 == unset == gpbackup default).
+			// The direct validator (Part A) still operates on the in-memory struct
+			// where the explicit 0 is visible and IS rejected, so coverage of the
+			// "level must be >= 1" rule is preserved there. This case is therefore not
+			// a valid LIVE negative case (mirrors the 69j mutating-webhook-repair case).
+			liveSkip: true,
 		},
 		{
 			id: "69e", name: "invalid compression type",
@@ -239,8 +252,22 @@ func (s *Scenario69WebhookValidationE2ESuite) TestE2E_Scenario69_LiveAPIServerRe
 				s.T().Skip("mutating webhook repairs this field before validation; " +
 					"live API server accepts the CR")
 			}
-			cluster := scenario69E2ECluster("live-s69-"+tc.id, tc.mutate)
+			// Each case gets a UNIQUE, sanitized CR name. Previously all cases
+			// sharing an `id` (e.g. the two "69d" cases) collided on the same
+			// name; combined with no cleanup, a leftover object from a prior
+			// run/case made the "not persisted" assertion flap. A per-case name +
+			// best-effort pre-delete + deferred teardown guarantee isolation.
+			name := "live-s69-" + scenario69SanitizeName(tc.id+"-"+tc.name)
+			cluster := scenario69E2ECluster(name, tc.mutate)
 			cluster.Namespace = ns
+
+			nn := types.NamespacedName{Name: name, Namespace: ns}
+
+			// Best-effort pre-clean of any stale object with this name so the
+			// "not persisted" proof cannot be poisoned by leftovers.
+			scenario69DeleteIfExists(s.ctx, cl, nn)
+			// Deferred teardown: never leak a CR that (unexpectedly) got admitted.
+			defer scenario69DeleteIfExists(s.ctx, cl, nn)
 
 			createErr := cl.Create(s.ctx, cluster)
 			require.Error(s.T(), createErr, "live API server should reject invalid CR")
@@ -250,13 +277,39 @@ func (s *Scenario69WebhookValidationE2ESuite) TestE2E_Scenario69_LiveAPIServerRe
 
 			// Prove it was not persisted.
 			got := &cbv1alpha1.CloudberryCluster{}
-			getErr := cl.Get(s.ctx, types.NamespacedName{
-				Name:      cluster.Name,
-				Namespace: ns,
-			}, got)
+			getErr := cl.Get(s.ctx, nn, got)
 			require.Error(s.T(), getErr)
 			assert.True(s.T(), apierrors.IsNotFound(getErr),
 				"rejected CR must not be persisted, got %v", getErr)
 		})
 	}
+}
+
+// scenario69SanitizeName turns a human case label into an RFC-1123 label-safe,
+// unique-per-case CR name fragment (lowercase alnum + '-', trimmed).
+func scenario69SanitizeName(in string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(in) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// scenario69DeleteIfExists best-effort removes a CR (ignoring NotFound) so a
+// live negative case is never contaminated by a leftover object.
+func scenario69DeleteIfExists(ctx context.Context, cl client.Client, nn types.NamespacedName) {
+	obj := &cbv1alpha1.CloudberryCluster{}
+	obj.Name = nn.Name
+	obj.Namespace = nn.Namespace
+	_ = cl.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground))
 }

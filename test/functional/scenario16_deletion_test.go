@@ -307,6 +307,87 @@ func (s *Scenario16DeletionSuite) TestScenario16b_DeleteWithDeletePolicy() {
 		"PVCsRetained event should NOT be emitted with Delete policy; events: %v", events)
 }
 
+// --- Test: Delete While Stopped / Restricted / Maintenance (deletion-ordering fix) ---
+
+// TestScenario16c_DeleteWhileStopped is the functional regression for the
+// deletion-ordering fix (code review B1): Reconcile must route a Terminating
+// cluster to handleDeletion BEFORE the lifecycle phase short-circuit and the
+// generation gate. End-to-end journey: the cluster sits in a lifecycle phase
+// (Stopped primary; Restricted/Maintenance variants) with an up-to-date
+// ObservedGeneration (both gates armed), the user deletes the CR, and one
+// reconcile must remove the finalizer so the object terminates — no endless
+// requeue, PVCs retained per the Retain policy.
+func (s *Scenario16DeletionSuite) TestScenario16c_DeleteWhileStopped() {
+	phases := []struct {
+		name  string
+		phase cbv1alpha1.ClusterPhase
+	}{
+		{name: "stopped", phase: cbv1alpha1.ClusterPhaseStopped},
+		{name: "restricted", phase: cbv1alpha1.ClusterPhaseRestricted},
+		{name: "maintenance", phase: cbv1alpha1.ClusterPhaseMaintenance},
+	}
+
+	for _, tc := range phases {
+		s.Run(tc.name, func() {
+			t := s.T()
+
+			// Arrange: a cluster parked in the lifecycle phase with Retain policy.
+			cluster := testutil.NewClusterBuilder(scenario16ClusterName, scenario16Namespace).
+				WithVersion("7.1.0").
+				WithSegments(scenario16SegCount).
+				WithDeletionPolicy(cbv1alpha1.DeletionPolicyRetain).
+				WithBackupOnDelete(false).
+				WithFinalizer().
+				Build()
+
+			env := testutil.NewTestK8sEnv(cluster)
+
+			// Park the cluster in the lifecycle phase AND mark the generation
+			// observed — before the fix either gate could shadow handleDeletion
+			// (Stopped returned without removing the finalizer; Restricted/
+			// Maintenance requeued forever).
+			current, err := env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+			require.NoError(t, err)
+			current.Status.Phase = tc.phase
+			current.Status.ObservedGeneration = current.Generation
+			require.NoError(t, env.Client.Status().Update(s.ctx, current))
+
+			createPVCsForCluster(s.ctx, t, env, cluster.Name, cluster.Namespace, 2)
+
+			// Act: user deletes the CR (finalizer keeps it Terminating), then
+			// one reconcile pass runs.
+			setDeletionTimestamp(s.ctx, t, env, cluster.Name, cluster.Namespace)
+
+			fakeRecorder := record.NewFakeRecorder(100)
+			reconciler := newScenario16Reconciler(env, fakeRecorder, s.logger)
+			result, err := reconciler.Reconcile(s.ctx, scenario16Req())
+			require.NoError(t, err, "deletion reconciliation should succeed in phase %s", tc.phase)
+			assert.Zero(t, result.RequeueAfter,
+				"deletion must complete without an endless requeue loop in phase %s", tc.phase)
+
+			// Assert: the finalizer was removed so the object terminated.
+			_, getErr := env.GetCluster(s.ctx, cluster.Name, cluster.Namespace)
+			assert.Error(t, getErr,
+				"cluster in phase %s should be deleted after finalizer removal", tc.phase)
+
+			// PVCs retained (Retain policy) — deletion still honors the policy.
+			pvcList := &corev1.PersistentVolumeClaimList{}
+			require.NoError(t, env.Client.List(s.ctx, pvcList,
+				client.InNamespace(cluster.Namespace),
+				client.MatchingLabels{util.LabelCluster: cluster.Name}))
+			assert.Len(t, pvcList.Items, 2,
+				"PVCs should still exist with Retain policy in phase %s", tc.phase)
+
+			// Deletion events prove handleDeletion actually ran (not a gate skip).
+			events := collectScenario16Events(fakeRecorder)
+			assert.True(t, hasEvent(events, "Deleting"),
+				"Deleting event should be emitted in phase %s; events: %v", tc.phase, events)
+			assert.True(t, hasEvent(events, "Deleted"),
+				"Deleted event should be emitted in phase %s; events: %v", tc.phase, events)
+		})
+	}
+}
+
 // --- Test: No Finalizer Skips Deletion ---
 
 func (s *Scenario16DeletionSuite) TestScenario16_NoFinalizerSkipsDeletion() {

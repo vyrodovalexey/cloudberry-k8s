@@ -14,6 +14,10 @@
 #   CLOUDBERRY_SEGMENT_PORT     - Port for this segment (default: 5432)
 #   CLOUDBERRY_DB_ID            - Database ID for this segment
 #   CLOUDBERRY_MAX_CONNECTIONS  - Max connections (default: 100)
+#   CLOUDBERRY_GPEXPAND_MANAGED - When "true", a scale-out segment added by
+#                                 gpexpand: init_segment SKIPS initdb so gpexpand
+#                                 initializes the datadir from the coordinator
+#                                 template (default: false / normal first-boot).
 # =============================================================================
 
 set -euo pipefail
@@ -24,6 +28,22 @@ set -euo pipefail
 # GPHOME is intentionally not readonly — cloudberry-env.sh reassigns it.
 GPHOME="${GPHOME:-/usr/local/cloudberry-db}"
 export GPHOME
+
+# CLUSTER_SSH_PORT is the single source of truth for the intra-cluster SSH port.
+# Under the scoped OKD restricted-v2 SCC the DB container runs as gpadmin
+# (UID 1000) WITHOUT NET_BIND_SERVICE and WITHOUT dependable sudo-to-root, so it
+# cannot bind the privileged port 22. A rootless sshd on a high port (>=1024)
+# needs no capability and no root; 2022 is the proven default (matches the
+# backup subsystem precedent). gpexpand/gpssh/gpsync are redirected to this port
+# via the gpadmin ~/.ssh/config `Port` directive (see write_ssh_client_config).
+readonly CLUSTER_SSH_PORT="${CLUSTER_SSH_PORT:-2022}"
+
+# gpadmin-writable runtime paths for the rootless sshd (no root needed): host
+# key + pid file must live where gpadmin can write since /etc/ssh and /run are
+# root-owned under the SCC.
+readonly SSHD_HOSTKEY_DIR="${SSHD_HOSTKEY_DIR:-/home/gpadmin/.ssh/hostkeys}"
+readonly SSHD_HOSTKEY="${SSHD_HOSTKEY_DIR}/ssh_host_ed25519_key"
+readonly SSHD_PID_FILE="${SSHD_PID_FILE:-/home/gpadmin/run/sshd.pid}"
 
 readonly PGDATA="${PGDATA:-/data/pgdata}"
 readonly CLOUDBERRY_ROLE="${CLOUDBERRY_ROLE:-coordinator}"
@@ -144,10 +164,17 @@ readonly SHARED_SSH_DIR="${SHARED_SSH_DIR:-/etc/cloudberry/ssh}"
 # Disabling StrictHostKeyChecking + UserKnownHostsFile + lowering LogLevel keeps
 # the session clean. PAM lastlog/MOTD noise is suppressed separately (see
 # silence_login_noise + the image-build sshd/pam changes).
+#
+# The `Port ${CLUSTER_SSH_PORT}` (2022) directive is REQUIRED under the scoped
+# restricted-v2 SCC: the cluster pods run a ROOTLESS sshd on 2022 (no privileged
+# 22 bind is possible), and gpexpand/gpssh/gpsync/gpbackup all shell out to the
+# OpenSSH client, which honors this per-host `Port`. The only ssh targets in
+# these pods are other cluster pods, so a wildcard `Host *` block is safe.
 # ---------------------------------------------------------------------------
 write_ssh_client_config() {
-    cat > /home/gpadmin/.ssh/config <<'EOF'
+    cat > /home/gpadmin/.ssh/config <<EOF
 Host *
+  Port ${CLUSTER_SSH_PORT}
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
@@ -258,7 +285,60 @@ start_sshd() {
     write_ssh_client_config
     silence_login_noise
 
-    sudo /usr/sbin/sshd 2>/dev/null || log_warn "SSH daemon failed to start (non-fatal)"
+    start_rootless_sshd
+}
+
+# ---------------------------------------------------------------------------
+# Start a ROOTLESS sshd on CLUSTER_SSH_PORT (default 2022) as gpadmin.
+#
+# Under the scoped OKD restricted-v2 SCC the DB container runs as gpadmin
+# (UID 1000) WITHOUT NET_BIND_SERVICE and WITHOUT dependable sudo-to-root, so it
+# cannot bind privileged port 22. Binding a high port (>=1024) needs no
+# capability and no root. gpexpand's segment-init phase SSHes to the new segment
+# hosts to seed their data dirs (basebackup of the coordinator template); those
+# ssh/gpssh/gpsync calls are redirected to 2022 via the gpadmin ~/.ssh/config
+# `Port` directive, so a rootless sshd on 2022 is exactly what gpexpand reaches.
+#
+# `UsePAM=no` sidesteps the container-hostile PAM stack entirely (no sudo needed
+# to edit /etc/pam.d/sshd), which also fixes the exit-254 class of problems. Host
+# key + pid file live in gpadmin-writable paths. The legacy sudo:22 daemon is
+# still started as a best-effort LOCAL/non-OKD fallback so current non-SCC
+# behavior is preserved.
+# ---------------------------------------------------------------------------
+start_rootless_sshd() {
+    # gpadmin-owned runtime dirs (no root/privileged bind needed for :2022).
+    mkdir -p "${SSHD_HOSTKEY_DIR}" "$(dirname "${SSHD_PID_FILE}")" 2>/dev/null || true
+
+    # Generate a gpadmin-writable host key if missing (does NOT need root, unlike
+    # ssh-keygen -A which writes into root-owned /etc/ssh).
+    if [ ! -f "${SSHD_HOSTKEY}" ]; then
+        log_info "Generating rootless sshd host key at ${SSHD_HOSTKEY}..."
+        ssh-keygen -t ed25519 -N '' -f "${SSHD_HOSTKEY}" 2>/dev/null || \
+            log_warn "Failed to generate rootless sshd host key"
+    fi
+
+    log_info "Starting rootless SSH daemon on port ${CLUSTER_SSH_PORT}..."
+    # -f /dev/null: skip /etc/ssh/sshd_config which is root-owned and unreadable
+    # under the restricted-v2 SCC (Permission denied). All config is passed via -o.
+    /usr/sbin/sshd -f /dev/null \
+        -o "Port=${CLUSTER_SSH_PORT}" \
+        -o "HostKey=${SSHD_HOSTKEY}" \
+        -o "PidFile=${SSHD_PID_FILE}" \
+        -o "PubkeyAuthentication=yes" \
+        -o "PasswordAuthentication=no" \
+        -o "UsePAM=no" \
+        -o "StrictModes=no" \
+        -o "PrintMotd=no" \
+        -o "PrintLastLog=no" \
+        -o "AuthorizedKeysFile=/home/gpadmin/.ssh/authorized_keys" \
+        2>/dev/null || \
+        log_warn "Rootless SSH daemon failed to start on ${CLUSTER_SSH_PORT} (non-fatal)"
+
+    # Legacy sudo:22 daemon — best-effort LOCAL/non-OKD fallback only. Under the
+    # restricted-v2 SCC this is expected to fail (no root/NET_BIND_SERVICE); the
+    # rootless :2022 daemon above is the load-bearing listener.
+    sudo /usr/sbin/sshd 2>/dev/null || \
+        log_info "Privileged sshd on :22 not started (expected under restricted-v2 SCC; rootless :${CLUSTER_SSH_PORT} is used)"
 }
 
 # ---------------------------------------------------------------------------
@@ -393,6 +473,288 @@ init_coordinator() {
 }
 
 # ---------------------------------------------------------------------------
+# Decide whether THIS segment pod is a gpexpand-managed scale-out addition.
+#
+# Returns success (0) when the pod must SKIP self-initdb and let gpexpand
+# initialize its datadir. Two signals, in order of precedence:
+#   1. Explicit override CLOUDBERRY_GPEXPAND_MANAGED=true (local/manual runs).
+#   2. Operator-provided CLOUDBERRY_EXPANSION_BASE_COUNT (the pre-scale segment
+#      count) present AND this pod's content id (ordinal) >= that base — i.e.
+#      this is one of the newly-added segments in an in-progress scale-out.
+# Any other case (flag unset/false, no base count, or ordinal < base) => normal
+# first-boot initdb, unchanged.
+# ---------------------------------------------------------------------------
+is_gpexpand_managed_segment() {
+    if [ "${CLOUDBERRY_GPEXPAND_MANAGED:-false}" = "true" ]; then
+        return 0
+    fi
+
+    local base="${CLOUDBERRY_EXPANSION_BASE_COUNT:-}"
+    # Only act on a valid, non-empty integer base count.
+    if [[ "${base}" =~ ^[0-9]+$ ]]; then
+        local content="${CLOUDBERRY_CONTENT_ID:--1}"
+        if [[ "${content}" =~ ^[0-9]+$ ]] && [ "${content}" -ge "${base}" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Upsert the Cloudberry segment content id GUC into a datadir's
+# internal.auto.conf.
+#
+# In Cloudberry 2.1 the segment content id is carried by the GUC `gp_contentid`
+# in the datadir's internal.auto.conf (read at postmaster start), NOT by a
+# `postgres -C <id>` flag (that is standard PostgreSQL "print a config parameter
+# and exit"). init_segment writes `gp_contentid = <id>` for NORMAL segments; a
+# gpexpand-managed segment's datadir is basebackup'd from the COORDINATOR
+# template and therefore inherits the WRONG value (`gp_contentid = -1`), so it
+# must be corrected before postgres starts.
+#
+# This helper REPLACES any existing `gp_contentid` line (the inherited -1) and
+# appends one if none is present, using the EXACT `gp_contentid = <id>` spelling
+# init_segment uses so normal and gpexpand-managed segments are identical on
+# disk. It is idempotent and safe to call repeatedly.
+# ---------------------------------------------------------------------------
+upsert_gp_contentid() {
+    local data_dir="$1"
+    local content_id="$2"
+    local conf="${data_dir}/internal.auto.conf"
+
+    # Guard: only a valid integer content id may be written.
+    if ! [[ "${content_id}" =~ ^-?[0-9]+$ ]]; then
+        log_warn "refusing to write gp_contentid: invalid content id '${content_id}'"
+        return 1
+    fi
+
+    # Remove any prior gp_contentid line (e.g. the coordinator template's -1),
+    # then append the correct value. Matches init_segment's `gp_contentid = <id>`.
+    # grep -v to a temp file + mv is used (instead of `sed -i`) so the behavior is
+    # identical on GNU sed (container) and BSD sed (dev macOS) — `sed -i` has an
+    # incompatible in-place backup-suffix syntax between the two.
+    if [ -f "${conf}" ]; then
+        local tmp="${conf}.cbk.$$"
+        grep -v -E '^[[:space:]]*gp_contentid[[:space:]]*=' "${conf}" > "${tmp}" 2>/dev/null || true
+        mv "${tmp}" "${conf}" 2>/dev/null || rm -f "${tmp}" 2>/dev/null || true
+    fi
+    echo "gp_contentid = ${content_id}" >> "${conf}"
+    log_info "set gp_contentid = ${content_id} in ${conf}"
+}
+
+# ---------------------------------------------------------------------------
+# Location of the REAL pg_ctl binary AFTER the shim is installed in its place.
+# The shim is installed AT ${GPHOME}/bin/pg_ctl (replacing the real binary,
+# which is renamed to pg_ctl.real) so it ALWAYS wins regardless of PATH order.
+# ---------------------------------------------------------------------------
+readonly GPEXPAND_REAL_PGCTL_SUFFIX=".real"
+# Marker line the generated shim carries so the install is idempotent and
+# distinguishable from the real binary (which is ELF, not a shell script).
+readonly GPEXPAND_SHIM_MARKER="# cloudberry-k8s gpexpand pg_ctl shim"
+
+# ---------------------------------------------------------------------------
+# NO-OP: the gpexpand pg_ctl shim is now BAKED AT BUILD TIME (as root) into the
+# image at ${GPHOME}/bin/pg_ctl (the real binary renamed to pg_ctl.real). See
+# hack/gpexpand-pgctl-shim.sh + Dockerfile.cloudberry-official.
+#
+# WHY BAKED, NOT RUNTIME-INSTALLED: at RUNTIME the pod runs as gpadmin (UID
+# 1000) under the restricted-v2 SCC and ${GPHOME}/bin is root-owned, so the
+# previous runtime rename+write here failed with "cannot write
+# /usr/local/cloudberry-db/bin; gpexpand pg_ctl shim NOT installed" and the shim
+# never installed — gpexpand's pg_ctl start then never upserted gp_contentid and
+# postgres FATAL'd "contentid not specified". Baking at build time (root) side-
+# steps the SCC entirely, and the baked shim DERIVES the content id from the
+# `-D <datadir>` gpseg<N> suffix so the SAME shim is correct in every per-pod
+# image (no runtime env / no entrypoint cooperation needed).
+#
+# This function is kept (invoked by main()) as a TOLERANT no-op: it merely
+# VERIFIES the baked shim is present and logs, and NEVER fails on the read-only
+# ${GPHOME}/bin (so a normal segment start path is unaffected). The two readonly
+# constants above are retained for documentation/compat.
+# ---------------------------------------------------------------------------
+install_gpexpand_pgctl_shim() {
+    local pgctl="${GPHOME}/bin/pg_ctl"
+
+    if grep -q "${GPEXPAND_SHIM_MARKER}" "${pgctl}" 2>/dev/null; then
+        log_info "gpexpand pg_ctl shim is baked into the image at ${pgctl} (content id derived from the -D gpseg<N> datadir); no runtime install needed"
+    else
+        # The image predates the baked shim (or was rebuilt without it). Under
+        # the restricted-v2 SCC the runtime rename is NOT possible (root-owned
+        # ${GPHOME}/bin), so we do NOT attempt it — tolerate and warn. The
+        # gpexpand_handoff_to_steady_state upsert_gp_contentid path still
+        # corrects gp_contentid on this pod's own datadir after gpexpand init.
+        log_warn "gpexpand pg_ctl shim NOT baked into ${pgctl}; relying on the post-gpexpand handoff to correct gp_contentid (rebuild the cluster image to bake the shim)"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Pre-init idle loop for a gpexpand-managed scale-out segment.
+#
+# A newly-added, gpexpand-managed segment has an EMPTY datadir: gpexpand (driven
+# by the operator's coordinator-exec Job) initializes it from the coordinator
+# template over SSH AND starts postgres on it via `pg_ctl -D <datadir> ... start`
+# (using the segment port 5432). Until that happens there is NO local database
+# to start, so this pod must NOT exec `postgres` on the empty datadir (that would
+# exit immediately -> CrashLoopBackOff -> the pod is NOT Running, and the
+# operator's scale-out gate waits for the pod to be Running before it runs
+# gpexpand -> deadlock).
+#
+# CRITICAL: during this idle phase the entrypoint must NOT bind or hold the
+# segment postgres port (5432) and must NOT run any postgres process, otherwise
+# gpexpand's `pg_ctl start` cannot bind 5432 ("could not start server"). This
+# loop only polls the filesystem for PG_VERSION and re-asserts sshd:2022 — it
+# never touches 5432.
+#
+# We KEEP THE CONTAINER RUNNING (its foreground process is this wait loop; sshd
+# was already started in the background by start_sshd, so gpexpand can reach the
+# pod on ssh:2022) and poll for PG_VERSION to appear. Once gpexpand has
+# initialized the datadir, we return so the caller performs the post-gpexpand
+# HANDOFF (see gpexpand_handoff_to_steady_state) rather than racing gpexpand by
+# also starting postgres on the same datadir/port.
+#
+# Bounded by CLOUDBERRY_GPEXPAND_WAIT_SECONDS (default 3600s) so a wedged
+# expansion eventually fails the container instead of idling forever.
+# ---------------------------------------------------------------------------
+wait_for_gpexpand_init() {
+    local data_dir="$1"
+    local waited=0
+    local max_wait="${CLOUDBERRY_GPEXPAND_WAIT_SECONDS:-3600}"
+    local interval="${CLOUDBERRY_GPEXPAND_WAIT_INTERVAL:-5}"
+
+    log_info "gpexpand-managed segment (content=${CLOUDBERRY_CONTENT_ID}): datadir ${data_dir} is empty; keeping container Running (sshd up on ${CLUSTER_SSH_PORT}, NOT holding segment port ${CLOUDBERRY_SEGMENT_PORT}) until gpexpand initializes it"
+
+    while [ ! -f "${data_dir}/PG_VERSION" ]; do
+        if [ "${waited}" -ge "${max_wait}" ]; then
+            log_error "gpexpand did not initialize ${data_dir} within ${max_wait}s; giving up"
+            return 1
+        fi
+        # Re-assert sshd is alive so gpexpand can always reach this pod on 2022.
+        # This loop deliberately does NO postgres/port work: port 5432 stays free
+        # for gpexpand's pg_ctl start.
+        if [ -n "${SSHD_PID_FILE:-}" ] && [ -f "${SSHD_PID_FILE}" ]; then
+            if ! kill -0 "$(cat "${SSHD_PID_FILE}" 2>/dev/null)" 2>/dev/null; then
+                log_warn "sshd not running during gpexpand wait; restarting"
+                start_sshd
+            fi
+        fi
+        sleep "${interval}"
+        waited=$((waited + interval))
+    done
+
+    log_info "gpexpand initialized ${data_dir} (PG_VERSION present after ~${waited}s); handing off to steady state"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Post-gpexpand handoff: turn a gpexpand-managed segment into a normal, durable
+# segment whose postgres is the container's MAIN process.
+#
+# ROOT CAUSE this addresses: gpexpand owns BOTH the datadir init AND the postgres
+# start on the new segment. It runs, over SSH, roughly:
+#   pg_ctl -D <datadir> -o "-p 5432 -c gp_role=utility -M" start
+# The instant PG_VERSION appears, wait_for_gpexpand_init returns. If the
+# entrypoint then ALSO starts its own postgres (the background password-setup
+# start AND the final `exec postgres`), TWO postmasters race for the same datadir
+# and port 5432 -> "could not start server" (postmaster.pid lock / address in
+# use). That is the observed pg_ctl failure.
+#
+# The correct handoff is:
+#   1. Wait for gpexpand's pg_ctl-started postmaster to come fully up (its
+#      postmaster.pid + a live PID). We do NOT start postgres ourselves here.
+#   2. Fix ownership/permissions so gpadmin (UID 1000) owns the whole datadir
+#      (gpexpand rsync may leave template-copied files with other ownership).
+#   3. Stop that gpexpand/pg_ctl-started instance cleanly (fast shutdown) so the
+#      datadir/port are released with NO data loss.
+#   4. UPSERT the correct `gp_contentid` into the datadir's internal.auto.conf.
+#      gpexpand basebackups the datadir from the COORDINATOR template, which
+#      carries `gp_contentid = -1`; a segment MUST carry its own content id, so
+#      we replace the inherited -1 with this pod's ordinal-derived content id
+#      (the same `gp_contentid = <id>` line init_segment writes for normal
+#      segments). This is what lets the entrypoint start the segment WITHOUT the
+#      (wrong) `-C` flag — Cloudberry 2.1 reads the content id from this GUC.
+#   5. Return so the caller `exec postgres` re-launches it as the container's
+#      PID-appropriate main process (probes pass; survives pod restart, on which
+#      PG_VERSION now exists so this is a normal existing segment).
+#
+# If no gpexpand-started postmaster is detected (e.g. gpexpand started it in
+# utility mode and already stopped it, which is the normal gpexpand flow), we
+# simply ensure nothing is holding the datadir and return so the caller starts
+# postgres in the normal execute-mode way.
+#
+# NOTE on gp_dbid: unlike gp_contentid, the coordinator template's gp_dbid is
+# NOT reused here. gpexpand assigns and persists the new segment's dbid itself
+# when it registers the segment (it writes the segment's own internal.auto.conf
+# during segment-init), so the entrypoint only needs to correct gp_contentid.
+# ---------------------------------------------------------------------------
+gpexpand_handoff_to_steady_state() {
+    local data_dir="$1"
+    local waited=0
+    local max_wait="${CLOUDBERRY_GPEXPAND_HANDOFF_SECONDS:-300}"
+    local interval="${CLOUDBERRY_GPEXPAND_WAIT_INTERVAL:-5}"
+    local pidfile="${data_dir}/postmaster.pid"
+
+    log_info "post-gpexpand handoff for ${data_dir}: ensuring gpexpand's pg_ctl-started instance is stopped before the entrypoint takes over as main process"
+
+    # (1) Fix ownership/permissions FIRST so a gpadmin-owned pg_ctl stop and the
+    # subsequent exec postgres both succeed. gpexpand rsync of the coordinator
+    # template can leave files owned by another uid; postgres refuses to start a
+    # datadir it does not own. Best-effort chown (may already be correct).
+    if [ -n "$(find "${data_dir}" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]; then
+        log_info "normalizing datadir ownership to gpadmin ($(id -un):$(id -gn)) after gpexpand rsync"
+        chown -R "$(id -u):$(id -g)" "${data_dir}" 2>/dev/null || \
+            sudo chown -R "$(id -u):$(id -g)" "${data_dir}" 2>/dev/null || \
+            log_warn "could not fully chown ${data_dir}; postgres start may fail"
+    fi
+    chmod 700 "${data_dir}" 2>/dev/null || true
+
+    # (2) If gpexpand left a running postmaster, wait briefly for it to be fully
+    # up, then stop it cleanly so the entrypoint can re-exec it as PID 1's child
+    # (the container main process). We poll the pidfile rather than the port so we
+    # never bind 5432 ourselves.
+    if [ -f "${pidfile}" ]; then
+        local pg_pid
+        pg_pid="$(head -n1 "${pidfile}" 2>/dev/null || true)"
+        if [[ "${pg_pid}" =~ ^[0-9]+$ ]] && kill -0 "${pg_pid}" 2>/dev/null; then
+            log_info "gpexpand-started postmaster is running (pid=${pg_pid}); stopping it (fast) for clean handoff"
+            "${GPHOME}/bin/pg_ctl" -D "${data_dir}" -m fast -w -t "${max_wait}" stop 2>/dev/null || \
+                log_warn "pg_ctl stop returned non-zero; attempting to wait for shutdown"
+        fi
+    fi
+
+    # (3) Confirm the datadir/port are released: no live postmaster + no stale
+    # pidfile that would block our exec postgres. pg_ctl -w already waited, but be
+    # defensive against a stale pidfile.
+    while [ -f "${pidfile}" ]; do
+        local stale_pid
+        stale_pid="$(head -n1 "${pidfile}" 2>/dev/null || true)"
+        if ! [[ "${stale_pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${stale_pid}" 2>/dev/null; then
+            log_info "removing stale postmaster.pid (owner pid ${stale_pid:-none} not running)"
+            rm -f "${pidfile}" 2>/dev/null || true
+            break
+        fi
+        if [ "${waited}" -ge "${max_wait}" ]; then
+            log_warn "gpexpand postmaster still holding ${pidfile} after ${max_wait}s; proceeding (exec postgres may report an existing lock)"
+            break
+        fi
+        sleep "${interval}"
+        waited=$((waited + interval))
+    done
+
+    # (4) Correct gp_contentid in internal.auto.conf. The datadir was
+    # basebackup'd from the coordinator template (gp_contentid = -1); replace it
+    # with this pod's ordinal-derived content id so the segment starts with the
+    # right content id WITHOUT any `-C` flag (Cloudberry 2.1 reads gp_contentid
+    # from this GUC). Uses the exact `gp_contentid = <id>` spelling init_segment
+    # writes for normal segments.
+    upsert_gp_contentid "${data_dir}" "${CLOUDBERRY_CONTENT_ID}" || \
+        log_warn "could not correct gp_contentid in ${data_dir}/internal.auto.conf; segment start may use wrong content id"
+
+    log_info "post-gpexpand handoff complete; entrypoint will now exec postgres as the container main process on ${data_dir}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Initialize segment data directory
 # ---------------------------------------------------------------------------
 init_segment() {
@@ -401,6 +763,27 @@ init_segment() {
 
     if [ -f "${data_dir}/PG_VERSION" ]; then
         log_info "Segment data directory already initialized at ${data_dir}"
+        return 0
+    fi
+
+    # Scale-out (gpexpand) segments: SKIP initdb. A segment added during an
+    # active expansion is physically initialized by gpexpand's segment-init phase
+    # (basebackup from the coordinator template + catalog fix-ups), which creates
+    # every existing user database on the new segment with matching OIDs. If this
+    # pod self-initdb's an empty stock cluster first, gpexpand either rejects the
+    # pre-existing non-empty datadir or the segment diverges (empty catalog ->
+    # "database ... does not exist" on EXPAND TABLE). When this pod is a
+    # gpexpand-managed scale-out addition, leave the datadir untouched and let
+    # gpexpand initialize it. Normal first-boot bring-up is unchanged.
+    #
+    # The operator cannot flag individual pods via the SHARED StatefulSet env, so
+    # it exports CLOUDBERRY_EXPANSION_BASE_COUNT (the pre-scale segment count)
+    # while a scale-out is in progress; each pod derives the flag PER-POD by
+    # comparing its own content id (ordinal) against that base: ordinal >= base
+    # => new segment => gpexpand-managed. An explicit CLOUDBERRY_GPEXPAND_MANAGED
+    # override is still honored for local/manual runs.
+    if is_gpexpand_managed_segment; then
+        log_info "Segment ${role} (content=${CLOUDBERRY_CONTENT_ID}) is gpexpand-managed; skipping initdb (gpexpand will initialize ${data_dir} from the coordinator template)"
         return 0
     fi
 
@@ -728,8 +1111,25 @@ start_postgres() {
             exec postgres -D "${data_dir}" -c gp_role=dispatch
             ;;
         primary|mirror)
-            log_info "Starting segment in execute mode"
+            # Cloudberry 2.1 reads the segment content id from the GUC
+            # `gp_contentid` in the datadir's internal.auto.conf — NOT from a
+            # command-line flag. In standard PostgreSQL 14 (which Cloudberry 2.1
+            # is based on) `postgres -C <name>` means "print the value of config
+            # parameter <name> and exit", so passing the content id via that flag
+            # (e.g. `-C 0`) FATALs with `unrecognized configuration parameter "0"`.
+            # Normal first-boot segments get `gp_contentid = <id>` written by
+            # init_segment; gpexpand-managed segments get it written/upserted into
+            # internal.auto.conf during the handoff (gpexpand_handoff_to_steady_state),
+            # correcting the -1 inherited from the coordinator template basebackup.
+            # The start command therefore mirrors the normal path with no -C flag.
+            log_info "Starting segment in execute mode (content=${CLOUDBERRY_CONTENT_ID})"
             exec postgres -D "${data_dir}" -c gp_role=execute
+            ;;
+        gpexpand-wait)
+            # No-op placeholder role (never dispatched here): the gpexpand pre-init
+            # idle path is handled in main() via wait_for_gpexpand_init, which keeps
+            # sshd up until gpexpand initializes the datadir. Kept for clarity only.
+            log_info "gpexpand-managed segment waiting for datadir init"
             ;;
         *)
             exec postgres -D "${data_dir}"
@@ -786,6 +1186,40 @@ main() {
             ;;
         primary)
             init_segment
+            # gpexpand-managed scale-out segment: gpexpand owns BOTH the datadir
+            # init AND the postgres start (pg_ctl) on this pod. The entrypoint must
+            # NOT race gpexpand by also starting postgres on the same datadir/port
+            # (that collision is the "could not start server" pg_ctl failure).
+            #
+            # Flow for a gpexpand-managed segment:
+            #   a. EMPTY datadir  -> idle (sshd up, port 5432 free) until gpexpand
+            #      initializes it (wait_for_gpexpand_init).
+            #   b. datadir ready  -> hand off: stop gpexpand's pg_ctl-started
+            #      instance, fix ownership, then fall through to exec postgres as
+            #      the container main process (gpexpand_handoff_to_steady_state).
+            #   c. SKIP the background password-setup start below: it would race
+            #      gpexpand, and the password/config already come from the
+            #      coordinator template gpexpand rsync'd in.
+            if is_gpexpand_managed_segment; then
+                # Install the pg_ctl shim BEFORE gpexpand runs its segment-init:
+                # gpexpand's ssh'd `pg_ctl start` must find the CORRECT
+                # gp_contentid in the datadir's internal.auto.conf (Cloudberry
+                # 2.1 reads the content id from that GUC; the basebackup'd datadir
+                # inherits the coordinator template's -1). The shim replaces
+                # ${GPHOME}/bin/pg_ctl (real -> pg_ctl.real) so it wins regardless
+                # of PATH order, and upserts gp_contentid right before each start.
+                install_gpexpand_pgctl_shim || \
+                    log_warn "pg_ctl shim not installed; gpexpand -i start may use wrong gp_contentid"
+                if [ ! -f "${SEGMENT_DATA_DIR}/PG_VERSION" ]; then
+                    if ! wait_for_gpexpand_init "${SEGMENT_DATA_DIR}"; then
+                        exit 1
+                    fi
+                fi
+                gpexpand_handoff_to_steady_state "${SEGMENT_DATA_DIR}"
+                start_postgres "${SEGMENT_DATA_DIR}"
+                # start_postgres exec's postgres; not reached.
+                exit 0
+            fi
             if [ -n "${POSTGRES_PASSWORD:-}" ] && [ ! -f "${SEGMENT_DATA_DIR}/.password_set" ]; then
                 postgres -D "${SEGMENT_DATA_DIR}" &
                 local bg_pid=$!
@@ -798,7 +1232,29 @@ main() {
             start_postgres "${SEGMENT_DATA_DIR}"
             ;;
         mirror)
-            init_mirror
+            # gpexpand initializes the new mirror's datadir (basebackup from the
+            # new primary) AND starts postgres on it via pg_ctl. Until then, keep
+            # the pod Running (sshd up, port 5432 free) rather than exec'ing
+            # postgres on an empty dir. After gpexpand initializes it, hand off
+            # (stop gpexpand's pg_ctl instance + fix ownership) before the
+            # entrypoint exec's postgres as the container main process.
+            if is_gpexpand_managed_segment; then
+                # Same rationale as the primary path: gpexpand's ssh'd pg_ctl
+                # start of the new mirror needs the correct gp_contentid in the
+                # datadir's internal.auto.conf (Cloudberry 2.1 reads it from that
+                # GUC; the basebackup'd datadir inherits the coordinator's -1).
+                # The shim replaces ${GPHOME}/bin/pg_ctl so it wins over PATH.
+                install_gpexpand_pgctl_shim || \
+                    log_warn "pg_ctl shim not installed; gpexpand -i start may use wrong gp_contentid"
+                if [ ! -f "${SEGMENT_DATA_DIR}/PG_VERSION" ]; then
+                    if ! wait_for_gpexpand_init "${SEGMENT_DATA_DIR}"; then
+                        exit 1
+                    fi
+                fi
+                gpexpand_handoff_to_steady_state "${SEGMENT_DATA_DIR}"
+            else
+                init_mirror
+            fi
             start_postgres "${SEGMENT_DATA_DIR}"
             ;;
         *)

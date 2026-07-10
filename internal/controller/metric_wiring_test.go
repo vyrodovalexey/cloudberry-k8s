@@ -46,20 +46,12 @@ type maintenanceCall struct {
 	result    string
 }
 
-// redistributionCall captures a SetRedistributionProgress invocation.
-type redistributionCall struct {
-	cluster   string
-	namespace string
-	progress  float64
-}
-
 // wiringRecorder wraps NoopRecorder and tracks the metric calls exercised by
 // the controller metric-wiring code paths under test.
 type wiringRecorder struct {
 	metrics.NoopRecorder
-	pvcSizeCalls        []pvcSizeCall
-	maintenanceCalls    []maintenanceCall
-	redistributionCalls []redistributionCall
+	pvcSizeCalls     []pvcSizeCall
+	maintenanceCalls []maintenanceCall
 }
 
 func (w *wiringRecorder) SetPVCSizeBytes(cluster, namespace, component string, sizeBytes float64) {
@@ -74,12 +66,6 @@ func (w *wiringRecorder) RecordMaintenanceOperation(cluster, namespace, operatio
 	})
 }
 
-func (w *wiringRecorder) SetRedistributionProgress(cluster, namespace string, progress float64) {
-	w.redistributionCalls = append(w.redistributionCalls, redistributionCall{
-		cluster: cluster, namespace: namespace, progress: progress,
-	})
-}
-
 // vacuumErrDBClient embeds the shared mockDBClient and overrides Vacuum to
 // force a maintenance-via-DB failure, driving the Job-fallback path.
 type vacuumErrDBClient struct {
@@ -89,18 +75,6 @@ type vacuumErrDBClient struct {
 
 func (m *vacuumErrDBClient) Vacuum(_ context.Context, _ db.VacuumOptions) error {
 	return m.vacuumErr
-}
-
-// progressDBClient embeds the shared mockDBClient and overrides
-// GetRedistributionProgress to return configurable progress/error values.
-type progressDBClient struct {
-	*mockDBClient
-	progress    int32
-	progressErr error
-}
-
-func (m *progressDBClient) GetRedistributionProgress(_ context.Context) (int32, error) {
-	return m.progress, m.progressErr
 }
 
 // ============================================================================
@@ -267,94 +241,6 @@ func TestAdminReconciler_HandleMaintenance_JobCreateError(t *testing.T) {
 	// "failed" recorded on the DB path, but "started" never reached.
 	require.Len(t, rec.maintenanceCalls, 1)
 	assert.Equal(t, "failed", rec.maintenanceCalls[0].result)
-}
-
-// ============================================================================
-// GAP-6: redistributeData progress branches
-// ============================================================================
-
-func TestClusterReconciler_RedistributeData_ProgressError(t *testing.T) {
-	// Arrange: GetRedistributionProgress errors -> falls back to 1.0.
-	scheme := newTestScheme()
-	cluster := newTestCluster()
-	dbClient := &progressDBClient{
-		mockDBClient: &mockDBClient{},
-		progressErr:  fmt.Errorf("progress query failed"),
-	}
-	dbFactory := &mockDBClientFactory{client: dbClient}
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(cluster).
-		WithStatusSubresource(cluster).
-		Build()
-	rec := &wiringRecorder{}
-	r := NewClusterReconciler(k8sClient, scheme,
-		record.NewFakeRecorder(20), builder.NewBuilder(), rec, nil, dbFactory)
-
-	// Act
-	err := r.redistributeData(context.Background(), cluster)
-
-	// Assert
-	require.NoError(t, err)
-	require.Len(t, rec.redistributionCalls, 1)
-	assert.InDelta(t, 1.0, rec.redistributionCalls[0].progress, 0.001)
-}
-
-func TestClusterReconciler_RedistributeData_ProgressBelow100(t *testing.T) {
-	// Arrange: progress 40% -> converted to 0.4.
-	scheme := newTestScheme()
-	cluster := newTestCluster()
-	dbClient := &progressDBClient{
-		mockDBClient: &mockDBClient{},
-		progress:     40,
-	}
-	dbFactory := &mockDBClientFactory{client: dbClient}
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(cluster).
-		WithStatusSubresource(cluster).
-		Build()
-	rec := &wiringRecorder{}
-	r := NewClusterReconciler(k8sClient, scheme,
-		record.NewFakeRecorder(20), builder.NewBuilder(), rec, nil, dbFactory)
-
-	// Act
-	err := r.redistributeData(context.Background(), cluster)
-
-	// Assert
-	require.NoError(t, err)
-	require.Len(t, rec.redistributionCalls, 1)
-	assert.InDelta(t, 0.4, rec.redistributionCalls[0].progress, 0.001)
-}
-
-func TestClusterReconciler_RedistributeData_ProgressComplete(t *testing.T) {
-	// Arrange: progress 100% -> 1.0 (existing happy path with assertion).
-	scheme := newTestScheme()
-	cluster := newTestCluster()
-	dbClient := &progressDBClient{
-		mockDBClient: &mockDBClient{},
-		progress:     100,
-	}
-	dbFactory := &mockDBClientFactory{client: dbClient}
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(cluster).
-		WithStatusSubresource(cluster).
-		Build()
-	rec := &wiringRecorder{}
-	r := NewClusterReconciler(k8sClient, scheme,
-		record.NewFakeRecorder(20), builder.NewBuilder(), rec, nil, dbFactory)
-
-	// Act
-	err := r.redistributeData(context.Background(), cluster)
-
-	// Assert
-	require.NoError(t, err)
-	require.Len(t, rec.redistributionCalls, 1)
-	assert.InDelta(t, 1.0, rec.redistributionCalls[0].progress, 0.001)
 }
 
 // ============================================================================

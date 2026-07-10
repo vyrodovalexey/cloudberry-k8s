@@ -63,5 +63,17 @@ RUN chown -R gpadmin:gpadmin \
         /usr/local/cloudberry-db/share/postgresql/extension/pxf* \
     2>/dev/null || true
 
+# Assert the SSH daemon is present: the base entrypoint starts a ROOTLESS sshd
+# on port 2022 (restricted-v2 SCC compatible) that gpexpand's segment-init phase
+# SSHes to. gpexpand itself is asserted in the base image. The client ~/.ssh/config
+# (Port 2022) + rootless hostkey dir are inherited from the base image.
+RUN test -x /usr/sbin/sshd && \
+    test -x /usr/local/cloudberry-db/bin/gpexpand
+
 # Switch back to gpadmin
 USER 1000:1000
+
+# Re-declare the exposed ports (2022 = rootless sshd) for documentation; the base
+# image already EXPOSEs 5432 2022 but restate it here so the derived image is
+# self-describing.
+EXPOSE 5432 2022

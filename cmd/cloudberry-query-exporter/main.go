@@ -31,6 +31,9 @@ var version = "dev"
 
 const (
 	metricsNamespace = "cloudberry"
+	// metricsSubsystem is the subsystem for exporter self-metrics
+	// (cloudberry_query_exporter_*).
+	metricsSubsystem = "query_exporter"
 
 	// Exponential backoff parameters for database connection retries.
 	initialBackoff = 1 * time.Second
@@ -81,7 +84,11 @@ type exporterMetrics struct {
 	totalConnections prometheus.Gauge
 	up               prometheus.Gauge
 	scrapeDuration   prometheus.Histogram
-	collectors       *metricCollectors
+	// historyErrors counts history-pipeline failures per stage
+	// (snapshot|insert|explain), E2:
+	// cloudberry_query_exporter_history_errors_total{stage}.
+	historyErrors *prometheus.CounterVec
+	collectors    *metricCollectors
 }
 
 // newExporterMetrics creates and registers all Prometheus metrics,
@@ -110,17 +117,23 @@ func newExporterMetrics(reg prometheus.Registerer) *exporterMetrics {
 		}),
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
-			Subsystem: "query_exporter",
+			Subsystem: metricsSubsystem,
 			Name:      "up",
 			Help:      "Whether the database connection is healthy (1=up, 0=down).",
 		}),
 		scrapeDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
-			Subsystem: "query_exporter",
+			Subsystem: metricsSubsystem,
 			Name:      "scrape_duration_seconds",
 			Help:      "Duration of database metric scrape in seconds.",
 			Buckets:   prometheus.DefBuckets,
 		}),
+		historyErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "history_errors_total",
+			Help:      "Total number of query-history pipeline failures by stage (snapshot|insert|explain).",
+		}, []string{"stage"}),
 		collectors: newMetricCollectors(reg),
 	}
 
@@ -131,6 +144,7 @@ func newExporterMetrics(reg prometheus.Registerer) *exporterMetrics {
 		m.totalConnections,
 		m.up,
 		m.scrapeDuration,
+		m.historyErrors,
 	}
 	for _, c := range baseCollectors {
 		reg.MustRegister(c)
@@ -303,8 +317,9 @@ func run(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Create history collector.
-	histCollector := newHistoryCollector(logger, cfg.planCollection, cfg.slowQueryThreshold)
+	// Create history collector wired to the per-stage error counter (E2).
+	histCollector := newHistoryCollector(logger, cfg.planCollection, cfg.slowQueryThreshold,
+		metrics.historyErrors)
 
 	// Ensure history table exists on startup.
 	if conn != nil {
@@ -314,7 +329,15 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	// Start the periodic metric collection loop in a background goroutine.
-	go collectLoop(ctx, cfg, conn, metrics, logger, histCollector)
+	// Single-owner model (B3): ownership of conn transfers to the loop here —
+	// the loop closes whatever connection is CURRENT on exit (it may have
+	// reconnected), and run() only joins via the done channel. loopCancel
+	// guarantees the loop is stopped (and the join below cannot hang) even on
+	// exit paths where the parent context was never canceled.
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	defer loopCancel()
+	done := make(chan struct{})
+	go collectLoop(loopCtx, cfg, conn, metrics, logger, histCollector, done)
 
 	// Set up HTTP server with /metrics and /health endpoints.
 	mux := http.NewServeMux()
@@ -357,8 +380,12 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// Close the database connection if it was established.
-	closeConn(conn, logger)
+	// Join the collect loop before declaring the exporter stopped. The loop
+	// owns the current database connection and closes it on exit — run() must
+	// NOT close the original pointer (it may be stale after a reconnect, and
+	// closing it here could double-close a conn the loop already closed).
+	loopCancel()
+	<-done
 
 	logger.Info("cloudberry-query-exporter stopped")
 	return nil
@@ -421,6 +448,11 @@ func addJitter(d time.Duration) time.Duration {
 // collectLoop periodically collects metrics from the database.
 // If the connection is lost, it reconnects with exponential backoff.
 // The loop runs until the context is canceled.
+//
+// Ownership (B3): the loop OWNS the current database connection from the
+// moment it starts — collectOnce may close a broken conn and reconnect, so
+// only the loop knows which conn is live. On exit it closes the current conn
+// (exactly once) and then closes done so run() can join deterministically.
 func collectLoop(
 	ctx context.Context,
 	cfg *exporterConfig,
@@ -428,7 +460,10 @@ func collectLoop(
 	metrics *exporterMetrics,
 	logger *slog.Logger,
 	histCollector *historyCollector,
+	done chan struct{},
 ) {
+	defer close(done)
+
 	ticker := time.NewTicker(cfg.samplingInterval)
 	defer ticker.Stop()
 
@@ -446,6 +481,9 @@ func collectLoop(
 	for {
 		select {
 		case <-ctx.Done():
+			// Close whatever connection is current (the original or a
+			// reconnected one) — the loop is the single owner.
+			closeConn(currentConn, logger)
 			return
 		case <-ticker.C:
 			currentConn = collectOnce(ctx, cfg, currentConn, metrics, logger, histCollector)

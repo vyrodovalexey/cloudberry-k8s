@@ -44,6 +44,42 @@ func TestExporterAndBackupNames(t *testing.T) {
 	}
 }
 
+// TestGpexpandJobName verifies the DETERMINISTIC gpexpand Job name builder
+// derives "<cluster>-gpexpand-<old>-<new>" from the segment counts (NOT a
+// timestamp) so re-reconciles of the same expansion re-adopt the same Job, and
+// that non-conforming cluster names are sanitized/lowercased/bounded to 63 chars.
+func TestGpexpandJobName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		cluster          string
+		oldCount         int32
+		newCount         int32
+		want             string
+		wantSanitizedLen bool
+	}{
+		{"scale 2->3", "prod", 2, 3, "prod-gpexpand-2-3", true},
+		{"scale 1->8", "prod", 1, 8, "prod-gpexpand-1-8", true},
+		{"multi-digit counts", "prod", 10, 24, "prod-gpexpand-10-24", true},
+		{"same count (no-op bounds)", "prod", 4, 4, "prod-gpexpand-4-4", true},
+		{"sanitized cluster name", "My_Cluster", 2, 3, "my-cluster-gpexpand-2-3", true},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := GpexpandJobName(tc.cluster, tc.oldCount, tc.newCount)
+			assert.Equal(t, tc.want, got)
+			assert.LessOrEqual(t, len(got), 63)
+			assert.Equal(t, strings.ToLower(got), got)
+			// Deterministic: identical inputs always yield the identical name.
+			assert.Equal(t, got, GpexpandJobName(tc.cluster, tc.oldCount, tc.newCount))
+		})
+	}
+}
+
 // TestClusterSSHSecretName verifies the cluster-wide gpadmin SSH keypair Secret
 // name builder produces "<cluster>-ssh-keys" (sanitized).
 func TestClusterSSHSecretName(t *testing.T) {

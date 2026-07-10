@@ -116,6 +116,16 @@ const (
 
 	// backupDestinationTypeS3 is the S3 backup destination discriminator.
 	backupDestinationTypeS3 = "s3"
+
+	// workloadRulesConfigMapSuffix is the suffix of the per-cluster ConfigMap
+	// that stores the rendered workload/idle rules ("{cluster}-workload-rules").
+	workloadRulesConfigMapSuffix = "-workload-rules"
+
+	// Component label values for cloudberry_steady_state_refresh_errors_total
+	// (bounded enum, one per steady-state refresh function).
+	steadyStateComponentBackup      = "backup"
+	steadyStateComponentDataLoading = "dataloading"
+	steadyStateComponentStorage     = "storage"
 )
 
 // restartRequiredParams lists PostgreSQL parameters that require a server
@@ -284,10 +294,7 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 
 	// Re-read the current phase from the API server to avoid overwriting phase changes
 	// made by the cluster-controller (e.g., Scaling phase during scale-out).
-	var latest cbv1alpha1.CloudberryCluster
-	if err := r.client.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err == nil {
-		cluster.Status.Phase = latest.Status.Phase
-	}
+	r.refreshPhaseFromServer(ctx, logger, cluster)
 
 	// Perform a single status patch for all sub-reconciler changes.
 	// Using MergePatch prevents clobbering status changes from other controllers.
@@ -312,6 +319,41 @@ func (r *AdminReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resu
 func isExporterRoleReady(cluster *cbv1alpha1.CloudberryCluster) bool {
 	return cluster.Annotations[util.AnnotationExporterRoleReady] == "true" ||
 		cluster.Spec.QueryMonitoring == nil || !cluster.Spec.QueryMonitoring.Enabled
+}
+
+// refreshPhaseFromServer re-reads the cluster from the API server and adopts
+// the latest status phase, so a subsequent status patch does not overwrite
+// phase changes made by the cluster-controller (e.g. Scaling during
+// scale-out). Best-effort: on refetch failure the in-memory phase is kept and
+// the swallowed error is logged (never returned), so API flakiness on this
+// path stays visible without changing reconcile semantics.
+func (r *AdminReconciler) refreshPhaseFromServer(
+	ctx context.Context,
+	logger *slog.Logger,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	var latest cbv1alpha1.CloudberryCluster
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err != nil {
+		logger.Warn("failed to re-read cluster before status patch; keeping in-memory phase",
+			"cluster", cluster.Name, "namespace", cluster.Namespace, "error", err)
+		return
+	}
+	cluster.Status.Phase = latest.Status.Phase
+}
+
+// warnSteadyStateRefreshError logs a swallowed (non-fatal) steady-state
+// refresh error and increments cloudberry_steady_state_refresh_errors_total
+// so silent refresh degradation is visible to alerting. Reconcile result
+// semantics are intentionally unchanged — the steady-state refresh paths stay
+// best-effort (honest metrics: incremented only on a real refresh failure).
+func (r *AdminReconciler) warnSteadyStateRefreshError(
+	logger *slog.Logger,
+	cluster *cbv1alpha1.CloudberryCluster,
+	component, msg string,
+	err error,
+) {
+	logger.Warn(msg, "error", err)
+	r.metrics.RecordSteadyStateRefreshError(cluster.Name, cluster.Namespace, component)
 }
 
 // handleAdminEarlyReturns checks for conditions that should short-circuit the
@@ -417,7 +459,8 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 		// the steady-state path, which previously regressed the Scenario 25/26 +
 		// workload functional tests.
 		if err := r.removeBackupCronJob(ctx, cluster); err != nil {
-			logger.Warn("failed to remove backup cronjob on steady-state reconcile", "error", err)
+			r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+				"failed to remove backup cronjob on steady-state reconcile", err)
 		}
 		return
 	}
@@ -434,11 +477,13 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 	// idempotent (and a no-op when there is genuinely nothing to do), so running on
 	// every steady-state requeue converges both the CronJob and the status.
 	if err := r.ensureBackupCronJob(ctx, cluster); err != nil {
-		logger.Warn("failed to ensure backup cronjob on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to ensure backup cronjob on steady-state reconcile", err)
 	}
 
 	if err := r.refreshBackupStatus(ctx, cluster); err != nil {
-		logger.Warn("failed to refresh backup status on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to refresh backup status on steady-state reconcile", err)
 		return
 	}
 
@@ -448,7 +493,8 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 	// per-backup retention cleanup Job would never be created (Scenario 79d).
 	// Non-fatal: log and continue so a cleanup hiccup never blocks status persist.
 	if err := r.ensureRetentionCleanup(ctx, cluster); err != nil {
-		logger.Warn("failed to ensure retention cleanup on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to ensure retention cleanup on steady-state reconcile", err)
 	}
 
 	// Post-restore validation is Job-derived (it reacts to the newest Succeeded
@@ -458,17 +504,20 @@ func (r *AdminReconciler) refreshBackupStatusOnSteadyState(
 	// per-restore validation Job would never be created and its outcome metric/
 	// event would never be recorded (Scenario 80d). Non-fatal: log and continue.
 	if err := r.ensurePostRestoreValidation(ctx, cluster); err != nil {
-		logger.Warn("failed to ensure post-restore validation on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to ensure post-restore validation on steady-state reconcile", err)
 	}
 	if err := r.observeValidationJobs(ctx, cluster); err != nil {
-		logger.Warn("failed to observe validation jobs on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to observe validation jobs on steady-state reconcile", err)
 	}
 
 	// Persist refreshed backup status. MergePatch is used so already-set fields
 	// written by other controllers (e.g. cronJobName) are not clobbered, and a
 	// status-only change does not bump the spec generation (status subresource).
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		logger.Warn("failed to patch backup status on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentBackup,
+			"failed to patch backup status on steady-state reconcile", err)
 	}
 }
 
@@ -546,7 +595,8 @@ func (r *AdminReconciler) refreshDataLoadingStatusOnSteadyState(
 	// deterministic name), so a Job deleted out from under the operator is
 	// re-created here, and an existing Job's terminal status is refreshed.
 	if err := r.reconcileDataLoadingJobs(ctx, cluster); err != nil {
-		logger.Warn("failed to reconcile data loading jobs on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentDataLoading,
+			"failed to reconcile data loading jobs on steady-state reconcile", err)
 		return
 	}
 
@@ -554,7 +604,8 @@ func (r *AdminReconciler) refreshDataLoadingStatusOnSteadyState(
 	// explicit MergePatch (zero counters and an empty jobs slice are always
 	// included) so a status-only change never bumps the spec generation.
 	if err := r.patchDataLoadingStatus(ctx, cluster); err != nil {
-		logger.Warn("failed to patch data loading status on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentDataLoading,
+			"failed to patch data loading status on steady-state reconcile", err)
 	}
 }
 
@@ -593,7 +644,8 @@ func (r *AdminReconciler) refreshStorageOnSteadyState(
 		// cleared status only when there is an actual stale value (R6).
 		r.clearStorageSignals(ctx, cluster, logger)
 		if err := r.removeRecommendationScanCronJob(ctx, cluster); err != nil {
-			logger.Warn("failed to remove recommendation-scan cronjob on steady-state reconcile", "error", err)
+			r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentStorage,
+				"failed to remove recommendation-scan cronjob on steady-state reconcile", err)
 		}
 		return
 	}
@@ -632,7 +684,8 @@ func (r *AdminReconciler) refreshStorageOnSteadyState(
 	// cloudberry_recommendation_scan_cronjob gauge current, so calling it on every
 	// steady-state requeue is safe — exactly like ensureBackupCronJob.
 	if err := r.ensureRecommendationScanCronJob(ctx, cluster); err != nil {
-		logger.Warn("failed to ensure recommendation-scan cronjob on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentStorage,
+			"failed to ensure recommendation-scan cronjob on steady-state reconcile", err)
 		return
 	}
 
@@ -651,7 +704,8 @@ func (r *AdminReconciler) refreshStorageOnSteadyState(
 	// already-set fields written by other controllers are not clobbered, and a
 	// status-only change does not bump the spec generation (status subresource).
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
-		logger.Warn("failed to patch storage status on steady-state reconcile", "error", err)
+		r.warnSteadyStateRefreshError(logger, cluster, steadyStateComponentStorage,
+			"failed to patch storage status on steady-state reconcile", err)
 	}
 }
 
@@ -1009,10 +1063,7 @@ func (r *AdminReconciler) applyWorkloadRules(
 	}
 
 	cm := &corev1.ConfigMap{}
-	cmName := types.NamespacedName{
-		Name:      cluster.Name + "-workload-rules",
-		Namespace: cluster.Namespace,
-	}
+	cmName := workloadRulesConfigMapKey(cluster)
 
 	err = r.client.Get(ctx, cmName, cm)
 
@@ -1062,10 +1113,7 @@ func (r *AdminReconciler) applyIdleSessionRules(
 	}
 
 	cm := &corev1.ConfigMap{}
-	cmName := types.NamespacedName{
-		Name:      cluster.Name + "-workload-rules",
-		Namespace: cluster.Namespace,
-	}
+	cmName := workloadRulesConfigMapKey(cluster)
 
 	err = r.client.Get(ctx, cmName, cm)
 
@@ -1195,6 +1243,15 @@ func (r *AdminReconciler) dropAllUserResourceGroups(
 	}
 }
 
+// workloadRulesConfigMapKey returns the namespaced name of the per-cluster
+// workload-rules ConfigMap ("{cluster}-workload-rules").
+func workloadRulesConfigMapKey(cluster *cbv1alpha1.CloudberryCluster) types.NamespacedName {
+	return types.NamespacedName{
+		Name:      cluster.Name + workloadRulesConfigMapSuffix,
+		Namespace: cluster.Namespace,
+	}
+}
+
 // deleteWorkloadRulesConfigMap deletes the workload-rules ConfigMap for the cluster.
 // If the ConfigMap does not exist, this is a no-op.
 func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
@@ -1204,10 +1261,7 @@ func (r *AdminReconciler) deleteWorkloadRulesConfigMap(
 	logger := util.LoggerFromContext(ctx)
 
 	cm := &corev1.ConfigMap{}
-	cmName := types.NamespacedName{
-		Name:      cluster.Name + "-workload-rules",
-		Namespace: cluster.Namespace,
-	}
+	cmName := workloadRulesConfigMapKey(cluster)
 
 	if err := r.client.Get(ctx, cmName, cm); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -5111,10 +5165,7 @@ func (r *AdminReconciler) completeRollingRestart(
 
 	// Re-read the current phase from the API server to avoid overwriting phase changes
 	// made by the cluster-controller (e.g., Scaling phase during scale-out).
-	var latest cbv1alpha1.CloudberryCluster
-	if err := r.client.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err == nil {
-		cluster.Status.Phase = latest.Status.Phase
-	}
+	r.refreshPhaseFromServer(ctx, logger, cluster)
 
 	if err := patchStatus(ctx, r.client, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status after rolling restart: %w", err)

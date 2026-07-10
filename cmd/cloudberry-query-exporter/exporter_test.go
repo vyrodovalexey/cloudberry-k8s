@@ -248,7 +248,7 @@ func TestCollectOnce_NoConnection(t *testing.T) {
 	t.Setenv(envDataSourceName, "")
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{dsn: "", slowQueryThreshold: time.Second}
 	got := collectOnce(context.Background(), cfg, nil, m, testLogger(), hc)
 	assert.Nil(t, got)
@@ -266,7 +266,7 @@ func TestCollectOnce_Success(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{dsn: "host=x", slowQueryThreshold: time.Second}
 	got := collectOnce(context.Background(), cfg, conn, m, testLogger(), hc)
 	assert.NotNil(t, got)
@@ -281,7 +281,7 @@ func TestCollectOnce_ScrapeError(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{dsn: "host=x", slowQueryThreshold: time.Second}
 	got := collectOnce(context.Background(), cfg, conn, m, testLogger(), hc)
 	assert.Nil(t, got)
@@ -339,7 +339,7 @@ func TestShutdownServer(t *testing.T) {
 func TestCollectLoop_ContextCancel(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := newExporterMetrics(reg)
-	hc := newHistoryCollector(testLogger(), false, time.Second)
+	hc := newHistoryCollector(testLogger(), false, time.Second, nil)
 	cfg := &exporterConfig{
 		dsn:              "",
 		samplingInterval: time.Millisecond,
@@ -347,10 +347,7 @@ func TestCollectLoop_ContextCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() {
-		collectLoop(ctx, cfg, nil, m, testLogger(), hc)
-		close(done)
-	}()
+	go collectLoop(ctx, cfg, nil, m, testLogger(), hc, done)
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 	select {

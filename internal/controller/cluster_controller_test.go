@@ -787,6 +787,73 @@ func TestClusterReconciler_Reconcile_ObservedGenerationSkip(t *testing.T) {
 	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
 }
 
+func TestClusterReconciler_Reconcile_SteadyStateRefreshesSegmentsReady(t *testing.T) {
+	// REGRESSION (steady-state staleness): with generation unchanged and phase
+	// Running the reconciler early-returns — but a segment restart in that
+	// window (STS readyReplicas 2 -> 1 -> 2) previously left
+	// status.segmentsReady frozen at the mid-restart value forever (observed
+	// live as a permanent SEGMENTS 1/2 on a fully healthy cluster). The skip
+	// path must refresh coordinator/standby/segment readiness from the live
+	// StatefulSets and persist the drift.
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Finalizers = []string{util.FinalizerName}
+	cluster.Generation = 2
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Status.ObservedGeneration = 2
+	cluster.Status.CoordinatorReady = true
+	// Stale value captured mid-restart: 1 of 2 segments ready.
+	cluster.Status.SegmentsReady = 1
+	cluster.Status.SegmentsTotal = 2
+
+	segReplicas := int32(2)
+	coordReplicas := int32(1)
+	primarySts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.SegmentPrimaryName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Spec:   appsv1.StatefulSetSpec{Replicas: &segReplicas},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 2},
+	}
+	coordSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.CoordinatorName(cluster.Name),
+			Namespace: cluster.Namespace,
+		},
+		Spec:   appsv1.StatefulSetSpec{Replicas: &coordReplicas},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts, coordSts).
+		WithStatusSubresource(cluster).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	b := builder.NewBuilder()
+	m := &metrics.NoopRecorder{}
+
+	r := NewClusterReconciler(k8sClient, scheme, recorder, b, m, nil)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"},
+	})
+
+	// Still the steady-state skip (no full reconcile)...
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterDefault, result.RequeueAfter)
+
+	// ...but the readiness drift is refreshed and PERSISTED.
+	updated := &cbv1alpha1.CloudberryCluster{}
+	require.NoError(t, k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated))
+	assert.Equal(t, int32(2), updated.Status.SegmentsReady,
+		"steady-state skip must refresh segmentsReady from the live StatefulSet")
+	assert.True(t, updated.Status.CoordinatorReady,
+		"coordinator readiness must stay true (1/1 ready)")
+}
+
 func TestClusterReconciler_Reconcile_ObservedGenerationNotSkippedWhenNotRunning(t *testing.T) {
 	// When ObservedGeneration matches but phase is NOT Running, should NOT skip.
 	scheme := newTestScheme()
@@ -1874,6 +1941,56 @@ func TestClusterReconciler_HandleScaleOut_Success(t *testing.T) {
 	err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: "default"}, updated)
 	require.NoError(t, err)
 	assert.Equal(t, cbv1alpha1.ClusterPhaseScaling, updated.Status.Phase)
+}
+
+// TestClusterReconciler_HandleScaleOut_InjectsExpansionEnv is the BUG-1
+// regression test: handleScaleOut MUST persist the scale-state annotation
+// (carrying oldCount) BEFORE building+scaling the segment StatefulSet, so the new
+// pods start with CLOUDBERRY_EXPANSION_BASE_COUNT set (gpexpand-managed). It
+// asserts the applied StatefulSet carries the env AND the replica increase
+// atomically.
+func TestClusterReconciler_HandleScaleOut_InjectsExpansionEnv(t *testing.T) {
+	scheme := newTestScheme()
+	cluster := newTestCluster()
+	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
+	cluster.Spec.Segments.Count = 3 // desired post-scale count
+
+	b := builder.NewBuilder()
+	primarySts, _ := b.BuildSegmentPrimaryStatefulSet(cluster)
+	replicas := int32(2)
+	primarySts.Spec.Replicas = &replicas
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, primarySts).
+		WithStatusSubresource(cluster).
+		Build()
+	r := NewClusterReconciler(k8sClient, scheme, record.NewFakeRecorder(20),
+		b, &metrics.NoopRecorder{}, nil)
+
+	require.NoError(t, r.handleScaleOut(context.Background(), cluster, 2, 3))
+
+	// The scale-state annotation carrying oldCount must be persisted.
+	require.Contains(t, cluster.Annotations, annotationScaleState)
+
+	// The applied segment StatefulSet must carry the env AND be scaled to 3.
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name: util.SegmentPrimaryName(cluster.Name), Namespace: "default",
+	}, sts))
+	require.NotNil(t, sts.Spec.Replicas)
+	assert.Equal(t, int32(3), *sts.Spec.Replicas, "StatefulSet must be scaled up")
+
+	found := ""
+	for i := range sts.Spec.Template.Spec.Containers {
+		for _, e := range sts.Spec.Template.Spec.Containers[i].Env {
+			if e.Name == builder.EnvCloudberryExpansionBaseCount {
+				found = e.Value
+			}
+		}
+	}
+	assert.Equal(t, "2", found,
+		"new segment pods must start with CLOUDBERRY_EXPANSION_BASE_COUNT=<pre-scale count>")
 }
 
 func TestClusterReconciler_HandleScaleOut_NotRunning(t *testing.T) {

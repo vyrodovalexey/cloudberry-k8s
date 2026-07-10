@@ -875,7 +875,7 @@ func TestBuildSegmentPrimaryStatefulSet_PXFInjection(t *testing.T) {
 }
 
 // TestBuildCoordinatorStatefulSet_NoPXFInjection confirms PXF never leaks into
-// the coordinator pod even when PXF is fully enabled (segment-primary scope).
+// the coordinator pod even when PXF is fully enabled (segment scope only).
 func TestBuildCoordinatorStatefulSet_NoPXFInjection(t *testing.T) {
 	b := NewBuilder()
 	cluster := newPXFTestCluster()
@@ -883,6 +883,106 @@ func TestBuildCoordinatorStatefulSet_NoPXFInjection(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, containerNames(sts.Spec.Template.Spec.Containers), pxfContainerName)
 	assert.NotContains(t, volumeNames(sts.Spec.Template.Spec.Volumes), pxfBaseVolumeName)
+}
+
+// TestBuildStandbyStatefulSet_NoPXFInjection confirms PXF never leaks into the
+// standby coordinator pod even when PXF is fully enabled (segment scope only).
+func TestBuildStandbyStatefulSet_NoPXFInjection(t *testing.T) {
+	b := NewBuilder()
+	cluster := newPXFTestCluster()
+	cluster.Spec.Standby = &cbv1alpha1.StandbySpec{Enabled: true}
+	sts, err := b.BuildStandbyStatefulSet(cluster)
+	require.NoError(t, err)
+	require.NotNil(t, sts)
+	assert.NotContains(t, containerNames(sts.Spec.Template.Spec.Containers), pxfContainerName)
+	assert.NotContains(t, volumeNames(sts.Spec.Template.Spec.Volumes), pxfBaseVolumeName)
+}
+
+// TestBuildSegmentMirrorStatefulSet_PXFInjection is the D9 blast-radius firewall
+// for the MIRROR StatefulSet: with PXF enabled the mirror pod gains the SAME pxf
+// container, cred/connector init containers, and PXF volumes the primary does
+// (so PXF follows the acting primary after a failover); with PXF disabled /
+// dataLoading nil the mirror pod is byte-identical to the baseline.
+func TestBuildSegmentMirrorStatefulSet_PXFInjection(t *testing.T) {
+	b := NewBuilder()
+
+	// Baseline: default cluster with mirroring enabled but PXF off.
+	baseline := newTestCluster()
+	baseline.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+	baseSTS, err := b.BuildSegmentMirrorStatefulSet(baseline)
+	require.NoError(t, err)
+	require.NotNil(t, baseSTS)
+	baseContainers := containerNames(baseSTS.Spec.Template.Spec.Containers)
+	baseVolumes := volumeNames(baseSTS.Spec.Template.Spec.Volumes)
+	baseInit := containerNames(baseSTS.Spec.Template.Spec.InitContainers)
+	assert.NotContains(t, baseContainers, pxfContainerName)
+	assert.NotContains(t, baseVolumes, pxfBaseVolumeName)
+
+	t.Run("pxf enabled adds sidecar, init containers and volumes to mirror", func(t *testing.T) {
+		cluster := newPXFTestCluster()
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		sts, buildErr := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, buildErr)
+		require.NotNil(t, sts)
+
+		// The pxf sidecar container is present on the mirror pod.
+		names := containerNames(sts.Spec.Template.Spec.Containers)
+		assert.Contains(t, names, pxfContainerName)
+		assert.Len(t, names, len(baseContainers)+1)
+
+		// The PXF cred/connector init containers are appended (config auto-sync).
+		initNames := containerNames(sts.Spec.Template.Spec.InitContainers)
+		assert.Greater(t, len(initNames), len(baseInit),
+			"mirror must gain the PXF cred/connector init containers")
+
+		// The three PXF emptyDirs are present, IDENTICAL to the primary.
+		vols := volumeNames(sts.Spec.Template.Spec.Volumes)
+		assert.Contains(t, vols, pxfBaseVolumeName)
+		assert.Contains(t, vols, pxfServersVolumeName)
+		assert.Contains(t, vols, pxfLibVolumeName)
+
+		// Parity check: the mirror sidecar equals the primary sidecar.
+		primarySTS, perr := b.BuildSegmentPrimaryStatefulSet(cluster)
+		require.NoError(t, perr)
+		assert.Equal(t,
+			findContainer(primarySTS.Spec.Template.Spec.Containers, pxfContainerName),
+			findContainer(sts.Spec.Template.Spec.Containers, pxfContainerName),
+			"mirror PXF sidecar must be identical to the primary PXF sidecar")
+	})
+
+	t.Run("pxf disabled leaves mirror STS unchanged", func(t *testing.T) {
+		cluster := newTestCluster()
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
+			Enabled: true,
+			Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: testPxfImage},
+		}
+		sts, buildErr := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, buildErr)
+		require.NotNil(t, sts)
+		assert.Equal(t, baseContainers, containerNames(sts.Spec.Template.Spec.Containers))
+		assert.Equal(t, baseVolumes, volumeNames(sts.Spec.Template.Spec.Volumes))
+	})
+
+	t.Run("dataLoading nil leaves mirror STS unchanged", func(t *testing.T) {
+		cluster := newTestCluster()
+		cluster.Spec.Segments.Mirroring = &cbv1alpha1.MirroringSpec{Enabled: true}
+		sts, buildErr := b.BuildSegmentMirrorStatefulSet(cluster)
+		require.NoError(t, buildErr)
+		require.NotNil(t, sts)
+		assert.Equal(t, baseContainers, containerNames(sts.Spec.Template.Spec.Containers))
+		assert.Equal(t, baseVolumes, volumeNames(sts.Spec.Template.Spec.Volumes))
+	})
+}
+
+// findContainer returns a pointer to the container with the given name, or nil.
+func findContainer(cs []corev1.Container, name string) *corev1.Container {
+	for i := range cs {
+		if cs[i].Name == name {
+			return &cs[i]
+		}
+	}
+	return nil
 }
 
 // ============================================================================

@@ -24,7 +24,7 @@
 # Build arguments
 # ---------------------------------------------------------------------------
 ARG PXF_VERSION=2.1.0-incubating
-ARG GO_VERSION=1.26.4
+ARG GO_VERSION=1.26.5
 ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
 
 # =============================================================================

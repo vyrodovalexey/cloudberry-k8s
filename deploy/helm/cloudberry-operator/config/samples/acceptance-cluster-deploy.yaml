@@ -112,6 +112,22 @@ spec:
         address: "0.0.0.0/0"
         method: scram-sha-256
 
+  # Cluster-wide GUCs — rendered verbatim into the operator-managed
+  # postgresql.conf ConfigMap, so they are in effect from first pod start.
+  config:
+    parameters:
+      # Force the TCP interconnect for this acceptance environment. Cloudberry's
+      # default interconnect (udpifc) rides on UDP, which is unreliable under
+      # kind / Docker Desktop networking (the vpnkit/VM NAT path drops or
+      # reorders UDP between pod sandboxes) — Motion traffic between segments
+      # then stalls until gp_interconnect_setup_timeout even though the
+      # NetworkPolicy admits it. TCP survives that environment.
+      # NOTE: gp_interconnect_type is applied from postgresql.conf at server
+      # start; changing it on a RUNNING cluster needs a pod restart to take
+      # effect (the operator classifies it as a config change but cannot
+      # hot-reload postmaster-scoped interconnect settings).
+      gp_interconnect_type: tcp
+
   ha:
     ftsProbeInterval: 60
     ftsProbeTimeout: 20
