@@ -264,8 +264,9 @@ func TestPXFKeytabPath_DefaultKey(t *testing.T) {
 
 // TestBuildPXFClusterNetworkPolicy_Enabled proves the policy is emitted for a
 // PXF cluster, selects BOTH the segment-primary and segment-mirror pods (D9),
-// allows 5432 + exporter ports, and DELIBERATELY OMITS the PXF port 5888
-// (cross-pod PXF denied). (111-SE5-U)
+// allows 5432 + exporter ports (source-unrestricted) plus the cluster-scoped
+// interconnect range, and DELIBERATELY OMITS the PXF port 5888 from EVERY TCP
+// entry — exact ports and ranges alike (cross-pod PXF denied). (111-SE5-U)
 func TestBuildPXFClusterNetworkPolicy_Enabled(t *testing.T) {
 	b := NewBuilder()
 	cluster := newPXFTestCluster()
@@ -294,14 +295,17 @@ func TestBuildPXFClusterNetworkPolicy_Enabled(t *testing.T) {
 	// Ingress-only policy.
 	assert.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
 
-	// Collect the allowed ingress ports.
-	require.Len(t, np.Spec.Ingress, 1)
+	// Two rules: the source-unrestricted exact service ports and the
+	// cluster-scoped interconnect range (see networkpolicy_builder_test.go for
+	// the range/scoping details).
+	require.Len(t, np.Spec.Ingress, 2)
 	allowed := map[int32]bool{}
 	for _, p := range np.Spec.Ingress[0].Ports {
 		require.NotNil(t, p.Port)
 		allowed[p.Port.IntVal] = true
 		require.NotNil(t, p.Protocol)
 		assert.Equal(t, corev1.ProtocolTCP, *p.Protocol)
+		assert.Nil(t, p.EndPort, "service-port rule must keep exact ports, not ranges")
 	}
 
 	// 5432 (PostgreSQL) + exporter ports are allowed.
@@ -309,8 +313,31 @@ func TestBuildPXFClusterNetworkPolicy_Enabled(t *testing.T) {
 	assert.True(t, allowed[pgExporterPort], "pg exporter port must be allowed")
 	assert.True(t, allowed[nodeExporterPort], "node exporter port must be allowed")
 
-	// HONESTY (SE.5): the PXF port 5888 is NOT in the cross-pod ingress set.
-	assert.False(t, allowed[5888], "PXF port 5888 must NOT be allowed cross-pod")
+	// HONESTY (SE.5): no TCP entry in ANY rule — exact port or range — covers
+	// the PXF port 5888. The interconnect TCP range is split around it.
+	assert.False(t, tcpPortCoveredByPolicy(np, 5888),
+		"PXF port 5888 must NOT be allowed cross-pod by any TCP port or range")
+}
+
+// tcpPortCoveredByPolicy reports whether any TCP ingress entry (exact port or
+// port range) of the policy admits the given port.
+func tcpPortCoveredByPolicy(np *networkingv1.NetworkPolicy, port int32) bool {
+	for _, rule := range np.Spec.Ingress {
+		for _, p := range rule.Ports {
+			if p.Protocol == nil || *p.Protocol != corev1.ProtocolTCP || p.Port == nil {
+				continue
+			}
+			start := p.Port.IntVal
+			end := start
+			if p.EndPort != nil {
+				end = *p.EndPort
+			}
+			if port >= start && port <= end {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestBuildPXFClusterNetworkPolicy_Disabled proves no policy is emitted when PXF

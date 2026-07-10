@@ -147,6 +147,11 @@ Two authentication modes run side by side:
 - **OIDC (Keycloak)** — JWT validation with JWKS caching and role-claim
   extraction. Tokens are validated against the cached JWKS, and roles are read
   from the token claims to drive authorization.
+
+Rejected requests receive a `401` with a **generic** JSON body plus an RFC 7235
+`WWW-Authenticate` challenge advertising only the configured scheme(s)
+(`Basic realm="cloudberry"`, `Bearer`, or both); the concrete failure reason is
+logged, never disclosed to the client.
 ##### Permission model
 
 Five tiers, from most to least restricted:
@@ -244,7 +249,12 @@ as `skipped` rather than guessed).
 Cluster health, FTS, connections, and reconciliation are covered by
 `cloudberry_reconcile_total`, `cloudberry_reconcile_errors_total`, and
 `cloudberry_reconcile_duration_seconds` (labelled by cluster, namespace, and
-result).
+result). Swallowed (non-fatal) errors on the admin controller's steady-state
+refresh paths are counted on
+`cloudberry_steady_state_refresh_errors_total{cluster,namespace,component}`
+(`component` ∈ `backup`/`dataloading`/`storage`) — they intentionally don't
+change reconcile results, but the counter makes the silent degradation
+alertable.
 
 ##### Operational metrics
 
@@ -278,8 +288,10 @@ increments `{method="unknown",result="failure"}`).
 `cloudberry_api_requests_total` and `cloudberry_api_request_duration_seconds`
 are labelled by the low-cardinality **route template**, never the raw path.
 `cloudberry_api_requests_in_flight` is panic-safe (decremented even when a
-handler panics), and `cloudberry_api_rate_limit_rejections_total` tracks rate
-limiting.
+handler panics), `cloudberry_api_rate_limit_rejections_total` tracks rate
+limiting, and `cloudberry_api_rate_limit_entries` samples the limiter's live
+per-client entry count on every scrape (memory footprint and cleanup
+visibility).
 
 Request-side counters complement the controller-side outcome metrics:
 
@@ -342,12 +354,22 @@ the database.
 The `postgres-exporter` is Cloudberry-tailored — conditional resource-group
 query, incompatible built-in collectors disabled, recovery-safe WAL query — so
 scrapes run cleanly (`pg_exporter_last_scrape_error=0`) on coordinator, standby,
-and segments.
+and segments. Its per-table `cloudberry_table_stats` query is **catalog-only**
+(`pg_class` + `pg_namespace`): on Cloudberry `pg_stat_user_tables` is a
+distributed view dispatched to every segment, so a sidecar must not run it per
+scrape. The query reports **estimates** — live rows from
+`GREATEST(reltuples, 0)` and table size from `relpages * block_size`, both
+refreshed by `ANALYZE`/`VACUUM`; matviews included, temp tables excluded, and
+the per-table DML/scan counters are not exported.
 
 The query exporter reports its own health via
 `cbexporter_collector_errors_total{collector}` and
 `cbexporter_collector_duration_seconds{collector}` (per-collector error count
-and duration). The unbounded `usename` label was removed from
+and duration), plus `cloudberry_query_exporter_history_errors_total{stage}`
+(`snapshot`/`insert`/`explain`) for the query-history pipeline — history
+INSERTs and the retention DELETE are deadline-bounded (5 s / 60 s) so a
+degraded interconnect fails fast onto that counter instead of wedging the
+collect loop. The unbounded `usename` label was removed from
 `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound cardinality.
 
 #### Distributed tracing
@@ -414,6 +436,11 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Goroutine leak prevention in idle daemon via `startOrUpdateIdleDaemon`
 - Dependency vulnerability fix: upgraded `golang.org/x/net` (GO-2026-5026)
 - Dependency security update: bumped `golang.org/x/crypto` to v0.52.0 (Go toolchain pinned to 1.26.4)
+- `workload.resourceGroups[].ioLimits[].tablespace` is restricted to a SQL identifier or `*` (webhook + CRD pattern `^[A-Za-z_][A-Za-z0-9_]*$|^\*$`), and the rendered `ALTER RESOURCE GROUP … SET io_limit` value is additionally literal-quoted (`quoteLiteral`) — defense in depth against SQL injection through the io-limit DDL string
+- Query-exporter EXPLAIN plan collection is sandboxed: comment-stripped `SELECT`/`WITH` allowlist, top-level-semicolon (multi-statement) rejection, and `BEGIN READ ONLY` + `SET LOCAL statement_timeout` with `ROLLBACK` on all paths
+- Generic 401 bodies with an RFC 7235 `WWW-Authenticate` challenge advertising only the configured scheme(s) — auth failures never disclose which providers are configured, and the admin-password rotation endpoint no longer leaks raw Kubernetes error text (logged only)
+- API request bodies reject trailing data after the JSON value (`DisallowUnknownFields` deliberately deferred so clients with version skew keep working)
+- The cluster NetworkPolicy admits the MPP interconnect port range and TCP 22 (coordinator→segment SSH) only from same-cluster pods in the same namespace — cross-pod PXF `:5888` stays sealed (the TCP range is split around it)
 
 ### Administration
 
@@ -447,6 +474,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Backup failure handling verified by Scenario 83: backup Jobs are bounded by `spec.backup.jobTemplate.backoffLimit` (default `2`) and `activeDeadlineSeconds` (default `7200`), both seeded by `buildJobSpec` and overridable per cluster (the override reaches every backup/restore/cleanup/validation Job and the CronJob `jobTemplate`). **83a** a force-failure (unreachable/bad-creds S3, caught fast by the 77c pre-backup HEAD) retries up to `backoffLimit` (up to 3 pod attempts) and ends with the Job condition `reason=BackoffLimitExceeded`; **83b** a backup outliving a low `activeDeadlineSeconds` is killed by Kubernetes at the deadline (`reason=DeadlineExceeded`). The operator now classifies a Job as `Failed` when `Status.Failed > 0` **OR** it carries a terminal Failed condition (`jobHasFailedCondition` — `batchv1.JobFailed`/`ConditionTrue`), applied to `backupJobStatus`/`backupJobStatusCode`/`validationJobResult` after the Succeeded precedence — so a deadline-killed Job (failed-pod count may be `0`) is reliably recorded `Failed`. A Failed backup sets `status.backup.lastBackupStatus=Failed`, `cloudberry_backup_last_status=1`, and emits the de-duplicated `Warning`/`BackupFailed` Event (Scenario 77); a success sets the metric to `0`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario83-backup-failure.yaml`; live cycle `test/e2e/scripts/scenario83-backup-failure.sh`
 - Prometheus backup/restore metrics verified by Scenario 84: the `gpbackup_exporter` is the **operator `/metrics` endpoint** — the operator derives nine metrics (namespace `cloudberry`) from the observed backup/restore/cleanup Jobs + their `avsoft.io/*` annotations and exposes them on `/metrics` (vmagent scrapes them into VictoriaMetrics via the `prometheus.io/scrape` annotations; the Grafana operator dashboard renders a panel for each). The nine: `backup_total{type,result}`, `backup_duration_seconds{type}`, `backup_size_bytes{timestamp}`, `backup_last_success_timestamp`, `backup_last_status` (`0=success, 1=failed, 2=in-progress`), `restore_total{result}`, `restore_duration_seconds`, `backup_retention_deleted_total`, and `backup_job_status{job,operation}` (`0=pending, 1=running, 2=succeeded, 3=failed`). The outcome label on `backup_total`/`restore_total` is **`result`** (`success`|`failed`), **not** `status` — query `{result="success"}`/`{result="failed"}` (not renamed in code; dashboards/PromQL across 76–83 use `result`); both counters are **transition-gated** (one increment per actual Job state change — no inflation from periodic no-op reconciles). All nine were already wired across Scenarios 76–83 (`internal/metrics/metrics.go` `initBackupMetrics`; recorded by `recordLatestBackupMetrics`/`recordBackupJobMetrics`/`applyBackupJobToStatus` in `internal/controller/admin_controller.go`), so Scenario 84 is a verification/doc/dashboard scenario with no operator code change. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario84-metrics.yaml`; live cycle `test/e2e/scripts/scenario84-metrics.sh`
 - All backup API endpoints verified by Scenario 85: the **seven** OIDC/JWT-authed backup/restore REST endpoints under `/api/v1alpha1/clusters/{name}/backups`, each with its own RBAC — **85a** `GET /backups` (Basic) lists the operator's recorded backup history (`status.backup.backupHistory`, derived from observed Jobs — **not** a live `gpbackman` query); **85b** `POST /backups` (Operator) creates a backup Job whose `gpbackup` args match `CreateBackupRequest.gpbackupOptions` (`mergeGpbackupOptions` → `buildGpbackupArgs`), **including the fix that `leafPartitionData` now emits `--leaf-partition-data` on FULL backups too, exactly once** (`appendLeafPartitionDataArgs` guarded on `!isEffectivelyIncremental` so the incremental force-pair is never duplicated); **85c** `GET /backups/{timestamp}` (Basic) returns the matching history entry (`400` non-14-digit, `404 BACKUP_NOT_FOUND` unknown); **85d** `DELETE /backups/{timestamp}` (Admin) creates a `gpbackman` cleanup Job; **85e** `POST /backups/{timestamp}/restore` (Admin) creates a restore Job whose `gprestore` args match `RestoreRequest.gprestoreOptions` (`dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`, …) with `dataOnly`+`metadataOnly` rejected `400`, and include-schema/include-table + run-analyze/with-stats resolved to the more specific flag; **85f** `GET /backups/jobs` (Basic) lists backup/restore/cleanup Job statuses; **85g** `GET /backups/schedule` (Basic) returns the CronJob status + computed `nextScheduleTime`. Handlers in `internal/api/server.go` (`handle*Backup*`), DTOs/mapping in `internal/api/backup.go` (`buildBackupJobOptions`/`buildRestoreJobOptions`/`restoreOptionsConflict`). Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario85-api-endpoints.yaml`; live cycle `test/e2e/scripts/scenario85-api-endpoints.sh`
+- Backup lifecycle endpoints are uniformly gated on `backup.enabled`: create (`POST /backups`), delete (`DELETE /backups/{timestamp}`), and restore (`POST /backups/{timestamp}/restore`) all return `400 BACKUP_NOT_ENABLED` when backup is not enabled/configured for the cluster, so no backup, cleanup, or restore Job is ever built for an unconfigured destination (the restore reject is a client error — `cloudberry_restore_total{result="failed"}` is not incremented)
 - All backup CLI commands verified by Scenario 86: the **eleven** `cloudberry-ctl backup …` commands map to the operator backup REST API over an OIDC bearer token (`--operator-url`/`CLOUDBERRY_OPERATOR_URL`, `--auth-method oidc` + token via `--password`/`CLOUDBERRY_PASSWORD`) — **86a** `backup create` (all `gpbackupOptions` flags: `--type`, `--database`, `--compression-level`/`--compression-type`, `--jobs`, `--single-data-file`/`--copy-queue-size`, `--include-schema`/`--exclude-table`, `--incremental`/`--from-timestamp`/`--leaf-partition-data`, `--with-stats`, `--without-globals`) → `POST /backups`; **86b** `backup list` → `GET /backups`; **86c** `backup status --timestamp` → `GET /backups/{ts}`; **86d** `backup delete --timestamp` → `DELETE /backups/{ts}`; **86e** `backup restore --timestamp` (all `gprestoreOptions` flags incl. **`--resize-cluster`** — restores into a cluster with a different segment count) → `POST /backups/{ts}/restore`; **86f** `backup schedule` → `GET /backups/schedule`; **86g/h/i** `backup schedule set --cron`/`suspend`/`resume` → `PATCH /backups/schedule`; **86j** `backup jobs` → `GET /backups/jobs`; **86k** `backup jobs logs --job <name>` now **STREAMS** the Job's pod logs (`--follow`/`--tail`) via a **new** operator endpoint `GET /clusters/{name}/backups/jobs/{job}/logs` (Permission Basic, `text/plain`, `?follow`/`?tailLines`) that finds the Job's pod and streams its container logs — with a `kubectl logs` fallback when the endpoint is unavailable. The operator gained a typed Kubernetes clientset (injected via `Server.WithClientset`) to read pod logs; the CLI streams via `OperatorClient.GetStream`. Commands in `cmd/cloudberry-ctl/main.go` (`newBackup*`), endpoint `handleBackupJobLogs` in `internal/api/server.go`. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario86-cli-commands.yaml`; live cycle `test/e2e/scripts/scenario86-cli-commands.sh`
 - Session management: list active sessions from `pg_stat_activity`, cancel queries via `pg_cancel_backend()`, terminate sessions via `pg_terminate_backend()` (with PID validation and graceful degradation when DB is unavailable)
 - Resource group management: create, list, assign, and delete resource groups for workload isolation
@@ -621,7 +649,10 @@ cloudberry-ctl data-loading test-read --job <job> --limit 10
   Kerberos auth. Config-correct; live authenticated access is unverified in
   environments without a KDC.
 - **Network isolation** — a NetworkPolicy keeps segment↔sidecar PXF traffic
-  localhost-only.
+  localhost-only while admitting, **from same-cluster pods only**, the MPP
+  interconnect ephemeral range (TCP split around `:5888`, full UDP) and TCP 22
+  for the coordinator→segment SSH dispatch (`gpbackup`/`gprestore`) — so
+  distributed queries and backups work while cross-pod `:5888` stays sealed.
 - **TLS passthrough** — JDBC and S3 TLS options flow into the rendered site files.
 
 #### Disabled states
@@ -1021,6 +1052,13 @@ make fmt
 make vuln
 ```
 
+### Continuous Integration
+
+GitHub Actions CI (`.github/workflows/ci.yml`) runs the verification jobs —
+lint, govulncheck, unit/service tests, and the SonarCloud scan — on every pull
+request **and on pushes to `main`/`init`**. Release/publish jobs (release
+build, image push, Trivy scan, Helm package) run only on `v*` tag pushes.
+
 ## Testing
 
 ```bash
@@ -1084,9 +1122,13 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory — four dashboards: **operator** (`cloudberry-operator.json`), **exporters** (`cloudberry-exporters.json`), **node metrics** (`cloudberry-node-metrics.json`), and **OTel/telemetry** (`cloudberry-otel.json`). The operator dashboard visualizes all operator metrics — including the REST API panels (request rate/duration/in-flight/rate-limit rejections), DB connect/pool/query panels, idle-daemon health, and a **Security & Lifecycle** section covering certificate rotation and expiry, cluster TLS issuance, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery. The operator dashboard gained **8 panels** for the request-side API/DDL metrics — `cloudberry_api_cluster_lifecycle_requests_total` (by operation/result), `cloudberry_api_workload_operations_total` (by kind/operation/result), and `cloudberry_pxf_sync_total` (by result) — plus a **DB-query-duration-by-operation p95** panel built on `cloudberry_db_query_duration_seconds_bucket`. It also gained a **"gpfdist, PXF Extension & Data-Loader Role Setup"** row covering the data-loading control-plane metric families — for each of `cloudberry_gpfdist_reconcile_total` (by operation/result), `cloudberry_pxf_extension_setup_total` (by result), and `cloudberry_dataloader_role_setup_total` (by result, **3 new panels** following the `cloudberry_pxf_extension_setup_total` pattern): a rate timeseries, a 1h-total stat, and an error stat. The **OTel/telemetry** dashboard (`cloudberry-otel.json`) renders Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*`), and operator logs from VictoriaLogs. The test monitoring stack (Helm charts under `test/monitoring/`: vmagent, vector, otel-collector, node-exporter, kube-state-metrics) is deployed via `make monitoring-deploy`. **kube-state-metrics** (added in Scenario 104) feeds Kubernetes object-state metrics (`kube_job_status_failed`, `kube_pod_init_container_status_*`, `kube_deployment_status_replicas_available`) into VictoriaMetrics so pre-load health-check failures and gpfdist deployment readiness are observable in metrics (dashboard panels 274-276).
 
+The dashboards cover all **168** project metric families (168/168). The latest revision added 8 panels for the newest families: **Steady-State Refresh Errors** and **API Rate Limit Entries** on the operator dashboard, and **Query History Pipeline Errors** plus **Collector Errors/Duration** on the exporters dashboard — whose table-stats panels were also reworked for the catalog-only estimates ("Top Tables by Estimated Size/Rows", "Estimated Size by Schema").
+
 ## Performance Characteristics
 
 Current baseline (latest perf-test cycle): authenticated API throughput is **~7 RPS per client** — dominated by bcrypt password verification on every Basic-auth request — and health endpoints sustain **p99 < 10ms**. Note that the default API rate limit is **10 requests/minute per IP** (`api-rate-limit` / `CLOUDBERRY_API_RATE_LIMIT`; set `0` to disable), so performance testing requires raising or disabling the limit.
+
+Latest validation (2026-07-10, kind via `kubectl port-forward`, `hey` load generator): health endpoints p50 2.7 ms / p99 10.4 ms at 100 RPS with 0 errors; authenticated API p99 167 ms (bcrypt-dominated); the default 10 req/min rate limit enforced exactly, with fast ~39 ms 429 rejections and accurate `cloudberry_api_rate_limit_rejections_total` / `cloudberry_api_rate_limit_entries`; zero 5xx across 24,000+ requests. Full report: [test/performance/results/2026-07-10-perftest-report.md](test/performance/results/2026-07-10-perftest-report.md).
 
 Earlier full load-test results (2026-05-19, 287,122 total requests, zero errors):
 

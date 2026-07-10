@@ -1,0 +1,42 @@
+# =============================================================================
+# Rate Limiter Knee Detection Test
+# =============================================================================
+#
+# Purpose: Find the exact RPS threshold where the rate limiter starts
+#          rejecting requests (429 Too Many Requests). The default rate
+#          limit is 10 requests/minute per IP.
+#
+# Strategy: Stepped load from 1 to 50 RPS with short holds at each step
+#           to observe the transition from 200 → 429 responses.
+#
+# Tool substitution: On macOS, Docker --net=host is a no-op, so this
+#                    config is for reference. Actual execution uses `hey`.
+#
+# =============================================================================
+
+phantom:
+  address: localhost:8190
+  ssl: false
+  ammo_type: uri
+  ammofile: ammo/api-read-acceptance.txt
+  load_profile:
+    load_type: rps
+    schedule: >
+      line(1, 5, 15s)
+      const(5, 30s)
+      line(5, 10, 10s)
+      const(10, 30s)
+      line(10, 20, 10s)
+      const(20, 30s)
+      line(20, 50, 10s)
+      const(50, 30s)
+  timeout: 5s
+  instances: 100
+  connection_test: true
+  writelog: all
+
+autostop:
+  autostop:
+    - time(3000, 30s)
+    - http(5xx, 10%, 15s)
+    - net(xx, 5%, 10s)

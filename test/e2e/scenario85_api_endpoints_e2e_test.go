@@ -261,6 +261,7 @@ func (s *Scenario85APIEndpointsE2ESuite) TestE2E_Scenario85_LiveAPIEndpoints() {
 	if cluster == "" {
 		cluster = "scenario85-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS85Script)
 	if script == "" {

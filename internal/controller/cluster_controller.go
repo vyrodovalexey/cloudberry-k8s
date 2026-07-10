@@ -181,7 +181,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		"observedGeneration", cluster.Status.ObservedGeneration,
 		"deletionTimestamp", cluster.DeletionTimestamp)
 
-	// Handle annotation-based actions FIRST — annotations don't change the
+	// Handle deletion FIRST — before the action-annotation gate, the lifecycle
+	// phase short-circuit and the generation gate. A Terminating cluster in
+	// phase Stopped would otherwise return without removing the finalizer
+	// (stuck Terminating forever), and Restricted/Maintenance would requeue
+	// endlessly without ever reaching handleDeletion. Deletion always wins.
+	if !cluster.DeletionTimestamp.IsZero() {
+		logger.Debug("handling cluster deletion")
+		result, err = r.handleDeletion(ctx, cluster)
+		return result, err
+	}
+
+	// Handle annotation-based actions next — annotations don't change the
 	// generation, so they must be checked before the generation skip.
 	if action, ok := cluster.Annotations[util.AnnotationAction]; ok {
 		logger.Debug("handling action annotation", "action", action)
@@ -205,13 +216,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			err = res.err
 			return res.result, err
 		}
-	}
-
-	// Handle deletion.
-	if !cluster.DeletionTimestamp.IsZero() {
-		logger.Debug("handling cluster deletion")
-		result, err = r.handleDeletion(ctx, cluster)
-		return result, err
 	}
 
 	// Ensure finalizer is set.
@@ -327,9 +331,65 @@ func (r *ClusterReconciler) handleGenerationUnchanged(
 	}
 	logger.Debug("skipping reconciliation, generation unchanged and cluster running",
 		"generation", cluster.Generation)
+	// Even in the steady state the readiness counters must track the LIVE
+	// StatefulSets: a segment/coordinator restart while Running (readyReplicas
+	// N -> N-1 -> N) would otherwise leave status.segmentsReady frozen at the
+	// value captured mid-restart until the next generation bump — observed as a
+	// permanent 1/2 on a fully healthy cluster. Refresh from the (cached) STSes
+	// and persist only when something actually changed.
+	r.refreshSteadyStateReadiness(ctx, cluster)
 	r.recordMetricsSnapshot(cluster)
 	return generationUnchangedResult{
 		result: ctrl.Result{RequeueAfter: r.requeueDefault()}, handled: true,
+	}
+}
+
+// refreshSteadyStateReadiness re-reads the coordinator/standby/segment
+// readiness from the live StatefulSets during the generation-unchanged steady
+// state and persists the counters when they drifted from the stored status.
+// The patch is a manually-built MergePatch so omitempty zero values (false/0)
+// are explicitly present — a plain patchStatus would silently drop them and
+// leave a stale positive counter behind (see patchClearReadinessStatus).
+// Best-effort: a patch failure is logged, never escalated — the next requeue
+// retries.
+func (r *ClusterReconciler) refreshSteadyStateReadiness(
+	ctx context.Context,
+	cluster *cbv1alpha1.CloudberryCluster,
+) {
+	logger := util.LoggerFromContext(ctx)
+
+	prevCoordinator := cluster.Status.CoordinatorReady
+	prevStandby := cluster.Status.StandbyReady
+	prevSegments := cluster.Status.SegmentsReady
+
+	r.updateComponentReadiness(ctx, cluster)
+
+	if cluster.Status.CoordinatorReady == prevCoordinator &&
+		cluster.Status.StandbyReady == prevStandby &&
+		cluster.Status.SegmentsReady == prevSegments {
+		return
+	}
+
+	logger.Info("steady-state readiness drift detected, refreshing status",
+		"coordinatorReady", cluster.Status.CoordinatorReady,
+		"standbyReady", cluster.Status.StandbyReady,
+		"segmentsReady", cluster.Status.SegmentsReady,
+		"prevSegmentsReady", prevSegments)
+
+	statusPatch, err := json.Marshal(map[string]interface{}{
+		patchKeyStatus: map[string]interface{}{
+			"coordinatorReady": cluster.Status.CoordinatorReady,
+			"standbyReady":     cluster.Status.StandbyReady,
+			"segmentsReady":    cluster.Status.SegmentsReady,
+		},
+	})
+	if err != nil {
+		logger.Warn("failed to marshal steady-state readiness patch", "error", err)
+		return
+	}
+	if patchErr := r.client.Status().Patch(ctx, cluster,
+		client.RawPatch(types.MergePatchType, statusPatch)); patchErr != nil {
+		logger.Warn("failed to persist steady-state readiness refresh", "error", patchErr)
 	}
 }
 

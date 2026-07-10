@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/dbschema"
 )
 
 // QueryHistoryEntry represents a completed query stored in the history table.
@@ -67,36 +69,11 @@ const (
 	maxHistoryLimit     = 100
 )
 
-// queryHistoryDDL is the DDL for creating the query history table and indexes.
-const queryHistoryDDL = `
-CREATE TABLE IF NOT EXISTS cloudberry_query_history (
-    id               BIGSERIAL PRIMARY KEY,
-    query_id         TEXT NOT NULL,
-    pid              INTEGER NOT NULL,
-    username         TEXT NOT NULL,
-    database_name    TEXT NOT NULL,
-    query_text       TEXT NOT NULL,
-    query_start      TIMESTAMPTZ NOT NULL,
-    query_end        TIMESTAMPTZ NOT NULL,
-    duration_ms      DOUBLE PRECISION NOT NULL,
-    state            TEXT NOT NULL,
-    rows_affected    BIGINT DEFAULT 0,
-    cpu_time_ms      DOUBLE PRECISION DEFAULT 0,
-    memory_bytes     BIGINT DEFAULT 0,
-    spill_bytes      BIGINT DEFAULT 0,
-    disk_read_bytes  BIGINT DEFAULT 0,
-    disk_write_bytes BIGINT DEFAULT 0,
-    wait_events      TEXT DEFAULT '',
-    resource_group   TEXT DEFAULT '',
-    explain_plan     TEXT DEFAULT '',
-    error_message    TEXT DEFAULT '',
-    created_at       TIMESTAMPTZ DEFAULT NOW()
-) DISTRIBUTED BY (id);
-
-CREATE INDEX IF NOT EXISTS idx_query_history_start ON cloudberry_query_history (query_start);
-CREATE INDEX IF NOT EXISTS idx_query_history_user ON cloudberry_query_history (username);
-CREATE INDEX IF NOT EXISTS idx_query_history_db ON cloudberry_query_history (database_name);
-`
+// queryHistoryDDL is the DDL for creating the query history table and
+// indexes. The definition lives in the shared const-only internal/dbschema
+// package so this client and the standalone query exporter cannot drift
+// (T19/D3).
+const queryHistoryDDL = dbschema.QueryHistoryDDL
 
 // queryHistoryColumns is the ordered list of columns for SELECT queries.
 const queryHistoryColumns = `id, query_id, pid, username, database_name, query_text,

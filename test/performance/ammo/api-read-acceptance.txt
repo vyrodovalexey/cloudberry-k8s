@@ -1,0 +1,15 @@
+[Host: localhost:8190]
+[Connection: keep-alive]
+[User-Agent: yandex-tank/perftest]
+[Accept: application/json]
+[Authorization: Basic YWRtaW46U3dpc01uR2lqV0lUX3ZlNyRQY0dMUF4wKlBKNUgyK0g=]
+/api/v1alpha1/clusters
+/api/v1alpha1/clusters/acceptance-test
+/api/v1alpha1/clusters/acceptance-test/status
+/api/v1alpha1/clusters/acceptance-test/segments
+/api/v1alpha1/clusters/acceptance-test/mirroring
+/api/v1alpha1/clusters/acceptance-test/standby
+/api/v1alpha1/clusters
+/api/v1alpha1/clusters/acceptance-test
+/api/v1alpha1/clusters/acceptance-test/status
+/api/v1alpha1/clusters/acceptance-test/segments

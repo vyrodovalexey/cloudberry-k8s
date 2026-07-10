@@ -1607,11 +1607,14 @@ func (c *pgxClient) AlterResourceGroup(ctx context.Context, opts ResourceGroupOp
 		}
 	}
 
-	// Apply I/O limits if specified.
+	// Apply I/O limits if specified. The io_limit string embeds the free-form
+	// CRD Tablespace value, so it is quoted with quoteLiteral (single-quote
+	// escaping) instead of naive '%s' interpolation — defense in depth against
+	// SQL injection alongside the webhook/CRD pattern validation (C1a).
 	if len(opts.IOLimits) > 0 {
 		ioLimitStr := FormatIOLimits(opts.IOLimits)
-		alterSQL := fmt.Sprintf(`ALTER RESOURCE GROUP %s SET io_limit '%s'`,
-			pgx.Identifier{opts.Name}.Sanitize(), ioLimitStr)
+		alterSQL := fmt.Sprintf(`ALTER RESOURCE GROUP %s SET io_limit %s`,
+			pgx.Identifier{opts.Name}.Sanitize(), quoteLiteral(ioLimitStr))
 		if _, execErr := c.pool.Exec(ctx, alterSQL); execErr != nil {
 			err = fmt.Errorf("setting io_limit for resource group %s: %w", opts.Name, execErr)
 			return err

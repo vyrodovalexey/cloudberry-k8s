@@ -331,6 +331,7 @@ func (s *Scenario79RetentionE2ESuite) TestE2E_Scenario79_LiveRetentionLifecycle(
 	if cluster == "" {
 		cluster = "scenario79-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS79Script)
 	if script == "" {

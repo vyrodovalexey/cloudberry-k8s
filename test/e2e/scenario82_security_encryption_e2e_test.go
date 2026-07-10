@@ -264,6 +264,7 @@ func (s *Scenario82SecurityEncryptionE2ESuite) TestE2E_Scenario82_LiveSecurityEn
 	if cluster == "" {
 		cluster = "scenario82-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS82Script)
 	if script == "" {

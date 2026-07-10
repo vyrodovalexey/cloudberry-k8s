@@ -242,11 +242,28 @@ func (s *Scenario120Suite) TestIntegration_Scenario120_CatalogHonest() {
 // against the deployed operator API for the ENABLED cluster and asserts the
 // enriched content (200, usageReportEnabled true, entries present or honest
 // empty). SKIPS cleanly when the apiserver / CRD / namespace / the operator API
-// are absent.
+// are absent, when the target cluster is not deployed, or when its spec does
+// not actually enable storage.usageReport (this probe's contract is the
+// ENABLED path; the disabled contract is TestIntegration_Scenario120_
+// DisabledUnavailableLive) — mirroring the disabled probe's own existence gate.
 func (s *Scenario120Suite) TestIntegration_Scenario120_UsageReportLive() {
 	s.scenario120RequireLive()
 
-	res := s.scenario120apiOrSkip(scenario120ClusterName())
+	cluster := scenario120ClusterName()
+	if out, err := s.scenario120Kubectl("get", "cloudberrycluster", cluster,
+		"-n", scenario120Namespace()); err != nil {
+		s.T().Skipf("enabled cluster %q not present [CONFIG-ONLY: point %s at a "+
+			"deployed usageReport-enabled cluster]: %s", cluster, envS120ClusterI, out)
+	}
+	if enabled, _ := s.scenario120Kubectl("get", "cloudberrycluster", cluster,
+		"-n", scenario120Namespace(),
+		"-o", "jsonpath={.spec.storage.usageReport.enabled}"); strings.TrimSpace(enabled) != "true" {
+		s.T().Skipf("cluster %q does not enable spec.storage.usageReport [CONFIG-ONLY: "+
+			"this probe asserts the ENABLED contract; the disabled contract is covered by "+
+			"TestIntegration_Scenario120_DisabledUnavailableLive]", cluster)
+	}
+
+	res := s.scenario120apiOrSkip(cluster)
 	require.Equalf(s.T(), http.StatusOK, res.status,
 		"120-C13-api-L: GET usage-report (enabled) must be 200 (body=%s)", scenario120Trunc(res.body))
 

@@ -293,6 +293,8 @@ func (s *Scenario87MigrationE2ESuite) TestE2E_Scenario87_LiveMigration() {
 	if target == "" {
 		target = "scenario87-dst"
 	}
+	requireLiveClusterDeployed(s.T(), source, "cloudberry-test")
+	requireLiveClusterDeployed(s.T(), target, "cloudberry-test")
 
 	script := os.Getenv(envS87Script)
 	if script == "" {

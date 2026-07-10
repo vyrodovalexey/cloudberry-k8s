@@ -357,6 +357,7 @@ func (s *Scenario78IncrementalBackupE2ESuite) TestE2E_Scenario78_LiveIncremental
 	if cluster == "" {
 		cluster = "scenario78-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS78Script)
 	if script == "" {

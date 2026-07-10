@@ -2157,8 +2157,12 @@ spec:
                                 format: int32
                                 type: integer
                               tablespace:
-                                description: Tablespace is the target tablespace name.
-                                  Use "*" for all tablespaces.
+                                description: |-
+                                  Tablespace is the target tablespace name. Use "*" for all tablespaces.
+                                  Restricted to SQL identifier characters (or the "*" wildcard) because
+                                  the value is embedded in the rendered io_limit DDL string (C1b,
+                                  defense-in-depth alongside webhook validation and literal quoting).
+                                pattern: ^[A-Za-z_][A-Za-z0-9_]*$|^\*$
                                 type: string
                               writeBytesPerSec:
                                 description: WriteBytesPerSec is the maximum write

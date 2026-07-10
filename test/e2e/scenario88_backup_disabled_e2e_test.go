@@ -177,6 +177,7 @@ func (s *Scenario88BackupDisabledE2ESuite) TestE2E_Scenario88_LiveBackupDisabled
 		// Default to a deployed S3-backed cluster name; override via SCENARIO88_CLUSTER.
 		cluster = "scenario88"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS88Script)
 	if script == "" {

@@ -1033,6 +1033,10 @@ type WorkloadSpec struct {
 // Applied via ALTER RESOURCE GROUP ... SET io_limit.
 type TablespaceIOLimitSpec struct {
 	// Tablespace is the target tablespace name. Use "*" for all tablespaces.
+	// Restricted to SQL identifier characters (or the "*" wildcard) because
+	// the value is embedded in the rendered io_limit DDL string (C1b,
+	// defense-in-depth alongside webhook validation and literal quoting).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_]*$|^\*$`
 	Tablespace string `json:"tablespace"`
 	// ReadBytesPerSec is the maximum read throughput in bytes per second.
 	// +optional

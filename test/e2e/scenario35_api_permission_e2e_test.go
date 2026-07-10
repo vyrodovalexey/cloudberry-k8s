@@ -509,7 +509,11 @@ func (s *Scenario35APIPermissionE2ESuite) TestScenario35c_Unauthenticated_Reques
 			errObj, ok := errResp["error"].(map[string]interface{})
 			require.True(s.T(), ok, "response should have 'error' object")
 			assert.Equal(s.T(), "UNAUTHORIZED", errObj["code"])
-			assert.Equal(s.T(), "missing Authorization header", errObj["message"])
+			// C3: the 401 body is generic — the concrete reason (missing
+			// header) is logged server-side, never disclosed to the client.
+			assert.Equal(s.T(), "authentication required", errObj["message"])
+			assert.NotEmpty(s.T(), rec.Header().Get("WWW-Authenticate"),
+				"401 must carry the RFC 7235 challenge header")
 
 			// Verify security headers are present on 401 responses.
 			assert.Equal(s.T(), "nosniff", rec.Header().Get("X-Content-Type-Options"),

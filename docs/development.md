@@ -17,6 +17,7 @@ This guide covers setting up a development environment, building the project, ru
 - [Shared DB Client Pattern in Admin Controller](#shared-db-client-pattern-in-admin-controller)
 - [Context-Aware Rebalance Goroutine Management](#context-aware-rebalance-goroutine-management)
 - [Code Style and Linting](#code-style-and-linting)
+- [Continuous Integration](#continuous-integration)
 - [Code Generation](#code-generation)
 - [Adding New Features](#adding-new-features)
 - [Debugging](#debugging)
@@ -4816,6 +4817,23 @@ make vuln
 - All external dependencies must be behind interfaces for testability
 - Use `context.Context` for cancellation and timeout propagation
 - Avoid global state; prefer dependency injection
+
+## Continuous Integration
+
+The GitHub Actions pipeline lives in `.github/workflows/ci.yml`. Its triggers:
+
+| Trigger | Jobs that run |
+|---------|---------------|
+| Pull request | Verification jobs (lint, govulncheck, unit/service tests, SonarCloud scan) plus the PR-only build jobs (`build`, `docker-build*`, `helm-test-pr`) |
+| Push to `main` or `init` | Verification jobs only: lint, govulncheck, unit/service tests, and the SonarCloud scan |
+| Push of a `v*` tag | Verification jobs plus the release/publish jobs: `build-release`, `docker-build-push*`, `trivy-scan`, `helm-package` |
+
+The release/publish jobs are gated on
+`github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')`, so they
+never fire on a branch push; PR-only jobs are gated on
+`github.event_name == 'pull_request'`. The Makefile targets invoked by CI
+(`make lint`, `make test`, `make vuln`, …) are unchanged — a branch push runs
+the same verification you run locally.
 
 ## Code Generation
 

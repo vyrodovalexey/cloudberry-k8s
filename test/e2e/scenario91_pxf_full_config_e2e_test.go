@@ -15,6 +15,8 @@ import (
 	"github.com/stretchr/testify/suite"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,14 +57,53 @@ import (
 // envKubeconfigS91 gates the live cluster test.
 const envKubeconfigS91 = "KUBECONFIG"
 
+// envS91Image / envS91PxfImage optionally override the LIVE cluster's DB and
+// PXF sidecar images so the live bootstrap can use images actually loaded on
+// the target nodes (e.g. cloudberry-official-pxf:2.1.0 + cloudberry-pxf:2.1.0
+// on the local kind node). The builder-direct Part A assertions stay pinned to
+// the cases.Scenario91Cases() catalog values — the live contracts verified
+// here (pxf sidecar env, servers ConfigMap keys, status counts, logLevel
+// rolling propagation) are image-tag independent.
+//
+// envS91ConnectorBase optionally rewrites each customConnectors[].jarUrl to
+// "<base>/<connector-name>.jar" for the LIVE cluster only. The catalog pins
+// the jarUrls to a documentation host (repo.example.com) that resolves
+// NOWHERE, so without a real staging base the pxf-connector-init container can
+// never download the jars and the segment pods never start. Point it at an
+// in-cluster-reachable HTTP base actually serving the jars (e.g.
+// http://minio:9000/pxf-connectors) to exercise the download path genuinely.
+const (
+	envS91Image         = "SCENARIO91_IMAGE"
+	envS91PxfImage      = "SCENARIO91_PXF_IMAGE"
+	envS91ConnectorBase = "SCENARIO91_CONNECTOR_BASE"
+)
+
 // scenario91LiveNamespace is the namespace used for the live cluster test.
 const scenario91LiveNamespace = "cloudberry-test"
 
-// scenario91LiveTimeout bounds each live wait loop.
-const scenario91LiveTimeout = 5 * time.Minute
+// envS91LiveTimeout optionally overrides the per-wait live budget (a Go
+// duration, e.g. "20m"). The status.dataLoading.pxf fields only populate once
+// the freshly-created live cluster reaches phase Running; under amd64
+// emulation a full bootstrap can far exceed the 5m default, so slow
+// environments extend the budget via ENV instead of hardcoding.
+const envS91LiveTimeout = "SCENARIO91_LIVE_TIMEOUT"
+
+// scenario91LiveDefaultTimeout bounds each live wait loop by default.
+const scenario91LiveDefaultTimeout = 5 * time.Minute
 
 // scenario91LivePollInterval is the live poll interval.
 const scenario91LivePollInterval = 5 * time.Second
+
+// scenario91LiveTimeout resolves the per-wait live budget: the
+// SCENARIO91_LIVE_TIMEOUT duration when set/valid, the 5m default otherwise.
+func scenario91LiveTimeout() time.Duration {
+	if v := os.Getenv(envS91LiveTimeout); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return scenario91LiveDefaultTimeout
+}
 
 // Scenario91E2ESuite tests the full PXF data-loading configuration end-to-end.
 type Scenario91E2ESuite struct {
@@ -434,6 +475,33 @@ func (s *Scenario91E2ESuite) TestE2E_Scenario91_LivePXFConfigured() {
 	name := fmt.Sprintf("live-s91-%d", time.Now().UnixNano())
 	cluster := scenario91E2ECluster(name, scenario91LiveNamespace)
 
+	// Adapt the live cluster to locally-available images when overridden (the
+	// catalog-pinned defaults are not necessarily loadable on every node).
+	if img := os.Getenv(envS91Image); img != "" {
+		cluster.Spec.Image = img
+	}
+	if pxfImg := os.Getenv(envS91PxfImage); pxfImg != "" {
+		cluster.Spec.DataLoading.Pxf.Image = pxfImg
+	}
+	// Point the connector jarUrls at a REAL staging base when provided (the
+	// catalog's repo.example.com is a documentation host that resolves
+	// nowhere, which would block pxf-connector-init and thus the pods).
+	if base := strings.TrimRight(os.Getenv(envS91ConnectorBase), "/"); base != "" {
+		for i := range cluster.Spec.DataLoading.Pxf.CustomConnectors {
+			c := &cluster.Spec.DataLoading.Pxf.CustomConnectors[i]
+			c.JarURL = base + "/" + c.Name + ".jar"
+		}
+	}
+
+	// Provision the PXF credential-Secret FIXTURES the spec's servers reference
+	// (s3-datalake-creds, minio-creds, mysql-creds): the segment pods'
+	// pxf-cred-init container mounts them, so without the fixtures the pods
+	// never start. Values are dummies — this live test verifies the CONFIG
+	// contracts (sidecar env, ConfigMap keys, status counts, logLevel roll),
+	// never live ingestion. Only the Secrets THIS run created are deleted.
+	cleanupSecrets := s.scenario91EnsureCredentialSecrets(cl, cluster)
+	defer cleanupSecrets()
+
 	if createErr := cl.Create(s.ctx, cluster); createErr != nil {
 		s.T().Skipf("could not create CR on live cluster (operator/webhook/namespace "+
 			"may be unavailable): %v", createErr)
@@ -455,7 +523,7 @@ func (s *Scenario91E2ESuite) TestE2E_Scenario91_LivePXFConfigured() {
 			Name: cmName, Namespace: scenario91LiveNamespace,
 		}, cm)
 		return getErr == nil
-	}, scenario91LiveTimeout, scenario91LivePollInterval,
+	}, scenario91LiveTimeout(), scenario91LivePollInterval,
 		"servers ConfigMap %s must be created by the operator", cmName)
 	for _, k := range []string{
 		"s3-datalake__s3-site.xml",
@@ -479,7 +547,7 @@ func (s *Scenario91E2ESuite) TestE2E_Scenario91_LivePXFConfigured() {
 		}
 		dl := got.Status.DataLoading
 		return dl != nil && dl.Pxf != nil && dl.Pxf.Configured && dl.Pxf.Servers == 5
-	}, scenario91LiveTimeout, scenario91LivePollInterval,
+	}, scenario91LiveTimeout(), scenario91LivePollInterval,
 		"status.dataLoading.pxf must report configured=true, servers=5")
 
 	// Re-patch pxf.logLevel=DEBUG and wait for the rolled segment pod template
@@ -512,6 +580,43 @@ func (s *Scenario91E2ESuite) waitForSegmentPxfLogLevel(
 		}
 		got, ok := scenario91E2EEnvValue(c, "PXF_LOG_LEVEL")
 		return ok && got == want
-	}, scenario91LiveTimeout, scenario91LivePollInterval,
+	}, scenario91LiveTimeout(), scenario91LivePollInterval,
 		"segment-primary pxf sidecar PXF_LOG_LEVEL must become %q", want)
+}
+
+// scenario91EnsureCredentialSecrets creates (idempotently) every credential
+// Secret the spec's PXF servers reference, with dummy values for the exact
+// referenced keys, and returns a cleanup func deleting ONLY the Secrets this
+// run created (pre-existing ones are left untouched).
+func (s *Scenario91E2ESuite) scenario91EnsureCredentialSecrets(
+	cl client.Client, cluster *cbv1alpha1.CloudberryCluster,
+) func() {
+	var created []*corev1.Secret
+	for _, srv := range cluster.Spec.DataLoading.Pxf.Servers {
+		for _, ref := range srv.CredentialSecrets {
+			key := ref.Key
+			if key == "" {
+				key = "value"
+			}
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      ref.Name,
+					Namespace: cluster.Namespace,
+				},
+				StringData: map[string]string{key: "s91-fixture"},
+			}
+			if err := cl.Create(s.ctx, secret); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					continue // ambient fixture — leave it (and never delete it)
+				}
+				s.T().Skipf("could not provision fixture Secret %q: %v", ref.Name, err)
+			}
+			created = append(created, secret)
+		}
+	}
+	return func() {
+		for _, sec := range created {
+			_ = cl.Delete(context.Background(), sec)
+		}
+	}
 }

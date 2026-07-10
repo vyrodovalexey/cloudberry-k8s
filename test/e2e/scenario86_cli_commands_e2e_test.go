@@ -295,6 +295,7 @@ func (s *Scenario86CLICommandsE2ESuite) TestE2E_Scenario86_LiveCLICommands() {
 	if cluster == "" {
 		cluster = "scenario86-s3"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS86Script)
 	if script == "" {

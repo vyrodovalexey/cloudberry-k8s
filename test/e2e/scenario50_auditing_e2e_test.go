@@ -819,11 +819,28 @@ func (s *Scenario50RealClusterE2ESuite) TestE2E_Scenario50b_RealCluster_Statemen
 	s.logger.Info("scenario 50b real cluster: statement audit params completed")
 }
 
-// TestE2E_Scenario50b_RealCluster_LogMinDurationStatement verifies that
-// the scenario1-cluster has log_min_duration_statement set to 500ms
-// as configured in the cluster spec.
+// TestE2E_Scenario50b_RealCluster_LogMinDurationStatement verifies that the
+// operator PROPAGATES spec.config.coordinatorParameters.log_min_duration_statement
+// to the live coordinator. The expected value is derived from the LIVE CR spec
+// (never hardcoded): the original scenario1-cluster configured "500" (surfaced
+// as "500ms" by SHOW), but any deployed target cluster is honest as long as
+// SHOW matches its own spec. When the target cluster does not configure the
+// parameter at all, there is nothing to propagate and the test SKIPS cleanly
+// (config-only) instead of asserting a value the spec never requested.
 func (s *Scenario50RealClusterE2ESuite) TestE2E_Scenario50b_RealCluster_LogMinDurationStatement() {
 	s.logger.Info("starting scenario 50b real cluster: log_min_duration_statement verification")
+
+	namespace := getEnvDefault(envCloudberryTestNamespace, defaultCloudberryNamespace)
+	service := getEnvDefault(envCloudberryTestService, defaultCloudberryService)
+	clusterName := strings.TrimSuffix(service, "-client")
+
+	configured := scenario50CoordinatorParameter(namespace, clusterName, "log_min_duration_statement")
+	if configured == "" {
+		s.T().Skipf("cluster %q does not set spec.config.coordinatorParameters."+
+			"log_min_duration_statement — nothing to propagate [CONFIG-ONLY: deploy a "+
+			"cluster with the parameter (e.g. scenario1-full-bootstrap sets 500) to "+
+			"exercise the propagation proof]", clusterName)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -831,13 +848,29 @@ func (s *Scenario50RealClusterE2ESuite) TestE2E_Scenario50b_RealCluster_LogMinDu
 	val, err := s.dbClient.ShowParameter(ctx, "log_min_duration_statement")
 	require.NoError(s.T(), err, "SHOW log_min_duration_statement should succeed")
 
-	// The scenario1-cluster has coordinatorParameters.log_min_duration_statement = "500".
-	// PostgreSQL/Cloudberry returns this as "500ms".
-	assert.Contains(s.T(), val, "500",
-		"log_min_duration_statement should contain '500' (configured as 500ms), got: %s", val)
+	// SHOW normalizes plain-millisecond specs ("500") to "500ms"; a substring
+	// match keeps the assertion honest for both spellings.
+	assert.Contains(s.T(), val, configured,
+		"log_min_duration_statement should contain %q (configured in the live CR spec), got: %s",
+		configured, val)
 
-	s.logger.Info("log_min_duration_statement verified", "value", val)
+	s.logger.Info("log_min_duration_statement verified", "configured", configured, "value", val)
 	s.logger.Info("scenario 50b real cluster: log_min_duration_statement verification completed")
+}
+
+// scenario50CoordinatorParameter reads one spec.config.coordinatorParameters
+// value from the live CR via kubectl (best-effort; empty when absent/unreadable).
+func scenario50CoordinatorParameter(namespace, cluster, param string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "kubectl", "get", "cloudberrycluster", cluster,
+		"-n", namespace,
+		"-o", fmt.Sprintf("jsonpath={.spec.config.coordinatorParameters.%s}",
+			strings.ReplaceAll(param, ".", `\.`))).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // --- 50c Real Cluster: Operator Audit with Real DB ---

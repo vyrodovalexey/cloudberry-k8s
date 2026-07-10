@@ -343,6 +343,8 @@ func (s *Scenario77PreBackupChecksE2ESuite) TestE2E_Scenario77_LivePreBackupChec
 	if localCluster == "" {
 		localCluster = "scenario77-local"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
+	requireLiveClusterDeployed(s.T(), localCluster, "cloudberry-test")
 
 	script := os.Getenv(envS77Script)
 	if script == "" {

@@ -147,6 +147,15 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	return true
 }
 
+// EntriesLen returns the current number of tracked per-client entries. It is
+// sampled on every Prometheus scrape for cloudberry_api_rate_limit_entries,
+// giving visibility into the limiter's memory footprint and cleanup behavior.
+func (rl *RateLimiter) EntriesLen() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.entries)
+}
+
 // RetryAfterSeconds returns the number of seconds until the next token is available.
 func (rl *RateLimiter) RetryAfterSeconds() int {
 	refillRate := float64(rl.limit) / rl.interval.Seconds()

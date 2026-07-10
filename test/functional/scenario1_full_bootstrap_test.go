@@ -550,6 +550,19 @@ func (m *mockMetricsRecorder) RecordReconcile(cluster, namespace, result string,
 	})
 }
 
+func (m *mockMetricsRecorder) RecordSteadyStateRefreshError(cluster, namespace, component string) {
+	m.record("RecordSteadyStateRefreshError", map[string]interface{}{
+		"cluster": cluster, "namespace": namespace, "component": component,
+	})
+}
+
+func (m *mockMetricsRecorder) RegisterRateLimitEntries(_ func() float64) func() {
+	m.record("RegisterRateLimitEntries", nil)
+	return func() {
+		// Nothing to unregister: the mock only records the registration call.
+	}
+}
+
 func (m *mockMetricsRecorder) UpdateClusterInfo(cluster, namespace, version, phase string, segments float64) {
 	m.record("UpdateClusterInfo", map[string]interface{}{
 		"cluster": cluster, "namespace": namespace, "version": version, "phase": phase, "segments": segments,

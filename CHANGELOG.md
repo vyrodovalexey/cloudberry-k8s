@@ -8,6 +8,51 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **Three new Prometheus metric families** making previously-silent failure paths
+  observable:
+  - `cloudberry_steady_state_refresh_errors_total{cluster,namespace,component}` —
+    swallowed (non-fatal) errors on the admin controller's steady-state refresh paths,
+    `component` ∈ {`backup`, `dataloading`, `storage`}. Refresh errors intentionally do
+    not change reconcile result semantics; the counter makes the silent degradation
+    alertable. The previously-swallowed cluster refetch error before status patches is
+    now also logged (`refreshPhaseFromServer`).
+  - `cloudberry_api_rate_limit_entries` — gauge of live per-client rate-limiter entries,
+    sampled on every Prometheus scrape (each API server registers a provider on start and
+    unregisters it on `Close`; multiple servers sharing one recorder are summed into the
+    single process-wide gauge).
+  - `cloudberry_query_exporter_history_errors_total{stage}` — query-exporter history
+    pipeline failures, `stage` ∈ {`snapshot`, `insert`, `explain`}; incremented only on a
+    real failure, never on skips or empty results.
+- **`internal/dbschema` shared DDL package** — the `cloudberry_query_history` DDL now
+  lives in a const-only leaf package consumed by both the operator db client
+  (`internal/db/query_history.go`) and the standalone query exporter
+  (`cmd/cloudberry-query-exporter/history.go`), replacing two hand-duplicated copies.
+  Drift tests on both sides pin the consumers to the shared constant.
+- **Grafana dashboard panels for the new metric families (8 panels)** — the operator
+  dashboard (`monitoring/grafana/cloudberry-operator.json`) gained "Steady-State Refresh
+  Errors" (rate timeseries + total stat) and "API Rate Limit Entries" (timeseries +
+  current stat); the exporters dashboard (`monitoring/grafana/cloudberry-exporters.json`)
+  gained "Query History Pipeline Errors" / "History Errors Total" and "Collector Errors
+  Rate" / "Collector Scrape Duration". Dashboards cover all 168 project metric families
+  (168/168).
+- **CI on branch pushes** — `.github/workflows/ci.yml` now also triggers on pushes to
+  `main` and `init` (verification jobs only: lint, govulncheck, unit/service tests, and
+  the SonarCloud scan). Release/publish jobs (`build-release`, `docker-build-push*`,
+  `trivy-scan`, `helm-package`) remain tag-gated (`v*`) and never fire on a branch push;
+  PR-only jobs stay gated on `pull_request`.
+- **Acceptance sample CR pins the TCP interconnect** —
+  `deploy/helm/cloudberry-operator/config/samples/acceptance-cluster-deploy.yaml` now
+  sets `config.parameters.gp_interconnect_type: tcp` with an in-file rationale: the
+  default UDP interconnect (`udpifc`) is unreliable under kind / Docker Desktop
+  networking (the VM NAT path drops or reorders UDP between pod sandboxes), stalling
+  Motion traffic even with the NetworkPolicy admitting it. Note the GUC is applied from
+  `postgresql.conf` at server start — changing it on a running cluster needs a pod
+  restart to take effect.
+- **Performance-test assets (2026-07-10)** — `test/performance/loads/`
+  (health-baseline, api-read-throughput, rate-limiter-knee),
+  `test/performance/ammo/api-read-acceptance.txt`, and the full report
+  `test/performance/results/2026-07-10-perftest-report.md` (summarized in
+  `test/performance/README.md`).
 - **Three new operator Prometheus metric families** (namespace `cloudberry`), all honest
   outcome counters:
   - `cloudberry_disk_usage_scan_total{cluster,namespace,result}` — disk-usage scan outcome,
@@ -143,8 +188,90 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   (`monitoring/grafana/cloudberry-otel.json`) is unchanged — it covers Tempo traces,
   otel-collector health (`otelcol_*`), and VictoriaLogs.
 
+### Changed
+
+- **postgres-exporter `cloudberry_table_stats` is now catalog-only** — the custom
+  per-table query reads `pg_class` + `pg_namespace` instead of `pg_stat_user_tables`. On
+  Cloudberry `pg_stat_user_tables` is a **distributed** view (and the `dbsize` functions
+  dispatch from the coordinator too), so every scrape previously triggered cluster-wide
+  dispatch over the Motion/Interconnect layer — per-scrape cluster load, and a wedged
+  sidecar whenever the interconnect was degraded. The catalog-only query reports
+  **estimates**: `n_live_tup` from `GREATEST(reltuples, 0)` (clamping the PostgreSQL 14
+  "never analyzed" `-1` sentinel) and a new `table_size_bytes` from
+  `relpages * block_size`, both refreshed by `ANALYZE`/`VACUUM` and labelled "Estimated"
+  in the HELP text. Tables **and materialized views** are covered
+  (`relkind IN ('r','m')`), temp relations are excluded, and the per-table DML/scan
+  counters (`seq_scan`, `n_tup_ins`, `n_dead_tup`, …) were **removed** — a sidecar
+  exporter must never trigger cluster-wide dispatch per scrape. The Grafana
+  exporters-dashboard table panels were reworked accordingly ("Top Tables by Estimated
+  Size/Rows", "Estimated Size by Schema").
+- **Backup lifecycle endpoints share the backup-enabled gate** —
+  `DELETE /clusters/{name}/backups/{timestamp}` and
+  `POST /clusters/{name}/backups/{timestamp}/restore` now return
+  `400 BACKUP_NOT_ENABLED` when `spec.backup` is absent or disabled, consistent with the
+  existing gate on `POST /backups` (shared `requireBackupEnabled` helper) — no cleanup or
+  restore Job is ever built for a cluster whose backup destination/credentials are
+  unconfigured. The restore reject is a client error, not a restore outcome:
+  `cloudberry_restore_total{result="failed"}` is intentionally **not** incremented.
+- **Optional JSON request bodies reject trailing data** — `decodeOptionalJSON` now
+  requires EOF after the first JSON value, so trailing garbage (`{} {}`, `{}[]`,
+  `{}garbage`) is rejected with `400` instead of silently ignored (it can mask
+  truncated/concatenated payloads). `DisallowUnknownFields` is deliberately **deferred**:
+  rejecting unknown fields would break lenient clients during version skew (e.g. a newer
+  ctl sending future fields to an older operator) — revisit with an API versioning story.
+- **Query-exporter history statements are deadline-bounded** — the history INSERT is
+  bounded at 5 s (aligned with the collector query timeout) and the hourly retention
+  DELETE at 60 s. Both target the **distributed** `cloudberry_query_history` table, so a
+  degraded interconnect previously wedged the shared connection (and the whole collect
+  loop) until `gp_interconnect_setup_timeout`; failures now fail fast and surface on
+  `cloudberry_query_exporter_history_errors_total` instead, and an aborted cleanup simply
+  retries on the next tick. The `resource_group` column is now inserted as an explicit
+  empty literal — the session snapshot never captured it, and the always-empty struct
+  field previously pretended otherwise (populating it from `rsgname` is a recorded
+  follow-up).
+
 ### Fixed
 
+- **CRITICAL: the cluster NetworkPolicy now admits the MPP interconnect** — the SE.5
+  `<cluster>-pxf` NetworkPolicy (present whenever the PXF sidecar is enabled) makes the
+  segment pods default-deny with only fixed service ports allowed, which silently dropped
+  the dynamically-bound Motion/Interconnect listeners **between cluster pods**: any
+  distributed query (JOIN, GROUP BY, multi-segment INSERT) hung until
+  `gp_interconnect_setup_timeout`, and `gpbackup` hung at its first coordinator→segment
+  SSH dispatch. The policy now carries a second, From-scoped ingress rule admitting —
+  **only from same-namespace pods carrying this cluster's label** — TCP `1025–5887` +
+  `5889–65535` (the range is split so cross-pod PXF `:5888` stays sealed), UDP
+  `1025–65535` (single full range; PXF has no UDP listener), and TCP `22` for the MPP
+  toolchain's coordinator→segment SSH (`gpbackup`/`gprestore`/`gpexpand`). Verified live:
+  distributed queries and backup/restore complete with the policy applied.
+- **HIGH: cluster deletion is handled before the action/lifecycle/generation gates** —
+  `Reconcile` now checks `DeletionTimestamp` first. Previously a Terminating cluster in
+  phase `Stopped` returned without removing the finalizer (stuck Terminating forever),
+  and `Restricted`/`Maintenance` clusters requeued endlessly without ever reaching
+  `handleDeletion`. Deletion always wins; clusters now delete correctly from every
+  lifecycle phase.
+- **Steady-state readiness refresh** — `status.segmentsReady` (and
+  `coordinatorReady`/`standbyReady`) were frozen at their last-reconciled values while
+  the spec generation was unchanged, so a segment restart in the Running steady state
+  left a stale count (observed as a permanent 1/2 on a fully healthy cluster).
+  Generation-unchanged reconciles now re-read the live StatefulSets and persist the
+  counters when they drift (explicit MergePatch so `omitempty` zero values are not
+  dropped).
+- **Admin-password rotation nil-map guard** — rotating the admin password against a
+  Secret persisted with no `data` no longer panics (`existing.Data` is initialized when
+  nil, mirroring the AlreadyExists-race path in `createAdminPasswordSecret`).
+- **Query-exporter shutdown joins the collect loop** — `run()` now cancels and **waits**
+  for the collect loop before declaring the exporter stopped, and the loop is the single
+  owner of the (possibly reconnected) database connection, closing whatever connection is
+  current exactly once on exit. Previously `run()` closed the original connection
+  pointer: a reconnected conn leaked, and shutdown could double-close a conn the loop had
+  already closed.
+- **Idle-daemon generation handover** — `Start()` now waits for the previous scan-loop
+  generation's done channel to drain before spawning the next one, and each loop closes
+  the done channel of **its own** generation (handed into the goroutine). Rapid
+  Stop/Start cycles can no longer run two scan loops concurrently (racing
+  `consecutiveFails` and the DB-client swap), double-close a done channel, or leave
+  `Stop()` hanging.
 - **Backup timestamp capture (restore-by-timestamp fix)** — the operator now captures
   `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` from the backup Job
   (surfaced via `/dev/termination-log` and the new `avsoft.io/backup-timestamp`
@@ -211,6 +338,57 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - **X-Forwarded-For trim** — the `X-Forwarded-For` hop is now whitespace-trimmed for the
   rate-limit bucket key.
 
+### Security
+
+- **`io_limit` DDL injection hardening (defense in depth)** — the free-form
+  `workload.resourceGroups[].ioLimits[].tablespace` CRD value is embedded in the rendered
+  `ALTER RESOURCE GROUP … SET io_limit '…'` string. It is now (1) escaped with
+  `quoteLiteral` in the db client, (2) validated by the webhook, and (3) constrained by a
+  CRD validation pattern on `TablespaceIOLimitSpec.Tablespace` — all enforcing
+  `^[A-Za-z_][A-Za-z0-9_]*$|^\*$` (a SQL identifier or the `*` wildcard). **Upgrade
+  note:** a pre-existing cluster whose stored tablespace value does not match the pattern
+  fails validation on its next update — rename the value to a plain SQL identifier (or
+  `*`) before updating.
+- **Query-exporter EXPLAIN sandbox** — plan collection re-plans query text captured from
+  `pg_stat_activity` (arbitrary user SQL). It is now allowlist-gated: leading SQL
+  comments (line and nested block) are stripped so a comment prefix cannot smuggle a
+  statement past the check, only `SELECT`/`WITH` statement heads qualify, and a top-level
+  semicolon followed by further statement content is rejected (protocol-independent
+  multi-statement defense — under a simple-protocol DSN an embedded `ROLLBACK` could
+  otherwise end the sandbox and let a trailing statement run outside it). The EXPLAIN
+  itself runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout`, with `ROLLBACK`
+  executed on **all** paths (success, error, timeout) so the shared connection is never
+  left inside a transaction.
+- **401 responses no longer disclose auth configuration** — every API 401 now returns a
+  generic body (`authentication required` / `authentication failed`) plus an RFC 7235
+  `WWW-Authenticate` challenge advertising only the configured scheme(s)
+  (`Basic realm="cloudberry"`, `Bearer`, or both). The concrete failure reason (missing
+  header, unknown scheme, unconfigured provider) is logged and attached to the trace
+  span, never returned to the client. The admin-password rotation handler likewise
+  returns a generic 500 body instead of the raw Kubernetes error text (which is only
+  logged).
+
+### Known issues
+
+- **Multi-writer status race (cluster vs. admin controller)** — both controllers persist
+  status via MergePatch, so a concurrent write can briefly overwrite the other's fields
+  (observed as a short-lived stale phase/counter). The status converges within one
+  requeue (~30 s). Field-scoped status patches per controller are the recommended
+  follow-up.
+- **`gp_interconnect_type` is not in `restartRequiredParams`** — a live edit is
+  classified reload-safe and only updates the ConfigMap, but the GUC is
+  postmaster-scoped: it takes effect only after the pods restart. Trigger a rolling
+  restart manually after changing it on a running cluster.
+- **`gp_toolkit` views absent in this Cloudberry build** — collectors and queries that
+  depend on `gp_toolkit` (resource-group iostats, skew, disk-free) degrade gracefully:
+  they log a WARN and skip (or record `result="skipped"`), never fabricate values.
+- **No exec-based `/metrics` probing on the operator image** — the operator runs on a
+  distroless image (no shell, no curl), so `kubectl exec … curl localhost:8080/metrics`
+  is impossible; use `kubectl port-forward` instead.
+- **`DisallowUnknownFields` deferred** — unknown fields in API request bodies are still
+  accepted (only trailing data after the JSON value is rejected) to keep older/newer
+  clients interoperable during version skew.
+
 ### Removed
 
 - **Dead `GetClusterState` method and `ClusterState` type** — removed from the `db.Client`
@@ -233,6 +411,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Verified
 
+- **2026-07-10 — full live acceptance (kind) after the reliability/security refactor.**
+  Operator deployed with Vault-PKI webhook certs + Vault kubernetes-auth + Keycloak OIDC;
+  `acceptance-test` cluster Running with HA coordinator + standby, 2+2 group segment
+  mirroring (`InSync`), cluster TLS auto-issued from Vault PKI, and
+  `gp_interconnect_type: tcp` (kind/Docker Desktop UDP unreliability — see the sample-CR
+  note under _Added_). With the interconnect NetworkPolicy fix in place, operator-tracked
+  `gpbackup` of a 234 MB `mydb` → MinIO (Vault-sourced S3 creds) → `gprestore` completed
+  with the restore **and** post-restore validation Jobs `Succeeded` and row counts
+  matching. PXF external writable + readable tables verified for `s3:text/parquet/avro`
+  and `hdfs:text/parquet/avro` (~10 MB each, full write → read-back round-trip);
+  `hdfs:SequenceFile` WRITE succeeds but READBACK fails with PXF's "No fields in record" —
+  the documented PXF profile limitation (a custom Java `Writable` schema class on the PXF
+  classpath is required), not an operator defect. Grafana dashboards published covering
+  168/168 project metric families. Performance (report:
+  `test/performance/results/2026-07-10-perftest-report.md`): health p99 10.4 ms at
+  100 RPS with 0 errors, authenticated API p99 167 ms (bcrypt-dominated), the rate
+  limiter enforced the configured 10 req/min exactly (fast ~39 ms 429 rejections;
+  `cloudberry_api_rate_limit_rejections_total` and `cloudberry_api_rate_limit_entries`
+  accurate under load), zero 5xx across 24,000+ requests, plus DB query baselines on the
+  500k-row dataset.
 - **2026-06-20 — verification re-run (no new code changes; codebase already clean).**
   Full end-to-end acceptance against the live test environment confirming the
   prior-refactor features remain correct and documented. Operator deployed to local k8s

@@ -73,6 +73,12 @@ const (
 type Recorder interface {
 	// RecordReconcile records a reconciliation event.
 	RecordReconcile(cluster, namespace, result string, duration time.Duration)
+	// RecordSteadyStateRefreshError records a swallowed (non-fatal) error from
+	// one of the admin controller's steady-state refresh paths. These errors
+	// intentionally do not change reconcile result semantics — the counter
+	// makes the otherwise-silent degradation visible to alerting. component is
+	// a bounded enum: "backup", "dataloading" or "storage".
+	RecordSteadyStateRefreshError(cluster, namespace, component string)
 	// UpdateClusterInfo updates cluster metadata gauge.
 	UpdateClusterInfo(cluster, namespace, version, phase string, segments float64)
 	// SetCoordinatorUp sets the coordinator availability gauge.
@@ -345,6 +351,13 @@ type Recorder interface {
 	// RecordRateLimitRejection records a request rejected (429) by the API
 	// rate limiter for the given route template.
 	RecordRateLimitRejection(route string)
+	// RegisterRateLimitEntries registers a provider of the current number of
+	// tracked per-client rate-limiter entries, sampled on every Prometheus
+	// scrape as cloudberry_api_rate_limit_entries. Multiple providers (one
+	// per live API server sharing the recorder) are summed into the single
+	// process-wide gauge. The returned function unregisters the provider and
+	// MUST be called when the owning server is closed.
+	RegisterRateLimitEntries(fn func() float64) (unregister func())
 
 	// RecordDBConnect records a database connection attempt for a cluster.
 	// result is "success" or "error"; duration is the connect (incl. retry) time.
@@ -425,9 +438,10 @@ type DBPoolStatsFunc func() (acquired, idle, maxConns float64)
 
 // PrometheusRecorder implements Recorder using Prometheus metrics.
 type PrometheusRecorder struct {
-	reconcileTotal    *prometheus.CounterVec
-	reconcileErrors   *prometheus.CounterVec
-	reconcileDuration *prometheus.HistogramVec
+	reconcileTotal           *prometheus.CounterVec
+	reconcileErrors          *prometheus.CounterVec
+	reconcileDuration        *prometheus.HistogramVec
+	steadyStateRefreshErrors *prometheus.CounterVec
 
 	clusterInfo    *prometheus.GaugeVec
 	coordinatorUp  *prometheus.GaugeVec
@@ -535,10 +549,11 @@ type PrometheusRecorder struct {
 	pxfRestartTotal         *prometheus.CounterVec
 	recoveryOperationsTotal *prometheus.CounterVec
 
-	apiRequestsTotal        *prometheus.CounterVec
-	apiRequestDuration      *prometheus.HistogramVec
-	apiRequestsInFlight     prometheus.Gauge
-	rateLimitRejectionTotal *prometheus.CounterVec
+	apiRequestsTotal          *prometheus.CounterVec
+	apiRequestDuration        *prometheus.HistogramVec
+	apiRequestsInFlight       prometheus.Gauge
+	rateLimitRejectionTotal   *prometheus.CounterVec
+	rateLimitEntriesCollector *rateLimitEntriesCollector
 
 	dbConnectTotal    *prometheus.CounterVec
 	dbConnectDuration *prometheus.HistogramVec
@@ -585,6 +600,12 @@ func (r *PrometheusRecorder) initCoreMetrics() {
 		Help:      "Duration of reconciliations in seconds.",
 		Buckets:   prometheus.DefBuckets,
 	}, []string{labelCluster, labelNamespace})
+	r.steadyStateRefreshErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "steady_state_refresh_errors_total",
+		Help: "Total number of swallowed errors on the admin controller " +
+			"steady-state refresh paths (backup/dataloading/storage).",
+	}, []string{labelCluster, labelNamespace, labelComponent})
 	r.clusterInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Name:      "cluster_info",
@@ -1196,6 +1217,7 @@ func (r *PrometheusRecorder) initAPIServerMetrics() {
 		Name:      "api_rate_limit_rejections_total",
 		Help:      "Total number of REST API requests rejected by the rate limiter (429).",
 	}, []string{labelRoute})
+	r.rateLimitEntriesCollector = newRateLimitEntriesCollector()
 }
 
 // initDBMetrics initializes database connection, pool and query metrics.
@@ -1349,6 +1371,7 @@ func NewPrometheusRecorder(reg prometheus.Registerer) *PrometheusRecorder {
 func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 	collectors := []prometheus.Collector{
 		r.reconcileTotal, r.reconcileErrors, r.reconcileDuration,
+		r.steadyStateRefreshErrors,
 		r.clusterInfo, r.coordinatorUp, r.standbyUp,
 		r.segmentsReady, r.segmentsTotal, r.segmentsFailed, r.mirroringSync,
 		r.ftsProbeTotal, r.ftsProbeFailures, r.ftsProbeDuration,
@@ -1394,6 +1417,7 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.recoveryOperationsTotal,
 		r.apiRequestsTotal, r.apiRequestDuration,
 		r.apiRequestsInFlight, r.rateLimitRejectionTotal,
+		r.rateLimitEntriesCollector,
 		r.dbConnectTotal, r.dbConnectDuration, r.dbQueryDuration,
 		r.dbPoolCollector,
 		r.idleDaemonUp, r.idleScanFailuresTotal, r.idleReconnectAttemptTotal,
@@ -1416,6 +1440,11 @@ func (r *PrometheusRecorder) RecordReconcile(cluster, namespace, result string, 
 	if result == "error" {
 		r.reconcileErrors.WithLabelValues(cluster, namespace).Inc()
 	}
+}
+
+// RecordSteadyStateRefreshError records a swallowed steady-state refresh error.
+func (r *PrometheusRecorder) RecordSteadyStateRefreshError(cluster, namespace, component string) {
+	r.steadyStateRefreshErrors.WithLabelValues(cluster, namespace, component).Inc()
 }
 
 // UpdateClusterInfo updates cluster metadata gauge.
@@ -1942,6 +1971,12 @@ func (r *PrometheusRecorder) RecordRateLimitRejection(route string) {
 	r.rateLimitRejectionTotal.WithLabelValues(route).Inc()
 }
 
+// RegisterRateLimitEntries registers a rate-limiter entries provider sampled
+// on every scrape. The returned function unregisters the provider.
+func (r *PrometheusRecorder) RegisterRateLimitEntries(fn func() float64) func() {
+	return r.rateLimitEntriesCollector.add(fn)
+}
+
 // RecordDBConnect records a database connection attempt for a cluster.
 func (r *PrometheusRecorder) RecordDBConnect(cluster, namespace, result string, duration time.Duration) {
 	r.dbConnectTotal.WithLabelValues(cluster, namespace, result).Inc()
@@ -2068,6 +2103,9 @@ func NewNoopRecorder() *NoopRecorder {
 
 // RecordReconcile is a no-op implementation for testing.
 func (n *NoopRecorder) RecordReconcile(_, _, _ string, _ time.Duration) {}
+
+// RecordSteadyStateRefreshError is a no-op implementation for testing.
+func (n *NoopRecorder) RecordSteadyStateRefreshError(_, _, _ string) {}
 
 // UpdateClusterInfo is a no-op implementation for testing.
 func (n *NoopRecorder) UpdateClusterInfo(_, _, _, _ string, _ float64) {}
@@ -2353,6 +2391,15 @@ func (n *NoopRecorder) AddAPIRequestsInFlight(_ float64) {}
 
 // RecordRateLimitRejection is a no-op implementation for testing.
 func (n *NoopRecorder) RecordRateLimitRejection(_ string) {}
+
+// RegisterRateLimitEntries is a no-op implementation for testing. The
+// returned unregister function is also a no-op.
+func (n *NoopRecorder) RegisterRateLimitEntries(_ func() float64) func() {
+	return func() {
+		// no-op: the NoopRecorder registers nothing, so there is nothing to
+		// unregister; the non-nil closure keeps the call-site contract simple.
+	}
+}
 
 // RecordDBConnect is a no-op implementation for testing.
 func (n *NoopRecorder) RecordDBConnect(_, _, _ string, _ time.Duration) {}

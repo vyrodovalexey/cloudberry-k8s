@@ -212,10 +212,14 @@ func (s *Scenario56ExporterQueriesSuite) TestFunctional_Scenario56d_LockMetrics(
 
 // --- 56e: Table Statistics ---
 
-// TestFunctional_Scenario56e_TableStatistics verifies that queries.yaml contains
-// cloudberry_table_stats with labels schemaname, relname and metrics seq_scan,
-// seq_tup_read, idx_scan, idx_tup_fetch, n_tup_ins, n_tup_upd, n_tup_del,
-// n_live_tup, n_dead_tup. Also verifies LIMIT 100 in query.
+// TestFunctional_Scenario56e_TableStatistics verifies that queries.yaml
+// contains the CATALOG-ONLY cloudberry_table_stats query (cycle-2 fix): labels
+// schemaname, relname and the estimate metrics n_live_tup + table_size_bytes
+// sourced from pg_class/pg_namespace. On Cloudberry pg_stat_user_tables is a
+// DISTRIBUTED view (every scrape dispatches to all segments over the
+// Motion/Interconnect layer), so the per-table DML/scan counters (seq_scan,
+// n_tup_ins, ...) were deliberately dropped — a sidecar exporter must never
+// trigger cluster-wide dispatch per scrape. Also verifies LIMIT 100 in query.
 func (s *Scenario56ExporterQueriesSuite) TestFunctional_Scenario56e_TableStatistics() {
 	// Arrange
 	cluster := scenario56Cluster()
@@ -239,8 +243,26 @@ func (s *Scenario56ExporterQueriesSuite) TestFunctional_Scenario56e_TableStatist
 	assert.Contains(s.T(), queries, "relname",
 		"cloudberry_table_stats should have relname label")
 
-	// Metrics
+	// Catalog-only estimate metrics (pg_class.reltuples / relpages based).
 	expectedMetrics := []string{
+		"n_live_tup",
+		"table_size_bytes",
+	}
+	for _, metric := range expectedMetrics {
+		assert.Contains(s.T(), queries, metric,
+			"cloudberry_table_stats should contain metric %s", metric)
+	}
+
+	// The query must be strictly catalog-sourced: pg_class join pg_namespace,
+	// never the distributed pg_stat_user_tables view.
+	assert.Contains(s.T(), queries, "FROM pg_class",
+		"cloudberry_table_stats must be catalog-only (pg_class-sourced)")
+	assert.NotContains(s.T(), queries, "FROM pg_stat_user_tables",
+		"cloudberry_table_stats must NOT query the distributed pg_stat_user_tables view "+
+			"(it dispatches to every segment per scrape and hangs on a degraded interconnect)")
+
+	// The distributed per-table DML/scan counters are deliberately dropped.
+	droppedCounters := []string{
 		"seq_scan",
 		"seq_tup_read",
 		"idx_scan",
@@ -248,12 +270,12 @@ func (s *Scenario56ExporterQueriesSuite) TestFunctional_Scenario56e_TableStatist
 		"n_tup_ins",
 		"n_tup_upd",
 		"n_tup_del",
-		"n_live_tup",
 		"n_dead_tup",
 	}
-	for _, metric := range expectedMetrics {
-		assert.Contains(s.T(), queries, metric,
-			"cloudberry_table_stats should contain metric %s", metric)
+	for _, counter := range droppedCounters {
+		assert.NotContains(s.T(), queries, counter,
+			"cloudberry_table_stats must NOT expose the distributed counter %s "+
+				"(dropped by the catalog-only cycle-2 fix)", counter)
 	}
 
 	// LIMIT 100

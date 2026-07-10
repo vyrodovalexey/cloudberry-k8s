@@ -554,6 +554,53 @@ The latest performance test was run on 2026-05-19 against a live operator deploy
 
 Full test report: `.yandextank/perftest_20260519_140320/REPORT.md`
 
+## Performance Test Results (2026-07-10)
+
+The latest performance test was run on 2026-07-10 against a live operator deployment with the `acceptance-test` cluster (HA, 2+2 mirrored segments, TLS, PXF, Standby). The test used `hey` (Go HTTP load generator) on macOS with `kubectl port-forward` to the operator pod. Yandex Tank Docker was not used because `--net=host` is a no-op on macOS.
+
+### Summary
+
+| Category | Result |
+|----------|--------|
+| Health Endpoints | **Excellent** — p50=2.7ms, p99=10.4ms, 0% errors at 100 RPS |
+| API Endpoints | **Good** — p50=127ms (bcrypt auth), 0% errors within rate limit |
+| Rate Limiter | **Verified** — 10 req/min enforced exactly, 429s with fast rejection (~39ms) |
+| DB Queries | **Baseline** — COUNT 338ms, JOIN+AGG 1.8s, Subquery 1.2s (500k rows) |
+| Stability | **Excellent** — Zero 5xx across 24,000+ requests, cluster healthy throughout |
+
+### Rate Limiter Verification
+
+| Metric | Value |
+|--------|-------|
+| Configured Limit | 10 requests/minute per IP |
+| First 429 at Request | #12 |
+| Avg 200 Latency | 155ms (includes bcrypt) |
+| Avg 429 Latency | 39ms (fast rejection, no bcrypt) |
+| Prometheus Metric | `cloudberry_api_rate_limit_rejections_total` = 5,707 (accurate) |
+| Entries Gauge | `cloudberry_api_rate_limit_entries` = 1 |
+
+### Stepped Load Results (5→100 RPS, authenticated)
+
+| RPS | Total Reqs | 200s | 429s | 429% | p50 (ms) | p95 (ms) |
+|-----|-----------|------|------|------|----------|----------|
+| 5 | 150 | 14 | 136 | 90.7% | 2.6 | 118.7 |
+| 10 | 300 | 5 | 295 | 98.3% | 3.3 | 10.1 |
+| 25 | 750 | 5 | 745 | 99.3% | 3.0 | 10.0 |
+| 50 | 1,500 | 5 | 1,495 | 99.7% | 2.9 | 6.3 |
+| 100 | 3,000 | 5 | 2,995 | 99.8% | 3.3 | 6.8 |
+
+### DB Query Timings (mydb: 500k orders, 200k customers)
+
+| Query | Avg (ms) | Description |
+|-------|----------|-------------|
+| C1 | 338 | COUNT(*) on 500k rows |
+| C2 | 699 | GROUP BY + AVG |
+| C3 | 1,766 | JOIN + GROUP BY + SUM |
+| C4 | 486 | Window function |
+| C5 | 1,233 | Subquery with comparison |
+
+Full test report: `results/2026-07-10-perftest-report.md`
+
 ## API Endpoints Under Test
 
 | Endpoint | Method | Auth Level | Ammo File |

@@ -1,0 +1,131 @@
+# =============================================================================
+# Cloudberry Operator — OKD4 / OpenShift Helm VALUES (namespace: greenplum)
+# =============================================================================
+# Saved Helm values for installing the cloudberry-operator on the OKD4 `svc`
+# cluster in the `greenplum` namespace:
+#
+#   helm upgrade --install cloudberry-operator \
+#     deploy/helm/cloudberry-operator \
+#     -n cloudberry --create-namespace \
+#     -f deploy/helm/cloudberry-operator/okd4-example.yaml
+#
+# Highlights:
+#   - openshift.enabled=true → OKD-aware operator securityContext (no fixed UID),
+#     operator SA bound to restricted-v2, and a SCOPED custom SCC bound only to
+#     the CloudberryCluster workload ServiceAccount (NOT anyuid).
+#   - All images pulled from github.
+#   - Webhook certs issued from Vault PKI; Vault Kubernetes auth; Keycloak OIDC.
+# =============================================================================
+
+replicaCount: 1
+
+# All operator images come from ACR (mirrored from ghcr.io/vyrodovalexey).
+image:
+  repository: ghcr.io/vyrodovalexey/cloudberry-k8s-operator
+  pullPolicy: IfNotPresent
+  tag: "0.9.4-cldb-2.1.0"
+
+
+installCRDs: true
+
+# -----------------------------------------------------------------------------
+# OpenShift / OKD4 enablement
+# -----------------------------------------------------------------------------
+openshift:
+  enabled: true
+  # Operator pod runs non-root / read-only → the built-in restricted-v2 SCC.
+  operatorSCC: restricted-v2
+  # Create the scoped minimal custom SCC for the cluster workload pods.
+  createClusterSCC: true
+  # The operator does NOT set an explicit ServiceAccountName on the DB pod
+  # template, so cluster pods run under the namespace `default` ServiceAccount.
+  # The custom SCC is bound ONLY to this SA in greenplum.
+  clusterServiceAccount: default
+  scc:
+    # Name auto-generates to "<release>-cloudberry-operator-cluster".
+    name: ""
+    priority: 10
+    # RunAsAny is required for the non-contiguous {0 (root init), 1000 (gpadmin)}
+    # UID set. Still strictly narrower than anyuid: limited caps, no host access,
+    # single-SA binding.
+    runAsUser: RunAsAny
+    allowedCapabilities:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    requiredDropCapabilities:
+      - KILL
+      - MKNOD
+      - NET_RAW
+
+# Route disabled — the operator API/metrics are not externally exposed by default.
+route:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Webhook — certificates issued from Vault PKI
+# -----------------------------------------------------------------------------
+webhook:
+  enabled: true
+  certSource: vault-pki
+  vaultPKI:
+    mountPath: pki
+    # ASSUMPTION / DevOps action required: this uses the Vault PKI role
+    # `cloudberry`. That role MUST exist and its allowed_domains MUST cover the
+    # operator webhook DNS (*.greenplum.svc, *.greenplum.svc.cluster.local) and
+    # the cluster service DNS. If the platform `nova-apps` role is reused
+    # instead, change this to `nova-apps` AND confirm its allowed_domains cover
+    # svc.cluster.local + greenplum SANs.
+    role: cloudberry
+
+# -----------------------------------------------------------------------------
+# Vault — Kubernetes auth
+# -----------------------------------------------------------------------------
+vault:
+  enabled: true
+  address: "http://vault.vault.svc:8200"
+  authMethod: kubernetes
+  authPath: auth/kubernetes
+  role: cloudberry-operator
+  secretPath: secret/data/cloudberry
+  # PKI defaults for the vault-pki webhook cert source (aligns with webhook.vaultPKI).
+  pkiMountPath: pki
+  pkiRole: cloudberry
+
+# -----------------------------------------------------------------------------
+# OIDC — Keycloak DL realm
+# -----------------------------------------------------------------------------
+oidc:
+  enabled: true
+  issuerURL: "https://keycloak.apps.svc.demo.ai/realms/cl"
+  clientID: cloudberry
+  # Client secret provided out-of-band as a Secret in greenplum.
+  existingSecret: cloudberry-oidc
+  existingSecretKey: client-secret
+
+# -----------------------------------------------------------------------------
+# Telemetry / Metrics
+# -----------------------------------------------------------------------------
+telemetry:
+  enabled: true
+  otlpEndpoint: "otel-collector.observability.svc:4317"
+  otlpProtocol: grpc
+  otlpInsecure: true
+  samplingRate: 1.0
+  serviceName: cloudberry-operator
+
+metrics:
+  enabled: true
+  port: 8080
+
+# ServiceMonitor optional — enable if the Prometheus Operator is installed.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+
+api:
+  enabled: true
+  port: 8090

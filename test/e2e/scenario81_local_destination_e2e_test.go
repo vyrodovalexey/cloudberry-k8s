@@ -243,6 +243,7 @@ func (s *Scenario81LocalDestinationE2ESuite) TestE2E_Scenario81_LiveLocalDestina
 	if cluster == "" {
 		cluster = "scenario81-local"
 	}
+	requireLiveClusterDeployed(s.T(), cluster, "cloudberry-test")
 
 	script := os.Getenv(envS81Script)
 	if script == "" {

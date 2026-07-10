@@ -1,0 +1,232 @@
+# =============================================================================
+# OKD4 CloudberryCluster — namespace: greenplum
+# =============================================================================
+# End-to-end CloudberryCluster for the OKD4 `svc` cluster. Deployed AFTER the
+# operator (okd4-example.yaml) is installed in greenplum. Admitted by the scoped custom SCC
+# (<release>-cloudberry-operator-cluster) bound to the greenplum `default`
+# ServiceAccount.
+#
+# Layout:
+#   - DB image cloudberry-k8s-official-pxf:0.94-cldb-2.1.0 (pxf + pxf_fdw available)
+#   - HA coordinator with standby
+#   - 2 segments, primariesPerHost=2, 20Gi PVC/segment, group mirroring
+#   - TLS from Vault PKI (auth.ssl, certSecret okd4-cluster-tls, not pre-created)
+#   - Keycloak OIDC (DL realm) + Vault KV secrets + Vault k8s auth
+#   - postgres-exporter (segments + mirrors) + cloudberry-query-exporter
+#   - PXF s3:parquet external load from MinIO cloudberry-test
+#   - Backup → MinIO cloudberry-test with S3 creds from Vault KV
+#   - deletionPolicy Retain
+#
+# Resources are modest (workers are 4 vCPU / 16 GB).
+# =============================================================================
+apiVersion: avsoft.io/v1alpha1
+kind: CloudberryCluster
+metadata:
+  name: okd4-cluster
+  namespace: greenplum
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    platform: okd4
+spec:
+  version: "2.1.0"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.4-cldb-2.1.0"
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: acr-pull-secret
+
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+
+  standby:
+    enabled: true
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+
+  segments:
+    count: 2
+    primariesPerHost: 2
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    storage:
+      size: "20Gi"
+    mirroring:
+      enabled: true
+      layout: group
+    antiAffinity: preferred
+
+  auth:
+    basic:
+      enabled: true
+      adminUser: gpadmin
+    ssl:
+      # TLS certificates issued from Vault PKI (stored in okd4-cluster-tls).
+      enabled: true
+      certSecret:
+        name: okd4-cluster-tls
+      minTLSVersion: "1.2"
+    oidc:
+      enabled: true
+      issuerURL: "https://keycloak.apps.svc.demo.ai/realms/cl"
+      clientID: "cloudberry"
+      clientSecret:
+        secretRef:
+          name: cloudberry-oidc
+          key: client-secret
+      scopes:
+        - openid
+        - profile
+        - email
+      roleClaimPath: "realm_access.roles"
+      roleClaimSource: id_token
+      roleMatchMode: exact
+      roleMapping:
+        admin: Admin
+        user: Basic
+        reader: "Self Only"
+      pkce: true
+      allowLocalSignIn: true
+    hbaRules:
+      - type: local
+        database: all
+        user: gpadmin
+        method: trust
+      - type: host
+        database: all
+        user: all
+        address: "0.0.0.0/0"
+        method: scram-sha-256
+
+  ha:
+    ftsProbeInterval: 60
+    ftsProbeTimeout: 20
+    ftsProbeRetries: 5
+
+  vault:
+    enabled: true
+    address: "http://vault.vault.svc:8200"
+    authMethod: kubernetes
+    authPath: "auth/kubernetes"
+    role: "cloudberry-operator"
+    secretPath: "secret/data/cloudberry"
+
+  queryMonitoring:
+    enabled: true
+    guestAccess: false
+    historyRetention: "30d"
+    samplingInterval: 6
+    planCollection: true
+    slowQueryThreshold: "1000ms"
+    exporters:
+      postgresExporter:
+        enabled: true
+        image: "prometheuscommunity/postgres-exporter:v0.16.0"
+        port: 9187
+        segments: true
+        mirrors: true
+      cloudberryQueryExporter:
+        enabled: true
+        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.4-cldb-2.1.0"
+        port: 9188
+
+  monitoring:
+    enabled: true
+    metricsPort: 9187
+    serviceMonitor: false
+
+  # ---------------------------------------------------------------------------
+  # Data loading — PXF s3:parquet from MinIO cloudberry-test
+  # ---------------------------------------------------------------------------
+  dataLoading:
+    enabled: true
+    pxf:
+      enabled: true
+      image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.4-cldb-2.1.0"
+      jvmOpts: "-Xmx1g -Xms256m"
+      port: 5888
+      logLevel: INFO
+      extensions:
+        pxf: true
+        pxfFdw: true
+      servers:
+        - name: minio-greenplum
+          type: s3
+          config:
+            fs.s3a.endpoint: "https://minio.minio.svc.cluster.local"
+            fs.s3a.path.style.access: "true"
+          credentialSecrets:
+            # Materialized from Vault KV by the operator's backup credential flow
+            # (see backup.destination.s3.vaultSecret below).
+            - name: okd4-cluster-backup-s3-vault-creds
+              key: aws_access_key_id
+            - name: okd4-cluster-backup-s3-vault-creds
+              key: aws_secret_access_key
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
+    jobs:
+      # s3:parquet read from cloudberry-test into a target table (scenario step 9).
+      - name: s3-parquet-read
+        type: pxf
+        enabled: true
+        pxfJob:
+          server: minio-greenplum
+          profile: "s3:parquet"
+          resource: "cloudberry-test/parquet/data.parquet"
+          targetTable: "public.okd4_parquet_read"
+
+  # ---------------------------------------------------------------------------
+  # Backup — MinIO cloudberry-test, S3 credentials from Vault KV
+  # ---------------------------------------------------------------------------
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"
+    retention:
+      fullCount: 3
+      incrementalCount: 10
+      maxAge: "30d"
+    destination:
+      type: s3
+      s3:
+        bucket: cloudberry-test
+        endpoint: "https://minio.minio.svc.cluster.local"
+        region: us-east-1
+        folder: /backups
+        encryption: "on"
+        forcePathStyle: true
+        vaultSecret:
+          path: "secret/cloudberry/backup-s3"
+          accessKeyField: aws_access_key_id
+          secretKeyField: aws_secret_access_key
+        multipart:
+          backupMaxConcurrentRequests: 4
+          backupMultipartChunksize: "10MB"
+          restoreMaxConcurrentRequests: 4
+          restoreMultipartChunksize: "10MB"
+
+  deletionPolicy: Retain
