@@ -556,7 +556,18 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: docker
-      # Step a: Build cloudberry-pxf (standalone, amd64)
+      # Step a: Build cloudberry-pxf (standalone sidecar, amd64) — no push on PRs.
+      # `load: true` and the bare `cloudberry-pxf:2.1.0` tag are REQUIRED so the
+      # downstream cloudberry-official-pxf build (Step c) resolves it locally via
+      # its `CB_PXF_IMAGE` build-arg. Labels mirror the release job so PR builds
+      # exercise the same metadata; the image is verified-built but never pushed.
+      - id: meta-pxf
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_PXF }}
+          tags: |
+            type=ref,event=pr
+            type=sha,prefix=pr-
       - name: Build cloudberry-pxf
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -565,6 +576,7 @@ jobs:
           push: false
           load: true
           tags: cloudberry-pxf:2.1.0
+          labels: ${{ steps.meta-pxf.outputs.labels }}
       # Step b: Build cloudberry-official (standalone, amd64)
       - name: Build cloudberry-official
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
