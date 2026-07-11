@@ -22,6 +22,7 @@ env:
   DOCKER_IMAGE_QUERY_EXPORTER: ghcr.io/${{ github.repository }}-query-exporter
   DOCKER_IMAGE_BACKUP: ghcr.io/${{ github.repository }}-backup
   DOCKER_IMAGE_GPFDIST: ghcr.io/${{ github.repository }}-gpfdist
+  DOCKER_IMAGE_PXF: ghcr.io/${{ github.repository }}-pxf
   DOCKER_IMAGE_OFFICIAL_PXF: ghcr.io/${{ github.repository }}-official-pxf
   HELM_CHART_PATH: deploy/helm/cloudberry-operator
 
@@ -844,7 +845,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step a: Build cloudberry-pxf (standalone, amd64) — load only
+      # Step a: Build cloudberry-pxf (standalone sidecar, amd64) — load + push.
+      # `load: true` and the bare `cloudberry-pxf:2.1.0` tag are REQUIRED so the
+      # downstream cloudberry-official-pxf build (Step c) resolves it locally via
+      # its `CB_PXF_IMAGE` build-arg; the registry tags are additionally pushed so
+      # the standalone PXF sidecar image is available for clusters that reference
+      # it in `spec.dataLoading.pxf.image`.
+      - id: meta-pxf
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_PXF }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest
       - name: Build cloudberry-pxf
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -852,7 +867,16 @@ jobs:
           file: ./Dockerfile.cloudberry-pxf
           push: false
           load: true
-          tags: cloudberry-pxf:2.1.0
+          tags: |
+            cloudberry-pxf:2.1.0
+            ${{ steps.meta-pxf.outputs.tags }}
+          labels: ${{ steps.meta-pxf.outputs.labels }}
+      - name: Push cloudberry-pxf
+        run: |
+          tags="${{ steps.meta-pxf.outputs.tags }}"
+          for tag in ${tags}; do
+            docker push "${tag}"
+          done
 
       # Step b: Build cloudberry-official (standalone, amd64) — load + push
       - id: meta-cloudberry
@@ -945,6 +969,12 @@ jobs:
 
       # Sign all pushed images
       - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.7.0
+      - name: Sign cloudberry-pxf
+        run: |
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-pxf.outputs.tags }}' | head -1)" 2>/dev/null || true)
+          if [ -n "${digest}" ]; then
+            cosign sign --yes "${digest}"
+          fi
       - name: Sign cloudberry-official
         run: |
           digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-cloudberry.outputs.tags }}' | head -1)" 2>/dev/null || true)
@@ -999,6 +1029,10 @@ jobs:
           - name: backup
             image_key: DOCKER_IMAGE_BACKUP
             skip_dirs: '/usr/local/bin'
+          # pxf: standalone PXF sidecar image (PXF server + CLI, no Cloudberry DB bin).
+          - name: pxf
+            image_key: DOCKER_IMAGE_PXF
+            skip_dirs: ''
           # official-pxf: exclude the Cloudberry bin directory (same as cloudberry image).
           - name: official-pxf
             image_key: DOCKER_IMAGE_OFFICIAL_PXF
