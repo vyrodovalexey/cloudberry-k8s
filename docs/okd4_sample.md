@@ -13,10 +13,6 @@ uses a **scoped custom SCC** for the database pods — deliberately **not** the 
 `anyuid` — plus Vault-PKI TLS, Vault Kubernetes auth, Keycloak OIDC, and MinIO
 S3 backups.
 
-> The scenario was executed against the live OKD4 `svc` cluster (Azure) in the
-> `cloudberry` namespace with operator image `okd4fix29`. All nine steps pass
-> (end-to-end run, ITERATION 4). Evidence numbers throughout are copied from that
-> final run.
 
 ## Table of Contents
 
@@ -123,7 +119,7 @@ platform uses.
 | **Storage class** | `managed-csi` (Azure CSI). 20Gi PVC per segment.                                                                                                          |
 | **Vault** | Internal `http://vault.vault.svc:8200`; PKI mount `pki`; Kubernetes auth enabled; policy `cloudberry`; role `cloudberry-operator`; PKI role `cloudberry`. |
 | **Keycloak** | DL realm issuer `https://keycloak.apps.svc.demo.ai/realms/cl`; confidential client `cloudberry`.                                                          |
-| **MinIO** | Internal S3 `https://minio.dos.svc.cluster.local` (path-style); bucket `cloudberry-test`; S3 creds stored in Vault KV `secret/cloudberry/backup-s3`.     |
+| **MinIO** | Internal S3 `https://minio.minio.svc.cluster.local` (path-style); bucket `cloudberry-test`; S3 creds stored in Vault KV `secret/cloudberry/backup-s3`.    |
 
 Each backing service is expanded into its own subsection below. The definitive image
 tags used by this scenario are listed in [§9](#9-definitive-image-tag-table).
@@ -155,10 +151,9 @@ tags used by this scenario are listed in [§9](#9-definitive-image-tag-table).
     --from-literal=client-secret='<keycloak-client-secret>'   # placeholder
   ```
 
-#### Image mirror requirement (ghcr → ACR)
+#### Images
 
-All images must exist in  `ghcr.io` repositories. What must be
-present in ACR are the repositories and tags from the
+All images must exist in  `ghcr.io` repositories.
 [Definitive Image Tag Table](#9-definitive-image-tag-table):
 `cloudberry-k8s-operator`, `cloudberry-official-pxf`, `cloudberry-pxf`,
 `cloudberry-backup`, `cloudberry-query-exporter`, and `postgres-exporter`. 
@@ -355,7 +350,7 @@ replicaCount: 1
 image:
   repository: ghcr.io/vyrodovalexey/cloudberry-k8s-operator
   pullPolicy: IfNotPresent
-  tag: "0.9.4-cldb-2.1.0"
+  tag: "0.9.5-cldb-2.1.0"
 
 
 installCRDs: true
@@ -506,7 +501,7 @@ oc apply -f deploy/helm/cloudberry-operator/config/samples/okd4-cluster.yaml -n 
 # ServiceAccount.
 #
 # Layout:
-#   - DB image ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.4-cldb-2.1.0 (pxf + pxf_fdw available)
+#   - DB image ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.5-cldb-2.1.0 (pxf + pxf_fdw available)
 #   - HA coordinator with standby
 #   - 2 segments, primariesPerHost=2, 20Gi PVC/segment, group mirroring
 #   - TLS from Vault PKI (auth.ssl, certSecret okd4-cluster-tls, not pre-created)
@@ -528,7 +523,7 @@ metadata:
     platform: okd4
 spec:
   version: "2.1.0"
-  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.3-cldb-2.1.0"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.5-cldb-2.1.0"
   imagePullPolicy: IfNotPresent
   imagePullSecrets:
     - name: acr-pull-secret
@@ -645,7 +640,7 @@ spec:
         mirrors: true
       cloudberryQueryExporter:
         enabled: true
-        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.4-cldb-2.1.0"
+        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.5-cldb-2.1.0"
         port: 9188
 
   monitoring:
@@ -660,7 +655,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.3-cldb-2.1.0"
+      image: "ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.5-cldb-2.1.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO
@@ -704,7 +699,7 @@ spec:
   backup:
     enabled: true
     schedule: "0 2 * * *"
-    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.5-cldb-2.1.0"
     retention:
       fullCount: 3
       incrementalCount: 10
@@ -1147,11 +1142,11 @@ All images are mirrored to ACR `alphyndemo.azurecr.io/cloudberry/*` and pulled v
 
 | Component | ACR repository | Tag |
 |---|---|----|
-| Operator | `ghcr.io/vyrodovalexey/cloudberry-k8s-operator` | `0.9.4-cldb-2.1.0` |
-| Cluster (DB + PXF) | `ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf` | `0.9.4-cldb-2.1.0` |
-| Backup | `ghcr.io/vyrodovalexey/cloudberry-k8s-backup` | `0.9.4-cldb-2.1.0` |
-| PXF sidecar | `ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf` | `0.9.4-cldb-2.1.0` |
-| Query exporter | `ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter` | `0.9.4-cldb-2.1.0` |
+| Operator | `ghcr.io/vyrodovalexey/cloudberry-k8s-operator` | `0.9.5-cldb-2.1.0` |
+| Cluster (DB + PXF) | `ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf` | `0.9.5-cldb-2.1.0` |
+| Backup | `ghcr.io/vyrodovalexey/cloudberry-k8s-backup` | `0.9.5-cldb-2.1.0` |
+| PXF sidecar | `ghcr.io/vyrodovalexey/cloudberry-k8s-pxf` | `0.9.5-cldb-2.1.0` |
+| Query exporter | `ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter` | `0.9.5-cldb-2.1.0` |
 | Postgres exporter | `prometheuscommunity/postgres-exporter` | `v0.16.0` |
 
 ---
