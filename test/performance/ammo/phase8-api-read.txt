@@ -1,8 +1,8 @@
-[Host: localhost:18090]
+[Host: localhost:8190]
 [Connection: keep-alive]
 [User-Agent: yandex-tank/perftest-phase8]
 [Accept: application/json]
-[Authorization: Basic YWRtaW46dSppem5qS2QoPXQmcEhUUm9pSVVlQkkpUVkxakphanc=]
+[Authorization: Basic b3BlcmF0b3JfdXNlcjpvcGVyYXRvcl9wYXNz]
 /api/v1alpha1/clusters
 /api/v1alpha1/clusters/acceptance-test
 /api/v1alpha1/clusters/acceptance-test/status
