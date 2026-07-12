@@ -174,7 +174,27 @@ Five tiers, from most to least restricted:
 ##### Webhook certificates
 
 The operator manages its own webhook TLS certificate, sourced either from Vault
-PKI or as a self-signed certificate with automatic rotation.
+PKI or as a self-signed certificate with automatic rotation. The rotation loop
+is **leader-gated** (`mgr.Elected()` — only the leader replica writes cert
+Secrets and webhook configurations) and runs on a **jittered interval** (12 h
+base + up to 10 %), rotating at 2/3 of the certificate lifetime.
+
+- **CA bundle re-injection on every rotation** — the CA bundle is injected
+  into the `ValidatingWebhookConfiguration`/`MutatingWebhookConfiguration` at
+  startup **and after every rotation** (with retry/backoff); an injection
+  whose retry budget is exhausted is kept pending and re-attempted on every
+  subsequent rotation tick, so admission never silently breaks after an
+  in-place rotation. Outcomes: `cloudberry_webhook_ca_bundle_injection_total{result}`.
+- **Self-signed CA reuse (leaf-only renewal)** — the CA private key is
+  persisted in the webhook cert Secret (`ca.key`), and rotations re-issue only
+  the serving certificate from the persisted CA while it remains valid (own
+  CA, under its 2/3-lifetime threshold, remaining validity covers the new
+  leaf), keeping `ca.crt` — and the injected bundle — stable across rotations.
+  Legacy Secrets without `ca.key` fall back to full regeneration.
+- **Union CA bundle on CA cutover** — when a rotation does replace the CA
+  (any source) and the previous CA is still time-valid, the injected bundle is
+  the union of new + old CA, keeping admission working while the kubelet
+  propagates the rotated Secret to the webhook pod.
 
 ##### Cluster TLS auto-issuance from Vault PKI
 
@@ -223,6 +243,14 @@ that grant only `<mount>/data/*`: a 403 on the verbatim path triggers a single
 fallback read, with no re-auth for path-shape 403s. Explicit `secret/data/...`
 paths keep working — the webhook warns and suggests the logical form.
 
+##### Secret watching and the disabled client
+
+The `SecretWatcher` polls watched Vault paths for changes and exposes per-path
+freshness: `cloudberry_vault_watch_last_success_timestamp{path}` (staleness =
+`time() - <gauge>`) and `cloudberry_vault_watch_errors_total{path}`. With Vault
+integration disabled, the no-op client's `ReadSecret` returns the typed
+`vault.ErrVaultDisabled` (match with `errors.Is`) instead of `(nil, nil)`, so
+callers can never mistake "Vault off" for an existing-but-empty secret.
 
 #### Configuration precedence
 
@@ -277,6 +305,18 @@ Wired to real operations:
 `cloudberry_vault_operation_duration_seconds`, and
 `cloudberry_auth_attempts_total` (a missing or malformed `Authorization` header
 increments `{method="unknown",result="failure"}`).
+
+Certificate-rotation health and Vault secret-watch freshness:
+
+- `cloudberry_webhook_ca_bundle_injection_total{result}` — webhook CA-bundle
+  injection attempts (startup and post-rotation re-injection).
+- `cloudberry_cert_rotation_check_errors_total{component}` — failed
+  `NeedsRotation` checks in the rotation loop (`component="webhook"`).
+- `cloudberry_vault_watch_last_success_timestamp{path}` — Unix timestamp of the
+  last successful poll of a watched Vault secret path; staleness =
+  `time() - <gauge>`.
+- `cloudberry_vault_watch_errors_total{path}` — failed polls per watched Vault
+  secret path.
 
 ##### Admission and lifecycle
 
@@ -372,6 +412,21 @@ degraded interconnect fails fast onto that counter instead of wedging the
 collect loop. The unbounded `usename` label was removed from
 `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound cardinality.
 
+The query exporter's logging and tracing are configurable (environment
+variables take precedence over the matching flags):
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--log-level` | `LOG_LEVEL` | `info` | JSON log level: `debug`, `info`, `warn`, `error` (case-insensitive) |
+| `--telemetry-enabled` | `TELEMETRY_ENABLED` | `false` | Enable OTLP trace export (disabled by default) |
+| `--otlp-endpoint` | `OTLP_ENDPOINT` | `""` | OTLP collector endpoint for trace export |
+
+When tracing is enabled the exporter emits `exporter.collect` (one span per
+collection cycle, error status when the cycle ends without a live DB
+connection) and `exporter.history.cleanup` (one span per retention-cleanup
+tick) under `service.name=cloudberry-query-exporter`; no statement text is
+attached to spans.
+
 #### Distributed tracing
 
 OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans use
@@ -388,9 +443,14 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - **`auth.*`**, **`webhook.*`**, **`idle.*`** — authentication, admission, and
   idle-scan spans.
 - **`vault.watch.check`**, **`certmanager.issueVaultPKICert`**, **`operator.*`**
-  — Vault read, PKI issuance, and startup spans (error status set on failure).
+  — Vault read, PKI issuance, and startup/lifecycle spans (error status set on
+  failure), including `operator.certRotationCheck` — one span per certificate
+  rotation tick with `needs_rotation`/`rotated` attributes.
   Errors are recorded via `SetSpanError()`, which sets error status and exception
   events on the span.
+- **`exporter.*`** — the standalone query exporter's optional spans
+  (`exporter.collect`, `exporter.history.cleanup`), exported under
+  `service.name=cloudberry-query-exporter` when its telemetry is enabled.
 
 #### Logging and error handling
 
@@ -429,7 +489,8 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - DB connection pool leak prevention on retry failures
 - Admin password persisted to K8s Secret (survives pod restarts)
 - CLI password flag security warning (recommends env var)
-- Webhook CA bundle injection with retry and exponential backoff
+- Webhook CA bundle injection with retry and exponential backoff — at startup **and after every certificate rotation** (a failed injection is retried on every rotation tick until it lands), so a rotated cert can never leave the API server distrusting the webhook
+- Webhook cert rotation is leader-gated (`mgr.Elected()`) and jittered (12 h + up to 10 %); the self-signed source reuses its persisted CA (`ca.key` in the cert Secret) for leaf-only renewals and returns a union old+new CA bundle during a CA cutover
 - Webhook cert rotation forces re-issuance on certificate-source mismatch (e.g. a stale self-signed cert while `certSource=vault-pki`) instead of keeping the stale cert until natural expiry
 - Operator-to-cluster database TLS uses `sslmode=verify-ca` (CA chain validation against the cluster CA from the SSL cert Secret's `ca.crt`) when SSL is enabled with a `certSecret`
 - Context cancellation checks in database propagation operations
@@ -1120,15 +1181,15 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
   --set telemetry.otlpInsecure=true
 ```
 
-Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory — four dashboards: **operator** (`cloudberry-operator.json`), **exporters** (`cloudberry-exporters.json`), **node metrics** (`cloudberry-node-metrics.json`), and **OTel/telemetry** (`cloudberry-otel.json`). The operator dashboard visualizes all operator metrics — including the REST API panels (request rate/duration/in-flight/rate-limit rejections), DB connect/pool/query panels, idle-daemon health, and a **Security & Lifecycle** section covering certificate rotation and expiry, cluster TLS issuance, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery. The operator dashboard gained **8 panels** for the request-side API/DDL metrics — `cloudberry_api_cluster_lifecycle_requests_total` (by operation/result), `cloudberry_api_workload_operations_total` (by kind/operation/result), and `cloudberry_pxf_sync_total` (by result) — plus a **DB-query-duration-by-operation p95** panel built on `cloudberry_db_query_duration_seconds_bucket`. It also gained a **"gpfdist, PXF Extension & Data-Loader Role Setup"** row covering the data-loading control-plane metric families — for each of `cloudberry_gpfdist_reconcile_total` (by operation/result), `cloudberry_pxf_extension_setup_total` (by result), and `cloudberry_dataloader_role_setup_total` (by result, **3 new panels** following the `cloudberry_pxf_extension_setup_total` pattern): a rate timeseries, a 1h-total stat, and an error stat. The **OTel/telemetry** dashboard (`cloudberry-otel.json`) renders Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*`), and operator logs from VictoriaLogs. The test monitoring stack (Helm charts under `test/monitoring/`: vmagent, vector, otel-collector, node-exporter, kube-state-metrics) is deployed via `make monitoring-deploy`. **kube-state-metrics** (added in Scenario 104) feeds Kubernetes object-state metrics (`kube_job_status_failed`, `kube_pod_init_container_status_*`, `kube_deployment_status_replicas_available`) into VictoriaMetrics so pre-load health-check failures and gpfdist deployment readiness are observable in metrics (dashboard panels 274-276).
+Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory — four dashboards: **operator** (`cloudberry-operator.json`), **exporters** (`cloudberry-exporters.json`), **node metrics** (`cloudberry-node-metrics.json`), and **OTel/telemetry** (`cloudberry-otel.json`). The operator dashboard visualizes all operator metrics — including the REST API panels (request rate/duration/in-flight/rate-limit rejections), DB connect/pool/query panels, idle-daemon health, and a **Security & Lifecycle** section covering certificate rotation and expiry, cluster TLS issuance, Vault operations, webhook admissions, upgrades, rolling restarts, and recovery — extended with **8 panels** for the rotation/vault-watch health metrics (CA bundle injection rate + errors, cert rotation check errors, Vault watch staleness/last-success/errors, built on `cloudberry_webhook_ca_bundle_injection_total`, `cloudberry_cert_rotation_check_errors_total`, `cloudberry_vault_watch_last_success_timestamp`, and `cloudberry_vault_watch_errors_total`). The operator dashboard gained **8 panels** for the request-side API/DDL metrics — `cloudberry_api_cluster_lifecycle_requests_total` (by operation/result), `cloudberry_api_workload_operations_total` (by kind/operation/result), and `cloudberry_pxf_sync_total` (by result) — plus a **DB-query-duration-by-operation p95** panel built on `cloudberry_db_query_duration_seconds_bucket`. It also gained a **"gpfdist, PXF Extension & Data-Loader Role Setup"** row covering the data-loading control-plane metric families — for each of `cloudberry_gpfdist_reconcile_total` (by operation/result), `cloudberry_pxf_extension_setup_total` (by result), and `cloudberry_dataloader_role_setup_total` (by result, **3 new panels** following the `cloudberry_pxf_extension_setup_total` pattern): a rate timeseries, a 1h-total stat, and an error stat. The **OTel/telemetry** dashboard (`cloudberry-otel.json`) renders Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*`), and operator logs from VictoriaLogs. The test monitoring stack (Helm charts under `test/monitoring/`: vmagent, vector, otel-collector, node-exporter, kube-state-metrics) is deployed via `make monitoring-deploy`. **kube-state-metrics** (added in Scenario 104) feeds Kubernetes object-state metrics (`kube_job_status_failed`, `kube_pod_init_container_status_*`, `kube_deployment_status_replicas_available`) into VictoriaMetrics so pre-load health-check failures and gpfdist deployment readiness are observable in metrics (dashboard panels 274-276).
 
-The dashboards cover all **168** project metric families (168/168). The latest revision added 8 panels for the newest families: **Steady-State Refresh Errors** and **API Rate Limit Entries** on the operator dashboard, and **Query History Pipeline Errors** plus **Collector Errors/Duration** on the exporters dashboard — whose table-stats panels were also reworked for the catalog-only estimates ("Top Tables by Estimated Size/Rows", "Estimated Size by Schema").
+The dashboards cover all **172** project metric families (172/172, including the four 2026-07-12 rotation/vault-watch families). The latest revision added 8 Security & Lifecycle panels for the CA-bundle-injection, cert-rotation-check, and Vault-watch metrics; the revision before it added 8 panels for **Steady-State Refresh Errors** and **API Rate Limit Entries** on the operator dashboard, and **Query History Pipeline Errors** plus **Collector Errors/Duration** on the exporters dashboard — whose table-stats panels were also reworked for the catalog-only estimates ("Top Tables by Estimated Size/Rows", "Estimated Size by Schema").
 
 ## Performance Characteristics
 
 Current baseline (latest perf-test cycle): authenticated API throughput is **~7 RPS per client** — dominated by bcrypt password verification on every Basic-auth request — and health endpoints sustain **p99 < 10ms**. Note that the default API rate limit is **10 requests/minute per IP** (`api-rate-limit` / `CLOUDBERRY_API_RATE_LIMIT`; set `0` to disable), so performance testing requires raising or disabling the limit.
 
-Latest validation (2026-07-10, kind via `kubectl port-forward`, `hey` load generator): health endpoints p50 2.7 ms / p99 10.4 ms at 100 RPS with 0 errors; authenticated API p99 167 ms (bcrypt-dominated); the default 10 req/min rate limit enforced exactly, with fast ~39 ms 429 rejections and accurate `cloudberry_api_rate_limit_rejections_total` / `cloudberry_api_rate_limit_entries`; zero 5xx across 24,000+ requests. Full report: [test/performance/results/2026-07-10-perftest-report.md](test/performance/results/2026-07-10-perftest-report.md).
+Latest validation (2026-07-12, kind via `kubectl port-forward`, `hey` load generator, after the cert-rotation/metrics changes): health endpoints p50 2.7 ms / p99 10.2 ms at 100 RPS with 0 errors; all SLOs pass with **no regression** vs the 2026-07-10 baseline (every health-latency delta within ±5 %); the default 10 req/min rate limit enforced exactly with accurate `cloudberry_api_rate_limit_rejections_total` / `cloudberry_api_rate_limit_entries`; zero 5xx. Full report: [test/performance/results/2026-07-12-perftest-report.md](test/performance/results/2026-07-12-perftest-report.md) (baseline: [2026-07-10](test/performance/results/2026-07-10-perftest-report.md)).
 
 Earlier full load-test results (2026-05-19, 287,122 total requests, zero errors):
 

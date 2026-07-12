@@ -310,12 +310,16 @@ curl -u admin:password -X POST \
 
 | Method | Path | Permission | Description |
 |--------|------|-----------|-------------|
-| `GET` | `/clusters/{name}/config` | Operator Basic | Get configuration |
-| `PUT` | `/clusters/{name}/config` | Operator | Update configuration |
-| `GET` | `/clusters/{name}/config/parameters` | Operator Basic | List parameters |
-| `PUT` | `/clusters/{name}/config/parameters` | Operator | Set parameters |
-| `GET` | `/clusters/{name}/config/hba` | Operator Basic | Get HBA rules |
-| `PUT` | `/clusters/{name}/config/hba` | Admin | Update HBA rules |
+| `GET` | `/clusters/{name}/config` | Operator Basic | Get configuration (the cluster's `spec.config`) |
+| `PUT` | `/clusters/{name}/config` | Operator | Update configuration (replaces `spec.config`) |
+
+Parameters at every scope — cluster-wide (`parameters`), coordinator-only
+(`coordinatorParameters`), per-database (`databaseParameters`), and per-role
+(`roleParameters`) — are managed through this single config endpoint: the body
+is the CRD `ConfigSpec`, and the admin controller applies it on the next
+reconcile. HBA rules are managed declaratively via the CRD's `spec.auth.hbaRules`
+(see the [User Guide](user-guide.md#managing-hba-rules)); there is no separate
+`/config/hba` REST route.
 
 #### Update Configuration
 
@@ -330,6 +334,12 @@ curl -u admin:password -X PUT \
     },
     "coordinatorParameters": {
       "optimizer": "on"
+    },
+    "databaseParameters": {
+      "mydb": { "work_mem": "512MB" }
+    },
+    "roleParameters": {
+      "analyst": { "statement_mem": "1GB" }
     }
   }'
 ```
@@ -342,24 +352,18 @@ curl -u admin:password -X PUT \
 }
 ```
 
-#### Update HBA Rules
-
-```bash
-curl -u admin:password -X PUT \
-  http://operator:8090/api/v1alpha1/clusters/my-cluster/config/hba \
-  -H "Content-Type: application/json" \
-  -d '{
-    "rules": [
-      {
-        "type": "host",
-        "database": "all",
-        "user": "all",
-        "address": "10.0.0.0/8",
-        "method": "scram-sha-256"
-      }
-    ]
-  }'
-```
+> **Parameter scope validation (applied at reconcile).** When the admin
+> controller applies the config, each parameter is set through
+> `db.Client.SetParameter` with a validated scope: the level must be `""`/
+> `cluster` (`ALTER SYSTEM`), `database` (`ALTER DATABASE … SET`, target
+> required), or `role` (`ALTER ROLE … SET`, target required) — exact,
+> case-sensitive match. Any other scope is rejected with
+> `db.ErrInvalidParameterScope` **before any SQL is executed** (previously an
+> unknown level silently escalated to a cluster-wide `ALTER SYSTEM`). The
+> declarative maps above always produce valid scopes — the database/role
+> target comes from the map key — so this guard protects programmatic users
+> of the Go client; per-parameter apply failures are logged by the controller
+> and do not fail the API request, which only persists the spec.
 
 ### Storage
 

@@ -1958,8 +1958,8 @@ go test ./test/e2e/... -v -tags e2e -run TestE2E_Scenario47
 Tests the operator's webhook certificate management across two certificate sources: Vault PKI (48a) and self-signed (48b). Verifies certificate issuance, Kubernetes Secret creation, webhook configuration patching with `caBundle`, certificate rotation detection, and Helm auto-generation of Secret and service names.
 
 - **48a — Vault PKI cert source**: Operator authenticates to Vault with token auth, requests certificate from `pki/issue/cloudberry-operator` with correct CN (`{service}.{namespace}.svc`) and SANs (`.svc` and `.svc.cluster.local`). Certificate stored in `kubernetes.io/tls` Secret with `tls.crt`, `tls.key`, `ca.crt`. Both validating and mutating webhook configurations patched with `caBundle`. All `CLOUDBERRY_WEBHOOK_*` environment variables verified
-- **48b — Self-signed cert source**: Operator generates ECDSA P-256 CA (10-year validity, CA:TRUE, pathlen:0) and server cert (1-year validity, CA:FALSE) with correct SANs. Secret created with all 3 keys. Webhook functional — CR accepted
-- **Certificate rotation**: Background goroutine checks every 12 hours. Rotation threshold at 2/3 of certificate lifetime. `checkCertRotation()` correctly detects near-expiry certs
+- **48b — Self-signed cert source**: Operator generates ECDSA P-256 CA (10-year validity, CA:TRUE, pathlen:0) and server cert (1-year validity, CA:FALSE) with correct SANs. Secret created with `ca.crt`, `tls.crt`, `tls.key` — plus `ca.key` (persisted so later rotations can reuse the CA for leaf-only renewals). Webhook functional — CR accepted
+- **Certificate rotation**: Background goroutine (leader-gated via `mgr.Elected()`) checks on a jittered ~12-hour interval. Rotation threshold at 2/3 of certificate lifetime. `checkCertRotation()` correctly detects near-expiry certs. After every rotation the CA bundle is re-injected into both webhook configurations (pending-bundle retry on subsequent ticks; outcomes on `cloudberry_webhook_ca_bundle_injection_total`); the self-signed source persists `ca.key` and reuses the CA for leaf-only renewals
 - **Helm auto-generation**: `certSecretName` auto-generated as `{release}-webhook-certs`, `serviceName` auto-generated as `{release}-webhook`, empty `caBundle` triggers runtime injection
 - **Test case catalog**: `WebhookCertCase` type and `WebhookCertCases()` function in `test/cases/test_cases.go`
 - **Example CRs**: `test/examples/scenario48a-webhook-vault-pki.yaml`, `test/examples/scenario48b-webhook-self-signed.yaml`
@@ -4245,23 +4245,30 @@ scenario1-cluster-segment-mirror-3    (mirror of primary-3)
 
 ### Coverage
 
-The project **enforces 90%+ unit test statement coverage per package** (not just overall). Total project coverage: **90.9%** (improved from 85.3%). Current coverage for key packages:
+The project **enforces 90%+ unit test statement coverage per package** (not just overall). Total coverage across the production packages (`./internal/... ./cmd/... ./api/...`): **94.7%**, with **no package below 90%**. The GitHub Actions CI pipeline enforces a **≥90% total-coverage gate** on that package set (`Enforce coverage threshold` step in `.github/workflows/ci.yml`) — a PR that drops total coverage below 90% fails the unit-test job. Current per-package coverage (2026-07-12):
 
-| Package | Coverage | Notes |
-|---------|----------|-------|
-| `internal/controller` | ~90% | Improved from 88.1% → 90.0% with mock DB client tests, action annotation retry, lifecycle phase error logging, and context-aware rebalance |
-| `internal/certmanager` | ~93% | Improved from ~90% with additional rotation and edge case tests |
-| `internal/vault` | 99.1% | Near-complete coverage |
-| `internal/metrics` | 100% | Full coverage |
-| `internal/db` | ~92% | Improved from 89.3% → 92.2% with mock DB client factory, SSL config tests, and connection string builder tests |
-| `internal/api` | ~96% | Improved from ~74% with input validation, recovery type validation, and rate limiter shutdown tests |
-| `internal/ctl` | ~85% | URL encoding and response size limit tests |
-| `internal/auth` | ~97.6% | Improved from 89.4% → 97.6% with OIDC redirect protection, auth controller log level, and unused field removal tests |
-| `internal/idle` | ~97% | Improved from 71.2% → 97.1% with reconnection mechanism, health check, and exponential backoff tests |
-| `cmd/operator` | ~30.1% | New coverage — previously 0%. Covers main startup, WaitGroup-based goroutine tracking, and admin password persistence |
-| `cmd/cloudberry-ctl` | ~83.4% | Improved from 28.5% → 83.4% with context propagation, bulk import, and signal handling tests |
+| Package | Coverage |
+|---------|----------|
+| `internal/metrics`, `internal/httpjson`, `internal/pxfpolicy` | 100% |
+| `internal/webhook` | 99.9% |
+| `internal/vault` | 99.6% |
+| `internal/config` | 99.1% |
+| `internal/idle` | 98.9% |
+| `internal/planchecker` | 97.8% |
+| `cmd/cloudberry-query-exporter` | 97.4% |
+| `api/v1alpha1` | 97.1% |
+| `internal/builder` | 97.0% |
+| `internal/util` | 96.2% |
+| `internal/auth`, `internal/certmanager` | 96.0% |
+| `internal/ctl` | 95.8% |
+| `internal/cron` | 95.2% |
+| `internal/api` | 94.7% |
+| `internal/db`, `cmd/operator` | 93.1% |
+| `internal/telemetry` | 92.5% |
+| `cmd/cloudberry-ctl` | 92.4% |
+| `internal/controller` | 92.0% |
 
-All 14 internal packages now meet or exceed the 90% coverage target.
+Every package meets or exceeds the 90% coverage target (the lowest, `internal/controller`, is at 92.0%).
 
 **Goroutine-leak detection**: goroutine-heavy packages (`internal/api`, `internal/controller`, `internal/idle`, `internal/vault`) run [goleak](https://github.com/uber-go/goleak) from their `TestMain` (`main_test.go`), failing the package's test run if any test leaks a goroutine. New tests in these packages must clean up servers, daemons, watchers, and clients they start.
 
@@ -5044,6 +5051,22 @@ The `cloudberry-query-exporter` sidecar accepts a `--history-retention` flag con
 An empty value falls back to the default retention period, and negative or otherwise invalid values are rejected with a clear error.
 
 > **Fixed**: Previously, passing a day- or week-based value such as `--history-retention=30d` crashed the exporter because `time.ParseDuration` does not understand the `d`/`w` units. `parseRetention()` now normalizes these suffixes to hours before parsing, so values like `30d`, `90d`, and `2w` work alongside standard Go durations.
+
+### cloudberry-query-exporter Logging and Tracing Flags
+
+The exporter also accepts (environment variables override the matching flag — the project-wide precedence, applied in `parseConfigFromFlagSet`):
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--log-level` | `LOG_LEVEL` | `info` | JSON log level (`debug`/`info`/`warn`/`error`, validated case-insensitively; invalid values fail startup) |
+| `--telemetry-enabled` | `TELEMETRY_ENABLED` | `false` | Enable OTLP trace export (`TELEMETRY_ENABLED` must parse as a boolean when set) |
+| `--otlp-endpoint` | `OTLP_ENDPOINT` | `""` | OTLP collector endpoint for trace export |
+
+Tracing is a no-op unless enabled; when on, each collection cycle runs inside an `exporter.collect` span (error status when the cycle ends without a live DB connection) and each retention-cleanup tick inside `exporter.history.cleanup`, exported under `service.name=cloudberry-query-exporter` with a bounded (5 s) tracer shutdown joined on all exit paths.
+
+### db.Client Capability Interfaces
+
+`db.Client` (`internal/db/interfaces.go`) is the embedding composition of 17 capability interfaces — `ConnectionOps`, `TopologyOps`, `ConfigOps`, `SessionOps`, `RoleOps`, `MaintenanceOps`, `MonitoringOps`, `WorkloadOps`, `BackupOps`, `DataLoadingOps`, `StorageOps`, `RecommendationOps`, `HAOps`, `ScaleOps`, `PXFOps`, `QueryHistoryStore`, and `ExporterSetupOps`. The composed method set is unchanged (the split is source-compatible), but **new consumers should depend on the narrowest capability interface they need** instead of the full `Client` (the idle daemon already does), which keeps mocks small and dependencies honest.
 
 ## Debugging
 

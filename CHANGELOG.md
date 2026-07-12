@@ -6,8 +6,85 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+> **Behavior change — backup-schedule cron day-field semantics (2026-07-12).**
+> The operator's cron parser (`internal/cron`, used for backup-schedule
+> next-run computation and webhook schedule validation) now follows the
+> Vixie-cron **star rule** implemented by robfig/cron — the engine behind
+> Kubernetes CronJobs: a day-of-month / day-of-week field is *unrestricted*
+> only when its raw text starts with `*` (`*` or `*/n`). An explicit full
+> range such as `1-31` or `0-6` is now treated as **restricted**, which flips
+> the day matching to **OR** semantics between the two day fields. A schedule
+> like `0 0 1-31 * 1` therefore now matches **every day** (day-of-month 1–31
+> OR Monday) instead of Mondays only — matching what the Kubernetes CronJob
+> controller actually executes. Previously such explicit full ranges were
+> treated as unrestricted (AND semantics), so the operator's `nextScheduleTime`
+> predictions could disagree with the real firing times. Review any schedule
+> that spells out a full day range instead of `*`.
+
 ### Added
 
+- **Four new Prometheus metric families** (namespace `cloudberry`) covering
+  certificate-rotation health and Vault secret-watch freshness:
+  - `cloudberry_webhook_ca_bundle_injection_total{result}` — webhook CA-bundle
+    injection attempts (startup **and** post-rotation re-injection);
+    `result` ∈ {`success`, `error`}. Recorded once per injection attempt
+    (after retries) at both call sites.
+  - `cloudberry_cert_rotation_check_errors_total{component}` — failed
+    `NeedsRotation` checks in the background rotation loop; `component` is a
+    bounded enum (currently `webhook`). Previously these failures were
+    log-only.
+  - `cloudberry_vault_watch_last_success_timestamp{path}` — Unix timestamp of
+    the last successful poll of a watched Vault secret path; staleness is
+    derived in PromQL as `time() - <gauge>`. A successful poll of an empty
+    secret still counts as a success. `path` is bounded (the config-derived
+    watched Vault paths).
+  - `cloudberry_vault_watch_errors_total{path}` — failed polls per watched
+    Vault secret path (the paired error counter; `ReadSecret` still meters
+    the underlying vault operation, so there is no double count on
+    `cloudberry_vault_operations_total`).
+  All four use the shared result-label constants (`metrics.ResultSuccess` /
+  `metrics.ResultError`), so the outcome vocabulary cannot drift between
+  metric families.
+- **Query-exporter `--log-level` flag + `LOG_LEVEL` env**
+  (`cmd/cloudberry-query-exporter`) — the exporter's JSON logger level is now
+  configurable (`debug`/`info`/`warn`/`error`, case-insensitive, default
+  `info`), making `Debug` diagnostics reachable in the field. The environment
+  variable takes precedence over the flag, matching the project-wide
+  configuration precedence.
+- **Query-exporter optional OTLP tracing** — new `--telemetry-enabled` /
+  `--otlp-endpoint` flags with `TELEMETRY_ENABLED` / `OTLP_ENDPOINT`
+  environment overrides (ENV > flag). **Disabled by default** — behavior is
+  unchanged unless explicitly enabled. When enabled the exporter exports
+  spans under `service.name=cloudberry-query-exporter` (gRPC OTLP): one
+  `exporter.collect` span per collection cycle (error status when the cycle
+  ends without a live database connection) and one `exporter.history.cleanup`
+  span per retention-cleanup tick; tracer shutdown is bounded (5 s) and joined
+  on all exit paths. No statement text is attached to spans (PII-safe).
+- **New operator span `operator.certRotationCheck`** — one span per rotation
+  tick carrying `needs_rotation`/`rotated` attributes and error status on
+  check/rotate/inject failures, so a mid-run rotation months after startup
+  stays diagnosable in the tracing backend.
+- **Grafana: 8 new operator-dashboard panels** (Security & Lifecycle section
+  of `monitoring/grafana/cloudberry-operator.json`, panel ids 326–333): "CA
+  Bundle Injection Rate" / "CA Bundle Injection Errors (1h)", "Cert Rotation
+  Check Errors Rate" / "Cert Rotation Check Errors (1h)", "Vault Watch
+  Staleness" (`time() - cloudberry_vault_watch_last_success_timestamp`) /
+  "Vault Watch Last Success", and "Vault Watch Errors Rate" / "Vault Watch
+  Errors (1h)". The OTEL dashboard (`cloudberry-otel.json`) description now
+  lists the new spans `operator.certRotationCheck`, `exporter.collect`, and
+  `exporter.history.cleanup`.
+- **CI coverage gate** — `.github/workflows/ci.yml` now fails the unit-test
+  job when total statement coverage of `./internal/... ./cmd/... ./api/...`
+  drops below **90 %**. Current total: **94.7 %**, with no package below 90 %.
+- **CODEOWNERS for the PXF/gpfdist Dockerfiles** —
+  `Dockerfile.cloudberry-pxf`, `Dockerfile.cloudberry-official-pxf`, and
+  `Dockerfile.cloudberry-gpfdist` are now owned by the devops group like the
+  other image Dockerfiles.
+- **Performance-test report (2026-07-12)** —
+  `test/performance/results/2026-07-12-perftest-report.md`: all SLOs pass and
+  there is no regression vs the 2026-07-10 baseline after the cert-rotation
+  and metrics changes (health p99 ~10 ms at 100 RPS with 0 errors; rate
+  limiter enforcement unchanged).
 - **Three new Prometheus metric families** making previously-silent failure paths
   observable:
   - `cloudberry_steady_state_refresh_errors_total{cluster,namespace,component}` —
@@ -190,6 +267,76 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **Backup-schedule cron semantics: explicit full day ranges are now
+  RESTRICTED (Vixie/robfig star-rule parity).** See the prominent
+  **Behavior change** note at the top of this section — `internal/cron` now
+  decides day-of-month/day-of-week restriction from the raw field text
+  (`*`/`*/n` = unrestricted), so `"0 0 1-31 * 1"` fires every day (OR
+  semantics) exactly as the Kubernetes CronJob controller executes it, and
+  the operator's `nextScheduleTime` and webhook validation agree with
+  reality.
+- **Certificate rotation loop hardened** (`cmd/operator`):
+  - **Leader-gated** — the loop blocks on `mgr.Elected()` before doing any
+    work, so in a multi-replica deployment only the leader writes cert
+    Secrets and webhook configurations. With leader election disabled,
+    controller-runtime closes the elected channel as soon as the manager
+    starts, preserving single-replica behavior.
+  - **Jittered interval** — each tick waits the base 12 h interval plus a
+    random jitter of up to 10 %, so multiple replicas de-synchronize instead
+    of probing the cert Secret in lockstep.
+  - **Pending-bundle retry on every tick** and per-tick
+    `operator.certRotationCheck` span + outcome metrics (see *Fixed* /
+    *Added* above). Failed rotation checks now also increment
+    `cloudberry_cert_rotation_check_errors_total{component="webhook"}`.
+- **Self-signed webhook certificates: the CA is now reused across rotations
+  (leaf-only renewal).** The CA private key is persisted alongside the CA
+  certificate in the webhook cert Secret (new `ca.key` key), and a rotation
+  re-issues **only the serving (leaf) certificate** from the persisted CA as
+  long as the CA parses, is the operator's own self-signed CA, is not past
+  its own 2/3-lifetime rotation threshold, and its remaining validity covers
+  the full validity of the new leaf (a leaf never outlives its issuer). With
+  a reused CA, `ca.crt` — and therefore the injected webhook CA bundle —
+  stays byte-identical across rotations. Legacy Secrets without `ca.key`
+  keep working via the full-regeneration fallback (a missing `ca.key` is
+  deliberately **not** a rotation trigger); the regeneration path starts
+  persisting `ca.key`. Switching to `vault-pki` drops a stale `ca.key` from
+  the Secret.
+- **Union CA bundle during a CA cutover.** When a rotation replaces the CA
+  (any source, including a Vault PKI issuing-CA change) and the previous CA
+  is still time-valid, the bundle injected into the webhook configurations is
+  the **union of the new and old CA**: during the kubelet Secret-propagation
+  window the webhook pod may still serve the old leaf while the API server
+  already trusts only the freshly injected bundle — including the old CA
+  keeps admission working through the cutover race. The CA-reuse path
+  (unchanged CA) returns the single CA as before.
+- **Self-signed certificate issuance now rejects an empty `dnsNames` slice**
+  with a clear error instead of panicking on the Common-Name access.
+- **Disabled Vault client returns a typed error.** With Vault integration
+  disabled, the no-op client's `ReadSecret` now returns
+  `vault.ErrVaultDisabled` (match with `errors.Is`) instead of `(nil, nil)`,
+  so an unguarded caller can no longer mistake the result for an
+  existing-but-empty secret. Callers should keep guarding with
+  `IsEnabled()`; guarded call sites are unaffected.
+- **Vault `SecretWatcher` staleness observability.** `NewSecretWatcher`
+  accepts an optional metrics recorder (variadic, matching the
+  `certmanager.New` pattern) and emits the two per-path watch metrics above.
+  The Vault client's operation recorder is now stored atomically, so
+  `SetRecorder` is safe against the background token lifetime watcher
+  reading it concurrently.
+- **`db.Client` split into 17 capability interfaces** (`internal/db/interfaces.go`):
+  `ConnectionOps`, `TopologyOps`, `ConfigOps`, `SessionOps`, `RoleOps`,
+  `MaintenanceOps`, `MonitoringOps`, `WorkloadOps`, `BackupOps`,
+  `DataLoadingOps`, `StorageOps`, `RecommendationOps`, `HAOps`, `ScaleOps`,
+  `PXFOps`, `QueryHistoryStore`, and `ExporterSetupOps`. `Client` is now the
+  composition (embedding) of all seventeen — the method set is unchanged, so
+  the split is **source-compatible**; consumers can depend on just the
+  capability they use (the idle daemon already consumes the narrow
+  interfaces).
+- **Query-exporter graceful shutdown joins the collect loop on every exit
+  path** — the loop join (cancel + wait) is registered as a deferred closure
+  immediately after the loop starts, so the HTTP-server error path joins the
+  loop too, and the loop remains the single owner of the (possibly
+  reconnected) database connection.
 - **postgres-exporter `cloudberry_table_stats` is now catalog-only** — the custom
   per-table query reads `pg_class` + `pg_namespace` instead of `pg_stat_user_tables`. On
   Cloudberry `pg_stat_user_tables` is a **distributed** view (and the `dbsize` functions
@@ -232,6 +379,45 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **HIGH (H-1): the webhook CA bundle is re-injected after every certificate
+  rotation.** Previously the CA bundle was injected into the
+  `ValidatingWebhookConfiguration`/`MutatingWebhookConfiguration` **only at
+  operator startup**. An in-place rotation re-issues the serving certificate —
+  and, for the self-signed source, could mint a fresh CA — so after the first
+  rotation (typically ~2/3 of the cert lifetime, months into an operator's
+  run) the API server rejected every admission call with `x509: certificate
+  signed by unknown authority` until the operator was restarted. The rotation
+  loop now captures the CA bundle returned by every successful rotation and
+  re-injects it with the shared retry budget (5 retries, 1 s–30 s exponential
+  backoff, 10 % jitter); when the retry budget is exhausted the bundle is kept
+  as **pending** and re-attempted on every subsequent tick (once the Secret is
+  rotated `NeedsRotation` reports false, so without this retry a transient
+  API-server outage would strand the rotated CA forever). Both call sites
+  (startup and rotation) record the outcome on the new
+  `cloudberry_webhook_ca_bundle_injection_total{result}` counter.
+- **`SetParameter` scope validation — a typo could silently escalate to
+  `ALTER SYSTEM`.** `db.Client.SetParameter` previously routed any
+  unrecognized `ParameterScope.Level` (e.g. `"databsae"`) through the default
+  branch, executing a **cluster-wide** `ALTER SYSTEM` instead of the intended
+  scoped statement. The scope is now validated before any SQL is built:
+  `Level` must be `""`/`ScopeLevelCluster` (`"cluster"`),
+  `ScopeLevelDatabase` (`"database"`), or `ScopeLevelRole` (`"role"`) — exact,
+  case-sensitive match — and the database/role levels **require** a non-empty
+  `Target`. Invalid scopes are rejected with the new sentinel
+  `db.ErrInvalidParameterScope` (match with `errors.Is`); SQL for valid
+  scopes is byte-identical to before.
+- **Backup Job scripts: base64 decode failures now abort loudly (SC2155).**
+  The generated coordinator-exec script exported its connection env as
+  `export VAR=$(printf '%s' "$N" | base64 -d)`, which masks the pipeline's
+  exit status under `set -euo pipefail` — a corrupt argument decoded to an
+  **empty** value (e.g. empty `PGPASSWORD`) and the tool proceeded to a
+  confusing downstream auth failure. Declaration and export are now split
+  (`VAR=$(…); export VAR`), so a decode failure aborts the Job step with the
+  real error.
+- **`GetQueryDetail` no longer discards row errors silently** — lock/table
+  collection keeps its best-effort semantics (partial `locks`/`tablesAccessed`
+  still returned, never a hard failure), but query errors, per-row scan errors,
+  and `rows.Err()` are now logged at Debug instead of being dropped.
 - **CRITICAL: the cluster NetworkPolicy now admits the MPP interconnect** — the SE.5
   `<cluster>-pxf` NetworkPolicy (present whenever the PXF sidecar is enabled) makes the
   segment pods default-deny with only fixed service ports allowed, which silently dropped
@@ -340,6 +526,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Security
 
+- **The self-signed CA private key is persisted in the webhook cert Secret
+  (`ca.key`).** Rationale: the same namespace-scoped Secret already holds the
+  server private key (`tls.key`), so the blast radius of a Secret compromise
+  is unchanged — and persisting the CA key is what enables leaf-only renewals
+  that keep the injected CA bundle stable across rotations (part of the H-1
+  hardening). The key is stored only for the self-signed source; the
+  vault-pki issuing CA key never leaves Vault.
 - **`io_limit` DDL injection hardening (defense in depth)** — the free-form
   `workload.resourceGroups[].ioLimits[].tablespace` CRD value is embedded in the rendered
   `ALTER RESOURCE GROUP … SET io_limit '…'` string. It is now (1) escaped with
@@ -411,6 +604,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Verified
 
+- **2026-07-12 — performance re-run after the cert-rotation/metrics changes.**
+  All SLOs pass, no regression vs the 2026-07-10 baseline
+  (`test/performance/results/2026-07-12-perftest-report.md`): health
+  endpoints p99 ≤ ~10 ms at 100 RPS (24,000 requests, 0 errors), authed API
+  reads bcrypt-dominated as before, rate limiter knee exact, zero 5xx.
+  Coverage after the accompanying unit-test phase: **94.7 %** total across
+  `./internal/... ./cmd/... ./api/...` with no package below 90 % (enforced
+  by the new CI gate).
 - **2026-07-10 — full live acceptance (kind) after the reliability/security refactor.**
   Operator deployed with Vault-PKI webhook certs + Vault kubernetes-auth + Keycloak OIDC;
   `acceptance-test` cluster Running with HA coordinator + standby, 2+2 group segment
