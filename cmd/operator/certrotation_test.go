@@ -80,8 +80,9 @@ func runRotation(t *testing.T, cm *atomicCertManager, pred func() bool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	k8sClient := newFakeClient(admissionWebhookFixture())
 	go func() {
-		runCertRotation(ctx, cm, testLogger())
+		runCertRotation(ctx, cm, k8sClient, testLogger())
 		close(done)
 	}()
 

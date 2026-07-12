@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -811,6 +812,39 @@ func setupWebhookCerts(
 	// can verify the self-signed certificate used by the webhook server.
 	// Retry with exponential backoff to handle transient API server errors
 	// during startup or network instability.
+	if err := injectCABundleWithRetry(ctx, directClient, caBundle, span, logger); err != nil {
+		return fmt.Errorf("injecting CA bundle into webhook configurations: %w", err)
+	}
+
+	// Start background goroutine for certificate rotation. It owns the
+	// dedicated Vault client (if any) and closes it when rotation stops. The
+	// direct (uncached) client is passed so the rotation loop can re-inject
+	// the CA bundle after every rotation (H-1) without depending on the
+	// manager cache lifecycle.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if ownedVault != nil {
+			defer ownedVault.Close()
+		}
+		runCertRotation(ctx, cm, directClient, logger)
+	}()
+
+	return nil
+}
+
+// injectCABundleWithRetry injects the CA bundle into the operator's webhook
+// configurations, retrying transient failures with the shared exponential
+// backoff budget (5 retries, 1s..30s, x2, 10% jitter). The optional span (nil
+// on the rotation path, which has no startup span) receives one event per
+// attempt so a flaky API server is visible on the cert span (D-7).
+func injectCABundleWithRetry(
+	ctx context.Context,
+	k8sClient client.Client,
+	caBundle []byte,
+	span trace.Span,
+	logger *slog.Logger,
+) error {
 	retryOpts := util.RetryOptions{
 		MaxRetries:     5,
 		InitialBackoff: time.Second,
@@ -819,28 +853,15 @@ func setupWebhookCerts(
 		JitterFraction: 0.1,
 	}
 	attempt := 0
-	if err := util.RetryWithBackoff(ctx, retryOpts, func(retryCtx context.Context) error {
+	return util.RetryWithBackoff(ctx, retryOpts, func(retryCtx context.Context) error {
 		// Each retry is recorded as a span event (not a separate span) so a
 		// flaky API server during startup is visible on the cert span (D-7).
 		attempt++
-		telemetry.AddSpanEvent(span, "injectCABundle.attempt", attribute.Int("attempt", attempt))
-		return injectCABundle(retryCtx, directClient, caBundle, logger)
-	}); err != nil {
-		return fmt.Errorf("injecting CA bundle into webhook configurations: %w", err)
-	}
-
-	// Start background goroutine for certificate rotation. It owns the
-	// dedicated Vault client (if any) and closes it when rotation stops.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if ownedVault != nil {
-			defer ownedVault.Close()
+		if span != nil {
+			telemetry.AddSpanEvent(span, "injectCABundle.attempt", attribute.Int("attempt", attempt))
 		}
-		runCertRotation(ctx, cm, logger)
-	}()
-
-	return nil
+		return injectCABundle(retryCtx, k8sClient, caBundle, logger)
+	})
 }
 
 // resolveWebhookPKIVaultClient returns the Vault client used for webhook PKI
@@ -941,30 +962,89 @@ func injectCABundle(
 }
 
 // runCertRotation periodically checks and rotates webhook certificates.
-func runCertRotation(ctx context.Context, cm certmanager.CertManager, logger *slog.Logger) {
+//
+// H-1: an in-place rotation re-issues the serving certificate — and, for the
+// self-signed source, a fresh CA — so the CA bundle previously injected into
+// the Validating/MutatingWebhookConfigurations stops validating the new
+// serving certificate. Without re-injection the API server rejects every
+// webhook call with "x509: certificate signed by unknown authority" until the
+// operator restarts. The loop therefore captures the bundle returned by every
+// successful rotation and re-injects it via injectCABundleWithRetry.
+func runCertRotation(
+	ctx context.Context,
+	cm certmanager.CertManager,
+	k8sClient client.Client,
+	logger *slog.Logger,
+) {
 	ticker := time.NewTicker(certRotationInterval)
 	defer ticker.Stop()
+
+	// pendingBundle holds a successfully rotated CA bundle whose injection has
+	// not succeeded yet. It is re-attempted on EVERY tick: once the Secret is
+	// rotated, NeedsRotation reports false, so without this retry an injection
+	// failure (retry budget exhausted) would never be re-attempted and
+	// admission would stay broken until restart (H-1).
+	var pendingBundle []byte
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			needs, err := cm.NeedsRotation(ctx)
-			if err != nil {
-				logger.Error("failed to check certificate rotation", "error", err)
-				continue
-			}
-			if needs {
-				logger.Info("rotating webhook certificates")
-				if _, rotErr := cm.EnsureCertificates(ctx); rotErr != nil {
-					logger.Error("failed to rotate certificates", "error", rotErr)
-				} else {
-					logger.Info("webhook certificates rotated successfully")
-				}
-			}
+			pendingBundle = rotateOnce(ctx, cm, k8sClient, pendingBundle, logger)
 		}
 	}
+}
+
+// rotateOnce performs one rotation tick: it first retries a pending CA-bundle
+// injection from a previous tick, then checks whether the certificates need
+// rotation and, when they do, rotates them and injects the fresh bundle. It
+// returns the bundle that still awaits injection (nil when none is pending).
+// Errors are logged, never propagated — the rotation loop must survive
+// transient failures and retry on subsequent ticks.
+func rotateOnce(
+	ctx context.Context,
+	cm certmanager.CertManager,
+	k8sClient client.Client,
+	pendingBundle []byte,
+	logger *slog.Logger,
+) []byte {
+	// Retry a previously failed injection before anything else so a transient
+	// API-server outage cannot permanently strand an already-rotated CA (H-1).
+	if pendingBundle != nil {
+		if err := injectCABundleWithRetry(ctx, k8sClient, pendingBundle, nil, logger); err != nil {
+			logger.Error("failed to inject pending CA bundle; will retry on next tick", "error", err)
+		} else {
+			logger.Info("pending CA bundle injected into webhook configurations")
+			pendingBundle = nil
+		}
+	}
+
+	needs, err := cm.NeedsRotation(ctx)
+	if err != nil {
+		logger.Error("failed to check certificate rotation", "error", err)
+		return pendingBundle
+	}
+	if !needs {
+		return pendingBundle
+	}
+
+	logger.Info("rotating webhook certificates")
+	caBundle, rotErr := cm.EnsureCertificates(ctx)
+	if rotErr != nil {
+		logger.Error("failed to rotate certificates", "error", rotErr)
+		return pendingBundle
+	}
+	logger.Info("webhook certificates rotated successfully")
+
+	// H-1: re-inject the NEW bundle so the API server trusts the rotated
+	// serving certificate. On failure the fresh bundle becomes pending and is
+	// retried on the next tick.
+	if injErr := injectCABundleWithRetry(ctx, k8sClient, caBundle, nil, logger); injErr != nil {
+		logger.Error("failed to inject rotated CA bundle; will retry on next tick", "error", injErr)
+		return caBundle
+	}
+	return nil
 }
 
 // registerWebhooks registers the validating and mutating admission webhooks

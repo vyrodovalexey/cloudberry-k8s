@@ -358,7 +358,7 @@ func TestRunCertRotation_ContextCanceled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), logger)
 		close(done)
 	}()
 
@@ -392,7 +392,7 @@ func TestRunCertRotation_NeedsRotation_EnsureSucceeds(t *testing.T) {
 		// function by canceling the context. The key is that the mock is set up
 		// to return needsRotation=true, so if the ticker fires, it will call
 		// EnsureCertificates.
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), logger)
 		close(done)
 	}()
 
@@ -421,7 +421,7 @@ func TestRunCertRotation_NeedsRotation_EnsureFails(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), logger)
 		close(done)
 	}()
 
@@ -448,7 +448,7 @@ func TestRunCertRotation_NeedsRotationError(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), logger)
 		close(done)
 	}()
 
@@ -869,7 +869,7 @@ func TestRunCertRotation_NoRotationNeeded(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), logger)
 		close(done)
 	}()
 
