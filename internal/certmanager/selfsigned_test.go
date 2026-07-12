@@ -17,7 +17,7 @@ func TestGenerateSelfSignedCert(t *testing.T) {
 	}
 	validity := 365 * 24 * time.Hour
 
-	caCertPEM, serverCertPEM, serverKeyPEM, err := generateSelfSignedCert(dnsNames, validity)
+	caCertPEM, _, serverCertPEM, serverKeyPEM, err := generateSelfSignedCert(dnsNames, validity)
 	require.NoError(t, err)
 	require.NotEmpty(t, caCertPEM)
 	require.NotEmpty(t, serverCertPEM)
@@ -62,7 +62,7 @@ func TestGenerateSelfSignedCert_Validity(t *testing.T) {
 	dnsNames := []string{"test.default.svc"}
 	validity := 30 * 24 * time.Hour // 30 days
 
-	_, serverCertPEM, _, err := generateSelfSignedCert(dnsNames, validity)
+	_, _, serverCertPEM, _, err := generateSelfSignedCert(dnsNames, validity)
 	require.NoError(t, err)
 
 	block, _ := pem.Decode(serverCertPEM)

@@ -136,7 +136,7 @@ func TestSetCertExpiry_ValidCert(t *testing.T) {
 	rec := newCapturingRecorder()
 	m := &certManager{recorder: rec}
 
-	_, tlsCert, _, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
+	_, _, tlsCert, _, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
 	require.NoError(t, err)
 
 	m.setCertExpiry(tlsCert)
@@ -177,9 +177,9 @@ func TestEnsureCertificates_RecordsMetrics_VaultPKI(t *testing.T) {
 	cfg.CertSource = CertSourceVaultPKI
 
 	// Use a self-signed cert as the vault-issued cert so setCertExpiry can parse it.
-	_, tlsCert, tlsKey, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
+	_, _, tlsCert, tlsKey, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
 	require.NoError(t, err)
-	caCert, _, _, err := generateSelfSignedCert([]string{"ca"}, 365*24*time.Hour)
+	caCert, _, _, _, err := generateSelfSignedCert([]string{"ca"}, 365*24*time.Hour)
 	require.NoError(t, err)
 
 	mockVault := &mockVaultClient{
@@ -231,7 +231,7 @@ func TestEnsureCertificates_ExistingValid_RefreshesExpiry(t *testing.T) {
 	scheme := newTestScheme()
 	cfg := newTestConfig()
 
-	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+	caCert, _, tlsCert, tlsKey, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc", "test-webhook.test-ns.svc.cluster.local"},
 		365*24*time.Hour,
 	)
