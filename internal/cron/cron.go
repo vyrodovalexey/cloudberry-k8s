@@ -5,6 +5,15 @@
 // from drifting (code review L-2). Supported field syntax: numbers, "*",
 // ranges "a-b", lists "a,b" and steps "*/n" / "a-b/n" — the subset accepted
 // by Kubernetes CronJobs.
+//
+// Day-of-month / day-of-week combination follows the Vixie cron star rule
+// (also implemented by robfig/cron, the engine behind Kubernetes CronJobs):
+// a field is UNRESTRICTED exactly when its raw text starts with '*' ("*" or
+// "*/n"); when BOTH day fields are restricted a time matches if EITHER
+// matches (OR), otherwise both must match (AND). An explicit full range such
+// as "1-31" is therefore RESTRICTED — distinguishable from "*" — so the
+// operator's next-run predictions and webhook validation agree with what the
+// CronJob controller will actually execute (L-6).
 package cron
 
 import (
@@ -46,6 +55,13 @@ type Schedule struct {
 	days     map[int]bool
 	months   map[int]bool
 	weekdays map[int]bool
+	// domIsStar / dowIsStar record whether the RAW day-of-month /
+	// day-of-week field text started with '*' ("*" or "*/n") — Vixie cron's
+	// star rule for deciding day-field restriction (L-6). An explicit full
+	// range ("1-31", "0-6") yields the same value SET as "*" but is still
+	// RESTRICTED, which flips dayMatches to OR semantics.
+	domIsStar bool
+	dowIsStar bool
 }
 
 // maxSearchMinutes bounds the forward search for the next matching minute to
@@ -75,6 +91,10 @@ func Parse(expr string) (*Schedule, error) {
 		days:     sets[2],
 		months:   sets[3],
 		weekdays: sets[4],
+		// Vixie star rule (L-6): restriction is a property of the raw field
+		// TEXT, not of the resulting value set.
+		domIsStar: strings.HasPrefix(fields[2], "*"),
+		dowIsStar: strings.HasPrefix(fields[4], "*"),
 	}, nil
 }
 
@@ -120,10 +140,15 @@ func (s *Schedule) matches(t time.Time) bool {
 	return s.dayMatches(t)
 }
 
-// dayMatches applies the day-of-month / day-of-week OR semantics.
+// dayMatches applies the day-of-month / day-of-week OR semantics. A field is
+// restricted when its raw text did not start with '*' (Vixie/robfig star
+// rule) — DELIBERATE behavior change (L-6): explicit full ranges such as
+// "1-31" or "0-6" now count as restricted (previously the len()-based
+// heuristics treated them as unrestricted), matching what the Kubernetes
+// CronJob engine actually executes.
 func (s *Schedule) dayMatches(t time.Time) bool {
-	domRestricted := len(s.days) != 31
-	dowRestricted := len(s.weekdays) != 7
+	domRestricted := !s.domIsStar
+	dowRestricted := !s.dowIsStar
 	dom := s.days[t.Day()]
 	dow := s.weekdays[int(t.Weekday())]
 
