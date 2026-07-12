@@ -47,10 +47,9 @@ const (
 	rotationThresholdFraction = 2.0 / 3.0
 
 	// certComponent is the component label value used for certificate metrics.
+	// The result label values are the shared metrics.ResultSuccess /
+	// metrics.ResultError constants (L-7).
 	certComponent = "webhook"
-	// resultSuccess and resultError are the result label values for cert metrics.
-	resultSuccess = "success"
-	resultError   = "error"
 
 	// certTracerName is the tracer name used for certificate-management spans.
 	certTracerName = "certmanager"
@@ -197,7 +196,7 @@ func (m *certManager) EnsureCertificates(ctx context.Context) (caBundle []byte, 
 	// Generate or issue new certificates.
 	caBundle, err = m.generateCertificates(ctx, existing, apierrors.IsNotFound(getErr))
 	if err != nil {
-		m.recordCertRotation(resultError)
+		m.recordCertRotation(metrics.ResultError)
 		err = fmt.Errorf("generating certificates: %w", err)
 		return nil, err
 	}
@@ -283,7 +282,7 @@ func (m *certManager) generateCertificates(
 	}
 
 	// Record successful (re)generation and refresh the expiry gauge.
-	m.recordCertRotation(resultSuccess)
+	m.recordCertRotation(metrics.ResultSuccess)
 	m.setCertExpiry(tlsCert)
 
 	return caCert, nil

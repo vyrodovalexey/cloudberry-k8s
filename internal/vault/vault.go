@@ -34,10 +34,8 @@ const (
 	vaultOpRenew  = "renew"
 	vaultOpReauth = "reauth"
 
-	// metricResultSuccess and metricResultError are the result label values used
-	// for Vault operation metrics.
-	metricResultSuccess = "success"
-	metricResultError   = "error"
+	// The result label values for Vault operation metrics are the shared
+	// metrics.ResultSuccess / metrics.ResultError constants (L-7).
 
 	// vaultTracerName is the tracer name used for Vault operation spans.
 	vaultTracerName = "vault-client"
@@ -154,9 +152,9 @@ func (v *vaultClient) recordVaultOp(operation string, start time.Time, err error
 	if v.recorder == nil {
 		return
 	}
-	result := metricResultSuccess
+	result := metrics.ResultSuccess
 	if err != nil {
-		result = metricResultError
+		result = metrics.ResultError
 	}
 	v.recorder.RecordVaultOperation(operation, result)
 	v.recorder.ObserveVaultOperationDuration(operation, time.Since(start))
@@ -387,7 +385,7 @@ func (v *vaultClient) watchRenewals(ctx context.Context, watcher *vaultapi.Lifet
 			return true
 		case renewal := <-watcher.RenewCh():
 			if v.recorder != nil {
-				v.recorder.RecordVaultOperation(vaultOpRenew, metricResultSuccess)
+				v.recorder.RecordVaultOperation(vaultOpRenew, metrics.ResultSuccess)
 			}
 			v.logger.Debug("vault token renewed",
 				"renewedAt", renewal.RenewedAt)
@@ -404,7 +402,7 @@ func (v *vaultClient) recordRenewalDone(err error) {
 	}
 	v.logger.Warn("vault token renewal stopped", "error", err)
 	if v.recorder != nil {
-		v.recorder.RecordVaultOperation(vaultOpRenew, metricResultError)
+		v.recorder.RecordVaultOperation(vaultOpRenew, metrics.ResultError)
 	}
 }
 

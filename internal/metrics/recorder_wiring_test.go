@@ -23,9 +23,18 @@ import (
 // The data-loading metrics (RecordDataLoadingRows + the four new families) now
 // have real production call sites in the controller's reconcileDataLoadingJobs
 // terminal-state handling (the DATALOAD_ROWS marker harvest and the Job-status
-// derived gauges), so RecordDataLoadingRows is no longer exempt. The allowlist
-// is intentionally empty: every Recorder method must be wired.
-var wiringAllowlist = map[string]string{}
+// derived gauges), so RecordDataLoadingRows is no longer exempt.
+//
+// The four DEV-3 methods below are TEMPORARILY exempt: registration precedes
+// emission within the same change series (DEV-4 wires the cert-rotation pair,
+// DEV-5 wires the vault-watch pair); each exemption is removed by the task
+// that adds the production call site.
+var wiringAllowlist = map[string]string{
+	"RecordCABundleInjection":   "emitted by DEV-4 (cmd/operator rotation loop)",
+	"IncCertRotationCheckError": "emitted by DEV-4 (cmd/operator rotation loop)",
+	"SetVaultWatchLastSuccess":  "emitted by DEV-5 (vault SecretWatcher)",
+	"IncVaultWatchError":        "emitted by DEV-5 (vault SecretWatcher)",
+}
 
 // collectProductionSources returns the contents of every non-test .go file in
 // the repository outside internal/metrics (the defining package, whose own

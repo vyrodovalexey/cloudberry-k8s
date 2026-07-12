@@ -101,7 +101,7 @@ func TestSecretWatcher_CheckForChanges_Span(t *testing.T) {
 		assert.Equal(t, 1, opsAfter-opsBefore,
 			"failed check must record the vault read/error metric exactly once (no double-count)")
 		assert.Equal(t, vaultOpRead, lastOp)
-		assert.Equal(t, metricResultError, lastResult)
+		assert.Equal(t, metrics.ResultError, lastResult)
 	})
 }
 
@@ -173,7 +173,7 @@ func TestRecordVaultOp_Success(t *testing.T) {
 
 	assert.Equal(t, 1, rec.ops)
 	assert.Equal(t, vaultOpWrite, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 	assert.Equal(t, 1, rec.durations)
 	assert.Positive(t, rec.lastDuration)
 }
@@ -186,7 +186,7 @@ func TestRecordVaultOp_Error(t *testing.T) {
 
 	assert.Equal(t, 1, rec.ops)
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 	assert.Equal(t, 1, rec.durations)
 }
 
@@ -233,7 +233,7 @@ func TestVaultClient_RecordsMetrics_OnRead(t *testing.T) {
 	// Auth on NewClient records one op; the read records another.
 	assert.GreaterOrEqual(t, rec.ops, 2)
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnReadError(t *testing.T) {
@@ -251,7 +251,7 @@ func TestVaultClient_RecordsMetrics_OnReadError(t *testing.T) {
 	require.Error(t, err)
 
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnWrite(t *testing.T) {
@@ -272,7 +272,7 @@ func TestVaultClient_RecordsMetrics_OnWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, vaultOpWrite, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnAuth(t *testing.T) {
@@ -285,5 +285,5 @@ func TestVaultClient_RecordsMetrics_OnAuth(t *testing.T) {
 	// Token auth succeeds during NewClient and records an auth op.
 	assert.GreaterOrEqual(t, rec.ops, 1)
 	assert.Equal(t, vaultOpAuth, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }

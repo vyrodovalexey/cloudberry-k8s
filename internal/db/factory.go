@@ -203,9 +203,9 @@ func (f *ClientFactory) recordConnectOutcome(
 	if f.recorder == nil {
 		return
 	}
-	result := "success"
+	result := metrics.ResultSuccess
 	if err != nil {
-		result = "error"
+		result = metrics.ResultError
 	}
 	f.recorder.RecordDBConnect(cluster.Name, cluster.Namespace, result, time.Since(start))
 }

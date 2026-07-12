@@ -55,12 +55,9 @@ const (
 	RoleClaimSourceUserinfo = "userinfo"
 )
 
-// Bounded `result` label values for the OIDC outcome counters
-// (cloudberry_oidc_discovery_total / cloudberry_oidc_userinfo_total).
-const (
-	oidcResultSuccess = "success"
-	oidcResultError   = "error"
-)
+// The bounded `result` label values for the OIDC outcome counters
+// (cloudberry_oidc_discovery_total / cloudberry_oidc_userinfo_total) are the
+// shared metrics.ResultSuccess / metrics.ResultError constants (L-7).
 
 // OIDCProvider implements Provider for OIDC/JWT authentication.
 type OIDCProvider struct {
@@ -261,17 +258,17 @@ func (p *OIDCProvider) fetchUserinfoClaims(
 	}))
 	if err != nil {
 		telemetry.SetSpanError(span, err)
-		p.recordUserinfo(oidcResultError)
+		p.recordUserinfo(metrics.ResultError)
 		return nil, fmt.Errorf("querying userinfo endpoint: %w", err)
 	}
 
 	var claims map[string]interface{}
 	if err := userinfo.Claims(&claims); err != nil {
 		telemetry.SetSpanError(span, err)
-		p.recordUserinfo(oidcResultError)
+		p.recordUserinfo(metrics.ResultError)
 		return nil, fmt.Errorf("extracting userinfo claims: %w", err)
 	}
-	p.recordUserinfo(oidcResultSuccess)
+	p.recordUserinfo(metrics.ResultSuccess)
 	return claims, nil
 }
 
@@ -533,9 +530,9 @@ func (p *LazyOIDCProvider) recordDiscovery(err error) {
 	if p.recorder == nil {
 		return
 	}
-	result := oidcResultSuccess
+	result := metrics.ResultSuccess
 	if err != nil {
-		result = oidcResultError
+		result = metrics.ResultError
 	}
 	p.recorder.RecordOIDCDiscovery(result)
 }

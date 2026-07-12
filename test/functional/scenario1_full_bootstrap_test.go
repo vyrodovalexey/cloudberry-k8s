@@ -983,9 +983,13 @@ func (m *mockMetricsRecorder) RecordMonitorResume(_, _ string)                  
 func (m *mockMetricsRecorder) RecordMonitoringDisabledAccess(_, _ string)              {}
 func (m *mockMetricsRecorder) RecordCertRotation(_, _, _ string)                       {}
 func (m *mockMetricsRecorder) SetCertExpirySeconds(_ string, _ float64)                {}
+func (m *mockMetricsRecorder) RecordCABundleInjection(_ string)                        {}
+func (m *mockMetricsRecorder) IncCertRotationCheckError(_ string)                      {}
 func (m *mockMetricsRecorder) RecordClusterCertIssuance(_, _, _ string)                {}
 func (m *mockMetricsRecorder) RecordVaultOperation(_, _ string)                        {}
 func (m *mockMetricsRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {}
+func (m *mockMetricsRecorder) SetVaultWatchLastSuccess(_ string, _ float64)            {}
+func (m *mockMetricsRecorder) IncVaultWatchError(_ string)                             {}
 func (m *mockMetricsRecorder) RecordWebhookAdmission(_, _, _ string)                   {}
 func (m *mockMetricsRecorder) RecordUpgradeOperation(_, _, _ string)                   {}
 
