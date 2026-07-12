@@ -435,7 +435,7 @@ func TestRecordRenewalDone(t *testing.T) {
 	// and without a recorder.
 	vc.recordRenewalDone(nil)
 	vc.recordRenewalDone(fmt.Errorf("renewal exploded"))
-	vc.recorder = nil
+	vc.SetRecorder(nil)
 	vc.recordRenewalDone(fmt.Errorf("renewal exploded without recorder"))
 }
 

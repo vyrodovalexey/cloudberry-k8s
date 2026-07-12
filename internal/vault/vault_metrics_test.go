@@ -144,15 +144,15 @@ func (c *capturingRecorder) ObserveVaultOperationDuration(_ string, d time.Durat
 
 func TestVaultClient_SetRecorder(t *testing.T) {
 	vc := &vaultClient{}
-	require.Nil(t, vc.recorder)
+	require.Nil(t, vc.metricsRecorder())
 
 	rec := newCapturingRecorder()
 	vc.SetRecorder(rec)
-	assert.NotNil(t, vc.recorder)
+	assert.NotNil(t, vc.metricsRecorder())
 
-	// Setting nil is also valid.
+	// Setting nil is also valid (the holder wraps a nil interface).
 	vc.SetRecorder(nil)
-	assert.Nil(t, vc.recorder)
+	assert.Nil(t, vc.metricsRecorder())
 }
 
 // ============================================================================
@@ -167,7 +167,8 @@ func TestRecordVaultOp_NilRecorder(t *testing.T) {
 
 func TestRecordVaultOp_Success(t *testing.T) {
 	rec := newCapturingRecorder()
-	vc := &vaultClient{recorder: rec}
+	vc := &vaultClient{}
+	vc.SetRecorder(rec)
 
 	vc.recordVaultOp(vaultOpWrite, time.Now().Add(-time.Millisecond), nil)
 
@@ -180,7 +181,8 @@ func TestRecordVaultOp_Success(t *testing.T) {
 
 func TestRecordVaultOp_Error(t *testing.T) {
 	rec := newCapturingRecorder()
-	vc := &vaultClient{recorder: rec}
+	vc := &vaultClient{}
+	vc.SetRecorder(rec)
 
 	vc.recordVaultOp(vaultOpRead, time.Now(), assertErr)
 
