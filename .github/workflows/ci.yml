@@ -1044,7 +1044,7 @@ jobs:
           # pxf: standalone PXF sidecar image (PXF server + CLI, no Cloudberry DB bin).
           - name: pxf
             image_key: DOCKER_IMAGE_PXF
-            skip_dirs: ''
+            skip_dirs: 'usr/local/cloudberry-pxf'
           # official-pxf: exclude the Cloudberry bin directory (same as cloudberry image).
           - name: official-pxf
             image_key: DOCKER_IMAGE_OFFICIAL_PXF

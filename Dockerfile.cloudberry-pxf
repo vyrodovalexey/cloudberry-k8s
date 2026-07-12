@@ -48,7 +48,21 @@ RUN dnf -y --allowerasing install \
         libcurl-devel openssl-devel \
         lz4 make maven ncurses net-tools openldap openssh-clients openssh-server openssl \
         pam perl procps-ng python3 readline rsync shadow-utils sqlite sqlite-libs \
-        sudo unzip which zlib zlib-devel \
+        sudo unzip which zlib zlib-devel && \
+    dnf -y upgrade \
+      gnupg2 \
+      expat \
+      gnutls \
+      krb5-libs \
+      libarchive \
+      libbrotli \
+      libcap \
+      libnghttp2 \
+      libxml2 \
+      openssl \
+      vim-minimal \
+      openssl-libs \
+      pam \
     && dnf clean all && rm -rf /var/cache/dnf
 
 # ---- Install Cloudberry RPM (provides pg_config, cloudberry-env.sh) ---------
