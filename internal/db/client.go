@@ -372,11 +372,32 @@ type Client interface {
 	MoveQueryToResourceGroup(ctx context.Context, pid int32, targetGroup string) error
 }
 
+// Scope levels accepted by SetParameter (M-2). Matching is exact and
+// case-sensitive; an empty Level is equivalent to ScopeLevelCluster.
+const (
+	// ScopeLevelCluster applies a parameter cluster-wide via ALTER SYSTEM.
+	ScopeLevelCluster = "cluster"
+	// ScopeLevelDatabase applies a parameter to one database via
+	// ALTER DATABASE ... SET; requires ParameterScope.Target.
+	ScopeLevelDatabase = "database"
+	// ScopeLevelRole applies a parameter to one role via ALTER ROLE ... SET;
+	// requires ParameterScope.Target.
+	ScopeLevelRole = "role"
+)
+
+// ErrInvalidParameterScope is returned by SetParameter when the requested
+// scope is invalid: an unknown Level, or a database/role Level without a
+// Target (M-2). Match with errors.Is.
+var ErrInvalidParameterScope = errors.New("invalid parameter scope")
+
 // ParameterScope defines the scope for parameter changes.
 type ParameterScope struct {
-	// Level is the scope level (cluster, database, role).
+	// Level is the scope level: "" or ScopeLevelCluster (cluster-wide),
+	// ScopeLevelDatabase, or ScopeLevelRole. Any other value is rejected
+	// with ErrInvalidParameterScope (exact, case-sensitive match).
 	Level string
-	// Target is the database or role name (for database/role scope).
+	// Target is the database or role name (required for the
+	// ScopeLevelDatabase / ScopeLevelRole levels).
 	Target string
 }
 
@@ -1103,27 +1124,53 @@ func (c *pgxClient) GetSegmentConfiguration(ctx context.Context) (segments []Seg
 	return segments, nil
 }
 
+// validateParameterScope validates a SetParameter scope BEFORE any SQL is
+// built or executed (M-2): "" and ScopeLevelCluster select ALTER SYSTEM;
+// ScopeLevelDatabase / ScopeLevelRole require a non-empty Target; any other
+// Level is rejected. Matching is exact and case-sensitive, so a typo like
+// "databsae" can no longer silently escalate to a cluster-wide ALTER SYSTEM.
+func validateParameterScope(scope ParameterScope) error {
+	switch scope.Level {
+	case "", ScopeLevelCluster:
+		return nil
+	case ScopeLevelDatabase, ScopeLevelRole:
+		if scope.Target == "" {
+			return fmt.Errorf("scope level %q requires a non-empty target: %w",
+				scope.Level, ErrInvalidParameterScope)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown scope level %q: %w", scope.Level, ErrInvalidParameterScope)
+	}
+}
+
 // SetParameter sets a configuration parameter at the specified scope.
 func (c *pgxClient) SetParameter(ctx context.Context, name, value string, scope ParameterScope) (err error) {
 	ctx, end := c.startOperation(ctx, "SetParameter")
 	defer func() { end(err) }()
 
+	// M-2: no Exec is issued on invalid input.
+	if err := validateParameterScope(scope); err != nil {
+		return err
+	}
+
 	var query string
 
 	switch scope.Level {
-	case "database":
+	case ScopeLevelDatabase:
 		query = fmt.Sprintf("ALTER DATABASE %s SET %s = %s",
 			pgx.Identifier{scope.Target}.Sanitize(),
 			pgx.Identifier{name}.Sanitize(),
 			quoteLiteral(value),
 		)
-	case "role":
+	case ScopeLevelRole:
 		query = fmt.Sprintf("ALTER ROLE %s SET %s = %s",
 			pgx.Identifier{scope.Target}.Sanitize(),
 			pgx.Identifier{name}.Sanitize(),
 			quoteLiteral(value),
 		)
 	default:
+		// "" or ScopeLevelCluster (validated above): cluster-wide ALTER SYSTEM.
 		query = fmt.Sprintf("ALTER SYSTEM SET %s = %s",
 			pgx.Identifier{name}.Sanitize(),
 			quoteLiteral(value),
@@ -4697,38 +4744,72 @@ func (c *pgxClient) GetQueryDetail(ctx context.Context, pid int32) (detail *Quer
 		return nil, fmt.Errorf("query not found or not accessible: %w", err)
 	}
 
-	// 2. Get locks for this PID.
+	// 2. Get locks for this PID (best-effort).
+	c.collectQueryLocks(ctx, pid, detail)
+
+	// 3. Get tables accessed (best-effort).
+	c.collectAccessedTables(ctx, pid, detail)
+
+	c.logger.Info("query detail retrieved", "pid", pid, "state", detail.State)
+	return detail, nil
+}
+
+// collectQueryLocks appends the PID's pg_locks rows to detail.Locks.
+// Best-effort (L-3): the query error, per-row scan errors and the final
+// rows.Err() are logged at Debug and swallowed — Locks may be partial and
+// the detail is still returned.
+func (c *pgxClient) collectQueryLocks(ctx context.Context, pid int32, detail *QueryDetail) {
 	lockQuery := `SELECT locktype, mode, granted, COALESCE(relation::regclass::text, '')
 		FROM pg_locks WHERE pid = $1`
 	lockRows, lockErr := c.pool.Query(ctx, lockQuery, pid)
-	if lockErr == nil {
-		defer lockRows.Close()
-		for lockRows.Next() {
-			var lock LockInfo
-			if scanErr := lockRows.Scan(&lock.LockType, &lock.Mode, &lock.Granted, &lock.Relation); scanErr == nil {
-				detail.Locks = append(detail.Locks, lock)
-			}
+	if lockErr != nil {
+		c.logger.Debug("querying locks failed; returning detail without locks",
+			"pid", pid, "error", lockErr)
+		return
+	}
+	defer lockRows.Close()
+	for lockRows.Next() {
+		var lock LockInfo
+		if scanErr := lockRows.Scan(&lock.LockType, &lock.Mode, &lock.Granted, &lock.Relation); scanErr == nil {
+			detail.Locks = append(detail.Locks, lock)
+		} else {
+			c.logger.Debug("skipping unscannable lock row", "pid", pid, "error", scanErr)
 		}
 	}
+	if rowsErr := lockRows.Err(); rowsErr != nil {
+		c.logger.Debug("lock rows iteration failed; locks may be partial",
+			"pid", pid, "error", rowsErr)
+	}
+}
 
-	// 3. Get tables accessed (tables with recent activity in the query's database).
-	// This is an approximation — we list tables that have been accessed recently.
+// collectAccessedTables appends recently accessed tables (an approximation
+// from pg_stat_user_tables) to detail.TablesAccessed. Best-effort (L-3): the
+// query error, per-row scan errors and the final rows.Err() are logged at
+// Debug and swallowed — TablesAccessed may be partial and the detail is
+// still returned.
+func (c *pgxClient) collectAccessedTables(ctx context.Context, pid int32, detail *QueryDetail) {
 	tableQuery := `SELECT schemaname || '.' || relname FROM pg_stat_user_tables
 		WHERE (seq_scan + COALESCE(idx_scan, 0)) > 0
 		ORDER BY (seq_scan + COALESCE(idx_scan, 0)) DESC LIMIT 20`
 	tableRows, tableErr := c.pool.Query(ctx, tableQuery)
-	if tableErr == nil {
-		defer tableRows.Close()
-		for tableRows.Next() {
-			var table string
-			if scanErr := tableRows.Scan(&table); scanErr == nil {
-				detail.TablesAccessed = append(detail.TablesAccessed, table)
-			}
+	if tableErr != nil {
+		c.logger.Debug("querying accessed tables failed; returning detail without tables",
+			"pid", pid, "error", tableErr)
+		return
+	}
+	defer tableRows.Close()
+	for tableRows.Next() {
+		var table string
+		if scanErr := tableRows.Scan(&table); scanErr == nil {
+			detail.TablesAccessed = append(detail.TablesAccessed, table)
+		} else {
+			c.logger.Debug("skipping unscannable table row", "pid", pid, "error", scanErr)
 		}
 	}
-
-	c.logger.Info("query detail retrieved", "pid", pid, "state", detail.State)
-	return detail, nil
+	if rowsErr := tableRows.Err(); rowsErr != nil {
+		c.logger.Debug("table rows iteration failed; accessed tables may be partial",
+			"pid", pid, "error", rowsErr)
+	}
 }
 
 // buildRoleOptions constructs the SQL options clause for role operations.
