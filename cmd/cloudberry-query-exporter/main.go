@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // version is set via ldflags at build time (e.g. -X main.version=...).
@@ -49,6 +52,10 @@ const (
 
 	// envDataSourceName is the environment variable for the PostgreSQL connection string.
 	envDataSourceName = "DATA_SOURCE_NAME"
+
+	// envLogLevel is the environment variable overriding the -log-level flag
+	// (ENV > flag, project convention — L-5/G-5).
+	envLogLevel = "LOG_LEVEL"
 
 	// defaultHistoryRetention is the default retention period for query history entries.
 	defaultHistoryRetention = 30 * 24 * time.Hour
@@ -165,6 +172,30 @@ type exporterConfig struct {
 	// collectLoop. It is not exposed as a flag; the default is kept at one
 	// hour and tests inject shorter intervals (testability seam, E-2).
 	cleanupInterval time.Duration
+	// logLevel is the effective logging level (debug|info|warn|error),
+	// resolved with ENV (LOG_LEVEL) taking priority over the -log-level flag
+	// (L-5/G-5).
+	logLevel string
+}
+
+// validLogLevels are the accepted -log-level / LOG_LEVEL values (validated
+// case-insensitively, mirroring internal/config). Immutable lookup table.
+var validLogLevels = map[string]bool{
+	"debug": true, "info": true, "warn": true, "error": true,
+}
+
+// resolveLogLevel applies the ENV-over-flag precedence and validates the
+// result case-insensitively. It returns the normalized (lower-case) level.
+func resolveLogLevel(flagValue string, getenv func(string) string) (string, error) {
+	level := flagValue
+	if env := getenv(envLogLevel); env != "" {
+		level = env
+	}
+	normalized := strings.ToLower(level)
+	if !validLogLevels[normalized] {
+		return "", fmt.Errorf("log-level must be one of debug, info, warn, error; got %q", level)
+	}
+	return normalized, nil
 }
 
 // parseRetention converts a retention string into a time.Duration.
@@ -225,6 +256,7 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 		"history-retention", "30d",
 		`Retention period for query history entries (e.g. "30d", "2w", "720h")`,
 	)
+	logLevel := fs.String("log-level", "info", "Logging level (debug, info, warn, error)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -236,6 +268,13 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 	retention, err := parseRetention(*historyRetention)
 	if err != nil {
 		return nil, fmt.Errorf("parsing history-retention: %w", err)
+	}
+
+	// LOG_LEVEL (env) beats -log-level (flag), matching the project-wide
+	// config precedence (L-5/G-5).
+	level, err := resolveLogLevel(*logLevel, getenv)
+	if err != nil {
+		return nil, err
 	}
 
 	dsn := getenv(envDataSourceName)
@@ -251,6 +290,7 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 		planCollection:     *planCollection,
 		historyRetention:   retention,
 		cleanupInterval:    defaultCleanupInterval,
+		logLevel:           level,
 	}, nil
 }
 
@@ -280,9 +320,10 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("parsing configuration: %w", err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	// Build the JSON logger at the configured level (L-5/G-5): the shared
+	// util.NewLogger parses the level, making logger.Debug diagnostics
+	// reachable in the field via -log-level/LOG_LEVEL.
+	logger := util.NewLogger(cfg.logLevel, util.LogFormatJSON, os.Stdout)
 	slog.SetDefault(logger)
 
 	logger.Info("starting cloudberry-query-exporter",
@@ -290,6 +331,7 @@ func run(ctx context.Context, args []string) error {
 		"listenAddress", cfg.listenAddress,
 		"samplingInterval", cfg.samplingInterval.String(),
 		"slowQueryThreshold", cfg.slowQueryThreshold.String(),
+		"logLevel", cfg.logLevel,
 	)
 
 	// Register Prometheus metrics.
@@ -331,13 +373,20 @@ func run(ctx context.Context, args []string) error {
 	// Start the periodic metric collection loop in a background goroutine.
 	// Single-owner model (B3): ownership of conn transfers to the loop here —
 	// the loop closes whatever connection is CURRENT on exit (it may have
-	// reconnected), and run() only joins via the done channel. loopCancel
-	// guarantees the loop is stopped (and the join below cannot hang) even on
-	// exit paths where the parent context was never canceled.
+	// reconnected), and run() only joins via the done channel.
 	loopCtx, loopCancel := context.WithCancel(ctx)
-	defer loopCancel()
 	done := make(chan struct{})
 	go collectLoop(loopCtx, cfg, conn, metrics, logger, histCollector, done)
+	// Join the collect loop on EVERY exit path (L-4): the deferred closure
+	// cancels the loop context (guaranteeing the join cannot hang even when
+	// the parent context was never canceled) and waits for the loop to close
+	// the current database connection. Registered right after the goroutine
+	// starts, so the HTTP-error return below joins too; defer LIFO order runs
+	// it after the inline shutdownServer on the clean path.
+	defer func() {
+		loopCancel()
+		<-done
+	}()
 
 	// Set up HTTP server with /metrics and /health endpoints.
 	mux := http.NewServeMux()
@@ -375,17 +424,13 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	// Graceful shutdown: use a fresh context because the parent context
-	// may already be canceled when this code runs.
+	// may already be canceled when this code runs. The collect loop is joined
+	// by the deferred closure above (all-paths join, L-4) — run() must NOT
+	// close the original conn pointer (it may be stale after a reconnect, and
+	// closing it here could double-close a conn the loop already closed).
 	if err := shutdownServer(srv, logger); err != nil {
 		return err
 	}
-
-	// Join the collect loop before declaring the exporter stopped. The loop
-	// owns the current database connection and closes it on exit — run() must
-	// NOT close the original pointer (it may be stale after a reconnect, and
-	// closing it here could double-close a conn the loop already closed).
-	loopCancel()
-	<-done
 
 	logger.Info("cloudberry-query-exporter stopped")
 	return nil
