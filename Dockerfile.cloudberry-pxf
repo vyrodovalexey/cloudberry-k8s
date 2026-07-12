@@ -206,7 +206,12 @@ LABEL org.opencontainers.image.title="cloudberry-pxf" \
 # the full curl package; allow dnf to replace it.
 RUN dnf -y --allowerasing install \
         bash ca-certificates curl gettext hostname java-11-openjdk-headless \
-        procps-ng shadow-utils which \
+        procps-ng shadow-utils which && \
+    dnf -y upgrade \
+      expat \
+      gnutls \
+      openssl  \
+      openssl-libs \
     && dnf clean all && rm -rf /var/cache/dnf
 
 # ---- Create gpadmin user (UID 1000, matching the DB image) -------------------
