@@ -63,6 +63,7 @@ type fakeManager struct {
 	cache      *fakeCache
 	restCfg    *rest.Config
 	webhookSrv ctrlwebhook.Server
+	elected    chan struct{}
 
 	addErr     error
 	healthzErr error
@@ -76,6 +77,10 @@ type fakeManager struct {
 
 // newFakeManager builds a stub manager backed by the given fake client.
 func newFakeManager(c client.Client) *fakeManager {
+	// elected starts closed, mirroring a manager without leader election
+	// (controller-runtime closes Elected() as soon as Start runs).
+	elected := make(chan struct{})
+	close(elected)
 	return &fakeManager{
 		client:  c,
 		scheme:  newTestScheme(),
@@ -83,8 +88,13 @@ func newFakeManager(c client.Client) *fakeManager {
 		restCfg: &rest.Config{Host: "http://127.0.0.1:1"},
 		// A real (unstarted) webhook server: Register works without Start.
 		webhookSrv: ctrlwebhook.NewServer(ctrlwebhook.Options{Port: 9443}),
+		elected:    elected,
 	}
 }
+
+// Elected returns the stub election channel (closed by default: the stub
+// behaves like a single-replica manager without leader election).
+func (m *fakeManager) Elected() <-chan struct{} { return m.elected }
 
 func (m *fakeManager) GetClient() client.Client    { return m.client }
 func (m *fakeManager) GetScheme() *runtime.Scheme  { return m.scheme }
