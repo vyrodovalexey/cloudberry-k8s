@@ -65,7 +65,7 @@ type failingFactory struct {
 	client    db.Client
 }
 
-func (f *failingFactory) NewClient(_ context.Context) (db.Client, error) {
+func (f *failingFactory) NewClient(_ context.Context) (DBClient, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failures > 0 {
