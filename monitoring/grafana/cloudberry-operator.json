@@ -6243,13 +6243,434 @@
       }
     },
     {
+      "id": 326,
+      "type": "timeseries",
+      "title": "CA Bundle Injection Rate",
+      "description": "Rate of webhook CA-bundle injection attempts (cloudberry_webhook_ca_bundle_injection_total{result}). Tracks startup and post-rotation re-injection outcomes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 290,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(cloudberry_webhook_ca_bundle_injection_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 327,
+      "type": "stat",
+      "title": "CA Bundle Injection Errors (1h)",
+      "description": "CA-bundle injection errors in the last hour. Non-zero indicates webhook configuration failures.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 290,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(cloudberry_webhook_ca_bundle_injection_total{instance=~\"$instance\",result=\"error\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "errors",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 328,
+      "type": "timeseries",
+      "title": "Cert Rotation Check Errors Rate",
+      "description": "Rate of failed certificate rotation checks (cloudberry_cert_rotation_check_errors_total{component}). Non-zero indicates NeedsRotation errors in the background rotation loop.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 290,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (component) (rate(cloudberry_cert_rotation_check_errors_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{component}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 329,
+      "type": "stat",
+      "title": "Cert Rotation Check Errors (1h)",
+      "description": "Certificate rotation check errors in the last hour by component.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 290,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (component) (increase(cloudberry_cert_rotation_check_errors_total{instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 330,
+      "type": "timeseries",
+      "title": "Vault Watch Staleness",
+      "description": "Staleness of watched Vault secret paths: time() - cloudberry_vault_watch_last_success_timestamp{path}. High values indicate the watcher has not successfully polled recently.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 298,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "time() - cloudberry_vault_watch_last_success_timestamp{instance=~\"$instance\"}",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 331,
+      "type": "stat",
+      "title": "Vault Watch Last Success",
+      "description": "Unix timestamp of the last successful poll of each watched Vault secret path (cloudberry_vault_watch_last_success_timestamp{path}).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 298,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "cloudberry_vault_watch_last_success_timestamp{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{path}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "dateTimeFromNow"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 332,
+      "type": "timeseries",
+      "title": "Vault Watch Errors Rate",
+      "description": "Rate of failed polls of watched Vault secret paths (cloudberry_vault_watch_errors_total{path}). Non-zero indicates the watcher is failing to read secrets.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 298,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(cloudberry_vault_watch_errors_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 333,
+      "type": "stat",
+      "title": "Vault Watch Errors (1h)",
+      "description": "Vault secret watcher poll errors in the last hour by path.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 298,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (path) (increase(cloudberry_vault_watch_errors_total{instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "{{path}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      }
+    },
+    {
       "id": 200,
       "type": "row",
       "title": "API & Lifecycle Operations",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 290,
+        "y": 306,
         "w": 24,
         "h": 1
       },
@@ -6265,7 +6686,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 291,
+        "y": 307,
         "w": 12,
         "h": 8
       },
@@ -6310,7 +6731,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 291,
+        "y": 307,
         "w": 12,
         "h": 8
       },
@@ -6360,7 +6781,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 299,
+        "y": 315,
         "w": 8,
         "h": 8
       },
@@ -6405,7 +6826,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 299,
+        "y": 315,
         "w": 8,
         "h": 8
       },
@@ -6451,7 +6872,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 307,
+        "y": 323,
         "w": 24,
         "h": 8
       },
@@ -6516,7 +6937,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 355,
+        "y": 371,
         "w": 12,
         "h": 8
       },
@@ -6562,7 +6983,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 355,
+        "y": 371,
         "w": 12,
         "h": 8
       },
@@ -6617,7 +7038,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 364,
+        "y": 380,
         "w": 24,
         "h": 8
       },
@@ -6682,7 +7103,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 372,
+        "y": 388,
         "w": 24,
         "h": 8
       },
@@ -6730,7 +7151,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 315,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -6777,7 +7198,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 363,
+        "y": 379,
         "w": 24,
         "h": 1
       },
@@ -6793,7 +7214,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 380,
+        "y": 396,
         "w": 8,
         "h": 8
       },
@@ -6838,7 +7259,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 380,
+        "y": 396,
         "w": 8,
         "h": 8
       },
@@ -6888,7 +7309,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 380,
+        "y": 396,
         "w": 8,
         "h": 8
       },
@@ -6933,7 +7354,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 388,
+        "y": 404,
         "w": 12,
         "h": 8
       },
@@ -6988,7 +7409,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 388,
+        "y": 404,
         "w": 12,
         "h": 8
       },
@@ -7032,7 +7453,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 396,
+        "y": 412,
         "w": 24,
         "h": 1
       },
@@ -7048,7 +7469,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 397,
+        "y": 413,
         "w": 6,
         "h": 8
       },
@@ -7095,7 +7516,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 397,
+        "y": 413,
         "w": 6,
         "h": 8
       },
@@ -7140,7 +7561,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 397,
+        "y": 413,
         "w": 6,
         "h": 8
       },
@@ -7185,7 +7606,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 397,
+        "y": 413,
         "w": 6,
         "h": 8
       },
@@ -7230,7 +7651,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 315,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -7275,7 +7696,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 315,
+        "y": 331,
         "w": 8,
         "h": 8
       },
@@ -7320,7 +7741,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 323,
+        "y": 339,
         "w": 8,
         "h": 8
       },
@@ -7365,7 +7786,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 323,
+        "y": 339,
         "w": 8,
         "h": 8
       },
@@ -7410,7 +7831,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 323,
+        "y": 339,
         "w": 8,
         "h": 8
       },
@@ -7455,7 +7876,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 331,
+        "y": 347,
         "w": 8,
         "h": 8
       },
@@ -7497,7 +7918,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 405,
+        "y": 421,
         "w": 24,
         "h": 1
       },
@@ -7513,7 +7934,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 406,
+        "y": 422,
         "w": 12,
         "h": 8
       },
@@ -7558,7 +7979,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 406,
+        "y": 422,
         "w": 12,
         "h": 8
       },
@@ -7604,7 +8025,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 331,
+        "y": 347,
         "w": 8,
         "h": 8
       },
@@ -7666,7 +8087,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 331,
+        "y": 347,
         "w": 8,
         "h": 8
       },
@@ -7728,7 +8149,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 339,
+        "y": 355,
         "w": 8,
         "h": 8
       },
@@ -7790,7 +8211,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 339,
+        "y": 355,
         "w": 6,
         "h": 8
       },
@@ -7839,7 +8260,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 339,
+        "y": 355,
         "w": 6,
         "h": 8
       },
@@ -7888,7 +8309,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 347,
+        "y": 363,
         "w": 6,
         "h": 8
       },
@@ -7937,7 +8358,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 347,
+        "y": 363,
         "w": 12,
         "h": 8
       },
@@ -7978,7 +8399,7 @@
       "title": "gpfdist, PXF Extension, Data-Loader & Exporter Role Setup",
       "gridPos": {
         "x": 0,
-        "y": 414,
+        "y": 430,
         "w": 24,
         "h": 1
       },
@@ -7996,7 +8417,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 415,
+        "y": 431,
         "w": 12,
         "h": 8
       },
@@ -8058,7 +8479,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },
@@ -8111,7 +8532,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },
@@ -8168,7 +8589,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 423,
+        "y": 439,
         "w": 12,
         "h": 8
       },
@@ -8260,7 +8681,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },
@@ -8313,7 +8734,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },
@@ -8370,7 +8791,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 431,
+        "y": 447,
         "w": 12,
         "h": 8
       },
@@ -8447,7 +8868,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 51,
         "w": 4,
         "h": 4
       },
@@ -8500,7 +8921,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 35,
+        "y": 51,
         "w": 4,
         "h": 4
       },
@@ -8557,7 +8978,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 439,
+        "y": 455,
         "w": 12,
         "h": 8
       },
@@ -8634,7 +9055,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 35,
+        "y": 51,
         "w": 4,
         "h": 4
       },
@@ -8687,7 +9108,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 35,
+        "y": 51,
         "w": 4,
         "h": 4
       },
@@ -8743,7 +9164,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 447,
+        "y": 463,
         "w": 8,
         "h": 8
       },
@@ -8788,7 +9209,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 447,
+        "y": 463,
         "w": 6,
         "h": 8
       },
@@ -8841,7 +9262,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 447,
+        "y": 463,
         "w": 8,
         "h": 8
       },
@@ -8886,7 +9307,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 455,
+        "y": 471,
         "w": 8,
         "h": 8
       },
@@ -8932,7 +9353,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 15,
+        "y": 31,
         "w": 4,
         "h": 4
       },
@@ -8989,7 +9410,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 15,
+        "y": 31,
         "w": 4,
         "h": 4
       },
@@ -9046,7 +9467,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 156,
+        "y": 172,
         "w": 8,
         "h": 8
       },
@@ -9119,7 +9540,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 148,
+        "y": 164,
         "w": 8,
         "h": 8
       },
@@ -9181,7 +9602,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 172,
+        "y": 188,
         "w": 12,
         "h": 8
       },
@@ -9258,7 +9679,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 172,
+        "y": 188,
         "w": 12,
         "h": 8
       },
@@ -9335,7 +9756,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 180,
+        "y": 196,
         "w": 12,
         "h": 8
       },
@@ -9381,7 +9802,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 23,
+        "y": 39,
         "w": 4,
         "h": 4
       },
@@ -9438,7 +9859,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 23,
+        "y": 39,
         "w": 4,
         "h": 4
       },
@@ -9495,7 +9916,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 23,
+        "y": 39,
         "w": 4,
         "h": 4
       },
@@ -9548,7 +9969,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 23,
+        "y": 39,
         "w": 4,
         "h": 4
       },
@@ -9605,7 +10026,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 23,
+        "y": 39,
         "w": 4,
         "h": 4
       },
@@ -9664,7 +10085,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 43,
         "w": 4,
         "h": 4
       },
@@ -9738,7 +10159,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 27,
+        "y": 43,
         "w": 4,
         "h": 4
       },
@@ -9779,7 +10200,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 27,
+        "y": 43,
         "w": 4,
         "h": 4
       },
@@ -9861,7 +10282,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 27,
+        "y": 43,
         "w": 4,
         "h": 4
       },
@@ -9901,7 +10322,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },
@@ -9963,7 +10384,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 31,
+        "y": 47,
         "w": 4,
         "h": 4
       },

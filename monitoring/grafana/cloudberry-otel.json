@@ -32,7 +32,7 @@
       "id": 2,
       "type": "traces",
       "title": "Operator Spans (service.name=cloudberry-operator)",
-      "description": "Explore operator traces from Tempo. Spans include Reconcile, handleMigrate, vault.*, EnsureCertificates, API '<METHOD> <path>', reconcileBackup, runFTSProbe, handleFailover.",
+      "description": "Explore operator traces from Tempo. Spans include Reconcile, handleMigrate, vault.*, EnsureCertificates, API '<METHOD> <path>', reconcileBackup, runFTSProbe, handleFailover, operator.certRotationCheck, exporter.collect, exporter.history.cleanup.",
       "datasource": {
         "type": "tempo",
         "uid": "tempo"
@@ -607,7 +607,7 @@
       "id": 23,
       "type": "traces",
       "title": "Controller & Operator Spans (controller.*, operator.*)",
-      "description": "Reconcile loop and operator lifecycle spans.",
+      "description": "Reconcile loop and operator lifecycle spans, operator.certRotationCheck.",
       "datasource": {
         "type": "tempo",
         "uid": "tempo"
