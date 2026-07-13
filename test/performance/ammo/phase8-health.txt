@@ -1,4 +1,4 @@
-[Host: localhost:18090]
+[Host: localhost:8190]
 [Connection: keep-alive]
 [User-Agent: yandex-tank/perftest-phase8]
 /healthz

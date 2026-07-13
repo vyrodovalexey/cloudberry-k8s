@@ -41,6 +41,20 @@ const (
 	// pxf_service_up gauge (M.1): the segment-primary pod name whose "pxf"
 	// container readiness the gauge reports.
 	labelSegmentHost = "segment_host"
+	// labelPath carries the watched Vault secret path on the vault-watch
+	// metrics. Cardinality is bounded: the values are the config-derived
+	// watched Vault paths (a small, fixed set per deployment).
+	labelPath = "path"
+)
+
+// Shared result-label values for outcome-labeled metrics (L-7). Every
+// package that records a success/error outcome references these constants so
+// the label vocabulary cannot drift between metric families.
+const (
+	// ResultSuccess is the result-label value recorded for successful operations.
+	ResultSuccess = "success"
+	// ResultError is the result-label value recorded for failed operations.
+	ResultError = "error"
 )
 
 // HONESTY: intentionally-absent PXF / gpfdist metrics.
@@ -315,6 +329,14 @@ type Recorder interface {
 	// CloudberryCluster server certificate from Vault PKI (spec.auth.ssl).
 	// result is "success" or "error".
 	RecordClusterCertIssuance(cluster, namespace, result string)
+	// RecordCABundleInjection records the outcome of a webhook CA-bundle
+	// injection attempt (startup or post-rotation re-injection, G-1).
+	// result is ResultSuccess or ResultError (bounded).
+	RecordCABundleInjection(result string)
+	// IncCertRotationCheckError increments the counter of failed certificate
+	// rotation checks (NeedsRotation errors in the rotation loop, G-1).
+	// component is a bounded enum: "webhook".
+	IncCertRotationCheckError(component string)
 	// RecordVaultOperation records a Vault operation event.
 	// operation is "auth", "read", "write", "renew" (background token
 	// renewal), or "reauth" (re-login after a 401/403 or token expiry);
@@ -322,6 +344,15 @@ type Recorder interface {
 	RecordVaultOperation(operation, result string)
 	// ObserveVaultOperationDuration records the duration of a Vault operation.
 	ObserveVaultOperationDuration(operation string, d time.Duration)
+	// SetVaultWatchLastSuccess sets the Unix timestamp (seconds) of the last
+	// successful poll of a watched Vault secret path (M-3/G-2). Staleness is
+	// derived in PromQL as time() - this gauge. path is bounded: the
+	// config-derived watched Vault paths.
+	SetVaultWatchLastSuccess(path string, ts float64)
+	// IncVaultWatchError increments the counter of failed polls of a watched
+	// Vault secret path (M-3/G-2). path is bounded: the config-derived
+	// watched Vault paths.
+	IncVaultWatchError(path string)
 	// RecordWebhookAdmission records an admission webhook decision.
 	// webhook is "validating" or "mutating"; operation is "create", "update", or "delete";
 	// result is "allowed", "denied", or "error".
@@ -540,9 +571,13 @@ type PrometheusRecorder struct {
 
 	certRotationTotal       *prometheus.CounterVec
 	certExpirySeconds       *prometheus.GaugeVec
+	certRotationCheckErrors *prometheus.CounterVec
+	caBundleInjectionTotal  *prometheus.CounterVec
 	clusterCertIssuance     *prometheus.CounterVec
 	vaultOperationsTotal    *prometheus.CounterVec
 	vaultOperationDuration  *prometheus.HistogramVec
+	vaultWatchLastSuccess   *prometheus.GaugeVec
+	vaultWatchErrorsTotal   *prometheus.CounterVec
 	webhookAdmissionTotal   *prometheus.CounterVec
 	upgradeOperationsTotal  *prometheus.CounterVec
 	rollingRestartTotal     *prometheus.CounterVec
@@ -1142,6 +1177,21 @@ func (r *PrometheusRecorder) initSecurityMetrics() {
 		Name:      "cert_expiry_seconds",
 		Help:      "Seconds until the certificate expires per component.",
 	}, []string{labelComponent})
+	// certRotationCheckErrors counts NeedsRotation failures in the background
+	// rotation loop (G-1). component is a bounded enum ("webhook").
+	r.certRotationCheckErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "cert_rotation_check_errors_total",
+		Help:      "Total number of failed certificate rotation checks per component.",
+	}, []string{labelComponent})
+	// caBundleInjectionTotal counts webhook CA-bundle injection outcomes
+	// (startup and post-rotation re-injection, G-1/H-1). result is bounded
+	// (success/error).
+	r.caBundleInjectionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "webhook_ca_bundle_injection_total",
+		Help:      "Total number of webhook CA bundle injection attempts by result.",
+	}, []string{labelResult})
 	r.clusterCertIssuance = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "cluster_cert_issuance_total",
@@ -1159,6 +1209,20 @@ func (r *PrometheusRecorder) initSecurityMetrics() {
 		Help:      "Duration of Vault operations in seconds.",
 		Buckets:   prometheus.DefBuckets,
 	}, []string{labelOperation})
+	// vaultWatchLastSuccess exposes per-watched-path poll freshness (M-3/G-2):
+	// staleness alerting uses time() - this gauge. path is bounded (the
+	// config-derived watched Vault paths).
+	r.vaultWatchLastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "vault_watch_last_success_timestamp",
+		Help:      "Unix timestamp of the last successful poll of a watched Vault secret path.",
+	}, []string{labelPath})
+	// vaultWatchErrorsTotal counts failed polls per watched path (M-3/G-2).
+	r.vaultWatchErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Name:      "vault_watch_errors_total",
+		Help:      "Total number of failed polls of watched Vault secret paths.",
+	}, []string{labelPath})
 }
 
 // initAdmissionMetrics initializes webhook admission metrics.
@@ -1410,8 +1474,10 @@ func (r *PrometheusRecorder) register(reg prometheus.Registerer) {
 		r.activeQueryExportTotal, r.guestAccessTotal,
 		r.monitorPauseTotal, r.monitorResumeTotal,
 		r.monitoringDisabledAccessTotal,
-		r.certRotationTotal, r.certExpirySeconds, r.clusterCertIssuance,
+		r.certRotationTotal, r.certExpirySeconds, r.certRotationCheckErrors,
+		r.caBundleInjectionTotal, r.clusterCertIssuance,
 		r.vaultOperationsTotal, r.vaultOperationDuration,
+		r.vaultWatchLastSuccess, r.vaultWatchErrorsTotal,
 		r.webhookAdmissionTotal,
 		r.upgradeOperationsTotal, r.rollingRestartTotal, r.pxfRestartTotal,
 		r.recoveryOperationsTotal,
@@ -1920,6 +1986,18 @@ func (r *PrometheusRecorder) RecordClusterCertIssuance(cluster, namespace, resul
 	r.clusterCertIssuance.WithLabelValues(cluster, namespace, result).Inc()
 }
 
+// RecordCABundleInjection records the outcome of a webhook CA-bundle injection
+// attempt (result is ResultSuccess or ResultError).
+func (r *PrometheusRecorder) RecordCABundleInjection(result string) {
+	r.caBundleInjectionTotal.WithLabelValues(result).Inc()
+}
+
+// IncCertRotationCheckError increments the failed rotation-check counter for a
+// component ("webhook").
+func (r *PrometheusRecorder) IncCertRotationCheckError(component string) {
+	r.certRotationCheckErrors.WithLabelValues(component).Inc()
+}
+
 // RecordVaultOperation records a Vault operation event.
 func (r *PrometheusRecorder) RecordVaultOperation(operation, result string) {
 	r.vaultOperationsTotal.WithLabelValues(operation, result).Inc()
@@ -1928,6 +2006,18 @@ func (r *PrometheusRecorder) RecordVaultOperation(operation, result string) {
 // ObserveVaultOperationDuration records the duration of a Vault operation.
 func (r *PrometheusRecorder) ObserveVaultOperationDuration(operation string, d time.Duration) {
 	r.vaultOperationDuration.WithLabelValues(operation).Observe(d.Seconds())
+}
+
+// SetVaultWatchLastSuccess sets the Unix timestamp of the last successful poll
+// of a watched Vault secret path.
+func (r *PrometheusRecorder) SetVaultWatchLastSuccess(path string, ts float64) {
+	r.vaultWatchLastSuccess.WithLabelValues(path).Set(ts)
+}
+
+// IncVaultWatchError increments the failed-poll counter for a watched Vault
+// secret path.
+func (r *PrometheusRecorder) IncVaultWatchError(path string) {
+	r.vaultWatchErrorsTotal.WithLabelValues(path).Inc()
 }
 
 // RecordWebhookAdmission records an admission webhook decision.
@@ -2362,11 +2452,23 @@ func (n *NoopRecorder) SetCertExpirySeconds(_ string, _ float64) {}
 // RecordClusterCertIssuance is a no-op implementation for testing.
 func (n *NoopRecorder) RecordClusterCertIssuance(_, _, _ string) {}
 
+// RecordCABundleInjection is a no-op implementation for testing.
+func (n *NoopRecorder) RecordCABundleInjection(_ string) {}
+
+// IncCertRotationCheckError is a no-op implementation for testing.
+func (n *NoopRecorder) IncCertRotationCheckError(_ string) {}
+
 // RecordVaultOperation is a no-op implementation for testing.
 func (n *NoopRecorder) RecordVaultOperation(_, _ string) {}
 
 // ObserveVaultOperationDuration is a no-op implementation for testing.
 func (n *NoopRecorder) ObserveVaultOperationDuration(_ string, _ time.Duration) {}
+
+// SetVaultWatchLastSuccess is a no-op implementation for testing.
+func (n *NoopRecorder) SetVaultWatchLastSuccess(_ string, _ float64) {}
+
+// IncVaultWatchError is a no-op implementation for testing.
+func (n *NoopRecorder) IncVaultWatchError(_ string) {}
 
 // RecordWebhookAdmission is a no-op implementation for testing.
 func (n *NoopRecorder) RecordWebhookAdmission(_, _, _ string) {}

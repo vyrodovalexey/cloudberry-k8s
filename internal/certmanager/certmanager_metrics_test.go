@@ -83,19 +83,19 @@ func TestCertSource(t *testing.T) {
 func TestRecordCertRotation_NilRecorder(t *testing.T) {
 	m := &certManager{config: Config{CertSource: CertSourceSelfSigned}}
 	// No recorder: must be a no-op and not panic.
-	m.recordCertRotation(resultSuccess)
+	m.recordCertRotation(metrics.ResultSuccess)
 }
 
 func TestRecordCertRotation_RecordsMetric(t *testing.T) {
 	rec := newCapturingRecorder()
 	m := &certManager{config: Config{CertSource: CertSourceVaultPKI}, recorder: rec}
 
-	m.recordCertRotation(resultError)
+	m.recordCertRotation(metrics.ResultError)
 
 	assert.Equal(t, 1, rec.rotations)
 	assert.Equal(t, certComponent, rec.lastComponent)
 	assert.Equal(t, CertSourceVaultPKI, rec.lastSource)
-	assert.Equal(t, resultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 }
 
 // ============================================================================
@@ -136,7 +136,7 @@ func TestSetCertExpiry_ValidCert(t *testing.T) {
 	rec := newCapturingRecorder()
 	m := &certManager{recorder: rec}
 
-	_, tlsCert, _, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
+	_, _, tlsCert, _, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
 	require.NoError(t, err)
 
 	m.setCertExpiry(tlsCert)
@@ -164,7 +164,7 @@ func TestEnsureCertificates_RecordsMetrics_SelfSigned(t *testing.T) {
 	// A successful rotation was recorded for the self-signed source.
 	assert.Equal(t, 1, rec.rotations)
 	assert.Equal(t, CertSourceSelfSigned, rec.lastSource)
-	assert.Equal(t, resultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 	// The expiry gauge was refreshed from the freshly generated cert.
 	assert.Equal(t, 1, rec.expirySets)
 	assert.Positive(t, rec.expirySeconds)
@@ -177,9 +177,9 @@ func TestEnsureCertificates_RecordsMetrics_VaultPKI(t *testing.T) {
 	cfg.CertSource = CertSourceVaultPKI
 
 	// Use a self-signed cert as the vault-issued cert so setCertExpiry can parse it.
-	_, tlsCert, tlsKey, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
+	_, _, tlsCert, tlsKey, err := generateSelfSignedCert([]string{"test.svc"}, 365*24*time.Hour)
 	require.NoError(t, err)
-	caCert, _, _, err := generateSelfSignedCert([]string{"ca"}, 365*24*time.Hour)
+	caCert, _, _, _, err := generateSelfSignedCert([]string{"ca"}, 365*24*time.Hour)
 	require.NoError(t, err)
 
 	mockVault := &mockVaultClient{
@@ -200,7 +200,7 @@ func TestEnsureCertificates_RecordsMetrics_VaultPKI(t *testing.T) {
 
 	assert.Equal(t, 1, rec.rotations)
 	assert.Equal(t, CertSourceVaultPKI, rec.lastSource)
-	assert.Equal(t, resultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 	// vault-issued cert is a valid parseable cert, so expiry is set.
 	assert.Equal(t, 1, rec.expirySets)
 	assert.Positive(t, rec.expirySeconds)
@@ -224,14 +224,14 @@ func TestEnsureCertificates_RecordsErrorMetric(t *testing.T) {
 	// An error rotation metric was recorded.
 	assert.Equal(t, 1, rec.rotations)
 	assert.Equal(t, CertSourceVaultPKI, rec.lastSource)
-	assert.Equal(t, resultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 }
 
 func TestEnsureCertificates_ExistingValid_RefreshesExpiry(t *testing.T) {
 	scheme := newTestScheme()
 	cfg := newTestConfig()
 
-	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+	caCert, _, tlsCert, tlsKey, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc", "test-webhook.test-ns.svc.cluster.local"},
 		365*24*time.Hour,
 	)

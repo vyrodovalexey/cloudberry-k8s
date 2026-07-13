@@ -200,7 +200,7 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 The operator manages TLS certificates for its admission webhooks. Two certificate sources are supported:
 
-**Self-signed (default):** The operator generates an ECDSA P-256 CA and server certificate on startup. Certificates are stored in a Kubernetes Secret and automatically rotated when 2/3 of their lifetime has elapsed. No external dependencies are required.
+**Self-signed (default):** The operator generates an ECDSA P-256 CA and server certificate on startup. Certificates — including the CA private key (`ca.key`) — are stored in a Kubernetes Secret and automatically rotated when 2/3 of their lifetime has elapsed. Rotations **reuse the persisted CA** (renewing only the server certificate) while the CA remains valid, so the injected CA bundle stays stable across rotations; legacy Secrets without `ca.key` fall back to full regeneration. No external dependencies are required.
 
 **Vault PKI:** The operator issues certificates from Vault's PKI secrets engine. Configure the mount path and role:
 
@@ -213,7 +213,7 @@ webhook:
     role: cloudberry-operator
 ```
 
-The operator injects the CA bundle into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` at runtime. To use a static CA bundle instead (e.g., for externally managed certificates), set `webhook.caBundle` to the base64-encoded CA certificate.
+The operator injects the CA bundle into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` at startup **and re-injects it after every certificate rotation** (rotation runs on the elected leader only, on a jittered ~12 h interval; a failed injection is retried on every subsequent rotation check). To use a static CA bundle instead (e.g., for externally managed certificates), set `webhook.caBundle` to the base64-encoded CA certificate.
 
 The deployment template automatically:
 - Sets `CLOUDBERRY_WEBHOOK_CERT_SOURCE`, `CLOUDBERRY_WEBHOOK_CERT_SECRET_NAME`, and `CLOUDBERRY_WEBHOOK_SERVICE_NAME` environment variables
@@ -468,7 +468,7 @@ The deployment template automatically:
 - Mounts the certificate Secret at `/tmp/k8s-webhook-server/serving-certs`
 - Exposes the webhook port (default `9443`)
 - Creates a dedicated webhook Service
-- Injects the CA bundle into `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` at runtime
+- Injects the CA bundle into `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` at startup and after every certificate rotation
 
 ## Monitoring Integration
 
@@ -511,9 +511,22 @@ The operator exposes metrics at `/metrics` on port 8080, including:
 - REST API server (`cloudberry_api_requests_total`/`_duration_seconds`/`_in_flight`, `cloudberry_api_rate_limit_rejections_total` — all labelled by route template)
 - Database client (`cloudberry_db_connect_*`, `cloudberry_db_query_duration_seconds`, `cloudberry_db_pool_acquired/idle/max_conns`)
 - Idle daemon and sessions (`cloudberry_idle_daemon_up`, `cloudberry_idle_scan_failures_total`, `cloudberry_session_terminations_total`)
-- Security and lifecycle (`cloudberry_cert_rotation_total`, `cloudberry_cluster_cert_issuance_total`, `cloudberry_vault_operations_total` incl. `renew`/`reauth`, `cloudberry_backup_on_delete_total`, `cloudberry_scale_phase_duration_seconds`)
+- Security and lifecycle (`cloudberry_cert_rotation_total`, `cloudberry_cluster_cert_issuance_total`, `cloudberry_webhook_ca_bundle_injection_total`, `cloudberry_cert_rotation_check_errors_total`, `cloudberry_vault_operations_total` incl. `renew`/`reauth`, `cloudberry_vault_watch_last_success_timestamp` / `cloudberry_vault_watch_errors_total` per watched Vault path, `cloudberry_backup_on_delete_total`, `cloudberry_scale_phase_duration_seconds`)
 
 Pre-built Grafana dashboards are available in the `monitoring/grafana/` directory (operator, exporters, node-metrics, and OTel dashboards). The test monitoring stack charts (vmagent, vector, otel-collector, node-exporter) live under `test/monitoring/`.
+
+### Query Exporter Sidecar Environment Variables
+
+The `cloudberry-query-exporter` sidecar (deployed by the operator onto the coordinator pod when `spec.queryMonitoring` is enabled on a `CloudberryCluster`) is configured with flags rendered from `spec.queryMonitoring` (listen address `:9188`, sampling interval, slow-query threshold, plan collection, history retention). In addition, the exporter binary recognizes the following environment variables — each **overrides** its matching command-line flag (the project-wide ENV > flag precedence):
+
+| Env Variable | Matching Flag | Default | Description |
+|--------------|---------------|---------|-------------|
+| `DATA_SOURCE_NAME` | — | — | PostgreSQL connection string. The operator sets this from the `<cluster>-exporter-credentials` Secret; when unset the exporter starts in degraded mode and retries |
+| `LOG_LEVEL` | `--log-level` | `info` | JSON log level: `debug`, `info`, `warn`, `error` (case-insensitive; invalid values fail startup) |
+| `TELEMETRY_ENABLED` | `--telemetry-enabled` | `false` | Enable OTLP trace export (`exporter.collect` / `exporter.history.cleanup` spans under `service.name=cloudberry-query-exporter`). Disabled by default; must parse as a boolean when set |
+| `OTLP_ENDPOINT` | `--otlp-endpoint` | `""` | OTLP collector endpoint for trace export (gRPC) |
+
+The operator-rendered sidecar sets only `DATA_SOURCE_NAME`; the logging/tracing variables keep their defaults (`info`, tracing off) and are available for custom deployments of the `cloudberry-query-exporter` image.
 
 ### Distributed Tracing (OpenTelemetry)
 
@@ -555,7 +568,7 @@ The operator includes the following security hardening measures:
 - **Port validation**: CRD types validate port values are in the range 1–65535
 - **Rate limiting**: Per-IP token bucket rate limiting on API endpoints, plus inter-table delay for rebalance operations
 - **Context cancellation**: Database propagation operations check for context cancellation between operations
-- **Webhook CA bundle retry**: CA bundle injection uses exponential backoff for transient API server errors
+- **Webhook CA bundle retry**: CA bundle injection uses exponential backoff for transient API server errors, runs at startup **and after every certificate rotation**, and re-attempts a failed injection on every rotation check (observable via `cloudberry_webhook_ca_bundle_injection_total`)
 - **Error aggregation**: Sub-component reconciliation uses `errors.Join` to report all errors
 
 ## CRDs

@@ -131,6 +131,8 @@ This guide covers day-to-day operations for managing Cloudberry Database cluster
   - [Checking Exporter Health](#checking-exporter-health)
   - [Exporter Types](#exporter-types)
   - [Exporter Health Metrics](#exporter-health-metrics)
+  - [cloudberry-query-exporter Self-Observability Metrics](#cloudberry-query-exporter-self-observability-metrics)
+  - [cloudberry-query-exporter Configuration](#cloudberry-query-exporter-configuration)
 - [Resource Group Management](#resource-group-management)
   - [Creating a Resource Group](#creating-a-resource-group)
   - [Listing Resource Groups](#listing-resource-groups)
@@ -1043,6 +1045,22 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario76-sched
 > **Scheduled-backup target database.** `gpbackup` hard-requires `--dbname` and the CRD declares no per-schedule database field, so scheduled (CronJob) backups target the **coordinator maintenance database (`postgres`)** by default; the `CBDB_DATABASE` env on the CronJob container mirrors the rendered `--dbname`. On-demand backups are stricter: `POST /clusters/{name}/backups` **requires** a non-empty `databases` array (`400 INVALID_REQUEST` otherwise), so user-facing requests are always explicit.
 
 > **Near-future schedule for testing.** The sample CR ships the production schedule `0 2 * * *` (daily at 02:00). The live test (`test/e2e/scripts/scenario76-scheduled-backup.sh`) overrides it to `*/2 * * * *` via `kubectl patch --type=merge` so the CronJob fires within ~2 minutes; the operator then reconciles the CronJob's schedule accordingly.
+
+> **Cron day-field semantics (behavior change).** The operator's cron parser
+> (`internal/cron` — used for `nextScheduleTime` computation and webhook
+> schedule validation) follows the Vixie-cron **star rule**, the same rule
+> robfig/cron (the Kubernetes CronJob engine) implements: the day-of-month and
+> day-of-week fields are *unrestricted* only when their raw text starts with
+> `*` (`*` or `*/n`). When **both** day fields are restricted, a time matches
+> if **either** matches (OR); otherwise both must match. An explicit full
+> range such as `1-31` (day-of-month) or `0-6` (day-of-week) is therefore
+> **restricted** even though it covers every value — so a schedule like
+> `0 0 1-31 * 1` fires **every day** (day 1–31 OR Monday), not Mondays only.
+> This matches what the CronJob controller actually executes; earlier operator
+> versions treated explicit full ranges as unrestricted, so their predicted
+> next-run times could disagree with the real firing times. Prefer `*` over an
+> explicit full range unless you want the OR semantics. Day-of-week `7` is
+> accepted as Sunday (equivalent to `0`).
 
 **Status populated after a successful backup.** After the backup Job succeeds, the operator populates `status.backup`:
 
@@ -2396,6 +2414,25 @@ spec:
         statement_mem: "1GB"
 ```
 
+> **Parameter scope validation.** The database client validates the parameter
+> scope **before any SQL is built or executed**. The accepted scope levels are
+> exactly (case-sensitive):
+>
+> | Level | SQL applied | Target |
+> |-------|-------------|--------|
+> | `""` or `cluster` (`db.ScopeLevelCluster`) | `ALTER SYSTEM SET …` (cluster-wide) | ignored |
+> | `database` (`db.ScopeLevelDatabase`) | `ALTER DATABASE <target> SET …` | **required** (database name) |
+> | `role` (`db.ScopeLevelRole`) | `ALTER ROLE <target> SET …` | **required** (role name) |
+>
+> Any other level — or a `database`/`role` scope without a target — is
+> rejected with the sentinel error `db.ErrInvalidParameterScope` (match with
+> `errors.Is`) and **no statement is executed**. Previously an unknown level
+> silently fell through to a cluster-wide `ALTER SYSTEM`, so a scope typo
+> could escalate a per-database change to the whole cluster. The declarative
+> paths above always build valid scopes (`databaseParameters`/`roleParameters`
+> supply the target from the map key); the validation protects programmatic
+> users of the Go `db.Client`.
+
 ### Hot-Reload vs Rolling Restart
 
 The operator automatically classifies parameter changes into two categories:
@@ -3091,7 +3128,7 @@ Vault PKI issues certificates with the following fields:
 | `issuing_ca` | PEM-encoded CA certificate |
 | `serial_number` | Certificate serial number |
 
-**Certificate rotation**: Certificates are automatically rotated when 2/3 of their lifetime has elapsed. The rotation check runs every 12 hours. After rotation, the new CA bundle is injected into the webhook configurations.
+**Certificate rotation**: Certificates are automatically rotated when 2/3 of their lifetime has elapsed. The rotation check runs on a jittered ~12-hour interval on the elected leader only. After **every** rotation, the returned CA bundle is re-injected into the webhook configurations (with retry; a failed injection is re-attempted on every subsequent check), and when the issuing CA itself changed while the previous CA is still valid, a **union old+new bundle** is injected to cover the Secret-propagation window. Outcomes are observable via `cloudberry_webhook_ca_bundle_injection_total{result}` and `cloudberry_cert_rotation_check_errors_total{component="webhook"}`.
 
 > **Note**: `webhook.certSource: vault-pki` only governs the operator's own admission **webhook** certificate. The cluster TLS Secret referenced by `auth.ssl.certSecret` is either **auto-issued by the operator** (see below) or a `kubernetes.io/tls`/generic Secret that you create yourself — see [Issuing the cluster TLS Secret from Vault PKI](#issuing-the-cluster-tls-secret-from-vault-pki).
 
@@ -3314,7 +3351,7 @@ The server certificate includes the following SANs:
 - `{service}.{namespace}.svc`
 - `{service}.{namespace}.svc.cluster.local`
 
-**Automatic rotation**: Certificates are checked for rotation every 12 hours and automatically rotated when 2/3 of their lifetime has elapsed. After rotation, the new CA bundle is re-injected into both validating and mutating webhook configurations.
+**Automatic rotation**: Certificates are checked for rotation on a jittered ~12-hour interval (leader-only in multi-replica deployments) and automatically rotated when 2/3 of their lifetime has elapsed. The self-signed CA private key is persisted in the cert Secret (`ca.key`), so a rotation **reuses the CA and renews only the server certificate** while the CA remains valid — the CA bundle stays byte-identical across rotations. After every rotation the CA bundle is re-injected into both validating and mutating webhook configurations (with retry; a failed injection is re-attempted on every subsequent rotation check).
 
 **Helm auto-generation**: When using the Helm chart, the following values are auto-generated if left empty:
 - `certSecretName`: `{release}-webhook-certs`
@@ -5094,6 +5131,22 @@ The `cloudberry-query-exporter` sidecar exposes its own per-collector scrape hea
 
 > **Cardinality note**: the unbounded `usename` label was **removed** from `cbexporter_queries_total` / `cbexporter_queries_slow_total` to bound the metric series count.
 
+### cloudberry-query-exporter Configuration
+
+The exporter binary is configured with flags; a matching environment variable
+**overrides** its flag (the project-wide precedence). The operator-rendered
+sidecar sets the collection flags from `spec.queryMonitoring` (listen address,
+sampling interval, slow-query threshold, plan collection, history retention)
+and `DATA_SOURCE_NAME` from the exporter credentials Secret; the
+logging/tracing knobs below default to `info`/disabled:
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--log-level` | `LOG_LEVEL` | `info` | JSON log level: `debug`, `info`, `warn`, `error` (case-insensitive). Invalid values fail startup with a clear error |
+| `--telemetry-enabled` | `TELEMETRY_ENABLED` | `false` | Enable OTLP trace export (`exporter.collect` / `exporter.history.cleanup` spans under `service.name=cloudberry-query-exporter`). Disabled by default — behavior is unchanged unless enabled |
+| `--otlp-endpoint` | `OTLP_ENDPOINT` | `""` | OTLP collector endpoint for trace export (gRPC) |
+| — | `DATA_SOURCE_NAME` | — | PostgreSQL connection string (set by the operator from the `<cluster>-exporter-credentials` Secret; the exporter starts degraded and retries when unset) |
+
 ## Resource Group Management
 
 Resource groups allow you to control how database resources (CPU, memory, concurrency) are allocated across different workloads and roles. You can create resource groups with specific limits, assign database roles to them, and manage their lifecycle through the CLI or REST API.
@@ -6405,8 +6458,9 @@ When OpenTelemetry tracing is enabled, the operator creates spans across its imp
 - **Admission webhooks** — `webhook.validate` and `webhook.mutate` spans with the admission operation and a `webhook.allowed` attribute.
 - **Idle daemon** — `idle.scan` per scan cycle, with `idle.reconnect` span events on reconnect attempts.
 - **Migration** — `handleMigrate` with `migrate.validate` and `migrate.create` child spans.
-- **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`, and `vault.watch.check` (the `SecretWatcher.checkForChanges` read — span-only, error status on a read failure; the vault read/error metric is already emitted by `ReadSecret`, so there is no double-count).
-- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning), `certmanager.issueVaultPKICert` (the Vault PKI cert-issuance call, error status on failure), and `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`).
+- **Vault operations** — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`, and `vault.watch.check` (the `SecretWatcher.checkForChanges` read — error status on a read failure; the vault read/error metric is already emitted by `ReadSecret`, so there is no double-count on `cloudberry_vault_operations_total` — the watcher records the dedicated per-path `cloudberry_vault_watch_*` metrics instead).
+- **Certificate management** — `EnsureCertificates` (webhook TLS provisioning), `certmanager.issueVaultPKICert` (the Vault PKI cert-issuance call, error status on failure), the `operator.*` startup spans (`operator.setupWebhookCerts`, `operator.injectCABundle`), and `operator.certRotationCheck` — one span per background rotation tick with `needs_rotation`/`rotated` attributes and error status on check/rotate/inject failures.
+- **Query exporter** (separate binary; disabled by default) — with `--telemetry-enabled`/`TELEMETRY_ENABLED` set, the `cloudberry-query-exporter` sidecar emits its own spans under `service.name=cloudberry-query-exporter`: `exporter.collect` per collection cycle (error status when the cycle ends without a live database connection) and `exporter.history.cleanup` per retention-cleanup tick. No statement text is attached to spans.
 
 **Error recording on spans:**
 
@@ -6819,6 +6873,62 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 > operator emits the correct DDL; the missing piece is the source-specific
 > `Writable` schema class.
 > Prefer `hdfs:text`/`parquet`/`avro` for a deterministic write **and** read.
+
+#### Verified PXF external-table LOCATION syntax
+
+The following `LOCATION` patterns are the live-verified round-trip syntax
+(source of truth: `test/cases/phase7f_external_tables.sql`, run against the
+acceptance cluster) for the seven profiles. S3 locations start with the bucket
+(`s3-datalake` is an `s3`-type PXF server pointing at MinIO with path-style
+access); HDFS locations are absolute HDFS paths against the `hadoop-cluster`
+server. `*:text` uses `FORMAT 'TEXT'`; `*:parquet`/`*:avro`/`SequenceFile` use
+`FORMAT 'CUSTOM'` with `pxfwritable_export` (write) / `pxfwritable_import`
+(read) — no explicit schema needed for parquet/avro (PXF derives it from the
+column definitions):
+
+```sql
+-- s3:text (writable + readable pair over the same location)
+CREATE WRITABLE EXTERNAL TABLE wext_s3_text (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://cloudberry-data/phase7f/s3_text?PROFILE=s3:text&SERVER=s3-datalake')
+  FORMAT 'TEXT' (delimiter ',');
+CREATE EXTERNAL TABLE rext_s3_text (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://cloudberry-data/phase7f/s3_text?PROFILE=s3:text&SERVER=s3-datalake')
+  FORMAT 'TEXT' (delimiter ',');
+
+-- s3:parquet / s3:avro (same shape; swap the PROFILE and path)
+CREATE WRITABLE EXTERNAL TABLE wext_s3_parquet (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://cloudberry-data/phase7f/s3_parquet?PROFILE=s3:parquet&SERVER=s3-datalake')
+  FORMAT 'CUSTOM' (formatter='pxfwritable_export');
+CREATE EXTERNAL TABLE rext_s3_parquet (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://cloudberry-data/phase7f/s3_parquet?PROFILE=s3:parquet&SERVER=s3-datalake')
+  FORMAT 'CUSTOM' (formatter='pxfwritable_import');
+
+-- hdfs:text / hdfs:parquet / hdfs:avro (leading HDFS path instead of a bucket)
+CREATE WRITABLE EXTERNAL TABLE wext_hdfs_text (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://phase7f/hdfs_text?PROFILE=hdfs:text&SERVER=hadoop-cluster')
+  FORMAT 'TEXT' (delimiter ',');
+
+-- hdfs:SequenceFile — REQUIRES a DATA-SCHEMA Java Writable class (see below)
+CREATE WRITABLE EXTERNAL TABLE wext_hdfs_seq (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://phase7f/hdfs_sequencefile?PROFILE=hdfs:SequenceFile&SERVER=hadoop-cluster&DATA-SCHEMA=Phase7fRecord')
+  FORMAT 'CUSTOM' (formatter='pxfwritable_export');
+CREATE EXTERNAL TABLE rext_hdfs_seq (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://phase7f/hdfs_sequencefile?PROFILE=hdfs:SequenceFile&SERVER=hadoop-cluster&DATA-SCHEMA=Phase7fRecord')
+  FORMAT 'CUSTOM' (formatter='pxfwritable_import');
+```
+
+> **`DATA-SCHEMA` caveat (SequenceFile round-trip).** `hdfs:SequenceFile` is
+> the one profile whose round-trip needs an extra artifact: the
+> `DATA-SCHEMA=<JavaClass>` LOCATION option names a custom Java `Writable`
+> class describing the record schema, and for the **read** leg the compiled
+> class must be present on the PXF sidecar classpath on every segment primary
+> (the acceptance suite ships `test/cases/Phase7fRecord.java`, compiled for
+> Java 11 and dropped into `/pxf-base/lib`). Writes can succeed without the
+> deployed class, but reads then fail with PXF's "No fields in record".
+> Two further gotchas from the live runs: directory names must not start with
+> `_` or `.` (Hadoop's hidden-file filter silently skips them, making the
+> readable table report "Input path does not exist"), and the writable/readable
+> pair must reference the **same** location string.
 
 > **FDW-based loading path (Scenario 103).** Set **`pxfJob.loadMethod: fdw`** (the
 > default `external-table` keeps the transient external-table path) to load via a
@@ -7282,6 +7392,10 @@ The operator records dedicated metrics for webhook/certificate rotation, Vault o
 | `cloudberry_upgrade_operations_total` | Counter | `cluster`, `namespace`, `result` | Cluster upgrade operations. `result` is `started`, `completed`, `rollback`, or `failed` |
 | `cloudberry_rolling_restart_total` | Counter | `cluster`, `namespace`, `result` | Rolling restart operations. `result` is `started`, `completed`, or `failed` |
 | `cloudberry_recovery_operations_total` | Counter | `cluster`, `namespace`, `type`, `result` | Recovery operations. `type` is `incremental`, `full`, `differential`, or `standby-activation`; `result` is `started`, `completed`, `failed`, or `noop`. Segment recovery is not implemented yet, so segment recovery requests record `result="noop"`; standby activation records real `completed`/`failed` outcomes |
+| `cloudberry_webhook_ca_bundle_injection_total` | Counter | `result` | Webhook CA-bundle injection attempts into the `Validating`/`MutatingWebhookConfiguration` — at startup **and** after every certificate rotation. Recorded once per attempt (after retries) at both call sites; `result` is `success` or `error` |
+| `cloudberry_cert_rotation_check_errors_total` | Counter | `component` | Failed `NeedsRotation` checks in the background certificate rotation loop (previously log-only). `component` is a bounded enum, currently `webhook` |
+| `cloudberry_vault_watch_last_success_timestamp` | Gauge | `path` | Unix timestamp of the last successful poll of a watched Vault secret path. Derive staleness in PromQL as `time() - <gauge>`. A successful poll of an empty secret still counts as a success. `path` is bounded (the config-derived watched Vault paths) |
+| `cloudberry_vault_watch_errors_total` | Counter | `path` | Failed polls of a watched Vault secret path. The underlying read is still metered by `cloudberry_vault_operations_total{operation="read"}` (no double count) — this counter adds the per-path dimension |
 
 **Useful PromQL queries:**
 
@@ -7291,6 +7405,13 @@ cloudberry_cert_expiry_seconds < 604800
 
 # Vault operation error rate (last 5 minutes)
 sum(rate(cloudberry_vault_operations_total{result="error"}[5m])) by (operation)
+
+# Vault secret-watch staleness (alert when a watched path hasn't polled
+# successfully for more than 5 minutes)
+time() - cloudberry_vault_watch_last_success_timestamp > 300
+
+# CA bundle injection failures (last hour) — should be 0
+increase(cloudberry_webhook_ca_bundle_injection_total{result="error"}[1h])
 
 # Denied admission decisions over the last hour
 increase(cloudberry_webhook_admission_total{result="denied"}[1h])
@@ -7335,7 +7456,7 @@ The operator reads its telemetry configuration from `TelemetryConfig` (config ke
 | `telemetry.sampling-rate` | `CLOUDBERRY_TELEMETRY_SAMPLING_RATE` | `1.0` | Trace sampling rate (0.0–1.0) |
 | `telemetry.service-name` | `CLOUDBERRY_TELEMETRY_SERVICE_NAME` | `cloudberry-operator` | `service.name` resource attribute applied to all spans |
 
-Traces include spans for reconciliation loops (all four controllers), controller sub-operations (`controller.*`), API requests (`<METHOD> <route template>` server spans), database operations (`db.*` — both the mutating/DDL and the read-path methods), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret` / `vault.watch.check`), certificate provisioning (`EnsureCertificates` / `certmanager.issueVaultPKICert`), and operator startup (`operator.*`). All span names are low-cardinality. See [Telemetry Spans](#telemetry-spans) for the full list.
+Traces include spans for reconciliation loops (all four controllers), controller sub-operations (`controller.*`), API requests (`<METHOD> <route template>` server spans), database operations (`db.*` — both the mutating/DDL and the read-path methods), authentication (`auth.*`), admission webhooks (`webhook.*`), the idle daemon (`idle.*`), migrations (`handleMigrate` → `migrate.validate` / `migrate.create`), Vault operations (`vault.authenticate` / `vault.ReadSecret` / `vault.WriteSecret` / `vault.watch.check`), certificate provisioning and rotation (`EnsureCertificates` / `certmanager.issueVaultPKICert` / `operator.certRotationCheck`), and operator startup (`operator.*`). All span names are low-cardinality. See [Telemetry Spans](#telemetry-spans) for the full list.
 
 The **Cloudberry OTEL / Telemetry** Grafana dashboard (`monitoring/grafana/cloudberry-otel.json`) visualizes Tempo traces for `service.name=cloudberry-operator`, otel-collector health (`otelcol_*` metrics), and operator logs from VictoriaLogs. It is one of four dashboards (operator, exporters, node-metrics, otel) published by `test/monitoring/scripts/publish-dashboards.sh`.
 
@@ -7738,6 +7859,20 @@ The operator includes a `SecretWatcher` that periodically polls Vault secrets an
 5. The callback updates the corresponding Kubernetes Secret and reloads affected components (e.g., database password rotation, TLS certificate reload)
 
 This mechanism ensures that secrets updated directly in Vault are automatically propagated to the cluster without manual intervention.
+
+**Watch staleness observability.** The watcher records two per-path metrics:
+`cloudberry_vault_watch_last_success_timestamp{path}` (Unix timestamp of the
+last successful poll — a successful poll of an empty secret still counts) and
+`cloudberry_vault_watch_errors_total{path}` (failed polls). Alert on watch
+staleness with `time() - cloudberry_vault_watch_last_success_timestamp > <threshold>`.
+The underlying reads remain metered on `cloudberry_vault_operations_total`
+(no double count); each poll is also traced by the `vault.watch.check` span.
+
+> **Disabled-Vault behavior.** When Vault integration is disabled, the no-op
+> client's `ReadSecret` returns the typed error `vault.ErrVaultDisabled`
+> (match with `errors.Is`) instead of an empty success — a caller can never
+> mistake "Vault off" for an existing-but-empty secret. Code paths gated on
+> `IsEnabled()` are unaffected.
 
 #### Connection Retry Configuration
 

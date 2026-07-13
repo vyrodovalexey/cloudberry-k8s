@@ -101,7 +101,7 @@ func TestSecretWatcher_CheckForChanges_Span(t *testing.T) {
 		assert.Equal(t, 1, opsAfter-opsBefore,
 			"failed check must record the vault read/error metric exactly once (no double-count)")
 		assert.Equal(t, vaultOpRead, lastOp)
-		assert.Equal(t, metricResultError, lastResult)
+		assert.Equal(t, metrics.ResultError, lastResult)
 	})
 }
 
@@ -144,15 +144,15 @@ func (c *capturingRecorder) ObserveVaultOperationDuration(_ string, d time.Durat
 
 func TestVaultClient_SetRecorder(t *testing.T) {
 	vc := &vaultClient{}
-	require.Nil(t, vc.recorder)
+	require.Nil(t, vc.metricsRecorder())
 
 	rec := newCapturingRecorder()
 	vc.SetRecorder(rec)
-	assert.NotNil(t, vc.recorder)
+	assert.NotNil(t, vc.metricsRecorder())
 
-	// Setting nil is also valid.
+	// Setting nil is also valid (the holder wraps a nil interface).
 	vc.SetRecorder(nil)
-	assert.Nil(t, vc.recorder)
+	assert.Nil(t, vc.metricsRecorder())
 }
 
 // ============================================================================
@@ -167,26 +167,28 @@ func TestRecordVaultOp_NilRecorder(t *testing.T) {
 
 func TestRecordVaultOp_Success(t *testing.T) {
 	rec := newCapturingRecorder()
-	vc := &vaultClient{recorder: rec}
+	vc := &vaultClient{}
+	vc.SetRecorder(rec)
 
 	vc.recordVaultOp(vaultOpWrite, time.Now().Add(-time.Millisecond), nil)
 
 	assert.Equal(t, 1, rec.ops)
 	assert.Equal(t, vaultOpWrite, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 	assert.Equal(t, 1, rec.durations)
 	assert.Positive(t, rec.lastDuration)
 }
 
 func TestRecordVaultOp_Error(t *testing.T) {
 	rec := newCapturingRecorder()
-	vc := &vaultClient{recorder: rec}
+	vc := &vaultClient{}
+	vc.SetRecorder(rec)
 
 	vc.recordVaultOp(vaultOpRead, time.Now(), assertErr)
 
 	assert.Equal(t, 1, rec.ops)
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 	assert.Equal(t, 1, rec.durations)
 }
 
@@ -233,7 +235,7 @@ func TestVaultClient_RecordsMetrics_OnRead(t *testing.T) {
 	// Auth on NewClient records one op; the read records another.
 	assert.GreaterOrEqual(t, rec.ops, 2)
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnReadError(t *testing.T) {
@@ -251,7 +253,7 @@ func TestVaultClient_RecordsMetrics_OnReadError(t *testing.T) {
 	require.Error(t, err)
 
 	assert.Equal(t, vaultOpRead, rec.lastOp)
-	assert.Equal(t, metricResultError, rec.lastResult)
+	assert.Equal(t, metrics.ResultError, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnWrite(t *testing.T) {
@@ -272,7 +274,7 @@ func TestVaultClient_RecordsMetrics_OnWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, vaultOpWrite, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }
 
 func TestVaultClient_RecordsMetrics_OnAuth(t *testing.T) {
@@ -285,5 +287,5 @@ func TestVaultClient_RecordsMetrics_OnAuth(t *testing.T) {
 	// Token auth succeeds during NewClient and records an auth op.
 	assert.GreaterOrEqual(t, rec.ops, 1)
 	assert.Equal(t, vaultOpAuth, rec.lastOp)
-	assert.Equal(t, metricResultSuccess, rec.lastResult)
+	assert.Equal(t, metrics.ResultSuccess, rec.lastResult)
 }

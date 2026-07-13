@@ -1301,7 +1301,7 @@ func TestDaemon_HealthCheck_PingFailure_TriggersReconnect(t *testing.T) {
 
 	reconnectCalled := false
 	factory := &mockDBClientFactory{
-		newClientFn: func(_ context.Context) (db.Client, error) {
+		newClientFn: func(_ context.Context) (DBClient, error) {
 			reconnectCalled = true
 			return &mockDBClient{}, nil
 		},
@@ -1343,7 +1343,7 @@ func TestDaemon_AttemptReconnect_Success(t *testing.T) {
 	newClient := &mockDBClient{}
 
 	factory := &mockDBClientFactory{
-		newClientFn: func(_ context.Context) (db.Client, error) {
+		newClientFn: func(_ context.Context) (DBClient, error) {
 			return newClient, nil
 		},
 	}
@@ -1371,7 +1371,7 @@ func TestDaemon_AttemptReconnect_Success(t *testing.T) {
 
 func TestDaemon_AttemptReconnect_AllRetrysFail(t *testing.T) {
 	factory := &mockDBClientFactory{
-		newClientFn: func(_ context.Context) (db.Client, error) {
+		newClientFn: func(_ context.Context) (DBClient, error) {
 			return nil, fmt.Errorf("connection refused")
 		},
 	}
@@ -1400,7 +1400,7 @@ func TestDaemon_AttemptReconnect_AllRetrysFail(t *testing.T) {
 
 func TestDaemon_AttemptReconnect_ContextCanceled(t *testing.T) {
 	factory := &mockDBClientFactory{
-		newClientFn: func(_ context.Context) (db.Client, error) {
+		newClientFn: func(_ context.Context) (DBClient, error) {
 			return nil, fmt.Errorf("connection refused")
 		},
 	}
@@ -1435,7 +1435,7 @@ func TestDaemon_ScanLoop_ConsecutiveFailuresTriggersReconnect(t *testing.T) {
 
 	reconnectCalled := false
 	factory := &mockDBClientFactory{
-		newClientFn: func(_ context.Context) (db.Client, error) {
+		newClientFn: func(_ context.Context) (DBClient, error) {
 			reconnectCalled = true
 			return &mockDBClient{}, nil
 		},
@@ -1583,10 +1583,10 @@ func TestDaemon_New_NegativeScanInterval(t *testing.T) {
 
 // mockDBClientFactory implements idle.DBClientFactory for testing.
 type mockDBClientFactory struct {
-	newClientFn func(ctx context.Context) (db.Client, error)
+	newClientFn func(ctx context.Context) (DBClient, error)
 }
 
-func (f *mockDBClientFactory) NewClient(ctx context.Context) (db.Client, error) {
+func (f *mockDBClientFactory) NewClient(ctx context.Context) (DBClient, error) {
 	if f.newClientFn != nil {
 		return f.newClientFn(ctx)
 	}

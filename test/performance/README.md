@@ -556,7 +556,7 @@ Full test report: `.yandextank/perftest_20260519_140320/REPORT.md`
 
 ## Performance Test Results (2026-07-10)
 
-The latest performance test was run on 2026-07-10 against a live operator deployment with the `acceptance-test` cluster (HA, 2+2 mirrored segments, TLS, PXF, Standby). The test used `hey` (Go HTTP load generator) on macOS with `kubectl port-forward` to the operator pod. Yandex Tank Docker was not used because `--net=host` is a no-op on macOS.
+This performance test was run on 2026-07-10 against a live operator deployment with the `acceptance-test` cluster (HA, 2+2 mirrored segments, TLS, PXF, Standby). The test used `hey` (Go HTTP load generator) on macOS with `kubectl port-forward` to the operator pod. Yandex Tank Docker was not used because `--net=host` is a no-op on macOS.
 
 ### Summary
 
@@ -600,6 +600,25 @@ The latest performance test was run on 2026-07-10 against a live operator deploy
 | C5 | 1,233 | Subquery with comparison |
 
 Full test report: `results/2026-07-10-perftest-report.md`
+
+## Performance Test Results (2026-07-12)
+
+The latest performance test was run on 2026-07-12 after the certificate-rotation and metrics changes (rotation loop with CA-bundle re-injection, 4 new metric families), against a live operator deployment with the `acceptance-test` cluster (HA, 2+2 mirrored segments, TLS, PXF, Standby; `mydb` ~214 MB). Same methodology as 2026-07-10 (`hey` on macOS + `kubectl port-forward`).
+
+### Summary
+
+| Category | Result |
+|----------|--------|
+| Health Endpoints | **Excellent** — p50=2.7ms, p99=10.2ms, 0% errors at 100 RPS |
+| API Endpoints | **Good** — p50=145-149ms (bcrypt-dominated ~110ms), 0 errors within rate limit |
+| Rate Limiter | **Verified** — 10 req/min enforced exactly (first 429 at request #12), 429s at ~38ms |
+| DB Queries | **Baseline** — COUNT 428ms avg, GROUP BY 468ms, window 533ms (200k-row dataset) |
+| Stability | **Excellent** — zero 5xx across all steps up to 100 RPS, cluster healthy throughout |
+| Regression vs 2026-07-10 | **None** — every health-latency delta within ±5%; goroutines stable (184→183, no leak from the rotation loop); memory +3.5 MB over 17,752 requests (normal GC variance) |
+
+**All SLOs pass.** The new cert-rotation loop and metric families had zero measurable performance impact (`cloudberry_cert_expiry_seconds{component="webhook"}` ≈ 365 days; no rotation fired during the test window).
+
+Full test report: `results/2026-07-12-perftest-report.md`
 
 ## API Endpoints Under Test
 

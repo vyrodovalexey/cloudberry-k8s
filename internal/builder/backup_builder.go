@@ -833,12 +833,19 @@ func coordinatorExecScript(cluster *cbv1alpha1.CloudberryCluster, tool string, a
 	// pod's own env via the positional args).
 	var innerTool strings.Builder
 	innerTool.WriteString("set -euo pipefail\n")
-	innerTool.WriteString("export COORD_CFG=$(printf '%s' \"$1\" | base64 -d)\n")
-	innerTool.WriteString("export PGHOST=$(printf '%s' \"$2\" | base64 -d)\n")
-	innerTool.WriteString("export PGPORT=$(printf '%s' \"$3\" | base64 -d)\n")
-	innerTool.WriteString("export PGUSER=$(printf '%s' \"$4\" | base64 -d)\n")
-	innerTool.WriteString("export PGDATABASE=$(printf '%s' \"$5\" | base64 -d)\n")
-	innerTool.WriteString("export PGPASSWORD=$(printf '%s' \"$6\" | base64 -d)\n")
+	// SC2155 (L-8): `export VAR=$(cmd)` masks cmd's exit status — under
+	// `set -euo pipefail` a failing base64 -d would be silently swallowed and
+	// the tool would proceed with an empty value (e.g. empty PGPASSWORD →
+	// confusing downstream auth failure). Splitting declaration and export
+	// makes a decode failure abort the Job step loudly instead. The PATH
+	// export below uses parameter expansion (no command substitution), so it
+	// is not affected.
+	innerTool.WriteString("COORD_CFG=$(printf '%s' \"$1\" | base64 -d); export COORD_CFG\n")
+	innerTool.WriteString("PGHOST=$(printf '%s' \"$2\" | base64 -d); export PGHOST\n")
+	innerTool.WriteString("PGPORT=$(printf '%s' \"$3\" | base64 -d); export PGPORT\n")
+	innerTool.WriteString("PGUSER=$(printf '%s' \"$4\" | base64 -d); export PGUSER\n")
+	innerTool.WriteString("PGDATABASE=$(printf '%s' \"$5\" | base64 -d); export PGDATABASE\n")
+	innerTool.WriteString("PGPASSWORD=$(printf '%s' \"$6\" | base64 -d); export PGPASSWORD\n")
 	// `ls` of the (possibly missing) env file returns non-zero; with `pipefail`
 	// + `set -e` that would abort, so guard with `|| true`. Likewise the
 	// `[ -n ] && source` test must not abort when GPENV is empty.

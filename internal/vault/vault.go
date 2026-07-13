@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -34,10 +35,8 @@ const (
 	vaultOpRenew  = "renew"
 	vaultOpReauth = "reauth"
 
-	// metricResultSuccess and metricResultError are the result label values used
-	// for Vault operation metrics.
-	metricResultSuccess = "success"
-	metricResultError   = "error"
+	// The result label values for Vault operation metrics are the shared
+	// metrics.ResultSuccess / metrics.ResultError constants (L-7).
 
 	// vaultTracerName is the tracer name used for Vault operation spans.
 	vaultTracerName = "vault-client"
@@ -54,9 +53,17 @@ var newLifetimeWatcher = func(c *vaultapi.Client, secret *vaultapi.Secret) (*vau
 	return c.NewLifetimeWatcher(&vaultapi.LifetimeWatcherInput{Secret: secret})
 }
 
+// ErrVaultDisabled is returned by read operations when Vault integration is
+// disabled (the no-op client). Callers should keep guarding with IsEnabled();
+// the typed error protects any unguarded caller from mistaking a nil map for
+// an existing-but-empty secret (L-9). Match with errors.Is.
+var ErrVaultDisabled = errors.New("vault: integration disabled")
+
 // Client defines the interface for Vault operations.
 type Client interface {
-	// ReadSecret reads a secret from Vault KV v2.
+	// ReadSecret reads a secret from Vault KV v2. Implementations return
+	// ErrVaultDisabled when Vault integration is disabled; callers keep the
+	// IsEnabled() guard.
 	ReadSecret(ctx context.Context, path string) (map[string]interface{}, error)
 	// WriteSecret writes a secret to Vault KV v2.
 	WriteSecret(ctx context.Context, path string, data map[string]interface{}) error
@@ -110,15 +117,24 @@ type Config struct {
 	RetryOpts util.RetryOptions
 }
 
+// recorderHolder wraps the optional metrics recorder so it can be stored in
+// an atomic.Pointer (which needs a concrete type). The wrapped interface may
+// itself be nil (SetRecorder(nil) semantics).
+type recorderHolder struct {
+	r metrics.Recorder
+}
+
 // vaultClient implements Client using the Vault API.
 type vaultClient struct {
 	client    *vaultapi.Client
 	config    Config
 	retryOpts util.RetryOptions
 	logger    *slog.Logger
-	// recorder records Vault operation metrics. It is optional and may be nil;
-	// all metric recording is guarded with a nil check.
-	recorder metrics.Recorder
+	// recorder holds the optional metrics recorder. It is an atomic pointer
+	// because the background lifetime-watcher goroutine reads it while
+	// SetRecorder may store concurrently (L-1); a nil pointer or a nil
+	// wrapped interface disables recording.
+	recorder atomic.Pointer[recorderHolder]
 
 	// authMu serializes (re-)authentication so concurrent operations that hit
 	// an expired/revoked token trigger exactly ONE re-login (no stampede).
@@ -143,23 +159,36 @@ type vaultClient struct {
 }
 
 // SetRecorder sets an optional metrics recorder for Vault operations.
-// It is safe to leave the recorder unset (nil); metric recording is then a no-op.
+// It is safe to leave the recorder unset (nil); metric recording is then a
+// no-op. Safe for concurrent use: the recorder is stored atomically, so the
+// background token lifetime watcher may read it while it is being set (L-1).
 func (v *vaultClient) SetRecorder(recorder metrics.Recorder) {
-	v.recorder = recorder
+	v.recorder.Store(&recorderHolder{r: recorder})
+}
+
+// metricsRecorder returns the configured metrics recorder, or nil when none
+// (or a nil recorder) was set. Safe for concurrent use.
+func (v *vaultClient) metricsRecorder() metrics.Recorder {
+	holder := v.recorder.Load()
+	if holder == nil {
+		return nil
+	}
+	return holder.r
 }
 
 // recordVaultOp records a Vault operation metric and its duration when a recorder
 // is configured. It is nil-safe.
 func (v *vaultClient) recordVaultOp(operation string, start time.Time, err error) {
-	if v.recorder == nil {
+	rec := v.metricsRecorder()
+	if rec == nil {
 		return
 	}
-	result := metricResultSuccess
+	result := metrics.ResultSuccess
 	if err != nil {
-		result = metricResultError
+		result = metrics.ResultError
 	}
-	v.recorder.RecordVaultOperation(operation, result)
-	v.recorder.ObserveVaultOperationDuration(operation, time.Since(start))
+	rec.RecordVaultOperation(operation, result)
+	rec.ObserveVaultOperationDuration(operation, time.Since(start))
 }
 
 // NewClient creates a new Vault client.
@@ -211,7 +240,7 @@ func NewClient(
 		logger:    logger,
 	}
 	if len(recorder) > 0 {
-		vc.recorder = recorder[0]
+		vc.SetRecorder(recorder[0])
 	}
 
 	if err := vc.authenticate(ctx); err != nil {
@@ -386,8 +415,8 @@ func (v *vaultClient) watchRenewals(ctx context.Context, watcher *vaultapi.Lifet
 			v.recordRenewalDone(err)
 			return true
 		case renewal := <-watcher.RenewCh():
-			if v.recorder != nil {
-				v.recorder.RecordVaultOperation(vaultOpRenew, metricResultSuccess)
+			if rec := v.metricsRecorder(); rec != nil {
+				rec.RecordVaultOperation(vaultOpRenew, metrics.ResultSuccess)
 			}
 			v.logger.Debug("vault token renewed",
 				"renewedAt", renewal.RenewedAt)
@@ -403,8 +432,8 @@ func (v *vaultClient) recordRenewalDone(err error) {
 		return
 	}
 	v.logger.Warn("vault token renewal stopped", "error", err)
-	if v.recorder != nil {
-		v.recorder.RecordVaultOperation(vaultOpRenew, metricResultError)
+	if rec := v.metricsRecorder(); rec != nil {
+		rec.RecordVaultOperation(vaultOpRenew, metrics.ResultError)
 	}
 }
 
@@ -730,9 +759,11 @@ func (v *vaultClient) IsEnabled() bool {
 // noopClient is a no-op Vault client used when Vault is disabled.
 type noopClient struct{}
 
-// ReadSecret returns nil when Vault is disabled.
+// ReadSecret returns ErrVaultDisabled when Vault is disabled (L-9): a typed
+// error instead of a silent (nil, nil) so an unguarded caller cannot mistake
+// the result for an existing-but-empty secret.
 func (n *noopClient) ReadSecret(_ context.Context, _ string) (map[string]interface{}, error) {
-	return nil, nil
+	return nil, ErrVaultDisabled
 }
 
 // WriteSecret is a no-op when Vault is disabled.
@@ -760,23 +791,34 @@ type SecretWatcher struct {
 	lastHash string
 	logger   *slog.Logger
 	onChange func(data map[string]interface{})
+	// recorder is the optional metrics recorder for per-path watch staleness
+	// signals (M-3/G-2). It may be nil (nil-safe).
+	recorder metrics.Recorder
 }
 
-// NewSecretWatcher creates a new SecretWatcher.
+// NewSecretWatcher creates a new SecretWatcher. An optional metrics recorder
+// may be supplied (variadic, matching the certmanager.New pattern) to emit
+// the per-path watch staleness metrics (M-3/G-2); when omitted (or nil),
+// metric recording is a no-op.
 func NewSecretWatcher(
 	client Client,
 	path string,
 	interval time.Duration,
 	onChange func(data map[string]interface{}),
 	logger *slog.Logger,
+	recorder ...metrics.Recorder,
 ) *SecretWatcher {
-	return &SecretWatcher{
+	w := &SecretWatcher{
 		client:   client,
 		path:     path,
 		interval: interval,
 		logger:   logger,
 		onChange: onChange,
 	}
+	if len(recorder) > 0 {
+		w.recorder = recorder[0]
+	}
+	return w
 }
 
 // Watch starts watching for secret changes. It blocks until the context is canceled.
@@ -801,14 +843,25 @@ func (w *SecretWatcher) checkForChanges(ctx context.Context) {
 
 	data, err := w.client.ReadSecret(ctx, w.path)
 	if err != nil {
-		// ReadSecret already meters the read/error outcome; do NOT record another
-		// vault operation here (it would double-count). Only mark the span.
+		// ReadSecret already meters the read/error outcome on
+		// vault_operations_total; do NOT record another vault operation here
+		// (it would double-count). Only mark the span and the dedicated
+		// per-path watch error counter (M-3/G-2).
 		telemetry.SetSpanError(span, err)
+		if w.recorder != nil {
+			w.recorder.IncVaultWatchError(w.path)
+		}
 		w.logger.Warn("failed to read vault secret for change detection",
 			"path", w.path,
 			"error", err,
 		)
 		return
+	}
+
+	// Record the last-success timestamp BEFORE the data==nil early return: a
+	// successful poll of an empty secret is still a successful poll (M-3/G-2).
+	if w.recorder != nil {
+		w.recorder.SetVaultWatchLastSuccess(w.path, float64(time.Now().Unix()))
 	}
 
 	if data == nil {

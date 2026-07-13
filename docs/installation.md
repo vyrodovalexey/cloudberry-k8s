@@ -333,9 +333,10 @@ helm install cloudberry-operator deploy/helm/cloudberry-operator \
 
 The operator:
 1. Generates an ECDSA P-256 CA key pair and a server certificate
-2. Stores both in a Kubernetes Secret (`{release}-webhook-certs`)
+2. Stores them in a Kubernetes Secret (`{release}-webhook-certs`) — including the CA private key (`ca.key`), which enables later leaf-only renewals
 3. Injects the CA bundle into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration`
-4. Checks for rotation every 12 hours and rotates when 2/3 of the certificate lifetime has elapsed
+4. Checks for rotation on a jittered ~12-hour interval (leader-only in multi-replica deployments) and rotates when 2/3 of the certificate lifetime has elapsed. Rotations **reuse the persisted CA** and renew only the server (leaf) certificate while the CA remains valid, so the injected CA bundle stays stable; when the CA itself is replaced, the operator injects a union old+new bundle for the propagation window
+5. **Re-injects the CA bundle after every rotation** (and retries a failed injection on every subsequent rotation check), so admission keeps working across rotations without an operator restart
 
 #### Vault PKI Certificates (Recommended for Production)
 
@@ -575,7 +576,7 @@ For production deployments using Vault PKI for webhook certificates, follow thes
    kubectl get validatingwebhookconfigurations -o jsonpath='{.items[*].webhooks[*].clientConfig.caBundle}' | head -c 50
    ```
 
-The operator automatically rotates certificates when 2/3 of their lifetime has elapsed. CA bundle injection into webhook configurations uses retry with exponential backoff to handle transient API server errors during operator startup. See [Webhook Certificate Configuration](#webhook-certificate-configuration) for additional options.
+The operator automatically rotates certificates when 2/3 of their lifetime has elapsed and **re-injects the CA bundle into the webhook configurations after every rotation** (not only at startup). CA bundle injection uses retry with exponential backoff to handle transient API server errors, and an injection that exhausts its retry budget is re-attempted on every subsequent rotation check; outcomes are observable via `cloudberry_webhook_ca_bundle_injection_total{result}` and `cloudberry_cert_rotation_check_errors_total{component="webhook"}`. See [Webhook Certificate Configuration](#webhook-certificate-configuration) for additional options.
 
 #### Vault PKI with Kubernetes Auth (End-to-End)
 
@@ -680,7 +681,7 @@ The flow is:
    vault read auth/kubernetes/role/cloudberry-operator
    ```
 
-The operator authenticates to Vault on startup and on each certificate rotation, recording `cloudberry_vault_operations_total` and `cloudberry_cert_rotation_total` metrics for observability. See [Monitoring and Observability](user-guide.md#monitoring-and-observability) for the metric reference.
+The operator authenticates to Vault on startup and on each certificate rotation, recording `cloudberry_vault_operations_total` and `cloudberry_cert_rotation_total` metrics for observability; rotation health is additionally covered by `cloudberry_cert_rotation_check_errors_total` and the post-rotation CA-bundle re-injection counter `cloudberry_webhook_ca_bundle_injection_total`. See [Monitoring and Observability](user-guide.md#monitoring-and-observability) for the metric reference.
 
 #### Vault PKI with Kubernetes Auth on Docker Desktop (Make targets)
 

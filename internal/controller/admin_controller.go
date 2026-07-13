@@ -1409,7 +1409,9 @@ func (f *idleDaemonDBClientFactory) setCluster(cluster *cbv1alpha1.CloudberryClu
 }
 
 // NewClient creates a new database client using the current cluster snapshot.
-func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (db.Client, error) {
+// The returned full db.Client value is exposed through the idle daemon's
+// narrow idle.DBClient capability surface (M-1 step 2).
+func (f *idleDaemonDBClientFactory) NewClient(ctx context.Context) (idle.DBClient, error) {
 	f.mu.RLock()
 	cluster := f.cluster
 	f.mu.RUnlock()

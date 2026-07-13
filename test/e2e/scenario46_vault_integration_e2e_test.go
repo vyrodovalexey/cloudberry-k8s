@@ -399,9 +399,11 @@ func (s *Scenario46VaultE2ESuite) TestE2E_Scenario46_DisabledVaultClient() {
 	require.NotNil(s.T(), client)
 	assert.False(s.T(), client.IsEnabled())
 
-	// No-op operations should succeed silently.
+	// Reads on the no-op client surface the typed ErrVaultDisabled (L-9);
+	// writes remain silent no-ops.
 	data, readErr := client.ReadSecret(s.ctx, "secret/data/any")
-	assert.NoError(s.T(), readErr)
+	assert.ErrorIs(s.T(), readErr, vault.ErrVaultDisabled,
+		"disabled vault ReadSecret must return typed ErrVaultDisabled")
 	assert.Nil(s.T(), data)
 
 	writeErr := client.WriteSecret(s.ctx, "secret/data/any", map[string]interface{}{"k": "v"})

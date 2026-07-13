@@ -1049,7 +1049,7 @@ The operator exposes metrics at the `/metrics` endpoint. All custom metrics are 
 - **Auth metrics**: `cloudberry_auth_attempts_total` (labels `method`, `result`). A missing or malformed `Authorization` header increments `{method="unknown",result="failure"}`
 - **Workload metrics**: `cloudberry_resource_group_cpu_usage`, `cloudberry_resource_group_memory_usage`, `cloudberry_slow_queries_total`, `cloudberry_workload_rule_actions_total`
 - **Query history metrics**: `cloudberry_query_history_total`, `cloudberry_query_history_retention_deleted_total`, `cloudberry_query_history_size_bytes`
-- **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`)
+- **Security metrics**: `cloudberry_cert_rotation_total` (labels `component`, `source`, `result`), `cloudberry_cert_expiry_seconds` (label `component`), `cloudberry_vault_operations_total` (labels `operation`, `result`), `cloudberry_vault_operation_duration_seconds` (histogram, label `operation`), `cloudberry_webhook_ca_bundle_injection_total` (label `result` ∈ {`success`, `error`} — webhook CA-bundle injection attempts, recorded once per attempt after retries at BOTH call sites: startup and post-rotation re-injection), `cloudberry_cert_rotation_check_errors_total` (label `component`, currently `webhook` — failed `NeedsRotation` checks in the rotation loop, previously log-only), `cloudberry_vault_watch_last_success_timestamp` (gauge, label `path` — Unix timestamp of the last successful poll of a watched Vault secret path; staleness is derived in PromQL as `time() - <gauge>`; a successful poll of an empty secret still counts), and `cloudberry_vault_watch_errors_total` (label `path` — failed polls per watched path; `ReadSecret` still meters the underlying vault operation, so `cloudberry_vault_operations_total` is not double-counted). The `path` label is bounded: the config-derived watched Vault paths
 - **Admission metrics**: `cloudberry_webhook_admission_total` (labels `webhook`, `operation`, `result`). Internal (non-validation) admission failures record the distinct `result=error` instead of being bucketed as `denied`
 - **Lifecycle metrics**: `cloudberry_upgrade_operations_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `rollback`, `failed`}), `cloudberry_rolling_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `completed`, `failed`}), `cloudberry_pxf_restart_total` (labels `cluster`, `namespace`, `result` ∈ {`started`, `failed`}; emitted by the operator-driven `pxf restart` handler — see [PXF lifecycle](#pod-deletion-recovery)), `cloudberry_pxf_status` (labels `cluster`, `namespace`; 0=Stopped/1=Running/2=Error from real segment-primary `pxf` `ContainerStatuses` readiness aggregation — emitted **only when observable**, Scenario 105), `cloudberry_pxf_extensions_installed` (labels `cluster`, `namespace`; count of installed PXF extensions from a real read-only `pg_extension` probe — emitted **only when observed**, Scenario 105), `cloudberry_pxf_servers_changed_total` (labels `cluster`, `namespace`; counter incremented on a real `<cluster>-pxf-servers` ConfigMap `Data` diff by BOTH the reconcile `emitPXFServersChanged` and the `pxf sync` `recordPXFServersChanged` — never on a no-op sync or first create, Scenario 106), `cloudberry_pxf_service_up` (labels `cluster`, `namespace`, `segment_host`; the **per-segment** disaggregation of `cloudberry_pxf_status` — `1`/`0` per observed segment-primary pod from real `pxf` `ContainerStatuses[pxf].Ready` via `util.PXFReadyByHost`; `0` on a killed segment, emitted only for observed hosts, never synthesized, Scenario 109), `cloudberry_data_loading_bytes_total` (labels `cluster`, `namespace`, `job`, `source_type`; emitted from the **real** `DATALOAD_BYTES=<n>` marker computed via `wc -c` for a **local gpload input source** — **omitted (honestly absent)** for external-table/pxf/FDW/continuous loads, never synthesized, Scenario 109), plus the **actuator request/latency passthrough** — the **real** `http_server_requests_seconds_count`/`_sum`/`_bucket` series (surfacing `cloudberry_pxf_requests_total` M.2 + `cloudberry_pxf_request_duration_seconds` M.3) scraped from the PXF Spring Boot Actuator `/actuator/prometheus` by a **dedicated vmagent `:5888` scrape job**; the request count + latency are REAL but the `server`/`profile`/`operation` labels are downgraded to the actuator-native `uri`/`method`/`status` (not honestly derivable from the URI — never fabricated, Scenario 109), `cloudberry_recovery_operations_total` (labels `cluster`, `namespace`, `type`, `result`; segment recovery records `result=noop` until implemented, standby activation records real `completed`/`failed`)
 - **REST API server metrics**: `cloudberry_api_requests_total` (labels `route`, `method`, `code`), `cloudberry_api_request_duration_seconds` (labels `route`, `method`), `cloudberry_api_requests_in_flight`, `cloudberry_api_rate_limit_rejections_total` (label `route`), and `cloudberry_api_rate_limit_entries` (gauge of live per-client limiter entries, sampled on every scrape; each API server registers a provider on start and unregisters it on `Close`, with multiple servers summed into one process-wide gauge). The `route` label is always the matched route **template**, never the raw path (bounded cardinality). The middleware records via `defer`, so the in-flight gauge is decremented — and the request recorded — even when a handler panics (the gauge can never leak upward)
@@ -1074,8 +1074,9 @@ Tracing is **disabled by default**. When telemetry is enabled (`telemetry.enable
 - Admission webhooks — `webhook.validate` / `webhook.mutate` spans with a `webhook.allowed` attribute
 - Idle daemon — `idle.scan` per scan cycle with `idle.reconnect` span events
 - Migrations — `handleMigrate` with `migrate.validate` / `migrate.create` child spans; the migrate span now records the **real** underlying error (no fabricated placeholder string)
-- Vault operations — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`, and `vault.watch.check` (`SecretWatcher.checkForChanges` — span-only, error status on a read failure; the vault read/error metric is already emitted by `ReadSecret`, so there is no double-count)
-- Certificate provisioning — `EnsureCertificates`, `certmanager.issueVaultPKICert` (wraps the Vault PKI `WriteSecretWithResponse` call, error status on failure), and operator startup spans `operator.setupWebhookCerts` / `operator.injectCABundle`
+- Vault operations — `vault.authenticate`, `vault.ReadSecret`, `vault.WriteSecret`, and `vault.watch.check` (`SecretWatcher.checkForChanges` — error status on a read failure; the vault read/error metric is already emitted by `ReadSecret`, so `cloudberry_vault_operations_total` is not double-counted — the watcher instead records the dedicated per-path `cloudberry_vault_watch_errors_total` / `cloudberry_vault_watch_last_success_timestamp` signals when a recorder is wired)
+- Certificate provisioning — `EnsureCertificates`, `certmanager.issueVaultPKICert` (wraps the Vault PKI `WriteSecretWithResponse` call, error status on failure), operator startup spans `operator.setupWebhookCerts` / `operator.injectCABundle`, and `operator.certRotationCheck` — one span per background rotation tick, carrying `needs_rotation`/`rotated` attributes and error status on check/rotate/inject failures, so a rotation months after startup stays diagnosable
+- Query exporter (separate binary, optional) — when the exporter's own telemetry is enabled (`--telemetry-enabled`/`TELEMETRY_ENABLED` + `--otlp-endpoint`/`OTLP_ENDPOINT`; disabled by default) it emits `exporter.collect` (one per collection cycle, error status when the cycle ends without a live DB connection) and `exporter.history.cleanup` (one per retention-cleanup tick) under `service.name=cloudberry-query-exporter`; no statement text is attached (PII-safe)
 
 **Span names are low-cardinality by design**: they come from bounded sets (route templates, method names, operation enums) — never raw URL paths, cluster names, or PIDs. High-cardinality values are carried as span attributes.
 
@@ -1574,13 +1575,15 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  Kubernetes Secret (TLS type)                         │  │
 │  │  - ca.crt   (CA certificate PEM)                      │  │
+│  │  - ca.key   (CA private key PEM — self-signed source  │  │
+│  │             only; enables leaf-only renewals)         │  │
 │  │  - tls.crt  (server certificate PEM)                  │  │
 │  │  - tls.key  (server private key PEM)                  │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                      │                                      │
 │                      ▼                                      │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  CA Bundle Injection                                  │  │
+│  │  CA Bundle Injection (startup + after EVERY rotation) │  │
 │  │  → ValidatingWebhookConfiguration.caBundle            │  │
 │  │  → MutatingWebhookConfiguration.caBundle              │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -1590,11 +1593,12 @@ The `internal/certmanager` package manages TLS certificates for the admission we
 ### Certificate Lifecycle
 
 1. **Startup**: `EnsureCertificates()` checks if a valid certificate Secret exists
-2. **Issuance**: If no Secret exists or the certificate is invalid, new certificates are generated using the configured source
-3. **Storage**: Certificates are stored in a Kubernetes Secret of type `kubernetes.io/tls`
-4. **Rotation check**: `NeedsRotation()` is called periodically (every 12 hours). Rotation triggers when **2/3 of the certificate lifetime** has elapsed
+2. **Issuance**: If no Secret exists or the certificate is invalid, new certificates are generated using the configured source. Self-signed issuance requires at least one DNS name (an empty `dnsNames` slice is rejected with an error, not a panic)
+3. **Storage**: Certificates are stored in a Kubernetes Secret of type `kubernetes.io/tls`. For the **self-signed** source the CA private key is persisted too (`ca.key`) — the same namespace-scoped Secret already holds `tls.key`, so the blast radius of a Secret compromise is unchanged, and the persisted key is what enables leaf-only renewals. Switching to `vault-pki` drops a stale `ca.key` (the Vault issuing-CA key never leaves Vault)
+4. **Rotation check**: `NeedsRotation()` is called by the background rotation loop on a **jittered interval** (12 hours + up to 10 % random jitter, so multiple replicas de-synchronize). Rotation triggers when **2/3 of the certificate lifetime** has elapsed. A missing `ca.key` is deliberately **not** a rotation trigger — legacy Secrets stay valid until the leaf hits its normal threshold, and the regeneration path then starts persisting `ca.key`
 5. **Source-mismatch detection**: Rotation is also forced when the serving certificate in the Secret was issued by a different source than the configured `webhook.certSource`. For example, if a stale self-signed certificate is present while `certSource=vault-pki` (or vice versa), the operator re-issues the certificate from the configured source immediately, rather than keeping the stale certificate until its natural expiry
-6. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources
+6. **CA reuse (self-signed leaf-only renewal)**: A rotation reuses the persisted CA and re-issues **only the serving (leaf) certificate** when ALL of the following hold: `ca.crt` and `ca.key` are present, the CA parses and is the operator's own self-signed CA, the CA is not past its own 2/3-lifetime threshold, and its remaining validity covers the full validity of the new leaf (a leaf never outlives its issuer). A reused CA keeps `ca.crt` — and therefore the injected webhook CA bundle — byte-identical across rotations; anything else falls back to full CA + leaf regeneration
+7. **CA bundle injection**: The returned CA bundle (PEM) is injected into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources — at startup **and after every rotation** (see [Certificate Rotation Loop](#cert-rotation-goroutine-tracking)). When a rotation **replaced** the CA (any source, including a Vault PKI issuing-CA change) and the previous CA is still time-valid, the injected bundle is the **union of the new and old CA**: during the kubelet Secret-propagation window the webhook pod may still serve the old leaf while the API server already trusts only the fresh bundle — the union keeps admission working through the cutover race
 
 ### Vault PKI Certificate Issuance
 
@@ -1642,7 +1646,7 @@ When Vault integration is enabled, token renewal and re-authentication are **aut
 
 ## Cert Rotation Goroutine Tracking
 
-The operator starts a background goroutine for periodic webhook certificate rotation checks. To ensure clean shutdown, the goroutine is tracked with a `sync.WaitGroup` in `cmd/operator/main.go`:
+The operator starts a background goroutine for periodic webhook certificate rotation checks (`runCertRotation` in `cmd/operator/main.go`). To ensure clean shutdown, the goroutine is tracked with a `sync.WaitGroup`:
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -1653,21 +1657,30 @@ The operator starts a background goroutine for periodic webhook certificate rota
 │    ├── var backgroundWg sync.WaitGroup                            │
 │    │                                                              │
 │    ├── backgroundWg.Add(1)                                        │
-│    ├── go startCertRotation(ctx, certManager, &backgroundWg)      │
+│    ├── go runCertRotation(ctx, cm, directClient, elected, …)      │
 │    │    └── defer backgroundWg.Done()                             │
-│    │        └── Checks NeedsRotation() every 12 hours             │
-│    │            └── Calls EnsureCertificates() when needed        │
+│    │        ├── Blocks on mgr.Elected() (leader gate)             │
+│    │        └── Every 12h + up to 10% jitter: rotateOnce()        │
+│    │            ├── Retries any PENDING CA-bundle injection       │
+│    │            ├── NeedsRotation()? → EnsureCertificates()       │
+│    │            └── Re-injects the returned CA bundle (H-1)       │
 │    │                                                              │
 │    ├── ... (start controller manager, API server, etc.)           │
 │    │                                                              │
 │    └── On shutdown signal:                                        │
-│         ├── Cancel context → goroutine exits its ticker loop      │
+│         ├── Cancel context → goroutine exits its wait loop        │
 │         └── backgroundWg.Wait() → blocks until goroutine returns  │
 │              └── Process exits cleanly                            │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 **Why this matters**: Without the WaitGroup, the operator process could exit while the cert rotation goroutine is still running, potentially leaving a half-written certificate Secret. The WaitGroup ensures the goroutine completes its current operation before the process terminates.
+
+**Leader gating**: the loop blocks on `mgr.Elected()` before doing any work, so in a multi-replica deployment only the elected leader writes cert Secrets and webhook configurations. With leader election disabled, controller-runtime closes the elected channel as soon as `mgr.Start` runs, preserving single-replica behavior (the goroutine starts before `mgr.Start` and simply blocks until election or shutdown).
+
+**Re-injection after every rotation (H-1)**: an in-place rotation re-issues the serving certificate — and, for the self-signed source, can replace the CA — so a CA bundle injected only at startup would stop validating the rotated certificate and every admission call would fail with `x509: certificate signed by unknown authority` until an operator restart. `rotateOnce` therefore captures the bundle returned by every successful rotation and re-injects it into both webhook configurations. If the injection's retry budget is exhausted, the bundle is kept as **pending** and re-attempted on every subsequent tick — once the Secret is rotated `NeedsRotation` reports false, so without the pending retry a transient API-server outage would strand the rotated CA forever.
+
+**Observability**: each tick is wrapped in an `operator.certRotationCheck` span (attributes `needs_rotation`/`rotated`, error status on failures); failed checks increment `cloudberry_cert_rotation_check_errors_total{component="webhook"}`, and every injection attempt (startup and rotation) records `cloudberry_webhook_ca_bundle_injection_total{result}`. Errors are logged, never propagated — the loop must survive transient failures and retry on later ticks.
 
 ## CLI Context Propagation for Bulk Operations
 
@@ -1758,7 +1771,7 @@ The `reconcileSubComponents()` method in the Admin Controller uses `errors.Join(
 
 ### Webhook CA Bundle Injection with Retry
 
-The webhook certificate manager uses retry with exponential backoff when injecting the CA bundle into `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources. This handles transient API server errors during operator startup when webhook configurations may not yet be available.
+The operator uses retry with exponential backoff (5 retries, 1 s–30 s, ×2, 10 % jitter) when injecting the CA bundle into the `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` resources. This handles transient API server errors during operator startup when webhook configurations may not yet be available. The same shared helper (`injectCABundleWithRetry`) also runs **after every certificate rotation** — a bundle whose injection fails even after retries is kept pending and re-attempted on every subsequent rotation tick — and both call sites record the outcome on `cloudberry_webhook_ca_bundle_injection_total{result}`, so the emission cannot diverge between startup and rotation.
 
 ### Goroutine Leak Prevention in Idle Daemon
 

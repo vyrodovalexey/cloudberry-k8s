@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/telemetry"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
 // version is set via ldflags at build time (e.g. -X main.version=...).
@@ -49,6 +53,27 @@ const (
 
 	// envDataSourceName is the environment variable for the PostgreSQL connection string.
 	envDataSourceName = "DATA_SOURCE_NAME"
+
+	// envLogLevel is the environment variable overriding the -log-level flag
+	// (ENV > flag, project convention — L-5/G-5).
+	envLogLevel = "LOG_LEVEL"
+
+	// envTelemetryEnabled and envOTLPEndpoint override the -telemetry-enabled
+	// and -otlp-endpoint flags (ENV > flag, project convention — G-3).
+	envTelemetryEnabled = "TELEMETRY_ENABLED"
+	envOTLPEndpoint     = "OTLP_ENDPOINT"
+
+	// exporterServiceName identifies this binary in exported traces; it is
+	// also the tracer name for exporter spans (G-3).
+	exporterServiceName = "cloudberry-query-exporter"
+
+	// exporterSamplingRate is the fixed trace sampling rate (the project-wide
+	// default, mirroring internal/config's telemetry.sampling-rate). Only the
+	// enabled/endpoint knobs are exposed in this pass.
+	exporterSamplingRate = 1.0
+
+	// tracerShutdownTimeout bounds the OTLP tracer shutdown on exit.
+	tracerShutdownTimeout = 5 * time.Second
 
 	// defaultHistoryRetention is the default retention period for query history entries.
 	defaultHistoryRetention = 30 * 24 * time.Hour
@@ -165,6 +190,59 @@ type exporterConfig struct {
 	// collectLoop. It is not exposed as a flag; the default is kept at one
 	// hour and tests inject shorter intervals (testability seam, E-2).
 	cleanupInterval time.Duration
+	// logLevel is the effective logging level (debug|info|warn|error),
+	// resolved with ENV (LOG_LEVEL) taking priority over the -log-level flag
+	// (L-5/G-5).
+	logLevel string
+	// telemetryEnabled turns optional OTLP tracing on (G-3); disabled by
+	// default so behavior is unchanged unless explicitly requested.
+	telemetryEnabled bool
+	// otlpEndpoint is the OTLP collector endpoint used when telemetry is
+	// enabled.
+	otlpEndpoint string
+}
+
+// validLogLevels are the accepted -log-level / LOG_LEVEL values (validated
+// case-insensitively, mirroring internal/config). Immutable lookup table.
+var validLogLevels = map[string]bool{
+	"debug": true, "info": true, "warn": true, "error": true,
+}
+
+// resolveLogLevel applies the ENV-over-flag precedence and validates the
+// result case-insensitively. It returns the normalized (lower-case) level.
+func resolveLogLevel(flagValue string, getenv func(string) string) (string, error) {
+	level := flagValue
+	if env := getenv(envLogLevel); env != "" {
+		level = env
+	}
+	normalized := strings.ToLower(level)
+	if !validLogLevels[normalized] {
+		return "", fmt.Errorf("log-level must be one of debug, info, warn, error; got %q", level)
+	}
+	return normalized, nil
+}
+
+// resolveTelemetrySettings applies the ENV-over-flag precedence for the
+// optional OTLP tracing knobs (G-3). TELEMETRY_ENABLED must parse as a
+// boolean when set; OTLP_ENDPOINT overrides the flag verbatim.
+func resolveTelemetrySettings(
+	flagEnabled bool,
+	flagEndpoint string,
+	getenv func(string) string,
+) (enabled bool, endpoint string, err error) {
+	enabled = flagEnabled
+	if env := getenv(envTelemetryEnabled); env != "" {
+		parsed, parseErr := strconv.ParseBool(env)
+		if parseErr != nil {
+			return false, "", fmt.Errorf("invalid %s value %q: %w", envTelemetryEnabled, env, parseErr)
+		}
+		enabled = parsed
+	}
+	endpoint = flagEndpoint
+	if env := getenv(envOTLPEndpoint); env != "" {
+		endpoint = env
+	}
+	return enabled, endpoint, nil
 }
 
 // parseRetention converts a retention string into a time.Duration.
@@ -225,6 +303,9 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 		"history-retention", "30d",
 		`Retention period for query history entries (e.g. "30d", "2w", "720h")`,
 	)
+	logLevel := fs.String("log-level", "info", "Logging level (debug, info, warn, error)")
+	telemetryEnabled := fs.Bool("telemetry-enabled", false, "Enable OTLP trace export")
+	otlpEndpoint := fs.String("otlp-endpoint", "", "OTLP collector endpoint for trace export")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -236,6 +317,19 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 	retention, err := parseRetention(*historyRetention)
 	if err != nil {
 		return nil, fmt.Errorf("parsing history-retention: %w", err)
+	}
+
+	// LOG_LEVEL (env) beats -log-level (flag), matching the project-wide
+	// config precedence (L-5/G-5).
+	level, err := resolveLogLevel(*logLevel, getenv)
+	if err != nil {
+		return nil, err
+	}
+
+	// TELEMETRY_ENABLED / OTLP_ENDPOINT (env) beat their flags (G-3).
+	traceEnabled, traceEndpoint, err := resolveTelemetrySettings(*telemetryEnabled, *otlpEndpoint, getenv)
+	if err != nil {
+		return nil, err
 	}
 
 	dsn := getenv(envDataSourceName)
@@ -251,6 +345,9 @@ func parseConfigFromFlagSet(fs *flag.FlagSet, args []string, getenv func(string)
 		planCollection:     *planCollection,
 		historyRetention:   retention,
 		cleanupInterval:    defaultCleanupInterval,
+		logLevel:           level,
+		telemetryEnabled:   traceEnabled,
+		otlpEndpoint:       traceEndpoint,
 	}, nil
 }
 
@@ -280,9 +377,10 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("parsing configuration: %w", err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	// Build the JSON logger at the configured level (L-5/G-5): the shared
+	// util.NewLogger parses the level, making logger.Debug diagnostics
+	// reachable in the field via -log-level/LOG_LEVEL.
+	logger := util.NewLogger(cfg.logLevel, util.LogFormatJSON, os.Stdout)
 	slog.SetDefault(logger)
 
 	logger.Info("starting cloudberry-query-exporter",
@@ -290,7 +388,14 @@ func run(ctx context.Context, args []string) error {
 		"listenAddress", cfg.listenAddress,
 		"samplingInterval", cfg.samplingInterval.String(),
 		"slowQueryThreshold", cfg.slowQueryThreshold.String(),
+		"logLevel", cfg.logLevel,
+		"telemetryEnabled", cfg.telemetryEnabled,
 	)
+
+	// Optional OTLP tracing (G-3): disabled by default, so behavior is
+	// unchanged unless -telemetry-enabled/TELEMETRY_ENABLED is set. The
+	// returned cleanup joins the tracer shutdown on all exit paths.
+	defer setupTelemetry(ctx, cfg, logger)()
 
 	// Register Prometheus metrics.
 	reg := prometheus.NewRegistry()
@@ -331,13 +436,20 @@ func run(ctx context.Context, args []string) error {
 	// Start the periodic metric collection loop in a background goroutine.
 	// Single-owner model (B3): ownership of conn transfers to the loop here —
 	// the loop closes whatever connection is CURRENT on exit (it may have
-	// reconnected), and run() only joins via the done channel. loopCancel
-	// guarantees the loop is stopped (and the join below cannot hang) even on
-	// exit paths where the parent context was never canceled.
+	// reconnected), and run() only joins via the done channel.
 	loopCtx, loopCancel := context.WithCancel(ctx)
-	defer loopCancel()
 	done := make(chan struct{})
 	go collectLoop(loopCtx, cfg, conn, metrics, logger, histCollector, done)
+	// Join the collect loop on EVERY exit path (L-4): the deferred closure
+	// cancels the loop context (guaranteeing the join cannot hang even when
+	// the parent context was never canceled) and waits for the loop to close
+	// the current database connection. Registered right after the goroutine
+	// starts, so the HTTP-error return below joins too; defer LIFO order runs
+	// it after the inline shutdownServer on the clean path.
+	defer func() {
+		loopCancel()
+		<-done
+	}()
 
 	// Set up HTTP server with /metrics and /health endpoints.
 	mux := http.NewServeMux()
@@ -375,20 +487,49 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	// Graceful shutdown: use a fresh context because the parent context
-	// may already be canceled when this code runs.
+	// may already be canceled when this code runs. The collect loop is joined
+	// by the deferred closure above (all-paths join, L-4) — run() must NOT
+	// close the original conn pointer (it may be stale after a reconnect, and
+	// closing it here could double-close a conn the loop already closed).
 	if err := shutdownServer(srv, logger); err != nil {
 		return err
 	}
 
-	// Join the collect loop before declaring the exporter stopped. The loop
-	// owns the current database connection and closes it on exit — run() must
-	// NOT close the original pointer (it may be stale after a reconnect, and
-	// closing it here could double-close a conn the loop already closed).
-	loopCancel()
-	<-done
-
 	logger.Info("cloudberry-query-exporter stopped")
 	return nil
+}
+
+// setupTelemetry initializes the optional OTLP tracer (G-3): a no-op provider
+// when telemetry is disabled, an OTLP exporter (grpc protocol, TLS on,
+// project-default sampling) otherwise. Only the enabled/endpoint knobs are
+// exposed in this pass. It returns a never-nil cleanup that shuts the tracer
+// down with a fresh bounded context (the parent context may already be
+// canceled when the cleanup runs), mirroring cmd/operator.
+func setupTelemetry(ctx context.Context, cfg *exporterConfig, logger *slog.Logger) (cleanup func()) {
+	shutdownTracer, err := telemetry.InitTracer(ctx, telemetry.Config{
+		Enabled:        cfg.telemetryEnabled,
+		OTLPEndpoint:   cfg.otlpEndpoint,
+		SamplingRate:   exporterSamplingRate,
+		ServiceName:    exporterServiceName,
+		ServiceVersion: version,
+	})
+	if err != nil {
+		logger.Warn("failed to initialize telemetry", "error", err)
+		return func() {
+			// No-op: tracer initialization failed, so there is nothing to
+			// shut down; the non-nil closure keeps the call site simple.
+		}
+	}
+	//nolint:contextcheck // fresh ctx needed; parent may be canceled
+	return func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(), tracerShutdownTimeout,
+		)
+		defer shutdownCancel()
+		if shutdownErr := shutdownTracer(shutdownCtx); shutdownErr != nil {
+			logger.Error("failed to shutdown tracer", "error", shutdownErr)
+		}
+	}
 }
 
 // handleHealth responds with HTTP 200 to indicate the exporter process is alive.
@@ -486,13 +627,55 @@ func collectLoop(
 			closeConn(currentConn, logger)
 			return
 		case <-ticker.C:
-			currentConn = collectOnce(ctx, cfg, currentConn, metrics, logger, histCollector)
+			currentConn = collectOnceTraced(ctx, cfg, currentConn, metrics, logger, histCollector)
 		case <-cleanupTicker.C:
 			if currentConn != nil {
-				histCollector.cleanupHistory(ctx, currentConn, cfg.historyRetention)
+				cleanupHistoryTraced(ctx, cfg, currentConn, histCollector)
 			}
 		}
 	}
+}
+
+// errCollectCycleDegraded marks the exporter.collect span errored when a
+// collection cycle ends without a live database connection (connection loss,
+// scrape failure, or no DSN yet).
+var errCollectCycleDegraded = errors.New("collect cycle ended without a live database connection")
+
+// collectOnceTraced wraps one collection cycle in an "exporter.collect" span
+// (G-3). collectOnce returning nil is exactly the cycle-failure condition
+// (broken/unavailable connection), so the span error status is derived from
+// it. No statement text is attached (PII-safe, matching the pgx tracer
+// policy). The span is a no-op when telemetry is disabled.
+func collectOnceTraced(
+	ctx context.Context,
+	cfg *exporterConfig,
+	conn *pgx.Conn,
+	metrics *exporterMetrics,
+	logger *slog.Logger,
+	histCollector *historyCollector,
+) *pgx.Conn {
+	ctx, span := telemetry.StartSpan(ctx, exporterServiceName, "exporter.collect")
+	defer span.End()
+	newConn := collectOnce(ctx, cfg, conn, metrics, logger, histCollector)
+	if newConn == nil {
+		telemetry.SetSpanError(span, errCollectCycleDegraded)
+	}
+	return newConn
+}
+
+// cleanupHistoryTraced wraps one retention cleanup tick in an
+// "exporter.history.cleanup" span (G-3). cleanupHistory is best-effort and
+// reports failures via its own logging/metrics, so the span carries no error
+// status. The span is a no-op when telemetry is disabled.
+func cleanupHistoryTraced(
+	ctx context.Context,
+	cfg *exporterConfig,
+	conn *pgx.Conn,
+	histCollector *historyCollector,
+) {
+	ctx, span := telemetry.StartSpan(ctx, exporterServiceName, "exporter.history.cleanup")
+	defer span.End()
+	histCollector.cleanupHistory(ctx, conn, cfg.historyRetention)
 }
 
 // collectOnce performs a single metric collection cycle.

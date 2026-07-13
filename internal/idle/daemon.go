@@ -58,10 +58,22 @@ const (
 	healthCheckInterval     = 60 * time.Second
 )
 
+// DBClient is the narrow database capability surface the idle daemon needs
+// (M-1 step 2): connection lifecycle (Ping/Close) and session operations
+// (ListSessionsWithResourceGroup/TerminateSession). Any full db.Client value
+// satisfies it; accepting the composition instead of the wide interface
+// decouples the daemon from the ~80 unrelated capabilities.
+type DBClient interface {
+	db.ConnectionOps
+	db.SessionOps
+}
+
 // DBClientFactory defines the interface for creating database clients.
 // This allows the daemon to reconnect when the connection drops.
 type DBClientFactory interface {
-	NewClient(ctx context.Context) (db.Client, error)
+	// NewClient returns a fresh database client scoped to the daemon's
+	// narrow capability surface.
+	NewClient(ctx context.Context) (DBClient, error)
 }
 
 // Config holds daemon configuration.
@@ -73,7 +85,7 @@ type Config struct {
 	// ScanInterval is how often to scan sessions (default: 30s).
 	ScanInterval time.Duration
 	// DBClient is the database client used to list and terminate sessions.
-	DBClient db.Client
+	DBClient DBClient
 	// DBClientFactory is an optional factory for reconnecting the DB client.
 	// When set, the daemon will attempt to reconnect on connection failures.
 	DBClientFactory DBClientFactory

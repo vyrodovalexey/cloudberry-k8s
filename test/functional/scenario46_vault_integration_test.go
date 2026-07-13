@@ -450,9 +450,12 @@ func (s *Scenario46VaultSuite) TestFunctional_Scenario46_DisabledVault() {
 	require.NotNil(s.T(), client)
 	assert.False(s.T(), client.IsEnabled(), "disabled vault should return no-op client")
 
-	// No-op client operations should succeed silently.
+	// Reads on the no-op client surface the typed ErrVaultDisabled (L-9) so an
+	// unguarded caller cannot mistake the result for an empty-but-existing
+	// secret; writes remain silent no-ops.
 	data, readErr := client.ReadSecret(s.ctx, "secret/data/any")
-	assert.NoError(s.T(), readErr)
+	assert.ErrorIs(s.T(), readErr, vault.ErrVaultDisabled,
+		"disabled vault ReadSecret must return typed ErrVaultDisabled")
 	assert.Nil(s.T(), data)
 
 	writeErr := client.WriteSecret(s.ctx, "secret/data/any", map[string]interface{}{"k": "v"})

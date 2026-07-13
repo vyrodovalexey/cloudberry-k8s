@@ -1,6 +1,7 @@
 package certmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -142,7 +143,7 @@ func TestEnsureCertificates_ExistingValid(t *testing.T) {
 	cfg := newTestConfig()
 
 	// Generate valid certs and pre-create the secret.
-	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+	caCert, _, tlsCert, tlsKey, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc", "test-webhook.test-ns.svc.cluster.local"},
 		365*24*time.Hour,
 	)
@@ -215,7 +216,7 @@ func TestNeedsRotation_ValidCert(t *testing.T) {
 	scheme := newTestScheme()
 	cfg := newTestConfig()
 
-	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+	caCert, _, tlsCert, tlsKey, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc"},
 		365*24*time.Hour,
 	)
@@ -644,7 +645,7 @@ func TestCheckCertRotation_SelfSignedSource_SelfSignedCert_NoForcedRotation(t *t
 	// A self-signed cert with a self-signed source must not be rotated by the
 	// source-mismatch check; only the time-based logic applies (and the cert is
 	// fresh, so no rotation).
-	caCert, tlsCert, _, err := generateSelfSignedCert(
+	caCert, _, tlsCert, _, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc"},
 		365*24*time.Hour,
 	)
@@ -664,7 +665,7 @@ func TestCheckCertRotation_SelfSignedSource_SelfSignedCert_NoForcedRotation(t *t
 func TestCheckCertRotation_VaultSource_SelfSignedCert_ForcesRotation(t *testing.T) {
 	// A still-valid self-signed cert must be rotated when the configured source
 	// is vault-pki (source mismatch).
-	caCert, tlsCert, _, err := generateSelfSignedCert(
+	caCert, _, tlsCert, _, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc"},
 		365*24*time.Hour,
 	)
@@ -737,7 +738,7 @@ func TestEnsureCertificates_SourceMismatch_RegeneratesFromNewSource(t *testing.T
 	cfg := newTestConfig()
 	cfg.CertSource = CertSourceVaultPKI
 
-	caCert, tlsCert, tlsKey, err := generateSelfSignedCert(
+	caCert, _, tlsCert, tlsKey, err := generateSelfSignedCert(
 		[]string{"test-webhook.test-ns.svc", "test-webhook.test-ns.svc.cluster.local"},
 		365*24*time.Hour,
 	)
@@ -770,8 +771,12 @@ func TestEnsureCertificates_SourceMismatch_RegeneratesFromNewSource(t *testing.T
 
 	caBundle, err := cm.EnsureCertificates(context.Background())
 	require.NoError(t, err)
-	// The CA bundle must now come from vault, not the old self-signed CA.
-	assert.Equal(t, []byte("-----BEGIN CERTIFICATE-----\nMIIBvaultca\n-----END CERTIFICATE-----"), caBundle)
+	// The bundle must now LEAD with the vault issuing CA; the still-valid
+	// previous self-signed CA is appended (union bundle for the kubelet
+	// Secret propagation window, DEV-2/R-1).
+	assert.True(t, bytes.HasPrefix(caBundle,
+		[]byte("-----BEGIN CERTIFICATE-----\nMIIBvaultca\n-----END CERTIFICATE-----")))
+	assert.True(t, bytes.HasSuffix(caBundle, caCert))
 	assert.NotEqual(t, caCert, caBundle)
 }
 

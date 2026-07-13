@@ -41,9 +41,9 @@ func TestNoopClient(t *testing.T) {
 		assert.False(t, client.IsEnabled())
 	})
 
-	t.Run("ReadSecret returns nil", func(t *testing.T) {
+	t.Run("ReadSecret returns ErrVaultDisabled", func(t *testing.T) {
 		data, err := client.ReadSecret(context.Background(), "secret/path")
-		assert.NoError(t, err)
+		require.ErrorIs(t, err, ErrVaultDisabled)
 		assert.Nil(t, data)
 	})
 
@@ -287,9 +287,9 @@ func TestNewClient_MissingAddress(t *testing.T) {
 func TestNoopClient_ReadWriteSecret(t *testing.T) {
 	client := &noopClient{}
 
-	t.Run("ReadSecret returns nil data and no error", func(t *testing.T) {
+	t.Run("ReadSecret returns nil data and ErrVaultDisabled", func(t *testing.T) {
 		data, err := client.ReadSecret(context.Background(), "secret/data/test")
-		assert.NoError(t, err)
+		require.ErrorIs(t, err, ErrVaultDisabled)
 		assert.Nil(t, data)
 	})
 
@@ -417,9 +417,10 @@ func TestNewClient_DisabledReturnsNoopClient(t *testing.T) {
 	require.NotNil(t, client)
 	assert.False(t, client.IsEnabled())
 
-	// Verify it's a noopClient by testing behavior.
+	// Verify it's a noopClient by testing behavior (reads surface the typed
+	// ErrVaultDisabled, L-9).
 	data, err := client.ReadSecret(context.Background(), "any/path")
-	assert.NoError(t, err)
+	require.ErrorIs(t, err, ErrVaultDisabled)
 	assert.Nil(t, data)
 
 	err = client.WriteSecret(context.Background(), "any/path", map[string]interface{}{"k": "v"})

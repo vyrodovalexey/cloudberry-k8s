@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	cbv1alpha1 "github.com/cloudberry-contrib/cloudberry-k8s/api/v1alpha1"
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -327,140 +328,42 @@ func TestInjectCABundle(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// runCertRotation
+// runCertRotation — shutdown paths
 // ---------------------------------------------------------------------------
+// The tick behavior (rotation, check errors, no-rotation) is covered by the
+// interval-seam tests in certrotation_test.go and the pending-bundle tests in
+// certrotation_pending_test.go; the four former always-PASS duplicates that
+// ran at the 12h production interval were removed (UT-15/AP-1), and all
+// rotation tests share the race-safe atomicCertManager (AP-3).
 
-// mockCertManager implements certmanager.CertManager for testing.
-type mockCertManager struct {
-	needsRotation    bool
-	needsRotationErr error
-	ensureErr        error
-	ensureCalled     int
-}
-
-func (m *mockCertManager) EnsureCertificates(_ context.Context) ([]byte, error) {
-	m.ensureCalled++
-	return []byte("ca-bundle"), m.ensureErr
-}
-
-func (m *mockCertManager) NeedsRotation(_ context.Context) (bool, error) {
-	return m.needsRotation, m.needsRotationErr
-}
-
+// TestRunCertRotation_ContextCanceled pins the ctx-canceled-while-awaiting-
+// election branch DETERMINISTICALLY (UT-11/AP-2): the elected channel is
+// never closed, so the select at the top of runCertRotation has exactly one
+// ready case (ctx.Done) and must return without performing any work.
 func TestRunCertRotation_ContextCanceled(t *testing.T) {
 	t.Parallel()
 
-	cm := &mockCertManager{}
+	cm := &atomicCertManager{}
 	logger := testLogger()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
+	cancel()                            // Cancel immediately.
+	neverElected := make(chan struct{}) // never closed: only ctx.Done can fire
 
 	done := make(chan struct{})
 	go func() {
-		runCertRotation(ctx, cm, logger)
+		runCertRotation(ctx, cm, newFakeClient(), neverElected, &metrics.NoopRecorder{}, logger)
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		// Success: function returned.
+		// Success: function returned via the pre-election ctx.Done branch.
 	case <-time.After(2 * time.Second):
 		t.Fatal("runCertRotation did not return after context cancellation")
 	}
-}
-
-// ---------------------------------------------------------------------------
-// runCertRotation - additional paths
-// ---------------------------------------------------------------------------
-
-func TestRunCertRotation_NeedsRotation_EnsureSucceeds(t *testing.T) {
-	t.Parallel()
-
-	cm := &mockCertManager{
-		needsRotation: true,
-	}
-	logger := testLogger()
-
-	// Use a context that we cancel after a short delay to stop the ticker loop.
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Override the ticker by running in a goroutine and canceling after the first tick.
-	done := make(chan struct{})
-	go func() {
-		// We can't easily control the ticker interval (12h), so we test the
-		// function by canceling the context. The key is that the mock is set up
-		// to return needsRotation=true, so if the ticker fires, it will call
-		// EnsureCertificates.
-		runCertRotation(ctx, cm, logger)
-		close(done)
-	}()
-
-	// Cancel after a short delay.
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-		// Success: function returned after context cancellation.
-	case <-time.After(2 * time.Second):
-		t.Fatal("runCertRotation did not return after context cancellation")
-	}
-}
-
-func TestRunCertRotation_NeedsRotation_EnsureFails(t *testing.T) {
-	t.Parallel()
-
-	cm := &mockCertManager{
-		needsRotation: true,
-		ensureErr:     fmt.Errorf("cert rotation failed"),
-	}
-	logger := testLogger()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		runCertRotation(ctx, cm, logger)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-		// Success: function returned.
-	case <-time.After(2 * time.Second):
-		t.Fatal("runCertRotation did not return after context cancellation")
-	}
-}
-
-func TestRunCertRotation_NeedsRotationError(t *testing.T) {
-	t.Parallel()
-
-	cm := &mockCertManager{
-		needsRotationErr: fmt.Errorf("check failed"),
-	}
-	logger := testLogger()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		runCertRotation(ctx, cm, logger)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-		// Success: function returned.
-	case <-time.After(2 * time.Second):
-		t.Fatal("runCertRotation did not return after context cancellation")
-	}
+	assert.Zero(t, cm.needsCalls.Load(),
+		"no rotation check may run when the context is canceled before election")
 }
 
 // ---------------------------------------------------------------------------
@@ -851,38 +754,6 @@ func TestInjectCABundle_EmptyWebhookList(t *testing.T) {
 
 	err := injectCABundle(context.Background(), k8sClient, []byte("ca-bundle"), logger)
 	require.NoError(t, err)
-}
-
-// ---------------------------------------------------------------------------
-// runCertRotation - no rotation needed
-// ---------------------------------------------------------------------------
-
-func TestRunCertRotation_NoRotationNeeded(t *testing.T) {
-	t.Parallel()
-
-	cm := &mockCertManager{
-		needsRotation: false,
-	}
-	logger := testLogger()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		runCertRotation(ctx, cm, logger)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-		// Success: function returned.
-		assert.Equal(t, 0, cm.ensureCalled, "EnsureCertificates should not be called when rotation is not needed")
-	case <-time.After(2 * time.Second):
-		t.Fatal("runCertRotation did not return after context cancellation")
-	}
 }
 
 // ---------------------------------------------------------------------------

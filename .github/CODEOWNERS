@@ -14,6 +14,9 @@ Dockerfile.cloudberry @cloudberry-contrib/devops
 Dockerfile.cloudberry-official @cloudberry-contrib/devops
 Dockerfile.cloudberry-backup @cloudberry-contrib/devops
 Dockerfile.cloudberry-query-exporter @cloudberry-contrib/devops
+Dockerfile.cloudberry-pxf @cloudberry-contrib/devops
+Dockerfile.cloudberry-official-pxf @cloudberry-contrib/devops
+Dockerfile.cloudberry-gpfdist @cloudberry-contrib/devops
 .dockerignore @cloudberry-contrib/devops
 
 # Build system

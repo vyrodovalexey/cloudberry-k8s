@@ -16,6 +16,7 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/metrics"
 	"github.com/cloudberry-contrib/cloudberry-k8s/internal/util"
 )
 
@@ -74,14 +75,23 @@ func shrinkRotationInterval(t *testing.T) {
 	t.Cleanup(func() { certRotationInterval = prev })
 }
 
+// closedElectedChannel returns an already-closed election channel, mirroring
+// a manager without leader election (Elected() closes at Start).
+func closedElectedChannel() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
 // runRotation runs runCertRotation until the predicate holds (or times out),
 // then cancels and joins the loop.
 func runRotation(t *testing.T, cm *atomicCertManager, pred func() bool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	k8sClient := newFakeClient(admissionWebhookFixture())
 	go func() {
-		runCertRotation(ctx, cm, testLogger())
+		runCertRotation(ctx, cm, k8sClient, closedElectedChannel(), &metrics.NoopRecorder{}, testLogger())
 		close(done)
 	}()
 
