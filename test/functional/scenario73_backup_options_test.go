@@ -69,7 +69,7 @@ func scenario73Cluster(name string) *cbv1alpha1.CloudberryCluster {
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,
 			IncrementalCount: 10,

@@ -141,7 +141,7 @@ func scenario99Cluster(name string, jobs ...cbv1alpha1.DataLoadingJob) *cbv1alph
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			Servers: scenario99Servers(),
 		},
 		Jobs: jobs,

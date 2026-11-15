@@ -83,7 +83,7 @@ func scenario93FullDataLoading() *cbv1alpha1.DataLoadingSpec {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled:  true,
-			Image:    "cloudberry-pxf:2.1.0",
+			Image:    "cloudberry-pxf:2.2.0",
 			JvmOpts:  "-Xmx1g -Xms256m",
 			Port:     5888,
 			LogLevel: "INFO",

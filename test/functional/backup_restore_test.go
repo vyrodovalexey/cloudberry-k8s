@@ -53,7 +53,7 @@ func newS3BackupSpec() *cbv1alpha1.BackupSpec {
 	return &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        5,
 			IncrementalCount: 20,
@@ -350,7 +350,7 @@ func (s *BackupRestoreSuite) TestFunctional_BackupLocalDestination_ReconcilesSuc
 		Build()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "local",
 			Local: &cbv1alpha1.LocalDestination{

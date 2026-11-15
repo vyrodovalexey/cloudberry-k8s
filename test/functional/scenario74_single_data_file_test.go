@@ -33,7 +33,7 @@ import (
 //	  contain --jobs (per gpbackup rules --jobs cannot be combined with
 //	  --single-data-file; the builder returns early in single-data-file mode).
 //	  --single-data-file requires gpbackup_helper on every segment host; the
-//	  binary ships in cloudberry-official:2.1.0 at $GPHOME/bin/gpbackup_helper.
+//	  binary ships in cloudberry-official:2.2.0 at $GPHOME/bin/gpbackup_helper.
 //	RESTORE (all gprestore options): jobs=4, redirectDb=mydb_restored,
 //	  redirectSchema=restored, includeSchemas=[public,analytics],
 //	  includeTables=[public.users,public.orders], createDb, withStats,
@@ -74,7 +74,7 @@ func scenario74Cluster(name string) *cbv1alpha1.CloudberryCluster {
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,
 			IncrementalCount: 10,

@@ -39,7 +39,7 @@ import (
 //     "pxf prepare → pxf start → tail service log" lifecycle is owned by the
 //     IMAGE ENTRYPOINT (hack/docker-entrypoint-pxf.sh).
 //   - ProbePathHonest: the liveness/readiness probe path is /actuator/health
-//     (the real Spring Boot actuator endpoint on apache/cloudberry-pxf 2.1.0,
+//     (the real Spring Boot actuator endpoint on apache/cloudberry-pxf 2.2.0,
 //     returns {"status":"UP"}), NOT the legacy /pxf/v15/Status (a DB-client
 //     endpoint that returns 404 on the real image).
 //   - LogLevelPropagation: re-patching pxf.logLevel (e.g. WARN) and rebuilding
@@ -68,7 +68,7 @@ func (s *Scenario94Suite) SetupTest() {
 }
 
 // scenario94FullDataLoading returns the dataLoading spec exercised by this
-// scenario: the full pxf block with image cloudberry-pxf:2.1.0, jvmOpts at the
+// scenario: the full pxf block with image cloudberry-pxf:2.2.0, jvmOpts at the
 // default "-Xmx1g -Xms256m", port 5888, logLevel INFO, requests/limits
 // resources, default (nil) extensions (=> PXF_EXTENSION_*=true), and one s3
 // server. The values mirror cases.Scenario94Cases() exactly so CatalogHonest
@@ -78,7 +78,7 @@ func scenario94FullDataLoading() *cbv1alpha1.DataLoadingSpec {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled:  true,
-			Image:    "cloudberry-pxf:2.1.0",
+			Image:    "cloudberry-pxf:2.2.0",
 			JvmOpts:  "-Xmx1g -Xms256m",
 			Port:     5888,
 			LogLevel: "INFO",
@@ -154,7 +154,7 @@ func (s *Scenario94Suite) TestFunctional_Scenario94_SidecarContract() {
 	c, present := scenario94PxfContainer(sts.Spec.Template.Spec.Containers)
 	require.True(s.T(), present, "segment-primary pod template carries the 'pxf' sidecar")
 	assert.Equal(s.T(), "pxf", c.Name)
-	assert.Equal(s.T(), "cloudberry-pxf:2.1.0", c.Image)
+	assert.Equal(s.T(), "cloudberry-pxf:2.2.0", c.Image)
 
 	// Env vars (exact values).
 	assertEnv := func(name, want string) {
@@ -196,7 +196,7 @@ func (s *Scenario94Suite) TestFunctional_Scenario94_SidecarContract() {
 	// lifecycle is owned by the IMAGE ENTRYPOINT (hack/docker-entrypoint-pxf.sh),
 	// so the operator injects NO Command and NO Args. (This is also why the probe
 	// path above is /actuator/health, the Spring Boot actuator on the real
-	// apache/cloudberry-pxf 2.1.0 image — NOT the legacy /pxf/v15/Status, which is
+	// apache/cloudberry-pxf 2.2.0 image — NOT the legacy /pxf/v15/Status, which is
 	// a DB-client endpoint that returns 404.)
 	assert.Nil(s.T(), c.Command, "sidecar Command must be nil (entrypoint-owned lifecycle)")
 	assert.Nil(s.T(), c.Args, "sidecar Args must be nil (entrypoint-owned lifecycle)")

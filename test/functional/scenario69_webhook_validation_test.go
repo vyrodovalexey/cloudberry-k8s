@@ -53,7 +53,7 @@ func scenario69ValidBackup() *cbv1alpha1.BackupSpec {
 	return &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{

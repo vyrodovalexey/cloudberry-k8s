@@ -134,7 +134,7 @@ func scenario107DLCluster() *cbv1alpha1.CloudberryCluster {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "apache/cloudberry-pxf:2.1.0",
+			Image:   "apache/cloudberry-pxf:2.2.0",
 			Servers: []cbv1alpha1.PxfServerSpec{
 				{Name: "s3srv", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "http://minio:9000"}},
 				{Name: "hivesrv", Type: "hive", Config: map[string]string{"hive.metastore.uris": "thrift://h:9083"}},

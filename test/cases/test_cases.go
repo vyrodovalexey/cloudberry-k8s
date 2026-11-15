@@ -4486,7 +4486,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
 			ExpectedJobName:     "test-cluster-dataload-s3-parquet-loader",
 			ClusterName:         cluster,
-			ExpectedImage:       "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:       "cloudberrydb/cloudberry:2.2.0",
 			ExpectsPXFExtension: true,
 			ImageBlocked:        true,
 			Description: "pxf s3:parquet job: operator generates the pxf:// external-table " +
@@ -4510,7 +4510,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CSV';",
 			ExpectedJobName: "test-cluster-dataload-csv-bulk-load",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native gpfdist CSV job: operator generates the gpfdist:// external-table " +
 				"DDL (bare path served via the cluster gpfdist Service) — the genuine non-PXF path",
 		},
@@ -4540,7 +4540,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CSV';",
 			ExpectedJobName: "test-cluster-dataload-file-loader",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native bare-path single-file CSV job: operator generates the gpfdist:// " +
 				"external-table DDL (single file served via the cluster gpfdist Service) — the " +
 				"genuine non-PXF path (file:// is admission-rejected for multi-segment, see W.16)",
@@ -4570,7 +4570,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"LOG ERRORS SEGMENT REJECT LIMIT 50 ROWS;",
 			ExpectedJobName: "test-cluster-dataload-s3-csv-load",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native s3:// scheduled CSV job with LOG ERRORS: operator generates a " +
 				"CronJob carrying the s3:// external-table DDL + reject-limit suffix — non-PXF path",
 		},
@@ -4825,7 +4825,7 @@ func Scenario93Cases() []Scenario93Case {
 //
 // HONESTY NOTE: the liveness/readiness probe path is asserted as
 // "/actuator/health" — the real Spring Boot actuator endpoint exposed by the
-// apache/cloudberry-pxf 2.1.0 image (returns {"status":"UP"}). The legacy
+// apache/cloudberry-pxf 2.2.0 image (returns {"status":"UP"}). The legacy
 // "/pxf/v15/Status" path is a DB-client endpoint that returns 404 on that image
 // and is NOT used for health checks. The container also sets NO Command and NO
 // Args: the "pxf prepare → pxf start → tail service log" lifecycle is owned by
@@ -4930,7 +4930,7 @@ func Scenario94Cases() []Scenario94Case {
 		{
 			ID: "S94.12", FieldPath: "sidecar.liveness.path",
 			ExpectedValue: "/actuator/health",
-			Description: "liveness probe HTTPGet path is /actuator/health (PXF 2.1.0 Spring Boot " +
+			Description: "liveness probe HTTPGet path is /actuator/health (PXF 2.2.0 Spring Boot " +
 				"actuator), NOT the legacy /pxf/v15/Status (which 404s on the real image)",
 		},
 		{
@@ -6192,7 +6192,7 @@ const (
 // Scenario 101 well-known names + values (mirror the sample CR + spec §11).
 const (
 	// Scenario101GpfdistImage is the gpfdist Deployment image.
-	Scenario101GpfdistImage = "cloudberry-gpfdist:2.1.0"
+	Scenario101GpfdistImage = "cloudberry-gpfdist:2.2.0"
 	// Scenario101GpfdistPort is the default gpfdist port.
 	Scenario101GpfdistPort = 8080
 	// Scenario101JobName is the gpload-csv job name (== ConfigMap key prefix).
@@ -6232,7 +6232,7 @@ func Scenario101Cases() []Scenario101Case {
 		{
 			ID: "SC101-GP2-IMAGE", Req: "GP.2", Layer: Scenario101LayerBuilder,
 			Artifact: Scenario101ArtifactDeployment, Expected: Scenario101GpfdistImage,
-			Description: "container[0].image == Gpfdist.Image or default cloudberry-gpfdist:2.1.0.",
+			Description: "container[0].image == Gpfdist.Image or default cloudberry-gpfdist:2.2.0.",
 		},
 		{
 			ID: "SC101-GP2-CMD", Req: "GP.2", Layer: Scenario101LayerBuilder,
@@ -7189,7 +7189,7 @@ func Scenario104Cases() []Scenario104Case {
 			Contains: "proname = 'pxf_read'",
 			Description: "the dataload-healthcheck init script for a pxf job (pxf enabled) carries " +
 				"the DB-proxy PXF-readiness probe substrings (pg_extension, extname='pxf', " +
-				"pg_proc proname = 'pxf_read' — PXF 2.1 has no pxf_version(), HC.1 FAIL) — NOT a " +
+				"pg_proc proname = 'pxf_read' — PXF 2.2 has no pxf_version(), HC.1 FAIL) — NOT a " +
 				"direct sidecar curl (impossible from the load pod per spec §3341).",
 		},
 		{

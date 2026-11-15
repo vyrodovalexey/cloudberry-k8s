@@ -64,7 +64,7 @@ import (
 // ============================================================================
 
 const (
-	scenario84BackupImage = "cloudberry-backup:2.1.0"
+	scenario84BackupImage = "cloudberry-backup:2.2.0"
 	// scenario84FullTS / scenario84IncrTS are pinned 14-digit gpbackup-style
 	// timestamps for the full + incremental backups.
 	scenario84FullTS = "20260608040000"

@@ -292,8 +292,8 @@ func newScenario5Cluster() *cbv1alpha1.CloudberryCluster {
 			Namespace: scenario5Namespace,
 		},
 		Spec: cbv1alpha1.CloudberryClusterSpec{
-			Version: "2.1.0",
-			Image:   "cloudberrydb/cloudberry:2.1.0",
+			Version: "2.2.0",
+			Image:   "cloudberrydb/cloudberry:2.2.0",
 			Coordinator: cbv1alpha1.CoordinatorSpec{
 				Storage: cbv1alpha1.StorageSpec{Size: "10Gi"},
 			},

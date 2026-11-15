@@ -304,7 +304,7 @@ func scenario109AbsentCases() []Scenario109Case {
 		{
 			ID: "109-M4-ABSENT", Req: "M.4", Layer: Scenario109LayerUnit,
 			Expected: "cloudberry_pxf_bytes_transferred_total NOT registered/emitted",
-			Description: "PXF 2.1.0 exposes no honest per-transfer byte counter → the metric is " +
+			Description: "PXF 2.2.0 exposes no honest per-transfer byte counter → the metric is " +
 				"never registered and has ZERO series in VM (honest absence = PASS).",
 		},
 		{

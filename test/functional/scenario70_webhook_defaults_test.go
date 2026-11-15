@@ -65,7 +65,7 @@ func scenario70MinimalBackupCluster(name string) *cbv1alpha1.CloudberryCluster {
 	cluster := testutil.NewClusterBuilder(name, "default").Build()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{

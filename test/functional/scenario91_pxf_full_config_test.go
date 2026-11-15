@@ -291,7 +291,7 @@ func (s *Scenario91Suite) TestFunctional_Scenario91_DefaultsParsed() {
 	assert.Equal(s.T(), "2", c.Resources.Limits.Cpu().String())
 	assert.Equal(s.T(), "2Gi", c.Resources.Limits.Memory().String())
 
-	// Probes: HTTP GET /actuator/health (Spring Boot actuator, PXF 2.1.0) on the pxf port.
+	// Probes: HTTP GET /actuator/health (Spring Boot actuator, PXF 2.2.0) on the pxf port.
 	require.NotNil(s.T(), c.LivenessProbe)
 	require.NotNil(s.T(), c.LivenessProbe.HTTPGet)
 	assert.Equal(s.T(), "/actuator/health", c.LivenessProbe.HTTPGet.Path)

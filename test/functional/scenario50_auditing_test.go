@@ -329,7 +329,7 @@ func (s *Scenario50AuditSuite) TestFunctional_Scenario50c_OperatorAudit_Permissi
 	defer ts.Close()
 
 	// Viewer (Basic permission) tries to create a cluster (requires Admin).
-	body := `{"metadata":{"name":"test","namespace":"default"},"spec":{"version":"2.1.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
+	body := `{"metadata":{"name":"test","namespace":"default"},"spec":{"version":"2.2.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
 	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, ts.URL+"/api/v1alpha1/clusters",
 		strings.NewReader(body))
 	require.NoError(s.T(), err)

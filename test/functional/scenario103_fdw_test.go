@@ -92,7 +92,7 @@ func scenario103Cluster(
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			Servers: []cbv1alpha1.PxfServerSpec{scenario103S3Server()},
 		},
 		Jobs: jobs,

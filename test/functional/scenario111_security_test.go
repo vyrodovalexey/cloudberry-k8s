@@ -87,7 +87,7 @@ func scenario111SecureDataLoading() *cbv1alpha1.DataLoadingSpec {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			Port:    cases.Scenario111PxfPort,
 			Servers: []cbv1alpha1.PxfServerSpec{
 				// SE.1 / SE.3 / SL.6: s3 with creds + TLS toggle.

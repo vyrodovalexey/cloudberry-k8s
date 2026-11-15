@@ -229,7 +229,7 @@ func scenario96ClusterWith(
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			Servers: servers,
 		},
 		Jobs: jobs,

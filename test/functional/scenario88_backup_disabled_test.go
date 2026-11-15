@@ -94,7 +94,7 @@ func (s *Scenario88Suite) newReconciler(env *testutil.TestK8sEnv) *controller.Ad
 func scenario88BackupSpec(enabled bool, schedule string) *cbv1alpha1.BackupSpec {
 	return &cbv1alpha1.BackupSpec{
 		Enabled:  enabled,
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Schedule: schedule,
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,

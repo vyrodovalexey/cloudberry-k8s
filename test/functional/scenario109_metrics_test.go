@@ -57,7 +57,7 @@ const (
 	scenario109Namespace = "cloudberry-test"
 	scenario109Cluster   = "scenario109-metrics"
 
-	scenario109PxfImage = "apache/cloudberry-pxf:2.1.0"
+	scenario109PxfImage = "apache/cloudberry-pxf:2.2.0"
 )
 
 // Scenario109Suite drives the metric-emission contract through the real

@@ -63,7 +63,7 @@ import (
 // ============================================================================
 
 const (
-	scenario80BackupImage = "cloudberry-backup:2.1.0"
+	scenario80BackupImage = "cloudberry-backup:2.2.0"
 	// scenario80RestoreTS is the pinned restore timestamp used to key the
 	// deterministic validation Job name.
 	scenario80RestoreTS = "20260608130000"

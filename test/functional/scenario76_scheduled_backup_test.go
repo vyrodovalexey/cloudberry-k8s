@@ -47,7 +47,7 @@ import (
 // ============================================================================
 
 const (
-	scenario76BackupImage = "cloudberry-backup:2.1.0"
+	scenario76BackupImage = "cloudberry-backup:2.2.0"
 	scenario76Schedule    = "0 2 * * *"
 )
 
