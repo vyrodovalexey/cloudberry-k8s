@@ -23,15 +23,14 @@ LDFLAGS          := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X
 # --- Docker settings ---------------------------------------------------------
 IMG_OPERATOR         ?= cloudberry-operator:latest
 IMG_CTL              ?= cloudberry-ctl:latest
-IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
+IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.2.0
 IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
-IMG_BACKUP           ?= cloudberry-backup:2.1.0
-IMG_OFFICIAL         ?= cloudberry-official:2.1.0
-IMG_PXF              ?= cloudberry-pxf:2.1.0
-IMG_OFFICIAL_PXF     ?= cloudberry-official-pxf:2.1.0
-IMG_GPFDIST          ?= cloudberry-gpfdist:2.1.0
-PXF_VERSION          ?= 2.1.0-incubating
-GPBACKMAN_VERSION    ?= v0.8.1
+IMG_BACKUP           ?= cloudberry-backup:2.2.0
+IMG_OFFICIAL         ?= cloudberry-official:2.2.0
+IMG_PXF              ?= cloudberry-pxf:2.2.0
+IMG_OFFICIAL_PXF     ?= cloudberry-official-pxf:2.2.0
+IMG_GPFDIST          ?= cloudberry-gpfdist:2.2.0
+PXF_VERSION          ?= 2.2.0-incubating
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
@@ -196,10 +195,9 @@ docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles fro
 		-f Dockerfile.cloudberry .
 
 .PHONY: docker-build-backup
-docker-build-backup: ## Build cloudberry-backup toolchain image (incl. gpbackman)
+docker-build-backup: ## Build cloudberry-backup toolchain image (incl. in-tree gpbackman)
 	$(DOCKER) build \
 		$(DOCKER_BUILD_ARGS) \
-		--build-arg GPBACKMAN_VERSION=$(GPBACKMAN_VERSION) \
 		-t $(IMG_BACKUP) \
 		-f Dockerfile.cloudberry-backup .
 

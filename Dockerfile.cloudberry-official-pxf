@@ -9,11 +9,11 @@
 #
 # The extension artifacts (.so, .control, .sql) are copied from the PXF builder
 # stage (Dockerfile.cloudberry-pxf) to ensure ABI compatibility — both images
-# use the same Cloudberry 2.1.0 RPM.
+# use the same Cloudberry 2.2.0 RPM.
 #
 # Build (requires cloudberry-pxf builder stage):
 #   docker build --platform linux/amd64 -f Dockerfile.cloudberry-official-pxf \
-#       -t cloudberry-official-pxf:2.1.0 .
+#       -t cloudberry-official-pxf:2.2.0 .
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -22,8 +22,8 @@
 # In CI these are overridden via --build-arg to reference images loaded into
 # the local Docker daemon by earlier chain steps.
 # ---------------------------------------------------------------------------
-ARG CB_PXF_IMAGE=cloudberry-pxf:2.1.0
-ARG CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+ARG CB_PXF_IMAGE=cloudberry-pxf:2.2.0
+ARG CB_OFFICIAL_IMAGE=cloudberry-official:2.2.0
 
 # ---------------------------------------------------------------------------
 # Import the PXF builder stage to get the compiled extension artifacts
@@ -37,12 +37,12 @@ FROM --platform=linux/amd64 ${CB_OFFICIAL_IMAGE}
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database-official-pxf" \
-      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 (official RPM) with PXF extensions for Kubernetes" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.2.0 (official RPM) with PXF extensions for Kubernetes" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.vendor="Apache Software Foundation" \
       org.opencontainers.image.source="https://github.com/apache/cloudberry" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.base.name="cloudberry-official:2.1.0"
+      org.opencontainers.image.base.name="cloudberry-official:2.2.0"
 
 # Switch to root to install extensions
 USER root
