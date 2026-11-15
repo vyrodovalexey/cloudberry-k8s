@@ -43,7 +43,7 @@ HELM_RELEASE         ?= cloudberry-operator
 HELM_CHART           := deploy/helm/cloudberry-operator
 
 # --- Tool versions -----------------------------------------------------------
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 CONTROLLER_GEN_VERSION ?= v0.17.3
 
 # --- Tool binaries -----------------------------------------------------------

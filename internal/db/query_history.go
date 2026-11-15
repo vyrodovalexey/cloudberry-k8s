@@ -375,11 +375,11 @@ func (c *pgxClient) recordQueryHistorySize(ctx context.Context) {
 
 // buildHistoryWhereClause constructs parameterized WHERE conditions from a filter.
 // Returns the conditions slice, args slice, and any validation error.
+// Placeholder indices are derived from len(args) (same idiom as GetQueryHistory's
+// nextParam) so they always match the argument order.
 func buildHistoryWhereClause(
 	filter QueryHistoryFilter, logger *slog.Logger,
 ) (conditions []string, args []interface{}, err error) {
-	paramIdx := 1
-
 	// Pattern filter (regex or wildcard).
 	if filter.Pattern != "" {
 		patternType := filter.PatternType
@@ -393,71 +393,61 @@ func buildHistoryWhereClause(
 			if _, compileErr := regexp.Compile(filter.Pattern); compileErr != nil {
 				return nil, nil, fmt.Errorf("invalid regex pattern %q: %w", filter.Pattern, compileErr)
 			}
-			conditions = append(conditions, fmt.Sprintf("query_text ~ $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("query_text ~ $%d", len(args)+1))
 			args = append(args, filter.Pattern)
-			paramIdx++
 		case "wildcard":
 			// Convert wildcard to SQL LIKE pattern: * → %, ? → _
 			likePattern := convertWildcardToLike(filter.Pattern)
-			conditions = append(conditions, fmt.Sprintf("query_text LIKE $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("query_text LIKE $%d", len(args)+1))
 			args = append(args, likePattern)
-			paramIdx++
 		default:
 			logger.Warn("unknown pattern type, defaulting to regex", "patternType", patternType)
 			if _, compileErr := regexp.Compile(filter.Pattern); compileErr != nil {
 				return nil, nil, fmt.Errorf("invalid regex pattern %q: %w", filter.Pattern, compileErr)
 			}
-			conditions = append(conditions, fmt.Sprintf("query_text ~ $%d", paramIdx))
+			conditions = append(conditions, fmt.Sprintf("query_text ~ $%d", len(args)+1))
 			args = append(args, filter.Pattern)
-			paramIdx++
 		}
 	}
 
 	// Username filter.
 	if filter.Username != "" {
-		conditions = append(conditions, fmt.Sprintf("username = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("username = $%d", len(args)+1))
 		args = append(args, filter.Username)
-		paramIdx++
 	}
 
 	// Database filter.
 	if filter.Database != "" {
-		conditions = append(conditions, fmt.Sprintf("database_name = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("database_name = $%d", len(args)+1))
 		args = append(args, filter.Database)
-		paramIdx++
 	}
 
 	// Resource group filter.
 	if filter.ResourceGroup != "" {
-		conditions = append(conditions, fmt.Sprintf("resource_group = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("resource_group = $%d", len(args)+1))
 		args = append(args, filter.ResourceGroup)
-		paramIdx++
 	}
 
 	// State filter.
 	if filter.State != "" {
-		conditions = append(conditions, fmt.Sprintf("state = $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("state = $%d", len(args)+1))
 		args = append(args, filter.State)
-		paramIdx++
 	}
 
 	// Minimum duration filter.
 	if filter.MinDuration > 0 {
-		conditions = append(conditions, fmt.Sprintf("duration_ms >= $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("duration_ms >= $%d", len(args)+1))
 		args = append(args, filter.MinDuration)
-		paramIdx++
 	}
 
 	// Time range filter.
 	if !filter.Since.IsZero() {
-		conditions = append(conditions, fmt.Sprintf("query_start >= $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("query_start >= $%d", len(args)+1))
 		args = append(args, filter.Since)
-		paramIdx++
 	}
 	if !filter.Until.IsZero() {
-		conditions = append(conditions, fmt.Sprintf("query_start <= $%d", paramIdx))
+		conditions = append(conditions, fmt.Sprintf("query_start <= $%d", len(args)+1))
 		args = append(args, filter.Until)
-		paramIdx++ //nolint:ineffassign // paramIdx kept for consistency
 	}
 
 	return conditions, args, nil
