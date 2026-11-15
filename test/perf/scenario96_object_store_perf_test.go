@@ -31,6 +31,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 )
 
 const (
@@ -168,9 +170,10 @@ func BenchmarkScenario96_ReadThroughput(b *testing.B) {
 }
 
 // BenchmarkScenario96_WriteThroughput measures WRITE/EXPORT throughput (rows/sec)
-// by creating a WRITABLE PXF external table (pxfwritable_export) and timing the
-// INSERT (export) of a staged source table to MinIO. It reports rows/sec. The
-// profile is SCENARIO96_PERF_WRITE_PROFILE (default s3:text) on
+// by creating a WRITABLE PXF external table (the per-profile write clause per
+// DEF-4: FORMAT 'TEXT' (delimiter ',') for text, pxfwritable_export otherwise)
+// and timing the INSERT (export) of a staged source table to MinIO. It reports
+// rows/sec. The profile is SCENARIO96_PERF_WRITE_PROFILE (default s3:text) on
 // SCENARIO96_PERF_WRITE_SERVER (default s3-datalake). Skips cleanly without live
 // infra.
 func BenchmarkScenario96_WriteThroughput(b *testing.B) {
@@ -206,12 +209,16 @@ func BenchmarkScenario96_WriteThroughput(b *testing.B) {
 		b.StopTimer()
 		ext := fmt.Sprintf("s96_perf_write_ext_%d", i)
 		resource := fmt.Sprintf("%siter-%d/", resourceBase, i)
+		// DEF-4: the writable FORMAT clause is per-profile (the default s3:text
+		// profile needs FORMAT 'TEXT' (delimiter ',') — the bridge formatter
+		// fails at the PXF server on 2.2.0), from the builder's source of
+		// truth so an env-overridden profile stays correct too.
 		setup := fmt.Sprintf(
 			"DROP EXTERNAL TABLE IF EXISTS %s; "+
 				"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) "+
 				"LOCATION ('pxf://%s?PROFILE=%s&SERVER=%s') "+
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
-			ext, ext, src, resource, profile, server)
+				"%s;",
+			ext, ext, src, resource, profile, server, builder.PXFWriteFormatClause(profile))
 		if out, err := perfCoordExec(ctx,
 			fmt.Sprintf("psql -d postgres -v ON_ERROR_STOP=1 -c %s", perfShQuote(setup))); err != nil {
 			b.Skipf("perf write setup failed (PXF/extension may be absent): %v (out=%s)", err, out)

@@ -1942,12 +1942,13 @@ type PxfJobSpec struct {
 	TargetTable string `json:"targetTable"`
 
 	// Mode is the load mode: "insert" / "insert-select" build a READABLE
-	// external table (FORMATTER='pxfwritable_import') for ingestion, while
-	// "writable" builds a WRITABLE external table (FORMATTER='pxfwritable_export')
-	// for export. When Mode == "writable" the admission webhook enforces the
-	// write-capability matrix: only profiles whose format is writable
-	// (text/parquet/avro for object stores) are admitted; json/orc are rejected
-	// as write-unsupported (see internal/pxfpolicy).
+	// external table for ingestion, while "writable" builds a WRITABLE external
+	// table for export with the per-profile FORMAT clause (FORMAT 'TEXT'
+	// (delimiter ',') for delimited-text profiles, FORMATTER='pxfwritable_export'
+	// for bridge-serialized formats). When Mode == "writable" the admission
+	// webhook enforces the write-capability matrix: only profiles whose format
+	// is writable (text/parquet/avro for object stores) are admitted; json/orc
+	// are rejected as write-unsupported (see internal/pxfpolicy).
 	// +optional
 	Mode string `json:"mode,omitempty"`
 

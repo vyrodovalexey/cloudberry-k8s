@@ -104,9 +104,23 @@ const (
 	pxfFormatCSVSuffix = "csv"
 
 	// pxfWriteFormatClause is the PXF external-table FORMAT clause for the
-	// WRITE/EXPORT path (custom formatter pxfwritable_export). Used when
-	// pxfJob.Mode == pxfpolicy.ModeWritable to build a WRITABLE external table.
+	// WRITE/EXPORT path over BRIDGE-serialized profiles (parquet/avro/
+	// sequencefile, bare jdbc): the custom formatter pxfwritable_export. Used
+	// when pxfJob.Mode == pxfpolicy.ModeWritable to build a WRITABLE external
+	// table. For DELIMITED-TEXT profiles PXFWriteFormatClause substitutes
+	// pxfTextWriteFormatClause instead (DEF-4).
 	pxfWriteFormatClause = "FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')"
+
+	// pxfTextWriteFormatClause is the PXF external-table FORMAT clause for the
+	// WRITE/EXPORT path over DELIMITED-TEXT profiles (the s3/gs/abfss/wasbs/
+	// hdfs "text" — or "csv" — suffix). PXF 2.2.0's LineBreakAccessor-based
+	// text writer REJECTS the pxfwritable_export bridge at runtime
+	// ("class java.lang.Integer cannot be cast to class [B",
+	// LineBreakAccessor.writeNextObject — live-verified by TASK-U019's
+	// s3_text_bridge/hdfs_text_bridge probes, evidence 07/08), while this
+	// clause wrote and read back 175,000 rows with exact fidelity on both
+	// s3:text and hdfs:text (U019 §4 clause matrix, the live-proven shape).
+	pxfTextWriteFormatClause = "FORMAT 'TEXT' (delimiter ',')"
 
 	// defaultGpfdistPort is the gpfdist service port used when gpfdist.port is
 	// unset. It matches the conventional gpfdist default.
@@ -310,15 +324,51 @@ func PXFReadFormatClause(profile string) string {
 	return pxfFormatClause
 }
 
+// PXFWriteFormatClause returns the FORMAT clause for a PXF WRITE/EXPORT
+// external table (the DEF-4 fix, the write-side mirror of PXFReadFormatClause).
+// Delimited-text profiles — a "text" (or "csv") format suffix on any scheme
+// EXCEPT hive — must be declared FORMAT 'TEXT' (delimiter ','): on PXF 2.2.0
+// the text profiles' LineBreakAccessor writer expects delimited fields and
+// throws a ClassCastException when fed the pxfwritable_export bridge stream
+// ("class java.lang.Integer cannot be cast to class [B", live-verified by
+// TASK-U019's bridge probes on both s3:text and hdfs:text — only 0-byte
+// marker objects were created), so every operator-driven text export job
+// failed at runtime. The TEXT clause is the shape U019's 7/7-passing matrix
+// proved live (175,000 rows written and read back with exact set equality on
+// both sources).
+//
+// All other writable profiles keep the pxfwritable_export CUSTOM bridge —
+// parquet/avro/sequencefile writes were live-proven working with it (U019
+// §4/§5), and bare jdbc mints bridge-serialized records through
+// SQLQueryBuilder. (A "csv" suffix is included for parity with the read
+// helper's dual-suffix handling; it is UNREACHABLE through a CR because
+// pxfpolicy.WritableFormats has no "csv" row, so IsProfileWritable rejects a
+// csv-suffix writable job at admission W.10b and again at the builder.)
+//
+// It is EXPORTED (like PXFReadFormatClause) so the functional/e2e/perf suites
+// assert the exact clause from the SAME source of truth instead of re-deriving
+// it.
+func PXFWriteFormatClause(profile string) string {
+	lower := strings.ToLower(profile)
+	scheme, format, hasSep := strings.Cut(lower, ":")
+	if hasSep && scheme != pxfServerTypeHive &&
+		(format == pxfpolicy.FormatText || format == pxfFormatCSVSuffix) {
+		return pxfTextWriteFormatClause
+	}
+	return pxfWriteFormatClause
+}
+
 // buildPXFExternalTableDDL renders the pxf:// external-table DDL for a PXF job.
 //
 // When pxf.Mode == pxfpolicy.ModeWritable it emits a WRITABLE external table
-// (FORMATTER='pxfwritable_export') for data EXPORT — the WRITABLE keyword is set
-// and the LOG ERRORS / SEGMENT REJECT LIMIT suffix is omitted (writable tables
-// do not accept reject limits). Otherwise it emits the READ/IMPORT external
-// table with PXFReadFormatClause (FORMAT 'CSV' for delimited-text profiles per
-// DEF-1, FORMATTER='pxfwritable_import' otherwise) and the optional
-// error-handling suffix.
+// for data EXPORT — the WRITABLE keyword is set, the FORMAT clause comes from
+// PXFWriteFormatClause (FORMAT 'TEXT' (delimiter ',') for delimited-text
+// profiles per DEF-4, FORMATTER='pxfwritable_export' for bridge-serialized
+// profiles) and the LOG ERRORS / SEGMENT REJECT LIMIT suffix is omitted
+// (writable tables do not accept reject limits). Otherwise it emits the
+// READ/IMPORT external table with PXFReadFormatClause (FORMAT 'CSV' for
+// delimited-text profiles per DEF-1, FORMATTER='pxfwritable_import' otherwise)
+// and the optional error-handling suffix.
 //
 // DEFENSE IN DEPTH: even though the admission webhook rejects a writable job
 // with a write-unsupported format, the builder re-checks via the SAME
@@ -345,9 +395,11 @@ func buildPXFExternalTableDDL(job cbv1alpha1.DataLoadingJob) (string, error) {
 				"profile %q is write-unsupported", job.Name, pxf.Profile)
 		}
 		// Writable tables take no reject limit, so the error-handling suffix is
-		// intentionally not passed through.
+		// intentionally not passed through. The FORMAT clause is profile-aware
+		// (DEF-4): delimited-text profiles get FORMAT 'TEXT' (delimiter ','),
+		// bridge-serialized profiles the pxfwritable_export CUSTOM clause.
 		return assembleExternalTableDDL(job.Name, pxf.TargetTable, location,
-			pxfWriteFormatClause, true /* writable */, nil), nil
+			PXFWriteFormatClause(pxf.Profile), true /* writable */, nil), nil
 	}
 
 	return assembleExternalTableDDL(job.Name, pxf.TargetTable, location,

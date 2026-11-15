@@ -40,8 +40,9 @@ import (
 // It proves, per available service:
 //   1. the Scenario 99 EXPORT TARGETS exist + are writable (the JDBC export_target
 //      table prepared by gen-export-targets.sh; the S3/HDFS export prefixes),
-//   2. the operator's BUILT writable-export Job DDL carries the writable formatter
-//      FORMATTER='pxfwritable_export' for each FE.* target.
+//   2. the operator's BUILT writable-export Job DDL carries the per-profile write
+//      clause (DEF-4: FORMAT 'TEXT' (delimiter ',') for s3:text/hdfs:text;
+//      FORMATTER='pxfwritable_export' for jdbc) for each FE.* target.
 //
 // Targets/formats that cannot be synthesized locally (parquet/avro write tooling,
 // DATA_SCHEMA) are reported [CONFIG-ONLY]. The live "data lands" proof (object/
@@ -237,8 +238,9 @@ func (s *Scenario99ExportSuite) TestIntegration_Scenario99_HDFSExportDirWritable
 
 // TestIntegration_Scenario99_BuiltDDLCarriesFormatter binds the FE.* catalog to
 // the staged export targets: for each WRITABLE export catalog row, the
-// operator-built load Job DDL must carry the writable formatter
-// FORMATTER='pxfwritable_export'. This proves the operator's generated SQL would
+// operator-built load Job DDL must carry the per-profile write clause (DEF-4:
+// FORMAT 'TEXT' (delimiter ',') for s3:text/hdfs:text; FORMATTER=
+// 'pxfwritable_export' for jdbc). This proves the operator's generated SQL would
 // export to the exact target the integration env stages. Gated to run only when
 // SOME export-target service is up, matching the integration contract.
 func (s *Scenario99ExportSuite) TestIntegration_Scenario99_BuiltDDLCarriesFormatter() {
@@ -266,8 +268,9 @@ func (s *Scenario99ExportSuite) TestIntegration_Scenario99_BuiltDDLCarriesFormat
 			require.NotNil(s.T(), out)
 			script := out.Spec.Template.Spec.Containers[0].Args[0]
 
-			assert.Containsf(s.T(), script, cases.Scenario99WritableFormatter,
-				"%s built export DDL must carry the writable formatter", tc.ID)
+			assert.Containsf(s.T(), script, builder.PXFWriteFormatClause(tc.Profile),
+				"%s built export DDL must carry the per-profile write clause %q", tc.ID,
+				builder.PXFWriteFormatClause(tc.Profile))
 			// SF.1 additionally carries the WHERE script delta.
 			if tc.Expected == cases.Scenario99ExpectFilteredExport {
 				assert.Containsf(s.T(), script, cases.Scenario99WhereFragment,

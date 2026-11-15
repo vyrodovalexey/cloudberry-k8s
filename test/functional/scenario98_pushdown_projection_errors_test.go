@@ -330,7 +330,10 @@ func (s *Scenario98Suite) TestFunctional_Scenario98_ErrorHandling() {
 		job.PxfJob.Mode = "writable"
 		script := s.scenario98JobScript(cluster, job)
 		assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-		assert.Contains(s.T(), script, "pxfwritable_export")
+		// DEF-4: s3:text exports via FORMAT 'TEXT' (delimiter ','), not the
+		// pxfwritable_export bridge.
+		assert.Contains(s.T(), script, builder.PXFWriteFormatClause("s3:text"))
+		assert.NotContains(s.T(), script, "pxfwritable_export")
 		assert.NotContains(s.T(), script, "LOG ERRORS")
 		assert.NotContains(s.T(), script, "SEGMENT REJECT LIMIT")
 	})

@@ -210,7 +210,8 @@ func (s *Scenario97E2ESuite) TestE2E_Scenario97_PartA_ContractHonest() {
 				require.NotNilf(s.T(), out, "%s writable Job", tc.ID)
 				script := out.Spec.Template.Spec.Containers[0].Args[0]
 				assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-				assert.Contains(s.T(), script, "pxfwritable_export")
+				// DEF-4: per-profile write clause (hdfs:text → TEXT; seq → bridge).
+				assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.Profile))
 				assert.NotContains(s.T(), script, "LOG ERRORS")
 
 			case cases.Scenario97ExpectRenderOK:

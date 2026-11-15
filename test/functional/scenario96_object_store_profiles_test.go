@@ -352,10 +352,12 @@ func (s *Scenario96Suite) TestFunctional_Scenario96_WritableAdmitAndExportDDL() 
 			_, err := s.validator.ValidateCreate(s.ctx, cluster)
 			require.NoErrorf(s.T(), err, "%s writable %s must be admitted", tc.id, tc.profile)
 
-			// The operator builds the WRITABLE export Job.
+			// The operator builds the WRITABLE export Job with the per-profile
+			// write clause (DEF-4: s3:text → FORMAT 'TEXT' (delimiter ',');
+			// parquet/avro → pxfwritable_export).
 			script := s.scenario96JobScript(cluster, job)
 			assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-			assert.Contains(s.T(), script, "pxfwritable_export")
+			assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.profile))
 			assert.NotContains(s.T(), script, "pxfwritable_import")
 			// Writable tables take no reject limit → no LOG ERRORS.
 			assert.NotContains(s.T(), script, "LOG ERRORS")
@@ -475,14 +477,15 @@ func (s *Scenario96Suite) TestFunctional_Scenario96_CatalogHonest() {
 				assert.Contains(s.T(), err.Error(), "write-unsupported")
 
 			case cases.Scenario96ExpectAdmitWrite:
-				// Writable success rows: WRITABLE export DDL + admit.
+				// Writable success rows: WRITABLE export DDL with the
+				// per-profile write clause (DEF-4) + admit.
 				job := scenario96WriteJob(tc.ID, tc.Profile, tc.Server)
 				admitCluster := scenario96AdmissionCluster("s96-cat-"+
 					strings.ToLower(strings.ReplaceAll(tc.ID, ".", "-")), job)
 				_, err := s.validator.ValidateCreate(s.ctx, admitCluster)
 				require.NoErrorf(s.T(), err, "%s must be admitted", tc.ID)
 				script := s.scenario96JobScript(admitCluster, job)
-				assert.Contains(s.T(), script, "pxfwritable_export")
+				assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.Profile))
 				assert.Contains(s.T(), script, "PROFILE="+tc.Profile)
 
 			case cases.Scenario96ExpectAdmitRead:

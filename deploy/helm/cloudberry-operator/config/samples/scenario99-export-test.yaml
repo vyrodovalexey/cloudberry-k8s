@@ -20,8 +20,9 @@
 # JOBS (mode: writable export). The operator's export job reads FROM targetTable
 # (a SOURCE table in the cluster the e2e/deploy seeds, e.g. public.export_src) and
 # writes TO the external store named by resource/server. The generated DDL is a
-# WRITABLE EXTERNAL TABLE with FORMATTER='pxfwritable_export' and the reversed
-# INSERT (INSERT INTO <writable_ext> SELECT * FROM <targetTable>).
+# WRITABLE EXTERNAL TABLE with the per-profile write clause (DEF-4: text profiles
+# → FORMAT 'TEXT' (delimiter ','); jdbc → FORMATTER='pxfwritable_export') and the
+# reversed INSERT (INSERT INTO <writable_ext> SELECT * FROM <targetTable>).
 #   FE.9   s3-export          : s3:text writable → cloudberry-warehouse/exports/s3/
 #   FE.10  hdfs-export        : hdfs:text writable → /data-lake/exports/hdfs/
 #   FE.11  jdbc-export        : jdbc writable → export_target (pgsource table)
@@ -30,8 +31,9 @@
 #
 # HONESTY: NO bytes_transferred metric is implied (it stays PLANNED — PXF has no
 # honest external-bytes counter). The proofs are object/file/row LANDING (S3 list,
-# WebHDFS LISTSTATUS, JDBC count(*)) + the FORMATTER='pxfwritable_export' DDL
-# clause + the load Job status (cloudberry_data_loading_job_status / rows_total).
+# WebHDFS LISTSTATUS, JDBC count(*)) + the per-profile write DDL clause
+# (FORMAT 'TEXT' (delimiter ',') for text, FORMATTER='pxfwritable_export' for
+# jdbc) + the load Job status (cloudberry_data_loading_job_status / rows_total).
 # =============================================================================
 apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
@@ -239,7 +241,8 @@ spec:
     jobs:
       # --- FE.9 / WE.1 S3 WRITABLE EXPORT (s3:text) ---
       # Exports public.export_src TO cloudberry-warehouse/exports/s3/ as text.
-      # DDL = CREATE WRITABLE EXTERNAL TABLE ... FORMATTER='pxfwritable_export'.
+      # DDL = CREATE WRITABLE EXTERNAL TABLE ... FORMAT 'TEXT' (delimiter ',')
+      # (DEF-4: the live-proven PXF 2.2.0 text write clause).
       - name: s3-export
         type: pxf
         enabled: true

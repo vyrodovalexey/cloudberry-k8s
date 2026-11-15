@@ -645,10 +645,12 @@ func TestErrorHandlingClause_FE12Matrix(t *testing.T) {
 
 // TestBuildExternalTableDDL_Writable is the byte-exact WRITABLE-DDL matrix
 // (Scenario 96, FF.1-FF.3). A mode=writable PXF job emits a CREATE WRITABLE
-// EXTERNAL TABLE with FORMATTER='pxfwritable_export' and NO LOG ERRORS / SEGMENT
-// REJECT LIMIT suffix — even when ErrorHandling is configured (writable tables
-// take no reject limit, so it must be skipped). The LOCATION is byte-correct per
-// profile×scheme (s3/gs/abfss/wasbs).
+// EXTERNAL TABLE with the per-profile write FORMAT clause (DEF-4: delimited
+// text profiles get FORMAT 'TEXT' (delimiter ',') — the live-proven PXF 2.2.0
+// shape — bridge-serialized profiles keep FORMATTER='pxfwritable_export') and
+// NO LOG ERRORS / SEGMENT REJECT LIMIT suffix — even when ErrorHandling is
+// configured (writable tables take no reject limit, so it must be skipped).
+// The LOCATION is byte-correct per profile×scheme (s3/gs/abfss/wasbs).
 func TestBuildExternalTableDDL_Writable(t *testing.T) {
 	cluster := dataLoadDDLCluster(8080)
 
@@ -658,6 +660,10 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 		want string
 	}{
 		{
+			// FF.1 (Scenario 96) — s3:text writable export. DEF-4: delimited
+			// text writables use FORMAT 'TEXT' (delimiter ',') — the clause
+			// live-proven on PXF 2.2.0 by TASK-U019 (§4 matrix; the bridge
+			// formatter fails with a LineBreakAccessor ClassCastException).
 			name: "FF.1 s3:text writable export",
 			job: cbv1alpha1.DataLoadingJob{
 				Name: "s3-text-export",
@@ -672,7 +678,7 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			},
 			want: "CREATE WRITABLE EXTERNAL TABLE \"cbk_dataload_ext_s3_text_export\" (LIKE \"public\".\"events\")\n" +
 				"LOCATION ('pxf://s3a://data-lake/exports/?PROFILE=s3:text&SERVER=s3-datalake')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
+				"FORMAT 'TEXT' (delimiter ',');",
 		},
 		{
 			name: "FF.2 s3:parquet writable export",
@@ -711,7 +717,8 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 		{
 			// ErrorHandling is set but MUST be skipped for the writable path: a
 			// writable external table cannot carry LOG ERRORS / SEGMENT REJECT
-			// LIMIT, so the suffix is omitted and the DDL ends at the FORMAT.
+			// LIMIT, so the suffix is omitted and the DDL ends at the FORMAT
+			// clause (here the DEF-4 text clause; s3:text is a text profile).
 			name: "writable skips error-handling reject limit",
 			job: cbv1alpha1.DataLoadingJob{
 				Name: "s3-text-eh",
@@ -731,7 +738,7 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			},
 			want: "CREATE WRITABLE EXTERNAL TABLE \"cbk_dataload_ext_s3_text_eh\" (LIKE \"t\")\n" +
 				"LOCATION ('pxf://s3a://b/exports/?PROFILE=s3:text&SERVER=s3-datalake')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
+				"FORMAT 'TEXT' (delimiter ',');",
 		},
 		{
 			// Case-insensitive Mode match (EqualFold) still selects the writable
@@ -753,7 +760,8 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
 		},
 		// CFG.* / OS.* LOCATION-correctness rows: byte-exact LOCATION per
-		// profile×scheme. text is writable for every object-store scheme.
+		// profile×scheme. text is writable for every object-store scheme (and
+		// per DEF-4 takes the FORMAT 'TEXT' write clause on each of them).
 		{
 			name: "gs:text writable LOCATION correct",
 			job: cbv1alpha1.DataLoadingJob{
@@ -769,7 +777,7 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			},
 			want: "CREATE WRITABLE EXTERNAL TABLE \"cbk_dataload_ext_gs_text\" (LIKE \"t\")\n" +
 				"LOCATION ('pxf://gs://bucket/exports/?PROFILE=gs:text&SERVER=gcs-datalake')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
+				"FORMAT 'TEXT' (delimiter ',');",
 		},
 		{
 			name: "abfss:parquet writable LOCATION correct",
@@ -803,7 +811,7 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			},
 			want: "CREATE WRITABLE EXTERNAL TABLE \"cbk_dataload_ext_wasbs_text\" (LIKE \"t\")\n" +
 				"LOCATION ('pxf://wasbs://container@acct.blob.core.windows.net/out/?PROFILE=wasbs:text&SERVER=azure-blob')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
+				"FORMAT 'TEXT' (delimiter ',');",
 		},
 		// FF.7 (Scenario 97) — hdfs:SequenceFile writable SUCCEEDS: a CREATE
 		// WRITABLE EXTERNAL TABLE with pxfwritable_export and NO LOG ERRORS suffix.
@@ -826,7 +834,9 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 				"LOCATION ('pxf:///warehouse/exports/events?PROFILE=hdfs:SequenceFile&SERVER=hadoop-cluster')\n" +
 				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
 		},
-		// FF.7t/7p/7a (Scenario 97) — hdfs:text/parquet/avro writable also SUCCEED.
+		// FF.7t (Scenario 97) — hdfs:text writable SUCCEEDS with the DEF-4
+		// text write clause (live-proven shape on PXF 2.2.0 by TASK-U019: the
+		// bridge formatter fails at LineBreakAccessor.writeNextObject).
 		{
 			name: "FF.7t hdfs:text writable export",
 			job: cbv1alpha1.DataLoadingJob{
@@ -842,7 +852,7 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			},
 			want: "CREATE WRITABLE EXTERNAL TABLE \"cbk_dataload_ext_hdfs_text_export\" (LIKE \"t\")\n" +
 				"LOCATION ('pxf:///warehouse/exports/text?PROFILE=hdfs:text&SERVER=hadoop-cluster')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
+				"FORMAT 'TEXT' (delimiter ',');",
 		},
 	}
 
@@ -857,7 +867,15 @@ func TestBuildExternalTableDDL_Writable(t *testing.T) {
 			assert.NotContains(t, got, "SEGMENT REJECT LIMIT")
 			assert.NotContains(t, got, "LOG ERRORS")
 			assert.Contains(t, got, "CREATE WRITABLE EXTERNAL TABLE")
-			assert.Contains(t, got, "pxfwritable_export")
+			// Per-profile write clause (DEF-4): bridge-serialized profiles carry
+			// pxfwritable_export; delimited-text profiles carry the TEXT clause
+			// and must NOT carry the bridge formatter.
+			if strings.Contains(tc.want, pxfWriteFormatClause) {
+				assert.Contains(t, got, pxfWriteFormatClause)
+			} else {
+				assert.Contains(t, got, pxfTextWriteFormatClause)
+				assert.NotContains(t, got, "pxfwritable_export")
+			}
 			assert.NotContains(t, got, "pxfwritable_import")
 
 			// Determinism: same input => byte-identical output.
@@ -1042,8 +1060,9 @@ func TestBuildExternalTableDDL_GpfdistPortDefault(t *testing.T) {
 // schema size is 3", live-verified on the U015 acceptance cluster), so the
 // DDL must declare FORMAT 'CSV' instead (live-verified to parse 1000/1000
 // rows over the same s3:text dataset). Bridge-serialized profiles (hive:*,
-// bare jdbc/hbase, parquet/avro/json/orc) and the WRITABLE export path keep
-// the custom formatters.
+// bare jdbc/hbase, parquet/avro/json/orc) keep the custom import formatter;
+// the WRITABLE export path is profile-aware since DEF-4 (see
+// TestBuildPXFExternalTableDDL_DelimitedTextWriteFormatIsText).
 func TestBuildPXFExternalTableDDL_DelimitedTextReadFormatIsCSV(t *testing.T) {
 	cluster := dataLoadDDLCluster(0)
 
@@ -1108,9 +1127,12 @@ func TestBuildPXFExternalTableDDL_DelimitedTextReadFormatIsCSV(t *testing.T) {
 		})
 	}
 
-	// The WRITABLE export path is unchanged by DEF-1 (no live evidence against
-	// pxfwritable_export; exports were proven live in Scenario 99).
-	t.Run("text writable export keeps custom formatter", func(t *testing.T) {
+	// The WRITABLE export path for text is now covered by DEF-4 (TASK-U019
+	// live-proved the bridge formatter FAILS at the PXF server): the write
+	// clause is FORMAT 'TEXT' (delimiter ','), NOT the pxfwritable_export
+	// bridge and NOT the read-side FORMAT 'CSV'. Regression-guarded in full in
+	// TestBuildPXFExternalTableDDL_DelimitedTextWriteFormatIsText.
+	t.Run("text writable export uses the DEF-4 text clause", func(t *testing.T) {
 		job := cbv1alpha1.DataLoadingJob{
 			Name: "def1-w", Type: "pxf",
 			PxfJob: &cbv1alpha1.PxfJobSpec{
@@ -1120,9 +1142,158 @@ func TestBuildPXFExternalTableDDL_DelimitedTextReadFormatIsCSV(t *testing.T) {
 		}
 		got, err := buildExternalTableDDL(cluster, job)
 		require.NoError(t, err)
-		assert.Contains(t, got, pxfWriteFormatClause)
+		assert.Contains(t, got, pxfTextWriteFormatClause)
+		assert.NotContains(t, got, pxfWriteFormatClause)
 		assert.NotContains(t, got, "FORMAT 'CSV'")
 	})
+}
+
+// TestPXFWriteFormatClause_Matrix is the helper-level per-profile matrix for
+// the DEF-4 fix (TASK-U029): PXFWriteFormatClause — the exported single source
+// of truth the functional/e2e/perf suites assert against — must map every
+// delimited-text (and csv) suffix profile on a non-hive scheme to the
+// live-proven FORMAT 'TEXT' (delimiter ',') write clause, and every
+// bridge-serialized writable profile (parquet/avro/sequencefile, bare jdbc) to
+// the unchanged pxfwritable_export CUSTOM clause.
+func TestPXFWriteFormatClause_Matrix(t *testing.T) {
+	for _, profile := range []string{
+		"s3:text", "gs:text", "abfss:text", "wasbs:text", "hdfs:text",
+		"s3:csv", "S3:TEXT", "HDFS:Text",
+	} {
+		profile := profile
+		t.Run("text write "+profile, func(t *testing.T) {
+			assert.Equal(t, pxfTextWriteFormatClause, PXFWriteFormatClause(profile))
+		})
+	}
+	for _, profile := range []string{
+		"s3:parquet", "s3:avro", "hdfs:sequencefile", "hdfs:SequenceFile", "jdbc",
+	} {
+		profile := profile
+		t.Run("bridge write "+profile, func(t *testing.T) {
+			assert.Equal(t, pxfWriteFormatClause, PXFWriteFormatClause(profile))
+		})
+	}
+	// hive is excluded (read-only scheme, never writable): the bridge clause is
+	// the honest upstream contract for it, mirroring PXFReadFormatClause.
+	t.Run("hive:text keeps the bridge clause", func(t *testing.T) {
+		assert.Equal(t, pxfWriteFormatClause, PXFWriteFormatClause("hive:text"))
+	})
+}
+
+// TestBuildPXFExternalTableDDL_DelimitedTextWriteFormatIsText is the DEF-4
+// regression test (TASK-U029, anchored to TASK-U019's live-proven DDL): a
+// WRITE/export job for a delimited-text source (the s3/gs/abfss/wasbs/hdfs
+// "text" profiles) must NOT emit FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')
+// — on PXF 2.2.0 the text writer's LineBreakAccessor throws
+// "class java.lang.Integer cannot be cast to class [B" and only 0-byte marker
+// objects are created (U019 evidence 07/08, s3_text_bridge/hdfs_text_bridge
+// probes) — so the DDL must declare FORMAT 'TEXT' (delimiter ',') instead: the
+// clause that wrote and read back 175,000 rows with exact two-direction set
+// equality on BOTH s3:text and hdfs:text (U019 §4 matrix). Bridge-serialized
+// profiles (parquet/avro/sequencefile, bare jdbc) keep the CUSTOM export
+// formatter (live-proven 3×+1 by U019), and the READ path is untouched (no
+// regression on the DEF-1 FORMAT 'CSV' fix).
+func TestBuildPXFExternalTableDDL_DelimitedTextWriteFormatIsText(t *testing.T) {
+	cluster := dataLoadDDLCluster(0)
+
+	// Delimited-text write profiles across every non-hive scheme (+ case
+	// insensitivity) must emit the TEXT clause and never the CUSTOM bridge.
+	// This is the exact regression shape of the U019 bridge-probe failure.
+	for _, profile := range []string{
+		"s3:text", "gs:text", "abfss:text", "wasbs:text", "hdfs:text", "S3:TEXT",
+	} {
+		profile := profile
+		t.Run("text write "+profile, func(t *testing.T) {
+			job := cbv1alpha1.DataLoadingJob{
+				Name: "def4", Type: "pxf",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server: "srv", Profile: profile,
+					Resource: "s3a://b/out.csv", TargetTable: "public.t",
+					Mode: "writable",
+				},
+			}
+			got, err := buildExternalTableDDL(cluster, job)
+			require.NoError(t, err)
+			assert.Contains(t, got, "CREATE WRITABLE EXTERNAL TABLE")
+			assert.Contains(t, got, pxfTextWriteFormatClause,
+				"%s is a delimited-text profile; the bridge formatter fails at the PXF server on 2.2.0 (DEF-4)", profile)
+			assert.NotContains(t, got, "FORMAT 'CUSTOM'",
+				"%s text export must not use the pxfwritable_export bridge (DEF-4)", profile)
+			assert.NotContains(t, got, "pxfwritable_export")
+			assert.NotContains(t, got, "pxfwritable_import")
+			// Writable DDL still takes no reject-limit suffix.
+			assert.NotContains(t, got, "SEGMENT REJECT LIMIT")
+			assert.NotContains(t, got, "LOG ERRORS")
+		})
+	}
+
+	// Bridge-serialized write profiles keep the pxfwritable_export custom
+	// formatter (parquet/avro/sequencefile live-proven by U019's 7/7 matrix;
+	// bare jdbc mints bridge records through SQLQueryBuilder).
+	for _, profile := range []string{"s3:parquet", "s3:avro", "hdfs:sequencefile", "jdbc"} {
+		profile := profile
+		t.Run("bridge write "+profile, func(t *testing.T) {
+			job := cbv1alpha1.DataLoadingJob{
+				Name: "def4-bridge", Type: "pxf",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server: "srv", Profile: profile,
+					Resource: "res", TargetTable: "public.t",
+					Mode: "writable",
+				},
+			}
+			got, err := buildExternalTableDDL(cluster, job)
+			require.NoError(t, err)
+			assert.Contains(t, got, pxfWriteFormatClause)
+			assert.NotContains(t, got, pxfTextWriteFormatClause)
+		})
+	}
+
+	// NEGATIVE — no regression on the READ path (DEF-1): the same text
+	// profiles on a read/import job still emit FORMAT 'CSV', never the TEXT
+	// write clause and never the import bridge.
+	for _, profile := range []string{"s3:text", "hdfs:text"} {
+		profile := profile
+		t.Run("text read unchanged "+profile, func(t *testing.T) {
+			job := cbv1alpha1.DataLoadingJob{
+				Name: "def4-read", Type: "pxf",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server: "srv", Profile: profile,
+					Resource: "s3a://b/data.csv", TargetTable: "public.t",
+				},
+			}
+			got, err := buildExternalTableDDL(cluster, job)
+			require.NoError(t, err)
+			assert.Contains(t, got, "FORMAT 'CSV'")
+			assert.NotContains(t, got, pxfTextWriteFormatClause)
+			assert.NotContains(t, got, "pxfwritable_import")
+		})
+	}
+}
+
+// TestBuildDataLoadScript_DelimitedTextExportEmitsTextFormat asserts the DEF-4
+// fix reaches the LOAD SCRIPT the export Job actually runs (not just the DDL
+// helper): the psql heredoc body of a writable s3:text job must create the
+// WRITABLE external table with FORMAT 'TEXT' (delimiter ',') and never the
+// pxfwritable_export bridge formatter.
+func TestBuildDataLoadScript_DelimitedTextExportEmitsTextFormat(t *testing.T) {
+	cluster := dataLoadDDLCluster(0)
+	job := cbv1alpha1.DataLoadingJob{
+		Name: "s3-text-export", Type: "pxf",
+		PxfJob: &cbv1alpha1.PxfJobSpec{
+			Server: "s3-datalake", Profile: "s3:text",
+			Resource: "cloudberry-data/exports/out", TargetTable: "public.events",
+			Mode: "writable",
+		},
+	}
+	script, err := buildDataLoadScript(cluster, job)
+	require.NoError(t, err)
+	assert.Contains(t, script, "CREATE WRITABLE EXTERNAL TABLE")
+	assert.Contains(t, script, pxfTextWriteFormatClause)
+	assert.NotContains(t, script, "FORMAT 'CUSTOM'")
+	assert.NotContains(t, script, "pxfwritable_export")
+	// The export INSERT direction is unchanged (reversed).
+	assert.Contains(t, script,
+		"INSERT INTO \"cbk_dataload_ext_s3_text_export\" SELECT * FROM \"public\".\"events\"")
 }
 
 // TestBuildDataLoadScript_DelimitedTextJobEmitsCSVFormat asserts the DEF-1 fix

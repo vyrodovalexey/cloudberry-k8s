@@ -302,10 +302,12 @@ func (s *Scenario97Suite) TestFunctional_Scenario97_WritableSequenceFile() {
 			_, err := s.validator.ValidateCreate(s.ctx, cluster)
 			require.NoErrorf(s.T(), err, "%s writable %s must be admitted", tc.id, tc.profile)
 
-			// The operator builds the WRITABLE export Job.
+			// The operator builds the WRITABLE export Job with the per-profile
+			// write clause (DEF-4: hdfs:text → FORMAT 'TEXT' (delimiter ',');
+			// hdfs:sequencefile → pxfwritable_export).
 			script := s.scenario97JobScript(cluster, job)
 			assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-			assert.Contains(s.T(), script, "pxfwritable_export")
+			assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.profile))
 			assert.NotContains(s.T(), script, "pxfwritable_import")
 			// Writable tables take no reject limit → no LOG ERRORS.
 			assert.NotContains(s.T(), script, "LOG ERRORS")
@@ -395,14 +397,15 @@ func (s *Scenario97Suite) TestFunctional_Scenario97_CatalogHonest() {
 					"%s builder must refuse writable DDL", tc.ID)
 
 			case cases.Scenario97ExpectAdmitWrite:
-				// Writable success rows: WRITABLE export DDL + admit.
+				// Writable success rows: WRITABLE export DDL with the
+				// per-profile write clause (DEF-4) + admit.
 				job := scenario97WriteJob(tc.ID, tc.Profile, tc.Server)
 				admitCluster := scenario97Cluster("s97-cat-"+
 					strings.ToLower(strings.ReplaceAll(tc.ID, ".", "-")), job)
 				_, err := s.validator.ValidateCreate(s.ctx, admitCluster)
 				require.NoErrorf(s.T(), err, "%s must be admitted", tc.ID)
 				script := s.scenario97JobScript(admitCluster, job)
-				assert.Contains(s.T(), script, "pxfwritable_export")
+				assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.Profile))
 				assert.Contains(s.T(), script, "PROFILE="+tc.Profile)
 				assert.NotContains(s.T(), script, "LOG ERRORS")
 

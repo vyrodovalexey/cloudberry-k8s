@@ -35,9 +35,10 @@ import (
 //
 //   PART A (infra-free, ALWAYS runs): iterate cases.Scenario99Cases() and assert
 //     the documented contract via the REAL builder/validator WITHOUT a cluster —
-//     the writable DDL carries FORMATTER='pxfwritable_export', the export INSERT
-//     is reversed (INSERT INTO <ext> SELECT * FROM <target>), SF.1 carries the
-//     WHERE, and SF.2 is DENIED at admission (W.17).
+//     the writable DDL carries the per-profile write clause (DEF-4: FORMAT
+//     'TEXT' (delimiter ',') for s3:text/hdfs:text, FORMATTER='pxfwritable_export'
+//     for jdbc), the export INSERT is reversed (INSERT INTO <ext> SELECT * FROM
+//     <target>), SF.1 carries the WHERE, and SF.2 is DENIED at admission (W.17).
 //
 //   PART B (KUBECONFIG-gated live; heavy live data behind
 //     SCENARIO99_EXPORT_LIVE=1): against the deployed export-test cluster in
@@ -51,8 +52,9 @@ import (
 //       - FE.11 JDBC EXPORT (strongest, deterministic): jdbc writable export →
 //         assert ROWS appear in pgsource sourcedb.export_target (count(*)>0,
 //         matching the exported source rows).
-//       - WE.2: for each, verify FORMATTER='pxfwritable_export' in the created ext
-//         table + the landed data format.
+//       - WE.2: for each, verify the per-profile write clause in the created ext
+//         table (DEF-4: TEXT for the text exports; pxfwritable_export for jdbc)
+//         + the landed data format.
 //       - SF.1: filtered export (sourceFilter region='us-east') → FEWER rows than
 //         the unfiltered baseline (row-count comparison on the JDBC target).
 //       - SF.2: a read job with sourceFilter (and a writable job with ';') →
@@ -254,8 +256,10 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_PartA_ContractHonest() {
 
 			assert.Containsf(s.T(), script, tc.DDLContains,
 				"%s built DDL must carry %q", tc.ID, tc.DDLContains)
-			assert.Containsf(s.T(), script, cases.Scenario99WritableFormatter,
-				"%s writable export must use the export formatter", tc.ID)
+			// DEF-4: per-profile write clause (text → FORMAT 'TEXT'
+			// (delimiter ','); jdbc → pxfwritable_export).
+			assert.Containsf(s.T(), script, builder.PXFWriteFormatClause(tc.Profile),
+				"%s writable export must use the per-profile write clause", tc.ID)
 			assert.NotContains(s.T(), script, "pxfwritable_import",
 				"%s must be an export, not an import", tc.ID)
 
@@ -413,14 +417,16 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveJDBCExport() {
 	// Create the writable jdbc external table over the pgsource export_target and
 	// export the full source. The export_target table is prepared (empty) by
 	// gen-export-targets.sh; truncate it first for a deterministic count.
+	// jdbc is a bridge-serialized profile, so its write clause stays the
+	// pxfwritable_export CUSTOM form (per-profile per DEF-4).
 	ext := "s99_fe11_jdbc_export_ext"
 	loc := "pxf://" + cases.Scenario99JDBCExportResource +
 		"?PROFILE=jdbc&SERVER=" + cases.Scenario99ServerPostgresSource
 	createDDL := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
-			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')",
-		ext, ext, src, loc)
+			"%s",
+		ext, ext, src, loc, builder.PXFWriteFormatClause("jdbc"))
 	if out, err := s.scenario99PSQL(createDDL); err != nil {
 		s.T().Skipf("FE.11 could not create writable jdbc ext table: %v (out=%s) [CONFIG-ONLY]",
 			err, out)
@@ -487,11 +493,14 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveS3Export() {
 	ext := "s99_fe9_s3_export_ext"
 	loc := "pxf://" + cases.Scenario99S3ExportResource +
 		"?PROFILE=s3:text&SERVER=" + cases.Scenario99ServerMinioWarehouse
+	// DEF-4: the s3:text writable table is created with FORMAT 'TEXT'
+	// (delimiter ',') — the live-proven PXF 2.2.0 clause — from the SAME
+	// source of truth the operator's builder uses.
 	createDDL := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
-			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')",
-		ext, ext, src, loc)
+			"%s",
+		ext, ext, src, loc, builder.PXFWriteFormatClause("s3:text"))
 	if out, err := s.scenario99PSQL(createDDL); err != nil {
 		s.T().Skipf("FE.9 could not create writable s3 ext table: %v (out=%s) [CONFIG-ONLY]",
 			err, out)
@@ -534,11 +543,13 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveHDFSExport() {
 	ext := "s99_fe10_hdfs_export_ext"
 	loc := "pxf://" + cases.Scenario99HDFSExportResource +
 		"?PROFILE=hdfs:text&SERVER=" + cases.Scenario99ServerHadoopCluster
+	// DEF-4: hdfs:text mirrors s3:text — the proven FORMAT 'TEXT'
+	// (delimiter ',') write clause from the builder's source of truth.
 	createDDL := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
-			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')",
-		ext, ext, src, loc)
+			"%s",
+		ext, ext, src, loc, builder.PXFWriteFormatClause("hdfs:text"))
 	if out, err := s.scenario99PSQL(createDDL); err != nil {
 		s.T().Skipf("FE.10 could not create writable hdfs ext table: %v (out=%s) [CONFIG-ONLY]",
 			err, out)
