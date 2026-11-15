@@ -6,7 +6,7 @@
 #   - Scenario 71 backup block: S3 destination with Vault-sourced credentials
 #
 # Components:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl)
@@ -26,8 +26,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "93"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -169,7 +169,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO
@@ -247,7 +247,7 @@ spec:
   backup:
     enabled: true
     schedule: "0 2 * * *"
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

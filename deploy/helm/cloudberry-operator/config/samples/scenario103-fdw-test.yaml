@@ -3,14 +3,14 @@
 # =============================================================================
 # Acceptance-test cluster proving the FDW loading path is EQUIVALENT to the
 # external-table loading path over the SAME MinIO s3 dataset:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions; the
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions; the
 #     pxf_fdw wrappers s3_pxf_fdw/jdbc_pxf_fdw/... are registered — live-verified)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth + Vault KV secrets
 #   - Query monitoring: postgres-exporter on segments+mirrors+coordinator
 #     + cloudberry-query-exporter
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - deletionPolicy Retain
 #
 #   - dataLoading.pxf with ONE s3 server (s3-datalake) pointing at the MinIO s3
@@ -49,8 +49,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "103"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -176,7 +176,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

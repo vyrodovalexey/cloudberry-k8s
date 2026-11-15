@@ -11,8 +11,8 @@
 #
 # Topology mirrors scenario99-export-test: HA coord+standby, 2 segments mirrored
 # (group), Vault-PKI TLS, OIDC, postgres-exporter on segments+mirrors,
-# cloudberry-query-exporter, Vault k8s auth, DB cloudberry-official-pxf:2.1.0,
-# PXF sidecar cloudberry-pxf:2.1.0. Namespace cloudberry-test.
+# cloudberry-query-exporter, Vault k8s auth, DB cloudberry-official-pxf:2.2.0,
+# PXF sidecar cloudberry-pxf:2.2.0. Namespace cloudberry-test.
 # =============================================================================
 apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
@@ -23,8 +23,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "106"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -150,7 +150,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

@@ -2,7 +2,7 @@
 # Scenario 93 — Acceptance Test: Multi-Server PXF + HA + Vault PKI + Monitoring
 # =============================================================================
 # Full acceptance-test cluster with:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl)
@@ -12,7 +12,7 @@
 #   - deletionPolicy Retain
 #   - dataLoading.pxf with 6 servers covering ALL source types:
 #     s3, hdfs, jdbc(mysql), jdbc(postgres), hive, hbase
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - A pxf data-load job for s3 server proof
 # =============================================================================
 apiVersion: avsoft.io/v1alpha1
@@ -24,8 +24,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "93"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -151,7 +151,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

@@ -52,8 +52,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "85"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -182,7 +182,7 @@ spec:
   # nextScheduleTime). 10MB/4 multipart mirrors the live script's s3 plugin config.
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"            # ships gpbackman for 85d cleanup
+    image: "cloudberry-backup:2.2.0"            # ships gpbackman for 85d cleanup
     schedule: "0 2 * * *"                        # 85g: operator reconciles a CronJob
     retention:
       fullCount: 3

@@ -15,7 +15,7 @@
 #   #   gpbackup ... --single-data-file --copy-queue-size 4
 #   # and, per gpbackup rules, OMITS --jobs in single-data-file mode.
 #   # --single-data-file requires gpbackup_helper on every segment host; it is
-#   # shipped in cloudberry-official:2.1.0 at $GPHOME/bin/gpbackup_helper.
+#   # shipped in cloudberry-official:2.2.0 at $GPHOME/bin/gpbackup_helper.
 #   POST /api/v1alpha1/clusters/scenario74/backups?namespace=cloudberry-test
 #     body: {"type":"full","databases":["mydb"],
 #            "gpbackupOptions":{"singleDataFile":true,"copyQueueSize":4}}
@@ -57,8 +57,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "74"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -187,7 +187,7 @@ spec:
   backup:
     enabled: true
     schedule: "0 2 * * *"
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

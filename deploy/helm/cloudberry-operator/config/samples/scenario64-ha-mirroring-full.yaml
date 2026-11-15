@@ -15,8 +15,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "64"
 spec:
-  version: "2.1.0"
-  image: "cloudberrydb/cloudberry:2.1.0"
+  version: "2.2.0"
+  image: "cloudberrydb/cloudberry:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:

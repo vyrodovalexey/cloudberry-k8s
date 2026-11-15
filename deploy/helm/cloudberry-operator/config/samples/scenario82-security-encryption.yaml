@@ -107,8 +107,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "82"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -239,7 +239,7 @@ spec:
   # resource. Encryption is flipped to "off" live by patching the CR (82d).
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

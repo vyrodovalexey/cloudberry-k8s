@@ -4,7 +4,7 @@
 # Writable-export acceptance cluster modeled on scenario93-acceptance-test
 # (HA coord+standby, 2 segments mirrored group, Vault-PKI TLS, OIDC,
 # postgres-exporter on segments+mirrors, cloudberry-query-exporter, Vault k8s
-# auth, DB cloudberry-official-pxf:2.1.0, PXF sidecar cloudberry-pxf:2.1.0,
+# auth, DB cloudberry-official-pxf:2.2.0, PXF sidecar cloudberry-pxf:2.2.0,
 # deletionPolicy Retain).
 #
 # Cluster name is "export-test" (NOT acceptance-test) so it does not clash with
@@ -42,8 +42,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "99"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -169,7 +169,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

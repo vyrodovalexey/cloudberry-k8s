@@ -144,8 +144,8 @@ metadata:
   annotations:
     avsoft.io/recovery: full
 spec:
-  image: "cloudberrydb/cloudberry:2.1.0"
-  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.2.0"
+  version: "2.2.0"
   coordinator:
     resources:
       requests:

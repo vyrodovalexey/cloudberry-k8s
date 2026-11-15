@@ -30,8 +30,8 @@ metadata:
     scenario: "87"
     role: source
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -155,7 +155,7 @@ spec:
 
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     gpbackup:
       compressionType: zstd
       compressionLevel: 1
@@ -191,8 +191,8 @@ metadata:
     scenario: "87"
     role: target
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -316,7 +316,7 @@ spec:
 
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     gpbackup:
       compressionType: zstd
       compressionLevel: 1

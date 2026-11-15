@@ -3,14 +3,14 @@
 # =============================================================================
 # Full cluster (modeled on scenario93-acceptance-test.yaml) that exercises the
 # kafka custom-connector / continuous-streaming data-loading path:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl) + Vault k8s auth + OIDC
 #   - Query monitoring: postgres-exporter on segments+mirrors
 #     + cloudberry-query-exporter
 #   - deletionPolicy Retain
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - dataLoading.pxf.customConnectors: the kafka-connector JAR (staged in MinIO)
 #   - dataLoading.pxf.servers: a kafka-connector server of type=custom (W.3+W.24)
 #   - dataLoading.jobs: the kafka-cdc job (type pxf, NO schedule, continuous) —
@@ -33,8 +33,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "102"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -160,7 +160,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO
