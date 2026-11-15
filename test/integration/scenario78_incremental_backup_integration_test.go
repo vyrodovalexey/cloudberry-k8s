@@ -79,7 +79,7 @@ func (s *Scenario78IntegrationSuite) SetupTest() {
 		Build()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,
 			IncrementalCount: 10,

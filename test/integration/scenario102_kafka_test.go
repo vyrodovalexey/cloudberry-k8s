@@ -126,7 +126,7 @@ func scenario102SampleCluster() *cbv1alpha1.CloudberryCluster {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			CustomConnectors: []cbv1alpha1.PxfCustomConnector{
 				{Name: cases.Scenario102ConnectorName, JarURL: cases.Scenario102ConnectorJarURL},
 			},

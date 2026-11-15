@@ -228,3 +228,64 @@ var Scenario85BackupAPINegatives = []BackupAPINegativeCase{
 		Description:  "Operator identity on restore -> 403 (Admin required).",
 	},
 }
+
+// ============================================================================
+// Scenario 85e — restore Job name-collision retry contract (DEF-6 / U018 §9
+// F-4 / U030, operator commit 8a79782): the restore Job name is deterministic
+// (<cluster>-restore-<timestamp>), so re-restoring the same timestamp collides
+// with the previous attempt's leftover Job. The resolution semantics:
+// a TERMINAL (failed or succeeded) leftover is deleted and replaced so the
+// retry proceeds (202); an IN-FLIGHT (running/pending) leftover is a 409
+// CONFLICT naming the Job and is never clobbered. Genuine server errors stay
+// 500 (pinned at the unit layer, internal/api/restore_collision_test.go).
+// ============================================================================
+
+// RestoreCollisionCase describes one collision-retry contract row for 85e.
+type RestoreCollisionCase struct {
+	// ID is the collision case id (85e-col1..col3).
+	ID string
+	// Leftover is the seeded pre-existing restore Job state: "failed",
+	// "succeeded", "running" or "pending" (the coarse jobStatus classes).
+	Leftover string
+	// ExpectStatus is the HTTP status the retry POST must return.
+	ExpectStatus int
+	// ExpectReplace documents whether the retry must REPLACE the leftover
+	// (terminal cases: 202 + a fresh Job) or leave it UNTOUCHED (in-flight
+	// cases: 409, the running attempt survives).
+	ExpectReplace bool
+	// Description documents the contract row.
+	Description string
+}
+
+// Scenario85RestoreCollisionCases is the DEF-6 collision-retry catalog. The
+// integration layer proves col1 + col3 LIVE against the deployed operator API
+// (scenario85_live_restore_collision_test.go); col2 (succeeded leftover) shares
+// the terminal-replace branch with col1 and is pinned at the unit layer, so the
+// live suite does not spend a second real restore attempt on it.
+var Scenario85RestoreCollisionCases = []RestoreCollisionCase{
+	{
+		ID:            "85e-col1",
+		Leftover:      "failed",
+		ExpectStatus:  202,
+		ExpectReplace: true,
+		Description: "Retry colliding with a FAILED leftover restore Job: the leftover is " +
+			"replaced and the retry returns 202 \"restore started\" (was an opaque 500 " +
+			"\"failed to create restore job\" before the U030 fix).",
+	},
+	{
+		ID:            "85e-col2",
+		Leftover:      "succeeded",
+		ExpectStatus:  202,
+		ExpectReplace: true,
+		Description: "Retry colliding with a SUCCEEDED leftover (re-restoring an already-" +
+			"restored timestamp, e.g. into a different redirectDb): replaced + 202.",
+	},
+	{
+		ID:            "85e-col3",
+		Leftover:      "running",
+		ExpectStatus:  409,
+		ExpectReplace: false,
+		Description: "Retry colliding with an IN-FLIGHT restore Job: 409 CONFLICT with an " +
+			"actionable message naming the Job; the in-flight run is never clobbered.",
+	},
+}
