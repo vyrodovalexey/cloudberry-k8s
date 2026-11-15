@@ -1,6 +1,6 @@
 module github.com/cloudberry-contrib/cloudberry-k8s
 
-go 1.26.5
+go 1.27.4
 
 require (
 	github.com/coreos/go-oidc/v3 v3.20.0
