@@ -1194,7 +1194,7 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_active_queries{instance=~\"$instance\"}",
+          "expr": "cloudberry_active_queries{instance=~\"$instance\",pod!~\"cloudberry-operator.*\"}",
           "legendFormat": "active",
           "refId": "A"
         },
@@ -1712,7 +1712,7 @@
     },
     {
       "type": "stat",
-      "title": "Query History Count",
+      "title": "Query History Rows (live)",
       "description": "Total number of queries inserted into query history",
       "datasource": {
         "type": "prometheus",
@@ -1726,7 +1726,8 @@
       },
       "targets": [
         {
-          "expr": "cloudberry_query_history_total{instance=~\"$instance\"}",
+          "expr": "max(cloudberry_table_stats_n_live_tup{relname=\"cloudberry_query_history\"})",
+          "legendFormat": "history rows",
           "refId": "A"
         }
       ],
@@ -2484,61 +2485,6 @@
           "expr": "cloudberry_resgroup_memory_usage_bytes{instance=~\"$instance\"}",
           "legendFormat": "used {{rsgname}} {{hostname}}",
           "refId": "A"
-        },
-        {
-          "expr": "cloudberry_resgroup_memory_available_bytes{instance=~\"$instance\"}",
-          "legendFormat": "available {{rsgname}} {{hostname}}",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "fillOpacity": 10,
-            "pointSize": 5,
-            "showPoints": "auto"
-          },
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Memory Quota & Shared Usage",
-      "description": "Memory quota used and shared memory used per resource group and host",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "victoriametrics"
-      },
-      "gridPos": {
-        "x": 16,
-        "y": 132,
-        "w": 8,
-        "h": 8
-      },
-      "targets": [
-        {
-          "expr": "cloudberry_resgroup_memory_quota_used_bytes{instance=~\"$instance\"}",
-          "legendFormat": "quota used {{rsgname}} {{hostname}}",
-          "refId": "A"
-        },
-        {
-          "expr": "cloudberry_resgroup_memory_shared_used_bytes{instance=~\"$instance\"}",
-          "legendFormat": "shared used {{rsgname}} {{hostname}}",
-          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -3462,7 +3408,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Exporter Collector Errors (P3a)",
+      "title": "Segments Down (per target)",
       "datasource": {
         "type": "prometheus",
         "uid": "victoriametrics"
@@ -3470,13 +3416,13 @@
       "gridPos": {
         "x": 0,
         "y": 201,
-        "w": 12,
+        "w": 24,
         "h": 8
       },
       "targets": [
         {
-          "expr": "sum by (collector) (rate(cbexporter_collector_errors_total[5m]))",
-          "legendFormat": "{{collector}}",
+          "expr": "cloudberry_segments_down_down_count{instance=~\"$instance\"}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ],
@@ -3489,51 +3435,8 @@
             "pointSize": 5,
             "showPoints": "auto"
           },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Exporter Collector Duration p99 (P3a)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "victoriametrics"
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 201,
-        "w": 12,
-        "h": 8
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.99, sum by (collector, le) (rate(cbexporter_collector_duration_seconds_bucket[5m])))",
-          "legendFormat": "{{collector}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "fillOpacity": 10,
-            "pointSize": 5,
-            "showPoints": "auto"
-          },
-          "unit": "s"
+          "unit": "short",
+          "min": 0
         },
         "overrides": []
       },
