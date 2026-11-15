@@ -2,7 +2,7 @@ apiVersion: v2
 name: cloudberry-operator
 description: A Helm chart for the Cloudberry Database Kubernetes Operator
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "0.1.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/cloudberry-contrib/cloudberry-k8s

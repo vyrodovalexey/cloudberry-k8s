@@ -10,10 +10,17 @@ webhooks:
     admissionReviewVersions:
       - v1
     clientConfig:
+      {{- /*
+      caBundle is intentionally OMITTED when webhook.caBundle is empty:
+      an empty caBundle is non-functional anyway, and the operator always
+      injects the real bundle at startup and on every cert rotation
+      (certmanager.injectCABundle, both self-signed and vault-pki sources).
+      With Helm 4 server-side apply, rendering `caBundle: ""` makes Helm
+      claim ownership of the field and upgrade conflicts with the
+      operator's injected value (field-manager conflict on upgrade).
+      */}}
       {{- if .Values.webhook.caBundle }}
       caBundle: {{ .Values.webhook.caBundle | b64enc }}
-      {{- else }}
-      caBundle: ""
       {{- end }}
       service:
         name: {{ include "cloudberry-operator.webhookServiceName" . }}
@@ -45,8 +52,6 @@ webhooks:
     clientConfig:
       {{- if .Values.webhook.caBundle }}
       caBundle: {{ .Values.webhook.caBundle | b64enc }}
-      {{- else }}
-      caBundle: ""
       {{- end }}
       service:
         name: {{ include "cloudberry-operator.webhookServiceName" . }}

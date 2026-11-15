@@ -26,13 +26,23 @@
 #     'cloudberry-operator' must exist in namespace 'cloudberry-test'
 #
 # Docker-Desktop Note:
-#   The Vault container reaches the k8s API at https://kubernetes.docker.internal:6443.
-#   IMPORTANT: we MUST use the hostname "kubernetes.docker.internal" (NOT
-#   "host.docker.internal"). The docker-desktop API server serving certificate
-#   includes "kubernetes.docker.internal" in its SANs but NOT
-#   "host.docker.internal"; using the latter causes Vault's TokenReview HTTPS
-#   call to fail TLS hostname verification, surfacing as "permission denied"
-#   (HTTP 403) on login.
+#   Historically the Vault container reached the k8s API at
+#   https://kubernetes.docker.internal:6443 (hostname covered by the API
+#   server serving-certificate SANs; "host.docker.internal" was NOT covered
+#   and caused Vault's TokenReview call to fail TLS hostname verification,
+#   surfacing as "permission denied" / HTTP 403 on login).
+#
+#   Docker Desktop's kind-style Kubernetes (sysbox node container
+#   "desktop-control-plane", provider-id kind://docker/desktop) no longer
+#   publishes 6443 on that hostname: the API server listens only inside the
+#   node container, and the host-side kubeconfig points at a random
+#   loopback port. The serving certificate instead carries the node's
+#   InternalIP as an IP SAN, and the node IP is directly routable from the
+#   compose network (all containers share the Docker Desktop VM kernel).
+#   Therefore, when the legacy hostname is unreachable, the script
+#   auto-detects the node InternalIP via kubectl and configures Vault with
+#   https://<node-ip>:6443. The IP can change across Docker Desktop VM
+#   restarts — re-run this script (idempotent) after a VM restart.
 #
 #   Vault validates the operator SA JWT via the k8s TokenReview API using a
 #   dedicated token-reviewer ServiceAccount (system:auth-delegator). This script
@@ -159,6 +169,36 @@ EOF
     # Give the token controller a moment to populate the Secret
     sleep 3
     log_info "  Token-reviewer SA '${REVIEWER_SA}' ready (system:auth-delegator)"
+}
+
+# ---------------------------------------------------------------------------
+# Step a3: Detect a working kubernetes_host for docker-desktop's kind-style
+# k8s (see Docker-Desktop Note above). Leaves K8S_HOST untouched when the
+# configured host already answers /healthz.
+# ---------------------------------------------------------------------------
+detect_k8s_host() {
+    if ! command -v "${KUBECTL}" > /dev/null 2>&1; then
+        return 0
+    fi
+    if curl -sk --max-time 3 -o /dev/null "${K8S_HOST}/healthz" 2>/dev/null; then
+        log_info "  ${K8S_HOST} reachable, keeping configured host"
+        return 0
+    fi
+    local node_ip provider_id
+    provider_id=$("${KUBECTL}" get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null || true)
+    case "${provider_id}" in
+        *docker*|*kind*) ;;
+        *) log_warn "  ${K8S_HOST} unreachable and this is not a docker-desktop/kind node; keeping configured host"
+           return 0 ;;
+    esac
+    node_ip=$("${KUBECTL}" get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+    if [ -n "${node_ip}" ]; then
+        log_warn "  ${K8S_HOST} unreachable (docker-desktop kind-style k8s); switching to node InternalIP"
+        K8S_HOST="https://${node_ip}:6443"
+        log_info "  K8S_HOST=${K8S_HOST}"
+    else
+        log_warn "  ${K8S_HOST} unreachable and node InternalIP not resolvable; keeping configured host"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -509,6 +549,9 @@ main() {
 
     # Step a2: Create token-reviewer ServiceAccount (system:auth-delegator)
     create_token_reviewer
+
+    # Step a3: Detect working kubernetes_host (docker-desktop kind-style k8s)
+    detect_k8s_host
 
     # Step b: Configure kubernetes auth (with reviewer JWT + CA)
     configure_k8s_auth
