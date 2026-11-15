@@ -38,6 +38,10 @@ DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT)
 NAMESPACE_OPERATOR   ?= cloudberry-system
 NAMESPACE_TEST       ?= cloudberry-test
 NAMESPACE_MONITORING ?= cloudberry-test
+# CloudberryCluster sample manifest applied by deploy-cluster/undeploy-cluster.
+# Override to deploy a different sample, e.g.
+#   make deploy-cluster CLUSTER_SAMPLE=deploy/helm/cloudberry-operator/config/samples/acceptance-cluster-deploy.yaml
+CLUSTER_SAMPLE       ?= deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml
 HELM_RELEASE         ?= cloudberry-operator
 HELM_CHART           := deploy/helm/cloudberry-operator
 
@@ -330,14 +334,13 @@ helm-uninstall-test: ## Uninstall operator from cloudberry-test namespace
 	$(HELM) uninstall $(HELM_RELEASE) --namespace $(NAMESPACE_TEST) || true
 
 .PHONY: deploy-cluster
-deploy-cluster: ## Deploy sample CloudberryCluster in cloudberry-test namespace
+deploy-cluster: ## Deploy sample CloudberryCluster in cloudberry-test namespace (override sample via CLUSTER_SAMPLE=...)
 	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -f deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml \
-		-n $(NAMESPACE_TEST)
+	kubectl apply -f $(CLUSTER_SAMPLE) -n $(NAMESPACE_TEST)
 
 .PHONY: undeploy-cluster
-undeploy-cluster: ## Remove sample cluster
-	kubectl delete -f deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml \
+undeploy-cluster: ## Remove sample cluster (override sample via CLUSTER_SAMPLE=...)
+	kubectl delete -f $(CLUSTER_SAMPLE) \
 		-n $(NAMESPACE_TEST) --ignore-not-found
 
 # =============================================================================

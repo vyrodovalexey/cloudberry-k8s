@@ -222,7 +222,7 @@ spec:
         pxfJob:
           server: s3-datalake
           profile: "s3:text"
-          resource: "cloudberry-data/dataset/data_1.csv"
+          resource: "cloudberry-data/text/data.csv"
           targetTable: "public.pxf_loaded"
 
   deletionPolicy: Retain
