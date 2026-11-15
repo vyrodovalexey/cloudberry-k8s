@@ -30,7 +30,7 @@ const (
 	// defaultGpfdistImage is the gpfdist container image used when
 	// gpfdist.image is unset. It matches the spec literal (a thin image that
 	// just runs the gpfdist binary over the served /data directory).
-	defaultGpfdistImage = "cloudberry-gpfdist:2.1.0"
+	defaultGpfdistImage = "cloudberry-gpfdist:2.2.0"
 
 	// defaultGpfdistReplicas is the gpfdist Deployment replica count used when
 	// gpfdist.replicas is unset. It defaults to 1 because the backing PVC is

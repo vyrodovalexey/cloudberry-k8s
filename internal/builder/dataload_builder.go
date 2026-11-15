@@ -7,8 +7,9 @@
 // for both the PXF protocol (pxf://) and the engine-native protocols
 // (gpfdist://, s3://, and bare paths served by the cluster gpfdist Service). A
 // live pxf:// read-back is IMAGE-BLOCKED — there is no runnable cloudberry-pxf
-// image and cloudberry-official:2.1.0 ships no PXF agent (only a pxf_fdw client
-// stub) — so the pxf path is built but never claimed to execute. The genuine,
+// image and cloudberry-official:2.2.0 ships no PXF agent (2.1.0 shipped at most
+// a pxf_fdw client stub; core dropped pxf_fdw from its default build in 2.2.0)
+// — so the pxf path is built but never claimed to execute. The genuine,
 // row-count-verified load path is the NATIVE protocols (gpfdist/s3), which need
 // NO PXF and run on cloudberry-official.
 //
@@ -1248,7 +1249,7 @@ func dataLoadHealthCheckObjectStoreJob(job cbv1alpha1.DataLoadingJob) bool {
 //
 //   - HC.1 (pxf jobs, pxf enabled): a DB-PROXY PXF-readiness probe via psql
 //     (baseline SELECT 1, pxf extension present, and a real PXF function —
-//     pg_proc.pxf_read — registered, since PXF 2.1 has no pxf_version()). The
+//     pg_proc.pxf_read — registered, since PXF 2.2 has no pxf_version()). The
 //     load pod CANNOT reach a segment's localhost-only PXF sidecar (spec §3341),
 //     so this is the honest DB-side proxy, not a direct sidecar curl.
 //   - HC.2 (ALL jobs): to_regclass(targetTable) target-table existence.
@@ -1306,7 +1307,7 @@ func writeDataLoadHealthCheckHC1(
 	b.WriteString("psql -v ON_ERROR_STOP=1 -tAc " +
 		"\"SELECT 1 FROM pg_extension WHERE extname='pxf'\" | grep -q 1 " +
 		"|| { echo 'HC.1 FAIL: pxf extension absent'; exit 1; }\n")
-	// PXF readiness: PXF 2.1 provides NO pxf_version() SQL function, so verify a
+	// PXF readiness: PXF 2.2 provides NO pxf_version() SQL function, so verify a
 	// real PXF function (pxf_read) exists in the catalog. This proves PXF is
 	// actually usable (functions registered), not just that the extension row is
 	// present; guarded so a down DB / half-installed pxf fails clearly.

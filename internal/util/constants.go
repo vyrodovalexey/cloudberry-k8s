@@ -259,15 +259,15 @@ const (
 	// DefaultMetricsPort is the default Prometheus metrics port.
 	DefaultMetricsPort = 9187
 	// DefaultVersion is the default Cloudberry DB version.
-	DefaultVersion = "2.1.0"
+	DefaultVersion = "2.2.0"
 	// DefaultImage is the default Cloudberry DB container image.
-	DefaultImage = "cloudberrydb/cloudberry:2.1.0"
+	DefaultImage = "cloudberrydb/cloudberry:2.2.0"
 	// DefaultBackupImage is the default backup toolchain container image used
 	// for backup/restore Jobs when spec.backup.image is unset. A backup-capable
 	// image MUST contain kubectl (the Jobs `kubectl exec` gpbackup/gprestore
 	// into the coordinator pod — the coordinator-exec model) and the
 	// gpbackup/gprestore/gpbackup_s3_plugin toolchain.
-	DefaultBackupImage = "cloudberry-backup:2.1.0"
+	DefaultBackupImage = "cloudberry-backup:2.2.0"
 
 	// DefaultPostgresExporterImage is the default container image for the
 	// Prometheus postgres_exporter sidecar, applied by the mutating webhook

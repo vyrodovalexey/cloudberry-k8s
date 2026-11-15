@@ -1178,7 +1178,7 @@ func (c *pgxClient) GetDiskUsage(ctx context.Context, database string) (usages [
 	defer func() { end(err) }()
 
 	// Filter on datallowconn = true (connectable databases) rather than
-	// datistemplate = false: on Cloudberry 2.1.0 the real connectable postgres
+	// datistemplate = false: on Cloudberry 2.2.0 the real connectable postgres
 	// database is flagged datistemplate = true, so a datistemplate = false filter
 	// would exclude every database and return an empty result. datallowconn = true
 	// includes postgres + user databases (template0 has datallowconn = false);
@@ -1680,7 +1680,7 @@ func (c *pgxClient) GetStorageDiskUsage(ctx context.Context) (usages []DiskUsage
 // tableStorageQuery lists the largest user tables with their on-disk size, live
 // row count, and dead-tuple bloat percentage. It joins the always-present
 // pg_stat_user_tables to pg_class/pg_namespace for the relation OID. The bloat
-// percentage is cast FLOOR(...)::int because Cloudberry 2.1.0 returns the
+// percentage is cast FLOOR(...)::int because Cloudberry 2.2.0 returns the
 // n_dead_tup*100/(...) division as a NUMERIC (e.g. with a fractional scale) on
 // real churned data, which pgx cannot scan into a plain int32 — the same lesson
 // applied in GetBloatRecommendations. The divide-by-zero case is guarded by the
@@ -1985,7 +1985,7 @@ func (c *pgxClient) GetBloatRecommendations(
 	defer func() { end(err) }()
 
 	// dead_pct is cast to ::int in BOTH the projection and the WHERE gate.
-	// Cloudberry 2.1.0 returns the n_dead_tup*100/(...) division as NUMERIC
+	// Cloudberry 2.2.0 returns the n_dead_tup*100/(...) division as NUMERIC
 	// (e.g. with a -16 scale) on real churned data, which pgx cannot scan into
 	// a plain int64. FLOOR(...)::int forces a clean integer so the row scans
 	// into deadPct (int64) and the gate compares an int to $1 (int).
@@ -2298,7 +2298,7 @@ func (c *pgxClient) GetTableDetails(ctx context.Context, schema, table string) (
 	defer func() { end(err) }()
 
 	// bloat_percent is cast FLOOR(...)::int (not plain integer division) because
-	// Cloudberry 2.1.0 returns the n_dead_tup*100/(...) division as a NUMERIC with
+	// Cloudberry 2.2.0 returns the n_dead_tup*100/(...) division as a NUMERIC with
 	// a fractional scale on real churned data, which pgx cannot scan into a plain
 	// int32 — the Scenario 117 NUMERIC-cast lesson, identical to
 	// GetBloatRecommendations / tableStorageQuery. The divide-by-zero case is
@@ -2414,7 +2414,7 @@ func (c *pgxClient) GetUsageReport(ctx context.Context, month string) (entries [
 	//
 	// The database filter targets CONNECTABLE databases (datallowconn = true)
 	// rather than non-template databases (datistemplate = false). On Cloudberry
-	// 2.1.0 the real, connectable "postgres" database is flagged
+	// 2.2.0 the real, connectable "postgres" database is flagged
 	// datistemplate = true, so a datistemplate = false filter excludes every
 	// database and yields an empty report. datallowconn = true correctly
 	// includes "postgres" plus any user databases and is portable across
@@ -4019,9 +4019,10 @@ var pxfProtocolPrivileges = []string{"SELECT", "INSERT"}
 // pxf_fdw) via CREATE EXTENSION IF NOT EXISTS. It mirrors SetupExporterRole's
 // shape (an existence probe for connectivity, then per-statement Exec with
 // tracing) but is deliberately NON-FATAL: the pxf agent/extension is not
-// present in the cloudberry-official:2.1.0 image (at most a pxf_fdw client stub
-// exists), so a CREATE EXTENSION failure is logged as a warning and the method
-// returns nil. Only a hard connectivity error (the probe itself failing) is
+// present in the cloudberry-official:2.2.0 image (pxf_fdw was dropped from the
+// core default build in 2.2.0), so a CREATE EXTENSION failure is logged as a
+// warning and the method returns nil. Only a hard connectivity error (the
+// probe itself failing) is
 // surfaced so reconcile can distinguish "DB unreachable" from "pxf unavailable".
 // The method is idempotent (IF NOT EXISTS) and safe to call repeatedly. It
 // returns the number of extensions actually CREATE EXTENSIONed on this call

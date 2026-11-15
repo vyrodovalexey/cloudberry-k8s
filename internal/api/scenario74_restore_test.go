@@ -33,7 +33,7 @@ import (
 // the Scenario 74 option set and asserts the created Job's gprestore args.
 func TestHandleRestoreBackup_Scenario74Args(t *testing.T) {
 	cluster := newBackupEnabledCluster()
-	cluster.Spec.Backup.Image = "cloudberry-backup:2.1.0"
+	cluster.Spec.Backup.Image = "cloudberry-backup:2.2.0"
 	s := newTestServerWithBatch(cluster)
 
 	const timestamp = "20260101010101"

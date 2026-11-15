@@ -441,12 +441,12 @@ type CloudberryClusterList struct {
 // CloudberryClusterSpec defines the desired state of CloudberryCluster.
 type CloudberryClusterSpec struct {
 	// Version is the Cloudberry DB version.
-	// +kubebuilder:default="2.1.0"
+	// +kubebuilder:default="2.2.0"
 	// +optional
 	Version string `json:"version,omitempty"`
 
 	// Image is the container image for Cloudberry DB.
-	// +kubebuilder:default="cloudberrydb/cloudberry:2.1.0"
+	// +kubebuilder:default="cloudberrydb/cloudberry:2.2.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -1315,7 +1315,7 @@ type BackupSpec struct {
 	// +optional
 	JobTemplate *BackupJobTemplate `json:"jobTemplate,omitempty"`
 
-	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.2.0).
 	// It MUST be backup-capable: the image must contain kubectl (backup/restore
 	// Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
 	// coordinator-exec model) and the gpbackup/gprestore/gpbackup_s3_plugin

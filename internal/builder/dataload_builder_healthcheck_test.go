@@ -92,7 +92,7 @@ func TestHealthCheckScript_HC1_PXFReadiness(t *testing.T) {
 
 	assert.Contains(t, script, "pg_extension")
 	assert.Contains(t, script, "extname='pxf'")
-	// PXF 2.1 has no pxf_version(); readiness is proven via a real PXF function
+	// PXF 2.2 has no pxf_version(); readiness is proven via a real PXF function
 	// (pxf_read) in pg_proc.
 	assert.Contains(t, script, "pg_proc")
 	assert.Contains(t, script, "proname = 'pxf_read'")

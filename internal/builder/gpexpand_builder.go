@@ -317,7 +317,7 @@ func newSegmentLines(
 }
 
 // dbidPlaceholder is the token rendered in the dbid column of every gpexpand
-// input line by the operator. The bundled Cloudberry 2.1.0 gpexpand REQUIRES a
+// input line by the operator. The bundled Cloudberry 2.2.0 gpexpand REQUIRES a
 // valid integer dbid for each new segment (an empty dbid fails with
 // "Invalid dbid on line N"), and the correct next dbids can only be known from
 // the LIVE cluster catalog (SELECT max(dbid) FROM gp_segment_configuration).
@@ -330,7 +330,7 @@ func newSegmentLines(
 const dbidPlaceholder = "__CBK_DBID__"
 
 // renderGpexpandInputFile renders the gpexpand input file body (one line per new
-// segment). The bundled CBDB 2.1 gpexpand consumes the documented pipe-delimited
+// segment). The bundled CBDB 2.2 gpexpand consumes the documented pipe-delimited
 // column order:
 //
 //	<hostname>|<address>|<port>|<datadir>|<dbid>|<content>|<preferred_role>
@@ -485,7 +485,7 @@ func renderGpexpandScript(
 //     WITHOUT wiping (a real expansion is in progress);
 //  5. PHASE A (only when no expansion is set up): assigns REAL consecutive dbids
 //     (max(dbid)+NR, DEFECT A fix) then gpexpand -i <input> -a — the DB is
-//     selected via PGDATABASE (Cloudberry 2.1.0 gpexpand has no -D option);
+//     selected via PGDATABASE (Cloudberry 2.2.0 gpexpand has no -D option);
 //  6. PHASE B: gpexpand -a -d <duration>  (redistribution incl.
 //     ALTER TABLE ... EXPAND TABLE) — resumable via status_detail;
 //  7. verifies completion, runs gpexpand --clean, removes the input file, and
@@ -592,7 +592,7 @@ func renderGpexpandInnerScript() string {
 
 	// PHASE B: redistribution (ALTER TABLE ... EXPAND TABLE), bounded duration,
 	// resumable via status_detail. -a = non-interactive. DB selected via
-	// PGDATABASE (no -D option in Cloudberry 2.1.0 gpexpand).
+	// PGDATABASE (no -D option in Cloudberry 2.2.0 gpexpand).
 	fmt.Fprintf(&b, "gpexpand -a -d %s -v\n", gpexpandRedistributeDuration)
 
 	// Verify completion via status_detail, then clean up the expansion schema.
@@ -603,7 +603,7 @@ func renderGpexpandInnerScript() string {
 	// FINALIZATION (D9): verify-and-fall-back clean so the Job never reports
 	// success while the gpexpand schema lingers (which blocks a subsequent
 	// gpbackup with "expansion currently in process"). DB selected via
-	// PGDATABASE (no -D option in Cloudberry 2.1.0 gpexpand). gpexpand -c can
+	// PGDATABASE (no -D option in Cloudberry 2.2.0 gpexpand). gpexpand -c can
 	// fail if the schema is half-finalized, so drop it directly as a fallback.
 	b.WriteString("  if ! gpexpand --clean -a; then\n")
 	b.WriteString("    psql -d " + gpexpandStatusDatabase +
@@ -899,7 +899,7 @@ func writeInnerExistingSegmentHealthCheck(b *strings.Builder) {
 
 // writeInnerDbidAssignment emits the DEFECT A fix: assign a REAL, consecutive
 // dbid to every new segment line, IN PLACE in the actual GPEXPAND_INPUT path
-// that gpexpand reads. Cloudberry 2.1.0 gpexpand requires a valid integer dbid
+// that gpexpand reads. Cloudberry 2.2.0 gpexpand requires a valid integer dbid
 // per line (an empty/placeholder dbid fails with "Invalid dbid on line N"). The
 // correct next dbids are only knowable from the LIVE catalog, so compute
 // max(dbid) here (inside the coordinator pod, at Job run time — no TOCTOU

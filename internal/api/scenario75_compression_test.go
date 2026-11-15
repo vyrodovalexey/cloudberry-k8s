@@ -37,7 +37,7 @@ func s75CreateBackupJobScript(t *testing.T, gpbackupOptions string) string {
 	t.Helper()
 
 	cluster := newBackupEnabledCluster()
-	cluster.Spec.Backup.Image = "cloudberry-backup:2.1.0"
+	cluster.Spec.Backup.Image = "cloudberry-backup:2.2.0"
 	s := newTestServerWithBatch(cluster)
 
 	body := `{"type":"full","databases":["mydb"],"gpbackupOptions":` + gpbackupOptions + `}`

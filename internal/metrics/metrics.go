@@ -61,15 +61,15 @@ const (
 //
 // The following metrics from the metrics spec are DELIBERATELY NOT registered and
 // NEVER emitted because there is NO honest source for them in the shipped runtime
-// (PXF 2.1.0 / gpfdist). Synthesizing a value would violate the metrics-honesty
+// (PXF 2.2.0 / gpfdist). Synthesizing a value would violate the metrics-honesty
 // constraint, so each stays absent + documented here rather than fabricated:
 //
-//   - M.4  pxf_bytes_transferred_total   — PXF 2.1.0 exposes no per-transfer byte
+//   - M.4  pxf_bytes_transferred_total   — PXF 2.2.0 exposes no per-transfer byte
 //     counter the operator can observe; no honest source.
-//   - M.5  pxf_records_total             — PXF 2.1.0 exposes no per-record counter;
+//   - M.5  pxf_records_total             — PXF 2.2.0 exposes no per-record counter;
 //     SUBSTITUTED by the honest data_loading_rows_total (harvested from the load
 //     Job's real DATALOAD_ROWS marker), which is registered and emitted instead.
-//   - M.7  pxf_active_connections        — PXF 2.1.0 exposes no live connection
+//   - M.7  pxf_active_connections        — PXF 2.2.0 exposes no live connection
 //     gauge the operator can observe; no honest source.
 //   - M.15 gpfdist_connections_active    — gpfdist exposes no scrapable active
 //     connection count; no honest source.

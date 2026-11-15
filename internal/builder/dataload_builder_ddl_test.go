@@ -22,7 +22,7 @@ func dataLoadDDLCluster(gpfdistPort int32) *cbv1alpha1.CloudberryCluster {
 	return &cbv1alpha1.CloudberryCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "ddl-cluster", Namespace: "default"},
 		Spec: cbv1alpha1.CloudberryClusterSpec{
-			Image:       "cloudberrydb/cloudberry:2.1.0",
+			Image:       "cloudberrydb/cloudberry:2.2.0",
 			DataLoading: dl,
 		},
 	}

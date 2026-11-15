@@ -519,7 +519,7 @@ spec:
                     type: object
                   image:
                     description: |-
-                      Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+                      Image is the backup toolchain container image (e.g. cloudberry-backup:2.2.0).
                       It MUST be backup-capable: the image must contain kubectl (backup/restore
                       Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
                       coordinator-exec model) and the gpbackup/gprestore/gpbackup_s3_plugin
@@ -1456,7 +1456,7 @@ spec:
                     type: integer
                 type: object
               image:
-                default: cloudberrydb/cloudberry:2.1.0
+                default: cloudberrydb/cloudberry:2.2.0
                 description: Image is the container image for Cloudberry DB.
                 type: string
               imagePullPolicy:
@@ -2074,7 +2074,7 @@ spec:
                     type: object
                 type: object
               version:
-                default: 2.1.0
+                default: 2.2.0
                 description: Version is the Cloudberry DB version.
                 type: string
               workload:

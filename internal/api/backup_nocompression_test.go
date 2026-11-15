@@ -73,7 +73,7 @@ func TestMergeGpbackupOptions_NoCompressionOverride(t *testing.T) {
 // do NOT contain --compression-level (compression level ignored, 73b).
 func TestHandleCreateBackup_NoCompressionOverride(t *testing.T) {
 	cluster := newBackupEnabledCluster()
-	cluster.Spec.Backup.Image = "cloudberry-backup:2.1.0"
+	cluster.Spec.Backup.Image = "cloudberry-backup:2.2.0"
 	s := newTestServerWithBatch(cluster)
 
 	body := `{"type":"full","databases":["mydb"],` +
@@ -106,7 +106,7 @@ func TestHandleCreateBackup_NoCompressionOverride(t *testing.T) {
 // surface in the created Job's gpbackup args.
 func TestHandleCreateBackup_StandardOptions(t *testing.T) {
 	cluster := newBackupEnabledCluster()
-	cluster.Spec.Backup.Image = "cloudberry-backup:2.1.0"
+	cluster.Spec.Backup.Image = "cloudberry-backup:2.2.0"
 	s := newTestServerWithBatch(cluster)
 
 	body := `{"type":"full","databases":["mydb"],` +

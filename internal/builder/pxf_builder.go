@@ -75,8 +75,8 @@ const (
 	pxfConnectorInitContainerName = "pxf-connector-init"
 
 	// pxfStatusPath is the PXF Spring Boot actuator health endpoint
-	// (PXF 2.1.0) used as the single source of truth for both the liveness
-	// and readiness probes. PXF 2.1.0 exposes its health via the Spring Boot
+	// (PXF 2.2.0) used as the single source of truth for both the liveness
+	// and readiness probes. PXF 2.2.0 exposes its health via the Spring Boot
 	// actuator at /actuator/health (returns {"status":"UP",...}); the legacy
 	// /pxf/v15/Status path is a DB-client endpoint and returns 404, so it must
 	// not be used for health checks.

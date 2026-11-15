@@ -4281,7 +4281,7 @@ func (r *AdminReconciler) publishTableBloatRatios(
 // matches the status (M.1). It is the measurement step of R.2.
 //
 // It uses a ROBUST, PORTABLE fallback chain so it produces a real value on
-// Cloudberry 2.1.0 (where gp_toolkit.gp_disk_free does NOT exist) while still
+// Cloudberry 2.2.0 (where gp_toolkit.gp_disk_free does NOT exist) while still
 // preferring the TRUE filesystem source when it is present:
 //
 //  1. PREFERRED (true filesystem usage): GetDiskUsagePercent reads
@@ -4372,7 +4372,7 @@ func (r *AdminReconciler) measureDiskUsagePercent(
 	}
 
 	// gp_toolkit.gp_disk_free is absent on this server version (e.g. Cloudberry
-	// 2.1.0). Fall back to the portable LOGICAL-vs-provisioned proxy.
+	// 2.2.0). Fall back to the portable LOGICAL-vs-provisioned proxy.
 	logger.Debug("gp_disk_free unavailable, using logical-size proxy", "error", err)
 	return r.measureLogicalDiskUsageProxy(dbCtx, span, cluster, dbClient, logger)
 }

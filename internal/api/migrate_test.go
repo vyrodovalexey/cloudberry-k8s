@@ -30,7 +30,7 @@ func migrateCluster(name, bucket string) *cbv1alpha1.CloudberryCluster {
 	cluster := newTestCluster(name, "default")
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{
@@ -372,7 +372,7 @@ func TestCreateMigrateJob_CreateError_Returns500AndWrappedError(t *testing.T) {
 
 func TestHandleCreateBackup_IncrementalArgs(t *testing.T) {
 	cluster := newBackupEnabledCluster()
-	cluster.Spec.Backup.Image = "cloudberry-backup:2.1.0"
+	cluster.Spec.Backup.Image = "cloudberry-backup:2.2.0"
 	cluster.Spec.Backup.Gpbackup = &cbv1alpha1.GpbackupOptions{LeafPartitionData: true}
 	s := newTestServerWithBatch(cluster)
 

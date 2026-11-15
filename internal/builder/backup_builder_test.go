@@ -20,7 +20,7 @@ func newBackupCluster() *cbv1alpha1.CloudberryCluster {
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount: 3,
 			MaxAge:    "30d",
@@ -289,7 +289,7 @@ func TestBuildBackupS3ConfigMap(t *testing.T) {
 
 	t.Run("config template omits aws_signature_version", func(t *testing.T) {
 		// aws_signature_version was intentionally removed: the version-matched
-		// gpbackup_s3_plugin (2.1.0-incubating) rejects the unknown field. SigV4
+		// gpbackup_s3_plugin (2.2.0-incubating) rejects the unknown field. SigV4
 		// is the default for both AWS and MinIO, so the template must NOT emit it.
 		cm := b.BuildBackupS3ConfigMap(newBackupCluster())
 		require.NotNil(t, cm)
@@ -421,7 +421,7 @@ func TestBuildBackupCronJob(t *testing.T) {
 		require.NotNil(t, cj.Spec.SuccessfulJobsHistoryLimit)
 		assert.Equal(t, int32(3), *cj.Spec.SuccessfulJobsHistoryLimit)
 		container := cj.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
-		assert.Equal(t, "cloudberry-backup:2.1.0", container.Image)
+		assert.Equal(t, "cloudberry-backup:2.2.0", container.Image)
 		assert.Equal(t, backupContainerName, container.Name)
 	})
 
@@ -823,7 +823,7 @@ func TestBuildBackupJobPreBackupInitContainer(t *testing.T) {
 	require.Len(t, initContainers, 1)
 	ic := initContainers[0]
 	assert.Equal(t, preBackupCheckContainerName, ic.Name)
-	assert.Equal(t, "cloudberry-backup:2.1.0", ic.Image)
+	assert.Equal(t, "cloudberry-backup:2.2.0", ic.Image)
 	require.NotEmpty(t, ic.Args)
 	assert.Contains(t, ic.Args[0], "gp_segment_configuration")
 	assert.Contains(t, ic.Args[0], "pg_stat_activity")

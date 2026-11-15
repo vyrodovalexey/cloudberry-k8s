@@ -46,7 +46,7 @@ func TestBuildGpfdist_NilDataLoadingDefaults(t *testing.T) {
 	require.NotNil(t, dep)
 	require.NotNil(t, dep.Spec.Replicas)
 	assert.Equal(t, int32(1), *dep.Spec.Replicas)
-	assert.Equal(t, "cloudberry-gpfdist:2.1.0", dep.Spec.Template.Spec.Containers[0].Image)
+	assert.Equal(t, "cloudberry-gpfdist:2.2.0", dep.Spec.Template.Spec.Containers[0].Image)
 	assert.Equal(t, int32(8080), dep.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
 
 	svc := b.BuildGpfdistService(cluster)
@@ -132,7 +132,7 @@ func TestBuildGpfdistDeployment_Image(t *testing.T) {
 		want  string
 	}{
 		{name: "custom image honored", image: "my-registry/gpfdist:9.9", want: "my-registry/gpfdist:9.9"},
-		{name: "default image when unset", image: "", want: "cloudberry-gpfdist:2.1.0"},
+		{name: "default image when unset", image: "", want: "cloudberry-gpfdist:2.2.0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
