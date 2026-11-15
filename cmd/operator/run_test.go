@@ -903,6 +903,19 @@ func TestSetupWebhookCerts_InvalidSecretRegenerated(t *testing.T) {
 	}, secret))
 	assert.NotEqual(t, []byte("not-a-pem"), secret.Data["tls.crt"],
 		"an invalid PEM secret must be regenerated")
+
+	// Join the background rotation goroutine before this test returns:
+	// later tests write the certRotationInterval test seam
+	// (shrinkRotationInterval), and an unjoined rotation loop reading it
+	// races with them (exposed by -shuffle=1794750918283694000).
+	cancel()
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cert rotation goroutine leaked past context cancellation")
+	}
 }
 
 func TestSetupWebhookCerts_DirectClientError(t *testing.T) {
@@ -976,6 +989,19 @@ func TestSetupWebhookCerts_NamespaceFallsBackToConfigThenDefault(t *testing.T) {
 	require.NoError(t, directClient.Get(context.Background(), types.NamespacedName{
 		Name: "cloudberry-webhook-certs", Namespace: util.OperatorNamespace,
 	}, secret))
+
+	// Join the background rotation goroutine before this test returns:
+	// later tests write the certRotationInterval test seam
+	// (shrinkRotationInterval), and an unjoined rotation loop reading it
+	// races with them (exposed by -shuffle=1794750918283694000).
+	cancel()
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cert rotation goroutine leaked past context cancellation")
+	}
 }
 
 func TestSetupWebhookCerts_InjectCABundleConflictRetried(t *testing.T) {
@@ -1009,4 +1035,17 @@ func TestSetupWebhookCerts_InjectCABundleConflictRetried(t *testing.T) {
 
 	require.NoError(t, err, "a single transient CA-injection failure must be retried away")
 	assert.GreaterOrEqual(t, updateCalls, 2, "the failed update must have been retried")
+
+	// Join the background rotation goroutine before this test returns:
+	// later tests write the certRotationInterval test seam
+	// (shrinkRotationInterval), and an unjoined rotation loop reading it
+	// races with them (exposed by -shuffle=1794750918283694000).
+	cancel()
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cert rotation goroutine leaked past context cancellation")
+	}
 }
