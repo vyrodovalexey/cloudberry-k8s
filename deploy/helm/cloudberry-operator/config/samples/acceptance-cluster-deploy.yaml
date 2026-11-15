@@ -38,7 +38,10 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 1 Gi: 512 Mi OOMKilled the coordinator during in-pod gpbackup
+        # report finalization (U018 F-1, exit 137) — marginal for ≥100 MB
+        # payloads under amd64 emulation. Requests unchanged.
+        memory: "1Gi"
     storage:
       size: "2Gi"
 
@@ -63,7 +66,10 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 1 Gi: 512 Mi OOMKilled a segment primary during restore COPY of
+        # line_items (U018 F-2) and U023 perf hits the same envelope
+        # (960k-row COPY + WAL + mirror sync). Requests unchanged.
+        memory: "1Gi"
     storage:
       size: "2Gi"
     mirroring:
