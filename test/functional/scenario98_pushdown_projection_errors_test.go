@@ -276,7 +276,8 @@ func (s *Scenario98Suite) TestFunctional_Scenario98_ErrorHandling() {
 		script := s.scenario98JobScript(cluster, job)
 		assert.Contains(s.T(), script, "LOG ERRORS")
 		assert.Contains(s.T(), script, "SEGMENT REJECT LIMIT 10 ROWS")
-		assert.Contains(s.T(), script, "pxfwritable_import")
+		// DEF-1: s3:text is delimited text — FORMAT 'CSV', not the CUSTOM bridge.
+		assert.Contains(s.T(), script, "FORMAT 'CSV'")
 	})
 
 	// FE.12b — ROWS limit BELOW the bad-row count → failure threshold.
@@ -435,8 +436,8 @@ func (s *Scenario98Suite) TestFunctional_Scenario98_CatalogHonest() {
 			script := s.scenario98JobScript(cluster, job)
 			assert.Containsf(s.T(), script, tc.DDLContains,
 				"%s built DDL must carry %q", tc.ID, tc.DDLContains)
-			assert.Contains(s.T(), script, "pxfwritable_import",
-				"%s read DDL must use the import formatter", tc.ID)
+			assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile),
+				"%s read DDL must use the per-profile read FORMAT clause (DEF-1)", tc.ID)
 
 			if strings.Contains(tc.Description, "[CONFIG-ONLY]") {
 				s.T().Logf("scenario98 %s: [CONFIG-ONLY] — DDL knob correctness only", tc.ID)

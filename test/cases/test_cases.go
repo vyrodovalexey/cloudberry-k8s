@@ -4461,9 +4461,10 @@ type Scenario92DataLoadCase struct {
 //
 // The DDL/Job for ClusterName "test-cluster" matches the builder defaults
 // (gpfdist service "<cluster>-gpfdist:8080", temp table "cbk_dataload_ext_<job>",
-// FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import') for pxf, FORMAT 'CSV'/'TEXT'
-// for native). DL.1 (pxf) is image-blocked; DL.2-DL.4 (native) are the genuine
-// row-count-verified path.
+// PXFReadFormatClause for pxf — FORMAT 'CSV' for delimited-text profiles since
+// the DEF-1 fix, else FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import') — and
+// FORMAT 'CSV'/'TEXT' for native). DL.1 (pxf) is image-blocked; DL.2-DL.4
+// (native) are the genuine row-count-verified path.
 func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 	const cluster = "test-cluster"
 	return []Scenario92DataLoadCase{

@@ -18,6 +18,14 @@
 #                                 gpexpand: init_segment SKIPS initdb so gpexpand
 #                                 initializes the datadir from the coordinator
 #                                 template (default: false / normal first-boot).
+#   CLOUDBERRY_STANDBY_SERVICE  - Standby headless service name (standby role).
+#                                 Derived from CLOUDBERRY_COORDINATOR_HOST
+#                                 (<cluster>-coord-hl -> <cluster>-standby-hl)
+#                                 when unset.
+#   CLOUDBERRY_STANDBY_REGISTER_RETRIES / _INTERVAL - retry count (default 60)
+#                                 and seconds between polls (default 5) for the
+#                                 standby's self-registration in
+#                                 gp_segment_configuration.
 # =============================================================================
 
 set -euo pipefail
@@ -1052,6 +1060,110 @@ register_segments() {
 }
 
 # ---------------------------------------------------------------------------
+# Register the STANDBY coordinator in gp_segment_configuration (DEF-2 fix)
+# ---------------------------------------------------------------------------
+# register_segments() (above) populates the coordinator/primaries/mirrors but
+# never the standby row, leaving a streaming-healthy standby invisible to
+# FTS/gpstate/gpactivatestandby. The standby therefore registers ITSELF: this
+# task waits until the local WAL receiver is STREAMING from the primary
+# coordinator (pg_stat_wal_receiver; hot_standby=on permits the read-only
+# local query) and then inserts the standby row (content=-1, role=m,
+# preferred_role=m, dbid from CLOUDBERRY_DB_ID = 2) into the coordinator's
+# gp_segment_configuration via psql over TCP (gpadmin trust hba, the same
+# channel pg_basebackup uses). This mirrors gpinitstandby semantics: the row
+# appears only once sync is healthy, so the catalog never advertises a down
+# standby. Idempotent: an existing standby row (previous boot, manual
+# registration) skips the INSERT.
+#
+# It runs as a BACKGROUND task spawned before start_postgres execs postgres
+# (the standby's postgres only starts accepting read-only connections after
+# that exec, so the poll loop must outlive it). Bounded by
+# CLOUDBERRY_STANDBY_REGISTER_RETRIES x CLOUDBERRY_STANDBY_REGISTER_INTERVAL
+# (default 60 x 5s = 5 min); on timeout it logs a warning and exits 1 — the
+# pod keeps running exactly like the pre-fix behavior, only louder.
+register_standby() {
+    local port="${CLOUDBERRY_SEGMENT_PORT}"
+    local coordinator_host="${CLOUDBERRY_COORDINATOR_HOST}"
+    local data_dir="${COORDINATOR_DATA_DIR}"
+    local standby_svc="${CLOUDBERRY_STANDBY_SERVICE:-}"
+
+    # Derive the standby headless service from the coordinator host the same
+    # way register_segments derives the segment service: <cluster>-coord-hl ->
+    # <cluster>-standby-hl (util.StandbyServiceName's deterministic naming).
+    if [ -z "${standby_svc}" ]; then
+        standby_svc="$(echo "${coordinator_host}" | sed 's/-coord-hl$/-standby-hl/')"
+    fi
+
+    # HOSTNAME is the pod name under Kubernetes; the catalog hostname is the
+    # pod FQDN under the standby headless service (64-char limit applies).
+    if [ -z "${HOSTNAME:-}" ]; then
+        log_warn "HOSTNAME unset; cannot derive the standby FQDN, skipping standby registration"
+        return 1
+    fi
+    local standby_hostname="${HOSTNAME}.${standby_svc}"
+    if [ ${#standby_hostname} -gt 64 ]; then
+        log_warn "Standby hostname exceeds 64 chars (${#standby_hostname}): ${standby_hostname}"
+    fi
+
+    local retries="${CLOUDBERRY_STANDBY_REGISTER_RETRIES:-60}"
+    local interval="${CLOUDBERRY_STANDBY_REGISTER_INTERVAL:-5}"
+
+    # 1. Wait until this standby is STREAMING from the primary coordinator
+    #    (the DEF-2 gate: registration happens only when sync is healthy). The
+    #    loop also absorbs the window before postgres starts accepting
+    #    read-only connections.
+    while true; do
+        # grep without -q (reads ALL input) so psql can never take a SIGPIPE
+        # that pipefail would misreport as not-streaming.
+        if psql -U gpadmin -d postgres -p "${port}" -tAc \
+                "SELECT status FROM pg_stat_wal_receiver" 2>/dev/null | grep '^streaming$' >/dev/null; then
+            break
+        fi
+        retries=$((retries - 1))
+        if [ "${retries}" -le 0 ]; then
+            log_warn "Standby WAL receiver did not reach streaming state; not registering standby in gp_segment_configuration"
+            return 1
+        fi
+        sleep "${interval}"
+    done
+    log_info "Standby WAL receiver is streaming from ${coordinator_host}"
+
+    # 2. Wait for the coordinator to accept remote psql (trust hba).
+    local coord_retries="${CLOUDBERRY_STANDBY_REGISTER_RETRIES:-60}"
+    while ! psql -h "${coordinator_host}" -p "${port}" -U gpadmin -d postgres -tAc "SELECT 1" >/dev/null 2>&1; do
+        coord_retries=$((coord_retries - 1))
+        if [ "${coord_retries}" -le 0 ]; then
+            log_warn "Coordinator ${coordinator_host} not reachable for standby registration"
+            return 1
+        fi
+        sleep "${interval}"
+    done
+
+    # 3. Idempotence: skip when a standby row already exists.
+    local standby_registered
+    standby_registered="$(psql -h "${coordinator_host}" -p "${port}" -U gpadmin -d postgres -tAc \
+        "SELECT count(*) FROM gp_segment_configuration WHERE content = -1 AND role = 'm';" \
+        2>/dev/null || echo "0")"
+    if [ "${standby_registered}" != "0" ]; then
+        log_info "Standby already registered in gp_segment_configuration, skipping"
+        return 0
+    fi
+
+    # 4. Insert the standby row (the entrypoint's own register_segments
+    #    pattern: allow_system_table_mods for the system-catalog INSERT).
+    log_info "Registering standby coordinator in gp_segment_configuration (${standby_hostname})..."
+    psql -h "${coordinator_host}" -p "${port}" -U gpadmin -d postgres -c "
+        SET allow_system_table_mods = true;
+        INSERT INTO gp_segment_configuration
+            (dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir)
+        VALUES
+            (${CLOUDBERRY_DB_ID}, -1, 'm', 'm', 's', 'u', ${port},
+             '${standby_hostname}', '${standby_hostname}', '${data_dir}');
+    " 2>/dev/null || log_warn "Failed to register standby in gp_segment_configuration"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Set coordinator to dispatch mode
 # ---------------------------------------------------------------------------
 set_dispatch_mode() {
@@ -1182,6 +1294,12 @@ main() {
             ;;
         standby)
             init_standby
+            # DEF-2: the standby registers itself in the coordinator's
+            # gp_segment_configuration once its WAL receiver is streaming. A
+            # background task because start_postgres below EXECs postgres as
+            # the container's main process; the registration poll loop must
+            # survive that exec (it waits for the local postgres first).
+            register_standby &
             start_postgres "${COORDINATOR_DATA_DIR}"
             ;;
         primary)

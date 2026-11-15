@@ -228,7 +228,7 @@ func (s *Scenario97E2ESuite) TestE2E_Scenario97_PartA_ContractHonest() {
 				wantLoc := "pxf://" + scenario97E2EResource(tc.Profile) +
 					"?PROFILE=" + tc.Profile + "&SERVER=" + tc.Server
 				assert.Containsf(s.T(), script, wantLoc, "%s LOCATION", tc.ID)
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 				if strings.Contains(tc.Description, "[CONFIG-ONLY]") {
 					s.T().Logf("scenario97 %s: [CONFIG-ONLY] — DDL/LOCATION assertions only", tc.ID)
 				}

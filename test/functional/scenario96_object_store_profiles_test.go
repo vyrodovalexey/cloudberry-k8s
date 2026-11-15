@@ -30,7 +30,8 @@ import (
 //   - T4.1 ReadProfilesAcrossServers: build a DataLoading spec with all 5
 //     object-store profiles (text/parquet/avro/json/orc) × 2 MinIO-backed
 //     servers (s3-datalake, minio-warehouse). For each readable job the operator
-//     builds a load Job whose script carries the pxfwritable_import READ DDL with
+//     builds a load Job whose script carries the per-profile READ DDL (DEF-1:
+//     FORMAT 'CSV' for delimited-text profiles, pxfwritable_import otherwise)
 //     the byte-correct pxf:// LOCATION (PROFILE/SERVER). The servers ConfigMap
 //     carries one <server>__s3-site.xml per object-store server (path-style for
 //     minio-warehouse). Covers OS.* (config-only DDL/site assertions here; the
@@ -277,9 +278,11 @@ func (s *Scenario96Suite) TestFunctional_Scenario96_ReadProfilesAcrossServers() 
 					"?PROFILE=" + profile + "&SERVER=" + server
 				assert.Containsf(s.T(), script, wantLoc,
 					"read DDL LOCATION must be byte-correct for %s on %s", profile, server)
-				// Read path uses the import formatter and CREATE EXTERNAL TABLE
-				// (never WRITABLE).
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				// Read path uses the per-profile read FORMAT clause (DEF-1:
+				// delimited-text profiles are FORMAT 'CSV'; bridge-serialized
+				// profiles the pxfwritable_import formatter) and CREATE
+				// EXTERNAL TABLE (never WRITABLE).
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(profile))
 				assert.NotContains(s.T(), script, "pxfwritable_export")
 				assert.NotContains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
 				assert.Contains(s.T(), script, "CREATE EXTERNAL TABLE")
@@ -483,15 +486,17 @@ func (s *Scenario96Suite) TestFunctional_Scenario96_CatalogHonest() {
 				assert.Contains(s.T(), script, "PROFILE="+tc.Profile)
 
 			case cases.Scenario96ExpectAdmitRead:
-				// Read rows (OS.*/CFG.*): byte-correct LOCATION + site file when
-				// the layer covers server-config.
+				// Read rows (OS.*/CFG.*): byte-correct LOCATION + per-profile
+				// read FORMAT clause (DEF-1: text → FORMAT 'CSV', others the
+				// pxfwritable_import bridge) + site file when the layer covers
+				// server-config.
 				job := scenario96ReadJob(tc.ID, tc.Profile, tc.Server)
 				script := s.scenario96JobScript(cluster, job)
 				wantLoc := "pxf://" + scenario96Resource(tc.Profile, tc.Server) +
 					"?PROFILE=" + tc.Profile + "&SERVER=" + tc.Server
 				assert.Containsf(s.T(), script, wantLoc,
 					"%s LOCATION must be byte-correct", tc.ID)
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 				if strings.Contains(tc.Layer, "server-config") {
 					site := cm.Data[tc.Server+"__s3-site.xml"]
 					assert.NotEmptyf(s.T(), site, "%s site file must exist", tc.ID)

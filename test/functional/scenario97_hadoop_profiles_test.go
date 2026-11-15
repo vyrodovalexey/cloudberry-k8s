@@ -33,7 +33,8 @@ import (
 // quorum), asserting the shipped production contract WITHOUT a live cluster:
 //
 //   - ReadProfiles: build a load Job per HDFS/Hive/HBase READ profile and assert
-//     the generated read DDL (pxfwritable_import) carries the byte-correct
+//     the generated read DDL (DEF-1: FORMAT 'CSV' for hdfs:text, the
+//     pxfwritable_import bridge otherwise) carries the byte-correct
 //     pxf:// LOCATION (PROFILE/SERVER). Covers HP.*/HV.*/HB.* at the builder
 //     layer (config-only DDL/LOCATION here; live row landing is at e2e).
 //
@@ -225,9 +226,10 @@ func (s *Scenario97Suite) TestFunctional_Scenario97_ReadProfiles() {
 				"?PROFILE=" + tc.profile + "&SERVER=" + server
 			assert.Containsf(s.T(), script, wantLoc,
 				"read DDL LOCATION must be byte-correct for %s", tc.profile)
-			// Read path uses the import formatter and CREATE EXTERNAL TABLE
-			// (never WRITABLE).
-			assert.Contains(s.T(), script, "pxfwritable_import")
+			// Read path uses the per-profile read FORMAT clause (DEF-1: hdfs:text
+			// is delimited text → FORMAT 'CSV'; hive profiles keep the
+			// pxfwritable_import bridge) and CREATE EXTERNAL TABLE (never WRITABLE).
+			assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.profile))
 			assert.NotContains(s.T(), script, "pxfwritable_export")
 			assert.NotContains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
 			assert.Contains(s.T(), script, "CREATE EXTERNAL TABLE")
@@ -414,14 +416,15 @@ func (s *Scenario97Suite) TestFunctional_Scenario97_CatalogHonest() {
 					"%s site file %s must contain %q", tc.ID, tc.SiteFile, tc.SiteContains)
 
 			case cases.Scenario97ExpectAdmitRead:
-				// Read rows (HP.*/HV.*/HB.*/FF.6a): byte-correct LOCATION + import.
+				// Read rows (HP.*/HV.*/HB.*/FF.6a): byte-correct LOCATION +
+				// per-profile read FORMAT clause (DEF-1).
 				job := scenario97ReadJob(tc.ID, tc.Profile, tc.Server)
 				script := s.scenario97JobScript(cluster, job)
 				wantLoc := "pxf://" + scenario97Resource(tc.Profile) +
 					"?PROFILE=" + tc.Profile + "&SERVER=" + tc.Server
 				assert.Containsf(s.T(), script, wantLoc,
 					"%s LOCATION must be byte-correct", tc.ID)
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 				if strings.Contains(tc.Description, "[CONFIG-ONLY]") {
 					s.T().Logf("scenario97 %s: [CONFIG-ONLY] — DDL/LOCATION assertions only", tc.ID)
 				}

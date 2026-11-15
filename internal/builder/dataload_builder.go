@@ -89,10 +89,19 @@ const (
 	protoFile    = "file"
 	protoS3      = "s3"
 
-	// pxfFormatClause is the PXF external-table FORMAT clause for the READ/IMPORT
-	// path (custom formatter pxfwritable_import). Used when mode is not
-	// "writable" (insert / insert-select).
+	// pxfFormatClause is the PXF external-table FORMAT clause for READ/IMPORT
+	// jobs over BRIDGE-serialized profiles (parquet/avro/json/orc/rc/
+	// sequencefile, bare jdbc/hive/hbase): the custom formatter
+	// pxfwritable_import. For DELIMITED-TEXT profiles PXFReadFormatClause
+	// substitutes FORMAT 'CSV' instead (DEF-1).
 	pxfFormatClause = "FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')"
+
+	// pxfFormatCSVSuffix is the profile format suffix of a delimited-CSV PXF
+	// profile. It is not in pxfpolicy (the admission allowlist W.10 has no
+	// "csv" suffix — text is the admitted delimited profile), but the builder
+	// is also exercised directly, so a "<scheme>:csv" profile maps to the same
+	// FORMAT 'CSV' clause as text.
+	pxfFormatCSVSuffix = "csv"
 
 	// pxfWriteFormatClause is the PXF external-table FORMAT clause for the
 	// WRITE/EXPORT path (custom formatter pxfwritable_export). Used when
@@ -246,7 +255,9 @@ func pxfBoolFlag(v *bool) bool {
 //
 //   - pxf  (job.Type==pxf): a pxf:// LOCATION with PROFILE/SERVER and the typed
 //     options (FILTER_PUSHDOWN, PARTITION_BY/RANGE/INTERVAL, PROJECT) synthesized
-//     deterministically, FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import').
+//     deterministically, FORMAT from PXFReadFormatClause — FORMAT 'CSV' for
+//     delimited-text profiles (DEF-1), else FORMAT 'CUSTOM'
+//     (FORMATTER='pxfwritable_import').
 //   - gpload/native: a gpfdist:// (from the gpfdist Service) / s3:// LOCATION
 //     derived from the filePaths, FORMAT 'CSV'/'TEXT' from the job. (file:// is
 //     admission-rejected for multi-segment gpload jobs, see W.16.)
@@ -269,14 +280,45 @@ func buildExternalTableDDL(
 	}
 }
 
+// PXFReadFormatClause returns the FORMAT clause for a PXF READ/IMPORT
+// external table (DEF-1 fix). Delimited-text profiles — a "text" (or "csv")
+// format suffix on any scheme EXCEPT hive — must be declared FORMAT 'CSV':
+// PXF's text plugin streams comma-delimited lines, and the pxfwritable_import
+// custom formatter is a per-record binary bridge that yields ONE field per
+// line for such data ("Record has 1 fields but the schema size is 3",
+// live-verified on Cloudberry 2.2.0 in the U015 acceptance deployment; a
+// manual FORMAT 'CSV' probe parsed 1000/1000 rows over the same s3:text
+// dataset). This mirrors the FDW path's identical text→csv mapping
+// (fdwFormatOption).
+//
+// The hive scheme is EXCLUDED: HiveFragment mints proper bridge-serialized
+// records, so hive/hive:text/hive:orc/hive:rc keep pxfwritable_import (the
+// upstream PXF contract for Hive). All other profiles (parquet, avro, json,
+// orc, rc, sequencefile and the bare jdbc/hbase connectors) also keep the
+// custom formatter — hdfs:json was live-verified working with it (2000 rows,
+// spec 12 §Scenario 97).
+//
+// It is EXPORTED (like ForeignTableName) so the functional/e2e suites assert
+// the exact clause from the SAME source of truth instead of re-deriving it.
+func PXFReadFormatClause(profile string) string {
+	lower := strings.ToLower(profile)
+	scheme, format, hasSep := strings.Cut(lower, ":")
+	if hasSep && scheme != "hive" &&
+		(format == pxfpolicy.FormatText || format == pxfFormatCSVSuffix) {
+		return fmt.Sprintf("FORMAT '%s'", defaultLoadFormatCSV)
+	}
+	return pxfFormatClause
+}
+
 // buildPXFExternalTableDDL renders the pxf:// external-table DDL for a PXF job.
 //
 // When pxf.Mode == pxfpolicy.ModeWritable it emits a WRITABLE external table
 // (FORMATTER='pxfwritable_export') for data EXPORT — the WRITABLE keyword is set
 // and the LOG ERRORS / SEGMENT REJECT LIMIT suffix is omitted (writable tables
 // do not accept reject limits). Otherwise it emits the READ/IMPORT external
-// table (FORMATTER='pxfwritable_import') with the optional error-handling suffix
-// — byte-identical to the historical behavior.
+// table with PXFReadFormatClause (FORMAT 'CSV' for delimited-text profiles per
+// DEF-1, FORMATTER='pxfwritable_import' otherwise) and the optional
+// error-handling suffix.
 //
 // DEFENSE IN DEPTH: even though the admission webhook rejects a writable job
 // with a write-unsupported format, the builder re-checks via the SAME
@@ -309,7 +351,7 @@ func buildPXFExternalTableDDL(job cbv1alpha1.DataLoadingJob) (string, error) {
 	}
 
 	return assembleExternalTableDDL(job.Name, pxf.TargetTable, location,
-		pxfFormatClause, false /* writable */, pxf.ErrorHandling), nil
+		PXFReadFormatClause(pxf.Profile), false /* writable */, pxf.ErrorHandling), nil
 }
 
 // buildPXFLocation synthesizes the deterministic pxf:// URI from the typed PXF

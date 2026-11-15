@@ -160,7 +160,7 @@ func TestBuildExternalTableDDL_ByteExact(t *testing.T) {
 			},
 			want: "CREATE EXTERNAL TABLE \"cbk_dataload_ext_rl_noprefix\" (LIKE \"public\".\"t\")\n" +
 				"LOCATION ('pxf://s3a://b/malformed/?PROFILE=s3:csv&SERVER=s3-datalake')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')\n" +
+				"FORMAT 'CSV'\n" +
 				"SEGMENT REJECT LIMIT 25 ROWS;",
 		},
 		{
@@ -185,7 +185,7 @@ func TestBuildExternalTableDDL_ByteExact(t *testing.T) {
 			},
 			want: "CREATE EXTERNAL TABLE \"cbk_dataload_ext_rl_zero\" (LIKE \"public\".\"t\")\n" +
 				"LOCATION ('pxf://s3a://b/clean/?PROFILE=s3:csv&SERVER=s3-datalake')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
+				"FORMAT 'CSV';",
 		},
 		{
 			name: "pxf jdbc with partitioning",
@@ -233,7 +233,9 @@ func TestBuildExternalTableDDL_ByteExact(t *testing.T) {
 		},
 		{
 			// HP.1 (Scenario 97) — hdfs read DDL golden: a read/import external
-			// table on the hadoop-cluster server with pxfwritable_import.
+			// table on the hadoop-cluster server. hdfs:text is a delimited-text
+			// profile, so the DEF-1 fix declares FORMAT 'CSV' (comma-delimited)
+			// instead of the pxfwritable_import binary bridge.
 			name: "pxf hdfs:text read import",
 			job: cbv1alpha1.DataLoadingJob{
 				Name: "hdfs-text-read",
@@ -247,7 +249,7 @@ func TestBuildExternalTableDDL_ByteExact(t *testing.T) {
 			},
 			want: "CREATE EXTERNAL TABLE \"cbk_dataload_ext_hdfs_text_read\" (LIKE \"public\".\"events\")\n" +
 				"LOCATION ('pxf:///warehouse/raw/events?PROFILE=hdfs:text&SERVER=hadoop-cluster')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
+				"FORMAT 'CSV';",
 		},
 		{
 			// HV.1 (Scenario 97) — bare hive (auto-detect, caveat C1) read DDL:
@@ -303,7 +305,7 @@ func TestBuildExternalTableDDL_ByteExact(t *testing.T) {
 			},
 			want: "CREATE EXTERNAL TABLE \"cbk_dataload_ext_pct\" (LIKE \"t\")\n" +
 				"LOCATION ('pxf://s3a://b/p/?PROFILE=s3:csv&SERVER=srv')\n" +
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')\n" +
+				"FORMAT 'CSV'\n" +
 				"SEGMENT REJECT LIMIT 5 PERCENT;",
 		},
 		{
@@ -1030,6 +1032,117 @@ func TestBuildExternalTableDDL_GpfdistPortDefault(t *testing.T) {
 	got, err := buildExternalTableDDL(cluster, job)
 	require.NoError(t, err)
 	assert.Contains(t, got, "gpfdist://ddl-cluster-gpfdist:8080/x.csv")
+}
+
+// TestBuildPXFExternalTableDDL_DelimitedTextReadFormatIsCSV is the DEF-1
+// regression test (TASK-U027): a READ/import job for a delimited-text source
+// (the s3/gs/abfss/wasbs/hdfs "text" — or "csv" — profiles) must NOT emit
+// FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import'): that binary bridge yields
+// one field per line for comma-delimited data ("Record has 1 fields but the
+// schema size is 3", live-verified on the U015 acceptance cluster), so the
+// DDL must declare FORMAT 'CSV' instead (live-verified to parse 1000/1000
+// rows over the same s3:text dataset). Bridge-serialized profiles (hive:*,
+// bare jdbc/hbase, parquet/avro/json/orc) and the WRITABLE export path keep
+// the custom formatters.
+func TestBuildPXFExternalTableDDL_DelimitedTextReadFormatIsCSV(t *testing.T) {
+	cluster := dataLoadDDLCluster(0)
+
+	// Delimited-text read profiles across every non-hive scheme (+ a csv
+	// suffix, + case-insensitivity) must emit FORMAT 'CSV' and no CUSTOM
+	// clause. This is the exact regression shape of the U015 dataload failure.
+	for _, profile := range []string{
+		"s3:text", "gs:text", "abfss:text", "wasbs:text", "hdfs:text",
+		"s3:csv", "S3:TEXT",
+	} {
+		profile := profile
+		t.Run("text read "+profile, func(t *testing.T) {
+			job := cbv1alpha1.DataLoadingJob{
+				Name: "def1", Type: "pxf",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server: "srv", Profile: profile,
+					Resource: "s3a://b/data.csv", TargetTable: "public.t",
+				},
+			}
+			got, err := buildExternalTableDDL(cluster, job)
+			require.NoError(t, err)
+			assert.Contains(t, got, "FORMAT 'CSV'")
+			assert.NotContains(t, got, "FORMAT 'CUSTOM'",
+				"%s is a delimited-text profile; the CUSTOM bridge mangles it to 1 field/line (DEF-1)", profile)
+			assert.NotContains(t, got, "pxfwritable_import")
+		})
+	}
+
+	// The reject-limit suffix must still compose with FORMAT 'CSV'.
+	t.Run("text read with reject limit keeps suffix", func(t *testing.T) {
+		job := cbv1alpha1.DataLoadingJob{
+			Name: "def1-rl", Type: "pxf",
+			PxfJob: &cbv1alpha1.PxfJobSpec{
+				Server: "srv", Profile: "s3:text", Resource: "s3a://b/x.csv",
+				TargetTable: "public.t",
+				ErrorHandling: &cbv1alpha1.ErrorHandlingSpec{
+					SegmentRejectLimit: 25, LogErrors: util.Ptr(true),
+				},
+			},
+		}
+		got, err := buildExternalTableDDL(cluster, job)
+		require.NoError(t, err)
+		assert.Contains(t, got, "FORMAT 'CSV'\nLOG ERRORS SEGMENT REJECT LIMIT 25 ROWS;")
+	})
+
+	// Bridge-serialized profiles keep the custom import formatter (hive mints
+	// proper bridge records; parquet/json/avro/orc and bare jdbc are the
+	// upstream PXF CUSTOM contract — hdfs:json live-verified at 2000 rows).
+	for _, profile := range []string{"hive", "hive:text", "hive:orc", "jdbc", "hbase", "s3:parquet", "hdfs:json"} {
+		profile := profile
+		t.Run("bridge read "+profile, func(t *testing.T) {
+			job := cbv1alpha1.DataLoadingJob{
+				Name: "def1-bridge", Type: "pxf",
+				PxfJob: &cbv1alpha1.PxfJobSpec{
+					Server: "srv", Profile: profile,
+					Resource: "res", TargetTable: "public.t",
+				},
+			}
+			got, err := buildExternalTableDDL(cluster, job)
+			require.NoError(t, err)
+			assert.Contains(t, got, pxfFormatClause)
+		})
+	}
+
+	// The WRITABLE export path is unchanged by DEF-1 (no live evidence against
+	// pxfwritable_export; exports were proven live in Scenario 99).
+	t.Run("text writable export keeps custom formatter", func(t *testing.T) {
+		job := cbv1alpha1.DataLoadingJob{
+			Name: "def1-w", Type: "pxf",
+			PxfJob: &cbv1alpha1.PxfJobSpec{
+				Server: "srv", Profile: "s3:text", Resource: "s3a://b/out/",
+				TargetTable: "public.t", Mode: "writable",
+			},
+		}
+		got, err := buildExternalTableDDL(cluster, job)
+		require.NoError(t, err)
+		assert.Contains(t, got, pxfWriteFormatClause)
+		assert.NotContains(t, got, "FORMAT 'CSV'")
+	})
+}
+
+// TestBuildDataLoadScript_DelimitedTextJobEmitsCSVFormat asserts the DEF-1 fix
+// reaches the LOAD SCRIPT the data-loading Job actually runs (not just the DDL
+// helper): the psql heredoc body of an s3:text job must create the external
+// table with FORMAT 'CSV' and never the pxfwritable_import formatter.
+func TestBuildDataLoadScript_DelimitedTextJobEmitsCSVFormat(t *testing.T) {
+	cluster := dataLoadDDLCluster(0)
+	job := cbv1alpha1.DataLoadingJob{
+		Name: "s3-csv-load", Type: "pxf",
+		PxfJob: &cbv1alpha1.PxfJobSpec{
+			Server: "s3-datalake", Profile: "s3:text",
+			Resource: "cloudberry-data/text/data.csv", TargetTable: "public.pxf_loaded",
+		},
+	}
+	script, err := buildDataLoadScript(cluster, job)
+	require.NoError(t, err)
+	assert.Contains(t, script, "FORMAT 'CSV'")
+	assert.NotContains(t, script, "FORMAT 'CUSTOM'")
+	assert.NotContains(t, script, "pxfwritable_import")
 }
 
 // TestIsWritableExportJob covers the writable-export predicate that selects the
