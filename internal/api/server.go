@@ -3728,9 +3728,20 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	opts := buildRestoreJobOptions(cluster, &req, timestamp)
 	job := s.builder.BuildRestoreJob(cluster, opts)
 	if createErr := s.k8sClient.Create(r.Context(), job); createErr != nil {
-		s.logger.Error("failed to create restore job", "cluster", name, "error", createErr)
-		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create restore job")
-		return
+		if !apierrors.IsAlreadyExists(createErr) {
+			s.logger.Error("failed to create restore job", "cluster", name, "error", createErr)
+			writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal, "failed to create restore job")
+			return
+		}
+		// DEF-6 (U018 §9 F-4): the restore Job name is deterministic
+		// (<cluster>-restore-<timestamp>), so re-restoring the same backup
+		// timestamp collides with the previous attempt's leftover Job and
+		// used to surface here as an opaque 500. Resolve the collision:
+		// replace a terminal leftover so the retry proceeds; an in-flight
+		// Job is a client-side conflict (409) and is never clobbered.
+		if !s.replaceFinishedRestoreJob(r.Context(), job, w) {
+			return
+		}
 	}
 
 	if s.metrics != nil {
@@ -3743,6 +3754,81 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		responseKeyJob:       job.Name,
 		responseKeyTimestamp: timestamp,
 	})
+}
+
+// replaceFinishedRestoreJob resolves a restore Job name collision (DEF-6 /
+// U018 §9 F-4): the restore Job name is deterministic —
+// util.RestoreJobName(cluster, timestamp) — so re-restoring the same backup
+// timestamp after a previous attempt collides with that attempt's leftover
+// Job. The administration/API/backup specs (03/06/11) are silent on
+// retry-after-failure, so the semantics follow the operator's existing
+// AlreadyExists-tolerant Job handling (the data-loading one-off runs, the
+// retention cleanup's get-before-create):
+//
+//   - terminal leftover ("failed" or "succeeded"): a finished Job is immutable
+//     and its outcome is already recorded on status.backup/backupHistory and
+//     the cloudberry_restore_total counter (and finished Jobs are
+//     ttlSecondsAfterFinished-GC'd anyway), so it is deleted and replaced with
+//     the freshly requested retry.
+//   - active/pending leftover ("running"/"pending"): a restore of this
+//     timestamp is still in flight — 409 CONFLICT with an actionable message
+//     (the data-loading JOB_ALREADY_RUNNING idiom), never clobbering the run.
+//     Like the backup-disabled gate above, this client conflict is NOT a
+//     restore outcome, so RecordRestore is intentionally not emitted here.
+//
+// The caller must not proceed until the replacement exists, so this helper
+// performs the re-Create itself. It writes the client-facing error response
+// directly and returns false when the retry must not proceed; a true return
+// means the replacement Job was created.
+func (s *Server) replaceFinishedRestoreJob(
+	ctx context.Context,
+	job *batchv1.Job,
+	w http.ResponseWriter,
+) bool {
+	existing := &batchv1.Job{}
+	key := client.ObjectKey{Name: job.Name, Namespace: job.Namespace}
+	if getErr := s.k8sClient.Get(ctx, key, existing); getErr != nil {
+		s.logger.Error("failed to inspect colliding restore job",
+			"job", job.Name, "error", getErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to inspect existing restore job")
+		return false
+	}
+
+	status := jobStatus(existing)
+	if status != "failed" && status != "succeeded" {
+		writeErrorJSON(w, http.StatusConflict, errCodeConflict,
+			fmt.Sprintf("restore job %q is still in progress; wait for it to "+
+				"finish or delete it before retrying the restore", existing.Name))
+		return false
+	}
+
+	if delErr := s.k8sClient.Delete(ctx, existing, backgroundDeletion()); delErr != nil &&
+		!apierrors.IsNotFound(delErr) {
+		s.logger.Error("failed to delete finished restore job",
+			"job", existing.Name, "previousStatus", status, "error", delErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to replace existing restore job")
+		return false
+	}
+	if createErr := s.k8sClient.Create(ctx, job); createErr != nil {
+		if apierrors.IsAlreadyExists(createErr) {
+			// A concurrent retry of the same timestamp won the replace race
+			// and its replacement Job is already in flight — the same 409
+			// semantics as the in-flight case above, never a 500.
+			writeErrorJSON(w, http.StatusConflict, errCodeConflict,
+				fmt.Sprintf("restore job %q is already being retried by another request", job.Name))
+			return false
+		}
+		s.logger.Error("failed to create replacement restore job",
+			"job", job.Name, "previousStatus", status, "error", createErr)
+		writeErrorJSON(w, http.StatusInternalServerError, errCodeInternal,
+			"failed to create restore job")
+		return false
+	}
+	s.logger.Info("replaced finished restore job for retry",
+		"job", job.Name, "previousStatus", status)
+	return true
 }
 
 // handleListBackupJobs lists backup/restore/cleanup Job statuses for a cluster.
