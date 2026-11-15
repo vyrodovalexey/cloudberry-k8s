@@ -37,7 +37,7 @@ DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT)
 # --- Kubernetes / Helm settings ----------------------------------------------
 NAMESPACE_OPERATOR   ?= cloudberry-system
 NAMESPACE_TEST       ?= cloudberry-test
-NAMESPACE_MONITORING ?= monitoring
+NAMESPACE_MONITORING ?= cloudberry-test
 HELM_RELEASE         ?= cloudberry-operator
 HELM_CHART           := deploy/helm/cloudberry-operator
 
@@ -366,7 +366,7 @@ endif
 # =============================================================================
 
 .PHONY: monitoring-deploy
-monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector + node-exporter + kube-state-metrics) to monitoring namespace
+monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector + node-exporter + kube-state-metrics) to NAMESPACE_MONITORING (cloudberry-test)
 	kubectl create namespace $(NAMESPACE_MONITORING) --dry-run=client -o yaml | kubectl apply -f -
 	$(HELM) upgrade --install vmagent test/monitoring/vmagent \
 		--namespace $(NAMESPACE_MONITORING) \
@@ -450,7 +450,7 @@ monitoring-verify: ## Verify monitoring stack integration (metrics in VM, logs i
 	fi
 
 .PHONY: monitoring-undeploy
-monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
+monitoring-undeploy: ## Remove monitoring stack from NAMESPACE_MONITORING (cloudberry-test)
 	$(HELM) uninstall kube-state-metrics --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
 	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
 	$(HELM) uninstall vector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
@@ -459,7 +459,7 @@ monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
 	@echo "Monitoring stack removed from namespace $(NAMESPACE_MONITORING)"
 
 .PHONY: monitoring-status
-monitoring-status: ## Check monitoring stack status in monitoring namespace
+monitoring-status: ## Check monitoring stack status in NAMESPACE_MONITORING (cloudberry-test)
 	@echo "=== VictoriaMetrics Agent ==="
 	$(HELM) status vmagent --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "vmagent: not installed"
 	@echo ""
