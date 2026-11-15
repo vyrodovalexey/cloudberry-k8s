@@ -101,11 +101,19 @@ WORKDIR /home/gpadmin
 
 # Download and extract Apache Cloudberry 2.2.0 source
 # (PG kernel 14.10 per the 2.2.0 release; kernel comes from the source tree)
+# Source of truth is the ASF distribution tarball (U001 §1.2): it extracts to
+# apache-cloudberry-<version>/ and ships a .sha512 that is verified before
+# extraction. The GitHub auto-archive (used briefly in commit 3f016b6) extracts
+# to cloudberry-<version>/ (no "apache-" prefix) and breaks the mv below; it is
+# also a regenerated convenience copy, not the voted source release.
 ARG CB_RELEASE_VERSION=2.2.0-incubating
-RUN curl -L -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
-    "https://github.com/apache/cloudberry/archive/refs/tags/${CB_RELEASE_VERSION}.tar.gz" && \
+RUN curl -fSL -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
+    "https://downloads.apache.org/incubator/cloudberry/${CB_RELEASE_VERSION}/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
+    curl -fSL -o "/home/gpadmin/src.tar.gz.sha512" \
+    "https://downloads.apache.org/incubator/cloudberry/${CB_RELEASE_VERSION}/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz.sha512" && \
+    (cd /home/gpadmin && sha512sum -c src.tar.gz.sha512) && \
     tar -xzf "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" -C /home/gpadmin && \
-    rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
+    rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" "/home/gpadmin/src.tar.gz.sha512" && \
     mv "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}" /home/gpadmin/cloudberry
 
 # Build Cloudberry using the official build scripts
