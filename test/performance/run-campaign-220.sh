@@ -26,8 +26,8 @@ API_LOCAL=8190; HEALTH_LOCAL=8181
 VM="http://127.0.0.1:8428"
 HEY="$HOME/go/bin/hey"; command -v hey >/dev/null 2>&1 && HEY="$(command -v hey)"
 RUNS="${RUNS:-3}"
-START_FROM="${START_FROM:-PTC-220-01}"   # resume: skip scenario blocks before this id
-skip_until() { [[ "$1" < "${START_FROM}" ]]; }
+START_FROM="${START_FROM:-PTC-220-01}"   # resume: run only blocks with id >= START_FROM
+should_run() { [[ "$1" > "${START_FROM}" || "$1" == "${START_FROM}" ]]; }
 TS="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="${SCRIPT_DIR}/.yandextank/u023-${TS}"
 RESULTS="${OUTDIR}/results.jsonl"
@@ -69,6 +69,20 @@ abort_campaign() {
 # --- load-generator CPU sampler (ps %cpu ≈ lifetime average of the process) --
 lg_start() { ( while kill -0 "$1" 2>/dev/null; do ps -p "$1" -o %cpu= 2>/dev/null; sleep 0.5; done; echo -1 ) > "$2" & }
 lg_max()   { awk '$1>max{max=$1} END{print (max==-1?"na":max+0)}' "$1" 2>/dev/null || echo na; }
+
+# wait_jobs <secs> <pid>...: bounded wait on SPECIFIC pids (never bare `wait` —
+# it would also wait on the port-forward jobs and hang the campaign; that exact
+# defect hung PTC-220-03 run1 for 2h16m on 2026-11-16). On timeout the pids are
+# killed and the caller sees rc=124.
+wait_jobs() {
+  local secs="$1"; shift
+  ( sleep "${secs}"; for p in "$@"; do kill -TERM "$p" 2>/dev/null; done; sleep 2
+    for p in "$@"; do kill -9 "$p" 2>/dev/null; done ) & local wd=$!
+  local rc=0
+  for p in "$@"; do wait "$p" || rc=$?; done
+  kill "${wd}" 2>/dev/null; wait "${wd}" 2>/dev/null
+  return ${rc}
+}
 
 cleanup() {
   [[ -n "${PF_API_PID}" ]] && kill "${PF_API_PID}" 2>/dev/null
@@ -116,7 +130,7 @@ fp_check() {
 # =============================================================================
 # PTC-220-01 — health endpoints A1..A4: 100 RPS x 60s (07-12 baseline parity)
 # =============================================================================
-skip_until PTC-220-02 || for run in $(seq 1 ${RUNS}); do
+should_run PTC-220-01 || for run in $(seq 1 ${RUNS}); do
   for ep in healthz readyz; do
     for tgt in "api:${API_LOCAL}" "health:${HEALTH_LOCAL}"; do
       port="${tgt#*:}"
@@ -162,7 +176,7 @@ done
 # =============================================================================
 # PTC-220-02 — API read path (B1/B2): 9 sequential authed requests per endpoint
 # =============================================================================
-skip_until PTC-220-03 || for run in $(seq 1 ${RUNS}); do
+should_run PTC-220-02 || for run in $(seq 1 ${RUNS}); do
   for ep in "clusters" "clusters/${CLUSTER}"; do
     f="${OUTDIR}/PTC-220-02.${ep//\//_}.run${run}.csv"
     for i in $(seq 1 9); do
@@ -190,58 +204,78 @@ done
 # =============================================================================
 # PTC-220-03 — rate-limiter knee (ADAPTED: configured limit is 600/min — the
 # documented U022 config drift; the 07-12 baseline ran the default 10/min).
-# 8 parallel curl loops, 20s, per-request CSV -> first-429 index + per-class
-# latencies. All requests share the port-forward source IP 127.0.0.1.
+#
+# METHOD NOTE (found live this campaign): the rate limiter runs BEFORE auth
+# (withAuth: limiter -> auth), but authed traffic cannot reach the 600/min
+# knee on this operator sizing: bcrypt cost-10 (~110ms CPU/auth) under the
+# 500m CPU limit caps sustained authed throughput at ~4.5-6.5 rps — BELOW the
+# 600/min refill rate (10/s). Authed bursts therefore measure the bcrypt
+# ceiling (kept as 1 evidence run, PTC-220-03E), while the knee itself is
+# measured with UNAUTHENTICATED requests (fast 401s, no bcrypt in the path,
+# limiter still engaged per-IP): first ~600 pass, then 429s.
 # =============================================================================
-for run in $(seq 1 ${RUNS}); do
-  f="${OUTDIR}/PTC-220-03.knee.run${run}.csv"
-  # 8 PARALLEL curl loops (background + wait): the first revision ran them
-  # sequentially (~7 req/s offered — under the 600/min refill rate, so the
-  # knee never engaged). Parallel loops offer ~50 req/s until the bucket
-  # empties. Burst depth exceeds the operator bcrypt ceiling (~4.5 authed
-  # rps at its 500m CPU limit): 200-class latency during the burst measures
-  # the CPU-queued auth path and is reported as such.
+knee_run() { # $1 label  $2 authed(0/1)  $3 run  -> writes csv+cpu, emits JSONL
+  local label="$1" authed="$2" run="$3"
+  local f="${OUTDIR}/${label}.run${run}.csv"
+  local kpids=()
   for i in $(seq 1 8); do
     ( end=$(( $(date +%s) + 20 )); while [ $(date +%s) -lt $end ]; do
-        curl -s -o /dev/null -w "%{http_code},%{time_total}\n" --max-time 5 -u "admin:${PW}" \
-          "http://127.0.0.1:${API_LOCAL}/api/v1alpha1/clusters/${CLUSTER}"
+        if [[ "${authed}" == 1 ]]; then
+          curl -s -o /dev/null -w "%{http_code},%{time_total}\n" --max-time 5 -u "admin:${PW}" \
+            "http://127.0.0.1:${API_LOCAL}/api/v1alpha1/clusters/${CLUSTER}"
+        else
+          curl -s -o /dev/null -w "%{http_code},%{time_total}\n" --max-time 5 \
+            "http://127.0.0.1:${API_LOCAL}/api/v1alpha1/clusters/${CLUSTER}"
+        fi
       done ) >> "$f" 2>/dev/null &
+    kpids+=($!)
   done
   ( end=$(( $(date +%s) + 22 )); while [ $(date +%s) -lt $end ]; do
       ps -Ao %cpu,comm= | awk '$2=="curl"{s+=$1} END{print s+0}'; sleep 0.5
-    done; echo -1 ) > "${OUTDIR}/PTC-220-03.knee.run${run}.cpu" &
-  wait
-  lgmax=$(lg_max "${OUTDIR}/PTC-220-03.knee.run${run}.cpu")
-  python3 - "$f" "${run}" "${lgmax}" >> "${RESULTS}" <<'PYC'
+    done; echo -1 ) > "${OUTDIR}/${label}.run${run}.cpu" &
+  kpids+=($!)
+  wait_jobs 60 "${kpids[@]}" || log "WARN ${label} run${run}: wait_jobs rc=$? (partial?)"
+  local lgmax; lgmax=$(lg_max "${OUTDIR}/${label}.run${run}.cpu")
+  python3 - "$f" "${label}" "${run}" "${lgmax}" >> "${RESULTS}" <<'PYC'
 import sys, csv, json, statistics
-rows=[r for r in csv.reader(open(sys.argv[1])) if len(r)==2]
+f, label, run, lg = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rows=[r for r in csv.reader(open(f)) if len(r)==2]
 first429=next((i+1 for i,r in enumerate(rows) if r[0]=="429"), None)
-ok=[float(r[1]) for r in rows if r[0]=="200"]; rl=[float(r[1]) for r in rows if r[0]=="429"]
+def cls(c): return [float(r[1]) for r in rows if r[0]==c]
+ok, rl, unauth = cls("200"), cls("429"), cls("401")
+def st(l):
+    if not l: return None
+    l=sorted(l); return {"n":len(l),"avg_ms":round(statistics.mean(l)*1000,1),
+                         "p95_ms":round(l[int(len(l)*0.95)]*1000,1)}
 oth={}
 for r in rows:
-    if r[0] not in ("200","429"): oth[r[0]]=oth.get(r[0],0)+1
-s5=sum(v for k,v in oth.items() if k.startswith("5"))
-print(json.dumps({"ptc":"PTC-220-03","run":"run"+sys.argv[2],"requests":len(rows),
-  "first_429_at":first429,"ok_n":len(ok),
-  "ok_avg_ms":round(statistics.mean(ok)*1000,1) if ok else None,
-  "ok_p95_ms":round(sorted(ok)[int(len(ok)*0.95)]*1000,1) if ok else None,
-  "rl_n":len(rl),
-  "rl_avg_ms":round(statistics.mean(rl)*1000,1) if rl else None,
-  "other":oth or None,"loadgen_max_cpu": None if sys.argv[3]=="na" else float(sys.argv[3])}))
+    if r[0] not in ("200","429","401"): oth[r[0]]=oth.get(r[0],0)+1
+print(json.dumps({"ptc":label,"run":"run"+run,"requests":len(rows),"first_429_at":first429,
+  "c200":st(ok),"c429":st(rl),"c401":st(unauth),"other":oth or None,
+  "loadgen_max_cpu": None if lg=="na" else float(lg)}))
 PYC
-  log "RESULT PTC-220-03 run${run}"
-  [[ -n "$(python3 -c "
+  log "RESULT ${label} run${run}"
+  python3 -c "
 import json,sys
-lines=[l for l in open('${RESULTS}') if 'PTC-220-03' in l and 'run${run}' in l]
-o=json.loads(lines[-1]); print('5XX' if any(k.startswith('5') for k in (o.get('other') or {})) else '')")" ]] \
-    && { abort_campaign "5xx during knee run${run}"; exit 1; }
-  sleep 180  # bucket drain + operator CPU cool-down (bcrypt ceiling ~4.5 rps @ 500m)
-done
+o=json.loads([l for l in open('${RESULTS}') if '"${label}"' in l and 'run${run}' in l][-1])
+sys.exit(1 if any(k.startswith('5') for k in (o.get('other') or {})) else 0)" \
+    || { abort_campaign "5xx during ${label} run${run}"; exit 1; }
+}
+
+should_run PTC-220-03 || {
+  for run in $(seq 1 ${RUNS}); do
+    knee_run PTC-220-03 0 "${run}"
+    sleep 180  # bucket drain (600 tokens @ 10/s refill) between knee runs
+  done
+  # Authed burst evidence run: documents the bcrypt ceiling (see METHOD NOTE).
+  knee_run PTC-220-03E 1 1
+  sleep 60
+}
 
 # =============================================================================
 # PTC-220-04 — stepped load 5/10/25/50/100 RPS x 30s, authed (B4 parity)
 # =============================================================================
-skip_until PTC-220-05 || for run in $(seq 1 ${RUNS}); do
+should_run PTC-220-04 || for run in $(seq 1 ${RUNS}); do
   for rps in 5 10 25 50 100; do
     label="PTC-220-04.step${rps}.run${run}"
     outfile="${OUTDIR}/${label}.txt"
@@ -290,13 +324,15 @@ done
 # =============================================================================
 # PTC-220-05 — DB query benchmark on mydb (C1..C5), warmup + 3 timed passes
 # =============================================================================
-skip_until PTC-220-06 || for run in $(seq 1 ${RUNS}); do
+should_run PTC-220-05 || for run in $(seq 1 ${RUNS}); do
   kubectl exec -i -n ${NS} ${COORD_POD} -c cloudberry -- /usr/local/cloudberry-db/bin/psql -U gpadmin -d mydb -f - \
     < "${SCRIPT_DIR}/sql/mydb-benchmark-u023.sql" > "${OUTDIR}/PTC-220-05.warmup.run${run}.log" 2>&1 || true
   for pass in 1 2 3; do
     kubectl exec -i -n ${NS} ${COORD_POD} -c cloudberry -- /usr/local/cloudberry-db/bin/psql -U gpadmin -d mydb -v ON_ERROR_STOP=1 -f - \
-      < "${SCRIPT_DIR}/sql/mydb-benchmark-u023.sql" > "${OUTDIR}/PTC-220-05.pass${pass}.run${run}.log" 2>&1 \
-      || { abort_campaign "db bench pass failed"; exit 1; }
+      < "${SCRIPT_DIR}/sql/mydb-benchmark-u023.sql" > "${OUTDIR}/PTC-220-05.pass${pass}.run${run}.log" 2>&1 &
+    bp=$!
+    wait_jobs 300 "${bp}" \
+      || { abort_campaign "db bench pass${pass} failed/timed out"; exit 1; }
   done
   python3 - "${OUTDIR}" "${run}" >> "${RESULTS}" <<'PYE'
 import sys, os, re, json, statistics
@@ -364,43 +400,43 @@ exit(1 if o['fails']>0 else 0)" || { abort_campaign "go bench ${tag} run${run} h
 cd "${REPO_ROOT}"
 # PTC-220-06: s96 s3 read (text -> FORMAT 'CSV') + write (text -> FORMAT 'TEXT');
 # timestamped MinIO prefix per constraint.
-skip_until PTC-220-07 || go_bench PTC-220-06 "BenchmarkScenario96_" "3x" \
+should_run PTC-220-06 || go_bench PTC-220-06 "BenchmarkScenario96_" "3x" \
   SCENARIO96_OBJSTORE_LIVE=1 SCENARIO96_CLUSTER=${CLUSTER} \
   SCENARIO96_PERF_WRITE_RESOURCE="cloudberry-warehouse/perf-u023-${MINTS}/" || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 # PTC-220-07: s97 hdfs:text read (CSV clause) + hdfs:sequencefile write (bridge)
-skip_until PTC-220-08 || go_bench PTC-220-07 "BenchmarkScenario97_" "3x" SCENARIO97_HADOOP_LIVE=1 SCENARIO97_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-07 || go_bench PTC-220-07 "BenchmarkScenario97_" "3x" SCENARIO97_HADOOP_LIVE=1 SCENARIO97_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 # PTC-220-08: s99 jdbc export (bridge clause)
-skip_until PTC-220-09 || go_bench PTC-220-08 "BenchmarkScenario99_" "3x" SCENARIO99_EXPORT_LIVE=1 SCENARIO99_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-08 || go_bench PTC-220-08 "BenchmarkScenario99_" "3x" SCENARIO99_EXPORT_LIVE=1 SCENARIO99_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 
 # PTC-220-09: s105 PXF status read (OIDC path — honest skip if Keycloak unreachable)
-skip_until PTC-220-10 || go_bench PTC-220-09 "BenchmarkScenario105_" "50x" SCENARIO105_PXF_LIVE=1 SCENARIO105_CLUSTER=${CLUSTER} || true
+should_run PTC-220-09 || go_bench PTC-220-09 "BenchmarkScenario105_" "50x" SCENARIO105_PXF_LIVE=1 SCENARIO105_CLUSTER=${CLUSTER} || true
 
 # PTC-220-10/11: s107 + s108 API read latency (basic auth; 429 tolerated)
-skip_until PTC-220-11 || go_bench PTC-220-10 "BenchmarkScenario107_" "50x" SCENARIO107_LIVE=1 SCENARIO107_CLUSTER=${CLUSTER} \
+should_run PTC-220-10 || go_bench PTC-220-10 "BenchmarkScenario107_" "50x" SCENARIO107_LIVE=1 SCENARIO107_CLUSTER=${CLUSTER} \
   SCENARIO107_API_BASE="http://127.0.0.1:${API_LOCAL}" SCENARIO107_API_USER=admin SCENARIO107_API_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
-skip_until PTC-220-12 || go_bench PTC-220-11 "BenchmarkScenario108_" "50x" SCENARIO108_LIVE=1 SCENARIO108_CLUSTER=${CLUSTER} \
+should_run PTC-220-11 || go_bench PTC-220-11 "BenchmarkScenario108_" "50x" SCENARIO108_LIVE=1 SCENARIO108_CLUSTER=${CLUSTER} \
   SCENARIO108_API_BASE="http://127.0.0.1:${API_LOCAL}" SCENARIO108_API_USER=admin SCENARIO108_API_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-12: s109 VM query latency
-skip_until PTC-220-13 || go_bench PTC-220-12 "BenchmarkScenario109_" "30x" SCENARIO109_VM_BASE="${VM}" || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-12 || go_bench PTC-220-12 "BenchmarkScenario109_" "30x" SCENARIO109_VM_BASE="${VM}" || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-13/14/15: admission + netpol + storage admission (dry-run / read-only)
-skip_until PTC-220-14 || go_bench PTC-220-13 "BenchmarkScenario110_" "20x" SCENARIO110_LIVE=1 SCENARIO110_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
-skip_until PTC-220-15 || go_bench PTC-220-14 "BenchmarkScenario111_" "20x" SCENARIO111_LIVE=1 SCENARIO111_CLUSTER=${CLUSTER} SCENARIO111_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
-skip_until PTC-220-16 || go_bench PTC-220-15 "BenchmarkScenario113_" "20x" SCENARIO113_LIVE=1 SCENARIO113_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-13 || go_bench PTC-220-13 "BenchmarkScenario110_" "20x" SCENARIO110_LIVE=1 SCENARIO110_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-14 || go_bench PTC-220-14 "BenchmarkScenario111_" "20x" SCENARIO111_LIVE=1 SCENARIO111_CLUSTER=${CLUSTER} SCENARIO111_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+should_run PTC-220-15 || go_bench PTC-220-15 "BenchmarkScenario113_" "20x" SCENARIO113_LIVE=1 SCENARIO113_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-16: s119 storage API (disabled-path; real status codes recorded)
-skip_until PTC-220-17 || go_bench PTC-220-16 "BenchmarkScenario119_" "30x" SCENARIO119_LIVE=1 SCENARIO119_CLUSTER=${CLUSTER} \
+should_run PTC-220-16 || go_bench PTC-220-16 "BenchmarkScenario119_" "30x" SCENARIO119_LIVE=1 SCENARIO119_CLUSTER=${CLUSTER} \
   SCENARIO119_TARGET="127.0.0.1:${API_LOCAL}" SCENARIO119_USER=admin SCENARIO119_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
 cd "${SCRIPT_DIR}"
 
 # =============================================================================
 # PTC-220-17 — in-process suite (make test-perf methodology), 3x
 # =============================================================================
-skip_until PTC-220-18 || for run in $(seq 1 ${RUNS}); do
+should_run PTC-220-17 || for run in $(seq 1 ${RUNS}); do
   f="${OUTDIR}/PTC-220-17.run${run}.log"
   ( cd "${REPO_ROOT}" && go test ./test/perf/... -tags=e2e -run='^$' -bench=. -benchmem -count=1 -timeout=30m -v ) > "${f}" 2>&1 &
   gp=$!; lg_start ${gp} "${OUTDIR}/PTC-220-17.run${run}.cpu"; wait ${gp}; rc=$?
