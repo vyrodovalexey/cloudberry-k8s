@@ -4313,13 +4313,19 @@ func randomPXFSampleTableName() string {
 
 // buildPXFSampleLocation renders the pxf:// LOCATION URI for a preview read from
 // the sanitized server/profile/resource. PROFILE is always present; SERVER is
-// appended only when set. The resource path and option values are URI-escaped so
-// a crafted value cannot break out of the single-quoted LOCATION literal added
-// by the caller.
+// appended only when set. All components are emitted VERBATIM — the same grammar
+// as builder.buildPXFLocation (the live-proven job DDL path) — because PXF
+// matches the PROFILE and SERVER option tokens literally against
+// pxf-profiles.xml / the servers directory: percent-encoding them corrupts the
+// lookup (DEF-12: url.QueryEscape turned "s3:text" into "s3%3atext" and PXF
+// rejected the profile). A preview must render the exact LOCATION the job DDL
+// would use, or it previews a different source than the job reads. Injection
+// safety is NOT done here: the caller embeds the LOCATION in a single-quoted SQL
+// literal and doubles embedded single quotes.
 func buildPXFSampleLocation(server, profile, resource string) string {
-	opts := "PROFILE=" + url.QueryEscape(profile)
+	opts := "PROFILE=" + profile
 	if server != "" {
-		opts += "&SERVER=" + url.QueryEscape(server)
+		opts += "&SERVER=" + server
 	}
 	return fmt.Sprintf("pxf://%s?%s", resource, opts)
 }
