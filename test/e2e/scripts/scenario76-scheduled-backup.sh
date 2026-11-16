@@ -640,7 +640,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: gpbackup
-          image: cloudberry-backup:2.1.0
+          image: cloudberry-backup:2.2.0
           command: ["true"]
 EOF
 

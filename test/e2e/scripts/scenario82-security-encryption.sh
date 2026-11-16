@@ -71,7 +71,7 @@
 #   SEED_ROWS            rows seeded per table (default: 2000)
 #   STATUS_TIMEOUT_SECS  max seconds to wait for a Job/Pod/status (default: 180)
 #   READY_TIMEOUT        cluster readiness timeout (default: 10m)
-#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.1.0)
+#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.2.0)
 # =============================================================================
 
 set -euo pipefail
@@ -92,7 +92,7 @@ BACKUP_SA="${BACKUP_SA:-cloudberry-backup-sa}"
 SEED_ROWS="${SEED_ROWS:-2000}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-180}"
 READY_TIMEOUT="${READY_TIMEOUT:-10m}"
-BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.1.0}"
+BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.2.0}"
 
 # S3 wiring (mirrors the scenario82-s3 sample CR). Used by the 82b render pod env.
 S3_REGION="${S3_REGION:-us-east-1}"

@@ -4,8 +4,11 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -299,6 +302,130 @@ func scenario99WebHDFSAddr() string {
 	return scenario99Env(envScenario99WebHDFSAddr, scenario99DefaultWebHDFSAddr)
 }
 
+// scenario99S3Bucket/Prefix split Scenario99S3ExportResource ("<bucket>/<prefix>/")
+// into its S3 parts for the authenticated MinIO landing checks.
+func scenario99S3BucketAndPrefix() (string, string) {
+	bucket, prefix, _ := strings.Cut(cases.Scenario99S3ExportResource, "/")
+	return bucket, prefix
+}
+
+// scenario99S3Client builds the authenticated S3 test client for the MinIO
+// landing checks: SCENARIO99_MINIO_ADDR overrides the endpoint, credentials
+// come from the shared MINIO_* envs (compose defaults).
+func scenario99S3Client() *testutil.S3TestClient {
+	c := testutil.NewS3TestClientFromEnv()
+	if addr := scenario99Env(envScenario99MinIOAddr, ""); addr != "" {
+		c.Endpoint = addr
+	}
+	return c
+}
+
+// scenario99WebHDFSOp runs one WebHDFS name-node operation (e.g. MKDIRS,
+// DELETE) and returns the HTTP status code.
+func (s *Scenario99E2ESuite) scenario99WebHDFSOp(method, path, op string, extra url.Values) int {
+	q := url.Values{"op": {op}, "user.name": {"hive"}}
+	for k, vs := range extra {
+		q[k] = vs
+	}
+	target := strings.TrimRight(scenario99WebHDFSAddr(), "/") +
+		"/webhdfs/v1" + path + "?" + q.Encode()
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, target, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
+}
+
+// scenario99WebHDFSReset empties the HDFS export dir (recursive DELETE) and
+// re-creates it world-writable, so the landing assertion and the read-back are
+// deterministic across re-runs (part files from previous runs are gone).
+func (s *Scenario99E2ESuite) scenario99WebHDFSReset(dir string) {
+	// DELETE is best-effort: 200 (deleted) / 404 (never existed) both fine.
+	_ = s.scenario99WebHDFSOp(http.MethodDelete, strings.TrimRight(dir, "/"),
+		"DELETE", url.Values{"recursive": {"true"}})
+	if code := s.scenario99WebHDFSOp(http.MethodPut, strings.TrimRight(dir, "/"),
+		"MKDIRS", url.Values{"permission": {"1777"}}); code != http.StatusOK {
+		s.T().Logf("scenario99: WebHDFS MKDIRS %s returned %d (may already exist)", dir, code)
+	}
+}
+
+// scenario99WebHDFSFileLengths lists the export dir and returns the file byte
+// lengths (part files) found in the LISTSTATUS response.
+func (s *Scenario99E2ESuite) scenario99WebHDFSFileLengths(dir string) ([]int64, error) {
+	target := strings.TrimRight(scenario99WebHDFSAddr(), "/") +
+		"/webhdfs/v1" + strings.TrimRight(dir, "/") + "?op=LISTSTATUS&user.name=hive"
+	code, body := s.scenario99HTTPGet(target)
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("WebHDFS LISTSTATUS %s: HTTP %d (body[:200]=%.200s)", dir, code, body)
+	}
+	var listing struct {
+		FileStatuses struct {
+			FileStatus []struct {
+				Length int64  `json:"length"`
+				Path   string `json:"pathSuffix"`
+				Type   string `json:"type"`
+			} `json:"FileStatus"`
+		} `json:"FileStatuses"`
+	}
+	if err := json.Unmarshal([]byte(body), &listing); err != nil {
+		return nil, fmt.Errorf("decoding LISTSTATUS JSON: %w (body[:200]=%.200s)", err, body)
+	}
+	lengths := make([]int64, 0, len(listing.FileStatuses.FileStatus))
+	for _, fs := range listing.FileStatuses.FileStatus {
+		if fs.Type == "FILE" {
+			lengths = append(lengths, fs.Length)
+		}
+	}
+	return lengths, nil
+}
+
+// scenario99ReadBack creates a READABLE external table over the same LOCATION
+// with the per-profile READ clause (FORMAT 'CSV' for text profiles per DEF-1)
+// and returns (count, sum(amount)) of the landed data. This is the strongest
+// honest landing proof: the exported bytes round-trip through the reader.
+func (s *Scenario99E2ESuite) scenario99ReadBack(ext, like, location, profile string) (int64, float64, error) {
+	readDDL := fmt.Sprintf(
+		"DROP EXTERNAL TABLE IF EXISTS %s; "+
+			"CREATE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') %s",
+		ext, ext, like, location, builder.PXFReadFormatClause(profile))
+	if out, err := s.scenario99PSQL(readDDL); err != nil {
+		return 0, 0, fmt.Errorf("create read-back ext: %w (out=%s)", err, out)
+	}
+	defer func() { _, _ = s.scenario99PSQL("DROP EXTERNAL TABLE IF EXISTS " + ext) }()
+
+	out, err := s.scenario99CoordExec(fmt.Sprintf(
+		"psql -d postgres -tA -c %s",
+		scenario99ShQuote(fmt.Sprintf("SELECT count(*), coalesce(sum(amount),0) FROM %s", ext))))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read-back select: %w (out=%s)", err, out)
+	}
+	// psql -tA renders multi-column rows as col1|col2.
+	parts := strings.Split(strings.TrimSpace(out), "|")
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("read-back returned %q (want 'count|sum')", out)
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read-back count %q: %w", parts[0], err)
+	}
+	sum, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read-back sum %q: %w", parts[1], err)
+	}
+	return n, sum, nil
+}
+
+// scenario99SeedSum is the closed-form sum(amount) of the seeded source
+// (generate_series 1..200, amount = g*1.5): 1.5 * 20100 = 30150.
+const scenario99SeedSum = 30150.0
+
 // scenario99RequireKubeconfig skips cleanly when KUBECONFIG is unset.
 func (s *Scenario99E2ESuite) scenario99RequireKubeconfig() {
 	if os.Getenv(envKubeconfigS99) == "" {
@@ -422,6 +549,16 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveJDBCExport() {
 	ext := "s99_fe11_jdbc_export_ext"
 	loc := "pxf://" + cases.Scenario99JDBCExportResource +
 		"?PROFILE=jdbc&SERVER=" + cases.Scenario99ServerPostgresSource
+
+	// Baseline BEFORE the export (the pgsource target accumulates across
+	// re-runs; the delta is the deterministic landing proof).
+	readExt := "s99_fe11_jdbc_read_ext"
+	before, _, bErr := s.scenario99JDBCTargetCount(src, loc, readExt)
+	if bErr != nil {
+		s.T().Skipf("FE.11 could not read the jdbc target baseline (pgsource/export_target "+
+			"not prepared by gen-export-targets.sh?): %v [CONFIG-ONLY]", bErr)
+	}
+
 	createDDL := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
@@ -440,38 +577,45 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveJDBCExport() {
 		s.T().Logf("scenario99 FE.11/WE.2 ext table \\d+ (best-effort):\n%s", out)
 	}
 
-	// Export: reversed INSERT INTO <writable_ext> SELECT * FROM <src>.
+	// Export: reversed INSERT INTO <writable_ext> SELECT * FROM <src>. With the
+	// writable table successfully created the environment is proven present, so
+	// a failure here is a REAL defect (the U019 zero-byte-marker class), not a
+	// missing-env skip.
 	if out, err := s.scenario99PSQL(
 		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", ext, src)); err != nil {
-		s.T().Skipf("FE.11 export INSERT failed (jdbc-site.xml write creds required): "+
-			"%v (out=%s) [CONFIG-ONLY]", err, out)
+		s.T().Fatalf("FE.11 export INSERT failed after the writable table was created "+
+			"(jdbc-site.xml write creds / pxfwritable_export path): %v (out=%s)", err, out)
 	}
 
 	// HONEST signal: rows LAND in pgsource export_target. Query it through a
 	// READABLE jdbc external table (the same target) so the count is observable
 	// from the coordinator without a direct pgsource client.
-	readExt := "s99_fe11_jdbc_read_ext"
+	landed, lOut, lErr := s.scenario99JDBCTargetCount(src, loc, readExt)
+	if lErr != nil {
+		s.T().Fatalf("FE.11 read-back count failed after a successful export: %v (out=%s)", lErr, lOut)
+	}
+	assert.Zerof(s.T(), (landed-before)-total,
+		"FE.11 HONEST proof: exactly the exported rows must LAND in pgsource %s "+
+			"(before=%d exported=%d after=%d)",
+		cases.Scenario99JDBCExportResource, before, total, landed)
+	s.T().Logf("scenario99 FE.11 jdbc export: %d source rows exported → %d rows landed in %s "+
+		"(baseline %d + %d new)",
+		total, landed, cases.Scenario99JDBCExportResource, before, landed-before)
+}
+
+// scenario99JDBCTargetCount counts the pgsource export_target rows through a
+// READABLE jdbc external table over the given LOCATION.
+func (s *Scenario99E2ESuite) scenario99JDBCTargetCount(src, loc, readExt string) (int64, string, error) {
 	readDDL := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
 			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')",
 		readExt, readExt, src, loc)
 	if out, err := s.scenario99PSQL(readDDL); err != nil {
-		s.T().Logf("scenario99 FE.11: could not create read-back ext table: %v (out=%s)", err, out)
-		return
+		return 0, out, fmt.Errorf("create read-back ext table: %w", err)
 	}
 	defer func() { _, _ = s.scenario99PSQL("DROP EXTERNAL TABLE IF EXISTS " + readExt) }()
-
-	landed, lOut, lErr := s.scenario99Count(readExt)
-	if lErr != nil {
-		s.T().Logf("scenario99 FE.11: read-back count failed: %v (out=%s)", lErr, lOut)
-		return
-	}
-	assert.Positivef(s.T(), landed,
-		"FE.11 HONEST proof: rows must LAND in pgsource %s (got %d)",
-		cases.Scenario99JDBCExportResource, landed)
-	s.T().Logf("scenario99 FE.11 jdbc export: %d source rows exported → %d rows landed in %s",
-		total, landed, cases.Scenario99JDBCExportResource)
+	return s.scenario99Count(readExt)
 }
 
 // TestE2E_Scenario99_LiveS3Export (Part B) is the FE.9/WE.1 live proof: it seeds
@@ -486,13 +630,30 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveS3Export() {
 	}
 
 	src := "public.export_src"
-	if _, err := s.scenario99SeedExportSource(src); err != nil {
+	total, err := s.scenario99SeedExportSource(src)
+	if err != nil {
 		s.T().Skipf("FE.9 could not seed export source: %v [CONFIG-ONLY]", err)
 	}
+	require.Positive(s.T(), total, "FE.9 export source must have rows")
 
 	ext := "s99_fe9_s3_export_ext"
 	loc := "pxf://" + cases.Scenario99S3ExportResource +
 		"?PROFILE=s3:text&SERVER=" + cases.Scenario99ServerMinioWarehouse
+
+	// Determinism pre-step: wipe the export prefix (drops the gen-export-targets
+	// 0-byte .keep marker and any part files from previous runs) so the landing
+	// assertions below are exact on EVERY re-run.
+	bucket, prefix := scenario99S3BucketAndPrefix()
+	s3 := scenario99S3Client()
+	wipeCtx, wipeCancel := context.WithTimeout(s.ctx, 30*time.Second)
+	wiped, wipeErr := s3.DeletePrefix(wipeCtx, bucket, prefix)
+	wipeCancel()
+	if wipeErr != nil {
+		s.T().Skipf("FE.9 MinIO prefix wipe failed (MinIO not reachable / creds?): "+
+			"%v [CONFIG-ONLY]", wipeErr)
+	}
+	s.T().Logf("scenario99 FE.9: wiped %d pre-existing objects under %s/%s", wiped, bucket, prefix)
+
 	// DEF-4: the s3:text writable table is created with FORMAT 'TEXT'
 	// (delimiter ',') — the live-proven PXF 2.2.0 clause — from the SAME
 	// source of truth the operator's builder uses.
@@ -509,19 +670,49 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveS3Export() {
 
 	if out, err := s.scenario99PSQL(
 		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", ext, src)); err != nil {
-		s.T().Skipf("FE.9 export INSERT to s3 failed: %v (out=%s) [CONFIG-ONLY]", err, out)
+		// The writable table EXISTS (create succeeded) and the source is seeded,
+		// so the environment is proven present: an INSERT failure here is the
+		// DEF-4 defect class (the U019 run left only 0-byte markers) — FAIL.
+		s.T().Fatalf("FE.9 export INSERT to s3 failed after the writable table was "+
+			"created: %v (out=%s)", err, out)
 	}
 
-	// HONEST signal: objects LAND in MinIO under the export prefix. List the
-	// bucket via curl (anonymous list may 403; a 403/200 both prove the endpoint
-	// serves the path — the operator-side INSERT success is the primary signal).
-	listURL := strings.TrimRight(scenario99MinIOAddr(), "/") + "/" +
-		strings.SplitN(cases.Scenario99S3ExportResource, "/", 2)[0] + "/?list-type=2&prefix=exports/"
-	code, body := s.scenario99HTTPGet(listURL)
-	s.T().Logf("scenario99 FE.9/WE.1 s3 export: MinIO list HTTP=%d (export prefix %q); "+
-		"WE.2 format=text/CSV-shaped. body[:200]=%.200s",
-		code, cases.Scenario99S3ExportResource, body)
-	assert.NotZerof(s.T(), code, "FE.9 MinIO endpoint must be reachable to confirm landing")
+	// HONEST landing proof #1 (U029 §8 step 2): AUTHENTICATED MinIO listing must
+	// show at least one NON-ZERO-BYTE object under the export prefix — the
+	// pre-fix behaviour left only 0-byte *_bridge markers.
+	listCtx, listCancel := context.WithTimeout(s.ctx, 30*time.Second)
+	objects, lErr := s3.ListObjectsWithSize(listCtx, bucket, prefix)
+	listCancel()
+	require.NoErrorf(s.T(), lErr, "FE.9 MinIO listing of %s/%s must succeed", bucket, prefix)
+	nonZero := 0
+	var totalBytes int64
+	for _, o := range objects {
+		s.T().Logf("scenario99 FE.9: landed object %s size=%d", o.Key, o.Size)
+		if o.Size > 0 {
+			nonZero++
+			totalBytes += o.Size
+		}
+	}
+	require.NotEmptyf(s.T(), objects, "FE.9 objects must LAND under %s/%s", bucket, prefix)
+	assert.Positivef(s.T(), nonZero,
+		"FE.9 DEF-4 proof: at least one landed object must be NON-ZERO-BYTE "+
+			"(pre-fix behaviour left only 0-byte markers); got %d objects: %v",
+		len(objects), objects)
+	s.T().Logf("scenario99 FE.9/WE.1 s3 export: %d objects landed (%d non-zero-byte, %d bytes) "+
+		"under %s/%s; WE.2 format=TEXT (delimiter ',')",
+		len(objects), nonZero, totalBytes, bucket, prefix)
+
+	// HONEST landing proof #2 (U029 §8 step 4, strongest): read the export back
+	// through the DEF-1 readable clause (FORMAT 'CSV') and diff count/sum against
+	// the seeded source.
+	rbName := "s99_fe9_s3_read_ext"
+	n, sum, rErr := s.scenario99ReadBack(rbName, src, loc, "s3:text")
+	require.NoErrorf(s.T(), rErr, "FE.9 read-back via FORMAT 'CSV' must work")
+	assert.Equalf(s.T(), total, n, "FE.9 read-back row count must equal the exported source")
+	assert.Lessf(s.T(), math.Abs(sum-scenario99SeedSum), 0.001,
+		"FE.9 read-back sum(amount) must equal the closed-form source sum %.2f (got %.2f)",
+		scenario99SeedSum, sum)
+	s.T().Logf("scenario99 FE.9 read-back (FORMAT 'CSV'): count=%d sum(amount)=%.2f", n, sum)
 }
 
 // TestE2E_Scenario99_LiveHDFSExport (Part B) is the FE.10 live proof: it seeds a
@@ -536,13 +727,20 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveHDFSExport() {
 	}
 
 	src := "public.export_src"
-	if _, err := s.scenario99SeedExportSource(src); err != nil {
+	total, err := s.scenario99SeedExportSource(src)
+	if err != nil {
 		s.T().Skipf("FE.10 could not seed export source: %v [CONFIG-ONLY]", err)
 	}
+	require.Positive(s.T(), total, "FE.10 export source must have rows")
 
 	ext := "s99_fe10_hdfs_export_ext"
 	loc := "pxf://" + cases.Scenario99HDFSExportResource +
 		"?PROFILE=hdfs:text&SERVER=" + cases.Scenario99ServerHadoopCluster
+
+	// Determinism pre-step: empty + re-create the export dir so part files from
+	// previous runs cannot pollute the landing/read-back assertions.
+	s.scenario99WebHDFSReset(cases.Scenario99HDFSExportResource)
+
 	// DEF-4: hdfs:text mirrors s3:text — the proven FORMAT 'TEXT'
 	// (delimiter ',') write clause from the builder's source of truth.
 	createDDL := fmt.Sprintf(
@@ -558,20 +756,42 @@ func (s *Scenario99E2ESuite) TestE2E_Scenario99_LiveHDFSExport() {
 
 	if out, err := s.scenario99PSQL(
 		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", ext, src)); err != nil {
-		s.T().Skipf("FE.10 export INSERT to hdfs failed: %v (out=%s) [CONFIG-ONLY]", err, out)
+		// Writable table created + HDFS dir reset: env proven present — an
+		// INSERT failure is the DEF-4 defect class, not a missing-env skip.
+		s.T().Fatalf("FE.10 export INSERT to hdfs failed after the writable table was "+
+			"created: %v (out=%s)", err, out)
 	}
 
-	// HONEST signal: files LAND in HDFS. WebHDFS LISTSTATUS on the export dir.
-	listURL := strings.TrimRight(scenario99WebHDFSAddr(), "/") +
-		"/webhdfs/v1" + strings.TrimRight(cases.Scenario99HDFSExportResource, "/") +
-		"?op=LISTSTATUS"
-	code, body := s.scenario99HTTPGet(listURL)
-	s.T().Logf("scenario99 FE.10 hdfs export: WebHDFS LISTSTATUS HTTP=%d (%q). body[:300]=%.300s",
-		code, cases.Scenario99HDFSExportResource, body)
-	if code == http.StatusOK {
-		assert.Contains(s.T(), body, "FileStatus",
-			"FE.10 WebHDFS LISTSTATUS must show files landed in the export dir")
+	// HONEST landing proof #1 (U029 §8 step 3): WebHDFS LISTSTATUS must show at
+	// least one part file with length > 0.
+	lengths, lErr := s.scenario99WebHDFSFileLengths(cases.Scenario99HDFSExportResource)
+	require.NoErrorf(s.T(), lErr, "FE.10 WebHDFS LISTSTATUS must succeed")
+	require.NotEmptyf(s.T(), lengths,
+		"FE.10 part files must LAND in %s", cases.Scenario99HDFSExportResource)
+	nonZero := 0
+	var totalBytes int64
+	for _, l := range lengths {
+		s.T().Logf("scenario99 FE.10: landed part file length=%d", l)
+		if l > 0 {
+			nonZero++
+			totalBytes += l
+		}
 	}
+	assert.Positivef(s.T(), nonZero,
+		"FE.10 DEF-4 proof: at least one landed part file must be NON-ZERO-BYTE; got %v", lengths)
+	s.T().Logf("scenario99 FE.10 hdfs export: %d part files landed (%d non-zero-byte, %d bytes) "+
+		"under %s", len(lengths), nonZero, totalBytes, cases.Scenario99HDFSExportResource)
+
+	// HONEST landing proof #2 (strongest): read the export back through the
+	// DEF-1 readable clause and diff count/sum against the seeded source.
+	rbName := "s99_fe10_hdfs_read_ext"
+	n, sum, rErr := s.scenario99ReadBack(rbName, src, loc, "hdfs:text")
+	require.NoErrorf(s.T(), rErr, "FE.10 read-back via FORMAT 'CSV' must work")
+	assert.Equalf(s.T(), total, n, "FE.10 read-back row count must equal the exported source")
+	assert.Lessf(s.T(), math.Abs(sum-scenario99SeedSum), 0.001,
+		"FE.10 read-back sum(amount) must equal the closed-form source sum %.2f (got %.2f)",
+		scenario99SeedSum, sum)
+	s.T().Logf("scenario99 FE.10 read-back (FORMAT 'CSV'): count=%d sum(amount)=%.2f", n, sum)
 }
 
 // TestE2E_Scenario99_LiveFilteredExport (Part B) is the SF.1 live proof: it
@@ -624,8 +844,8 @@ metadata:
   name: s99-w17-readfilter
   namespace: %s
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   coordinator:
     replicas: 1
     storage:
@@ -638,7 +858,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       servers:
         - name: minio-warehouse
           type: s3

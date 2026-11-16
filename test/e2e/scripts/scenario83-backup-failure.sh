@@ -75,7 +75,7 @@
 #   SEED_ROWS            rows seeded per table (default: 2000)
 #   STATUS_TIMEOUT_SECS  max seconds to wait for a Job/status (default: 240)
 #   READY_TIMEOUT        cluster readiness timeout (default: 10m)
-#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.1.0)
+#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.2.0)
 #   VM_URL               VictoriaMetrics base URL (default: http://127.0.0.1:8428)
 #   COMPRESSION_LEVEL    --compression-level for gpbackup (default: 1)
 #   S3_REGION/S3_ENDPOINT/S3_BUCKET/S3_FOLDER  S3 wiring (mirror the sample CR)
@@ -99,7 +99,7 @@ DEADLINE_SECS="${DEADLINE_SECS:-5}"
 SEED_ROWS="${SEED_ROWS:-2000}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-240}"
 READY_TIMEOUT="${READY_TIMEOUT:-10m}"
-BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.1.0}"
+BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.2.0}"
 VM_URL="${VM_URL:-http://127.0.0.1:8428}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-1}"
 

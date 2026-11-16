@@ -74,7 +74,7 @@
 #   VM_URL               VictoriaMetrics base URL (default: http://127.0.0.1:8428)
 #   STATUS_TIMEOUT_SECS  max seconds to wait for status/event (default: 180)
 #   READY_TIMEOUT        cluster readiness timeout (default: 10m)
-#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.1.0)
+#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.2.0)
 # =============================================================================
 
 set -euo pipefail
@@ -107,7 +107,7 @@ MINIO_CONTAINER="${MINIO_CONTAINER:-minio}"
 VM_URL="${VM_URL:-http://127.0.0.1:8428}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-180}"
 READY_TIMEOUT="${READY_TIMEOUT:-10m}"
-BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.1.0}"
+BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.2.0}"
 
 # ----------------------------------------------------------------------------
 # Logging helpers

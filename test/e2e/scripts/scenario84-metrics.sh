@@ -85,7 +85,7 @@
 #   RETENTION_DELETED    annotated retention-deleted count (default: 1)
 #   STATUS_TIMEOUT_SECS  max seconds to wait for a Job/status (default: 240)
 #   READY_TIMEOUT        cluster readiness timeout (default: 10m)
-#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.1.0)
+#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.2.0)
 #   VM_URL               VictoriaMetrics base URL (default: http://127.0.0.1:8428)
 #   VM_SETTLE_SECS       settle before first poll (default: 30)
 #   VM_POLL_TRIES        VictoriaMetrics poll attempts (default: 18, ~3 min @10s)
@@ -112,7 +112,7 @@ SEED_ROWS="${SEED_ROWS:-5000}"
 RETENTION_DELETED="${RETENTION_DELETED:-1}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-240}"
 READY_TIMEOUT="${READY_TIMEOUT:-10m}"
-BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.1.0}"
+BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.2.0}"
 VM_URL="${VM_URL:-http://127.0.0.1:8428}"
 VM_SETTLE_SECS="${VM_SETTLE_SECS:-30}"
 VM_POLL_TRIES="${VM_POLL_TRIES:-18}"

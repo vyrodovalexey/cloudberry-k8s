@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -499,6 +500,25 @@ func (s *Scenario108E2ESuite) TestE2E_Scenario108_LiveTestReadCLI() {
 		pxfJob = fields[0]
 	}
 
+	// The preceding PXFServersCLI subtest's L.7 `pxf restart` triggers an ASYNC
+	// segment-primary roll; a test-read issued mid-roll reaches a restarting PXF
+	// sidecar and fails. Readiness alone is not enough DURING a rolling update
+	// (the not-yet-deleted old pod still reports Ready), so first wait for the
+	// ROLLOUT itself to complete, then for every sidecar to be Ready.
+	if out, err := s.s108Kubectl("rollout", "status",
+		"statefulset/"+s108Cluster()+"-segment-primary",
+		"-n", s108Namespace(), "--timeout=300s"); err != nil {
+		s.T().Logf("scenario108 L.15: rollout status returned %v (out=%s) — continuing to the "+
+			"readiness wait", err, out)
+	}
+	require.Eventuallyf(s.T(), func() bool {
+		st := s.runCtlOnce(bin, "pxf", "status")
+		return st.err == nil &&
+			strings.Contains(st.out, "readySidecars:") &&
+			s108SidecarsAllReady(st.out)
+	}, 5*time.Minute, 10*time.Second,
+		"segment PXF sidecars must all be Ready before test-read (L.7 restart rolls pods)")
+
 	var res s108ctlResult
 	if pxfJob != "" {
 		res = s.runCtl(bin, "data-loading", "test-read", "--job", pxfJob, "--limit", "10")
@@ -515,6 +535,30 @@ func (s *Scenario108E2ESuite) TestE2E_Scenario108_LiveTestReadCLI() {
 	require.NoErrorf(s.T(), res.err,
 		"test-read must exit 0 (rows OR honest available:false) (out=%q)", res.out)
 	s.T().Logf("scenario108 108-L15-L: test-read output:\n%s", res.out)
+}
+
+// s108SidecarsAllReady parses ctl pxf status table output ("readySidecars: N"
+// and "totalSidecars: M" lines) and reports whether every sidecar is Ready.
+func s108SidecarsAllReady(out string) bool {
+	var ready, total int
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(fields[0])
+		val, err := strconv.Atoi(strings.TrimSpace(fields[1]))
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "readySidecars":
+			ready = val
+		case "totalSidecars":
+			total = val
+		}
+	}
+	return total > 0 && ready >= total
 }
 
 // s108LooksUnreachable reports whether ctl output indicates the operator API was
