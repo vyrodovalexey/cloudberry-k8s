@@ -27,7 +27,12 @@ VM="http://127.0.0.1:8428"
 HEY="$HOME/go/bin/hey"; command -v hey >/dev/null 2>&1 && HEY="$(command -v hey)"
 RUNS="${RUNS:-3}"
 START_FROM="${START_FROM:-PTC-220-01}"   # resume: run only blocks with id >= START_FROM
-should_run() { [[ "$1" > "${START_FROM}" || "$1" == "${START_FROM}" ]]; }
+# skip_block NEXT: true (skip) iff NEXT <= START_FROM. Call sites use
+# `skip_block <next-block-id> || <body>`. (Guard history: campaign-2's strictly-
+# less comparison re-ran one block too many; campaign-3's inverted-|| revision
+# skipped 03..17 entirely. Truth table verified in analysis/u023-guard-test.sh
+# before any further launch.)
+skip_block() { [[ ! "$1" > "${START_FROM}" ]]; }
 TS="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="${SCRIPT_DIR}/.yandextank/u023-${TS}"
 RESULTS="${OUTDIR}/results.jsonl"
@@ -130,7 +135,7 @@ fp_check() {
 # =============================================================================
 # PTC-220-01 — health endpoints A1..A4: 100 RPS x 60s (07-12 baseline parity)
 # =============================================================================
-should_run PTC-220-01 || for run in $(seq 1 ${RUNS}); do
+skip_block PTC-220-02 || for run in $(seq 1 ${RUNS}); do
   for ep in healthz readyz; do
     for tgt in "api:${API_LOCAL}" "health:${HEALTH_LOCAL}"; do
       port="${tgt#*:}"
@@ -176,7 +181,7 @@ done
 # =============================================================================
 # PTC-220-02 — API read path (B1/B2): 9 sequential authed requests per endpoint
 # =============================================================================
-should_run PTC-220-02 || for run in $(seq 1 ${RUNS}); do
+skip_block PTC-220-03 || for run in $(seq 1 ${RUNS}); do
   for ep in "clusters" "clusters/${CLUSTER}"; do
     f="${OUTDIR}/PTC-220-02.${ep//\//_}.run${run}.csv"
     for i in $(seq 1 9); do
@@ -262,7 +267,7 @@ sys.exit(1 if any(k.startswith('5') for k in (o.get('other') or {})) else 0)" \
     || { abort_campaign "5xx during ${label} run${run}"; exit 1; }
 }
 
-should_run PTC-220-03 || {
+skip_block PTC-220-04 || {
   for run in $(seq 1 ${RUNS}); do
     knee_run PTC-220-03 0 "${run}"
     sleep 180  # bucket drain (600 tokens @ 10/s refill) between knee runs
@@ -275,7 +280,7 @@ should_run PTC-220-03 || {
 # =============================================================================
 # PTC-220-04 — stepped load 5/10/25/50/100 RPS x 30s, authed (B4 parity)
 # =============================================================================
-should_run PTC-220-04 || for run in $(seq 1 ${RUNS}); do
+skip_block PTC-220-05 || for run in $(seq 1 ${RUNS}); do
   for rps in 5 10 25 50 100; do
     label="PTC-220-04.step${rps}.run${run}"
     outfile="${OUTDIR}/${label}.txt"
@@ -324,7 +329,7 @@ done
 # =============================================================================
 # PTC-220-05 — DB query benchmark on mydb (C1..C5), warmup + 3 timed passes
 # =============================================================================
-should_run PTC-220-05 || for run in $(seq 1 ${RUNS}); do
+skip_block PTC-220-06 || for run in $(seq 1 ${RUNS}); do
   kubectl exec -i -n ${NS} ${COORD_POD} -c cloudberry -- /usr/local/cloudberry-db/bin/psql -U gpadmin -d mydb -f - \
     < "${SCRIPT_DIR}/sql/mydb-benchmark-u023.sql" > "${OUTDIR}/PTC-220-05.warmup.run${run}.log" 2>&1 || true
   for pass in 1 2 3; do
@@ -400,43 +405,43 @@ exit(1 if o['fails']>0 else 0)" || { abort_campaign "go bench ${tag} run${run} h
 cd "${REPO_ROOT}"
 # PTC-220-06: s96 s3 read (text -> FORMAT 'CSV') + write (text -> FORMAT 'TEXT');
 # timestamped MinIO prefix per constraint.
-should_run PTC-220-06 || go_bench PTC-220-06 "BenchmarkScenario96_" "3x" \
+skip_block PTC-220-07 || go_bench PTC-220-06 "BenchmarkScenario96_" "3x" \
   SCENARIO96_OBJSTORE_LIVE=1 SCENARIO96_CLUSTER=${CLUSTER} \
   SCENARIO96_PERF_WRITE_RESOURCE="cloudberry-warehouse/perf-u023-${MINTS}/" || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 # PTC-220-07: s97 hdfs:text read (CSV clause) + hdfs:sequencefile write (bridge)
-should_run PTC-220-07 || go_bench PTC-220-07 "BenchmarkScenario97_" "3x" SCENARIO97_HADOOP_LIVE=1 SCENARIO97_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-08 || go_bench PTC-220-07 "BenchmarkScenario97_" "3x" SCENARIO97_HADOOP_LIVE=1 SCENARIO97_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 # PTC-220-08: s99 jdbc export (bridge clause)
-should_run PTC-220-08 || go_bench PTC-220-08 "BenchmarkScenario99_" "3x" SCENARIO99_EXPORT_LIVE=1 SCENARIO99_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-09 || go_bench PTC-220-08 "BenchmarkScenario99_" "3x" SCENARIO99_EXPORT_LIVE=1 SCENARIO99_CLUSTER=${CLUSTER} || { cd "${SCRIPT_DIR}"; exit 1; }
 fp_check || exit 1
 
 # PTC-220-09: s105 PXF status read (OIDC path — honest skip if Keycloak unreachable)
-should_run PTC-220-09 || go_bench PTC-220-09 "BenchmarkScenario105_" "50x" SCENARIO105_PXF_LIVE=1 SCENARIO105_CLUSTER=${CLUSTER} || true
+skip_block PTC-220-10 || go_bench PTC-220-09 "BenchmarkScenario105_" "50x" SCENARIO105_PXF_LIVE=1 SCENARIO105_CLUSTER=${CLUSTER} || true
 
 # PTC-220-10/11: s107 + s108 API read latency (basic auth; 429 tolerated)
-should_run PTC-220-10 || go_bench PTC-220-10 "BenchmarkScenario107_" "50x" SCENARIO107_LIVE=1 SCENARIO107_CLUSTER=${CLUSTER} \
+skip_block PTC-220-11 || go_bench PTC-220-10 "BenchmarkScenario107_" "50x" SCENARIO107_LIVE=1 SCENARIO107_CLUSTER=${CLUSTER} \
   SCENARIO107_API_BASE="http://127.0.0.1:${API_LOCAL}" SCENARIO107_API_USER=admin SCENARIO107_API_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
-should_run PTC-220-11 || go_bench PTC-220-11 "BenchmarkScenario108_" "50x" SCENARIO108_LIVE=1 SCENARIO108_CLUSTER=${CLUSTER} \
+skip_block PTC-220-12 || go_bench PTC-220-11 "BenchmarkScenario108_" "50x" SCENARIO108_LIVE=1 SCENARIO108_CLUSTER=${CLUSTER} \
   SCENARIO108_API_BASE="http://127.0.0.1:${API_LOCAL}" SCENARIO108_API_USER=admin SCENARIO108_API_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-12: s109 VM query latency
-should_run PTC-220-12 || go_bench PTC-220-12 "BenchmarkScenario109_" "30x" SCENARIO109_VM_BASE="${VM}" || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-13 || go_bench PTC-220-12 "BenchmarkScenario109_" "30x" SCENARIO109_VM_BASE="${VM}" || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-13/14/15: admission + netpol + storage admission (dry-run / read-only)
-should_run PTC-220-13 || go_bench PTC-220-13 "BenchmarkScenario110_" "20x" SCENARIO110_LIVE=1 SCENARIO110_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
-should_run PTC-220-14 || go_bench PTC-220-14 "BenchmarkScenario111_" "20x" SCENARIO111_LIVE=1 SCENARIO111_CLUSTER=${CLUSTER} SCENARIO111_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
-should_run PTC-220-15 || go_bench PTC-220-15 "BenchmarkScenario113_" "20x" SCENARIO113_LIVE=1 SCENARIO113_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-14 || go_bench PTC-220-13 "BenchmarkScenario110_" "20x" SCENARIO110_LIVE=1 SCENARIO110_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-15 || go_bench PTC-220-14 "BenchmarkScenario111_" "20x" SCENARIO111_LIVE=1 SCENARIO111_CLUSTER=${CLUSTER} SCENARIO111_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
+skip_block PTC-220-16 || go_bench PTC-220-15 "BenchmarkScenario113_" "20x" SCENARIO113_LIVE=1 SCENARIO113_NAMESPACE=${NS} || { cd "${SCRIPT_DIR}"; exit 1; }
 
 # PTC-220-16: s119 storage API (disabled-path; real status codes recorded)
-should_run PTC-220-16 || go_bench PTC-220-16 "BenchmarkScenario119_" "30x" SCENARIO119_LIVE=1 SCENARIO119_CLUSTER=${CLUSTER} \
+skip_block PTC-220-17 || go_bench PTC-220-16 "BenchmarkScenario119_" "30x" SCENARIO119_LIVE=1 SCENARIO119_CLUSTER=${CLUSTER} \
   SCENARIO119_TARGET="127.0.0.1:${API_LOCAL}" SCENARIO119_USER=admin SCENARIO119_PASS="${PW}" || { cd "${SCRIPT_DIR}"; exit 1; }
 cd "${SCRIPT_DIR}"
 
 # =============================================================================
 # PTC-220-17 — in-process suite (make test-perf methodology), 3x
 # =============================================================================
-should_run PTC-220-17 || for run in $(seq 1 ${RUNS}); do
+skip_block PTC-220-18 || for run in $(seq 1 ${RUNS}); do
   f="${OUTDIR}/PTC-220-17.run${run}.log"
   ( cd "${REPO_ROOT}" && go test ./test/perf/... -tags=e2e -run='^$' -bench=. -benchmem -count=1 -timeout=30m -v ) > "${f}" 2>&1 &
   gp=$!; lg_start ${gp} "${OUTDIR}/PTC-220-17.run${run}.cpu"; wait ${gp}; rc=$?
