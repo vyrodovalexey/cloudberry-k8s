@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 )
 
 const (
@@ -116,13 +118,21 @@ func BenchmarkScenario97_ReadThroughput(b *testing.B) {
 		b.Skipf("coordinator %s not reachable: %v (out=%s)", perf97CoordPod(), err, out)
 	}
 
+	// U027 (Cloudberry 2.2.0): per-profile read clause — hdfs:text (the
+	// default) reads with FORMAT 'CSV'; the import bridge is only correct
+	// for parquet/avro/sequencefile. Builder helper = single source of truth.
 	setup := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE EXTERNAL TABLE %s (LIKE %s) "+
 			"LOCATION ('pxf://%s?PROFILE=%s&SERVER=%s') "+
-			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
-		ext, ext, target, resource, profile, server)
-	prep := fmt.Sprintf("DROP TABLE IF EXISTS %s; CREATE TABLE %s (line text) DISTRIBUTED RANDOMLY;", target, target)
+			"%s;",
+		ext, ext, target, resource, profile, server, builder.PXFReadFormatClause(profile))
+	// The staged HDFS source (gen-hadoop-samples.sh data.csv shape:
+	// (id int, name text, value int)) must match the external table's columns
+	// under the U027 FORMAT 'CSV' read clause.
+	prep := fmt.Sprintf(
+		"DROP TABLE IF EXISTS %s; CREATE TABLE %s (id int, name text, value int) DISTRIBUTED RANDOMLY;",
+		target, target)
 	if out, err := perf97CoordExec(ctx,
 		fmt.Sprintf("psql -d postgres -v ON_ERROR_STOP=1 -c %s -c %s",
 			perf97ShQuote(prep), perf97ShQuote(setup))); err != nil {
@@ -199,12 +209,16 @@ func BenchmarkScenario97_WriteThroughput(b *testing.B) {
 		b.StopTimer()
 		ext := fmt.Sprintf("s97_perf_write_ext_%d", i)
 		resource := fmt.Sprintf("%siter-%d/", resourceBase, i)
+		// U029 (DEF-4): per-profile write clause from the builder's source
+		// of truth — hdfs:sequencefile (the default) keeps the
+		// pxfwritable_export bridge; a text-profile override would get
+		// FORMAT 'TEXT' (delimiter ',').
 		setup := fmt.Sprintf(
 			"DROP EXTERNAL TABLE IF EXISTS %s; "+
 				"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) "+
 				"LOCATION ('pxf://%s?PROFILE=%s&SERVER=%s') "+
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');",
-			ext, ext, src, resource, profile, server)
+				"%s;",
+			ext, ext, src, resource, profile, server, builder.PXFWriteFormatClause(profile))
 		if out, err := perf97CoordExec(ctx,
 			fmt.Sprintf("psql -d postgres -v ON_ERROR_STOP=1 -c %s", perf97ShQuote(setup))); err != nil {
 			b.Skipf("perf write setup failed (PXF/extension may be absent): %v (out=%s)", err, out)

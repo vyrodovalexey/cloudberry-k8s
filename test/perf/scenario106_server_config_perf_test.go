@@ -90,7 +90,7 @@ func perf106BuildCluster(n int, endpointSuffix string) *cbv1alpha1.CloudberryClu
 				Enabled: true,
 				Pxf: &cbv1alpha1.PxfSpec{
 					Enabled: true,
-					Image:   "apache/cloudberry-pxf:2.1.0",
+					Image:   "apache/cloudberry-pxf:2.2.0",
 					Servers: servers,
 				},
 			},

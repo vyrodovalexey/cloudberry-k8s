@@ -124,13 +124,24 @@ func BenchmarkScenario96_ReadThroughput(b *testing.B) {
 		b.Skipf("coordinator %s not reachable: %v (out=%s)", perfCoordPod(), err, out)
 	}
 
+	// U027 (Cloudberry 2.2.0): the read-side FORMAT clause is per-profile —
+	// delimited-text profiles (the s3:text default) must read with
+	// FORMAT 'CSV'; the pxfwritable_import bridge is only correct for
+	// parquet/avro/sequencefile. Take the clause from the builder's source
+	// of truth so an env-overridden profile stays correct too.
 	setup := fmt.Sprintf(
 		"DROP EXTERNAL TABLE IF EXISTS %s; "+
 			"CREATE EXTERNAL TABLE %s (LIKE %s) "+
 			"LOCATION ('pxf://%s?PROFILE=%s&SERVER=%s') "+
-			"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
-		ext, ext, target, resource, profile, server)
-	prep := fmt.Sprintf("DROP TABLE IF EXISTS %s; CREATE TABLE %s (line text) DISTRIBUTED RANDOMLY;", target, target)
+			"%s;",
+		ext, ext, target, resource, profile, server, builder.PXFReadFormatClause(profile))
+	// The staged source (gen-objstore-samples.sh text/data.csv) carries
+	// (id int, name text, value int); under the U027 FORMAT 'CSV' read clause
+	// the external table must declare the SAME columns (the old single
+	// (line text) shape only worked with the bridge formatter).
+	prep := fmt.Sprintf(
+		"DROP TABLE IF EXISTS %s; CREATE TABLE %s (id int, name text, value int) DISTRIBUTED RANDOMLY;",
+		target, target)
 	if out, err := perfCoordExec(ctx,
 		fmt.Sprintf("psql -d postgres -v ON_ERROR_STOP=1 -c %s -c %s",
 			perfShQuote(prep), perfShQuote(setup))); err != nil {
