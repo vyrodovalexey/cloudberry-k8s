@@ -73,7 +73,7 @@ func TestEnsurePxfServersConfigMap_PxfDisabledDLEnabled_DeletesStaleConfigMap(t 
 	cluster := newTestCluster()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
-		Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: "cloudberry/pxf:2.1.0"},
+		Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: "cloudberry/pxf:2.2.0"},
 	}
 	stale := stalePxfServersConfigMap(cluster.Name, cluster.Namespace)
 

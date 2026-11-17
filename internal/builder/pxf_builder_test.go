@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	testPxfImage      = "cloudberry/pxf:2.1.0"
+	testPxfImage      = "cloudberry/pxf:2.2.0"
 	testMySQLDriver   = "com.mysql.cj.jdbc.Driver"
 	testJDBCURLKey    = "jdbc.url"
 	testJDBCDriverKey = "jdbc.driver"

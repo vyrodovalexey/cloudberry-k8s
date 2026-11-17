@@ -69,8 +69,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "83"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -201,7 +201,7 @@ spec:
   # per-run Job with activeDeadlineSeconds: 5, NOT this CR).
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

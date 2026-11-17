@@ -240,7 +240,7 @@ func (s *Scenario98E2ESuite) TestE2E_Scenario98_PartA_ContractHonest() {
 
 			assert.Containsf(s.T(), script, tc.DDLContains,
 				"%s built DDL must carry %q", tc.ID, tc.DDLContains)
-			assert.Contains(s.T(), script, "pxfwritable_import")
+			assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 
 			if strings.Contains(tc.Description, "[CONFIG-ONLY]") {
 				s.T().Logf("scenario98 %s: [CONFIG-ONLY] — DDL knob correctness only", tc.ID)

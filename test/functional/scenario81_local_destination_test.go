@@ -50,7 +50,7 @@ import (
 // ============================================================================
 
 const (
-	scenario81BackupImage = "cloudberry-backup:2.1.0"
+	scenario81BackupImage = "cloudberry-backup:2.2.0"
 	// scenario81BackupPVC is the PVC the local destination mounts at the path.
 	scenario81BackupPVC = "backup-pvc"
 	// scenario81LocalPath is the on-pod local backup directory (--backup-dir).

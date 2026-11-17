@@ -387,8 +387,15 @@ func (b *DefaultBuilder) BuildExporterService(
 			Name:      util.ExporterMetricsServiceName(cluster.Name),
 			Namespace: cluster.Namespace,
 			Labels:    labels,
+			// The full prometheus.io/* set the vmagent
+			// kubernetes-service-endpoints job consumes. The port annotation
+			// targets the postgres-exporter port (9187); without it vmagent
+			// scrapes the wrong endpointslice port (permanently-down target —
+			// ADV-2/U024). The query-exporter port (9188) is covered by the
+			// chart's dedicated cloudberry-query-exporter job.
 			Annotations: map[string]string{
 				"prometheus.io/scrape": promScrapeTrue,
+				"prometheus.io/port":   fmt.Sprintf("%d", pgExporterPort),
 				"prometheus.io/path":   "/metrics",
 			},
 			OwnerReferences: []metav1.OwnerReference{

@@ -83,7 +83,7 @@ func TestPxfServerSpec_DeepCopy_KerberosRoundtrip(t *testing.T) {
 func TestPxfSpec_DeepCopy_DataLoaderRoleRoundtrip(t *testing.T) {
 	src := &PxfSpec{
 		Enabled:        true,
-		Image:          "cloudberry/pxf:2.1.0",
+		Image:          "cloudberry/pxf:2.2.0",
 		DataLoaderRole: "cb_dataload",
 		Servers: []PxfServerSpec{
 			{Name: "s3", Type: "s3"},

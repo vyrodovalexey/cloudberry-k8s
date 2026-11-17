@@ -13,6 +13,6 @@ kind: CloudberryCluster
 metadata:
   name: scenario34-workload-disabled
 spec:
-  version: "2.1.0"
+  version: "2.2.0"
   workload:
     enabled: false

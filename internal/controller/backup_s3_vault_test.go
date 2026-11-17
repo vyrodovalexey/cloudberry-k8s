@@ -77,7 +77,7 @@ func vaultBackupCluster() *cbv1alpha1.CloudberryCluster {
 				},
 			},
 		},
-		Image: "cloudberry-backup:2.1.0",
+		Image: "cloudberry-backup:2.2.0",
 	}
 	return cluster
 }

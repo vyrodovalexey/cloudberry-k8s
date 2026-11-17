@@ -46,9 +46,11 @@ for i in $(seq 1 60); do
 done
 
 # Wait for HBase Master to be ready (port 16010).
+# NOTE: /status/cluster was removed in newer HBase (2.5+); /master-status is
+# served across the 2.x line (TASK-U010, openeuler/hbase 2.6.5).
 echo "Waiting for HBase Master to be ready..."
 for i in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:16010/status/cluster" > /dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:16010/master-status" > /dev/null 2>&1; then
     echo "HBase Master is ready!"
     break
   fi

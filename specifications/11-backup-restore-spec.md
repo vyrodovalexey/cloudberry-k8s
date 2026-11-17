@@ -714,6 +714,31 @@ the two is set, that flag is emitted as-is. This rule applies to the **restore**
 path only; the **backup** path (`gpbackup --with-stats`) is unaffected and
 unchanged.
 
+**Restore Job naming + retry-after-failure (added 2026-11-15).** The restore
+Job is named **deterministically from the user-supplied backup timestamp** —
+`util.RestoreJobName(cluster, ts)` = `<cluster>-restore-<ts>`
+(`internal/builder/backup_builder.go` `BuildRestoreJob`). Unlike backups (whose
+timestamp is server-generated `time.Now()`), retrying a restore of the **same**
+timestamp regenerates the **same** Job name, so a retry may collide with a
+leftover Job from a previous attempt. The full collision/retry contract —
+terminal leftover (failed **or** succeeded) → **delete-and-replace + 202**;
+in-flight (Running/Pending) → **409 CONFLICT**, Job untouched; genuine
+server-side errors → **500** — is codified in the
+[Failure-handling contract](#failure-handling-contract) below and mirrored in
+[API Spec §5.17](06-api-specification.md#517-restore-request-post-clustersnamebackupstimestamprestore).
+
+> **Revision note (2026-11-15 — DEF-6 fix codified; commit `8a79782`,
+> live-proven).** This spec was previously **silent** on restore
+> retry-after-failure. Pre-fix, a retry whose timestamp-keyed Job name collided
+> with a lingering failed restore Job (which persists until
+> `ttlSecondsAfterFinished` GC) returned an opaque **500 `failed to create
+> restore job`**, and operators had to `kubectl delete job` by hand to un-block
+> the name. The implemented behavior is now contract: see the
+> [Failure-handling contract](#failure-handling-contract). Live-proven against
+> the deployed operator (Scenario 85e collision cases: seeded FAILED leftover →
+> **202** + replacement Job with a fresh uid and no inherited terminal
+> conditions; seeded in-flight leftover → **409 CONFLICT**, uid unchanged).
+
 ### Scenario 74 — Single Data File + Copy Queue + gpbackup_helper + Full-Option Restore
 
 **Scenario 74** triggers an on-demand **single-data-file** backup
@@ -1263,6 +1288,15 @@ restore-operation failures emit `RestoreFailed` and **never** `BackupFailed`, so
 Scenario 77's backup-only semantics (its test asserts zero `BackupFailed` for restore)
 stay intact while the 78d refuse-on-incomplete case is surfaced.
 
+**Retrying after a failed restore (added 2026-11-15).** The failed restore Job
+persists under its deterministic name `<cluster>-restore-<ts>` until
+`ttlSecondsAfterFinished` GC, but a retry of the **same timestamp** no longer
+requires manual Job deletion: the API **replaces the terminal leftover and
+proceeds (202)**, and only refuses with **409 CONFLICT** while a restore of that
+timestamp is still in flight — see the
+[Restore retry-after-failure contract](#restore-retry-after-failure-contract-added-2026-11-15)
+under the Failure-handling contract.
+
 ## Cross-Cluster Migration
 
 The operator supports database migration between clusters by creating a **single
@@ -1412,6 +1446,34 @@ each produce their own Warning, and **restore-operation** Job failures are
 **excluded** (Scenario 77 is backup-only). Healing the fault and triggering a
 fresh backup lets all four checks pass and the Job reach `Success`, transitioning
 `lastBackupStatus` back to `Success`.
+
+#### Restore retry-after-failure contract (added 2026-11-15)
+
+**Scope.** What the operator does when a `POST .../backups/{timestamp}/restore`
+retry collides with a leftover restore Job of the **same deterministic name**
+(`<cluster>-restore-<ts>`, `util.RestoreJobName` — see
+[Restore Request](#restore-request)). Implemented in `handleRestoreBackup`
+(`internal/api/server.go`, commit `8a79782`); live-proven by the Scenario 85e
+collision cases against the deployed operator.
+
+| Existing `<cluster>-restore-<ts>` Job state | Operator behavior | API response |
+|---|---|---|
+| **Terminal** — `JobFailed=True` **or** `JobComplete=True` (failed **or** succeeded leftover) | **Delete-and-replace.** The finished Job is deleted with background cascade propagation (NotFound tolerated), then a **fresh replacement Job** is built by the same builder call (owner-referenced, labelled, **fresh status — no terminal conditions inherited**). The previous outcome remains durably recorded on `status.backup`/`backupHistory[]` and in `cloudberry_restore_total{result=…}` (transition-gated per Job state change); the retry is recorded as a **new** restore start (`RecordRestore(…, "started")`). | **202** `restore started` |
+| **In flight** — `Running` or `Pending` | **Never clobbered.** The in-flight restore is left untouched; the caller receives an actionable conflict message: `restore job "<name>" is still in progress; wait for it to finish or delete it before retrying the restore`. **No** `RecordRestore(…, "failed")` is emitted for this client conflict (honest metrics — a rejected retry is not a restore failure). | **409 CONFLICT** (code `CONFLICT`) |
+| Replacement-Create `AlreadyExists` (a concurrent retry won the replace race) | surfaced as a conflict, no second delete attempted | **409 CONFLICT** |
+| Genuine server-side errors — Job `Get`/`Delete`/`Create` failures other than the classified cases above | honest error surfacing, nothing silently retried | **500 INTERNAL_ERROR** |
+
+Design notes: the handler is **create-first-then-classify** — only an
+`AlreadyExists` create error routes to collision resolution (no
+get-before-create TOCTOU window); deletion happens **only** for terminal Jobs
+whose pods are already terminal; a **succeeded** leftover is replaced by the
+same rule as a failed one (re-restoring an already-restored timestamp — e.g.
+into a different `redirectDb` — is the same deterministic-name defect class and
+must not 500). Finished restore Jobs are `ttlSecondsAfterFinished`-GC'd anyway,
+so the system already treats them as transient. This mirrors the established
+operator idiom for deterministic Job names (the data-loading `start` →
+`409 JOB_ALREADY_RUNNING` path and the controller's `IsAlreadyExists`-tolerant
+re-creation patterns).
 
 ### Scenario 77 — Pre-Backup Health Checks
 

@@ -1,6 +1,12 @@
 # =============================================================================
 # Cloudberry Operator Test Environment
 # =============================================================================
+# Image versions (TASK-U010, 2026-11-15): per the U001 Cloudberry 2.2.0
+# compatibility analysis §4, NO service image bump is *required* by Cloudberry
+# 2.2.0. Two availability-forced changes were necessary: minio (upstream
+# deleted its Docker Hub repository; see the minio service block) and hbase
+# (the previous amd64/JDK-8 image cannot run on this arm64 host — wedged under
+# qemu emulation; see the hbase service block).
 # Port allocation:
 #   8200       - Vault (dev mode, root token: myroot)
 #   8090/8091  - Keycloak (admin/admin)
@@ -193,9 +199,22 @@ services:
   # MinIO - S3-compatible object storage for backup testing
   # ===========================================================================
   minio:
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    # Image note (TASK-U010, 2026-11-15): the previously pinned
+    # minio/minio:RELEASE.2024-11-07T00-52-20Z became unpullable — MinIO
+    # removed its Docker Hub repository (and the quay.io mirror) in late 2025;
+    # see minio/minio#21647 ("Docker release?"). The exact old tag survives on
+    # no maintained registry (bitnami/minio purged, elestio carries only
+    # :latest). alpine/minio is the maintained Alpine-aports build of the same
+    # upstream, pinned to the 2025-10-15 security release (multi-arch, incl.
+    # native arm64 for this host). Two contract adjustments it forces: the
+    # image runs as non-root uid 100 (minio) and ships no curl, so the data
+    # volume is mounted at /home/minio (minio-owned in the image) instead of
+    # /data (root-owned there), and the healthcheck uses busybox wget instead
+    # of curl. S3 API, SigV4 auth and ports are unchanged — verified against
+    # setup-minio.sh (HTTP 200 on PUT /cloudberry-backups, /cloudberry-data).
+    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
     container_name: minio
-    command: server /data --console-address ":9001"
+    command: server /home/minio --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -203,9 +222,9 @@ services:
       - 9000:9000
       - 9001:9001
     volumes:
-      - minio_data:/data
+      - minio_data:/home/minio
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -465,14 +484,44 @@ services:
       start_period: 10s
 
   # ===========================================================================
-  # HBase - Single-node pseudo-distributed HBase (bundles ZooKeeper)
+  # HBase - Standalone HBase (single JVM: Master + RegionServer + ZooKeeper)
   # Provides ZooKeeper quorum at hbase:2181 for PXF hbase:* external-table
   # tests (Scenario 93 acceptance test).
+  #
+  # Image decision (TASK-U010, 2026-11-15, per U001 §4 — revised by evidence):
+  # the recommended KEPT image harisekhon/hbase:2.1 (amd64-only, JDK 8) is
+  # NOT RUNNABLE on this arm64 docker-desktop host: under qemu-x86_64 all
+  # five daemons wedge during JVM startup (zero log output, ~1% CPU, ZK
+  # port open but never answering `ruok`; unchanged after 20+ minutes —
+  # reproduced, see U010 report §9). Replaced with openeuler/hbase
+  # 2.6.5-oe2403sp3: maintained (2026), multi-arch native arm64, genuine
+  # upstream HBase 2.6.5 build, JDK 11. U001's preferred 2.5.x alignment
+  # remains impossible — no maintained 2.5.x image exists on Docker Hub
+  # (harisekhon max 2.1; no apache/hbase or bitnami/hbase repos; community
+  # images stale at <= 2.3.7). Pairing note: PXF 2.2.0's hbase client is
+  # 2.5.15 — an n-1 client against a 2.6 server, which HBase compatibility
+  # rules support (strictly better than the old 2.5-client/2.1-server
+  # n-4 pairing).
+  #
+  # Contract notes (see hbase/hbase-site.xml for the full story):
+  #   - the command creates a /hbase -> /usr/local/hbase symlink so the
+  #     setup scripts' `/hbase/bin/hbase shell` path keeps working unchanged;
+  #   - embedded ZooKeeper needs clientPortAddress=0.0.0.0 (else loopback
+  #     only) and the 4lw whitelist for `ruok`;
+  #   - the image has no `nc`, so the healthcheck probes `ruok` via bash
+  #     /dev/tcp (same technique as the keycloak_web healthcheck).
   # ===========================================================================
   hbase:
-    image: harisekhon/hbase:2.1
+    image: openeuler/hbase:2.6.5-oe2403sp3
     container_name: hbase
     hostname: hbase
+    entrypoint: ["bash", "-c"]
+    command:
+      - -c
+      - |
+        mkdir -p /hbase-data
+        ln -sfn /usr/local/hbase /hbase
+        exec /usr/local/hbase/bin/hbase master start
     ports:
       - 2181:2181      # ZooKeeper client port
       - 16010:16010    # HBase Master WebUI
@@ -480,8 +529,9 @@ services:
       - 16030:16030    # HBase RegionServer WebUI
     volumes:
       - hbase_data:/hbase-data
+      - ./hbase/hbase-site.xml:/usr/local/hbase/conf/hbase-site.xml:ro
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc 127.0.0.1 2181 | grep -q imok"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/2181 && printf 'ruok\\n' >&3 && head -c 4 <&3 | grep -q imok"]
       interval: 10s
       timeout: 5s
       retries: 30

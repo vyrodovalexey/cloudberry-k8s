@@ -441,12 +441,12 @@ type CloudberryClusterList struct {
 // CloudberryClusterSpec defines the desired state of CloudberryCluster.
 type CloudberryClusterSpec struct {
 	// Version is the Cloudberry DB version.
-	// +kubebuilder:default="2.1.0"
+	// +kubebuilder:default="2.2.0"
 	// +optional
 	Version string `json:"version,omitempty"`
 
 	// Image is the container image for Cloudberry DB.
-	// +kubebuilder:default="cloudberrydb/cloudberry:2.1.0"
+	// +kubebuilder:default="cloudberrydb/cloudberry:2.2.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -1315,7 +1315,7 @@ type BackupSpec struct {
 	// +optional
 	JobTemplate *BackupJobTemplate `json:"jobTemplate,omitempty"`
 
-	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.1.0).
+	// Image is the backup toolchain container image (e.g. cloudberry-backup:2.2.0).
 	// It MUST be backup-capable: the image must contain kubectl (backup/restore
 	// Jobs `kubectl exec` gpbackup/gprestore into the coordinator pod — the
 	// coordinator-exec model) and the gpbackup/gprestore/gpbackup_s3_plugin
@@ -1942,12 +1942,13 @@ type PxfJobSpec struct {
 	TargetTable string `json:"targetTable"`
 
 	// Mode is the load mode: "insert" / "insert-select" build a READABLE
-	// external table (FORMATTER='pxfwritable_import') for ingestion, while
-	// "writable" builds a WRITABLE external table (FORMATTER='pxfwritable_export')
-	// for export. When Mode == "writable" the admission webhook enforces the
-	// write-capability matrix: only profiles whose format is writable
-	// (text/parquet/avro for object stores) are admitted; json/orc are rejected
-	// as write-unsupported (see internal/pxfpolicy).
+	// external table for ingestion, while "writable" builds a WRITABLE external
+	// table for export with the per-profile FORMAT clause (FORMAT 'TEXT'
+	// (delimiter ',') for delimited-text profiles, FORMATTER='pxfwritable_export'
+	// for bridge-serialized formats). When Mode == "writable" the admission
+	// webhook enforces the write-capability matrix: only profiles whose format
+	// is writable (text/parquet/avro for object stores) are admitted; json/orc
+	// are rejected as write-unsupported (see internal/pxfpolicy).
 	// +optional
 	Mode string `json:"mode,omitempty"`
 

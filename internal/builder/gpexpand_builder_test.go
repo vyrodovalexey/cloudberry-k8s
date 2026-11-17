@@ -61,7 +61,7 @@ func TestBuildGpexpandJob_Shape(t *testing.T) {
 	assert.Contains(t, script, "gpexpand -a")
 	assert.Contains(t, script, "gpexpand --clean")
 
-	// Cloudberry 2.1.0 gpexpand does NOT support the -D <db> option; the target
+	// Cloudberry 2.2.0 gpexpand does NOT support the -D <db> option; the target
 	// DB is selected via the exported PGDATABASE env instead. Assert no -D flag
 	// is passed to any gpexpand invocation and the PGDATABASE export is present.
 	assert.NotContains(t, script, "-D "+gpexpandStatusDatabase,
@@ -285,7 +285,7 @@ func TestGpexpandScript_ResumeAndEnv(t *testing.T) {
 	// the input file is staged into the coordinator pod via base64.
 	assert.Contains(t, script, "base64 -d >")
 
-	// Cloudberry 2.1.0 gpexpand selects the DB via PGDATABASE, NOT -D <db>.
+	// Cloudberry 2.2.0 gpexpand selects the DB via PGDATABASE, NOT -D <db>.
 	inner := renderGpexpandInnerScript()
 	assert.Contains(t, inner, "export PGDATABASE="+gpexpandStatusDatabase,
 		"the DB must be selected via PGDATABASE, not the unsupported -D option")

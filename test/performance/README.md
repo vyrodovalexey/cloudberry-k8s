@@ -2,6 +2,17 @@
 
 Performance and load testing suite for the Cloudberry K8s Operator REST API using [Yandex Tank](https://yandextank.readthedocs.io/).
 
+> **Latest report (Cloudberry 2.2.0 campaign):**
+> [results/2026-11-16-cloudberry220-perftest-report.md](results/2026-11-16-cloudberry220-perftest-report.md) —
+> **no regression on the measured scenarios** vs the 2026-07-12 baseline (health, API
+> rate-limiter behavior, mydb C1–C5, PXF data-path throughput). Two caveats apply:
+> (1) **coverage is partial** — the run was time-boxed and PTC-220-08…17 (perf99 JDBC
+> export, the s105/107/108/109/110/111/113/119 API-latency benchmarks, and the
+> in-process `make test-perf` suite) were **not run** (see the report's not-run
+> table); (2) all wall-clock numbers carry the **amd64-emulation caveat** (arm64
+> host, emulated DB pods) — compare only relative deltas, never absolute values,
+> across environments.
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
@@ -21,7 +32,7 @@ Performance and load testing suite for the Cloudberry K8s Operator REST API usin
 - **Docker** (recommended) or native Yandex Tank installation
 - **Running Cloudberry Operator** with REST API accessible on port `:8090` (default)
 - **bash** 4.0+ (for the runner script)
-- **Go** 1.26.5+ (for building the operator from source)
+- **Go** 1.27.4+ (for building the operator from source)
 
 ### Docker (Recommended)
 

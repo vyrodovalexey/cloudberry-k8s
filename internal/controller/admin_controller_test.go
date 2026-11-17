@@ -280,7 +280,7 @@ func TestAdminReconciler_EnsurePostRestoreValidation(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{
@@ -360,7 +360,7 @@ func TestAdminReconciler_EnsurePostRestoreValidation_CreateError(t *testing.T) {
 	cluster := newTestCluster()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{
@@ -402,7 +402,7 @@ func TestAdminReconciler_EnsurePostRestoreValidation_SkipsRunning(t *testing.T) 
 	cluster := newTestCluster()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled: true,
-		Image:   "cloudberry-backup:2.1.0",
+		Image:   "cloudberry-backup:2.2.0",
 		Destination: cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{
@@ -543,7 +543,7 @@ func newPXFDataLoadingCluster() *cbv1alpha1.CloudberryCluster {
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry/pxf:2.1.0",
+			Image:   "cloudberry/pxf:2.2.0",
 			Servers: []cbv1alpha1.PxfServerSpec{
 				{Name: "s3-a", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "https://m"}},
 				{Name: "s3-b", Type: "s3", Config: map[string]string{"fs.s3a.endpoint": "https://n"}},
@@ -616,7 +616,7 @@ func TestAdminReconciler_ReconcileDataLoading_PXFDisabled(t *testing.T) {
 	cluster.Status.Phase = cbv1alpha1.ClusterPhaseRunning
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
-		Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: "cloudberry/pxf:2.1.0"},
+		Pxf:     &cbv1alpha1.PxfSpec{Enabled: false, Image: "cloudberry/pxf:2.2.0"},
 		Jobs:    []cbv1alpha1.DataLoadingJob{{Name: "j1", Type: "gpload", Enabled: true}},
 	}
 

@@ -41,7 +41,7 @@
 #     hostpath PVCs) — big enough for a modest backup set + headroom.
 #   * No `schedule` is set: Scenario 81 drives an on-demand backup/restore so each
 #     Job surfaces on a discrete reconciled resource.
-#   * The backup image MUST ship gpbackup/gprestore (cloudberry-backup:2.1.0) —
+#   * The backup image MUST ship gpbackup/gprestore (cloudberry-backup:2.2.0) —
 #     the live test runs real gpbackup/gprestore --backup-dir via coordinator-exec.
 #
 # Live test: test/e2e/scripts/scenario81-local-destination.sh \
@@ -75,8 +75,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "81"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -207,7 +207,7 @@ spec:
   # resource. gpbackup runs with --backup-dir <local.path> (no --plugin-config).
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

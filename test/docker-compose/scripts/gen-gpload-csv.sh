@@ -46,7 +46,7 @@
 #   DATA_DIR        - host output dir   (default: <repo>/test/docker-compose/data/gpload/incoming)
 #   GPFDIST_PVC     - the gpfdist PVC    (default: gpfdist-test-gpfdist-data-pvc)
 #   NAMESPACE       - k8s namespace      (default: cloudberry-test)
-#   GPFDIST_IMAGE   - seed Job image     (default: cloudberry-gpfdist:2.1.0)
+#   GPFDIST_IMAGE   - seed Job image     (default: cloudberry-gpfdist:2.2.0)
 # =============================================================================
 
 set -euo pipefail
@@ -57,7 +57,7 @@ DEFAULT_DATA_DIR="${SCRIPT_DIR}/../data/gpload/incoming"
 DATA_DIR="${DATA_DIR:-${DEFAULT_DATA_DIR}}"
 GPFDIST_PVC="${GPFDIST_PVC:-gpfdist-test-gpfdist-data-pvc}"
 NAMESPACE="${NAMESPACE:-cloudberry-test}"
-GPFDIST_IMAGE="${GPFDIST_IMAGE:-cloudberry-gpfdist:2.1.0}"
+GPFDIST_IMAGE="${GPFDIST_IMAGE:-cloudberry-gpfdist:2.2.0}"
 
 EMIT_SEED_JOB=false
 CAT_FILES=false

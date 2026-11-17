@@ -562,7 +562,7 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 				Gpbackup:    &GpbackupOptions{CompressionLevel: 6, CompressionType: "zstd", Jobs: 4, Incremental: true},
 				Gprestore:   &GprestoreOptions{Jobs: 4, WithStats: ptr.To(true)},
 				JobTemplate: &BackupJobTemplate{ServiceAccountName: "cloudberry-backup-sa"},
-				Image:       "cloudberry-backup:2.1.0",
+				Image:       "cloudberry-backup:2.2.0",
 			},
 			DataLoading: &DataLoadingSpec{
 				Enabled: true,
@@ -598,7 +598,7 @@ func newFullyPopulatedCluster() *CloudberryCluster {
 					},
 				},
 				Gpfdist: &GpfdistSpec{
-					Enabled: true, Replicas: ptr.To(int32(2)), Image: "cloudberry-gpfdist:2.1.0", Port: 8080,
+					Enabled: true, Replicas: ptr.To(int32(2)), Image: "cloudberry-gpfdist:2.2.0", Port: 8080,
 				},
 				Jobs: []DataLoadingJob{
 					{

@@ -55,7 +55,7 @@ const (
 	scenario105Namespace = "cloudberry-test"
 	scenario105Cluster   = "scenario105-pxf"
 
-	scenario105PxfImage = "apache/cloudberry-pxf:2.1.0"
+	scenario105PxfImage = "apache/cloudberry-pxf:2.2.0"
 )
 
 // Scenario105Suite drives the data-loading status enrichment through the real

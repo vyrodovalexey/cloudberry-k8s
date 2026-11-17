@@ -62,6 +62,23 @@ func (c *S3TestClient) IsAvailable(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// PutBucket creates the bucket (idempotent: an existing bucket is not an
+// error — MinIO answers 409, which is treated as success).
+func (c *S3TestClient) PutBucket(ctx context.Context, bucket string) error {
+	resp, err := c.do(ctx, http.MethodPut, bucket, "", nil, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusConflict:
+		return nil
+	default:
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("put bucket %s: unexpected status %d: %s", bucket, resp.StatusCode, data)
+	}
+}
+
 // BucketExists checks whether the bucket exists (HEAD bucket).
 func (c *S3TestClient) BucketExists(ctx context.Context, bucket string) (bool, error) {
 	resp, err := c.do(ctx, http.MethodHead, bucket, "", nil, nil)
@@ -127,6 +144,63 @@ type listBucketResult struct {
 		Key  string `xml:"Key"`
 		Size int64  `xml:"Size"`
 	} `xml:"Contents"`
+}
+
+// S3Object is one listed object with its byte size (ListObjectsWithSize).
+type S3Object struct {
+	Key  string
+	Size int64
+}
+
+// ListObjectsWithSize returns the keys AND byte sizes under prefix in bucket
+// (single page, up to 1000). The size is what the DEF-4 landing proofs need:
+// "objects landed AND are non-zero-byte" cannot be shown from keys alone.
+func (c *S3TestClient) ListObjectsWithSize(ctx context.Context, bucket, prefix string) ([]S3Object, error) {
+	query := url.Values{}
+	query.Set("list-type", "2")
+	query.Set("prefix", prefix)
+
+	resp, err := c.do(ctx, http.MethodGet, bucket, query.Encode(), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list objects %s prefix=%s: status %d: %s", bucket, prefix, resp.StatusCode, data)
+	}
+
+	var result listBucketResult
+	if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding list response: %w", err)
+	}
+	objects := make([]S3Object, 0, len(result.Contents))
+	for _, c := range result.Contents {
+		objects = append(objects, S3Object{Key: c.Key, Size: c.Size})
+	}
+	return objects, nil
+}
+
+// DeletePrefix deletes every object under bucket/prefix (single page per call;
+// loop while a page returns keys). Used by live e2e journeys to make their
+// export-prefix landing assertions deterministic across re-runs.
+func (c *S3TestClient) DeletePrefix(ctx context.Context, bucket, prefix string) (int, error) {
+	deleted := 0
+	for {
+		objects, err := c.ListObjectsWithSize(ctx, bucket, prefix)
+		if err != nil {
+			return deleted, err
+		}
+		if len(objects) == 0 {
+			return deleted, nil
+		}
+		for _, o := range objects {
+			if err := c.DeleteObject(ctx, bucket, o.Key); err != nil {
+				return deleted, err
+			}
+			deleted++
+		}
+	}
 }
 
 // ListObjects returns the keys under prefix in bucket (single page, up to 1000).

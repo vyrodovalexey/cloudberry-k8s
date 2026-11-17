@@ -113,7 +113,7 @@ func (s *Scenario51SecurityHeadersSuite) TestFunctional_Scenario51_AllHeaders_Au
 	ts, cleanup := s.setupServer()
 	defer cleanup()
 
-	body := `{"metadata":{"name":"test-s51","namespace":"default"},"spec":{"version":"2.1.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
+	body := `{"metadata":{"name":"test-s51","namespace":"default"},"spec":{"version":"2.2.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1alpha1/clusters",
 		strings.NewReader(body))
 	require.NoError(s.T(), err)
@@ -229,7 +229,7 @@ func (s *Scenario51SecurityHeadersSuite) TestFunctional_Scenario51_AllHeaders_Fo
 	ts, cleanup := s.setupServer()
 	defer cleanup()
 
-	body := `{"metadata":{"name":"test-s51-forbidden","namespace":"default"},"spec":{"version":"2.1.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
+	body := `{"metadata":{"name":"test-s51-forbidden","namespace":"default"},"spec":{"version":"2.2.0","image":"test:latest","coordinator":{"storage":{"size":"5Gi"}},"segments":{"count":2,"storage":{"size":"5Gi"}}}}`
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1alpha1/clusters",
 		strings.NewReader(body))
 	require.NoError(s.T(), err)

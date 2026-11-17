@@ -23,28 +23,33 @@ LDFLAGS          := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X
 # --- Docker settings ---------------------------------------------------------
 IMG_OPERATOR         ?= cloudberry-operator:latest
 IMG_CTL              ?= cloudberry-ctl:latest
-IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.1.0
+IMG_CLOUDBERRY       ?= cloudberrydb/cloudberry:2.2.0
 IMG_QUERY_EXPORTER   ?= cloudberry-query-exporter:1.0.0
-IMG_BACKUP           ?= cloudberry-backup:2.1.0
-IMG_OFFICIAL         ?= cloudberry-official:2.1.0
-IMG_PXF              ?= cloudberry-pxf:2.1.0
-IMG_OFFICIAL_PXF     ?= cloudberry-official-pxf:2.1.0
-IMG_GPFDIST          ?= cloudberry-gpfdist:2.1.0
-PXF_VERSION          ?= 2.1.0-incubating
-GPBACKMAN_VERSION    ?= v0.8.1
+IMG_BACKUP           ?= cloudberry-backup:2.2.0
+IMG_OFFICIAL         ?= cloudberry-official:2.2.0
+IMG_PXF              ?= cloudberry-pxf:2.2.0
+IMG_OFFICIAL_PXF     ?= cloudberry-official-pxf:2.2.0
+IMG_GPFDIST          ?= cloudberry-gpfdist:2.2.0
+PXF_VERSION          ?= 2.2.0-incubating
 DOCKER           ?= docker
 DOCKER_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
 
 # --- Kubernetes / Helm settings ----------------------------------------------
 NAMESPACE_OPERATOR   ?= cloudberry-system
 NAMESPACE_TEST       ?= cloudberry-test
-NAMESPACE_MONITORING ?= monitoring
+NAMESPACE_MONITORING ?= cloudberry-test
+# CloudberryCluster sample manifest applied by deploy-cluster/undeploy-cluster.
+# Override to deploy a different sample, e.g.
+#   make deploy-cluster CLUSTER_SAMPLE=deploy/helm/cloudberry-operator/config/samples/acceptance-cluster-deploy.yaml
+CLUSTER_SAMPLE       ?= deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml
 HELM_RELEASE         ?= cloudberry-operator
 HELM_CHART           := deploy/helm/cloudberry-operator
 
 # --- Tool versions -----------------------------------------------------------
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 CONTROLLER_GEN_VERSION ?= v0.17.3
+# Keep in sync with GOVULNCHECK_VERSION in .github/workflows/ci.yml.
+GOVULNCHECK_VERSION ?= v1.9.0
 
 # --- Tool binaries -----------------------------------------------------------
 GOLANGCI_LINT    := $(shell command -v golangci-lint 2>/dev/null)
@@ -144,8 +149,8 @@ fmt-check: ## Check gofmt formatting
 .PHONY: vuln
 vuln: ## Run govulncheck
 ifndef GOVULNCHECK
-	@echo "Installing govulncheck..."
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	@echo "Installing govulncheck $(GOVULNCHECK_VERSION)..."
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 endif
 	govulncheck ./...
 
@@ -196,10 +201,9 @@ docker-build-cloudberry: ## Build Apache Cloudberry database image (compiles fro
 		-f Dockerfile.cloudberry .
 
 .PHONY: docker-build-backup
-docker-build-backup: ## Build cloudberry-backup toolchain image (incl. gpbackman)
+docker-build-backup: ## Build cloudberry-backup toolchain image (incl. in-tree gpbackman)
 	$(DOCKER) build \
 		$(DOCKER_BUILD_ARGS) \
-		--build-arg GPBACKMAN_VERSION=$(GPBACKMAN_VERSION) \
 		-t $(IMG_BACKUP) \
 		-f Dockerfile.cloudberry-backup .
 
@@ -332,14 +336,13 @@ helm-uninstall-test: ## Uninstall operator from cloudberry-test namespace
 	$(HELM) uninstall $(HELM_RELEASE) --namespace $(NAMESPACE_TEST) || true
 
 .PHONY: deploy-cluster
-deploy-cluster: ## Deploy sample CloudberryCluster in cloudberry-test namespace
+deploy-cluster: ## Deploy sample CloudberryCluster in cloudberry-test namespace (override sample via CLUSTER_SAMPLE=...)
 	kubectl create namespace $(NAMESPACE_TEST) --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -f deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml \
-		-n $(NAMESPACE_TEST)
+	kubectl apply -f $(CLUSTER_SAMPLE) -n $(NAMESPACE_TEST)
 
 .PHONY: undeploy-cluster
-undeploy-cluster: ## Remove sample cluster
-	kubectl delete -f deploy/helm/cloudberry-operator/config/samples/cloudberrycluster-sample.yaml \
+undeploy-cluster: ## Remove sample cluster (override sample via CLUSTER_SAMPLE=...)
+	kubectl delete -f $(CLUSTER_SAMPLE) \
 		-n $(NAMESPACE_TEST) --ignore-not-found
 
 # =============================================================================
@@ -368,7 +371,7 @@ endif
 # =============================================================================
 
 .PHONY: monitoring-deploy
-monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector + node-exporter + kube-state-metrics) to monitoring namespace
+monitoring-deploy: ## Deploy monitoring stack (vmagent + otel-collector + vector + node-exporter + kube-state-metrics) to NAMESPACE_MONITORING (cloudberry-test)
 	kubectl create namespace $(NAMESPACE_MONITORING) --dry-run=client -o yaml | kubectl apply -f -
 	$(HELM) upgrade --install vmagent test/monitoring/vmagent \
 		--namespace $(NAMESPACE_MONITORING) \
@@ -452,7 +455,7 @@ monitoring-verify: ## Verify monitoring stack integration (metrics in VM, logs i
 	fi
 
 .PHONY: monitoring-undeploy
-monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
+monitoring-undeploy: ## Remove monitoring stack from NAMESPACE_MONITORING (cloudberry-test)
 	$(HELM) uninstall kube-state-metrics --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
 	$(HELM) uninstall otel-collector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
 	$(HELM) uninstall vector --namespace $(NAMESPACE_MONITORING) 2>/dev/null || true
@@ -461,7 +464,7 @@ monitoring-undeploy: ## Remove monitoring stack from monitoring namespace
 	@echo "Monitoring stack removed from namespace $(NAMESPACE_MONITORING)"
 
 .PHONY: monitoring-status
-monitoring-status: ## Check monitoring stack status in monitoring namespace
+monitoring-status: ## Check monitoring stack status in NAMESPACE_MONITORING (cloudberry-test)
 	@echo "=== VictoriaMetrics Agent ==="
 	$(HELM) status vmagent --namespace $(NAMESPACE_MONITORING) 2>/dev/null || echo "vmagent: not installed"
 	@echo ""
@@ -539,11 +542,20 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 .PHONY: test-env-full
 test-env-full: test-env-up ## Bring up + configure + verify the full test environment (idempotent)
 	@echo "Waiting for services to start..."
+	# A service is ready only when its healthcheck reports `healthy` (a
+	# missing healthcheck yields an empty field and passes). `unhealthy`
+	# or `exited` must NOT count as ready (U010 flag, TASK-U024), and the
+	# loop fails loudly after the last attempt instead of falling through.
 	@for i in $$(seq 1 90); do \
-		unhealthy=$$($(DOCKER) compose -f test/docker-compose/docker-compose.yml ps --format '{{.Name}} {{.Health}}' 2>/dev/null \
-			| grep -E 'starting' || true); \
-		if [ -z "$$unhealthy" ]; then echo "All healthchecked services ready at attempt $$i"; break; fi; \
-		echo "Attempt $$i: waiting for healthchecks... ($$unhealthy)"; sleep 5; \
+		notready=$$($(DOCKER) compose -f test/docker-compose/docker-compose.yml ps --format '{{.Name}} {{.Health}}' 2>/dev/null \
+			| awk '$$2 != "" && $$2 != "healthy" { printf "%s(%s) ", $$1, $$2 }' || true); \
+		if [ -z "$$notready" ]; then echo "All healthchecked services healthy at attempt $$i"; break; fi; \
+		if [ "$$i" -eq 90 ]; then \
+			echo "ERROR: services not healthy after 90 attempts:"; \
+			echo "$$notready" | tr ' ' '\n' | sed '/^$$/d; s/^/  /'; \
+			exit 1; \
+		fi; \
+		echo "Attempt $$i: waiting for healthchecks... ($$notready)"; sleep 5; \
 	done
 	$(MAKE) test-env-setup
 	$(MAKE) test-env-verify

@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile.cloudberry-official — Apache Cloudberry Database 2.1.0 (OFFICIAL RPM)
+# Dockerfile.cloudberry-official — Apache Cloudberry Database 2.2.0 (OFFICIAL RPM)
 # =============================================================================
 # Builds a Kubernetes-ready Cloudberry image from the OFFICIAL Apache Cloudberry
 # prebuilt release RPM instead of compiling from source.
@@ -14,22 +14,32 @@
 #
 # Architecture note
 # -----------------
-# The official Apache Cloudberry 2.1.0 release ships x86_64 (el9) RPMs only;
-# there is no published aarch64 RPM. This image is therefore linux/amd64. On
-# arm64 hosts it runs under emulation (qemu).
+# Since 2.2.0 the official Apache Cloudberry release also ships aarch64 (el8/el9/
+# el10) and el10 x86_64 RPM tarballs, so a native arm64 chain is conceivable.
+# This image stays linux/amd64 for this campaign: chain consistency with the
+# PXF sidecar image, the k8s manifests, and the amd64 performance baselines
+# (TASK-U001 §6 recommendation). On arm64 hosts it runs under emulation (qemu).
+#
+# Packaging note (2.2.0 breaking change)
+# -------------------------------------
+# 2.1.0 published the RPM as a raw release asset; 2.2.0 wraps the RPM in a
+# tar.gz together with its .asc signature and .sha512 checksum. CB_RPM_URL now
+# points at the tar.gz; the install step below extracts it, verifies the
+# sha512, and installs the RPM from the local file.
 #
 # It also bundles the gpbackup toolchain binaries (gpbackup, gprestore,
-# gpbackup_helper, gpbackup_s3_plugin) built from apache/cloudberry-backup so
-# the same image can run MPP backups.
+# gpbackup_helper, gpbackup_s3_plugin, gpbackman) built from
+# apache/cloudberry-backup so the same image can run MPP backups.
 #
 # Build args:
-#   CB_RPM_URL          — URL of the official Cloudberry RPM (el9 x86_64)
+#   CB_RPM_URL          — URL of the official Cloudberry RPM tar.gz (el9 x86_64)
+#   CB_RPM_FILE         — RPM filename inside the tar.gz
 #   CB_BACKUP_VERSION   — apache/cloudberry-backup version for the gpbackup tools
 #   GO_VERSION          — Go toolchain version for building the gpbackup tools
 #
 # Usage:
 #   docker build --platform linux/amd64 -f Dockerfile.cloudberry-official \
-#       -t cloudberry-official:2.1.0 .
+#       -t cloudberry-official:2.2.0 .
 # =============================================================================
 
 # =============================================================================
@@ -40,7 +50,7 @@
 # version-matched and include the lib/pq driver fix, the GetDBSize crash fix,
 # the LOCK TABLE / SAVEPOINT / snapshot fixes, and the --version flag support.
 # =============================================================================
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.27.4
 FROM --platform=linux/amd64 golang:${GO_VERSION}-bookworm AS gpbackup-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,7 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-ARG CB_BACKUP_VERSION=2.1.0-incubating
+ARG CB_BACKUP_VERSION=2.2.0-incubating
 ARG CB_BACKUP_REPO_URL=https://github.com/apache/cloudberry-backup/archive/refs/tags/${CB_BACKUP_VERSION}.tar.gz
 RUN curl -fSL -o /tmp/src.tar.gz "${CB_BACKUP_REPO_URL}" && \
     tar -xzf /tmp/src.tar.gz -C /build --strip-components=1 && \
@@ -104,8 +114,11 @@ RUN GOLIBS_DIR=$(find $(go env GOMODCACHE)/github.com/apache/cloudberry-go-libs*
     sed -i 's|sslmode = "prefer"|sslmode = "disable"|' "$GOLIBS_DIR/dbconn/dbconn.go" && \
     sed -i 's| statement_cache_capacity=0||g' "$GOLIBS_DIR/dbconn/dbconn.go"
 
-# Add lib/pq to the module graph so the patched import resolves at build time.
-RUN go get github.com/lib/pq@latest && go mod tidy
+# Ensure the patched blank import of lib/pq resolves at build time.
+# lib/pq v1.10.7 is a direct dependency in cloudberry-backup 2.2.0's go.mod,
+# so the old `go get github.com/lib/pq@latest` step is retired (no floating
+# @latest resolution); `go mod tidy` keeps go.mod/go.sum in sync.
+RUN go mod tidy
 
 # ---------------------------------------------------------------------------
 # PATCH 7: Register lib/pq driver in gprestore binary
@@ -136,21 +149,22 @@ RUN CGO_ENABLED=1 go build -trimpath \
         -o /out/gpbackup_s3_plugin .
 
 # ---------------------------------------------------------------------------
-# Build gpbackman (github.com/woblerr/gpbackman) — the retention-management
-# utility the operator's cleanup Job invokes (backup-info / backup-delete /
-# backup-clean). gpbackman operates on the coordinator's gpbackup_history.db
-# (SQLite), so it must live in this DB image too. CGO is required for the
-# mattn/go-sqlite3 history dependency (same as the gpbackup tools above).
+# Build gpbackman — the retention-management utility the operator's cleanup
+# Job invokes (backup-info / backup-delete / backup-clean). gpbackman
+# operates on the coordinator's gpbackup_history.db (SQLite), so it must
+# live in this DB image too. gpbackman is IN-TREE as of cloudberry-backup
+# 2.2.0 (upstream commit 81208cfb): gpbackman.go at the repo root selects it
+# via the "gpbackman" Go build tag — built from the SAME extracted source
+# tree; the separate woblerr/gpbackman clone (and its GPBACKMAN_VERSION
+# build arg) is retired. CGO is required for the mattn/go-sqlite3 history
+# dependency (same as the gpbackup tools above); the ldflags variable
+# follows the upstream Makefile (gpbackman/cmd.version).
 # ---------------------------------------------------------------------------
-ARG GPBACKMAN_VERSION=v0.8.1
-RUN git clone --depth 1 --branch "${GPBACKMAN_VERSION}" \
-        https://github.com/woblerr/gpbackman.git /tmp/gpbackman && \
-    cd /tmp/gpbackman && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath \
-        -ldflags="-s -w -X main.version=${GPBACKMAN_VERSION}" \
+RUN CGO_ENABLED=1 go build -trimpath \
+        -tags 'gpbackman' \
+        -ldflags="-s -w -X github.com/apache/cloudberry-backup/gpbackman/cmd.version=${CB_BACKUP_VERSION}" \
         -o /out/gpbackman . && \
-    /out/gpbackman --version && \
-    rm -rf /tmp/gpbackman
+    /out/gpbackman --version
 
 # =============================================================================
 # Stage 2: Runtime image — official Cloudberry RPM
@@ -159,8 +173,8 @@ FROM --platform=linux/amd64 rockylinux/rockylinux:9
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database-official" \
-      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 (official RPM) for Kubernetes, with gpbackup toolchain" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.2.0 (official RPM) for Kubernetes, with gpbackup toolchain" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.vendor="Apache Software Foundation" \
       org.opencontainers.image.source="https://github.com/apache/cloudberry" \
       org.opencontainers.image.licenses="Apache-2.0" \
@@ -172,28 +186,35 @@ LABEL org.opencontainers.image.title="cloudberry-database-official" \
 # PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin ...'). Without the zstd
 # command-line tool the pipe breaks ("could not write to COPY program: Broken
 # pipe") and zstd backups fail. gzip is already provided by the base image.
-ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
-RUN dnf -y install \
-        apr bash bzip2 ca-certificates glibc-langpack-en hostname iproute \
+#
+# 2.2.0 packaging change: the GitHub release asset is a tar.gz WRAPPER around
+# the RPM (plus .asc + .sha512), so fetch → extract → verify sha512 → install
+# the RPM from the local file. The RPM name convention and its
+# /usr/local/cloudberry-db-2.2.0 install layout (versioned dir + managed
+# /usr/local/cloudberry-db symlink) are unchanged from 2.1.0.
+ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.2.0-incubating/apache-cloudberry-db-incubating-2.2.0-1.el9.x86_64.tar.gz
+ARG CB_RPM_FILE=apache-cloudberry-db-incubating-2.2.0-1.el9.x86_64.rpm
+# --allowerasing: RockyLinux 9 ships curl-minimal which conflicts with the
+# full curl package (needed by the tar.gz fetch below); same pattern as
+# Dockerfile.cloudberry-pxf.
+# SECURITY (U033): full `dnf -y upgrade` — upgrades EVERY installed package
+# (base image + everything above) to its latest patched release, not a curated
+# CVE list. The prior curated list (gnupg2/gnutls/openssl/...) went stale as the
+# Rocky 9 CVE DB drifted: a rebuild picked up 67 HIGH/CRIT OS findings the list
+# didn't cover. A full upgrade self-maintains against DB drift at rebuild time.
+RUN dnf -y --allowerasing install \
+        apr bash bzip2 ca-certificates curl glibc-langpack-en hostname iproute \
         keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
         lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
         pam perl procps-ng python3 readline rsync shadow-utils sqlite sqlite-libs sudo which zlib \
         zstd && \
-    dnf -y upgrade \
-      gnupg2 \
-      expat \
-      gnutls \
-      krb5-libs \
-      libarchive \
-      libbrotli \
-      libcap \
-      libnghttp2 \
-      libxml2 \
-      openssl \
-      vim-minimal \
-      openssl-libs \
-      pam && \
-    dnf -y install "${CB_RPM_URL}" && \
+    dnf -y upgrade && \
+    curl -fSL "${CB_RPM_URL}" -o /tmp/cloudberry-rpm.tar.gz && \
+    tar -xzf /tmp/cloudberry-rpm.tar.gz -C /tmp && \
+    rm -f /tmp/cloudberry-rpm.tar.gz && \
+    (cd /tmp && sha512sum -c "${CB_RPM_FILE}.sha512") && \
+    dnf -y install "/tmp/${CB_RPM_FILE}" && \
+    rm -f "/tmp/${CB_RPM_FILE}" "/tmp/${CB_RPM_FILE}.asc" "/tmp/${CB_RPM_FILE}.sha512" && \
     dnf clean all && rm -rf /var/cache/dnf
 
 # The RPM installs Cloudberry to /usr/local/cloudberry-db (versioned dir +

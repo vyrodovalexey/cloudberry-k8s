@@ -53,12 +53,20 @@ WHERE backend_type = 'client backend' AND pid != pg_backend_pid()`
 )
 
 // SQL queries for resource group metrics (57b).
+//
+// Cloudberry 2.2.0 schema (live-verified on the acceptance cluster,
+// TASK-U027/DEF-3): gp_resgroup_status exposes the group name as `groupname`
+// (pre-2.2.0 `rsgname` no longer exists → SQLSTATE 42703), and
+// gp_resgroup_status_per_host only carries (groupid, groupname, hostname,
+// cpu_usage, memory_usage) — the pre-2.2.0 cpu/memory_used/memory_available/
+// memory_quota_used/memory_shared_used columns are GONE. The per-host memory
+// families with no 2.2.0 source (available/quota/shared) stay registered but
+// receive no series — honestly absent rather than fabricated zeros.
 const (
-	resgroupStatusSQL = `SELECT rsgname, num_running, num_queueing, num_executed, total_queue_duration
+	resgroupStatusSQL = `SELECT groupname AS rsgname, num_running, num_queueing, num_executed, total_queue_duration
 FROM gp_toolkit.gp_resgroup_status`
 
-	resgroupStatusPerHostSQL = `SELECT rsgname, hostname, cpu, memory_used, memory_available,
-       memory_quota_used, memory_shared_used
+	resgroupStatusPerHostSQL = `SELECT groupname AS rsgname, hostname, cpu_usage AS cpu, memory_usage AS memory_used
 FROM gp_toolkit.gp_resgroup_status_per_host`
 )
 
@@ -69,13 +77,19 @@ const resgroupIOStatsSQL = `SELECT rsgname, hostname, tablespace,
 FROM gp_toolkit.gp_resgroup_iostats_per_host`
 
 // SQL queries for spill file metrics (57d).
+//
+// Cloudberry 2.2.0 schema (DEF-3): gp_workfile_usage_per_segment carries only
+// (segid, size, numfiles) — no hostname column — so the per-segment hostname
+// is resolved by joining gp_segment_configuration on the content id
+// (live-verified: segid -1 maps to the coordinator, 0..N to the primaries).
 const (
 	spillFileSummarySQL = `SELECT count(*) as active_count, COALESCE(sum(size), 0) as total_bytes
 FROM gp_toolkit.gp_workfile_usage_per_query`
 
-	spillFilePerSegmentSQL = `SELECT segid::text as segment_id, hostname, COALESCE(sum(size), 0) as bytes
-FROM gp_toolkit.gp_workfile_usage_per_segment
-GROUP BY segid, hostname`
+	spillFilePerSegmentSQL = `SELECT w.segid::text as segment_id, g.hostname, COALESCE(sum(w.size), 0) as bytes
+FROM gp_toolkit.gp_workfile_usage_per_segment w
+JOIN gp_segment_configuration g ON g.content = w.segid AND g.role = 'p'
+GROUP BY w.segid, g.hostname`
 )
 
 // SQL queries for segment health metrics (57e).
@@ -105,8 +119,15 @@ FROM pg_stat_activity WHERE state != 'idle' AND xact_start IS NOT NULL`
 )
 
 // SQL query for data distribution / skew metrics (57g).
-const tableSkewSQL = `SELECT psdname as schemaname, psdrelname as tablename,
-       psdskewcoefficient as skew_coefficient
+//
+// Cloudberry 2.2.0 schema (DEF-3): gp_skew_coefficients exposes
+// (skcoid, skcnamespace, skcrelname, skccoeff) — the pre-2.2.0
+// psdname/psdrelname/psdskewcoefficient columns no longer exist. skcnamespace
+// and skcrelname are already `name` values (the view joins pg_class /
+// pg_namespace internally), and skccoeff is numeric, cast to float8 for a
+// clean scan (live-verified on the acceptance cluster).
+const tableSkewSQL = `SELECT skcnamespace as schemaname, skcrelname as tablename,
+       skccoeff::float8 as skew_coefficient
 FROM gp_toolkit.gp_skew_coefficients
 LIMIT 50`
 
@@ -649,26 +670,23 @@ func (mc *metricCollectors) collectResgroupStatusPerHost(
 
 	for rows.Next() {
 		var (
-			rsgname       string
-			hostname      string
-			cpu           float64
-			memUsed       float64
-			memAvailable  float64
-			memQuotaUsed  float64
-			memSharedUsed float64
+			rsgname  string
+			hostname string
+			cpu      float64
+			memUsed  float64
 		)
 
-		if scanErr := rows.Scan(&rsgname, &hostname, &cpu, &memUsed, &memAvailable,
-			&memQuotaUsed, &memSharedUsed); scanErr != nil {
+		if scanErr := rows.Scan(&rsgname, &hostname, &cpu, &memUsed); scanErr != nil {
 			logger.Warn("failed to scan resource group per-host row", "error", scanErr)
 			continue
 		}
 
 		mc.resgroupCPUUsagePercent.WithLabelValues(rsgname, hostname).Set(cpu)
 		mc.resgroupMemoryUsageBytes.WithLabelValues(rsgname, hostname).Set(memUsed)
-		mc.resgroupMemoryAvailableBytes.WithLabelValues(rsgname, hostname).Set(memAvailable)
-		mc.resgroupMemoryQuotaUsed.WithLabelValues(rsgname, hostname).Set(memQuotaUsed)
-		mc.resgroupMemorySharedUsed.WithLabelValues(rsgname, hostname).Set(memSharedUsed)
+		// Cloudberry 2.2.0 dropped the memory_available/quota/shared columns
+		// from gp_resgroup_status_per_host (DEF-3): those gauges stay
+		// registered but intentionally receive NO series rather than
+		// fabricated zeros ("0 bytes available" would page on-call).
 	}
 
 	if rowErr := rows.Err(); rowErr != nil {

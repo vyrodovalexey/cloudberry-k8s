@@ -88,7 +88,7 @@ func backupTestCluster() *cbv1alpha1.CloudberryCluster {
 				CredentialSecret: &cbv1alpha1.S3CredentialSecret{Name: "creds"},
 			},
 		},
-		Image: "cloudberry-backup:2.1.0",
+		Image: "cloudberry-backup:2.2.0",
 	}
 	return cluster
 }

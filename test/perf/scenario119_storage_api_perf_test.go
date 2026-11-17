@@ -45,11 +45,13 @@ const (
 	envScenario119Live      = "SCENARIO119_LIVE"
 	envScenario119Namespace = "SCENARIO119_NAMESPACE"
 	envScenario119Target    = "SCENARIO119_TARGET"
+	envScenario119Cluster   = "SCENARIO119_CLUSTER"
 	envScenario119User      = "SCENARIO119_USER"
 	envScenario119Pass      = "SCENARIO119_PASS"
 
 	perf119DefaultNamespace = "cloudberry-test"
 	perf119DefaultTarget    = "localhost:8190"
+	perf119DefaultCluster   = "acceptance-test"
 	perf119DefaultUser      = "admin"
 	perf119DefaultPass      = "admin"
 	perf119ExecTimeout      = 60 * time.Second
@@ -91,7 +93,9 @@ func perf119CurlGet(endpoint string) (int, time.Duration) {
 	defer cancel()
 
 	start := time.Now()
-	out, err := exec.CommandContext(ctx, "curl", "-sf",
+	// No -f: a 4xx/5xx must still surface its status code (see callers) —
+	// curl -f would discard it and let an error path masquerade as latency.
+	out, err := exec.CommandContext(ctx, "curl", "-s",
 		"-o", "/dev/null",
 		"-w", "%{http_code}",
 		"-u", user+":"+pass,
@@ -117,6 +121,7 @@ func BenchmarkScenario119_StorageAPILatency(b *testing.B) {
 
 	ns := perf119Env(envScenario119Namespace, perf119DefaultNamespace)
 	_ = ns // namespace is embedded in the cluster name, not the URL path
+	cluster := perf119Env(envScenario119Cluster, perf119DefaultCluster)
 
 	endpoints := []struct {
 		name     string
@@ -124,19 +129,19 @@ func BenchmarkScenario119_StorageAPILatency(b *testing.B) {
 	}{
 		{
 			"disk_usage",
-			"/api/v1alpha1/clusters/test-cluster/storage/disk-usage?namespace=default",
+			fmt.Sprintf("/api/v1alpha1/clusters/%s/storage/disk-usage?namespace=%s", cluster, ns),
 		},
 		{
 			"tables",
-			"/api/v1alpha1/clusters/test-cluster/storage/tables?namespace=default",
+			fmt.Sprintf("/api/v1alpha1/clusters/%s/storage/tables?namespace=%s", cluster, ns),
 		},
 		{
 			"recommendations",
-			"/api/v1alpha1/clusters/test-cluster/storage/recommendations?namespace=default",
+			fmt.Sprintf("/api/v1alpha1/clusters/%s/storage/recommendations?namespace=%s", cluster, ns),
 		},
 		{
 			"usage_report",
-			"/api/v1alpha1/clusters/test-cluster/storage/usage-report?namespace=default&month=2025-06",
+			fmt.Sprintf("/api/v1alpha1/clusters/%s/storage/usage-report?namespace=%s&month=2025-06", cluster, ns),
 		},
 	}
 
@@ -147,10 +152,12 @@ func BenchmarkScenario119_StorageAPILatency(b *testing.B) {
 			perf119CurlGet(ep.endpoint)
 
 			var total time.Duration
+			codes := map[int]int{}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_, elapsed := perf119CurlGet(ep.endpoint)
+				code, elapsed := perf119CurlGet(ep.endpoint)
+				codes[code]++
 				total += elapsed
 			}
 			b.StopTimer()
@@ -160,6 +167,9 @@ func BenchmarkScenario119_StorageAPILatency(b *testing.B) {
 			}
 			avgMs := float64(total.Microseconds()) / float64(b.N) / 1000.0
 			b.ReportMetric(avgMs, "avg_ms")
+			for code, n := range codes {
+				b.Logf("scenario119 storage API %s: HTTP %d x%d", ep.name, code, n)
+			}
 			b.Logf("scenario119 storage API %s: avg=%.2fms over %d requests", ep.name, avgMs, b.N)
 		})
 	}

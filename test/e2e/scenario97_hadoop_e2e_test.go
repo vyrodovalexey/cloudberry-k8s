@@ -210,7 +210,8 @@ func (s *Scenario97E2ESuite) TestE2E_Scenario97_PartA_ContractHonest() {
 				require.NotNilf(s.T(), out, "%s writable Job", tc.ID)
 				script := out.Spec.Template.Spec.Containers[0].Args[0]
 				assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-				assert.Contains(s.T(), script, "pxfwritable_export")
+				// DEF-4: per-profile write clause (hdfs:text → TEXT; seq → bridge).
+				assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.Profile))
 				assert.NotContains(s.T(), script, "LOG ERRORS")
 
 			case cases.Scenario97ExpectRenderOK:
@@ -228,7 +229,7 @@ func (s *Scenario97E2ESuite) TestE2E_Scenario97_PartA_ContractHonest() {
 				wantLoc := "pxf://" + scenario97E2EResource(tc.Profile) +
 					"?PROFILE=" + tc.Profile + "&SERVER=" + tc.Server
 				assert.Containsf(s.T(), script, wantLoc, "%s LOCATION", tc.ID)
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 				if strings.Contains(tc.Description, "[CONFIG-ONLY]") {
 					s.T().Logf("scenario97 %s: [CONFIG-ONLY] — DDL/LOCATION assertions only", tc.ID)
 				}

@@ -65,7 +65,7 @@ import (
 // ============================================================================
 
 const (
-	scenario83BackupImage = "cloudberry-backup:2.1.0"
+	scenario83BackupImage = "cloudberry-backup:2.2.0"
 	// scenario83TS is a pinned 14-digit gpbackup-style timestamp.
 	scenario83TS = "20260608030000"
 	// scenario83DefaultBackoffLimit is internal/builder's defaultBackoffLimit.

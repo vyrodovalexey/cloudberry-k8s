@@ -43,9 +43,21 @@ This guide covers installing the Cloudberry Operator on a Kubernetes cluster, co
 - Sufficient **node resources** for the operator and database pods
 - **Network connectivity** between operator and managed pods
 
+> **Sizing note (docker-desktop / single-node clusters).** For the acceptance
+> topology (standby coordinator + 2 mirrored segments) with backup/restore and
+> PXF data loading in play, set **1Gi memory limits on the coordinator and
+> segment containers** (requests can stay at 256Mi). The earlier 512Mi limits
+> were observed to OOMKill the coordinator during in-pod `gpbackup` report
+> finalization and a segment primary during restore `COPY` (exit 137 in both
+> cases). The standby container has no backup/COPY dispatch role and can stay
+> at 512Mi. This is the sizing carried by
+> `deploy/helm/cloudberry-operator/config/samples/acceptance-cluster-deploy.yaml`.
+
 ## Helm Installation
 
 ### Quick Install
+
+The chart currently ships as version `0.1.2` with `appVersion: 0.9.3-cldb-2.2.0` (the operator image tag; Cloudberry 2.2.0-incubating, PostgreSQL kernel 14.10):
 
 ```bash
 # Create the operator namespace
@@ -192,9 +204,9 @@ for vanilla Kubernetes; no SCC or Route objects are created.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
-| `image.repository` | Container image repository | `cloudberry-operator` |
+| `image.repository` | Container image repository | `ghcr.io/vyrodovalexey/cloudberry-k8s-operator` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `image.tag` | Image tag (defaults to chart appVersion) | `""` |
+| `image.tag` | Image tag | `0.9.3-cldb-2.2.0` (chart appVersion; must stay coherent with `Chart.yaml`) |
 | `imagePullSecrets` | Image pull secrets for private registries | `[]` |
 
 #### Operator Settings
@@ -506,7 +518,7 @@ make monitoring-undeploy
 make grafana-publish
 ```
 
-**`monitoring-deploy`** installs (all to the `cloudberry-test` namespace, configurable via the `NAMESPACE_TEST` Make variable):
+**`monitoring-deploy`** installs (all to the **`cloudberry-test`** namespace by default, configurable via the `NAMESPACE_MONITORING` Make variable):
 - **vmagent** (`test/monitoring/vmagent` Helm chart) — Prometheus-compatible metrics collection agent that remote-writes to VictoriaMetrics at `host.docker.internal:8428`
 - **node-exporter** (`test/monitoring/node-exporter` Helm chart) — node-level metrics
 - **vector** (`test/monitoring/vector` Helm chart) — tails the `kubernetes_logs` source and ships logs to VictoriaLogs at `host.docker.internal:9428`
@@ -515,7 +527,7 @@ make grafana-publish
 
 **`monitoring-status`** shows the Helm release status and running pods for all components, plus the published Grafana dashboard URLs.
 
-**`monitoring-undeploy`** removes all four Helm releases from the namespace.
+**`monitoring-undeploy`** removes all five Helm releases from the namespace.
 
 There are four Grafana dashboards in `monitoring/grafana/` — `cloudberry-operator.json` (operator metrics), `cloudberry-exporters.json` (cloudberry-query-exporter resource-group/IO/spill/skew and postgres-exporter custom SQL metrics), `cloudberry-node-metrics.json` (node-exporter metrics), and `cloudberry-otel.json` (Tempo traces, otel-collector health, and operator logs) — all published with `make grafana-publish` (which runs `test/monitoring/scripts/publish-dashboards.sh`).
 

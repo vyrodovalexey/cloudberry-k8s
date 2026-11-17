@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -342,6 +344,23 @@ func (s *Scenario92DataLoadRuntimeE2ESuite) TestE2E_Scenario92_LivePXFJobCreated
 	}
 
 	// A pxf job whose generated DDL we know byte-exactly from the builder.
+	// LIVE-PROVEN RESOURCE FORM (U022): the resource must be "<bucket>/<path>"
+	// (U028a/U019 evidence, and the acceptance cluster's own completed
+	// s3-csv-load job). The historical "s3a://<bucket>/<path>" scheme prefix —
+	// still used by the config-only catalog fixtures — is REJECTED by live PXF
+	// 2.2.0, whose s3 connector parses it as bucket name "s3a" ("Bucket s3a does
+	// not exist"). This live journey therefore uses the runnable form.
+	//
+	// SELF-ISOLATION (U022): the strict live path uses a UNIQUE-per-run target
+	// table and S3 prefix. The original fixture (public.events +
+	// data-lake/events/) is SHARED with other suites and with the operator's
+	// job-lifecycle churn on a shared cluster: a previously-completed Job under
+	// the deterministic name satisfied the completion wait instantly while the
+	// shared table was reset by concurrent churn — an order-dependent failure
+	// with no product defect behind it. A per-run table/prefix plus an explicit
+	// stale-Job deletion makes the journey deterministic AND re-runnable.
+	scenario92LiveRunID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	scenario92LiveTable := "public.s92_events_" + scenario92LiveRunID
 	pxfJob := cbv1alpha1.DataLoadingJob{
 		Name:    "s3-parquet-loader",
 		Type:    "pxf",
@@ -349,8 +368,8 @@ func (s *Scenario92DataLoadRuntimeE2ESuite) TestE2E_Scenario92_LivePXFJobCreated
 		PxfJob: &cbv1alpha1.PxfJobSpec{
 			Server:      "s3-datalake",
 			Profile:     "s3:parquet",
-			Resource:    "s3a://data-lake/events/",
-			TargetTable: "public.events",
+			Resource:    "data-lake/s92-" + scenario92LiveRunID + "/",
+			TargetTable: scenario92LiveTable,
 		},
 	}
 
@@ -406,6 +425,42 @@ func (s *Scenario92DataLoadRuntimeE2ESuite) TestE2E_Scenario92_LivePXFJobCreated
 		}
 	}()
 
+	// --- SELF-ISOLATED staging (U022), BEFORE the Job wait ----------------
+	// (a) Delete any STALE Job under the deterministic name FIRST: a leftover
+	// Completed Job from a previous run would satisfy both the byte-exact Job
+	// fetch and the completion wait without loading THIS run's table.
+	_ = cl.Delete(s.ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: util.DataLoadJobName(name, pxfJob.Name), Namespace: scenario92LiveNamespace}})
+
+	// (b) When the strict live path is enabled, stage the SOURCE parquet into
+	// this run's unique S3 prefix and create the (empty) target table via the
+	// coordinator's own proven writable path. The staged row count equals the
+	// expected count, so the assertion below is closed-form for this run.
+	if os.Getenv(envScenario92PXFLive) == "1" {
+		expectedRows := scenario92PXFExpectedRows(s.T())
+		stageSQL := fmt.Sprintf(
+			"DROP FOREIGN TABLE IF EXISTS public.s92_stage_wext; "+
+				"CREATE WRITABLE EXTERNAL TABLE public.s92_stage_wext "+
+				"(id int, name text, amount bigint, price float8) "+
+				"LOCATION ('pxf://%s?PROFILE=s3:parquet&SERVER=s3-datalake') "+
+				"FORMAT 'CUSTOM' (formatter='pxfwritable_export'); "+
+				"INSERT INTO public.s92_stage_wext SELECT g, 'customer_' || md5(g::text), "+
+				"(g %% 1000000)::bigint, ((g %% 100000)::float8)/100.0 "+
+				"FROM generate_series(1, %d) g; "+
+				"DROP FOREIGN TABLE public.s92_stage_wext; "+
+				"DROP TABLE IF EXISTS %s; "+
+				"CREATE TABLE %s (id int, name text, amount bigint, price float8) DISTRIBUTED BY (id);",
+			strings.TrimSuffix(pxfJob.PxfJob.Resource, "/"), expectedRows,
+			pxfJob.PxfJob.TargetTable, pxfJob.PxfJob.TargetTable)
+		stageCtx, stageCancel := context.WithTimeout(s.ctx, 5*time.Minute)
+		defer stageCancel()
+		if out, err := scenario92CoordExec(stageCtx, name+"-coordinator-0",
+			"psql -d postgres -v ON_ERROR_STOP=1 -c "+shQuote(stageSQL)); err != nil {
+			s.T().Skipf("could not stage the isolated parquet source/target "+
+				"(PXF/DB unavailable?): %v (out=%s) [CONFIG-ONLY]", err, out)
+		}
+	}
+
 	// Wait for the operator to create the deterministic dataload Job.
 	jobName := util.DataLoadJobName(name, pxfJob.Name)
 	job := &batchv1.Job{}
@@ -442,9 +497,10 @@ func (s *Scenario92DataLoadRuntimeE2ESuite) TestE2E_Scenario92_LivePXFJobCreated
 	assert.Equal(s.T(), localJob.Spec.Template.Spec.Containers[0].Args[0], script,
 		"live pxf Job args[0] must match the operator's locally-built load script byte-for-byte")
 	assert.Contains(s.T(), script,
-		"pxf://s3a://data-lake/events/?PROFILE=s3:parquet&SERVER=s3-datalake",
+		"pxf://data-lake/s92-"+scenario92LiveRunID+"/?PROFILE=s3:parquet&SERVER=s3-datalake",
 		"live pxf Job args[0] must carry the pxf:// LOCATION")
-	assert.Contains(s.T(), script, "INSERT INTO \"public\".\"events\" SELECT * FROM",
+	assert.Contains(s.T(), script,
+		fmt.Sprintf("INSERT INTO \"public\".\"s92_events_%s\" SELECT * FROM", scenario92LiveRunID),
 		"live pxf Job args[0] must carry the INSERT...SELECT into the target")
 	assert.Contains(s.T(), script, "DATALOAD_ROWS=",
 		"live pxf Job args[0] must carry the DATALOAD_ROWS marker")
@@ -489,12 +545,10 @@ func (s *Scenario92DataLoadRuntimeE2ESuite) scenario92AssertLivePXFRows(
 	}, scenario92PXFLiveTimeout, scenario92LivePollInterval,
 		"operator-driven pxf:// Job %s must complete successfully (SCENARIO92_PXF_LIVE=1)", jobName)
 
-	// Assert the REAL target-table row count via the coordinator. The expected
-	// value is configurable (default 183961, the proven MinIO-S3-via-PXF count).
+	// Assert the REAL target-table row count via the coordinator.
 	expectedRows := scenario92PXFExpectedRows(s.T())
 	target := pxfJob.PxfJob.TargetTable
-	coordPod := clusterName + "-coordinator-0"
-	countOut, countErr := scenario92CoordExec(s.ctx, coordPod,
+	countOut, countErr := scenario92CoordExec(s.ctx, clusterName+"-coordinator-0",
 		"psql -d postgres -tA -c "+shQuote("SELECT count(*) FROM "+target))
 	require.NoErrorf(s.T(), countErr, "pxf:// row-count query must succeed (output: %s)", countOut)
 

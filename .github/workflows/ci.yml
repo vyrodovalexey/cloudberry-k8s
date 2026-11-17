@@ -13,8 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.26.5'
-  GOLANGCI_LINT_VERSION: 'v2.12.2'
+  GO_VERSION: '1.27.4'
+  GOLANGCI_LINT_VERSION: 'v2.15.0'
+  GOVULNCHECK_VERSION: 'v1.9.0'
   DOCKER_REGISTRY: ghcr.io
   DOCKER_IMAGE_OPERATOR: ghcr.io/${{ github.repository }}-operator
   DOCKER_IMAGE_CTL: ghcr.io/${{ github.repository }}-ctl
@@ -46,7 +47,11 @@ jobs:
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
-          args: --timeout=5m
+          # 10m: cold-runner headroom (TASK-U024). Local warm-build run is ~11s,
+          # but a cold GH runner (4 vCPU, no Go build cache) must compile the
+          # full k8s.io/controller-runtime dependency graph before analysis;
+          # 5m was marginal. Must stay in sync with .golangci.yml run.timeout.
+          args: --timeout=10m
       - name: Validate Grafana dashboards
         run: |
           for f in monitoring/grafana/*.json; do
@@ -71,8 +76,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - run: |
-          go get golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
           govulncheck ./...
 
   unit-tests:
@@ -546,10 +550,10 @@ jobs:
   # ===========================================================================
   # The cloudberry images have a dependency chain that requires sequential
   # builds in a single runner so bare-tag FROM references resolve locally:
-  #   cloudberry-pxf:2.1.0           (standalone)
-  #   cloudberry-official:2.1.0      (standalone)
-  #   cloudberry-official-pxf:2.1.0  (FROM cloudberry-pxf + cloudberry-official)
-  #   cloudberry-gpfdist:2.1.0       (FROM cloudberry-official-pxf)
+  #   cloudberry-pxf:2.2.0           (standalone)
+  #   cloudberry-official:2.2.0      (standalone)
+  #   cloudberry-official-pxf:2.2.0  (FROM cloudberry-pxf + cloudberry-official)
+  #   cloudberry-gpfdist:2.2.0       (FROM cloudberry-official-pxf)
 
   docker-build-cloudberry-chain:
     name: Docker Build (cloudberry chain)
@@ -565,7 +569,7 @@ jobs:
         with:
           driver: docker
       # Step a: Build cloudberry-pxf (standalone sidecar, amd64) — no push on PRs.
-      # `load: true` and the bare `cloudberry-pxf:2.1.0` tag are REQUIRED so the
+      # `load: true` and the bare `cloudberry-pxf:2.2.0` tag are REQUIRED so the
       # downstream cloudberry-official-pxf build (Step c) resolves it locally via
       # its `CB_PXF_IMAGE` build-arg. Labels mirror the release job so PR builds
       # exercise the same metadata; the image is verified-built but never pushed.
@@ -583,7 +587,7 @@ jobs:
           file: ./Dockerfile.cloudberry-pxf
           push: false
           load: true
-          tags: cloudberry-pxf:2.1.0
+          tags: cloudberry-pxf:2.2.0
           labels: ${{ steps.meta-pxf.outputs.labels }}
       # Step b: Build cloudberry-official (standalone, amd64)
       - name: Build cloudberry-official
@@ -593,7 +597,7 @@ jobs:
           file: ./Dockerfile.cloudberry-official
           push: false
           load: true
-          tags: cloudberry-official:2.1.0
+          tags: cloudberry-official:2.2.0
       # Step c: Build cloudberry-official-pxf (depends on pxf + official)
       - name: Build cloudberry-official-pxf
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -602,10 +606,10 @@ jobs:
           file: ./Dockerfile.cloudberry-official-pxf
           push: false
           load: true
-          tags: cloudberry-official-pxf:2.1.0
+          tags: cloudberry-official-pxf:2.2.0
           build-args: |
-            CB_PXF_IMAGE=cloudberry-pxf:2.1.0
-            CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+            CB_PXF_IMAGE=cloudberry-pxf:2.2.0
+            CB_OFFICIAL_IMAGE=cloudberry-official:2.2.0
       # Step d: Build cloudberry-gpfdist (depends on official-pxf)
       - name: Build cloudberry-gpfdist
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -614,9 +618,9 @@ jobs:
           file: ./Dockerfile.cloudberry-gpfdist
           push: false
           load: true
-          tags: cloudberry-gpfdist:2.1.0
+          tags: cloudberry-gpfdist:2.2.0
           build-args: |
-            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
+            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.2.0
 
   # ===========================================================================
   # Helm Chart Testing (PR - Dry Run)
@@ -866,7 +870,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Step a: Build cloudberry-pxf (standalone sidecar, amd64) — load + push.
-      # `load: true` and the bare `cloudberry-pxf:2.1.0` tag are REQUIRED so the
+      # `load: true` and the bare `cloudberry-pxf:2.2.0` tag are REQUIRED so the
       # downstream cloudberry-official-pxf build (Step c) resolves it locally via
       # its `CB_PXF_IMAGE` build-arg; the registry tags are additionally pushed so
       # the standalone PXF sidecar image is available for clusters that reference
@@ -888,7 +892,7 @@ jobs:
           push: false
           load: true
           tags: |
-            cloudberry-pxf:2.1.0
+            cloudberry-pxf:2.2.0
             ${{ steps.meta-pxf.outputs.tags }}
           labels: ${{ steps.meta-pxf.outputs.labels }}
       - name: Push cloudberry-pxf
@@ -916,7 +920,7 @@ jobs:
           push: false
           load: true
           tags: |
-            cloudberry-official:2.1.0
+            cloudberry-official:2.2.0
             ${{ steps.meta-cloudberry.outputs.tags }}
           labels: ${{ steps.meta-cloudberry.outputs.labels }}
       - name: Push cloudberry-official
@@ -944,12 +948,12 @@ jobs:
           push: false
           load: true
           tags: |
-            cloudberry-official-pxf:2.1.0
+            cloudberry-official-pxf:2.2.0
             ${{ steps.meta-official-pxf.outputs.tags }}
           labels: ${{ steps.meta-official-pxf.outputs.labels }}
           build-args: |
-            CB_PXF_IMAGE=cloudberry-pxf:2.1.0
-            CB_OFFICIAL_IMAGE=cloudberry-official:2.1.0
+            CB_PXF_IMAGE=cloudberry-pxf:2.2.0
+            CB_OFFICIAL_IMAGE=cloudberry-official:2.2.0
       - name: Push cloudberry-official-pxf
         run: |
           tags="${{ steps.meta-official-pxf.outputs.tags }}"
@@ -975,11 +979,11 @@ jobs:
           push: false
           load: true
           tags: |
-            cloudberry-gpfdist:2.1.0
+            cloudberry-gpfdist:2.2.0
             ${{ steps.meta-gpfdist.outputs.tags }}
           labels: ${{ steps.meta-gpfdist.outputs.labels }}
           build-args: |
-            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.1.0
+            CB_OFFICIAL_PXF_IMAGE=cloudberry-official-pxf:2.2.0
       - name: Push cloudberry-gpfdist
         run: |
           tags="${{ steps.meta-gpfdist.outputs.tags }}"
@@ -1036,9 +1040,20 @@ jobs:
           - name: ctl
             image_key: DOCKER_IMAGE_CTL
             skip_dirs: ''
+          # cloudberry: exclude the Cloudberry DB bin dir. NOTE (TASK-U024
+          # live-verified with trivy 0.76.2): this image is built from
+          # Dockerfile.cloudberry-official (RPM layout: versioned dir
+          # /usr/local/cloudberry-db-2.2.0 + managed symlink
+          # /usr/local/cloudberry-db). Trivy skip-dirs match STORED layer
+          # paths, not symlinks: this versioned path removes exactly the 5
+          # gobinary findings under .../bin (72→67 on the 2.2.0 build);
+          # the symlink path removes NOTHING. The source-built
+          # Dockerfile.cloudberry (unversioned /usr/local/cloudberry-db,
+          # Makefile-only, not built/scanned in CI) would need
+          # /usr/local/cloudberry-db/bin instead.
           - name: cloudberry
             image_key: DOCKER_IMAGE_CLOUDBERRY
-            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
+            skip_dirs: '/usr/local/cloudberry-db-2.2.0/bin'
           - name: query-exporter
             image_key: DOCKER_IMAGE_QUERY_EXPORTER
             skip_dirs: ''
@@ -1056,11 +1071,11 @@ jobs:
           # official-pxf: exclude the Cloudberry bin directory (same as cloudberry image).
           - name: official-pxf
             image_key: DOCKER_IMAGE_OFFICIAL_PXF
-            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
+            skip_dirs: '/usr/local/cloudberry-db-2.2.0/bin'
           # gpfdist: exclude the Cloudberry bin directory (same as cloudberry image).
           - name: gpfdist
             image_key: DOCKER_IMAGE_GPFDIST
-            skip_dirs: '/usr/local/cloudberry-db-2.1.0/bin'
+            skip_dirs: '/usr/local/cloudberry-db-2.2.0/bin'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

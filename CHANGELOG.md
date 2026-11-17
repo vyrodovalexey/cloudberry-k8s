@@ -6,6 +6,81 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+> **Upgrade campaign — Go 1.27.4 / golangci-lint 2.15.0 / Apache Cloudberry
+> 2.2.0-incubating (verified 2026-11-15 → 2026-11-17).** The whole repository
+> was moved from Go 1.26.5 / golangci-lint 2.12.2 / Cloudberry 2.1.0 to the
+> versions below, and the result was verified end-to-end on a local
+> docker-desktop cluster (namespace `cloudberry-test`): operator with Vault-PKI
+> webhooks + Kubernetes auth + Keycloak OIDC, an HA/mirrored acceptance
+> cluster, backup/restore round-trip, PXF data loading, monitoring pipeline,
+> and the unit/functional/integration/e2e suites. OKD4 scenarios remain out of
+> scope (unchanged carve-out).
+>
+> - **Toolchain**: `go 1.27.4` (`go.mod`, `Dockerfile.operator`,
+>   `Dockerfile.ctl`, CI `GO_VERSION`); golangci-lint `v2.15.0` (Makefile +
+>   CI); govulncheck clean on the upgraded dependency set.
+> - **Cloudberry 2.2.0-incubating (PostgreSQL kernel 14.10)**: all `IMG_*`
+>   Makefile image vars, Dockerfile ARGs and RPM download paths (2.2.0 ships
+>   RPMs inside `.tar.gz` wrappers — an extract step was added), Go-code
+>   defaults/CRD defaults (`version: "2.2.0"`, `cloudberrydb/cloudberry:2.2.0`),
+>   Helm chart (`version: 0.1.2`, `appVersion: 0.9.3-cldb-2.2.0`) and all
+>   config samples. PXF is `2.2.0-incubating` (extension version 2.2).
+> - **Backup toolchain**: `gpbackup`/`gprestore`/`gpbackup_helper`/
+>   `gpbackup_s3_plugin`/`gpbackman` all at `2.2.0-incubating`, with gpbackman
+>   now **in-tree** in cloudberry-backup — the separate `woblerr/gpbackman`
+>   clone and the `GPBACKMAN_VERSION` Makefile variable are retired. The five
+>   2.1.0-era crash-workaround patches were re-validated live on 2.2.0 (all
+>   crash triggers clean) and are **retire-eligible but kept** this campaign
+>   (retirement is gated on a from-source-flavor validation or dropping that
+>   path); the pgx→lib/pq driver-switch patches stay (guards open upstream
+>   issue apache/cloudberry#2165). Repro harness:
+>   `test/e2e/scripts/gpbackup-crash-repro/`.
+> - **Behavior change — restore retry after failure**: retrying
+>   `POST /backups/{timestamp}/restore` whose deterministic Job name
+>   (`<cluster>-restore-<ts>`) collides with a **terminal** leftover Job now
+>   **replaces it and returns 202**; a **Running/Pending** collision (or a
+>   lost replace race) returns **409 CONFLICT** — previously both surfaced as
+>   an opaque `500 failed to create restore job`. Codified in specifications
+>   06 §5.17 and 11 (revision notes 2026-11-15; 409 replace-race row corrected
+>   2026-11-17 per code review REV-009).
+> - **Data loading**: PXF external-table FORMAT clauses are now **per-profile**
+>   (text family reads `FORMAT 'CSV'` / writes `FORMAT 'TEXT' (delimiter ',')`;
+>   parquet/avro/SequenceFile/json/orc/hive/jdbc/hbase keep the
+>   `pxfwritable_import`/`pxfwritable_export` bridge) — codified in
+>   specification 12 (revision 2026-11-15). Live-proven for all **7** writable
+>   profiles on 2.2.0 (s3/hdfs × text/parquet/avro + hdfs:SequenceFile with
+>   its `DATA_SCHEMA` prerequisite class), 175,000 rows per source with exact
+>   two-direction `EXCEPT ALL` equality.
+> - **Monitoring**: the monitoring stack (vmagent, vector, otel-collector,
+>   node-exporter, kube-state-metrics) now deploys to **`cloudberry-test`**
+>   (`NAMESPACE_MONITORING` default changed from `monitoring`); Grafana
+>   dashboards re-audited against the live metric inventory and republished;
+>   the vmagent `pxf-actuator` `:5888` scrape job was **removed** (DEF-5
+>   adjudication — SE.5 NetworkPolicy seals cross-pod PXF `:5888`; 0 actuator
+>   series in VictoriaMetrics is the expected steady state, PXF health is
+>   covered by `cloudberry_pxf_service_up`).
+> - **Test environment**: MinIO image moved to
+>   `alpine/minio:RELEASE.2025-10-15T17-29-55Z` and HBase to
+>   `openeuler/hbase:2.6.5-oe2403sp3` (forced changes — the old images left
+>   their registries / wedge under emulation on arm64); all 18 compose
+>   services healthy and verified (`make test-env-full` /
+>   `make test-env-verify`).
+> - **Verification evidence** (in-repo): performance report
+>   `test/performance/results/2026-11-16-cloudberry220-perftest-report.md` —
+>   **no regression on the measured scenarios** vs the 2026-07-12 baseline;
+>   coverage is **partial** (time-boxed run: PTC-220-08…17 — perf99 JDBC
+>   export, the s105–s119 API-latency benchmarks, in-process perf suite —
+>   were **not run**), and all numbers carry the amd64-emulation caveat
+>   (arm64 host). Metrics verification: 117/123 enumerated custom metric
+>   families present in VictoriaMetrics, every absent family documented
+>   (incl. 3 per-host resgroup memory families dropped from `gp_toolkit` in
+>   2.2.0, and the actuator families blocked under SE.5); backup/restore
+>   round-trip proven with Vault-stored S3 credentials (24/24 table
+>   fingerprints byte-identical). Per-task campaign reports (TASK-U001…U032,
+>   2026-11-15/16/17, `.opencode/output/`) document each step and stay with
+>   the campaign run; the amended specifications 06/11/12 carry the normative
+>   contracts.
+
 > **Behavior change — backup-schedule cron day-field semantics (2026-07-12).**
 > The operator's cron parser (`internal/cron`, used for backup-schedule
 > next-run computation and webhook schedule validation) now follows the

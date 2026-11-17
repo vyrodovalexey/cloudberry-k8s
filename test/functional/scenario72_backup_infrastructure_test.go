@@ -51,7 +51,7 @@ import (
 // ============================================================================
 
 const (
-	scenario72BackupImage = "cloudberry-backup:2.1.0"
+	scenario72BackupImage = "cloudberry-backup:2.2.0"
 	scenario72BackupSA    = "cloudberry-backup-sa"
 )
 
@@ -192,9 +192,9 @@ func (s *Scenario72Suite) s72AssertSecretRef(
 // --- V1: image binaries (image assertion; binaries verified live) ---
 
 // TestFunctional_Scenario72_ImageDefault asserts the backup Job container uses
-// the configured cloudberry-backup:2.1.0 toolchain image. The presence of the
+// the configured cloudberry-backup:2.2.0 toolchain image. The presence of the
 // gpbackup/gprestore/gpbackup_s3_plugin binaries inside the image is verified
-// live (`docker run cloudberry-backup:2.1.0`) and is NOT testable in Go.
+// live (`docker run cloudberry-backup:2.2.0`) and is NOT testable in Go.
 func (s *Scenario72Suite) TestFunctional_Scenario72_ImageDefault() {
 	cluster := scenario72Cluster("s72-image", true)
 

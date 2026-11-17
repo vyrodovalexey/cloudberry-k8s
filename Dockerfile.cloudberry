@@ -1,14 +1,14 @@
 # =============================================================================
-# Dockerfile.cloudberry — Apache Cloudberry Database 2.1.0 for Kubernetes
+# Dockerfile.cloudberry — Apache Cloudberry Database 2.2.0 for Kubernetes
 # =============================================================================
-# Multi-stage build that compiles Apache Cloudberry 2.1.0 from source and
+# Multi-stage build that compiles Apache Cloudberry 2.2.0 from source and
 # produces a minimal runtime image suitable for the cloudberry-k8s operator.
 #
 # Supports: linux/amd64, linux/arm64
 #
 # Usage:
-#   docker build -f Dockerfile.cloudberry -t cloudberrydb/cloudberry:2.1.0 .
-#   docker run -e POSTGRES_PASSWORD=secret cloudberrydb/cloudberry:2.1.0
+#   docker build -f Dockerfile.cloudberry -t cloudberrydb/cloudberry:2.2.0 .
+#   docker run -e POSTGRES_PASSWORD=secret cloudberrydb/cloudberry:2.2.0
 # =============================================================================
 
 # =============================================================================
@@ -99,12 +99,21 @@ RUN groupadd -r gpadmin && \
 USER gpadmin
 WORKDIR /home/gpadmin
 
-# Download and extract Apache Cloudberry 2.1.0 source
-ARG CB_RELEASE_VERSION=2.1.0-incubating
-RUN curl -L -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
-    "https://github.com/apache/cloudberry/archive/refs/tags/${CB_RELEASE_VERSION}.tar.gz" && \
+# Download and extract Apache Cloudberry 2.2.0 source
+# (PG kernel 14.10 per the 2.2.0 release; kernel comes from the source tree)
+# Source of truth is the ASF distribution tarball (U001 §1.2): it extracts to
+# apache-cloudberry-<version>/ and ships a .sha512 that is verified before
+# extraction. The GitHub auto-archive (used briefly in commit 3f016b6) extracts
+# to cloudberry-<version>/ (no "apache-" prefix) and breaks the mv below; it is
+# also a regenerated convenience copy, not the voted source release.
+ARG CB_RELEASE_VERSION=2.2.0-incubating
+RUN curl -fSL -o "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" \
+    "https://downloads.apache.org/incubator/cloudberry/${CB_RELEASE_VERSION}/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
+    curl -fSL -o "/home/gpadmin/src.tar.gz.sha512" \
+    "https://downloads.apache.org/incubator/cloudberry/${CB_RELEASE_VERSION}/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz.sha512" && \
+    (cd /home/gpadmin && sha512sum -c src.tar.gz.sha512) && \
     tar -xzf "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" -C /home/gpadmin && \
-    rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" && \
+    rm -f "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}-src.tar.gz" "/home/gpadmin/src.tar.gz.sha512" && \
     mv "/home/gpadmin/apache-cloudberry-${CB_RELEASE_VERSION}" /home/gpadmin/cloudberry
 
 # Build Cloudberry using the official build scripts
@@ -121,14 +130,19 @@ FROM rockylinux/rockylinux:9.6-minimal
 
 # OCI labels
 LABEL org.opencontainers.image.title="cloudberry-database" \
-      org.opencontainers.image.description="Apache Cloudberry Database 2.1.0 for Kubernetes" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.description="Apache Cloudberry Database 2.2.0 for Kubernetes" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.vendor="Apache Software Foundation" \
       org.opencontainers.image.source="https://github.com/apache/cloudberry" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.base.name="rockylinux/rockylinux:9.6-minimal"
 
 # Install runtime dependencies (sorted alphanumerically)
+# SECURITY (U033): full `microdnf -y upgrade` after install (official-image
+# convention: install → upgrade → clean in one layer) — upgrades EVERY
+# installed package, closing the pre-existing gap (U009: source image carried
+# 38 HIGH/CRIT OS findings; install-only never refreshed the 9.6-minimal base
+# snapshot's CVE-affected packages). Self-maintains against CVE-DB drift.
 RUN microdnf -y install \
       apr \
       bash \
@@ -167,6 +181,7 @@ RUN microdnf -y install \
       sudo \
       which \
       zlib && \
+    microdnf -y upgrade && \
     microdnf clean all && rm -rf /var/cache/yum
 
 # Create gpadmin user (UID 1000 for Kubernetes compatibility)

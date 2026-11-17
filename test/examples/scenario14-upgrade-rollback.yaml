@@ -45,8 +45,8 @@ metadata:
   namespace: cloudberry-test
 spec:
   # Change this image/version to trigger an upgrade
-  image: "cloudberrydb/cloudberry:2.1.0"
-  version: "2.1.0"
+  image: "cloudberrydb/cloudberry:2.2.0"
+  version: "2.2.0"
   coordinator:
     resources:
       requests:

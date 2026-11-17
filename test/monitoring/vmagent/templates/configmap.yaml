@@ -52,52 +52,22 @@ data:
             target_label: component
 
       # -----------------------------------------------------------------
-      # PXF Spring Boot Actuator (M.2/M.3: http_server_requests_seconds_*)
-      # -----------------------------------------------------------------
-      # The segment-primary pods already carry prometheus.io/scrape
-      # annotations for the pg-exporter (:9187 /metrics). A single pod
-      # annotation cannot cover two targets, so this SEPARATE job
-      # discovers the PXF sidecar actuator endpoint by label + container
-      # port. It selects pods with:
-      #   app.kubernetes.io/component = segment-primary
-      #   container port 5888 (named "pxf")
-      # and scrapes /actuator/prometheus on that port.
-      - job_name: 'pxf-actuator'
-        kubernetes_sd_configs:
-          - role: pod
-        metrics_path: /actuator/prometheus
-        relabel_configs:
-          # Keep only pods labelled as segment-primary (PXF sidecar host).
-          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
-            action: keep
-            regex: segment-primary
-          # Keep only the container port named "pxf" (5888).
-          - source_labels: [__meta_kubernetes_pod_container_port_name]
-            action: keep
-            regex: pxf
-          # Override the scrape address to use port 5888.
-          - source_labels: [__address__]
-            action: replace
-            regex: ([^:]+)(?::\d+)?
-            replacement: $1:5888
-            target_label: __address__
-          # Standard metadata labels.
-          - source_labels: [__meta_kubernetes_namespace]
-            action: replace
-            target_label: namespace
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: replace
-            target_label: pod
-          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
-            action: replace
-            target_label: component
-
-      # -----------------------------------------------------------------
       # Cloudberry Query Exporter (port 9188 on coordinator pods)
       # -----------------------------------------------------------------
       # The coordinator pod annotation prometheus.io/port=9187 targets the
-      # postgres-exporter sidecar. The query-exporter sidecar on :9188
-      # needs a separate scrape job (same pattern as pxf-actuator above).
+      # postgres-exporter sidecar. The query-exporter sidecar on :9188 is
+      # not covered by that annotation, so this SEPARATE job selects pods
+      # by the query-exporter container port (9188) plus the
+      # prometheus.io/scrape=true annotation.
+      #
+      # NOTE (DEF-5 adjudication, 2026-11-15, spec 12): a former
+      # `pxf-actuator` job here scraped the PXF sidecar actuator on :5888
+      # cross-pod; SE.5 (BuildPXFClusterNetworkPolicy) intentionally blocks
+      # cross-pod ingress to :5888, so that job could only ever produce
+      # down targets and was REMOVED. Zero PXF/Micrometer series in
+      # VictoriaMetrics is the EXPECTED steady state; the actuator stays
+      # enabled for same-pod (loopback) diagnostics. Do not re-add without
+      # an explicit SE.5 exception decision in spec 12.
       - job_name: 'cloudberry-query-exporter'
         honor_labels: true
         kubernetes_sd_configs:

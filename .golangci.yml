@@ -1,7 +1,9 @@
 version: "2"
 
 run:
-  timeout: 5m
+  # 10m: cold-runner headroom (TASK-U024); kept in sync with the
+  # --timeout arg on the CI lint job (.github/workflows/ci.yml).
+  timeout: 10m
   tests: false
 
 linters:

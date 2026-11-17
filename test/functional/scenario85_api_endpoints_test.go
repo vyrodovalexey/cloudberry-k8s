@@ -103,7 +103,7 @@ func scenario85BackupCluster(history ...cbv1alpha1.BackupHistoryEntry) *cbv1alph
 		Build()
 	cluster.Spec.Backup = &cbv1alpha1.BackupSpec{
 		Enabled:  true,
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Schedule: "0 2 * * *",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,

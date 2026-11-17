@@ -220,7 +220,7 @@ func (s *Scenario104Suite) TestFunctional_Scenario104_PxfScriptChecks() {
 	require.NotNil(s.T(), init)
 	script := init.Args[0]
 
-	// HC.1 DB-proxy PXF-readiness (NOT a direct sidecar curl). PXF 2.1 has no
+	// HC.1 DB-proxy PXF-readiness (NOT a direct sidecar curl). PXF 2.2 has no
 	// pxf_version(); readiness is proven via a real PXF function in pg_proc.
 	assert.Contains(s.T(), script, "pg_extension")
 	assert.Contains(s.T(), script, "extname='pxf'")
@@ -583,7 +583,7 @@ func (s *Scenario104Suite) scenario104ResolveBuilderRow(
 // image equals the data-loader image (the cluster image carrying psql/curl/df).
 func (s *Scenario104Suite) TestFunctional_Scenario104_InitImageIsDataLoader() {
 	cluster := scenario104Cluster("s104-img", scenario104PxfJob())
-	cluster.Spec.Image = "cloudberry-official-pxf:2.1.0"
+	cluster.Spec.Image = "cloudberry-official-pxf:2.2.0"
 	out := s.builder.BuildDataLoadJob(cluster, scenario104PxfJob())
 	require.NotNil(s.T(), out)
 	init := scenario104InitContainer(out)
@@ -592,7 +592,7 @@ func (s *Scenario104Suite) TestFunctional_Scenario104_InitImageIsDataLoader() {
 	require.NotNil(s.T(), main)
 	assert.Equal(s.T(), main.Image, init.Image,
 		"the init container shares the data-loader image with the main container")
-	assert.Equal(s.T(), "cloudberry-official-pxf:2.1.0", init.Image)
+	assert.Equal(s.T(), "cloudberry-official-pxf:2.2.0", init.Image)
 
 	// Sanity: the Job name is deterministic.
 	assert.Equal(s.T(), util.DataLoadJobName(cluster.Name, cases.Scenario104PxfJobName), out.Name)

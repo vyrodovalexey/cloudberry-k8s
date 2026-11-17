@@ -30,6 +30,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cloudberry-contrib/cloudberry-k8s/internal/builder"
 )
 
 const (
@@ -149,11 +151,14 @@ func BenchmarkScenario99_ExportThroughput(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		// (Re)create the writable external table over the JDBC export target.
+		// U029 (DEF-4): the write clause is per-profile; bare jdbc keeps the
+		// pxfwritable_export bridge (only delimited-text profiles switched to
+		// FORMAT 'TEXT'). Helper call = single source of truth.
 		createDDL := fmt.Sprintf(
 			"DROP EXTERNAL TABLE IF EXISTS %s; "+
 				"CREATE WRITABLE EXTERNAL TABLE %s (LIKE %s) LOCATION ('%s') "+
-				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')",
-			ext, ext, src, loc)
+				"%s",
+			ext, ext, src, loc, builder.PXFWriteFormatClause("jdbc"))
 		if out, err := perf99CoordExec(ctx,
 			fmt.Sprintf("psql -d postgres -v ON_ERROR_STOP=1 -c %s", perf99ShQuote(createDDL))); err != nil {
 			b.Skipf("perf writable ext create failed: %v (out=%s)", err, out)

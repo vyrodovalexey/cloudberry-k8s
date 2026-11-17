@@ -12,7 +12,7 @@ image:
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (defaults to chart appVersion)
-  tag: "0.9.3-cldb-2.1.0"
+  tag: "0.9.3-cldb-2.2.0"
 
 # -- Image pull secrets for private registries
 imagePullSecrets: []

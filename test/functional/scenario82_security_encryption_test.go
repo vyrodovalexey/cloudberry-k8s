@@ -50,7 +50,7 @@ import (
 // ============================================================================
 
 const (
-	scenario82BackupImage = "cloudberry-backup:2.1.0"
+	scenario82BackupImage = "cloudberry-backup:2.2.0"
 	// scenario82CredSecret is the user-named S3 credential Secret (creds live
 	// ONLY here, never in the ConfigMap).
 	scenario82CredSecret = "s3-credentials"

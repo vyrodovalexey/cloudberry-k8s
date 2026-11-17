@@ -109,7 +109,7 @@ func scenario71BackupSpec(useVault bool) *cbv1alpha1.BackupSpec {
 	return &cbv1alpha1.BackupSpec{
 		Enabled:  true,
 		Schedule: "0 2 * * *",
-		Image:    "cloudberry-backup:2.1.0",
+		Image:    "cloudberry-backup:2.2.0",
 		Retention: cbv1alpha1.BackupRetention{
 			FullCount:        3,
 			IncrementalCount: 10,
@@ -173,7 +173,7 @@ func (s *Scenario71Suite) assertFullS3Env(container corev1.Container) {
 	s.assertS3PlainEnv(container, "S3_ENCRYPTION", "on")
 	s.assertS3PlainEnv(container, "S3_FORCE_PATH_STYLE", "true")
 	// NOTE: S3_AWS_SIGNATURE_VERSION is intentionally NOT emitted. The
-	// version-matched gpbackup_s3_plugin (2.1.0-incubating) rejects the
+	// version-matched gpbackup_s3_plugin (2.2.0-incubating) rejects the
 	// aws_signature_version option ("field aws_signature_version not found in
 	// type s3plugin.PluginOptions"), so the operator no longer sets it (SigV4 is
 	// the plugin default).
@@ -191,7 +191,7 @@ func (s *Scenario71Suite) assertFullS3Env(container corev1.Container) {
 // TestFunctional_Scenario71_Secret_S3ConfigMap asserts the rendered S3 plugin
 // template carries all the configured placeholders and the canonical
 // executablepath, but NOT aws_signature_version (the version-matched
-// gpbackup_s3_plugin 2.1.0-incubating rejects that option).
+// gpbackup_s3_plugin 2.2.0-incubating rejects that option).
 func (s *Scenario71Suite) TestFunctional_Scenario71_Secret_S3ConfigMap() {
 	cluster := scenario71Cluster("s71-secret-cm", false)
 
@@ -208,7 +208,7 @@ func (s *Scenario71Suite) TestFunctional_Scenario71_Secret_S3ConfigMap() {
 	assert.Contains(s.T(), tpl, "folder: ${S3_FOLDER}")
 	assert.Contains(s.T(), tpl, "encryption: ${S3_ENCRYPTION}")
 	// aws_signature_version was intentionally removed: the version-matched
-	// gpbackup_s3_plugin (2.1.0-incubating) rejects the unknown field. SigV4 is
+	// gpbackup_s3_plugin (2.2.0-incubating) rejects the unknown field. SigV4 is
 	// the plugin default, so no explicit option is needed.
 	assert.NotContains(s.T(), tpl, "aws_signature_version")
 	assert.NotContains(s.T(), tpl, "S3_AWS_SIGNATURE_VERSION")

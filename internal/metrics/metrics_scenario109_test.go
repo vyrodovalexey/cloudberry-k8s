@@ -137,7 +137,7 @@ func TestNoopRecorder_Scenario109(t *testing.T) {
 // PASSING test that locks in the no-fabrication decision against future drift: if
 // someone later registers any of these synthetic families it FAILS loudly.
 //
-// The absent families (no honest source in PXF 2.1.0 / gpfdist):
+// The absent families (no honest source in PXF 2.2.0 / gpfdist):
 //   - M.4  cloudberry_pxf_bytes_transferred_total
 //   - M.5  cloudberry_pxf_records_total      (substituted by data_loading_rows_total)
 //   - M.7  cloudberry_pxf_active_connections (tomcat.threads.busy is a mislabeled proxy)

@@ -53,7 +53,7 @@ import (
 // ============================================================================
 
 const (
-	scenario78BackupImage = "cloudberry-backup:2.1.0"
+	scenario78BackupImage = "cloudberry-backup:2.2.0"
 	// scenario78FullTS is the pinned full-backup timestamp used for the 78c
 	// --from-timestamp override assertion.
 	scenario78FullTS = "20260608060000"

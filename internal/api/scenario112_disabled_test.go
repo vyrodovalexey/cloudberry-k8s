@@ -45,7 +45,7 @@ func newDLDisabledCluster(name, namespace string) *cbv1alpha1.CloudberryCluster 
 		Enabled: false,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "apache/cloudberry-pxf:2.1.0",
+			Image:   "apache/cloudberry-pxf:2.2.0",
 			Servers: []cbv1alpha1.PxfServerSpec{{Name: "s3srv", Type: "s3"}},
 		},
 	}

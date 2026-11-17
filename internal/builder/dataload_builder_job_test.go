@@ -146,7 +146,7 @@ func pxfWritableExportTestJob() cbv1alpha1.DataLoadingJob {
 // script (the FIX for the PXF writable export direction). For a mode=writable PXF
 // job the script must:
 //   - emit the WRITABLE external-table DDL (CREATE WRITABLE EXTERNAL TABLE ...
-//     pxfwritable_export),
+//     the per-profile write clause per DEF-4),
 //   - REVERSE the INSERT direction: INSERT INTO <tmp writable external>
 //     SELECT * FROM <target> (the cluster table is the SELECT source; the temp
 //     writable external table is the INSERT target — a WRITABLE external table
@@ -168,9 +168,11 @@ func TestBuildDataLoadJob_WritableExportScript(t *testing.T) {
 	require.Len(t, out.Spec.Template.Spec.Containers[0].Args, 1)
 	script := out.Spec.Template.Spec.Containers[0].Args[0]
 
-	// WRITABLE external-table DDL (export formatter).
+	// WRITABLE external-table DDL with the per-profile write clause (DEF-4:
+	// s3:text exports as FORMAT 'TEXT' (delimiter ','); bridge profiles as
+	// pxfwritable_export).
 	assert.Contains(t, script, "CREATE WRITABLE EXTERNAL TABLE")
-	assert.Contains(t, script, "FORMATTER='pxfwritable_export'")
+	assert.Contains(t, script, PXFWriteFormatClause(job.PxfJob.Profile))
 
 	// REVERSED INSERT direction: the temp WRITABLE external table is the INSERT
 	// target, the cluster target table is the SELECT source. Compute the exact
@@ -213,7 +215,8 @@ func pxfWritableExportFilteredTestJob() cbv1alpha1.DataLoadingJob {
 // INSERT becomes the reversed-direction `INSERT INTO <tmp writable ext>
 // SELECT * FROM <target> WHERE <sourceFilter>` emitted via the quoted heredoc
 // (so embedded single quotes survive), while still carrying the WRITABLE DDL
-// (FORMATTER='pxfwritable_export'), the DATALOAD_ROWS marker, the DROP cleanup,
+// (the per-profile write clause per DEF-4), the DATALOAD_ROWS marker, the DROP
+// cleanup,
 // and skipping ANALYZE. The temp/target identifiers are computed via the SAME
 // production helpers used by the builder so the assertion is byte-exact.
 func TestBuildDataLoadJob_WritableExportFilteredScript(t *testing.T) {
@@ -227,9 +230,10 @@ func TestBuildDataLoadJob_WritableExportFilteredScript(t *testing.T) {
 	require.Len(t, out.Spec.Template.Spec.Containers[0].Args, 1)
 	script := out.Spec.Template.Spec.Containers[0].Args[0]
 
-	// WRITABLE external-table DDL (export formatter) is still emitted.
+	// WRITABLE external-table DDL is still emitted, with the per-profile write
+	// clause (DEF-4: s3:text → FORMAT 'TEXT' (delimiter ',')).
 	assert.Contains(t, script, "CREATE WRITABLE EXTERNAL TABLE")
-	assert.Contains(t, script, "FORMATTER='pxfwritable_export'")
+	assert.Contains(t, script, PXFWriteFormatClause(job.PxfJob.Profile))
 
 	// Byte-exact temp/target identifiers via the production helpers.
 	tmp := quoteSQLIdentifier(dataLoadTmpTable(job.Name))

@@ -99,7 +99,7 @@ func pxfDataLoaderRole(pxf *cbv1alpha1.PxfSpec) string {
 // AnnotationPXFExtensionsReady idempotency flag (skipped once set) and is
 // strictly NON-FATAL: a missing dbFactory, a connection failure or a
 // SetupPXFExtensions error all only log a warning and return — the pxf agent is
-// absent in cloudberry-official:2.1.0, so an unavailable extension is expected
+// absent in cloudberry-official:2.2.0, so an unavailable extension is expected
 // and must never fail the reconcile.
 //
 // The AnnotationPXFExtensionsReady flag is only set once at least one extension

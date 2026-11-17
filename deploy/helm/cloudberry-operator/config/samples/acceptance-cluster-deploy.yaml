@@ -6,7 +6,7 @@
 #   - Scenario 71 backup block: S3 destination with Vault-sourced credentials
 #
 # Components:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl)
@@ -26,8 +26,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "93"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -38,7 +38,12 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 2 Gi (U033, user directive; DEF-8 reclassified as sizing, not a
+        # product defect): 512 Mi OOMKilled the coordinator during in-pod
+        # gpbackup report finalization (U018 F-1, exit 137); 1 Gi (U028b)
+        # cleared the OOMs but ran marginal under amd64 emulation. 2 Gi is
+        # headroom for the U034 1-hour soak. Requests unchanged.
+        memory: "2Gi"
     storage:
       size: "2Gi"
 
@@ -50,7 +55,11 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 2 Gi (U033): role symmetry with the coordinator — the standby runs
+        # the coordinator's replica topology and assumes the full coordinator
+        # workload on promotion/failover, so it carries the same limit. Was
+        # 512 Mi (no backup/COPY dispatch role while in standby).
+        memory: "2Gi"
     storage:
       size: "2Gi"
 
@@ -63,7 +72,10 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 1 Gi: 512 Mi OOMKilled a segment primary during restore COPY of
+        # line_items (U018 F-2) and U023 perf hits the same envelope
+        # (960k-row COPY + WAL + mirror sync). Requests unchanged.
+        memory: "1Gi"
     storage:
       size: "2Gi"
     mirroring:
@@ -169,8 +181,14 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
-      jvmOpts: "-Xmx1g -Xms256m"
+      image: "cloudberry-pxf:2.2.0"
+      # Docker-desktop amd64 emulation note: the PXF Spring Boot context needs
+      # ~75-90 s of emulated JIT work to reach /actuator/health, which brushes
+      # the operator's fixed 154 s startup-probe budget. TieredStopAtLevel=1
+      # removes most C2 JIT compilation from the boot path (the dominant cost
+      # under Rosetta-off emulation); steady-state throughput is acceptable for
+      # a test-env sidecar. Heap sized for 6 low-traffic servers.
+      jvmOpts: "-Xms128m -Xmx768m -XX:TieredStopAtLevel=1"
       port: 5888
       logLevel: INFO
       extensions:
@@ -231,7 +249,9 @@ spec:
           cpu: "100m"
           memory: "256Mi"
         limits:
-          cpu: "500m"
+          # 1 CPU for the PXF sidecar: JVM boot under amd64 emulation is
+          # JIT-bound; 500m made the startup probe budget marginal.
+          cpu: "1"
           memory: "1Gi"
     jobs:
       - name: s3-csv-load
@@ -240,14 +260,23 @@ spec:
         pxfJob:
           server: s3-datalake
           profile: "s3:text"
-          resource: "cloudberry-data/dataset/data_1.csv"
+          # loadMethod fdw: the s3:text CSV dataset is comma-delimited; the FDW
+          # path maps the text profile to the csv format (scenario103's
+          # s3-fdw-load pattern, same server/profile/resource). Kept on fdw
+          # deliberately for FDW-path parity with scenario103 — the
+          # external-table read path is FIXED since DEF-1 (U027:
+          # PXFReadFormatClause("s3:text") now emits FORMAT 'CSV'; live-proven
+          # by the U019 7-format matrix and scenario99 read-back), so either
+          # loadMethod works for this dataset.
+          loadMethod: fdw
+          resource: "cloudberry-data/text/data.csv"
           targetTable: "public.pxf_loaded"
 
   # S3 Backup with Vault-sourced credentials (from scenario71)
   backup:
     enabled: true
     schedule: "0 2 * * *"
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       fullCount: 3
       incrementalCount: 10

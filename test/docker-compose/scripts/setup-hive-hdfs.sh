@@ -17,6 +17,11 @@
 # Environment:
 #   WEBHDFS_ADDR    - WebHDFS base URL (default: http://127.0.0.1:9870)
 #   METASTORE_PORT  - Hive Metastore Thrift port on host (default: 9083)
+#   K8S_NAMESPACE   - k8s namespace for the ExternalName Services
+#                     (default: cloudberry-test)
+#   HADOOP_K8S_HOST - host the in-cluster 'namenode'/'hive-metastore'/
+#                     'hiveserver2' Services point at
+#                     (default: host.docker.internal)
 # =============================================================================
 
 set -euo pipefail
@@ -25,6 +30,11 @@ WEBHDFS_ADDR="${WEBHDFS_ADDR:-http://127.0.0.1:9870}"
 METASTORE_PORT="${METASTORE_PORT:-9083}"
 NAMENODE_CONTAINER="${NAMENODE_CONTAINER:-namenode}"
 HIVESERVER2_CONTAINER="${HIVESERVER2_CONTAINER:-hiveserver2}"
+# Kubernetes wiring (ENV-GAP-1, TASK-U024): ExternalName Services so the
+# in-cluster PXF servers / backup Jobs can resolve the compose Hive+HDFS
+# endpoints by their short names. Mirrors setup-minio.sh's Service pattern.
+K8S_NAMESPACE="${K8S_NAMESPACE:-cloudberry-test}"
+HADOOP_K8S_HOST="${HADOOP_K8S_HOST:-host.docker.internal}"
 VERIFY_ONLY=false
 CI_MODE=false
 
@@ -153,6 +163,118 @@ SQL
 }
 
 seed_hive_table
+
+# ---------------------------------------------------------------------------
+# Kubernetes wiring (ENV-GAP-1, TASK-U024): ExternalName Services for the
+# compose Hive+HDFS endpoints.
+#
+# The CR's PXF servers reference `hdfs://namenode:8020`,
+# `thrift://hive-metastore:9083` and `jdbc:hive2://hiveserver2:10000` (see
+# specifications/12-data-loading-spec.md); without Services those names are
+# unresolvable inside the cluster. ExternalName does NOT remap ports, so the
+# host must expose the compose ports as published (8020/9870/9083/10000).
+# Same pattern as setup-minio.sh's `minio` Service. Idempotent (kubectl
+# apply) and only attempted when:
+#   - not running in --ci mode (CI has no k8s cluster), AND
+#   - kubectl is installed, AND
+#   - a Kubernetes API server is actually reachable.
+# ---------------------------------------------------------------------------
+setup_k8s_hive_hdfs_services() {
+  if [ "$CI_MODE" = true ]; then
+    echo ""
+    echo "  CI mode: skipping k8s Hive+HDFS ExternalName Services"
+    return 0
+  fi
+
+  if ! command -v kubectl > /dev/null 2>&1; then
+    echo "  kubectl not found; skipping k8s Hive+HDFS ExternalName Services"
+    return 0
+  fi
+
+  # The kubectl binary may exist without a reachable cluster (e.g. GitHub CI).
+  if ! kubectl cluster-info > /dev/null 2>&1; then
+    echo "  No reachable Kubernetes cluster; skipping k8s Hive+HDFS ExternalName Services"
+    return 0
+  fi
+
+  echo ""
+  echo "=== Creating k8s ExternalName Services in namespace '${K8S_NAMESPACE}' ==="
+
+  kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml \
+    | kubectl apply -f - > /dev/null 2>&1 || true
+
+  # 1. NameNode: hdfs-rpc (8020) + WebHDFS/UI (9870).
+  echo "Creating ExternalName Service 'namenode' -> ${HADOOP_K8S_HOST}..."
+  kubectl apply -f - > /dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: namenode
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    app.kubernetes.io/component: hdfs-endpoint
+spec:
+  type: ExternalName
+  externalName: ${HADOOP_K8S_HOST}
+  ports:
+    - name: hdfs-rpc
+      port: 8020
+      targetPort: 8020
+      protocol: TCP
+    - name: webhdfs
+      port: 9870
+      targetPort: 9870
+      protocol: TCP
+EOF
+  echo "  Service 'namenode' ready in '${K8S_NAMESPACE}'"
+
+  # 2. Hive Metastore: Thrift (9083) for hive:* PXF profiles.
+  echo "Creating ExternalName Service 'hive-metastore' -> ${HADOOP_K8S_HOST}..."
+  kubectl apply -f - > /dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-metastore
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    app.kubernetes.io/component: hive-endpoint
+spec:
+  type: ExternalName
+  externalName: ${HADOOP_K8S_HOST}
+  ports:
+    - name: thrift
+      port: 9083
+      targetPort: 9083
+      protocol: TCP
+EOF
+  echo "  Service 'hive-metastore' ready in '${K8S_NAMESPACE}'"
+
+  # 3. HiveServer2: JDBC (10000) for the jdbc:hive2 PXF profile.
+  echo "Creating ExternalName Service 'hiveserver2' -> ${HADOOP_K8S_HOST}..."
+  kubectl apply -f - > /dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: hiveserver2
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: cloudberry-operator
+    app.kubernetes.io/component: hive-endpoint
+spec:
+  type: ExternalName
+  externalName: ${HADOOP_K8S_HOST}
+  ports:
+    - name: jdbc
+      port: 10000
+      targetPort: 10000
+      protocol: TCP
+EOF
+  echo "  Service 'hiveserver2' ready in '${K8S_NAMESPACE}'"
+}
+
+setup_k8s_hive_hdfs_services
 
 echo ""
 echo "=== Hive + HDFS Setup Complete ==="

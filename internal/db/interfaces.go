@@ -292,8 +292,9 @@ type ScaleOps interface {
 type PXFOps interface {
 	// SetupPXFExtensions best-effort installs the PXF client extensions:
 	// CREATE EXTENSION IF NOT EXISTS pxf, then pxf_fdw. Both statements are
-	// NON-FATAL — the pxf agent/extension is absent in cloudberry-official:2.1.0
-	// (only a pxf_fdw client stub may exist), so a CREATE EXTENSION failure is
+	// NON-FATAL — the pxf agent/extension is absent in cloudberry-official:2.2.0
+	// (pxf_fdw was dropped from the core default build in 2.2.0; 2.1.0 shipped
+	// at most a pxf_fdw client stub), so a CREATE EXTENSION failure is
 	// logged as a warning and the method returns (count, nil). Only a hard
 	// connectivity error (the existence probe itself failing) is surfaced.
 	// Idempotent. The returned int is the number of extensions actually CREATE

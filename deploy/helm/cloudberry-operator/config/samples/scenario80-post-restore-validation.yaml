@@ -39,7 +39,7 @@
 #     from ONE destination (gpbackup_history.db on the coordinator); the live
 #     test captures per-table expected counts at backup time.
 #   * The backup image MUST ship psql + gpbackup/gprestore
-#     (cloudberry-backup:2.1.0) — the validation Job runs psql queries and the
+#     (cloudberry-backup:2.2.0) — the validation Job runs psql queries and the
 #     live test runs real gpbackup/gprestore via coordinator-exec.
 #   * Multipart 10MB/4 (carried from scenario76/77/78/79) for MinIO emulation.
 #   * No `schedule` is set: Scenario 80 drives on-demand backup/restore so each
@@ -62,8 +62,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "80"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -192,7 +192,7 @@ spec:
   # discrete Job the operator reconciles.
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     # Post-restore validation: after a Succeeded restore the operator creates a
     # validation Job that compares restored row counts vs gpbackup history,
     # refreshes planner stats (ANALYZE), scans for invalid indexes and runs the

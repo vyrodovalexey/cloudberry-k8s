@@ -36,7 +36,10 @@
 # HONESTY: no target here implies a bytes_transferred metric (it stays PLANNED).
 # The honest "data lands" proofs are object landing (S3), file landing (HDFS
 # LISTSTATUS) and ROW landing (JDBC count(*)), all asserted by the Scenario 99
-# e2e Part B. The ALWAYS-true DDL signal is FORMATTER='pxfwritable_export'.
+# e2e Part B. The DDL signal is the per-profile write clause
+# (builder.PXFWriteFormatClause): FORMAT 'TEXT' (delimiter ',') for the text
+# targets (s3:text, hdfs:text) and FORMATTER='pxfwritable_export' for the
+# jdbc/bridge targets (DEF-4, U029).
 #
 # Usage:
 #   bash gen-export-targets.sh [--verify]

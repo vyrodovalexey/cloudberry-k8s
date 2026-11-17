@@ -82,11 +82,13 @@ oidc:
   existingSecretKey: client-secret
 
 # =============================================================================
-# Telemetry — OTLP to otel-collector in monitoring namespace
+# Telemetry — OTLP to otel-collector (deployed by test/monitoring charts into
+# cloudberry-test, per the campaign's single-namespace mandate; the former
+# "monitoring" namespace no longer exists — TASK-U012)
 # =============================================================================
 telemetry:
   enabled: true
-  otlpEndpoint: "otel-collector.monitoring.svc:4317"
+  otlpEndpoint: "otel-collector.cloudberry-test.svc:4317"
   otlpProtocol: grpc
   otlpInsecure: true
   samplingRate: 1.0

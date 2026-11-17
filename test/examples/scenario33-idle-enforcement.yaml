@@ -3,7 +3,7 @@ kind: CloudberryCluster
 metadata:
   name: scenario33-idle-enforcement
 spec:
-  version: "2.1.0"
+  version: "2.2.0"
   workload:
     enabled: true
     resourceGroups:

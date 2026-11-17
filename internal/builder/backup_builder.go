@@ -127,7 +127,7 @@ const (
 	defaultS3SecretKeyField = util.DefaultS3SecretKeyField
 
 	// NOTE: aws_signature_version was removed from the S3 plugin config template
-	// because the version-matched gpbackup_s3_plugin (2.1.0-incubating) does not
+	// because the version-matched gpbackup_s3_plugin (2.2.0-incubating) does not
 	// recognize this option. SigV4 is the default for both AWS and MinIO.
 
 	// preBackupCheckContainerName is the name of the pre-backup health-check init container.
@@ -153,7 +153,7 @@ const (
 	// manual export so the script works with any image layout.
 	//
 	// The whole block is a no-op when GPHOME is unset/empty: the
-	// cloudberry-backup:2.1.0 runtime image does NOT set GPHOME and ships the
+	// cloudberry-backup:2.2.0 runtime image does NOT set GPHOME and ships the
 	// gpbackup/gprestore/gpbackup_s3_plugin binaries on the default PATH
 	// (/usr/local/bin per Dockerfile.cloudberry-backup), so touching GPHOME
 	// paths there is unnecessary.  Every reference uses ${GPHOME:-} and the
@@ -994,14 +994,14 @@ func (b *DefaultBuilder) BuildBackupS3ConfigMap(cluster *cbv1alpha1.CloudberryCl
 	// observability.
 	//
 	// NOTE: aws_signature_version is intentionally NOT included in the template.
-	// The version-matched gpbackup_s3_plugin (2.1.0-incubating) does not
+	// The version-matched gpbackup_s3_plugin (2.2.0-incubating) does not
 	// recognize this option and rejects it with "field aws_signature_version not
 	// found in type s3plugin.PluginOptions". SigV4 is the default for both AWS
 	// and MinIO, so omitting it is safe.
 	template := strings.Join([]string{
 		// The gpbackup_s3_plugin lives at different paths per image: the
-		// cloudberry-backup:2.1.0 image installs it at /usr/local/bin (and does
-		// NOT set GPHOME), while the cloudberry-official:2.1.0 image bundles it
+		// cloudberry-backup:2.2.0 image installs it at /usr/local/bin (and does
+		// NOT set GPHOME), while the cloudberry-official:2.2.0 image bundles it
 		// at $GPHOME/bin.  The executablepath is pinned to the canonical
 		// /usr/local/bin/gpbackup_s3_plugin; the tool script guarantees that path
 		// exists at runtime (symlinking to $GPHOME/bin/gpbackup_s3_plugin on the

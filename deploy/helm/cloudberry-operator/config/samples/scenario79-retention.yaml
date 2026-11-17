@@ -30,7 +30,7 @@
 #   * retention.{fullCount,incrementalCount,maxAge} are ALL set so a single
 #     cleanup Job enforces every policy (the rendered script renders one
 #     count-loop per type plus a backup-clean --older-than-days step).
-#   * The backup image MUST include gpbackman (cloudberry-backup:2.1.0 ships
+#   * The backup image MUST include gpbackman (cloudberry-backup:2.2.0 ships
 #     gpbackman v0.8.1) — the cleanup Job invokes gpbackman backup-info /
 #     backup-delete / backup-clean.
 #   * Multipart 10MB/4 (carried from scenario76/77/78) for MinIO emulation.
@@ -53,8 +53,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "79"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -183,7 +183,7 @@ spec:
   # discrete Job the operator reconciles.
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     retention:
       # 79a: keep the newest 3 full backups (oldest excess deleted, cascade).
       fullCount: 3

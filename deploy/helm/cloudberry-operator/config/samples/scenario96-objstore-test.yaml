@@ -9,14 +9,14 @@
 # Cluster name is "objstore-test" (NOT acceptance-test) so it does not clash with
 # the deployed scenario93 acceptance cluster. Namespace cloudberry-test.
 #
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl) + Vault KV secrets + Vault k8s auth
 #   - Keycloak OIDC
 #   - Query monitoring: postgres-exporter on segments+mirrors
 #     + cloudberry-query-exporter
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - deletionPolicy Retain
 #
 # OBJECT-STORE SERVERS:
@@ -45,8 +45,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "96"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -172,7 +172,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

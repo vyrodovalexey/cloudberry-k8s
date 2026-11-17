@@ -30,8 +30,15 @@ KUBECTL="${KUBECTL:-kubectl}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CASES_DIR="${CASES_DIR:-${SCRIPT_DIR}/../../cases}"
-DDL_SQL="${CASES_DIR}/phase7d_dataload_mydb.sql"
-VERIFY_SQL="${CASES_DIR}/phase7d_dataload_verify.sql"
+# TASK-U022: default to the U017 deterministic loader/verify pair — the dataset
+# whose fingerprints (pg_database_size 222,647,789 B, closed-form counts/sums)
+# are the U018 restore baseline and the U023 perf payload. The legacy
+# phase7d_dataload_mydb.sql template (~half the volume, now()/random() values)
+# MUST NOT be run against the acceptance cluster any more: it silently replaces
+# the fingerprinted dataset. It stays reachable explicitly via DDL_SQL/VERIFY_SQL
+# for historical reproduction against a throwaway cluster.
+DDL_SQL="${DDL_SQL:-${CASES_DIR}/phase7d_dataload_mydb_u017.sql}"
+VERIFY_SQL="${VERIFY_SQL:-${CASES_DIR}/phase7d_dataload_verify_u017.sql}"
 
 KN=("${KUBECTL}" -n "${NAMESPACE}")
 
@@ -83,14 +90,17 @@ coord_psql_file() {
     ' _ "${DB_PASSWORD}" "${database}" < "${file}"
 }
 
-# --- Step 1: (re)create database mydb ----------------------------------------
-log "Creating database ${DB} (drop if exists)..."
+# --- Step 1: idempotent database bootstrap (TASK-U017 flow) -------------------
+# Create ${DB} only when missing, then ensure the gp_toolkit extension the
+# verification SQL relies on. The u017 loader re-creates the tables itself
+# (drop+recreate, deterministic), so a destructive DROP DATABASE is unnecessary
+# and would needlessly destroy unrelated objects.
+log "Ensuring database ${DB} exists (created only when missing)..."
 coord_psql postgres \
-  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB}' AND pid<>pg_backend_pid();" \
-  -At >/dev/null || true
-coord_psql postgres "DROP DATABASE IF EXISTS ${DB};" -At >/dev/null
-coord_psql postgres "CREATE DATABASE ${DB};" -At >/dev/null
-log "Database ${DB} created."
+  "SELECT 1 FROM pg_database WHERE datname='${DB}'" -At | grep -q 1 || \
+  coord_psql postgres "CREATE DATABASE ${DB};" -At >/dev/null
+coord_psql "${DB}" "CREATE EXTENSION IF NOT EXISTS gp_toolkit;" -At >/dev/null
+log "Database ${DB} ready."
 
 # --- Step 2: DDL + bulk load + indexes + ANALYZE -----------------------------
 log "Loading schema + data from ${DDL_SQL} (this takes a minute)..."

@@ -265,7 +265,7 @@ func writeMigrationBackupPhase(b *strings.Builder, opts *MigrationJobOptions) {
 // same S3 object. The restore connects with the TARGET_* connection env.
 //
 // Before gprestore it prepares the target database on the target coordinator
-// (see writeMigrationEnsureTargetDB): gprestore 2.1.0 REFUSES a table-filtered
+// (see writeMigrationEnsureTargetDB): gprestore 2.2.0 REFUSES a table-filtered
 // (--include-table) or data-only restore into a database that does not already
 // exist, and for that restore class --create-db is INSUFFICIENT (gprestore still
 // demands a pre-existing target DB). The target cluster does not have the source
@@ -326,7 +326,7 @@ func migrationTargetDatabase(opts *MigrationJobOptions) string {
 //     "clean target" intent is honored now that the fresh-DB migration restore
 //     can no longer use the incompatible gprestore --truncate-table flag.
 //
-// WHY (gprestore 2.1.0 semantics): a table-filtered (--include-table) or
+// WHY (gprestore 2.2.0 semantics): a table-filtered (--include-table) or
 // data-only restore REQUIRES the target database to already exist; gprestore
 // fails with `Database %q must be created manually to restore table-filtered or
 // data-only backups.` and --create-db does NOT satisfy this class (it creates the
@@ -532,7 +532,7 @@ func buildMigrationRestoreArgs(opts *MigrationJobOptions) []string {
 	if opts.RedirectSchema != "" {
 		args = append(args, "--redirect-schema", opts.RedirectSchema)
 	}
-	// NOTE: --create-db is deliberately NOT emitted here. gprestore 2.1.0 refuses
+	// NOTE: --create-db is deliberately NOT emitted here. gprestore 2.2.0 refuses
 	// a table-filtered (--include-table) / data-only restore into a non-existent
 	// target DB, and --create-db does NOT satisfy that class (it restores the DB
 	// from GLOBAL metadata, absent in a table-filtered backup). The migration

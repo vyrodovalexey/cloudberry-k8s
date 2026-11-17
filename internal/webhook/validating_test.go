@@ -321,7 +321,7 @@ func backupCluster(mutators ...func(*cbv1alpha1.BackupSpec)) *cbv1alpha1.Cloudbe
 // optionally further mutated by the supplied functions.
 func validS3Backup(extra ...func(*cbv1alpha1.BackupSpec)) func(*cbv1alpha1.BackupSpec) {
 	return func(b *cbv1alpha1.BackupSpec) {
-		b.Image = "cloudberry-backup:2.1.0"
+		b.Image = "cloudberry-backup:2.2.0"
 		b.Destination = cbv1alpha1.BackupDestination{
 			Type: "s3",
 			S3: &cbv1alpha1.S3Destination{
@@ -355,7 +355,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup enabled missing destination type",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{Type: ""}
 			}),
 			expectErr:   true,
@@ -364,7 +364,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup invalid destination type",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{Type: "gcs"}
 			}),
 			expectErr:   true,
@@ -373,7 +373,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 missing bucket",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{Type: "s3"}
 			}),
 			expectErr:   true,
@@ -382,7 +382,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 missing credential secret",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type: "s3",
 					S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
@@ -394,7 +394,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 missing credential secret mentions vaultSecret",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type: "s3",
 					S3:   &cbv1alpha1.S3Destination{Bucket: "my-bucket"},
@@ -406,7 +406,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 with vaultSecret and no credentialSecret valid",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type: "s3",
 					S3: &cbv1alpha1.S3Destination{
@@ -422,7 +422,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 with empty vaultSecret path and no credentialSecret rejected",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type: "s3",
 					S3: &cbv1alpha1.S3Destination{
@@ -437,7 +437,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup s3 with credentialSecret and no vaultSecret valid",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type: "s3",
 					S3: &cbv1alpha1.S3Destination{
@@ -534,7 +534,7 @@ func TestValidateBackup(t *testing.T) {
 		{
 			name: "backup local destination valid",
 			cluster: backupCluster(func(b *cbv1alpha1.BackupSpec) {
-				b.Image = "cloudberry-backup:2.1.0"
+				b.Image = "cloudberry-backup:2.2.0"
 				b.Destination = cbv1alpha1.BackupDestination{
 					Type:  "local",
 					Local: &cbv1alpha1.LocalDestination{Path: "/backups"},

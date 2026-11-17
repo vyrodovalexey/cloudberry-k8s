@@ -29,13 +29,15 @@ import (
 //
 //   - FE.9 / FE.10 / FE.11 (builder/DDL): a WRITABLE export job (mode:writable)
 //     on s3:text, hdfs:text and bare jdbc → the generated DDL (BuildDataLoadJob →
-//     Args[0]) carries "CREATE WRITABLE EXTERNAL TABLE" +
-//     "FORMATTER='pxfwritable_export'" + the REVERSED INSERT
+//     Args[0]) carries "CREATE WRITABLE EXTERNAL TABLE" + the PER-PROFILE write
+//     clause (DEF-4: FORMAT 'TEXT' (delimiter ',') for s3:text/hdfs:text,
+//     FORMATTER='pxfwritable_export' for jdbc) + the REVERSED INSERT
 //     (INSERT INTO <ext> SELECT * FROM <target>). NO LOG ERRORS / SEGMENT REJECT
 //     LIMIT (writable tables take no reject limit).
 //
-//   - WE.2: assert the FORMATTER='pxfwritable_export' clause + the correct format
-//     per profile (FORMAT 'CUSTOM' for text/parquet/avro on object-store/hdfs).
+//   - WE.2: assert the per-profile write clause + the correct format per
+//     profile (TEXT for the delimited-text exports, FORMAT 'CUSTOM' bridge for
+//     jdbc).
 //
 //   - SF.1: a writable export with SourceFilter="region='us-east'" → the export
 //     SCRIPT carries `... WHERE region='us-east'`; without a SourceFilter → no
@@ -50,7 +52,7 @@ import (
 //     still DENY (a quick guard so the writable matrix stays honest).
 //
 //   - CatalogHonest: resolve each cases.Scenario99Cases() row against the REAL
-//     built artifact (writable rows assert FORMATTER='pxfwritable_export'; SF.1
+//     built artifact (writable rows assert the per-profile write clause; SF.1
 //     asserts the WHERE; SF.2 asserts the admission DENY).
 //
 // METRIC HONESTY: cloudberry_pxf_bytes_transferred_total stays PLANNED and is
@@ -141,7 +143,7 @@ func scenario99Cluster(name string, jobs ...cbv1alpha1.DataLoadingJob) *cbv1alph
 		Enabled: true,
 		Pxf: &cbv1alpha1.PxfSpec{
 			Enabled: true,
-			Image:   "cloudberry-pxf:2.1.0",
+			Image:   "cloudberry-pxf:2.2.0",
 			Servers: scenario99Servers(),
 		},
 		Jobs: jobs,
@@ -201,8 +203,9 @@ func (s *Scenario99Suite) scenario99JobScript(
 
 // TestFunctional_Scenario99_WritableExportDDL builds writable export jobs on
 // s3:text (FE.9/WE.1), hdfs:text (FE.10) and bare jdbc (FE.11) → asserts the
-// generated DDL carries "CREATE WRITABLE EXTERNAL TABLE" +
-// "FORMATTER='pxfwritable_export'" + the REVERSED INSERT
+// generated DDL carries "CREATE WRITABLE EXTERNAL TABLE" + the PER-PROFILE write
+// clause (DEF-4: FORMAT 'TEXT' (delimiter ',') for s3:text/hdfs:text,
+// FORMATTER='pxfwritable_export' for jdbc) + the REVERSED INSERT
 // (INSERT INTO <ext> SELECT * FROM <target>), with NO LOG ERRORS / SEGMENT
 // REJECT LIMIT.
 func (s *Scenario99Suite) TestFunctional_Scenario99_WritableExportDDL() {
@@ -220,8 +223,11 @@ func (s *Scenario99Suite) TestFunctional_Scenario99_WritableExportDDL() {
 
 			assert.Containsf(s.T(), script, cases.Scenario99WritableDDL,
 				"%s must emit CREATE WRITABLE EXTERNAL TABLE", tc.id)
-			assert.Containsf(s.T(), script, cases.Scenario99WritableFormatter,
-				"%s must emit FORMATTER='pxfwritable_export'", tc.id)
+			// DEF-4: the write clause is per-profile — s3:text/hdfs:text get
+			// FORMAT 'TEXT' (delimiter ','); jdbc keeps pxfwritable_export.
+			assert.Containsf(s.T(), script, builder.PXFWriteFormatClause(tc.profile),
+				"%s must emit the per-profile write clause %q", tc.id,
+				builder.PXFWriteFormatClause(tc.profile))
 			assert.Containsf(s.T(), script, "PROFILE="+tc.profile,
 				"%s LOCATION must carry the profile", tc.id)
 
@@ -288,9 +294,10 @@ func scenario99QuotedTarget(ident string) string {
 // ----------------------------------------------------------------------------
 
 // TestFunctional_Scenario99_FormatterAndFormat asserts the WE.2 "correct format"
-// gate: every writable export DDL carries FORMATTER='pxfwritable_export' and the
-// FORMAT 'CUSTOM' clause (the writable formatter is a CUSTOM format), per the
-// profile under test.
+// gate: every writable export DDL carries the correct per-profile write clause —
+// FORMAT 'TEXT' (delimiter ',') for the delimited-text profiles (DEF-4), the
+// FORMAT 'CUSTOM' + pxfwritable_export bridge for jdbc — per the profile under
+// test.
 func (s *Scenario99Suite) TestFunctional_Scenario99_FormatterAndFormat() {
 	cluster := scenario99Cluster("s99-format")
 	formats := []struct{ id, profile, server string }{
@@ -303,10 +310,16 @@ func (s *Scenario99Suite) TestFunctional_Scenario99_FormatterAndFormat() {
 		s.Run(tc.id, func() {
 			job := scenario99ExportJob(tc.id, tc.profile, tc.server, "")
 			script := s.scenario99JobScript(cluster, job)
-			assert.Containsf(s.T(), script, cases.Scenario99WritableFormatter,
-				"%s WE.2 gate: DDL must carry FORMATTER='pxfwritable_export'", tc.id)
-			assert.Containsf(s.T(), script, "FORMAT 'CUSTOM'",
-				"%s writable export uses the CUSTOM format with the export formatter", tc.id)
+			assert.Containsf(s.T(), script, builder.PXFWriteFormatClause(tc.profile),
+				"%s WE.2 gate: DDL must carry the per-profile write clause %q", tc.id,
+				builder.PXFWriteFormatClause(tc.profile))
+			if strings.Contains(builder.PXFWriteFormatClause(tc.profile), "pxfwritable_export") {
+				assert.Containsf(s.T(), script, "FORMAT 'CUSTOM'",
+					"%s bridge export uses the CUSTOM format with the export formatter", tc.id)
+			} else {
+				assert.NotContainsf(s.T(), script, "FORMAT 'CUSTOM'",
+					"%s text export must not use the CUSTOM bridge (DEF-4)", tc.id)
+			}
 		})
 	}
 }
@@ -329,8 +342,9 @@ func (s *Scenario99Suite) TestFunctional_Scenario99_SourceFilterWhere() {
 		script := s.scenario99JobScript(cluster, job)
 		assert.Contains(s.T(), script, cases.Scenario99WhereFragment,
 			"SF.1 filtered export must carry WHERE region='us-east'")
-		// DDL is unchanged — the writable formatter is still present.
-		assert.Contains(s.T(), script, cases.Scenario99WritableFormatter)
+		// DDL is unchanged by the filter — the per-profile write clause (DEF-4:
+		// s3:text → FORMAT 'TEXT' (delimiter ',')) is still present.
+		assert.Contains(s.T(), script, builder.PXFWriteFormatClause("s3:text"))
 	})
 
 	// Without SourceFilter → NO WHERE (baseline).
@@ -420,9 +434,9 @@ func (s *Scenario99Suite) TestFunctional_Scenario99_WritableRejectParity() {
 
 // TestFunctional_Scenario99_CatalogHonest iterates cases.Scenario99Cases() and
 // resolves EVERY row against the REAL built artifact: writable export rows assert
-// FORMATTER='pxfwritable_export' + the reversed INSERT; SF.1 asserts the WHERE
-// script delta; SF.2 asserts the admission DENY. This keeps the catalog honest
-// against the implementation. bytes_transferred is NEVER asserted.
+// the per-profile write clause (DEF-4) + the reversed INSERT; SF.1 asserts the
+// WHERE script delta; SF.2 asserts the admission DENY. This keeps the catalog
+// honest against the implementation. bytes_transferred is NEVER asserted.
 func (s *Scenario99Suite) TestFunctional_Scenario99_CatalogHonest() {
 	catalog := cases.Scenario99Cases()
 	require.Len(s.T(), catalog, 6, "FE.9/WE.1 + FE.10 + FE.11 + WE.2 + SF.1 + SF.2")
@@ -462,9 +476,11 @@ func (s *Scenario99Suite) TestFunctional_Scenario99_CatalogHonest() {
 				script := s.scenario99JobScript(cluster, job)
 				assert.Containsf(s.T(), script, tc.DDLContains,
 					"%s built artifact must carry %q", tc.ID, tc.DDLContains)
-				// Every writable export row carries the export formatter.
-				assert.Containsf(s.T(), script, cases.Scenario99WritableFormatter,
-					"%s writable export must use the export formatter", tc.ID)
+				// Every writable export row carries the per-profile write
+				// clause (DEF-4: text → FORMAT 'TEXT' (delimiter ','); bridge
+				// profiles → pxfwritable_export).
+				assert.Containsf(s.T(), script, builder.PXFWriteFormatClause(tc.Profile),
+					"%s writable export must use the per-profile write clause", tc.ID)
 			}
 
 			if strings.Contains(tc.Description, "[CONFIG-ONLY]") {

@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile.cloudberry-pxf — Apache Cloudberry PXF 2.1.0 Sidecar Image
+# Dockerfile.cloudberry-pxf — Apache Cloudberry PXF 2.2.0 Sidecar Image
 # =============================================================================
 # Builds a Kubernetes-ready PXF (Platform Extension Framework) sidecar image
 # from the official apache/cloudberry-pxf source. The image runs the PXF Java
@@ -17,15 +17,19 @@
 #
 # Build:
 #   docker build --platform linux/amd64 -f Dockerfile.cloudberry-pxf \
-#       -t cloudberry-pxf:2.1.0 .
+#       -t cloudberry-pxf:2.2.0 .
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # Build arguments
 # ---------------------------------------------------------------------------
-ARG PXF_VERSION=2.1.0-incubating
-ARG GO_VERSION=1.26.5
-ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.1.0-incubating/apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm
+# NOTE: since 2.2.0 the GitHub release asset is a tar.gz WRAPPER around the
+# RPM (plus .asc + .sha512); CB_RPM_URL points at the tar.gz and the RPM is
+# extracted before local install (see the RPM install step below).
+ARG PXF_VERSION=2.2.0-incubating
+ARG GO_VERSION=1.27.4
+ARG CB_RPM_URL=https://github.com/apache/cloudberry/releases/download/2.2.0-incubating/apache-cloudberry-db-incubating-2.2.0-1.el9.x86_64.tar.gz
+ARG CB_RPM_FILE=apache-cloudberry-db-incubating-2.2.0-1.el9.x86_64.rpm
 
 # =============================================================================
 # Stage 1: BUILDER — compile PXF from source
@@ -35,6 +39,7 @@ FROM --platform=linux/amd64 rockylinux/rockylinux:9 AS builder
 ARG PXF_VERSION
 ARG GO_VERSION
 ARG CB_RPM_URL
+ARG CB_RPM_FILE
 
 # ---- Install build dependencies --------------------------------------------
 # The Cloudberry RPM provides pg_config + cloudberry-env.sh needed by the C
@@ -66,7 +71,14 @@ RUN dnf -y --allowerasing install \
     && dnf clean all && rm -rf /var/cache/dnf
 
 # ---- Install Cloudberry RPM (provides pg_config, cloudberry-env.sh) ---------
-RUN dnf -y install "${CB_RPM_URL}" \
+# 2.2.0 packaging: fetch the tar.gz wrapper, extract, verify the bundled
+# sha512, then install the RPM from the local file (dnf resolves deps).
+RUN curl -fSL "${CB_RPM_URL}" -o /tmp/cloudberry-rpm.tar.gz \
+    && tar -xzf /tmp/cloudberry-rpm.tar.gz -C /tmp \
+    && rm -f /tmp/cloudberry-rpm.tar.gz \
+    && (cd /tmp && sha512sum -c "${CB_RPM_FILE}.sha512") \
+    && dnf -y install "/tmp/${CB_RPM_FILE}" \
+    && rm -f "/tmp/${CB_RPM_FILE}" "/tmp/${CB_RPM_FILE}.asc" "/tmp/${CB_RPM_FILE}.sha512" \
     && dnf clean all && rm -rf /var/cache/dnf \
     && test -d /usr/local/cloudberry-db \
     && test -x /usr/local/cloudberry-db/bin/pg_config
@@ -204,15 +216,17 @@ LABEL org.opencontainers.image.title="cloudberry-pxf" \
 # JRE for the PXF Java server; curl for health checks; bash for entrypoint.
 # --allowerasing: RockyLinux 9 minimal ships curl-minimal which conflicts with
 # the full curl package; allow dnf to replace it.
+# SECURITY (U033): full `dnf -y upgrade` (official-image convention: install →
+# upgrade → clean) — the prior curated list (expat/gnutls/openssl) left most OS
+# packages unpatched, so HIGH/CRIT findings grew with CVE-DB drift (61 at the
+# U009 scan, 107 by U033's). The builder stage's curated list is intentionally
+# untouched: builder-stage packages do not ship in the final image, so only the
+# runtime stage affects scan results.
 RUN dnf -y --allowerasing install \
         bash ca-certificates curl gettext hostname java-11-openjdk-headless \
         procps-ng shadow-utils which && \
-    dnf -y upgrade \
-      expat \
-      gnutls \
-      openssl  \
-      openssl-libs \
-    && dnf clean all && rm -rf /var/cache/dnf
+    dnf -y upgrade && \
+    dnf clean all && rm -rf /var/cache/dnf
 
 # ---- Create gpadmin user (UID 1000, matching the DB image) -------------------
 RUN groupadd -g 1000 gpadmin \
@@ -223,7 +237,7 @@ COPY --from=builder /usr/local/cloudberry-pxf /usr/local/cloudberry-pxf
 
 # ---- Copy PXF extension artifacts for DELIVERABLE 2 (DB image derivation) ---
 # These are the C extension files (.so, .control, .sql) that a derived DB image
-# can COPY --from=cloudberry-pxf:2.1.0 /pxf-extensions/... into $GPHOME.
+# can COPY --from=cloudberry-pxf:2.2.0 /pxf-extensions/... into $GPHOME.
 COPY --from=builder /pxf-extensions /pxf-extensions
 
 # ---- Environment variables ---------------------------------------------------

@@ -279,14 +279,14 @@ func TestCollectResgroupStatusSummary_RowsErr(t *testing.T) {
 }
 
 func TestCollectResgroupStatusPerHost(t *testing.T) {
+	// Cloudberry 2.2.0 shape (DEF-3): groupname/hostname/cpu_usage/memory_usage.
 	fields := []fieldDesc{
 		textField("rsgname"), textField("hostname"), float8Field("cpu"),
-		float8Field("memory_used"), float8Field("memory_available"),
-		float8Field("memory_quota_used"), float8Field("memory_shared_used"),
+		float8Field("memory_used"),
 	}
 	conn, cleanup := newMockConn(t, func(_ string) []byte {
 		return rowsResponseTyped(fields, [][]string{
-			{"default_group", "host1", "0.45", "1024", "2048", "512", "256"},
+			{"default_group", "host1", "0.45", "1024"},
 		})
 	})
 	defer cleanup()
@@ -296,6 +296,12 @@ func TestCollectResgroupStatusPerHost(t *testing.T) {
 	mc.collectResgroupStatusPerHost(context.Background(), conn, testLogger())
 
 	assert.InDelta(t, 0.45, testGaugeVec(t, mc.resgroupCPUUsagePercent, "default_group", "host1"), 0.001)
+	assert.InDelta(t, float64(1024), testGaugeVec(t, mc.resgroupMemoryUsageBytes, "default_group", "host1"), 0.001)
+	// 2.2.0 dropped the available/quota/shared columns: those families must
+	// emit NO series (honestly absent, not fabricated zeros).
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupMemoryAvailableBytes))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupMemoryQuotaUsed))
+	assert.Zero(t, testutil.CollectAndCount(mc.resgroupMemorySharedUsed))
 }
 
 func TestCollectResgroupStatusPerHost_Error(t *testing.T) {
@@ -315,13 +321,12 @@ func TestCollectResgroupStatusPerHost_Error(t *testing.T) {
 func TestCollectResgroupStatusPerHost_ScanError_RowSkipped(t *testing.T) {
 	fields := []fieldDesc{
 		textField("rsgname"), textField("hostname"), float8Field("cpu"),
-		float8Field("memory_used"), float8Field("memory_available"),
-		float8Field("memory_quota_used"), float8Field("memory_shared_used"),
+		float8Field("memory_used"),
 	}
 	conn, cleanup := newMockConn(t, func(_ string) []byte {
 		return rowsResponseTyped(fields, [][]string{
-			{"good", "host1", "0.5", "1", "2", "3", "4"}, // valid
-			{"bad", "host1", "oops", "1", "2", "3", "4"}, // scan error (last: closes rows)
+			{"good", "host1", "0.5", "1"}, // valid
+			{"bad", "host1", "oops", "1"}, // scan error (last: closes rows)
 		})
 	})
 	defer cleanup()
@@ -341,13 +346,12 @@ func TestCollectResgroupStatus(t *testing.T) {
 	}
 	perHostFields := []fieldDesc{
 		textField("rsgname"), textField("hostname"), float8Field("cpu"),
-		float8Field("memory_used"), float8Field("memory_available"),
-		float8Field("memory_quota_used"), float8Field("memory_shared_used"),
+		float8Field("memory_used"),
 	}
 	conn, cleanup := newMockConn(t, func(query string) []byte {
 		if strings.Contains(query, "per_host") {
 			return rowsResponseTyped(perHostFields, [][]string{
-				{"default_group", "host1", "0.1", "1", "2", "3", "4"},
+				{"default_group", "host1", "0.1", "1"},
 			})
 		}
 		return rowsResponseTyped(fields, [][]string{
@@ -700,8 +704,8 @@ func TestCollectAll(t *testing.T) {
 		case strings.Contains(query, "per_host"):
 			return rowsResponseTyped([]fieldDesc{
 				textField("rsgname"), textField("hostname"), float8Field("cpu"),
-				float8Field("a"), float8Field("b"), float8Field("c"), float8Field("d"),
-			}, [][]string{{"g", "h", "0.1", "1", "2", "3", "4"}})
+				float8Field("memory_used"),
+			}, [][]string{{"g", "h", "0.1", "1"}})
 		case strings.Contains(query, "gp_resgroup_status"):
 			return rowsResponseTyped([]fieldDesc{
 				textField("rsgname"), int8Field("a"), int8Field("b"),

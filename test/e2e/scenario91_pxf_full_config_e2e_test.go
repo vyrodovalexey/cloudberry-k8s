@@ -76,6 +76,16 @@ const (
 	envS91Image         = "SCENARIO91_IMAGE"
 	envS91PxfImage      = "SCENARIO91_PXF_IMAGE"
 	envS91ConnectorBase = "SCENARIO91_CONNECTOR_BASE"
+
+	// envS91Live (U022) is the explicit opt-in gate for the live
+	// full-config-cluster bootstrap, mirroring the suite-wide SCENARIO*_LIVE
+	// convention every other heavy live Part B already follows. The journey
+	// deploys a COMPLETE extra CloudberryCluster (coordinator + standby +
+	// primaries + mirrors) and requires SCENARIO91_CONNECTOR_BASE to point at a
+	// real JAR-staging base (the catalog's repo.example.com resolves nowhere);
+	// without both, the honest outcome is a clean, documented skip — the
+	// builder-direct Part A contracts always run.
+	envS91Live = "SCENARIO91_LIVE"
 )
 
 // scenario91LiveNamespace is the namespace used for the live cluster test.
@@ -459,6 +469,12 @@ func (s *Scenario91E2ESuite) TestE2E_Scenario91_LivePXFConfigured() {
 	kubeconfig := os.Getenv(envKubeconfigS91)
 	if kubeconfig == "" {
 		s.T().Skip("KUBECONFIG not set, skipping live PXF-configured test")
+	}
+	if os.Getenv(envS91Live) != "1" {
+		s.T().Skip("SCENARIO91_LIVE not set, skipping the live full-config cluster " +
+			"bootstrap (deploys a COMPLETE extra cluster and needs SCENARIO91_CONNECTOR_BASE " +
+			"staging; on the shared single-node acceptance environment this is a documented " +
+			"capacity exclusion — RISK-006; the builder-direct contracts always run)")
 	}
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)

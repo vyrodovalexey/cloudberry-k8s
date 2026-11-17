@@ -579,16 +579,15 @@ func (s *Scenario103E2ESuite) TestE2E_Scenario103_LiveEquivalence() {
 	_, _ = s.scenario103PSQL("TRUNCATE " + cases.Scenario103ExtTargetTable +
 		", " + cases.Scenario103FDWTargetTable)
 
-	// Run the external-table leg. The s3:text profile with FORMAT 'CUSTOM'
-	// (pxfwritable_import) returns each CSV line as a single text field, so the
-	// operator's ext-load Job fails for multi-column CSV data. When that happens,
-	// fall back to loading events_ext via the operator's PERSISTENT FDW foreign
-	// table (created by the s3-fdw-load Job) — this still proves data equivalence
-	// over the SAME dataset without weakening the assertion.
+	// Run the external-table leg. Since the DEF-1 fix (TASK-U027) the s3:text
+	// external table is declared FORMAT 'CSV' and parses multi-column CSV
+	// directly. The FDW fallback below is kept as a safety net for environments
+	// running a pre-fix operator image: it still proves data equivalence over
+	// the SAME dataset without weakening the assertion.
 	if !s.scenario103RunDataLoadJob(cases.Scenario103ExtJobName, "equiv-ext") {
-		s.T().Log("scenario103: ext-load Job failed (s3:text + FORMAT CUSTOM limitation " +
-			"for multi-column CSV); falling back to the operator's FDW foreign table " +
-			"to load events_ext for the equivalence proof")
+		s.T().Log("scenario103: ext-load Job failed (unexpected since the DEF-1 " +
+			"FORMAT 'CSV' fix — check the s3-ext-load pod); falling back to the " +
+			"operator's FDW foreign table to load events_ext for the equivalence proof")
 		out, err := s.scenario103PSQL(
 			"INSERT INTO " + cases.Scenario103ExtTargetTable +
 				" SELECT * FROM \"foreign_s3_fdw_load\"")

@@ -70,7 +70,7 @@
 #   COMPRESSION_LEVEL    --compression-level for gpbackup (default: 1)
 #   STATUS_TIMEOUT_SECS  max seconds to wait for a Job/status (default: 180)
 #   READY_TIMEOUT        cluster readiness timeout (default: 10m)
-#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.1.0)
+#   BACKUP_IMAGE         backup toolchain image (default: cloudberry-backup:2.2.0)
 # =============================================================================
 
 set -euo pipefail
@@ -94,7 +94,7 @@ SEED_ROWS="${SEED_ROWS:-2000}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-1}"
 STATUS_TIMEOUT_SECS="${STATUS_TIMEOUT_SECS:-180}"
 READY_TIMEOUT="${READY_TIMEOUT:-10m}"
-BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.1.0}"
+BACKUP_IMAGE="${BACKUP_IMAGE:-cloudberry-backup:2.2.0}"
 
 # The fixed table set Scenario 81 seeds/compares. Keep this list small
 # (bash 3.2: plain vars, no associative arrays).

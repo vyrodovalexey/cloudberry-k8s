@@ -208,7 +208,7 @@ func TestReconcileDataLoading_SetupPXFExtensionsRoundTrip_PreservesStatus(t *tes
 		[]cbv1alpha1.DataLoadingJob{dlPxfJob("loader", true)})
 	cluster.Spec.DataLoading.Pxf = &cbv1alpha1.PxfSpec{
 		Enabled: true,
-		Image:   "cloudberry-pxf:2.1.0",
+		Image:   "cloudberry-pxf:2.2.0",
 		Servers: []cbv1alpha1.PxfServerSpec{
 			{Name: "s3", Type: "s3"},
 			{Name: "jdbc", Type: "jdbc"},
@@ -890,7 +890,7 @@ func TestRefreshDataLoadingStatusOnSteadyState_PreservesPXFStatus(t *testing.T) 
 		[]cbv1alpha1.DataLoadingJob{dlPxfJob("loader", true)})
 	cluster.Spec.DataLoading.Pxf = &cbv1alpha1.PxfSpec{
 		Enabled: true,
-		Image:   "cloudberry-pxf:2.1.0",
+		Image:   "cloudberry-pxf:2.2.0",
 		Servers: []cbv1alpha1.PxfServerSpec{
 			{Name: "s3", Type: "s3"},
 			{Name: "jdbc", Type: "jdbc"},

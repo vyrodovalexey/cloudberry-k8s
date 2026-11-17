@@ -164,25 +164,40 @@ var globals globalFlags
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
-		var apiErr *ctl.APIError
-		if errors.As(err, &apiErr) {
-			switch apiErr.StatusCode {
-			case http.StatusUnauthorized:
-				os.Exit(exitAuthFailure)
-			case http.StatusForbidden:
-				os.Exit(exitPermissionDenied)
-			case http.StatusNotFound:
-				os.Exit(exitClusterNotFound)
-			case http.StatusRequestTimeout:
-				os.Exit(exitTimeout)
-			case http.StatusTooManyRequests:
-				os.Exit(exitTimeout)
-			default:
-				os.Exit(exitGeneralError)
-			}
-		}
-		os.Exit(exitGeneralError)
+		os.Exit(executeErrorExitCode(err))
 	}
+}
+
+// executeErrorExitCode prints the command error to stderr and returns the
+// process exit code for it. The root command sets SilenceErrors, so main() owns
+// error rendering: a non-zero exit must never be silent (DEF-7 — on API 4xx/5xx
+// the CLI used to exit printing nothing). For a *ctl.APIError the printed line
+// carries the HTTP status code and the decoded API error (code + message, with
+// the raw response body as the message fallback), e.g.
+//
+//	Error: API error 409 (JOB_EXISTS): data loading job already exists
+//
+// The status code then maps to the documented exit-code contract.
+func executeErrorExitCode(err error) int {
+	fmt.Fprintln(os.Stderr, "Error:", err)
+	var apiErr *ctl.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusUnauthorized:
+			return exitAuthFailure
+		case http.StatusForbidden:
+			return exitPermissionDenied
+		case http.StatusNotFound:
+			return exitClusterNotFound
+		case http.StatusRequestTimeout:
+			return exitTimeout
+		case http.StatusTooManyRequests:
+			return exitTimeout
+		default:
+			return exitGeneralError
+		}
+	}
+	return exitGeneralError
 }
 
 // newClient creates an OperatorClient from the global flags.

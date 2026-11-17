@@ -59,7 +59,7 @@ import (
 // ============================================================================
 
 const (
-	scenario77BackupImage = "cloudberry-backup:2.1.0"
+	scenario77BackupImage = "cloudberry-backup:2.2.0"
 	scenario77LocalPath   = "/backups"
 )
 

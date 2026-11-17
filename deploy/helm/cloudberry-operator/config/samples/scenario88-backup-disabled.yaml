@@ -33,8 +33,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "88"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -160,7 +160,7 @@ spec:
   # disable (88a), re-enable (88a) and empty-schedule (88b) transitions.
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"
+    image: "cloudberry-backup:2.2.0"
     schedule: "0 2 * * *"
     gpbackup:
       compressionType: zstd

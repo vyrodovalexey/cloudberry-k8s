@@ -66,8 +66,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "84"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -196,7 +196,7 @@ spec:
   # operator observes to record the 9 metrics.
   backup:
     enabled: true
-    image: "cloudberry-backup:2.1.0"            # ships gpbackman for cleanup (M8)
+    image: "cloudberry-backup:2.2.0"            # ships gpbackman for cleanup (M8)
     retention:
       fullCount: 3                              # exercises M8 (retention cleanup)
       incrementalCount: 10

@@ -4461,9 +4461,10 @@ type Scenario92DataLoadCase struct {
 //
 // The DDL/Job for ClusterName "test-cluster" matches the builder defaults
 // (gpfdist service "<cluster>-gpfdist:8080", temp table "cbk_dataload_ext_<job>",
-// FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import') for pxf, FORMAT 'CSV'/'TEXT'
-// for native). DL.1 (pxf) is image-blocked; DL.2-DL.4 (native) are the genuine
-// row-count-verified path.
+// PXFReadFormatClause for pxf — FORMAT 'CSV' for delimited-text profiles since
+// the DEF-1 fix, else FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import') — and
+// FORMAT 'CSV'/'TEXT' for native). DL.1 (pxf) is image-blocked; DL.2-DL.4
+// (native) are the genuine row-count-verified path.
 func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 	const cluster = "test-cluster"
 	return []Scenario92DataLoadCase{
@@ -4486,7 +4487,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import');",
 			ExpectedJobName:     "test-cluster-dataload-s3-parquet-loader",
 			ClusterName:         cluster,
-			ExpectedImage:       "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:       "cloudberrydb/cloudberry:2.2.0",
 			ExpectsPXFExtension: true,
 			ImageBlocked:        true,
 			Description: "pxf s3:parquet job: operator generates the pxf:// external-table " +
@@ -4510,7 +4511,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CSV';",
 			ExpectedJobName: "test-cluster-dataload-csv-bulk-load",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native gpfdist CSV job: operator generates the gpfdist:// external-table " +
 				"DDL (bare path served via the cluster gpfdist Service) — the genuine non-PXF path",
 		},
@@ -4540,7 +4541,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"FORMAT 'CSV';",
 			ExpectedJobName: "test-cluster-dataload-file-loader",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native bare-path single-file CSV job: operator generates the gpfdist:// " +
 				"external-table DDL (single file served via the cluster gpfdist Service) — the " +
 				"genuine non-PXF path (file:// is admission-rejected for multi-segment, see W.16)",
@@ -4570,7 +4571,7 @@ func Scenario92DataLoadCases() []Scenario92DataLoadCase {
 				"LOG ERRORS SEGMENT REJECT LIMIT 50 ROWS;",
 			ExpectedJobName: "test-cluster-dataload-s3-csv-load",
 			ClusterName:     cluster,
-			ExpectedImage:   "cloudberrydb/cloudberry:2.1.0",
+			ExpectedImage:   "cloudberrydb/cloudberry:2.2.0",
 			Description: "native s3:// scheduled CSV job with LOG ERRORS: operator generates a " +
 				"CronJob carrying the s3:// external-table DDL + reject-limit suffix — non-PXF path",
 		},
@@ -4825,7 +4826,7 @@ func Scenario93Cases() []Scenario93Case {
 //
 // HONESTY NOTE: the liveness/readiness probe path is asserted as
 // "/actuator/health" — the real Spring Boot actuator endpoint exposed by the
-// apache/cloudberry-pxf 2.1.0 image (returns {"status":"UP"}). The legacy
+// apache/cloudberry-pxf 2.2.0 image (returns {"status":"UP"}). The legacy
 // "/pxf/v15/Status" path is a DB-client endpoint that returns 404 on that image
 // and is NOT used for health checks. The container also sets NO Command and NO
 // Args: the "pxf prepare → pxf start → tail service log" lifecycle is owned by
@@ -4930,7 +4931,7 @@ func Scenario94Cases() []Scenario94Case {
 		{
 			ID: "S94.12", FieldPath: "sidecar.liveness.path",
 			ExpectedValue: "/actuator/health",
-			Description: "liveness probe HTTPGet path is /actuator/health (PXF 2.1.0 Spring Boot " +
+			Description: "liveness probe HTTPGet path is /actuator/health (PXF 2.2.0 Spring Boot " +
 				"actuator), NOT the legacy /pxf/v15/Status (which 404s on the real image)",
 		},
 		{
@@ -5158,7 +5159,9 @@ const (
 	// read DDL (pxfwritable_import) + LOCATION is byte-correct.
 	Scenario96ExpectAdmitRead = "admit-read"
 	// Scenario96ExpectAdmitWrite — a writable profile that admits and whose
-	// WRITABLE export DDL (pxfwritable_export) is byte-correct (FF.1-FF.3).
+	// WRITABLE export DDL is byte-correct with the per-profile write clause
+	// (DEF-4: text → FORMAT 'TEXT' (delimiter ','); parquet/avro →
+	// pxfwritable_export) (FF.1-FF.3).
 	Scenario96ExpectAdmitWrite = "admit-write"
 	// Scenario96ExpectDenyWrite — a writable profile that is DENIED at admission
 	// with an error containing "write-unsupported"/"writable" (FF.4/FF.5).
@@ -5320,7 +5323,8 @@ func Scenario96Cases() []Scenario96Case {
 			Profile: "s3:text", Server: Scenario96ServerS3Datalake, Mode: "writable",
 			Expected: Scenario96ExpectAdmitWrite,
 			Description: "SUCCEED — s3:text writable admitted; WRITABLE export DDL has " +
-				"pxfwritable_export and NO LOG ERRORS; FF.1 live export round-trips",
+				"FORMAT 'TEXT' (delimiter ',') (DEF-4 live-proven clause) and NO LOG " +
+				"ERRORS; FF.1 live export round-trips",
 		},
 		{
 			ID: "FF.2", Layer: "webhook+builder/DDL+live-write",
@@ -5425,7 +5429,9 @@ const (
 	// read DDL (pxfwritable_import) + LOCATION is byte-correct.
 	Scenario97ExpectAdmitRead = "admit-read"
 	// Scenario97ExpectAdmitWrite — a writable profile that admits and whose
-	// WRITABLE export DDL (pxfwritable_export) is byte-correct (FF.7).
+	// WRITABLE export DDL is byte-correct with the per-profile write clause
+	// (DEF-4: hdfs:text → FORMAT 'TEXT' (delimiter ','); sequencefile →
+	// pxfwritable_export) (FF.7).
 	Scenario97ExpectAdmitWrite = "admit-write"
 	// Scenario97ExpectDenyWrite — a writable profile that is DENIED at admission
 	// with an error containing "write-unsupported" (WRej.* / FF.6b).
@@ -5604,8 +5610,8 @@ func Scenario97Cases() []Scenario97Case {
 			ID: "FF.7t", Layer: "webhook+builder/DDL+live-write",
 			Profile: "hdfs:text", Server: srv, Mode: "writable",
 			Expected: Scenario97ExpectAdmitWrite,
-			Description: "SUCCEED — hdfs:text writable admitted; export DDL correct; " +
-				"text export round-trips",
+			Description: "SUCCEED — hdfs:text writable admitted; export DDL carries " +
+				"FORMAT 'TEXT' (delimiter ',') (DEF-4); text export round-trips",
 		},
 
 		// --- WRej.* writable DENY matrix ------------------------------------
@@ -5887,10 +5893,13 @@ func Scenario98Cases() []Scenario98Case {
 // The PRODUCTION CONTRACT this catalog resolves against (verified + unit-tested):
 //
 //   - Writable export DDL: mode==writable → CREATE WRITABLE EXTERNAL TABLE ...
-//     FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export'), NO LOG ERRORS / SEGMENT
-//     REJECT LIMIT (writable tables take no reject limit). Profile-agnostic:
-//     s3:text/parquet/avro, hdfs:text/parquet/avro/sequencefile and bare jdbc are
-//     writable (IsProfileWritable); json/orc/rc/hive*/hbase are rejected (W.10b).
+//     the per-profile write clause (DEF-4: FORMAT 'TEXT' (delimiter ',') for
+//     delimited-text profiles — s3:text/hdfs:text; FORMAT 'CUSTOM'
+//     (FORMATTER='pxfwritable_export') for bridge-serialized profiles), NO LOG
+//     ERRORS / SEGMENT REJECT LIMIT (writable tables take no reject limit).
+//     Writable profile set: s3:text/parquet/avro, hdfs:text/parquet/avro/
+//     sequencefile and bare jdbc (IsProfileWritable); json/orc/rc/hive*/hbase
+//     are rejected (W.10b).
 //   - Export script: the REVERSED INSERT `INSERT INTO <writable_ext> SELECT * FROM
 //     <target>`; with PxfJob.SourceFilter set (writable only) the export INSERT
 //     becomes `... SELECT * FROM <target> WHERE <sourceFilter>` (the rowcount
@@ -5901,10 +5910,12 @@ func Scenario98Cases() []Scenario98Case {
 //
 // HONESTY: every Description names the REAL signal asserted and marks
 // [CONFIG-ONLY] where a format needs DATA_SCHEMA / has no live backing (e.g.
-// hdfs:parquet export). The ALWAYS-asserted DDL signal is
-// FORMATTER='pxfwritable_export'. bytes_transferred is NEVER asserted (it stays
-// PLANNED — PXF has no honest external-bytes counter); the live "data lands"
-// proofs are object/file landing (S3/HDFS) and ROW landing (JDBC count(*)).
+// hdfs:parquet export). The ALWAYS-asserted DDL signal is the per-profile
+// write clause (DEF-4: FORMAT 'TEXT' (delimiter ',') for text profiles,
+// FORMATTER='pxfwritable_export' otherwise). bytes_transferred is NEVER
+// asserted (it stays PLANNED — PXF has no honest external-bytes counter); the
+// live "data lands" proofs are object/file landing (S3/HDFS) and ROW landing
+// (JDBC count(*)).
 //
 // Scenario99Case mirrors the Scenario98Case SHAPE (a small, flat row catalog
 // resolved against the REAL built artifact).
@@ -5954,7 +5965,9 @@ const (
 	// DDL; live → rows land in the pgsource export_target (count(*)>0).
 	Scenario99ExpectExportJDBC = "export-jdbc"
 	// Scenario99ExpectFormat — WE.2: the LANDED artifact matches the expected
-	// FORMAT and the DDL carries FORMATTER='pxfwritable_export' (cross-cuts FE.*).
+	// FORMAT and the DDL carries the per-profile write clause (DEF-4: the TEXT
+	// clause for text profiles, FORMATTER='pxfwritable_export' otherwise;
+	// cross-cuts FE.*).
 	Scenario99ExpectFormat = "export-format"
 	// Scenario99ExpectFilteredExport — SF.1: a writable export with SourceFilter
 	// set → the export SCRIPT carries `WHERE <sourceFilter>`; live → FEWER rows
@@ -5967,9 +5980,17 @@ const (
 
 // Scenario 99 DDL substrings (byte-stable; mirror the builder output).
 const (
-	// Scenario99WritableFormatter is the writable-export FORMATTER clause every
-	// writable export DDL must carry (the ALWAYS-asserted WE.2 signal).
+	// Scenario99WritableFormatter is the writable-export FORMATTER clause a
+	// BRIDGE-serialized writable export DDL must carry (parquet/avro/
+	// sequencefile, bare jdbc). Since DEF-4 the delimited-text profiles carry
+	// Scenario99WritableTextClause instead — assert via the per-profile
+	// builder.PXFWriteFormatClause(profile) where the profile varies.
 	Scenario99WritableFormatter = "FORMATTER='pxfwritable_export'"
+	// Scenario99WritableTextClause is the writable-export FORMAT clause for
+	// delimited-text profiles (s3:text/hdfs:text) since DEF-4: the shape
+	// live-proven on PXF 2.2.0 by TASK-U019 (the bridge formatter fails at
+	// the PXF server's LineBreakAccessor writer).
+	Scenario99WritableTextClause = "FORMAT 'TEXT' (delimiter ',')"
 	// Scenario99WritableDDL is the writable-export table DDL prefix.
 	Scenario99WritableDDL = "CREATE WRITABLE EXTERNAL TABLE"
 )
@@ -6017,7 +6038,8 @@ const (
 // Scenario99Cases returns the full Scenario 99 catalog from the task-breakdown
 // §3 (FE.9/WE.1, FE.10, FE.11, WE.2, SF.1, SF.2/SF.2b). The rows are honest
 // against the shipped writable-export contract: every writable row asserts
-// FORMATTER='pxfwritable_export' (the WE.2 gate) and the reversed INSERT; SF.1
+// the per-profile write clause (DEF-4: text → FORMAT 'TEXT' (delimiter ','),
+// bridge → FORMATTER='pxfwritable_export') and the reversed INSERT; SF.1
 // adds the WHERE script delta; SF.2 is a webhook-deny row.
 //
 // HONESTY: every Description names the REAL signal asserted and marks
@@ -6030,9 +6052,11 @@ func Scenario99Cases() []Scenario99Case {
 			ID: "FE.9", Layer: "webhook+builder/DDL+live-object",
 			Profile: "s3:text", Target: Scenario99TargetObjectStore,
 			Server: Scenario99ServerMinioWarehouse, Mode: "writable",
-			Expected: Scenario99ExpectExportS3, DDLContains: Scenario99WritableFormatter,
+			Expected: Scenario99ExpectExportS3, DDLContains: Scenario99WritableTextClause,
 			Description: "S3 writable export (== WE.1) on s3:text: WRITABLE DDL carries " +
-				"FORMATTER='pxfwritable_export', NO LOG ERRORS; the export INSERT is reversed " +
+				"FORMAT 'TEXT' (delimiter ',') (DEF-4: the live-proven PXF 2.2.0 text " +
+				"write clause — the pxfwritable_export bridge fails at the PXF server), " +
+				"NO LOG ERRORS; the export INSERT is reversed " +
 				"(INSERT INTO <ext> SELECT * FROM <target>). HONEST signal = objects LAND in " +
 				"MinIO under cloudberry-warehouse/exports/s3/ (S3 list/HEAD). The s3:parquet " +
 				"companion is [CONFIG-ONLY] when parquet write tooling absent. " +
@@ -6043,9 +6067,10 @@ func Scenario99Cases() []Scenario99Case {
 			ID: "FE.10", Layer: "webhook+builder/DDL+live-file",
 			Profile: "hdfs:text", Target: Scenario99TargetHDFS,
 			Server: Scenario99ServerHadoopCluster, Mode: "writable",
-			Expected: Scenario99ExpectExportHDFS, DDLContains: Scenario99WritableFormatter,
+			Expected: Scenario99ExpectExportHDFS, DDLContains: Scenario99WritableTextClause,
 			Description: "HDFS writable export on hdfs:text: WRITABLE DDL carries " +
-				"FORMATTER='pxfwritable_export'; reversed export INSERT. HONEST signal = part " +
+				"FORMAT 'TEXT' (delimiter ',') (DEF-4 live-proven clause); reversed export " +
+				"INSERT. HONEST signal = part " +
 				"files LAND in HDFS under /data-lake/exports/hdfs/ (WebHDFS LISTSTATUS). " +
 				"hdfs:parquet/avro export is [CONFIG-ONLY] (needs DATA_SCHEMA) — prefer " +
 				"hdfs:text for the deterministic live landing. NO bytes_transferred asserted.",
@@ -6067,11 +6092,12 @@ func Scenario99Cases() []Scenario99Case {
 			ID: "WE.2", Layer: "builder/DDL+live-object+live-file+live-rowcount",
 			Profile: "s3:text", Target: Scenario99TargetObjectStore,
 			Server: Scenario99ServerMinioWarehouse, Mode: "writable",
-			Expected: Scenario99ExpectFormat, DDLContains: Scenario99WritableFormatter,
+			Expected: Scenario99ExpectFormat, DDLContains: Scenario99WritableTextClause,
 			Description: "data lands with CORRECT FORMAT: for each export the generated " +
-				"WRITABLE DDL carries FORMATTER='pxfwritable_export' AND the correct format per " +
-				"profile (s3:text/hdfs:text → text/CSV-shaped; jdbc → rows with expected " +
-				"columns). This is the explicit WE.2 'correct format' gate. parquet/avro " +
+				"WRITABLE DDL carries the correct per-profile write clause (DEF-4: " +
+				"s3:text/hdfs:text → FORMAT 'TEXT' (delimiter ','); jdbc → " +
+				"FORMATTER='pxfwritable_export' + the expected columns). This is the " +
+				"explicit WE.2 'correct format' gate. parquet/avro " +
 				"format-landing is [CONFIG-ONLY] without write tooling/DATA_SCHEMA. " +
 				"NO bytes_transferred asserted.",
 		},
@@ -6192,7 +6218,7 @@ const (
 // Scenario 101 well-known names + values (mirror the sample CR + spec §11).
 const (
 	// Scenario101GpfdistImage is the gpfdist Deployment image.
-	Scenario101GpfdistImage = "cloudberry-gpfdist:2.1.0"
+	Scenario101GpfdistImage = "cloudberry-gpfdist:2.2.0"
 	// Scenario101GpfdistPort is the default gpfdist port.
 	Scenario101GpfdistPort = 8080
 	// Scenario101JobName is the gpload-csv job name (== ConfigMap key prefix).
@@ -6232,7 +6258,7 @@ func Scenario101Cases() []Scenario101Case {
 		{
 			ID: "SC101-GP2-IMAGE", Req: "GP.2", Layer: Scenario101LayerBuilder,
 			Artifact: Scenario101ArtifactDeployment, Expected: Scenario101GpfdistImage,
-			Description: "container[0].image == Gpfdist.Image or default cloudberry-gpfdist:2.1.0.",
+			Description: "container[0].image == Gpfdist.Image or default cloudberry-gpfdist:2.2.0.",
 		},
 		{
 			ID: "SC101-GP2-CMD", Req: "GP.2", Layer: Scenario101LayerBuilder,
@@ -7189,7 +7215,7 @@ func Scenario104Cases() []Scenario104Case {
 			Contains: "proname = 'pxf_read'",
 			Description: "the dataload-healthcheck init script for a pxf job (pxf enabled) carries " +
 				"the DB-proxy PXF-readiness probe substrings (pg_extension, extname='pxf', " +
-				"pg_proc proname = 'pxf_read' — PXF 2.1 has no pxf_version(), HC.1 FAIL) — NOT a " +
+				"pg_proc proname = 'pxf_read' — PXF 2.2 has no pxf_version(), HC.1 FAIL) — NOT a " +
 				"direct sidecar curl (impossible from the load pod per spec §3341).",
 		},
 		{

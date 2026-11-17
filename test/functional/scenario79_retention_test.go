@@ -60,7 +60,7 @@ import (
 // ============================================================================
 
 const (
-	scenario79BackupImage = "cloudberry-backup:2.1.0"
+	scenario79BackupImage = "cloudberry-backup:2.2.0"
 	// scenario79LatestTS is the pinned latest-backup timestamp used to key the
 	// deterministic cleanup Job name.
 	scenario79LatestTS = "20260608060000"

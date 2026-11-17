@@ -19,6 +19,9 @@
 #   --native             Run via native yandex-tank installation
 #   --generate-data      Generate the 100MB test dataset before running
 #   --sql-bench          Run SQL benchmark queries against a target database
+#   --mydb-bench         Run the READ-ONLY U023 mydb benchmark (5 queries, 3 timed
+#                        passes) against the acceptance cluster via kubectl exec;
+#                        dataset must remain untouched (U017 contract)
 #   --db-host <host>     Database host for SQL benchmark (default: localhost)
 #   --db-port <port>     Database port for SQL benchmark (default: 5432)
 #   --db-name <name>     Database name for SQL benchmark (default: postgres)
@@ -55,6 +58,8 @@ DB_HOST="localhost"
 DB_PORT="5432"
 DB_NAME="postgres"
 DB_USER="gpadmin"
+SQL_BENCH=${SQL_BENCH:-false}
+MYDB_BENCH=${MYDB_BENCH:-false}
 ANALYZE_ONLY=false
 DRY_RUN=false
 PORT_FORWARD=false
@@ -144,6 +149,10 @@ parse_args() {
                 ;;
             --sql-bench)
                 SQL_BENCH=true
+                shift
+                ;;
+            --mydb-bench)
+                MYDB_BENCH=true
                 shift
                 ;;
             --db-host)
@@ -1133,6 +1142,46 @@ run_sql_bench() {
     log_success "SQL benchmark complete"
 }
 
+# Run the READ-ONLY U023 mydb benchmark (PTC-220-05): 5 queries x 3 timed
+# passes via kubectl exec on the acceptance coordinator (U015 access path).
+# Verifies the mydb fingerprint contract before and after (U017 §9).
+run_mydb_bench() {
+    log_header "Running mydb Benchmark (read-only, U023)"
+
+    local ns="${K8S_NAMESPACE}"
+    local pod="${MYDB_COORD_POD:-acceptance-test-coordinator-0}"
+    local psql="/usr/local/cloudberry-db/bin/psql"
+    local sql="${SCRIPT_DIR}/sql/mydb-benchmark-u023.sql"
+
+    [[ -f "$sql" ]] || { log_error "missing ${sql}"; exit 1; }
+
+    fingerprint_mydb() {
+        kubectl exec -n "$ns" "$pod" -c cloudberry -- "$psql" -U gpadmin -d mydb -tA             -c "SELECT pg_database_size('mydb')||' '||(SELECT count(*) FROM customers)||' '||(SELECT count(*) FROM orders)||' '||(SELECT count(*) FROM line_items)||' '||(SELECT sum(qty*price) FROM line_items)" 2>/dev/null
+    }
+
+    local fp_before fp_after
+    fp_before=$(fingerprint_mydb)
+    log_info "mydb fingerprint before: ${fp_before}"
+    [[ "$fp_before" == "222647789 80000 480000 960000 1314280100.00" ]] \
+        || { log_error "mydb fingerprint MISMATCH before bench — refusing to run: ${fp_before}"; exit 1; }
+
+    mkdir -p "${RESULTS_DIR}"
+    for pass in 1 2 3; do
+        log_info "Pass ${pass}/3 ..."
+        kubectl exec -i -n "$ns" "$pod" -c cloudberry -- \
+            "$psql" -U gpadmin -d mydb -v ON_ERROR_STOP=1 -f - < "$sql" 2>&1 \
+            | tee "${RESULTS_DIR}/mydb-bench-pass${pass}-$(date +%Y%m%d_%H%M%S).log" \
+            | grep -E '^===|Time:|total_orders|^ *[0-9]+ \|' || true
+        sleep 5
+    done
+
+    fp_after=$(fingerprint_mydb)
+    log_info "mydb fingerprint after:  ${fp_after}"
+    [[ "$fp_after" == "222647789 80000 480000 960000 1314280100.00" ]] \
+        || { log_error "mydb fingerprint CHANGED during bench: ${fp_after}"; exit 1; }
+    log_success "mydb benchmark complete — dataset untouched"
+}
+
 # Start kubectl port-forwards for the operator
 start_port_forwards() {
     log_header "Starting Port Forwards"
@@ -1203,7 +1252,7 @@ run_hey() {
     log_header "Running Load Test (hey)"
 
     if ! command -v hey &>/dev/null; then
-        log_error "hey is not installed. Install: brew install hey"
+        log_error "hey is not installed. Install: brew install hey  (or: go install github.com/rakyll/hey@latest)"
         exit 1
     fi
 
@@ -1589,6 +1638,12 @@ main() {
     # Handle --sql-bench flag
     if [[ "$SQL_BENCH" == "true" ]]; then
         run_sql_bench
+        exit 0
+    fi
+
+    # Handle --mydb-bench flag (read-only; leaves dataset intact)
+    if [[ "$MYDB_BENCH" == "true" ]]; then
+        run_mydb_bench
         exit 0
     fi
 

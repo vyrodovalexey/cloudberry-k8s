@@ -88,7 +88,7 @@ func perf104PxfCluster() (*cbv1alpha1.CloudberryCluster, cbv1alpha1.DataLoadingJ
 	cluster := &cbv1alpha1.CloudberryCluster{}
 	cluster.Name = perf104DefaultCluster
 	cluster.Namespace = perf104DefaultNamespace
-	cluster.Spec.Image = "cloudberry-official-pxf:2.1.0"
+	cluster.Spec.Image = "cloudberry-official-pxf:2.2.0"
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
 		Pxf:     &cbv1alpha1.PxfSpec{Enabled: true},

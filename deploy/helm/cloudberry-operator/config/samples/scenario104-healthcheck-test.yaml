@@ -5,18 +5,18 @@
 # (dataload-healthcheck) blocks a data-load Job when any of the 5 checks fail,
 # and lets the load proceed once the condition is restored. Modeled on
 # scenario93-acceptance-test.yaml:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth + Vault KV secrets
 #   - Query monitoring: postgres-exporter on segments+mirrors+coordinator
 #     + cloudberry-query-exporter
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - deletionPolicy Retain
 #
 #   - dataLoading.pxf with ONE s3 server (s3-datalake) pointing at the MinIO s3
 #     dataset (cloudberry-data/text/data.csv) — for HC.1/HC.2/HC.3/HC.5.
-#   - dataLoading.gpfdist {enabled, replicas:1, cloudberry-gpfdist:2.1.0, 8080} —
+#   - dataLoading.gpfdist {enabled, replicas:1, cloudberry-gpfdist:2.2.0, 8080} —
 #     deployed so HC.4 (gpfdist reachability) has a real Service to probe and to
 #     break (scale to 0).
 #   - dataLoading.healthChecks {enabled:true, diskMinFreeMB:64,
@@ -65,8 +65,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "104"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -192,7 +192,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO
@@ -225,7 +225,7 @@ spec:
     gpfdist:
       enabled: true
       replicas: 1
-      image: "cloudberry-gpfdist:2.1.0"
+      image: "cloudberry-gpfdist:2.2.0"
       port: 8080
     # Pre-load health checks (default ON). diskMinFreeMB 64 is the HC.5 threshold;
     # a small scratchSizeLimit (64Mi) bounds the shared scratch emptyDir so HC.5

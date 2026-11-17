@@ -143,10 +143,10 @@ func scenario104SampleCluster() *cbv1alpha1.CloudberryCluster {
 	cluster := testutil.NewClusterBuilder(cases.Scenario104ClusterName, cases.Scenario104Namespace).Build()
 	cluster.Spec.DataLoading = &cbv1alpha1.DataLoadingSpec{
 		Enabled: true,
-		Pxf:     &cbv1alpha1.PxfSpec{Enabled: true, Image: "cloudberry-pxf:2.1.0"},
+		Pxf:     &cbv1alpha1.PxfSpec{Enabled: true, Image: "cloudberry-pxf:2.2.0"},
 		Gpfdist: &cbv1alpha1.GpfdistSpec{
 			Enabled: true,
-			Image:   "cloudberry-gpfdist:2.1.0",
+			Image:   "cloudberry-gpfdist:2.2.0",
 			Port:    cases.Scenario104GpfdistPort,
 		},
 		HealthChecks: &cbv1alpha1.DataLoadHealthChecksSpec{

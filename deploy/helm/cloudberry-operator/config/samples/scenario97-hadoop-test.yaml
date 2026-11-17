@@ -5,13 +5,13 @@
 # Profiles, already shipped). It follows the 93→94→95→96 precedent.
 #
 # Full Hadoop-profile cluster (modeled on scenario93-acceptance-test.yaml) with:
-#   - DB image cloudberry-official-pxf:2.1.0 (pxf + pxf_fdw extensions)
+#   - DB image cloudberry-official-pxf:2.2.0 (pxf + pxf_fdw extensions)
 #   - HA coordinator with standby
 #   - 2 segments with mirroring (group layout)
 #   - Vault PKI TLS (auth.ssl) + OIDC + Vault k8s auth
 #   - Query monitoring: postgres-exporter on segments+mirrors
 #     + cloudberry-query-exporter
-#   - PXF sidecar (cloudberry-pxf:2.1.0) with extensions pxf+pxf_fdw
+#   - PXF sidecar (cloudberry-pxf:2.2.0) with extensions pxf+pxf_fdw
 #   - deletionPolicy Retain
 #   - dataLoading.pxf servers:
 #       * hadoop-cluster (hdfs) carrying fs.defaultFS + hive.metastore.uris
@@ -31,8 +31,8 @@ metadata:
     app.kubernetes.io/managed-by: cloudberry-operator
     scenario: "97"
 spec:
-  version: "2.1.0"
-  image: "cloudberry-official-pxf:2.1.0"
+  version: "2.2.0"
+  image: "cloudberry-official-pxf:2.2.0"
   imagePullPolicy: IfNotPresent
 
   coordinator:
@@ -158,7 +158,7 @@ spec:
     enabled: true
     pxf:
       enabled: true
-      image: "cloudberry-pxf:2.1.0"
+      image: "cloudberry-pxf:2.2.0"
       jvmOpts: "-Xmx1g -Xms256m"
       port: 5888
       logLevel: INFO

@@ -234,7 +234,8 @@ func (s *Scenario96E2ESuite) TestE2E_Scenario96_PartA_ContractHonest() {
 				require.NotNilf(s.T(), out, "%s writable Job", tc.ID)
 				script := out.Spec.Template.Spec.Containers[0].Args[0]
 				assert.Contains(s.T(), script, "CREATE WRITABLE EXTERNAL TABLE")
-				assert.Contains(s.T(), script, "pxfwritable_export")
+				// DEF-4: per-profile write clause (text → TEXT; others bridge).
+				assert.Contains(s.T(), script, builder.PXFWriteFormatClause(tc.Profile))
 				assert.NotContains(s.T(), script, "LOG ERRORS")
 
 			case cases.Scenario96ExpectAdmitRead:
@@ -245,7 +246,7 @@ func (s *Scenario96E2ESuite) TestE2E_Scenario96_PartA_ContractHonest() {
 				wantLoc := "pxf://" + scenario96E2EResource(tc.Profile, tc.Server) +
 					"?PROFILE=" + tc.Profile + "&SERVER=" + tc.Server
 				assert.Containsf(s.T(), script, wantLoc, "%s LOCATION", tc.ID)
-				assert.Contains(s.T(), script, "pxfwritable_import")
+				assert.Contains(s.T(), script, builder.PXFReadFormatClause(tc.Profile))
 				if strings.Contains(tc.Layer, "server-config") {
 					assert.NotEmptyf(s.T(), cm.Data[tc.Server+"__s3-site.xml"],
 						"%s site file", tc.ID)
