@@ -627,7 +627,14 @@ func TestBuildExporterService(t *testing.T) {
 
 	assert.Equal(t, util.ExporterMetricsServiceName("test-cluster"), svc.Name)
 	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+
+	// The Service must carry the full prometheus.io/* annotation set the
+	// vmagent kubernetes-service-endpoints job consumes (scrape + port +
+	// path). Without the port annotation vmagent scrapes the wrong
+	// endpointslice port — a permanently-down target (ADV-2/U024).
 	assert.Equal(t, promScrapeTrue, svc.Annotations["prometheus.io/scrape"])
+	assert.Equal(t, "9187", svc.Annotations["prometheus.io/port"])
+	assert.Equal(t, "/metrics", svc.Annotations["prometheus.io/path"])
 
 	require.Len(t, svc.Spec.Ports, 2)
 	assert.Equal(t, pgExporterPortName, svc.Spec.Ports[0].Name)

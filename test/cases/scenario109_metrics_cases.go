@@ -12,11 +12,16 @@ package cases
 //   - ABSENT — intentionally NOT registered/emitted because there is no honest
 //     source (synthesizing a value would be dishonest). An ABSENT assertion (the
 //     series has ZERO samples in VM) is a PASSING honesty check, NOT a failure.
+//   - BLOCKED — the honest source EXISTS but is unreachable BY DESIGN (SE.5,
+//     the PXF NetworkPolicy, excludes cross-pod ingress to the actuator :5888,
+//     so the vmagent scrape job was removed from the monitoring chart — DEF-5
+//     adjudication, 2026-11-15, spec 12). ZERO series in VM is the EXPECTED
+//     steady state, not a regression.
 //
 // Per-metric decision (task-breakdown §1):
 //   M.1  pxf_service_up{cluster,namespace,segment_host}         IMPLEMENTED (1/0 from real pxf container readiness)
-//   M.2  pxf_requests_total  → actuator http_server_requests_*  IMPLEMENTED (actuator passthrough; native names)
-//   M.3  pxf_request_duration_seconds → actuator histogram      IMPLEMENTED (actuator passthrough; native names)
+//   M.2  pxf_requests_total  → actuator http_server_requests_*  BLOCKED under SE.5 (scrape job removed; 0 series expected)
+//   M.3  pxf_request_duration_seconds → actuator histogram      BLOCKED under SE.5 (scrape job removed; 0 series expected)
 //   M.4  pxf_bytes_transferred_total                            ABSENT (no honest source)
 //   M.5  pxf_records_total                                      ABSENT (substituted by data_loading_rows_total)
 //   M.6  pxf_errors_total                                       FOLDED into data_loading_errors_total (+actuator non-2xx)
@@ -72,8 +77,14 @@ const (
 	Scenario109MetricJobStatus   = "cloudberry_data_loading_job_status"
 	// Scenario109ActuatorRequestsCount / Bucket are the REAL PXF Spring Boot
 	// actuator request-count + latency-histogram series (M.2/M.3) under their
-	// native names (NOT renamed to pxf_requests_total) — scraped by vmagent from
-	// :5888/actuator/prometheus when the scrape job is wired in.
+	// native names (NOT renamed to pxf_requests_total). BLOCKED under SE.5
+	// (DEF-5 adjudication, 2026-11-15, spec 12): the vmagent
+	// :5888/actuator/prometheus job was REMOVED from the monitoring chart
+	// because SE.5 excludes cross-pod ingress to :5888, so these series have
+	// ZERO samples in VictoriaMetrics by design (the operator-side actuator
+	// enablement stays real and loopback-healthy). The names remain for the
+	// e2e M.2/M.3 legs, which log CONFIG-ONLY when the series are absent; do
+	// not re-add the chart job without an explicit SE.5 exception in spec 12.
 	Scenario109ActuatorRequestsCount = "http_server_requests_seconds_count"
 	Scenario109ActuatorRequestBucket = "http_server_requests_seconds_bucket"
 
@@ -165,7 +176,7 @@ func scenario109ImplementedCases() []Scenario109Case {
 				"segment_host's pxf_service_up → 0; restore. Destructive/optional/last.",
 		},
 
-		// --- M.2 pxf_requests_total (IMPLEMENTED via actuator passthrough) --
+		// --- M.2 pxf_requests_total (BLOCKED under SE.5; job removed) ------
 		{
 			ID: "109-M2-F", Req: "M.2", Layer: Scenario109LayerFunctional,
 			Expected: "builder enables the actuator prometheus endpoint (exposure.include)",
@@ -175,18 +186,22 @@ func scenario109ImplementedCases() []Scenario109Case {
 		},
 		{
 			ID: "109-M2-L", Req: "M.2", Layer: Scenario109LayerLive,
-			Expected: "LIVE actuator http_server_requests_seconds_count present in VM",
-			Description: "[LIVE-ONLY] after a pxf:// read, the actuator request-count series is " +
-				"present in VM for the pxf sidecar target (CONFIG-ONLY if the actuator scrape " +
-				"job isn't wired in this env). NO invented server/profile/operation label.",
+			Expected: "LIVE actuator series ZERO in VM = expected (BLOCKED under SE.5)",
+			Description: "[LIVE-ONLY] BLOCKED under SE.5 (DEF-5, 2026-11-15): the vmagent " +
+				":5888/actuator/prometheus job was removed from the chart, so ZERO " +
+				"http_server_requests_seconds_count series in VM is the EXPECTED steady " +
+				"state; the e2e leg logs CONFIG-ONLY and never fabricates (if ever re-added " +
+				"via an explicit SE.5 exception: no invented server/profile/operation label).",
 		},
 
-		// --- M.3 pxf_request_duration_seconds (IMPLEMENTED via actuator) ----
+		// --- M.3 pxf_request_duration_seconds (BLOCKED under SE.5) ----------
 		{
 			ID: "109-M3-L", Req: "M.3", Layer: Scenario109LayerLive,
-			Expected: "LIVE actuator http_server_requests_seconds_bucket present in VM",
-			Description: "[LIVE-ONLY] the REAL actuator latency histogram (_bucket/_count) is " +
-				"present in VM after loads (CONFIG-ONLY if the actuator scrape isn't wired).",
+			Expected: "LIVE actuator histogram ZERO in VM = expected (BLOCKED under SE.5)",
+			Description: "[LIVE-ONLY] BLOCKED under SE.5 (DEF-5, 2026-11-15): same adjudication " +
+				"as M.2 — the latency histogram is loopback-healthy but not scrapable " +
+				"cross-pod, so ZERO series in VM is the EXPECTED steady state; the e2e " +
+				"leg logs CONFIG-ONLY.",
 		},
 
 		// --- M.8 data_loading_jobs_active (DONE) ---------------------------
