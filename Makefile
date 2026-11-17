@@ -48,6 +48,8 @@ HELM_CHART           := deploy/helm/cloudberry-operator
 # --- Tool versions -----------------------------------------------------------
 GOLANGCI_LINT_VERSION ?= v2.15.0
 CONTROLLER_GEN_VERSION ?= v0.17.3
+# Keep in sync with GOVULNCHECK_VERSION in .github/workflows/ci.yml.
+GOVULNCHECK_VERSION ?= v1.9.0
 
 # --- Tool binaries -----------------------------------------------------------
 GOLANGCI_LINT    := $(shell command -v golangci-lint 2>/dev/null)
@@ -147,8 +149,8 @@ fmt-check: ## Check gofmt formatting
 .PHONY: vuln
 vuln: ## Run govulncheck
 ifndef GOVULNCHECK
-	@echo "Installing govulncheck..."
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	@echo "Installing govulncheck $(GOVULNCHECK_VERSION)..."
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 endif
 	govulncheck ./...
 
@@ -540,11 +542,20 @@ test-env-setup: ## Run all service setup scripts (Vault, Keycloak, MinIO, Kafka,
 .PHONY: test-env-full
 test-env-full: test-env-up ## Bring up + configure + verify the full test environment (idempotent)
 	@echo "Waiting for services to start..."
+	# A service is ready only when its healthcheck reports `healthy` (a
+	# missing healthcheck yields an empty field and passes). `unhealthy`
+	# or `exited` must NOT count as ready (U010 flag, TASK-U024), and the
+	# loop fails loudly after the last attempt instead of falling through.
 	@for i in $$(seq 1 90); do \
-		unhealthy=$$($(DOCKER) compose -f test/docker-compose/docker-compose.yml ps --format '{{.Name}} {{.Health}}' 2>/dev/null \
-			| grep -E 'starting' || true); \
-		if [ -z "$$unhealthy" ]; then echo "All healthchecked services ready at attempt $$i"; break; fi; \
-		echo "Attempt $$i: waiting for healthchecks... ($$unhealthy)"; sleep 5; \
+		notready=$$($(DOCKER) compose -f test/docker-compose/docker-compose.yml ps --format '{{.Name}} {{.Health}}' 2>/dev/null \
+			| awk '$$2 != "" && $$2 != "healthy" { printf "%s(%s) ", $$1, $$2 }' || true); \
+		if [ -z "$$notready" ]; then echo "All healthchecked services healthy at attempt $$i"; break; fi; \
+		if [ "$$i" -eq 90 ]; then \
+			echo "ERROR: services not healthy after 90 attempts:"; \
+			echo "$$notready" | tr ' ' '\n' | sed '/^$$/d; s/^/  /'; \
+			exit 1; \
+		fi; \
+		echo "Attempt $$i: waiting for healthchecks... ($$notready)"; sleep 5; \
 	done
 	$(MAKE) test-env-setup
 	$(MAKE) test-env-verify

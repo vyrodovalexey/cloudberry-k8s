@@ -2,8 +2,12 @@ apiVersion: v2
 name: cloudberry-operator
 description: A Helm chart for the Cloudberry Database Kubernetes Operator
 type: application
-version: 0.1.1
-appVersion: "0.1.0"
+# version: chart packaging version (bumped for every chart change, per the
+# U014 convention). appVersion: the operator image version this chart ships
+# (tracked image.tag default; must stay coherent with values.yaml image.tag —
+# templates/_helpers.tpl falls back to appVersion when image.tag is unset).
+version: 0.1.2
+appVersion: "0.9.3-cldb-2.2.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/cloudberry-contrib/cloudberry-k8s
 sources:

@@ -47,7 +47,11 @@ jobs:
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
-          args: --timeout=5m
+          # 10m: cold-runner headroom (TASK-U024). Local warm-build run is ~11s,
+          # but a cold GH runner (4 vCPU, no Go build cache) must compile the
+          # full k8s.io/controller-runtime dependency graph before analysis;
+          # 5m was marginal. Must stay in sync with .golangci.yml run.timeout.
+          args: --timeout=10m
       - name: Validate Grafana dashboards
         run: |
           for f in monitoring/grafana/*.json; do
@@ -1036,6 +1040,17 @@ jobs:
           - name: ctl
             image_key: DOCKER_IMAGE_CTL
             skip_dirs: ''
+          # cloudberry: exclude the Cloudberry DB bin dir. NOTE (TASK-U024
+          # live-verified with trivy 0.76.2): this image is built from
+          # Dockerfile.cloudberry-official (RPM layout: versioned dir
+          # /usr/local/cloudberry-db-2.2.0 + managed symlink
+          # /usr/local/cloudberry-db). Trivy skip-dirs match STORED layer
+          # paths, not symlinks: this versioned path removes exactly the 5
+          # gobinary findings under .../bin (72→67 on the 2.2.0 build);
+          # the symlink path removes NOTHING. The source-built
+          # Dockerfile.cloudberry (unversioned /usr/local/cloudberry-db,
+          # Makefile-only, not built/scanned in CI) would need
+          # /usr/local/cloudberry-db/bin instead.
           - name: cloudberry
             image_key: DOCKER_IMAGE_CLOUDBERRY
             skip_dirs: '/usr/local/cloudberry-db-2.2.0/bin'

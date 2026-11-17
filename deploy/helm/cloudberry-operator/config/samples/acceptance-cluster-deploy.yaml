@@ -256,10 +256,12 @@ spec:
           profile: "s3:text"
           # loadMethod fdw: the s3:text CSV dataset is comma-delimited; the FDW
           # path maps the text profile to the csv format (scenario103's
-          # s3-fdw-load pattern, same server/profile/resource). The
-          # external-table path emits FORMAT 'CUSTOM' (pxfwritable_import),
-          # which delivers one field per line for this profile — see U015
-          # report defect DEF-1 before switching back.
+          # s3-fdw-load pattern, same server/profile/resource). Kept on fdw
+          # deliberately for FDW-path parity with scenario103 — the
+          # external-table read path is FIXED since DEF-1 (U027:
+          # PXFReadFormatClause("s3:text") now emits FORMAT 'CSV'; live-proven
+          # by the U019 7-format matrix and scenario99 read-back), so either
+          # loadMethod works for this dataset.
           loadMethod: fdw
           resource: "cloudberry-data/text/data.csv"
           targetTable: "public.pxf_loaded"
