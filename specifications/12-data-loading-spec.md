@@ -223,7 +223,11 @@ PXF includes connectors for the following external data stores:
 > [`internal/pxfpolicy`](#single-source-of-truth-internalpxfpolicy). A
 > `mode: writable` job whose profile format has **Write = No** (json/orc/rc) is
 > **rejected at admission**; text/parquet/avro/SequenceFile writable jobs are
-> admitted and build a `pxfwritable_export` writable external table. See
+> admitted and build a writable external table with the **per-profile FORMAT
+> clause** (`FORMAT 'TEXT' (delimiter ',')` for the text family;
+> `FORMATTER='pxfwritable_export'` for parquet/avro/SequenceFile and bare
+> `jdbc` — see the format-clause contract note in
+> [Data Loading Jobs](#data-loading-jobs)). See
 > [Writable External Tables](#writable-external-tables-data-export) and
 > [Scenario 96](#scenario-96--object-store-profiles--format-write-capability).
 
@@ -1009,8 +1013,15 @@ FORMAT '<...>'
 - **PXF jobs** (`type: pxf`): `pxf://<resource>?PROFILE=<p>&SERVER=<s>` with the
   typed options emitted in a **fixed order** — `FILTER_PUSHDOWN=true` (when
   `filterPushdown`), `PROJECT=true` (when `columnProjection`), then
-  `PARTITION_BY`/`RANGE`/`INTERVAL` (from `partitioning`) — and
-  `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')`.
+  `PARTITION_BY`/`RANGE`/`INTERVAL` (from `partitioning`) — and a
+  **profile-aware FORMAT clause** (see the format-clause contract note below;
+  `builder.PXFReadFormatClause(profile)` on the read path,
+  `builder.PXFWriteFormatClause(profile)` on the writable path):
+  delimited-text profiles (`text`/`csv` suffix on any non-`hive` scheme) get
+  `FORMAT 'CSV'` (read) / `FORMAT 'TEXT' (delimiter ',')` (writable); all other
+  profiles (parquet/avro/sequencefile/json/orc, all `hive*`, `jdbc`, `hbase`)
+  get the binary bridge `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')`
+  (read) / `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')` (writable).
 - **Native/gpload jobs** (`type: gpload`): `gpfdist://`/`s3://` LOCATION derived
   from `gploadJob.filePaths` (an explicit scheme is used verbatim; a bare path is
   served via the cluster gpfdist Service `<cluster>-gpfdist:<port>`), and
@@ -1021,6 +1032,39 @@ FORMAT '<...>'
 - **Error handling** → `LOG ERRORS SEGMENT REJECT LIMIT <n> ROWS|PERCENT` from
   `errorHandling` (`LOG ERRORS` prefix only when `logErrors: true`; the suffix is
   emitted only when `segmentRejectLimit > 0`).
+
+> **Revision note (2026-11-15 — profile-aware FORMAT clauses, DEF-1/DEF-4).**
+> This specification previously documented a **profile-agnostic bridge clause**
+> — `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')` for every read and
+> `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')` for every writable — as the
+> generated PXF DDL contract. **Live proven on Cloudberry 2.2.0 / PXF
+> `pxf-app-2.2.0-incubating`, this is wrong for the delimited-text family**: on
+> `text`/`csv` profiles (any non-`hive` scheme) the binary bridge formatter
+> fails — reads yield one field per line (`Record has 1 fields but the schema
+> size is N`), and writables fail inside PXF
+> (`LineBreakAccessor.writeNextObject` → `java.lang.ClassCastException: class
+> java.lang.Integer cannot be cast to class [B`) leaving only **0-byte marker
+> objects**. The **authoritative per-format clause matrix**, live-proven for all
+> 7 formats (175,000 rows written and read back per source with exact
+> two-direction `EXCEPT ALL` = 0/0) is: `s3:text`/`hdfs:text` (and `gs`/`abfss`/
+> `wasbs` text) → **`FORMAT 'CSV'`** readable / **`FORMAT 'TEXT'
+> (delimiter ',')`** writable; `s3:parquet`/`s3:avro`/`hdfs:parquet`/
+> `hdfs:avro`/`hdfs:SequenceFile` → **`FORMAT 'CUSTOM'
+> (formatter='pxfwritable_import')`** readable / **`FORMAT 'CUSTOM'
+> (formatter='pxfwritable_export')`** writable; bare `jdbc` → bridge on both
+> directions. Implemented by the exported helpers
+> **`internal/builder.PXFReadFormatClause(profile)`** (read side) and
+> **`internal/builder.PXFWriteFormatClause(profile)`** (writable side) — the
+> single source of truth the functional/e2e/perf suites assert against
+> (`internal/builder/dataload_builder.go`). `hive*` profiles keep the bridge on
+> the read path (upstream PXF contract for Hive; moot for writes — Hive/HBase
+> are read-only schemes). Evidence: U027 (DEF-1 read fix), U029 (DEF-4 write
+> fix), U019 §4 (the live-proven clause matrix, 7/7 formats), U028a/U028b
+> (rebuilt images prove the clauses inside the shipped binaries; live job log
+> `FORMAT 'CSV';` + `DATALOAD_ROWS=1000`), U022 (scenario99 Part B live:
+> text exports land non-zero-byte objects + full read-back round-trip). All
+> sections below that previously stated the blanket bridge clause are corrected
+> accordingly.
 
 **Load script (`buildDataLoadScript`, `set -euo pipefail`).** The sequence is:
 
@@ -1598,12 +1642,15 @@ first-time create increments **nothing** (no diff = no series forced).
 `cloudberry_pxf_status`, set per observed segment-primary pod from real
 `pxf` container readiness via `util.PXFReadyByHost` — `1` healthy / `0` on a
 killed segment; never a synthesized host); the actuator-passthrough
-`cloudberry_pxf_requests_total` + `cloudberry_pxf_request_duration_seconds` (the
-**real** `http_server_requests_seconds_count`/`_sum`/`_bucket` series scraped from
-the PXF Spring Boot Actuator `/actuator/prometheus` by a **dedicated vmagent scrape
-job** — request count + latency are REAL, but the `server`/`profile`/`operation`
-labels are downgraded to the actuator-native `uri`/`method`/`status` because they
-are **not** honestly derivable from the actuator URI); and the conditional
+`cloudberry_pxf_requests_total` + `cloudberry_pxf_request_duration_seconds`
+(**revised 2026-11-15 — BLOCKED under SE.5**: the real
+`http_server_requests_seconds_*` series are served by the PXF Spring Boot
+Actuator `/actuator/prometheus` — enabled by the operator, healthy via loopback
+— but the dedicated vmagent scrape job was **removed from the monitoring chart**
+by the DEF-5 decision because the SE.5 NetworkPolicy excludes cross-pod `:5888`
+ingress; **0 series in VictoriaMetrics is the expected steady state**, and the
+`server`/`profile`/`operation` label downgrade caveat applies if ever
+re-enabled); and the conditional
 `cloudberry_data_loading_bytes_total{cluster,namespace,job,source_type}` (emitted
 from the real `DATALOAD_BYTES=<n>` marker the gpload script computes via `wc -c`
 for a **local gpload input source**, and **omitted** — honestly absent — for
@@ -2174,7 +2221,7 @@ ConfigMap materialize; it **skips cleanly** when `KUBECONFIG` is unset.
 | Filter pushdown DDL knob (`pxfJob.filterPushdown=true` → `FILTER_PUSHDOWN=true`) + mutating default-true | **Implemented/verified** (Scenario 98; `buildPXFLocation` + `setPxfJobDefaults`; runtime-proven via row-count reduction / `EXPLAIN` / source logs — NOT bytes) |
 | Column projection DDL knob (`pxfJob.columnProjection=true` → `PROJECT=true`) + mutating default-true | **Implemented/verified** (Scenario 98; `buildPXFLocation` + `setPxfJobDefaults`; EXPLAIN-only proof) |
 | Per-row error handling DDL knob (`errorHandling` → `[LOG ERRORS ]SEGMENT REJECT LIMIT <n> [ROWS\|PERCENT]`; writable export OMITS it; W.15-validated) | **Implemented/verified** (Scenario 98; `errorHandlingClause`; proven via real `job_status`/`errors_total`/`rows_total`) |
-| Writable external-table EXPORT to **S3 / object store** (FE.9/WE.1), **HDFS** (FE.10), **JDBC** (FE.11) via `pxfwritable_export` (profile-agnostic builder; `IsProfileWritable` admits `s3:`/`hdfs:` text/parquet/avro(+seq) + bare `jdbc`) | **Implemented/verified** (Scenario 99; objects/part-files/rows LAND; `s3:parquet`/`hdfs:parquet`/`avro` `[CONFIG-ONLY]` — DATA_SCHEMA) |
+| Writable external-table EXPORT to **S3 / object store** (FE.9/WE.1), **HDFS** (FE.10), **JDBC** (FE.11) via the **per-profile writable FORMAT clause** (`PXFWriteFormatClause`: text → `FORMAT 'TEXT' (delimiter ',')`; parquet/avro/sequencefile/jdbc → `pxfwritable_export`; `IsProfileWritable` admits `s3:`/`hdfs:` text/parquet/avro(+seq) + bare `jdbc`) | **Implemented/verified** (Scenario 99, live-proven for text via the DEF-4 fix — U019 §4 / U022 scenario99 Part B; objects/part-files/rows LAND; `s3:parquet`/`hdfs:parquet`/`avro` `[CONFIG-ONLY]` — DATA_SCHEMA) |
 | `pxfJob.sourceFilter` filtered export (`INSERT INTO <ext> SELECT * FROM <target> WHERE <sourceFilter>`; quoted-heredoc single-quote safety; unset → byte-identical full export) | **Implemented/verified** (Scenario 99; `dataload_builder.go`; filtered `rows_total` < baseline) |
 | Webhook rule **W.17** (`sourceFilter` valid on `mode: writable` OR `loadMethod: fdw` read — Scenario 103 tweak; reject on a plain external-table read + `;`/`--`/`/*`) | **Implemented/verified** (Scenario 99 + 103; `validateSourceFilter`) |
 | Webhook rule **W.25** (`pxfJob.loadMethod` enum `external-table`\|`fdw`; `fdw` is read-only — reject `mode: writable`/`continuous: true`) | **Implemented/verified** (Scenario 103; `validateLoadMethod`, checked before W.17) |
@@ -2199,7 +2246,7 @@ ConfigMap materialize; it **skips cleanly** when `KUBECONFIG` is unset.
 | New CLI helper `runAPIPut` (alongside `runAPIGet`/`runAPIPost`/`runAPIDelete`) | **Implemented** (Scenario 108; used by `pxf servers update`) |
 | **FDW-based loading path** (`pxfJob.loadMethod: fdw` → persistent `CREATE SERVER`/`CREATE USER MAPPING`/`CREATE FOREIGN TABLE` IF NOT EXISTS, per-protocol `pxf_fdw` wrapper, `(LIKE <target>)`, never dropped; EX.5-EX.8; `INSERT INTO <target> SELECT * FROM <foreign> [WHERE <sourceFilter>]` — EQUIVALENT to the external-table path, equal row counts) + new `pxfJob.loadMethod` field + webhook **W.25** + W.17 tweak | **Implemented** (Scenario 103; `buildFDWDDL`/`buildFDWDataLoadScript`, `dataload_builder.go`; reuses `cloudberry_data_loading_*` — NO new metric) |
 | `cloudberry_pxf_service_up{cluster,namespace,segment_host}` (M.1) — per-segment PXF readiness | **Implemented** (Scenario 109; the per-segment-host disaggregation of `cloudberry_pxf_status`, set from **real** per-segment-primary-pod `pxf` container readiness via `util.PXFReadyByHost` — `1` healthy / `0` on a killed segment; emitted only for observed hosts, never synthesized) |
-| `cloudberry_pxf_requests_total` (M.2) + `cloudberry_pxf_request_duration_seconds` (M.3) — actuator passthrough | **Implemented** (Scenario 109; the **real** `http_server_requests_seconds_count`/`_sum`/`_bucket` series from the PXF Actuator `/actuator/prometheus`, enabled via `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus` and scraped by a **dedicated vmagent job** at `:5888`. **Label-honesty caveat:** count + latency are REAL; the catalog's `server`/`profile`/`operation` labels are downgraded to the actuator-native `uri`/`method`/`status` — not fabricated) |
+| `cloudberry_pxf_requests_total` (M.2) + `cloudberry_pxf_request_duration_seconds` (M.3) — actuator passthrough | **BLOCKED under SE.5 (revised 2026-11-15 — DEF-5 decision, option b; was "Implemented")** — the actuator endpoint is enabled and loopback-healthy (`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus`, `:5888/actuator/prometheus`), but the SE.5 NetworkPolicy intentionally excludes cross-pod `:5888` ingress, so the dedicated vmagent job was **removed from the chart**: **0 series in VictoriaMetrics is the expected steady state**. PXF health is covered by M.1 `cloudberry_pxf_service_up` (operator-side, live). If ever unblocked via an explicit SE.5 exception, the label-honesty caveat applies (count + latency REAL; `server`/`profile`/`operation` downgraded to actuator-native `uri`/`method`/`status` — never fabricated) |
 | `cloudberry_data_loading_bytes_total{cluster,namespace,job,source_type}` (M.10) | **Implemented when a real byte count is available** (Scenario 109; from the real `DATALOAD_BYTES=<n>` marker computed via `wc -c` for a **local gpload input**; **omitted** for external-table/pxf/FDW/continuous loads — never synthesized) |
 | 4 remaining `cloudberry_pxf_*` metrics (`pxf_bytes_transferred_total` M.4, `pxf_records_total` M.5, `pxf_errors_total` M.6, `pxf_active_connections` M.7) + 2 `cloudberry_gpfdist_*` (M.15/M.16) | **Planned / honestly absent** (no honest source in PXF 2.1.0 / gpfdist — never fabricated. M.5 record throughput is observed via `cloudberry_data_loading_rows_total`; **M.6 is FOLDED** into `cloudberry_data_loading_errors_total` + actuator non-2xx — no synthetic typed counter is registered. Scenario 109 tests assert the absence of M.4/M.5/M.7/M.15/M.16) |
 | PXF servers-changed observability: `PXFServersChanged` event (`EventReasonPXFServersChanged`, message `added/removed/updated`) + `cloudberry_pxf_servers_changed_total{cluster,namespace}` counter — emitted on a real `<cluster>-pxf-servers` ConfigMap `Data` diff by BOTH the reconcile (`emitPXFServersChanged`) and the `pxf sync` path (`recordPXFServersChanged`); shared `util.DiffPXFServerNames`/`FormatPXFServersChangedMessage` | **Implemented** (Scenario 106; fires ONLY on a real diff — never on a no-op sync or first create) |
@@ -2636,7 +2683,7 @@ CONFIG-ONLY — no local backing store):**
 
 | ID | Profile (`mode: writable`) | Expected |
 |----|----------------------------|----------|
-| FF.1 | `s3:text` | **SUCCEED** (admission + DDL + script) — admitted; `CREATE WRITABLE EXTERNAL TABLE … pxfwritable_export`, **no** `LOG ERRORS`; the operator emits the correct reversed-direction export `INSERT`. Live text export of **text-compatible** columns round-trips; see the PXF text-formatter note below |
+| FF.1 | `s3:text` | **SUCCEED** (admission + DDL + script) — admitted; `CREATE WRITABLE EXTERNAL TABLE … FORMAT 'TEXT' (delimiter ',')` (per-profile clause, `PXFWriteFormatClause`), **no** `LOG ERRORS`; the operator emits the correct reversed-direction export `INSERT`. Live text export round-trips for **all** column types (U019: int/text/bigint/float8, 175,000 rows exact fidelity); see the PXF text-formatter note below |
 | FF.2 | `s3:parquet` | **SUCCEED** — admitted; writable DDL correct; **live parquet export round-trips** (verified: 100 rows → MinIO `.snappy.parquet` objects) |
 | FF.3 | `s3:avro` | **SUCCEED** — admitted; **live avro export round-trips** (verified: 100 rows → MinIO `.avro` objects); config-only build+admit if avro tooling absent |
 | FF.4 | `s3:json` | **REJECT** — admission DENY; error contains `write-unsupported`/`writable`; builder also errors (defense-in-depth) |
@@ -2653,18 +2700,24 @@ CONFIG-ONLY — no local backing store):**
 - The **live export RUNTIME** (FF.1–FF.3) is proven only where the MinIO backing
   store is available; a first-class **export-Job kind** beyond the writable-DDL
   path remains **Planned**.
-- **PXF text-formatter data-type constraint (honest, verified live).** The
-  operator-generated export DDL/script is correct for all three writable formats
-  (the load Job pushes cluster rows OUT via `INSERT INTO <writable_ext> SELECT *
-  FROM <target>`). Live verification: **FF.2 (parquet) and FF.3 (avro) export
-  real data round-trip end-to-end** (100 rows each → MinIO objects). For **FF.1
-  (text)**, the PXF `s3:text` *write* path serializes each column to bytes and
-  rejects some non-text column types at the PXF sidecar (e.g. `class
-  java.lang.Integer cannot be cast to [B`); this is a **PXF connector
-  limitation**, not an operator defect — the previously-broken
-  "`cannot read from a WRITABLE external table`" direction bug is **fixed**.
-  Text exports succeed for text-compatible column types. Choose `parquet`/`avro`
-  for mixed-type exports.
+- **PXF text-formatter note (revised 2026-11-15 — DEF-4 fix; supersedes the
+  earlier "data-type constraint" finding).** The load Job pushes cluster rows
+  OUT via `INSERT INTO <writable_ext> SELECT * FROM <target>`. Live
+  verification: **FF.2 (parquet) and FF.3 (avro) export real data round-trip
+  end-to-end** (100 rows each → MinIO objects). For **FF.1 (text)** the earlier
+  campaign runs observed `class java.lang.Integer cannot be cast to [B` at the
+  PXF sidecar and recorded it as a "PXF connector limitation" — that diagnosis
+  was **incomplete**: the failure was caused by the operator emitting the
+  **binary bridge clause** (`FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')`)
+  for text profiles, which PXF's `LineBreakAccessor` rejects (it receives
+  bridge-serialized records where it expects text tuples). With the
+  **per-profile clause** `FORMAT 'TEXT' (delimiter ',')` (`PXFWriteFormatClause`,
+  DEF-4 fix) text exports succeed for **mixed column types** — live-proven
+  `(id int, name text, amount bigint, price float8)` × 175,000 rows on both
+  `s3:text` and `hdfs:text` with exact two-direction set equality (U019 §4/§5;
+  scenario99 Part B live: non-zero-byte objects + full read-back round-trip,
+  U022). The bridge clause remains **correct** for parquet/avro/SequenceFile
+  (live-proven 3×) and bare `jdbc`.
 
 The compose stack adds an `hbase` service (`harisekhon/hbase:2.1`) and
 `scripts/gen-objstore-samples.sh` generates the object-store sample data
@@ -2768,10 +2821,14 @@ site-file / admission deny) by the CatalogHonest functional + e2e tests.
 #### Config-only & live results (honest)
 
 The **operator behavior is correct for every Hadoop profile** — the generated
-external-table DDL/LOCATION uses the standard PXF contract `FORMAT 'CUSTOM'
-(FORMATTER='pxfwritable_import')` (read) / `pxfwritable_export` (write) for all
-profiles, and the rendered site files carry the metastore URI + ZK quorum
-(SITE.1–4 verified live). Verified at live deployment time (cluster
+external-table DDL/LOCATION uses the **per-profile PXF FORMAT contract**:
+`FORMAT 'CSV'` for delimited-text reads (`hdfs:text`; `PXFReadFormatClause`),
+`FORMAT 'TEXT' (delimiter ',')` for delimited-text writables (`hdfs:text`;
+`PXFWriteFormatClause`), and the bridge `FORMAT 'CUSTOM'
+(FORMATTER='pxfwritable_import')` (read) / `pxfwritable_export` (write) for the
+binary/profile-native family (`hdfs:parquet`/`hdfs:avro`/`hdfs:SequenceFile`,
+`hive*`, `hbase`) — and the rendered site files carry the metastore URI + ZK
+quorum (SITE.1–4 verified live). Verified at live deployment time (cluster
 `hadoop-test`):
 
 - **`hdfs:json`** read → **live rows land** (HP.4 — 2000 rows). **`hive`**
@@ -2917,8 +2974,11 @@ Planned.
 ### Scenario 99 — Writable External Tables / Data Export
 
 > **Status: Implemented (writable export to S3 / HDFS / JDBC + `sourceFilter`
-> filtered export + W.17) + Verified (Scenario 99).** The writable DDL
-> (`pxfwritable_export`) and the write-capability enforcement shipped in
+> filtered export + W.17) + Verified (Scenario 99; text legs live-proven via
+> the DEF-4 per-profile clause fix).** The writable DDL
+> (**per-profile FORMAT clause** — `FORMAT 'TEXT' (delimiter ',')` for the text
+> family, `FORMATTER='pxfwritable_export'` for parquet/avro/SequenceFile and
+> bare `jdbc`) and the write-capability enforcement shipped in
 > Scenario 96; Scenario 99 **verifies the three export targets live** and adds
 > the **new `PxfJobSpec.SourceFilter`** filtered export plus the **new webhook
 > rule W.17**. A first-class **data-export Job kind** (beyond the writable-DDL
@@ -2929,11 +2989,14 @@ Planned.
 > HBase); **98** = Filter Pushdown / Column Projection / Per-Row Error Handling;
 > **99** = Writable External Tables / Data Export (this section).
 
-#### The three export targets (profile-agnostic builder)
+#### The three export targets (one builder, per-profile FORMAT clause)
 
-`buildPXFExternalTableDDL` emits the SAME `CREATE WRITABLE EXTERNAL TABLE …
-FORMATTER='pxfwritable_export'` shape for all three targets, differing only by the
-LOCATION `PROFILE`/`SERVER`. `pxfpolicy.IsProfileWritable` admits each:
+`buildPXFExternalTableDDL` emits the SAME `CREATE WRITABLE EXTERNAL TABLE` shape
+for all three targets — differing only by the LOCATION `PROFILE`/`SERVER` **and
+the profile-aware FORMAT clause** (`PXFWriteFormatClause`: text-family →
+`FORMAT 'TEXT' (delimiter ',')`; parquet/avro/sequencefile and bare `jdbc` →
+`FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')`). `pxfpolicy.IsProfileWritable`
+admits each:
 
 - **S3 / object store (FE.9 / WE.1)** — `s3:text`/`s3:parquet`/`s3:avro` → objects
   LAND in MinIO under `cloudberry-warehouse/exports/s3/` (S3 list/HEAD). `s3:parquet`
@@ -2949,10 +3012,13 @@ LOCATION `PROFILE`/`SERVER`. `pxfpolicy.IsProfileWritable` admits each:
 
 #### WE.2 — data lands with the correct format
 
-For every export the generated WRITABLE DDL carries `FORMATTER='pxfwritable_export'`
-**and** the correct format per profile (`s3:text`/`hdfs:text` → text/CSV-shaped;
-`jdbc` → rows with the expected columns). This is the explicit WE.2 "correct
-format" gate. parquet/avro format-landing is **`[CONFIG-ONLY]`** without write
+For every export the generated WRITABLE DDL carries the **correct per-profile
+FORMAT clause** (`PXFWriteFormatClause`): `s3:text`/`hdfs:text` → `FORMAT 'TEXT'
+(delimiter ',')` — text/CSV-shaped objects land; `jdbc` → rows with the expected
+columns via the bridge formatter; parquet/avro/sequencefile → the
+`pxfwritable_export` bridge. This is the explicit WE.2 "correct format" gate
+(the catalog's `DDLContains` token is the per-profile clause, not the blanket
+formatter). parquet/avro format-landing is **`[CONFIG-ONLY]`** without write
 tooling / `DATA_SCHEMA`.
 
 #### SF.1 — `sourceFilter` filtered export
@@ -3008,10 +3074,10 @@ the CatalogHonest functional + e2e Part A tests; `[CONFIG-ONLY]` rows are marked
 
 | ID | Target | Profile | DDL proof | Honest live signal |
 |----|--------|---------|-----------|--------------------|
-| FE.9 / WE.1 | S3 / object store | `s3:text` writable | `FORMATTER='pxfwritable_export'`, no `LOG ERRORS`; reversed INSERT | objects LAND in MinIO `…/exports/s3/` (S3 list/HEAD); `s3:parquet` `[CONFIG-ONLY]` |
-| FE.10 | HDFS | `hdfs:text` writable | same writable DDL | part files LAND in HDFS `/data-lake/exports/hdfs/` (WebHDFS); `hdfs:parquet/avro` `[CONFIG-ONLY]` (DATA_SCHEMA) |
-| FE.11 | JDBC | bare `jdbc` writable | same writable DDL | rows LAND in `pgsource` `sourcedb.export_target` (`count(*) > 0`) — strongest |
-| WE.2 | all three | per profile | `FORMATTER='pxfwritable_export'` + correct format | text/CSV-shaped / JDBC rows; parquet/avro `[CONFIG-ONLY]` |
+| FE.9 / WE.1 | S3 / object store | `s3:text` writable | `FORMAT 'TEXT' (delimiter ',')` (per-profile clause), no `LOG ERRORS`; reversed INSERT | objects LAND in MinIO `…/exports/s3/` — **non-zero-byte** + full read-back round-trip via the `FORMAT 'CSV'` clause (U022 live); `s3:parquet` `[CONFIG-ONLY]` |
+| FE.10 | HDFS | `hdfs:text` writable | `FORMAT 'TEXT' (delimiter ',')` (per-profile clause) | part files LAND in HDFS `/data-lake/exports/hdfs/` (WebHDFS, `length > 0` — U022 live); `hdfs:parquet/avro` `[CONFIG-ONLY]` (DATA_SCHEMA) |
+| FE.11 | JDBC | bare `jdbc` writable | `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')` (bridge — correct for jdbc) | rows LAND in `pgsource` `sourcedb.export_target` (`count(*) > 0`) — strongest |
+| WE.2 | all three | per profile | the **per-profile clause** (`PXFWriteFormatClause`) is present and the wrong-direction clause is absent | text/CSV-shaped / JDBC rows; parquet/avro `[CONFIG-ONLY]` |
 | SF.1 | S3 (filtered) | `s3:text` + `sourceFilter` | `… SELECT * FROM <target> WHERE region='us-east'` | filtered export lands FEWER rows than baseline |
 | SF.2 / SF.2b | — | — (webhook) | none | admission DENY: W.17(a) mode gate / W.17(b) `;` sanity check |
 
@@ -3393,18 +3459,22 @@ filtered FDW load lands **950** (`< 1000`); `job_status` is **2** (success) with
 `rows_total` harvested. **EQUIVALENCE** holds (1000 == 1000) over the same CSV
 dataset.
 
-> **Distinct pre-existing caveat (NOT the FDW path).** The **external-table**
-> read path for an `s3:text` profile uses `FORMAT 'CUSTOM'
-> (FORMATTER='pxfwritable_import')`, which returns each CSV line as a **single
-> text field** — so the `s3-ext-load` Job fails on **multi-column CSV** ("Record
-> has 1 fields but the schema size is N"). This is a **pre-existing
-> external-table-path limitation**, independent of the FDW work: the **FDW path
-> handles CSV correctly** because it maps `s3:text` → the FDW `format 'csv'`. The
-> equivalence comparison therefore loads `events_ext` over the **same** dataset
-> via the operator's persistent FDW foreign table when the external-table CSV
-> leg can't parse, and remains a true equal-row-count assertion. (Fixing the
-> external-table `s3:text` CSV parse — e.g. emitting `FORMAT 'CSV'` for delimited
-> text profiles — is tracked separately and is out of Scenario 103's FDW scope.)
+> **Distinct pre-existing caveat (RESOLVED 2026-11-15 — DEF-1 fix; kept for
+> history).** The **external-table** read path for an `s3:text` profile
+> previously used `FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')`, which
+> returned each CSV line as a **single text field** — so the `s3-ext-load` Job
+> failed on **multi-column CSV** ("Record has 1 fields but the schema size is
+> N"). This was a **pre-existing external-table-path limitation**, independent
+> of the FDW work: the **FDW path handles CSV correctly** because it maps
+> `s3:text` → the FDW `format 'csv'`. The equivalence comparison therefore
+> loaded `events_ext` over the **same** dataset via the operator's persistent
+> FDW foreign table when the external-table CSV leg couldn't parse, and remained
+> a true equal-row-count assertion. **Resolution:** the tracked fix shipped —
+> `PXFReadFormatClause` now emits `FORMAT 'CSV'` for delimited-text profiles
+> (non-`hive` schemes), live-proven on 2.2.0 (`FORMAT 'CSV';` in the job log,
+> `DATALOAD_ROWS=1000`, three fields parsed per row — U027/U028a; 175,000-row
+> exact-fidelity reads on both `s3:text` and `hdfs:text` — U019 §4). Both paths
+> now parse multi-column CSV; the FDW equivalence proof stands unchanged.
 
 #### Artifacts
 
@@ -3923,8 +3993,8 @@ to 0; drive a job lifecycle → `data_loading_job_status` cycles 0→1→2→3."
 | M | Metric | Decision | REAL source / honest position |
 |---|--------|----------|-------------------------------|
 | **M.1** | `cloudberry_pxf_service_up{cluster,namespace,segment_host}` | **Implemented** | Per-segment-primary-pod `pxf` `ContainerStatuses[pxf].Ready` via `util.PXFReadyByHost`; the **per-segment disaggregation** of `cloudberry_pxf_status`. `1` healthy / `0` on a killed segment. Emitted **only for observed segment hosts** — never a synthesized host. |
-| **M.2** | `cloudberry_pxf_requests_total` | **Implemented (actuator passthrough)** | The **real** `http_server_requests_seconds_count` scraped from the PXF Actuator `/actuator/prometheus`. **Label caveat:** count is REAL; `server`/`profile`/`operation` are **NOT** honestly derivable from the actuator URI → downgraded to actuator-native `uri`/`method`/`status` — never fabricated. |
-| **M.3** | `cloudberry_pxf_request_duration_seconds` | **Implemented (actuator passthrough)** | The **real** latency histogram `http_server_requests_seconds_sum`/`_bucket` from the same scrape. **Label caveat:** latency is REAL; `server`/`profile` downgraded to actuator-native — never fabricated. |
+| **M.2** | `cloudberry_pxf_requests_total` | **BLOCKED under SE.5 (revised 2026-11-15 — DEF-5 adjudication; was "Implemented (actuator passthrough)")** | The intended source was the real `http_server_requests_seconds_count` scraped from the PXF Actuator `/actuator/prometheus` by the dedicated vmagent `:5888` job. The operator-side half (actuator enablement via `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus`) is real and the endpoint is healthy via **loopback** — but the **cross-pod scrape can never succeed**: the SE.5 NetworkPolicy deliberately omits cross-pod ingress to `:5888` (its whole purpose), so the vmagent job was **removed from the monitoring chart** by the DEF-5 decision (option b). **0 Micrometer series in VictoriaMetrics** is therefore the **expected, correct** steady state, not a regression. If ever unblocked (a deliberate SE.5 exception), re-add the chart job — the label-honesty caveat still applies (`server`/`profile`/`operation` NOT honestly derivable → actuator-native `uri`/`method`/`status`; never fabricated). |
+| **M.3** | `cloudberry_pxf_request_duration_seconds` | **BLOCKED under SE.5 (revised 2026-11-15 — DEF-5 adjudication; was "Implemented (actuator passthrough)")** | Same as M.2 — the real latency histogram `http_server_requests_seconds_sum`/`_bucket` is served on `:5888/actuator/prometheus` (loopback-healthy) but is **not scrapable cross-pod** under SE.5; the chart job was removed by the DEF-5 decision. PXF request/health observability is covered instead by M.1 `cloudberry_pxf_service_up{segment_host}` + `cloudberry_pxf_status` (operator-side, live-proven). |
 | **M.4** | `cloudberry_pxf_bytes_transferred_total` | **ABSENT (Planned)** | No honest external-bytes counter in PXF 2.1.0 (actuator exposes only `http_server_requests` + JVM). Test `109-M4-ABSENT` asserts NOT-emitted. |
 | **M.5** | `cloudberry_pxf_records_total` | **ABSENT (Planned, substituted)** | No PXF-native record counter; record throughput is observed via the honest `cloudberry_data_loading_rows_total`. `109-M5-ABSENT` asserts NOT-emitted; `109-M5-SUBST` asserts `rows_total` is the substitute. |
 | **M.6** | `cloudberry_pxf_errors_total` | **FOLDED (no synthetic metric)** | PXF exposes no typed error counts. Honest error signals: (1) `cloudberry_data_loading_errors_total{job}` on a Failed load (+ `job_status=3`); (2) actuator non-2xx `http_server_requests{status=~"4..\|5.."}`. **No typed `cloudberry_pxf_errors_total{error_type}` is registered.** `109-M6-F` asserts a forced pxf:// error increments `data_loading_errors_total` + flips `job_status=3`; `109-M6-L` asserts actuator non-2xx is visible. |
@@ -3941,18 +4011,54 @@ to 0; drive a job lifecycle → `data_loading_job_status` cycles 0→1→2→3."
 
 #### The actuator-scrape requirement (dedicated vmagent job — a honesty trap)
 
-M.2/M.3 require an **explicit, dedicated vmagent scrape job** for the PXF actuator
-at `:5888/actuator/prometheus`. **A single pod scrape annotation cannot cover both
-exporters**: the segment-primary pod **already** carries
-`prometheus.io/scrape=true`, `prometheus.io/port=9187`, `prometheus.io/path=/metrics`
-for the pg query-exporter, and the annotation mechanism supports **exactly one
-(port,path) pair per pod**. The PXF actuator lives on a **different port (`:5888`)
-and path (`/actuator/prometheus`)**, so re-using the existing annotation would
-**silently scrape nothing** — a honesty trap (claiming "scraped" while no data
-flows). Scenario 109 therefore adds an **explicit additional `scrape_config`** in
-the vmagent ConfigMap that selects the segment-primary pods by label and targets
-`:5888/actuator/prometheus`. The cross-cutting `109-VM-SCRAPE` case proves both the
-`:9187` exporter **and** the `:5888` actuator job scrape the **same** segment pod.
+> **Revision note (2026-11-15 — DEF-5 adjudication; the `pxf-actuator` scrape
+> job is REMOVED from the monitoring chart).** The design below is retained as
+> the honest account of why a dedicated job was required — but the
+> **operator-built SE.5 NetworkPolicy deliberately excludes cross-pod ingress
+> to `:5888`** ("the policy's whole purpose", `networkpolicy_builder.go`), so
+> the cross-pod vmagent scrape can **never** succeed: live evidence (U016)
+> showed the endpoint healthy via loopback (200, ~35.8 KB in 0.05 s) while the
+> chart's `pxf-actuator` job produced **2 permanently-down targets, 0
+> Micrometer series in VictoriaMetrics, and permanent failed-target noise**.
+> **Decision (option b of the three options on the table): drop the
+> `pxf-actuator` job from the monitoring chart and keep SE.5 unchanged.**
+> Security posture beats observability value here: the scraped set
+> (`http_server_requests_*` with downgraded labels — PXF's own REST traffic,
+> NOT data-loading throughput) is **not in the required-metrics set**
+> (REQ-ACC-8 unaffected), while PXF health is already covered live by the
+> operator-side `cloudberry_pxf_service_up{segment_host}` (M.1) +
+> `cloudberry_pxf_status` + the `cloudberry_data_loading_*` job metrics. The
+> rejected options: **(a) SE.5 exception** for the monitoring namespace —
+> would weaken the loopback-only confinement of a service that holds
+> external-store credentials, couples cluster security posture to the
+> monitoring stack's namespace/pod labeling, and buys only non-required,
+> label-downgraded HTTP-server counts; **(c) operator-side bridging metric** —
+> the operator pod equally cannot reach `:5888` cross-pod, so it would need
+> either the same SE.5 exception or per-reconcile exec-scraping of every
+> segment pod, and any relaying of actuator series would violate the
+> metrics-honesty position. Dropping the chart job is trivially reversible
+> (re-add the job **together with** an explicit SE.5 exception decision if PXF
+> request telemetry ever becomes a requirement). Consequences: M.2/M.3 are
+> reclassified **BLOCKED under SE.5** (see the per-metric table); the
+> scenario109 e2e M.2/M.3 legs skip cleanly when the scrape job is absent
+> (their existing gating); U013 already removed the M.2/M.3 dashboard panel.
+
+M.2/M.3 would have required an **explicit, dedicated vmagent scrape job** for
+the PXF actuator at `:5888/actuator/prometheus`. **A single pod scrape
+annotation cannot cover both exporters**: the segment-primary pod **already**
+carries `prometheus.io/scrape=true`, `prometheus.io/port=9187`,
+`prometheus.io/path=/metrics` for the pg query-exporter, and the annotation
+mechanism supports **exactly one (port,path) pair per pod**. The PXF actuator
+lives on a **different port (`:5888`) and path (`/actuator/prometheus`)**, so
+re-using the existing annotation would **silently scrape nothing** — a honesty
+trap (claiming "scraped" while no data flows). Scenario 109 therefore
+**previously** added an explicit additional `scrape_config` in the vmagent
+ConfigMap that selected the segment-primary pods by label and targeted
+`:5888/actuator/prometheus`; the cross-cutting `109-VM-SCRAPE` case proved both
+the `:9187` exporter **and** the `:5888` actuator job scraped the **same**
+segment pod. **Per the DEF-5 decision above, that job is now removed from the
+chart** — the `109-VM-SCRAPE` case is satisfied vacuously (the `:9187`
+annotation scrape continues to work; the `:5888` leg no longer exists).
 
 #### Honest-label boundary (M.2/M.3)
 
@@ -3991,8 +4097,11 @@ panel queries a non-emitted metric.
 - `internal/builder/{pxf_builder,dataload_builder,gpload_builder}.go` — the
   actuator `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus` env and
   the conditional `DATALOAD_BYTES=<n>` (`wc -c`, local gpload input) marker.
-- `test/monitoring/vmagent/templates/configmap.yaml` — the explicit
-  `:5888/actuator/prometheus` scrape job.
+- `test/monitoring/vmagent/templates/configmap.yaml` — ~~the explicit
+  `:5888/actuator/prometheus` scrape job~~ **removed 2026-11-15 by the DEF-5
+  decision (option b)** — the cross-pod scrape is unreachable under the SE.5
+  NetworkPolicy; see the
+  [actuator-scrape revision note](#the-actuator-scrape-requirement-dedicated-vmagent-job--a-honesty-trap).
 - `cases.Scenario109Cases()` — the `109-M{1..16}-{U,F,L}` catalog + the
   `109-HONESTY` / `109-VM-SCRAPE` cross-cutting cases.
 
@@ -4024,7 +4133,7 @@ TLS source is present — otherwise it is CONFIG-ONLY and never simulated."*
 | **SE.2 — JDBC TLS** | **CONFIG-ONLY** unless the source speaks TLS | The JDBC URL / `ssl` params are rendered verbatim into `jdbc-site.xml`. A live encrypted handshake is asserted **only** when the source actually speaks TLS; otherwise the rendered config is verified (no faked handshake). |
 | **SE.3 — S3 TLS** | **CONFIG-ONLY** unless the source speaks TLS | `fs.s3a.connection.ssl.enabled=true` is rendered into `s3-site.xml`. Same honesty boundary as SE.2. |
 | **SE.4 — Kerberos keytab** | **REAL config-correctness; live auth CONFIG-ONLY (no KDC)** | The keytab Secret is mounted on **both** the PXF sidecar and `pxf-cred-init` at `$PXF_BASE/keytabs/<server>/<key>`; `core-site.xml` is verified to carry `hadoop.security.authentication=kerberos`, `pxf.service.kerberos.principal=<principal>` and `pxf.service.kerberos.keytab=$PXF_BASE/keytabs/<server>/<key>`; an optional `krb5ConfigMap` is mounted at `/etc/krb5.conf` (`KRB5_CONFIG`). **HONESTY:** the operator never runs `kinit` and the test env has **no KDC**, so live authenticated Hadoop/Hive/HBase access is CONFIG-ONLY — config-correctness is verified, a live Kerberos handshake is **never simulated**. |
-| **SE.5 — segment↔sidecar `localhost`-only** | **REAL (proven)** | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy selecting the segment-primary pods whose ingress rules **omit** cross-pod access to PXF `:5888`. Because same-pod `localhost` traffic is never subject to a NetworkPolicy, the in-pod segment→sidecar path keeps working: the policy is applied **and** a real `pxf://` load still succeeds (the proof is the combination, not the policy alone). |
+| **SE.5 — segment↔sidecar `localhost`-only** | **REAL (proven)** | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy selecting the segment-primary pods whose ingress rules **omit** cross-pod access to PXF `:5888`. Because same-pod `localhost` traffic is never subject to a NetworkPolicy, the in-pod segment→sidecar path keeps working: the policy is applied **and** a real `pxf://` load still succeeds (the proof is the combination, not the policy alone). **(2026-11-15 — DEF-5 adjudication: this invariant is deliberately KEPT unchanged.** The monitoring chart's vmagent `pxf-actuator` cross-pod `:5888` scrape job — which could never succeed under this policy — was **removed from the chart** instead of opening an exception; see the [actuator-scrape revision note](#the-actuator-scrape-requirement-dedicated-vmagent-job--a-honesty-trap). The monitoring stack therefore gets **no** SE.5 exception; PXF health observability stays with the operator-side M.1 gauge.**)** |
 | **SE.6 — dedicated minimal-privilege DB role** | **REAL (least-privilege)** | `db.EnsureDataLoaderRole` runs `CREATE ROLE <role> NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` (idempotent) and grants **only** `SELECT,INSERT ON PROTOCOL pxf`. The proof: the role has the pxf protocol grants **and** cannot perform unrelated privileged ops (e.g. `CREATE ROLE`/`CREATE DATABASE` are denied). Opt-in via `pxf.dataLoaderRole`; **empty ⇒ `gpadmin`** (the existing behavior is byte-identical when unset). |
 
 #### CRD knobs
@@ -4379,21 +4488,28 @@ signal: a `PXFServersChanged` event with the removed server listed under
 >   (`s3`/`gs`/`abfss`/`wasbs`). `pxfpolicy.IsProfileWritable` admits `s3:text`/
 >   `s3:parquet`/`s3:avro`, `hdfs:text`/`hdfs:parquet`/`hdfs:avro`/
 >   `hdfs:sequencefile`, and **bare `jdbc`**.
-> - **Builder (Implemented).** When `pxfJob.mode == "writable"`,
->   `buildPXFExternalTableDDL` emits `CREATE WRITABLE EXTERNAL TABLE … FORMAT
->   'CUSTOM' (FORMATTER='pxfwritable_export')` with **no** `LOG ERRORS` / `SEGMENT
->   REJECT LIMIT` (writable tables take no reject limit). The read/import path is
->   unchanged (`pxfwritable_import`). The writable DDL / export-script path is
->   **profile-agnostic** — the SAME `dataload_builder.go` code emits the S3, HDFS
->   and JDBC export tables, differing only by the LOCATION `PROFILE`/`SERVER`.
->   **Defense-in-depth:** the builder re-checks `pxfpolicy.IsProfileWritable` and
->   **errors** on a writable + read-only-format combination even if the webhook
->   were bypassed.
+> - **Builder (Implemented — per-profile FORMAT clause).** When
+>   `pxfJob.mode == "writable"`, `buildPXFExternalTableDDL` emits `CREATE
+>   WRITABLE EXTERNAL TABLE … FORMAT <per-profile clause>` with **no** `LOG
+>   ERRORS` / `SEGMENT REJECT LIMIT` (writable tables take no reject limit):
+>   `FORMAT 'TEXT' (delimiter ',')` for the delimited-text family
+>   (`PXFWriteFormatClause`) and `FORMAT 'CUSTOM'
+>   (FORMATTER='pxfwritable_export')` for parquet/avro/SequenceFile and bare
+>   `jdbc`. The read/import path is likewise per-profile
+>   (`PXFReadFormatClause`; `pxfwritable_import` for the bridge family). The
+>   writable DDL / export-script path is generated by the **SAME**
+>   `dataload_builder.go` code for the S3, HDFS and JDBC export tables,
+>   differing only by the LOCATION `PROFILE`/`SERVER` and the profile-aware
+>   clause. **Defense-in-depth:** the builder re-checks
+>   `pxfpolicy.IsProfileWritable` and **errors** on a writable +
+>   read-only-format combination even if the webhook were bypassed.
 > - **Export targets — S3 + HDFS + JDBC (Verified — Scenario 99).** The three
 >   writable-export targets are exercised live in Scenario 99: **S3** (FE.9/WE.1),
->   **HDFS** (FE.10) and **JDBC** (FE.11), all via `CREATE WRITABLE EXTERNAL TABLE
->   … FORMATTER='pxfwritable_export'`. **WE.2** asserts the data lands with the
->   correct format and the `pxfwritable_export` formatter.
+>   **HDFS** (FE.10) and **JDBC** (FE.11), each with its per-profile clause —
+>   text targets via `FORMAT 'TEXT' (delimiter ',')` (live-proven post-DEF-4:
+>   non-zero-byte objects + read-back round-trip), `jdbc` via `FORMAT 'CUSTOM'
+>   (FORMATTER='pxfwritable_export')`. **WE.2** asserts the data lands with the
+>   correct format and the per-profile clause.
 > - **Filtered export — `sourceFilter` (Implemented — Scenario 99).** The new
 >   optional `pxfJob.sourceFilter` WHERE predicate turns the export into `INSERT
 >   INTO <writable_ext> SELECT * FROM <target> WHERE <sourceFilter>` (a filtered
@@ -4410,7 +4526,7 @@ signal: a `PXFServersChanged` event with the removed server listed under
 > Both the webhook and the builder read the SINGLE source of truth
 > [`internal/pxfpolicy`](#single-source-of-truth-internalpxfpolicy).
 
-PXF supports writing data back to external stores via `CREATE WRITABLE EXTERNAL TABLE`. A `mode: writable` PXF job builds a writable external table (no `LOG ERRORS`/`SEGMENT REJECT LIMIT`) and the load script **reverses the INSERT direction** — `INSERT INTO <writable_ext> SELECT * FROM <target> [WHERE <sourceFilter>]` — pushing Cloudberry query results OUT to the external store. The export path is profile-agnostic; the three verified targets (Scenario 99) are **S3 / object stores** (FE.9/WE.1), **HDFS** (FE.10) and **JDBC** (FE.11):
+PXF supports writing data back to external stores via `CREATE WRITABLE EXTERNAL TABLE`. A `mode: writable` PXF job builds a writable external table (no `LOG ERRORS`/`SEGMENT REJECT LIMIT`) and the load script **reverses the INSERT direction** — `INSERT INTO <writable_ext> SELECT * FROM <target> [WHERE <sourceFilter>]` — pushing Cloudberry query results OUT to the external store. The export path uses the **per-profile FORMAT clause** (one builder, `PXFWriteFormatClause`); the three verified targets (Scenario 99) are **S3 / object stores** (FE.9/WE.1), **HDFS** (FE.10) and **JDBC** (FE.11):
 
 **S3 / object-store export (FE.9 / WE.1)** — write-capable object-store formats (`text`/`parquet`/`avro`):
 
@@ -4422,12 +4538,12 @@ FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');
 INSERT INTO export_events SELECT * FROM public.events;
 ```
 
-**HDFS export (FE.10)** — `hdfs:text` for the deterministic live landing (`hdfs:parquet`/`hdfs:avro` may need `DATA_SCHEMA`, config-only):
+**HDFS export (FE.10)** — `hdfs:text` for the deterministic live landing (`hdfs:parquet`/`hdfs:avro` may need `DATA_SCHEMA`, config-only). The text-family target uses the **per-profile clause** `FORMAT 'TEXT' (delimiter ',')` — the bridge formatter is rejected by PXF's `LineBreakAccessor` on text profiles (DEF-4; see the format-clause contract note):
 
 ```sql
 CREATE WRITABLE EXTERNAL TABLE export_hdfs (LIKE public.export_src)
 LOCATION ('pxf:///data-lake/exports/hdfs/?PROFILE=hdfs:text&SERVER=hadoop-cluster')
-FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export');
+FORMAT 'TEXT' (delimiter ',');
  
 INSERT INTO export_hdfs SELECT * FROM public.export_src;
 ```
@@ -4592,7 +4708,7 @@ Job pod logs). Restore the broken condition → the Job re-runs → the init pas
 | **SE.2** — JDBC TLS | **Implemented (declarative)** | **CONFIG-ONLY** unless the source speaks TLS | TLS/SSL is wired declaratively via JDBC URL / ssl params rendered into `jdbc-site.xml`. A live encrypted handshake is asserted **only** when the source actually speaks TLS; otherwise the rendered config is verified (no faked handshake). |
 | **SE.3** — S3 TLS | **Implemented (declarative)** | **CONFIG-ONLY** unless the source speaks TLS | `fs.s3a.connection.ssl.enabled=true` is rendered into `s3-site.xml`. Same honesty boundary as SE.2 — live encryption asserted only against a TLS source. |
 | **SE.4** — Kerberos keytab | **Implemented (config-correct)** | **CONFIG-ONLY** (no live KDC) | `servers[].kerberos{principal,keytabSecret,krb5ConfigMap,realm}` mounts the keytab Secret on the PXF sidecar + cred-init at `$PXF_BASE/keytabs/<server>/` and folds `hadoop.security.authentication=kerberos` + `pxf.service.kerberos.principal`/`.keytab` into `core-site.xml`. Live *authenticated* Hadoop/Hive/HBase access is CONFIG-ONLY — the test env has no KDC, and the operator never performs a live `kinit`. |
-| **SE.5** — segment↔sidecar `localhost`-only | **Implemented** | **REAL (proven)** | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy for the segment-primary pods that does **not** allow cross-pod ingress to PXF `:5888`; same-pod localhost traffic is never subject to NetworkPolicy, so loads keep working (policy applied + load still succeeds). |
+| **SE.5** — segment↔sidecar `localhost`-only | **Implemented** | **REAL (proven)** | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy for the segment-primary pods that does **not** allow cross-pod ingress to PXF `:5888`; same-pod localhost traffic is never subject to NetworkPolicy, so loads keep working (policy applied + load still succeeds). **Kept unchanged by the 2026-11-15 DEF-5 decision — no monitoring exception; the chart's `pxf-actuator` scrape job is removed instead (see the [actuator-scrape revision note](#the-actuator-scrape-requirement-dedicated-vmagent-job--a-honesty-trap)).** |
 | **SE.6** — dedicated minimal-privilege DB role | **Implemented** | **REAL (least-privilege)** | `db.EnsureDataLoaderRole` creates a `NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` role granted **only** `SELECT,INSERT ON PROTOCOL pxf`. Opt-in via `pxf.dataLoaderRole` (empty ⇒ `gpadmin`, the existing behavior). The role cannot perform unrelated operations. |
 
 - **SE.1 / SL.6** — All external data source credentials are stored in Kubernetes Secrets and rendered into init-container XML configs (`pxf-cred-init`). Secrets are **never** committed to ConfigMaps; they exist only in the ephemeral pod filesystem. **REAL (verified).**
@@ -4618,8 +4734,8 @@ today. Verified against `api/v1alpha1/types.go`,
 | Webhook validation | **W.1–W.25 + W.10b** + W.10 profile allowlist + W.16 `file://` rejection (tested by Scenario 89; W.3/W.4 object-store extension + W.10b write-capability by Scenario 96; **W.17 `sourceFilter` by Scenario 99**; **W.18–W.22 gpload by Scenario 101**; **W.23/W.24/W.23c custom-connector + streaming by Scenario 102**; **W.25 `loadMethod` + the W.17 fdw-read tweak by Scenario 103**) |
 | Object-store server types `gs`/`abfss`/`wasbs` (+ Dell-ECS / MinIO variants) | CRD `PxfServerSpec.Type` enum widened; W.3/W.4 admit them; all render into `<server>__s3-site.xml` (`renderPXFServer`) — Scenario 96 |
 | Write-capability ENFORCEMENT (W.10b admission + builder re-check) | `mode: writable` + read-only format (`json`/`orc`/`rc`) **rejected**; single source of truth `internal/pxfpolicy` — Scenario 96 |
-| Writable external-table DDL (`pxfwritable_export`) | `buildPXFExternalTableDDL` emits `CREATE WRITABLE EXTERNAL TABLE … FORMATTER='pxfwritable_export'` (no `LOG ERRORS`/reject limit) for writable formats — Scenario 96 |
-| Writable EXPORT to **S3** (FE.9/WE.1) / **HDFS** (FE.10) / **JDBC** (FE.11) + WE.2 correct-format gate | Profile-agnostic `dataload_builder.go`; `IsProfileWritable` admits `s3:`/`hdfs:` text/parquet/avro(+seq) + bare `jdbc`; objects/part-files/rows LAND; `parquet`/`avro` `[CONFIG-ONLY]` (DATA_SCHEMA) — **Scenario 99** |
+| Writable external-table DDL (per-profile FORMAT clause) | `buildPXFExternalTableDDL` emits `CREATE WRITABLE EXTERNAL TABLE … FORMAT <PXFWriteFormatClause(profile)>` (text family → `FORMAT 'TEXT' (delimiter ',')`; parquet/avro/sequencefile/jdbc → `FORMATTER='pxfwritable_export'`; no `LOG ERRORS`/reject limit) for writable formats — Scenarios 96/99, DEF-4 fix live-proven (U019/U022) |
+| Writable EXPORT to **S3** (FE.9/WE.1) / **HDFS** (FE.10) / **JDBC** (FE.11) + WE.2 correct-format gate | One `dataload_builder.go` code path with the **per-profile clause** (`PXFWriteFormatClause`); `IsProfileWritable` admits `s3:`/`hdfs:` text/parquet/avro(+seq) + bare `jdbc`; objects/part-files/rows LAND (text legs live-proven post-DEF-4); `parquet`/`avro` `[CONFIG-ONLY]` (DATA_SCHEMA) — **Scenario 99** |
 | `pxfJob.sourceFilter` filtered export + **W.17** (`validateSourceFilter`) | `INSERT INTO <ext> SELECT * FROM <target> WHERE <sourceFilter>` via quoted heredoc (single-quote safe); unset → byte-identical full export; W.17 valid on `mode: writable` OR `loadMethod: fdw` read (Scenario 103), rejects a plain external-table read + `;`/`--`/`/*` — **Scenario 99 + 103** |
 | FDW-based loading path (`pxfJob.loadMethod: fdw`) + **W.25** (`validateLoadMethod`) | `buildFDWDDL`/`buildFDWDataLoadScript`: persistent `CREATE SERVER`/`USER MAPPING`/`FOREIGN TABLE` IF NOT EXISTS (per-protocol `pxf_fdw` wrapper, `(LIKE <target>)`, never dropped) → `SELECT count(*) FROM <foreign>` → `INSERT INTO <target> SELECT * FROM <foreign> [WHERE <sourceFilter>]` → `ANALYZE`. EQUIVALENT to the external-table path (equal row counts); W.25 enum + fdw read-only (reject `mode: writable`/`continuous: true`). Reuses `cloudberry_data_loading_*` — NO new metric — **Scenario 103** |
 | Hadoop-profile write-capability (HDFS per-format + **scheme-aware** Hive/HBase read-only) | `IsProfileWritable` is now scheme-aware (`readOnlySchemes={hive,hbase}`): `hdfs:text/parquet/avro/SequenceFile` writable; `hdfs:json/orc` + **all** `hive*` + `HBase` rejected (`hive:text` writable rejected despite `text` being a writable format) — Scenario 97 |
@@ -4667,7 +4783,7 @@ today. Verified against `api/v1alpha1/types.go`,
 | CLI helper `runAPIPut` (alongside `runAPIGet`/`runAPIPost`/`runAPIDelete`) | **Implemented** (Scenario 108) |
 | **SE.1 / SL.6** — init-container secret rendering (Scenario 111) | `pxf-cred-init` `envsubst`-resolves `${PLACEHOLDER}` site-XML from `credentialSecrets[]` into the ephemeral `pxf-servers` emptyDir; secrets only in the ephemeral pod fs, **never in the ConfigMap**. **REAL (verified).** |
 | **SE.4** — Kerberos keytab from Secret (Scenario 111) | New `pxf.servers[].kerberos{principal,keytabSecret{name,key},krb5ConfigMap,realm}`. Keytab Secret mounted on the PXF sidecar + `pxf-cred-init` at `$PXF_BASE/keytabs/<server>/`; renders `hadoop.security.authentication=kerberos` + `pxf.service.kerberos.principal`/`.keytab` into `core-site.xml`; optional krb5.conf ConfigMap mount. Webhook requires principal+keytab when kerberos set, rejects kerberos on non-hdfs/hive/hbase types. **Config-correct; live authenticated access CONFIG-ONLY (no KDC) — no faked `kinit`.** |
-| **SE.5** — segment↔sidecar `localhost`-only NetworkPolicy (Scenario 111) | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy for segment-primary pods that does NOT allow cross-pod ingress to PXF `:5888`; same-pod localhost traffic is never subject to NetworkPolicy so loads keep working. **REAL (policy applied + load still succeeds).** |
+| **SE.5** — segment↔sidecar `localhost`-only NetworkPolicy (Scenario 111) | `BuildPXFClusterNetworkPolicy` emits a NetworkPolicy for segment-primary pods that does NOT allow cross-pod ingress to PXF `:5888`; same-pod localhost traffic is never subject to NetworkPolicy so loads keep working. **REAL (policy applied + load still succeeds).** Invariant kept by the 2026-11-15 DEF-5 decision (no monitoring exception; chart `pxf-actuator` job removed — M.2/M.3 BLOCKED). |
 | **SE.6** — dedicated minimal-privilege DB role (Scenario 111) | `db.EnsureDataLoaderRole` creates `CREATE ROLE <role> NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN` granted **only** `SELECT,INSERT ON PROTOCOL pxf`. Opt-in via `pxf.dataLoaderRole` (empty ⇒ `gpadmin`, unchanged); additive. **REAL least-privilege.** |
 | **SE.2 / SE.3** — JDBC / S3 TLS passthrough (Scenario 111) | TLS wired declaratively: JDBC URL/`ssl` params → `jdbc-site.xml`; `fs.s3a.connection.ssl.enabled=true` → `s3-site.xml`. **Declarative; live encrypted handshake CONFIG-ONLY unless the source speaks TLS — never faked.** |
 | **DIS.1** — `dataLoading.enabled: false` TEARS DOWN (Scenario 112) | `reconcileDataLoading` dispatches to `cleanupDataLoading`: deletes the `<cluster>-pxf-servers` ConfigMap (CLUSTER ctrl `ensurePxfServersConfigMap` delete-when-disabled), gpfdist Deployment/Service/PVC, all data-loading Jobs+CronJobs, gpload control-file ConfigMaps, the PXF NetworkPolicy; drops the PXF sidecar from the segment-primary StatefulSet (re-render without it); clears `Status.DataLoading`; condition `DataLoadingConfigured=False` reason `DataLoadingDisabled`; one-shot `DataLoadingDisabled` event (de-dup on transition); `cloudberry_data_loading_jobs_active`→0, `cloudberry_pxf_servers_configured`→0. **No longer a no-op.** Re-enable → idempotent reconcile redeploys everything. |
@@ -4685,7 +4801,7 @@ today. Verified against `api/v1alpha1/types.go`,
 | gpload | Control-file (`gpload` YAML) Job |
 | Writable external tables (export-Job kind) | The write-capability **enforcement**, the `pxfwritable_export` **writable DDL** (Scenario 96) and the **S3/HDFS/JDBC export targets + `sourceFilter` filtered export + W.17** (Scenario 99) are now **Implemented** (see the Implemented table); a first-class **data-export Job kind** (beyond the writable-DDL path the load Job already builds) remains Planned |
 | Security (SE.1–SE.6, SL.6) | **NONE Planned** — the data-loading security controls are now **Implemented (Scenario 111)**: SE.1/SL.6 init-container secret rendering (REAL), SE.5 segment↔sidecar `localhost`-only NetworkPolicy (REAL), SE.6 dedicated minimal-privilege DB role (REAL), SE.4 Kerberos keytab mounting (config-correct; live auth CONFIG-ONLY/no-KDC), SE.2/SE.3 JDBC/S3 TLS passthrough (declarative; live TLS CONFIG-ONLY unless the source speaks TLS). See the Implemented table + [Scenario 111](#scenario-111--security-se1se6-sl6). |
-| Metrics (6 honestly absent) | **Scenario 109 flipped 4 to Implemented** from real sources: `cloudberry_pxf_service_up{segment_host}` (M.1, per-segment `pxf` readiness via `util.PXFReadyByHost`), `cloudberry_pxf_requests_total` (M.2) + `cloudberry_pxf_request_duration_seconds` (M.3) (the **real** `http_server_requests_*` actuator series scraped from `/actuator/prometheus` by a dedicated vmagent `:5888` job — count/latency REAL, `server/profile/operation` labels downgraded to actuator-native, never fabricated), and `cloudberry_data_loading_bytes_total` (M.10, from the real `DATALOAD_BYTES` marker via `wc -c` on local gpload input; omitted otherwise). The **6 honestly-absent** families stay Planned: `pxf_bytes_transferred_total` (M.4), `pxf_records_total` (M.5; record throughput observed via `cloudberry_data_loading_rows_total`), `pxf_errors_total` (M.6 — **FOLDED** into `cloudberry_data_loading_errors_total` + actuator non-2xx; no synthetic typed counter registered), `pxf_active_connections` (M.7), and the 2 `cloudberry_gpfdist_*` (M.15/M.16, no scrapable endpoint). **`pxf_bytes_transferred_total` is a deliberate metrics-honesty hold (Scenario 98):** PXF 2.1.0's Spring Boot Actuator exposes no honest external-bytes counter, so filter pushdown is observed via row-count reduction (`cloudberry_data_loading_rows_total`) + `EXPLAIN` + source logs instead of a fabricated byte gauge. **Pre-load health-check failures (Scenario 104) add NO new operator metric** — they are observed via the EXISTING `cloudberry_data_loading_job_status=3` (Failed) + `cloudberry_data_loading_errors_total` + the `DataLoadingHealthCheckFailed` Event + the NEW kube-state-metrics (`kube_job_status_failed` / `kube_pod_init_container_status_*` / `kube_deployment_status_replicas_available`); the 6 honestly-absent `cloudberry_pxf_*`/`cloudberry_gpfdist_*` families stay Planned |
+| Metrics (6 honestly absent) | **Scenario 109 flipped 3 to Implemented** from real sources — `cloudberry_pxf_service_up{segment_host}` (M.1, per-segment `pxf` readiness via `util.PXFReadyByHost`) and `cloudberry_data_loading_bytes_total` (M.10, from the real `DATALOAD_BYTES` marker via `wc -c` on local gpload input; omitted otherwise) — **plus M.2/M.3, initially flipped to "Implemented" as an actuator passthrough and RECLASSIFIED 2026-11-15 to BLOCKED-under-SE.5 by the DEF-5 decision (option b)**: the vmagent `:5888` scrape job was removed from the monitoring chart because the SE.5 NetworkPolicy intentionally excludes cross-pod `:5888` ingress (live: endpoint loopback-healthy, 0 Micrometer series in VM, 2 permanently-down targets — U016); the operator-side actuator enablement remains real, and **0 series is the expected steady state**. The **6 honestly-absent** families stay Planned: `pxf_bytes_transferred_total` (M.4), `pxf_records_total` (M.5; record throughput observed via `cloudberry_data_loading_rows_total`), `pxf_errors_total` (M.6 — **FOLDED** into `cloudberry_data_loading_errors_total`; no synthetic typed counter registered), `pxf_active_connections` (M.7), and the 2 `cloudberry_gpfdist_*` (M.15/M.16, no scrapable endpoint). **`pxf_bytes_transferred_total` is a deliberate metrics-honesty hold (Scenario 98):** PXF 2.1.0's Spring Boot Actuator exposes no honest external-bytes counter, so filter pushdown is observed via row-count reduction (`cloudberry_data_loading_rows_total`) + `EXPLAIN` + source logs instead of a fabricated byte gauge. **Pre-load health-check failures (Scenario 104) add NO new operator metric** — they are observed via the EXISTING `cloudberry_data_loading_job_status=3` (Failed) + `cloudberry_data_loading_errors_total` + the `DataLoadingHealthCheckFailed` Event + the NEW kube-state-metrics (`kube_job_status_failed` / `kube_pod_init_container_status_*` / `kube_deployment_status_replicas_available`); the honestly-absent `cloudberry_pxf_*`/`cloudberry_gpfdist_*` families stay Planned |
 | Per-profile read/write counts | No runtime metric for per-profile read/write counts; the write-capability decision is enforced at admission/build time, not measured at runtime (Scenario 96 + 97 dashboards show the real `source_type` breakdown — incl. a Hadoop-filtered timeseries — plus text panels, no new metric) |
 | Filter-pushdown / projection runtime metric | No dedicated runtime metric — the pushdown/projection decision is emitted into the DDL/LOCATION at build time and **observed** (not metered) at runtime via row-count reduction (`cloudberry_data_loading_rows_total`) + `EXPLAIN` + source-side query logs (Scenario 98 dashboard adds a doc text panel, no new metric; `pxf_bytes_transferred_total` stays Planned) |
 | REST | **NONE Planned** — the entire data-loading REST surface (P.1–P.15) is now **Implemented**: `pxf/servers` CRUD (P.2–P.5), `external-tables` (P.15), `jobs/{job}/logs` (P.14) landed in **Scenario 107**; `pxf/{status,restart,sync}` in Scenario 95; job CRUD/lifecycle (P.7–P.13) in Scenario 107. |

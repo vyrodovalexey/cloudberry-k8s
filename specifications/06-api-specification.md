@@ -472,6 +472,47 @@ All P.1–P.15 endpoints are **Implemented and serving real data** (Scenario 107
 
 **Response `202`**: `{ "status": "restore started", "cluster": "...", "job": "...", "timestamp": "..." }`.
 
+**Restore retry-after-failure / Job-name collision semantics.** The restore Job
+name is **deterministic on the user-supplied backup timestamp** —
+`util.RestoreJobName(cluster, ts)` = `<cluster>-restore-<ts>` — so retrying a
+restore of the **same** timestamp always regenerates the **same** Job name and
+may collide with a leftover Job from a previous attempt. The collision contract
+(implemented in `handleRestoreBackup`; commit `8a79782`, live-proven against the
+deployed operator by the Scenario 85e collision cases):
+
+| Collision state of the existing `<cluster>-restore-<ts>` Job | Response | Action taken |
+|---|---|---|
+| **Terminal** — `JobFailed` **or** `JobComplete` (a failed **or** already-succeeded leftover) | **202** `restore started` | The finished Job is immutable in Kubernetes, so it is **deleted (background cascade)** and a fresh replacement Job is created (fresh status, no terminal conditions inherited). The previous outcome stays durably recorded in `status.backup`/`backupHistory[]` and `cloudberry_restore_total{result=…}` (transition-gated); the retry is honestly recorded as a **new** restore start. |
+| **In flight** — `Running` or `Pending` | **409 CONFLICT** | The in-flight Job is **never touched**. Body: code `CONFLICT`, message `restore job "<name>" is still in progress; wait for it to finish or delete it before retrying the restore`. No `cloudberry_restore_total{result="failed"}` increment (client conflict, not a restore failure). |
+| **Replacement-Create `AlreadyExists`** during the replace (a concurrent retry of the same timestamp won the replace race; also hit transiently while the just-deleted terminal leftover is still propagating) | **409 CONFLICT** | No second delete attempted — the same conflict semantics as the in-flight case, never a 500. Message: `restore job "<name>" is already being retried by another request`. Self-healing: a client retry succeeds once the winning replacement is running / the old object finishes deleting. |
+| Genuine server-side errors (Job inspect/delete/create failures other than the classified collision and the replace-race `AlreadyExists` above) | **500 INTERNAL_ERROR** | Honest error surfacing; nothing silently retried. |
+| No leftover (happy path) | **202** `restore started` | Job created directly; name generation unchanged (`util.RestoreJobName`). |
+
+The handler is **create-first-then-classify** (no get-before-create TOCTOU
+window): only an `AlreadyExists` create error on the **initial** Create routes
+to collision resolution; within the resolver, a replacement-Create
+`AlreadyExists` is itself surfaced as a **409** (never re-resolved, never a
+500).
+
+> **Revision note (2026-11-15 — DEF-6 fix codified).** This section was
+> previously **silent** on retry-after-failure; pre-fix, any name collision
+> (typically a failed restore Job lingering until `ttlSecondsAfterFinished`
+> GC) surfaced as an opaque **500 `failed to create restore job`**. The
+> semantics above codify the implemented fix (commit `8a79782`): terminal
+> leftover → delete-and-replace + **202**; in-flight leftover → **409
+> CONFLICT** with an actionable message; genuine server errors → **500**.
+> *(Corrected 2026-11-17 — slice-2 code review REV-009: the replacement-Create
+> `AlreadyExists` outcome of the replace race is **409 CONFLICT**, not 500 —
+> this table's first draft wrongly folded it into the 500 row while spec 11
+> correctly gave it a dedicated 409 row; both now match the implemented
+> handler `internal/api/server.go:3815-3822` and its unit pin.)*
+> Live-proven by the Scenario 85e collision cases against the deployed
+> operator (seeded FAILED leftover → **202** with a replacement Job of a fresh
+> uid; seeded in-flight leftover → **409** with the Job's uid unchanged). The
+> symmetric **backup** path (`POST /backups`) uses a server-generated
+> `time.Now()` timestamp and therefore has only a same-second collision window;
+> it is unchanged by this amendment.
+
 ### 5.18 `gprestoreOptions` → `gprestore` flag mapping
 
 The leading args are destination-aware (S3 → `--plugin-config /tmp/s3-config.yaml`; local → `--backup-dir <path>`) plus `--timestamp <ts>`.
@@ -690,7 +731,7 @@ GET /openapi/v3
 
 - **85d — `DELETE /backups/{timestamp}` (Admin).** Creates a `gpbackman` cleanup Job (`backup-delete`, label `avsoft.io/backup-operation=cleanup`) to remove the backup. Response `202`: `{ status:"deleted", cluster, job, timestamp }`. Negatives: invalid timestamp → `400`; Operator/Basic identity → `403`.
 
-- **85e — `POST /backups/{timestamp}/restore` (Admin).** Creates a restore **Job** (label `avsoft.io/backup-operation=restore`) whose `gprestore` args match `RestoreRequest.gprestoreOptions` per §5.18 (e.g. `dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`). Mutual exclusivity: `dataOnly`+`metadataOnly` → `400 INVALID_REQUEST`; include-schema vs include-table and run-analyze vs with-stats resolved in favor of the more specific flag (no 400). Negatives: invalid timestamp / DB / JSON → `400`; Operator/Basic identity → `403`.
+- **85e — `POST /backups/{timestamp}/restore` (Admin).** Creates a restore **Job** (label `avsoft.io/backup-operation=restore`) whose `gprestore` args match `RestoreRequest.gprestoreOptions` per §5.18 (e.g. `dataOnly→--data-only`, `metadataOnly→--metadata-only`, `resizeCluster→--resize-cluster`). Mutual exclusivity: `dataOnly`+`metadataOnly` → `400 INVALID_REQUEST`; include-schema vs include-table and run-analyze vs with-stats resolved in favor of the more specific flag (no 400). Negatives: invalid timestamp / DB / JSON → `400`; Operator/Basic identity → `403`. **Retry-after-failure (Job-name collision, added 2026-11-15 — see §5.17):** the deterministic Job name `<cluster>-restore-<ts>` colliding with a **terminal** leftover (failed **or** succeeded) → the leftover is deleted, a replacement Job created, **202 `restore started`**; colliding with a **Running/Pending** Job → **409 CONFLICT** (actionable message, in-flight Job untouched); a replacement-Create `AlreadyExists` (concurrent retry won the replace race) → **409 CONFLICT**; genuine server-side create/inspect/delete errors other than the classified races → **500**. Live-proven against the deployed operator by the Scenario 85e collision cases (85e-col1: seeded FAILED leftover → 202 + fresh replacement uid; 85e-col3: seeded in-flight leftover → 409, uid unchanged).
 
 - **85f — `GET /backups/jobs` (Basic).** Lists backup/restore/cleanup Job statuses for the cluster (status ∈ `succeeded|failed|running|pending`); unrelated Jobs are excluded. Response `200`: `{ cluster, jobs:[{ name, operation, status, startTime?, completionTime? }], total }`.
 
