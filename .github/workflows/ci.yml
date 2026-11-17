@@ -993,30 +993,23 @@ jobs:
 
       # Sign all pushed images
       - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.7.0
-      - name: Sign cloudberry-pxf
+      - name: Sign pushed images
         run: |
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-pxf.outputs.tags }}' | head -1)" 2>/dev/null || true)
-          if [ -n "${digest}" ]; then
-            cosign sign --yes "${digest}"
-          fi
-      - name: Sign cloudberry-official
-        run: |
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-cloudberry.outputs.tags }}' | head -1)" 2>/dev/null || true)
-          if [ -n "${digest}" ]; then
-            cosign sign --yes "${digest}"
-          fi
-      - name: Sign cloudberry-official-pxf
-        run: |
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-official-pxf.outputs.tags }}' | head -1)" 2>/dev/null || true)
-          if [ -n "${digest}" ]; then
-            cosign sign --yes "${digest}"
-          fi
-      - name: Sign cloudberry-gpfdist
-        run: |
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$(echo '${{ steps.meta-gpfdist.outputs.tags }}' | head -1)" 2>/dev/null || true)
-          if [ -n "${digest}" ]; then
-            cosign sign --yes "${digest}"
-          fi
+          set -euo pipefail
+          for repo in \
+            "${DOCKER_IMAGE_PXF}" \
+            "${DOCKER_IMAGE_CLOUDBERRY}" \
+            "${DOCKER_IMAGE_OFFICIAL_PXF}" \
+            "${DOCKER_IMAGE_GPFDIST}"; do
+            ref=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:latest" \
+                  | grep "^${repo}@sha256:" | head -1)
+            if [ -z "${ref}" ]; then
+              echo "::error::No registry digest found for ${repo}"; exit 1
+            fi
+            echo "Signing ${ref}"
+            cosign sign --yes "${ref}"
+          done
+
 
   # ===========================================================================
   # Tag-only: Trivy Scan
