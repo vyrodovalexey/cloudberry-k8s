@@ -38,10 +38,12 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        # 1 Gi: 512 Mi OOMKilled the coordinator during in-pod gpbackup
-        # report finalization (U018 F-1, exit 137) — marginal for ≥100 MB
-        # payloads under amd64 emulation. Requests unchanged.
-        memory: "1Gi"
+        # 2 Gi (U033, user directive; DEF-8 reclassified as sizing, not a
+        # product defect): 512 Mi OOMKilled the coordinator during in-pod
+        # gpbackup report finalization (U018 F-1, exit 137); 1 Gi (U028b)
+        # cleared the OOMs but ran marginal under amd64 emulation. 2 Gi is
+        # headroom for the U034 1-hour soak. Requests unchanged.
+        memory: "2Gi"
     storage:
       size: "2Gi"
 
@@ -53,7 +55,11 @@ spec:
         memory: "256Mi"
       limits:
         cpu: "500m"
-        memory: "512Mi"
+        # 2 Gi (U033): role symmetry with the coordinator — the standby runs
+        # the coordinator's replica topology and assumes the full coordinator
+        # workload on promotion/failover, so it carries the same limit. Was
+        # 512 Mi (no backup/COPY dispatch role while in standby).
+        memory: "2Gi"
     storage:
       size: "2Gi"
 
