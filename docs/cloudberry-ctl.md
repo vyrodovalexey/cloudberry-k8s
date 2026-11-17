@@ -232,7 +232,7 @@ cloudberry-ctl cluster status --cluster my-cluster
 
 ```
 CLUSTER      PHASE    VERSION  COORDINATOR  STANDBY  SEGMENTS  MIRRORING
-my-cluster   Running  2.1.0    Ready        Ready    4/4       InSync
+my-cluster   Running  2.2.0    Ready        Ready    4/4       InSync
 ```
 
 #### cluster start
@@ -2005,7 +2005,7 @@ cloudberry-ctl cluster status --cluster my-cluster
 
 ```
 CLUSTER      PHASE    VERSION  COORDINATOR  STANDBY  SEGMENTS  MIRRORING
-my-cluster   Running  2.1.0    Ready        Ready    4/4       InSync
+my-cluster   Running  2.2.0    Ready        Ready    4/4       InSync
 ```
 
 ### JSON
@@ -2018,7 +2018,7 @@ cloudberry-ctl cluster status --cluster my-cluster --output json
 {
   "name": "my-cluster",
   "phase": "Running",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "coordinator": {"ready": true},
   "standby": {"ready": true},
   "segments": {"ready": 4, "total": 4},
@@ -2035,7 +2035,7 @@ cloudberry-ctl cluster status --cluster my-cluster --output yaml
 ```yaml
 name: my-cluster
 phase: Running
-version: "2.1.0"
+version: "2.2.0"
 coordinator:
   ready: true
 standby:
@@ -2048,18 +2048,17 @@ mirroring: InSync
 
 ## Exit Codes
 
-Exit codes are properly wired to the CLI process, enabling reliable scripting and automation:
+Exit codes are properly wired to the CLI process, enabling reliable scripting and automation. On **any** error the CLI prints `Error: <details>` to **stderr** before exiting — for API errors the line carries the HTTP status and the decoded API error (e.g. `Error: API error 409 (JOB_EXISTS): data loading job "dup" already exists`), with the raw response body as the message fallback when no JSON envelope exists. A non-zero exit is never silent:
 
 | Code | Description | Typical Cause |
 |------|-------------|---------------|
 | `0` | Success | Command completed successfully |
-| `1` | General error | Unexpected error, internal failure |
+| `1` | General error | Unexpected error, internal failure, API `409/500` (and any non-API error) |
 | `2` | Invalid arguments | Missing required flags, invalid flag values |
 | `3` | Authentication failure | Invalid credentials, expired token (HTTP 401) |
 | `4` | Permission denied | Insufficient permission level (HTTP 403) |
 | `5` | Cluster not found | Cluster does not exist in the specified namespace (HTTP 404) |
-| `6` | Operation timeout | API request exceeded the configured timeout |
-| `7` | Connection error | Cannot reach the operator API server |
+| `6` | Operation timeout / rate limited | API request exceeded the configured timeout (HTTP 408), or rate limit exceeded (HTTP 429) |
 
 **Usage in scripts:**
 
@@ -2069,14 +2068,14 @@ case $? in
   0) echo "Cluster is healthy" ;;
   3) echo "Authentication failed — check credentials" ;;
   5) echo "Cluster not found" ;;
-  7) echo "Cannot connect to operator API" ;;
-  *) echo "Unexpected error" ;;
+  6) echo "Timed out or rate-limited — inspect stderr and retry" ;;
+  *) echo "Unexpected error (see stderr)" ;;
 esac
 ```
 
 ### Rate Limiting
 
-When the operator API returns `429 Too Many Requests`, `cloudberry-ctl` reports the error and exits with code `1`. The `Retry-After` header value is displayed in the error message. Implement retry logic in automation scripts:
+When the operator API returns `429 Too Many Requests`, `cloudberry-ctl` prints the error (including the `Retry-After` header value when present) to stderr and exits with code `6` (the timeout/rate-limit code). Implement retry logic in automation scripts:
 
 ```bash
 # Retry with backoff on rate limiting

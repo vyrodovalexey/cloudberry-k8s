@@ -5,6 +5,7 @@ A Kubernetes operator for managing the full lifecycle of [Cloudberry Database](h
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [Version Matrix](#version-matrix)
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Prerequisites](#prerequisites)
@@ -77,6 +78,21 @@ A Kubernetes operator for managing the full lifecycle of [Cloudberry Database](h
 ```
 
 The operator follows the standard Kubernetes reconciliation pattern: **Watch** resources for changes, **Diff** desired vs. actual state, **Act** to converge, **Update** status, and **Requeue** as needed.
+
+## Version Matrix
+
+Component versions this repository currently targets (verified against `go.mod`, `Makefile`, `.github/workflows/ci.yml`, and `deploy/helm/cloudberry-operator/Chart.yaml`):
+
+| Component | Version | Source of truth |
+|-----------|---------|-----------------|
+| Apache Cloudberry | `2.2.0-incubating` (PostgreSQL kernel **14.10**) | `Makefile` (`IMG_*`, `PXF_VERSION`), `Dockerfile.*` |
+| PXF server + `pxf`/`pxf_fdw` extensions | `2.2.0-incubating` (extension version 2.2) | `Makefile` `PXF_VERSION` |
+| gpbackup / gprestore / gpbackman | `2.2.0-incubating` (in-tree gpbackman) | `Dockerfile.cloudberry-backup` |
+| Operator Helm chart | `0.1.2` / appVersion `0.9.3-cldb-2.2.0` | `deploy/helm/cloudberry-operator/Chart.yaml`, `values.yaml` |
+| Go toolchain | `1.27.4` | `go.mod`, `Dockerfile.operator`, CI `GO_VERSION` |
+| golangci-lint | `v2.15.0` | `Makefile` `GOLANGCI_LINT_VERSION`, CI `GOLANGCI_LINT_VERSION` |
+
+The campaign that moved these from Go 1.26.5 / golangci-lint 2.12.2 / Cloudberry 2.1.0 to the versions above is summarized in [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
@@ -515,7 +531,7 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Jobs created with `BackoffLimit=1`, `TTLSecondsAfterFinished=3600`
 - `PGPASSWORD` sourced from admin password Secret
 - Backup and restore to S3-compatible storage (AWS S3 / MinIO) via the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`)
-- `backup.image` is defaulted by the mutating webhook to the official backup image (`cloudberry-backup:2.1.0`) when unset; a backup-capable image **must** contain `kubectl` (coordinator-exec model) and the `gpbackup`/`gprestore` toolchain
+- `backup.image` is defaulted by the mutating webhook to the official backup image (`cloudberry-backup:2.2.0`) when unset; a backup-capable image **must** contain `kubectl` (coordinator-exec model) and the `gpbackup`/`gprestore` toolchain
 - Restores default to `--with-stats=false` (statistics restore is opt-in); with `withStats: true`, a `gprestore` exit code 2 (data restored, statistics failed) is treated as success-with-warning — `RestorePartial` Warning event and `cloudberry_restore_total{result="partial"}`
 - S3 credentials from a Kubernetes Secret or HashiCorp Vault: `vaultSecret.path` takes the **logical** KV path (e.g. `secret/cloudberry/backup-s3` — the operator injects `data/` for KV-v2 mounts, including under least-privilege `secret/data/*` policies; the explicit `secret/data/...` form still works with a webhook warning), materialized at reconcile time into the owner-referenced Secret `<cluster>-backup-s3-vault-creds` consumed via `secretKeyRef`; materialization failures emit a `Warning`/`BackupVaultCredentialsFailed` Event and mark the reconcile outcome `result="error"`
 - Full S3 config: bucket, folder, region, encryption, `forcePathStyle`, multipart tuning, retention, schedule (CronJob)
@@ -523,12 +539,12 @@ OpenTelemetry (OTLP) tracing is available with gRPC and HTTP exporters. Spans us
 - Backup infrastructure verified by Scenario 72: toolchain image (`gpbackup`/`gprestore`/`gpbackup_s3_plugin`), backup RBAC (`cloudberry-backup-sa` + `cloudberry-backup-role`), the `<cluster>-backup-s3-config` ConfigMap, and the `jobTemplate` pod-template overrides (resources, nodeSelector, tolerations, serviceAccountName, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished)
 - On-demand backup with per-request `gpbackupOptions` verified by Scenario 73: `POST /clusters/{name}/backups` accepts compression level/type, jobs, with-stats, without-globals, include-schemas, and a `noCompression` override (emits `--no-compression` and ignores `--compression-level`); the on-demand request creates a Kubernetes Job directly (not via the CronJob). A non-empty `databases` array is **required** (`400 INVALID_REQUEST` otherwise — `gpbackup` hard-requires `--dbname`); scheduled CronJob backups, which carry no request body, default the target database to `postgres`
 - Single-data-file backup + full-option restore verified by Scenario 74: a `singleDataFile`/`copyQueueSize` backup emits `--single-data-file --copy-queue-size 4` (no `--jobs`), requires `gpbackup_helper` on every segment, and writes one consolidated data file per segment; the full-option restore resolves `gprestore`'s mutual-exclusivity rules (include-table over include-schema, run-analyze over with-stats, `--copy-queue-size` instead of `--jobs` for single-data-file restores, and redirect-schema pre-creation) so `mydb_restored` is populated, objects land in the `restored` schema, and ANALYZE runs
-- Compression matrix (gzip vs zstd) verified by Scenario 75: two on-demand backups of the same data at `--compression-level 6` — one `--compression-type gzip`, one `--compression-type zstd` — both succeed and both restore cleanly into separate redirect DBs, with the on-disk sizes differing (zstd smaller). The `zstd` CLI now ships in the cluster image (`cloudberry-official:2.1.0`), required because `gpbackup` pipes segment `COPY` output through `zstd --compress`; data files are named `…_<oid>.gz` (gzip) vs `…_<oid>.zst` (zstd)
+- Compression matrix (gzip vs zstd) verified by Scenario 75: two on-demand backups of the same data at `--compression-level 6` — one `--compression-type gzip`, one `--compression-type zstd` — both succeed and both restore cleanly into separate redirect DBs, with the on-disk sizes differing (zstd smaller). The `zstd` CLI now ships in the cluster image (`cloudberry-official:2.2.0`), required because `gpbackup` pipes segment `COPY` output through `zstd --compress`; data files are named `…_<oid>.gz` (gzip) vs `…_<oid>.zst` (zstd)
 - Scheduled backup via CronJob + status population verified by Scenario 76: setting `spec.backup.schedule` reconciles a CronJob `{cluster}-backup-schedule` (`ownerReferences` → the cluster, `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` = 3, pod `restartPolicy: Never`) that fires on schedule and spawns a Job; after the backup succeeds the operator populates `status.backup` (`lastBackupTime`, `lastBackupTimestamp` 14-digit, `lastBackupStatus`, `lastBackupType`, `lastBackupJobName`, `cronJobName`, and `backupHistory[]` with `size`+`duration`). The 14-digit `lastBackupTimestamp` is guaranteed (CronJob Jobs derive it from `CompletionTime` in UTC), and backup status is refreshed on the periodic reconcile even in steady state (unchanged spec generation)
 - **Real gpbackup timestamp capture (restore-by-timestamp fix):** the operator now captures `gpbackup`'s **real** emitted `Backup Timestamp = <14-digit>` line from the backup Job (surfaced via `/dev/termination-log` and the new `avsoft.io/backup-timestamp` annotation) and records **that** as `status.lastBackupTimestamp`, instead of a pre-generated `time.Now()` value. Because `gpbackup` runs asynchronously inside the coordinator and assigns its own timestamp, the pre-generated value could **drift** from `gpbackup`'s real S3 object prefix, so a restore-by-timestamp directly against S3 previously failed with a `404`/`NotFound`; with the real timestamp recorded, restore-by-timestamp now resolves the correct S3 prefix. The change is **backward compatible** — when the annotation/marker is absent the operator falls back to the prior behaviour
 - Pre-backup health checks verified by Scenario 77: every backup Job's `pre-backup-check` init container blocks the backup when any of four checks fails — **77a** segments-up (`gp_segment_configuration` `status='d'`), **77b** long-running transaction (older than 1 hour), **77c** S3 reachability (a **fail-closed SigV4-signed HEAD** to `${S3_ENDPOINT}/${S3_BUCKET}` returns non-2xx/3xx — replacing the prior best-effort `aws s3 ls`), and **77d** local disk space (< 1 GiB free). On a fault the `gpbackup` container never starts, the operator sets `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`BackupFailed` Event (one per failed Job; restore failures excluded); healing the fault lets a fresh backup reach `Success`
 - Incremental backup lifecycle verified by Scenario 78: **78a** `gpbackup.incremental: true` (or a per-request `type=incremental`) always renders `--incremental --leaf-partition-data` once each on the Job *and* CronJob (leaf-partition-data forced even when unset; de-duplicated when set); **78b** a full → modify AO table → incremental WITHOUT `--from-timestamp` auto-forms against the most recent compatible backup (same bucket+folder) and `status.lastBackupType` becomes `incremental`; **78c** an explicit `--from-timestamp <full-ts>` (`gpbackupOptions.fromTimestamp`) pins the base. Each backup Job/CronJob is labelled `avsoft.io/backup-type` (`full|incremental`) and the operator derives `status.lastBackupType`/`backupHistory[].type` from the **Job's** label (spec fallback). **78d** restoring from the latest incremental validates the full set (full + all incrementals) and restores; a missing intermediate makes `gprestore` refuse (restore Job fails) — the operator records `lastBackupStatus=Failed` and emits a de-duplicated `Warning`/`RestoreFailed` Event (distinct from `BackupFailed`)
-- Retention cleanup (all policies) verified by Scenario 79: after **each successful backup** the operator creates one idempotent cleanup Job `<cluster>-cleanup-<ts>` (label `avsoft.io/backup-operation=cleanup`) that enforces all three policies via the **real** `gpbackman` CLI (`woblerr/gpbackman` — no `delete --keep-full`/`--older-than`; it ships v0.8.1 in `cloudberry-backup:2.1.0`). **79a** `fullCount` and **79b** `incrementalCount` enumerate `gpbackman backup-info --type full|incremental` and delete the oldest excess with `gpbackman backup-delete --timestamp <ts> --cascade` (re-enumerating after each delete so cascade neither over- nor under-counts); **79c** `maxAge` (`"30d"`) runs `gpbackman backup-clean --older-than-days 30 --cascade`. **79d** the cleanup script prints `RETENTION_DELETED=<n>` (also to `/dev/termination-log`); the operator patches `avsoft.io/backup-retention-deleted=<n>` onto the Succeeded cleanup Job and the metrics loop turns it into the counter `cloudberry_backup_retention_deleted_total` (incremented per deletion)
+- Retention cleanup (all policies) verified by Scenario 79: after **each successful backup** the operator creates one idempotent cleanup Job `<cluster>-cleanup-<ts>` (label `avsoft.io/backup-operation=cleanup`) that enforces all three policies via the **real** `gpbackman` CLI (no `delete --keep-full`/`--older-than`; the in-tree gpbackman ships in `cloudberry-backup:2.2.0` and reports version `2.2.0-incubating`). **79a** `fullCount` and **79b** `incrementalCount` enumerate `gpbackman backup-info --type full|incremental` and delete the oldest excess with `gpbackman backup-delete --timestamp <ts> --cascade` (re-enumerating after each delete so cascade neither over- nor under-counts); **79c** `maxAge` (`"30d"`) runs `gpbackman backup-clean --older-than-days 30 --cascade`. **79d** the cleanup script prints `RETENTION_DELETED=<n>` (also to `/dev/termination-log`); the operator patches `avsoft.io/backup-retention-deleted=<n>` onto the Succeeded cleanup Job and the metrics loop turns it into the counter `cloudberry_backup_retention_deleted_total` (incremented per deletion)
 - Post-restore validation verified by Scenario 80: after **each Succeeded restore** the operator creates one idempotent validation Job `<cluster>-validate-<ts>` (label `avsoft.io/backup-operation=validate`) whose script runs four checks — **80a** row-count compare of ACTUAL restored per-table counts against the EXPECTED counts captured from gpbackup history (passed via the restore Job's `avsoft.io/expected-row-counts` JSON annotation), emitting `ROW_COUNT_MATCH`/`ROW_COUNT_MISMATCH` and failing (`exit 1`) on any discrepancy (empty map → best-effort `ROW_COUNT_PROBE_SKIPPED`, no fail); **80b** an optional `ANALYZE` (`ANALYZE_OK`) when `backup.validation.runAnalyze` (falls back to `gprestore.runAnalyze`) refreshes planner stats; **80c** a must-pass invalid-index scan (`relkind='i' AND NOT indisvalid` → `exit 1`); and **80d** a configurable health-check query (`backup.validation.healthCheckQuery`, default `SELECT 1`). The operator records the terminal status into `cloudberry_restore_validation_total{cluster,namespace,result}` (`result=success|failed`) and emits a de-duplicated `Warning`/`ValidationFailed` Event on a Failed Job — **80e** a deliberate mismatch (data-only restore into a pre-populated table) is FLAGGED (Failed + Warning + `{result="failed"}`), and a failed validation does **not** retroactively fail the Succeeded restore
 - Local (PVC-backed) backup destination verified by Scenario 81: with `destination.type: local` the operator mounts the named PVC (`local.persistentVolumeClaim`) as the `backup-data` volume at `local.path` (default `/backups`) on the backup/restore Job and runs `gpbackup`/`gprestore` with `--backup-dir <path>` and **NO** S3 plugin — `backupDestinationArgs(cluster)` seeds `--backup-dir` for local (and `--plugin-config` for s3); `buildGpbackupArgs`/`buildGprestoreArgs`/`renderToolScript` are destination-aware so a local Job has **no** `--plugin-config`, **no** `s3-plugin-config` volume, **no** `/etc/gpbackup` render (the S3-config envsubst is skipped so the local Job does not crash under `set -euo pipefail`), and **no** `S3_*`/`AWS_*` env. The operator creates **no** S3 ConfigMap and **no** Vault/Secret S3 credentials for local; the pre-backup `df` disk-space check (Scenario 77d, < 1 GiB free blocks) and gpbackman retention (`--backup-dir <path>` instead of `--plugin-config`) are local-aware. **MPP note:** `gpbackup --backup-dir` writes per-segment backup sets on the coordinator and every segment host; an RWO PVC on one Job pod holds one set, so the live data cycle targets a segment-visible `--backup-dir` via coordinator-exec while the PVC mount proves the operator wiring
 - Backup security and encryption verified by Scenario 82: **82a** the `<cluster>-backup-s3-config` ConfigMap (`BuildBackupS3ConfigMap`) holds **only** `${...}` placeholders — no real credentials on disk/ConfigMap; creds reach the pod **only** as `valueFrom.secretKeyRef` env (`buildS3CredentialEnv`); **82b** `renderToolScript` runs `envsubst < /etc/gpbackup/s3-plugin-config.yaml.tpl > /tmp/s3-config.yaml` at runtime so the resolved config (with creds) exists **only** in the ephemeral pod filesystem (the ConfigMap stays placeholders-only); **82c** backup/restore/validate/cleanup Jobs run as `cloudberry-backup-sa` with **minimal RBAC** — Helm values `backup.rbac.scopeSecrets=true` + `backup.rbac.secretNames=[…]` scope `secrets:[get]` to a `resourceNames` allow-list so the SA is **denied** `get` on unrelated Secrets while still reading the backup-relevant ones (the S3 credential Secret + `<cluster>-ssh-keys`/`<cluster>-admin-password`/`<cluster>-backup-s3-vault-creds`); default `scopeSecrets=false` keeps namespace-wide get for backward compatibility (production should opt in, unioning per-cluster Secret names); **82d** `S3Destination.encryption` is an enum (`on|off`, default `on`, CRD-enforced) — `buildS3Env` sets `S3_ENCRYPTION` and the template line `encryption: ${S3_ENCRYPTION}` flips so the rendered config carries `encryption: on`/`off` (the S3 plugin TLS/SSL option; verified via the option, not literal HTTPS, in the HTTP-only test env); **82e** new `spec.backup.jobTemplate.imagePullSecrets` are applied to the backup Job pod spec (and restore/validate/cleanup/CronJob pods) via `applyJobTemplatePod` → `addImagePullSecrets`, so Jobs can pull from a private registry. Sample CR `deploy/helm/cloudberry-operator/config/samples/scenario82-security-encryption.yaml`; live cycle `test/e2e/scripts/scenario82-security-encryption.sh`
@@ -558,17 +574,17 @@ operator tears everything down rather than leaving orphaned resources behind.
 #### Quick start
 
 ```yaml
-apiVersion: cloudberry.apache.org/v1
+apiVersion: avsoft.io/v1alpha1
 kind: CloudberryCluster
 metadata:
   name: example
 spec:
-  image: cloudberry-official:2.1.0
+  image: cloudberry-official:2.2.0
   dataLoading:
     enabled: true
     pxf:
       enabled: true
-      image: cloudberry-pxf:2.1.0
+      image: cloudberry-pxf:2.2.0
       servers:
         - name: minio-warehouse
           type: s3
@@ -634,7 +650,7 @@ Each server type renders the appropriate `*-site.xml` files into the
 
 Enabling `dataLoading.pxf` deploys a PXF sidecar on **segment-primary pods
 only** (coordinator, standby, and mirror pods are untouched). The sidecar uses
-the PXF 2.1.0 Spring Boot actuator endpoint (`/actuator/health` on port `5888`)
+the PXF 2.2.0 Spring Boot actuator endpoint (`/actuator/health` on port `5888`)
 for health probing, with a StartupProbe budget of ~120 s to accommodate the slow
 cold start without tripping liveness into `CrashLoopBackOff`.
 
@@ -650,8 +666,17 @@ The per-format write-capability matrix is the single source of truth in
 
 The predicate is **scheme-aware**: every `hive*` profile and HBase are
 read-only regardless of format. Writable jobs (`mode: writable`) export rows out
-to S3/HDFS/JDBC via a profile-agnostic `pxfwritable_export` path, with an
-optional `sourceFilter` WHERE predicate.
+to S3/HDFS/JDBC via a **per-profile** FORMAT clause (codified in
+[spec 12](specifications/12-data-loading-spec.md), revision 2026-11-15): the
+**text family** (`text`/`csv` suffix — `s3:text`, `hdfs:text`, …) writes with
+`FORMAT 'TEXT' (delimiter ',')`, while parquet/avro/SequenceFile/json/orc,
+`hive*`, `jdbc`, and `hbase` use the bridge formatter
+`FORMAT 'CUSTOM' (FORMATTER='pxfwritable_export')`. Reads mirror this: the text
+family reads with `FORMAT 'CSV'` and the bridge family with
+`FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')`. Both clauses come from the
+single-source-of-truth helpers `internal/builder.PXFReadFormatClause` /
+`PXFWriteFormatClause`. A `sourceFilter` WHERE predicate is optional on
+writable jobs.
 
 Read jobs support filter pushdown (`FILTER_PUSHDOWN=true`), column projection
 (`PROJECT=true`), and per-row error handling
@@ -758,7 +783,7 @@ metadata:
   name: my-cluster
   namespace: cloudberry-test
 spec:
-  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.2.0"
   coordinator:
     resources:
       requests:
@@ -795,7 +820,7 @@ cloudberry-ctl cluster status --cluster my-cluster --namespace cloudberry-test
 |-------------|---------|
 | Kubernetes | >= 1.26 |
 | Helm | >= 3.x |
-| Go (for building) | >= 1.26.5 |
+| Go (for building) | >= 1.27.4 |
 | kubectl | >= 1.26 |
 
 Optional:
@@ -859,7 +884,7 @@ metadata:
   name: production-cluster
   namespace: cloudberry-prod
 spec:
-  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.2.0"
   coordinator:
     resources:
       requests:
@@ -1133,8 +1158,10 @@ make test-cover
 make test-functional
 
 # Integration tests (requires Docker Compose test environment)
-make test-env-up       # Start 9 services: Vault, Keycloak, MinIO, Kafka, RabbitMQ, VictoriaMetrics, Grafana, Tempo
-make test-env-setup    # Configure services (Vault PKI, Keycloak realm, MinIO buckets, etc.)
+make test-env-full    # Bring up + configure + verify all 18 compose services (idempotent):
+                      # Vault, Keycloak(+db), pgsource, MySQL, MinIO, Kafka, RabbitMQ,
+                      # HDFS namenode/datanode, Hive metastore(+db)/HiveServer2, HBase,
+                      # Tempo, VictoriaMetrics, VictoriaLogs, Grafana
 make test-integration
 make test-env-down     # Tear down
 
@@ -1156,10 +1183,10 @@ Scenario 7 populates the `mydb` database with realistic test data including Pare
 
 ## Monitoring Quick Start
 
-Deploy the monitoring stack (vmagent + OpenTelemetry Collector) alongside the operator:
+Deploy the monitoring stack (vmagent + vector + otel-collector + node-exporter + kube-state-metrics) alongside the operator. By default the Make targets install into the **`cloudberry-test`** namespace (override with `NAMESPACE_MONITORING=…`), sharing the namespace with the test operator and cluster:
 
 ```bash
-# Deploy monitoring stack to Kubernetes
+# Deploy monitoring stack to Kubernetes (namespace cloudberry-test by default)
 make monitoring-deploy
 
 # Check monitoring status
@@ -1189,7 +1216,9 @@ The dashboards cover all **172** project metric families (172/172, including the
 
 Current baseline (latest perf-test cycle): authenticated API throughput is **~7 RPS per client** — dominated by bcrypt password verification on every Basic-auth request — and health endpoints sustain **p99 < 10ms**. Note that the default API rate limit is **10 requests/minute per IP** (`api-rate-limit` / `CLOUDBERRY_API_RATE_LIMIT`; set `0` to disable), so performance testing requires raising or disabling the limit.
 
-Latest validation (2026-07-12, kind via `kubectl port-forward`, `hey` load generator, after the cert-rotation/metrics changes): health endpoints p50 2.7 ms / p99 10.2 ms at 100 RPS with 0 errors; all SLOs pass with **no regression** vs the 2026-07-10 baseline (every health-latency delta within ±5 %); the default 10 req/min rate limit enforced exactly with accurate `cloudberry_api_rate_limit_rejections_total` / `cloudberry_api_rate_limit_entries`; zero 5xx. Full report: [test/performance/results/2026-07-12-perftest-report.md](test/performance/results/2026-07-12-perftest-report.md) (baseline: [2026-07-10](test/performance/results/2026-07-10-perftest-report.md)).
+Latest validation (2026-11-16, docker-desktop k8s with the 2.2.0 acceptance cluster, `hey` load generator): **no regression on the measured scenarios** vs the 2026-07-12 baseline — health p50 2.3–2.7 ms (p99 jittered by the shared single node); mydb C1–C5 query deltas fully explained by the 2.4× larger dataset. **Coverage is partial**: the run was time-boxed, and scenarios PTC-220-08 through PTC-220-17 (perf99 JDBC export; s105/107/108/109/110/111/113/119 API-latency benchmarks; the in-process `make test-perf` suite) were **not run** — see the not-run table in the report. All wall-clock numbers carry the **amd64-emulation caveat** (arm64 host, emulated DB pods), so comparisons vs baselines are relative only. Full report: [test/performance/results/2026-11-16-cloudberry220-perftest-report.md](test/performance/results/2026-11-16-cloudberry220-perftest-report.md).
+
+Previous full validation (2026-07-12, kind via `kubectl port-forward`, after the cert-rotation/metrics changes): health endpoints p50 2.7 ms / p99 10.2 ms at 100 RPS with 0 errors; all SLOs pass with **no regression** vs the 2026-07-10 baseline (every health-latency delta within ±5 %); the default 10 req/min rate limit enforced exactly with accurate `cloudberry_api_rate_limit_rejections_total` / `cloudberry_api_rate_limit_entries`; zero 5xx. Report: [test/performance/results/2026-07-12-perftest-report.md](test/performance/results/2026-07-12-perftest-report.md) (baseline: [2026-07-10](test/performance/results/2026-07-10-perftest-report.md)).
 
 Earlier full load-test results (2026-05-19, 287,122 total requests, zero errors):
 

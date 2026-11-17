@@ -21,6 +21,7 @@ The Cloudberry Operator exposes a REST API for programmatic access to cluster ma
   - [Exporter Health](#exporter-health)
   - [Resource Groups](#resource-groups)
   - [Maintenance](#maintenance)
+  - [Backup and Restore](#backup-and-restore)
   - [Authentication Management](#authentication-management)
 - [Request/Response Schemas](#requestresponse-schemas)
 - [Error Handling](#error-handling)
@@ -159,7 +160,7 @@ curl -u admin:password http://operator:8090/api/v1alpha1/clusters
       "name": "my-cluster",
       "namespace": "cloudberry-test",
       "phase": "Running",
-      "version": "2.1.0"
+      "version": "2.2.0"
     }
   ],
   "total": 1
@@ -186,7 +187,7 @@ curl -u admin:password \
     "segmentsReady": 4,
     "segmentsTotal": 4,
     "mirroringStatus": "InSync",
-    "clusterVersion": "2.1.0",
+    "clusterVersion": "2.2.0",
     "lastReconcileTime": "2026-05-11T18:00:00Z",
     "conditions": [
       {
@@ -2580,6 +2581,34 @@ curl -u admin:password -X POST \
 }
 ```
 
+### Backup and Restore
+
+The backup/restore REST surface (Scenario 85; all endpoints OIDC/JWT-authed and gated on `backup.enabled` — `400 BACKUP_NOT_ENABLED` otherwise):
+
+| Method | Path | Permission | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/clusters/{name}/backups` | Basic | List recorded backup history |
+| `POST` | `/clusters/{name}/backups` | Operator | Create an on-demand backup Job |
+| `GET` | `/clusters/{name}/backups/{timestamp}` | Basic | Get one history entry (`400` non-14-digit, `404 BACKUP_NOT_FOUND` unknown) |
+| `DELETE` | `/clusters/{name}/backups/{timestamp}` | Admin | Create a `gpbackman` cleanup Job |
+| `POST` | `/clusters/{name}/backups/{timestamp}/restore` | Admin | Create a restore Job |
+| `GET` | `/clusters/{name}/backups/jobs` | Basic | List backup/restore/cleanup Job statuses |
+| `GET` | `/clusters/{name}/backups/schedule` | Basic | CronJob status + next schedule time |
+
+#### Restore retry-after-failure / Job-name collision contract
+
+The restore Job name is **deterministic on the user-supplied backup timestamp** — `<cluster>-restore-<ts>` — so retrying a restore of the same timestamp regenerates the same Job name and may collide with a leftover from a previous attempt. The collision behavior (codified in [spec 06 §5.17](../specifications/06-api-specification.md#517-restore-request-post-clustersnamebackupstimestamprestore) and [spec 11](../specifications/11-backup-restore-spec.md); revision notes 2026-11-15, corrected 2026-11-17 per code review REV-009):
+
+| Collision state of the existing `<cluster>-restore-<ts>` Job | Response | Action |
+|---|---|---|
+| **Terminal** (`JobFailed` **or** `JobComplete`) | **202** `restore started` | Finished Jobs are immutable, so the leftover is deleted (background cascade) and a fresh replacement Job created (no terminal conditions inherited). The previous outcome stays in `status.backup`/`backupHistory[]` + `cloudberry_restore_total`; the retry is recorded as a new restore start. |
+| **In flight** (`Running`/`Pending`) | **409 CONFLICT** | The in-flight Job is never touched; actionable message naming the Job. No `cloudberry_restore_total{result="failed"}` increment (client conflict, not a restore failure). |
+| Replacement-Create `AlreadyExists` (concurrent retry won the replace race) | **409 CONFLICT** | Same conflict semantics, never a 500; self-healing on client retry. |
+| Genuine server-side errors (other than the classified races) | **500 INTERNAL_ERROR** | Honest error surfacing; nothing silently retried. |
+| No leftover | **202** `restore started` | Job created directly. |
+
+The handler is **create-first-then-classify** (no TOCTOU window). Pre-fix, any collision surfaced as an opaque `500 failed to create restore job` and operators had to `kubectl delete job` by hand. Live-proven by the Scenario 85e collision cases (seeded FAILED leftover → 202 with a fresh replacement uid; seeded in-flight leftover → 409 with uid unchanged). The symmetric **backup** path (`POST /backups`) uses a server-generated timestamp and has only a same-second collision window; it is unchanged.
+
 ### Authentication Management
 
 | Method | Path | Permission | Description |
@@ -3130,8 +3159,8 @@ Sets defaults on `CloudberryCluster` resources:
 
 | Field | Default |
 |-------|---------|
-| `version` | `"2.1.0"` |
-| `image` | `"cloudberrydb/cloudberry:2.1.0"` |
+| `version` | `"2.2.0"` |
+| `image` | `"cloudberrydb/cloudberry:2.2.0"` |
 | `imagePullPolicy` | `IfNotPresent` |
 | `coordinator.replicas` | `1` |
 | `coordinator.port` | `5432` (validated: 1–65535) |
@@ -3143,7 +3172,7 @@ Sets defaults on `CloudberryCluster` resources:
 | `affinity.topologyKey` (when `spec.affinity` is set) | `kubernetes.io/hostname` |
 | `auth.basic.enabled` | `true` |
 | `auth.basic.adminUser` | `gpadmin` |
-| `backup.image` (when `backup.enabled`) | `"cloudberry-backup:2.1.0"` — the official backup toolchain image. A backup-capable image must contain `kubectl` (the backup/restore Jobs `kubectl exec` into the coordinator pod) and `gpbackup`/`gprestore`/`gpbackup_s3_plugin`; the base database image is **not** sufficient |
+| `backup.image` (when `backup.enabled`) | `"cloudberry-backup:2.2.0"` — the official backup toolchain image (gpbackup/gprestore/gpbackman `2.2.0-incubating`). A backup-capable image must contain `kubectl` (the backup/restore Jobs `kubectl exec` into the coordinator pod) and `gpbackup`/`gprestore`/`gpbackup_s3_plugin`; the base database image is **not** sufficient |
 | `ha.ftsProbeInterval` | `60` |
 | `ha.ftsProbeTimeout` | `20` |
 | `ha.ftsProbeRetries` | `5` |

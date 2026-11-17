@@ -248,7 +248,7 @@ metadata:
   name: production-cluster
   namespace: cloudberry-prod
 spec:
-  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.2.0"
 
   coordinator:
     resources:
@@ -585,15 +585,15 @@ To upgrade the database version, update `spec.version` and `spec.image`:
 
 ```bash
 kubectl patch cloudberrycluster my-cluster -n cloudberry-test --type merge -p '
-  {"spec": {"version": "7.2.0", "image": "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"}}'
+  {"spec": {"version": "2.2.0", "image": "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.2.0"}}'
 ```
 
 Or update the CRD manifest directly:
 
 ```yaml
 spec:
-  version: "7.2.0"    # 
-  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0"  # 
+  version: "2.2.0"    # 
+  image: "ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.2.0"  # 
 ```
 
 The operator detects the upgrade when `spec.version` differs from `status.clusterVersion` and performs a phase-by-phase rolling upgrade.
@@ -818,7 +818,23 @@ If the cluster does not have a finalizer (e.g., it was removed manually), Kubern
 
 The operator backs up Cloudberry databases to S3-compatible storage (AWS S3 or MinIO) using the `apache/cloudberry-backup` toolchain (`gpbackup`, `gprestore`, `gpbackup_s3_plugin`). Enable backups by adding a `backup` block to the cluster spec; S3 credentials are sourced from either a Kubernetes Secret or HashiCorp Vault. See [Specification 11: Backup and Restore](../specifications/11-backup-restore-spec.md) for the full CRD schema and reconciliation logic.
 
-> **Backup image requirement**: `backup.image` must be a **backup-capable** image — it must contain `kubectl` (the backup/restore Jobs `kubectl exec` `gpbackup`/`gprestore` into the coordinator pod, the coordinator-exec model) **and** the `gpbackup`/`gprestore`/`gpbackup_s3_plugin` toolchain (e.g. `cloudberry-backup:2.1.0`, built from `Dockerfile.cloudberry-backup`). The base database image is NOT sufficient. When `backup.image` is unset, the mutating webhook defaults it to the official backup image.
+> **Backup image requirement**: `backup.image` must be a **backup-capable** image — it must contain `kubectl` (the backup/restore Jobs `kubectl exec` `gpbackup`/`gprestore` into the coordinator pod, the coordinator-exec model) **and** the `gpbackup`/`gprestore`/`gpbackup_s3_plugin` toolchain (e.g. `cloudberry-backup:2.2.0`, built from `Dockerfile.cloudberry-backup`). The base database image is NOT sufficient. When `backup.image` is unset, the mutating webhook defaults it to the official backup image.
+
+> **Toolchain versions (2.2.0 campaign, verified live 2026-11-15/16).** The
+> `cloudberry-backup:2.2.0` image ships `gpbackup`, `gprestore`, `gpbackup_helper`,
+> `gpbackup_s3_plugin`, and the in-tree `gpbackman` — all reporting
+> **`2.2.0-incubating`** — against a Cloudberry **2.2.0-incubating** server
+> (PostgreSQL kernel 14.10). The image also carries seven downstream
+> **workaround patches** for Cloudberry 2.1.0-era segment crashes; their
+> disposition after live re-validation on 2.2.0: the five crash-trigger patches
+> (`pg_database_size`, `LOCK TABLE`, `SAVEPOINT`, `NOWAIT`, synchronized
+> snapshots) ran **clean** in per-trigger micro-repros and in-tool runs against
+> the official-RPM 2.2.0 server and are flagged **retire-eligible but kept**
+> (retirement is gated on either a from-source-flavor validation or dropping
+> the from-source deployment path — the toolchain image serves both server
+> flavors); the pgx→lib/pq driver-switch patches (6/7) are **kept** — go-libs
+> 2.2.0 is still pgx-based, and the simple-protocol driver also avoids the open
+> upstream extended-protocol issue apache/cloudberry#2165.
 
 > **Restore statistics default**: restores do **not** restore planner statistics by default (`gprestore.withStats` defaults to `false`). A known upstream `gpbackup` bug (invalid `bigint` in `statistics.sql`) makes `gprestore` exit with code **2** when only the statistics restore fails while the data restore succeeded. When statistics restore **is** explicitly requested (`withStats: true`) and `gprestore` exits with code 2, the operator treats the restore as **success-with-warning**: the Job succeeds, a `RestorePartial` Warning Event is emitted, and the `cloudberry_restore_total` metric records the result label `partial`. To get fresh statistics after a restore, prefer `runAnalyze: true`.
 
@@ -901,7 +917,7 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario72-backu
 
 Six infrastructure verifications pass:
 
-1. **Image binaries** — `gpbackup`, `gprestore`, and `gpbackup_s3_plugin` present in `cloudberry-backup:2.1.0`.
+1. **Image binaries** — `gpbackup`, `gprestore`, and `gpbackup_s3_plugin` present in `cloudberry-backup:2.2.0`.
 2. **RBAC** — `cloudberry-backup-sa` ServiceAccount + `cloudberry-backup-role` Role (`secrets` get, `configmaps` get, `events` create/patch) + RoleBinding.
 3. **S3 ConfigMap** — `<cluster>-backup-s3-config` with `executablepath: /usr/local/bin/gpbackup_s3_plugin`, the region/endpoint/credentials/bucket/folder/encryption placeholders, the four multipart placeholders, and no `aws_signature_version`.
 4. **Job labels/namespace** — Jobs in the cluster namespace labelled `app.kubernetes.io/managed-by: cloudberry-operator`, `avsoft.io/cluster: <cluster>`, `avsoft.io/component: backup`, `avsoft.io/backup-operation: backup`.
@@ -963,7 +979,7 @@ curl -X POST 'http://localhost:8080/api/v1alpha1/clusters/scenario74/backups?nam
        "gpbackupOptions":{"singleDataFile":true,"copyQueueSize":4}}'
 ```
 
-Verified `gpbackup` args: `--single-data-file --copy-queue-size 4`, with `--jobs` **omitted** (`gpbackup` rejects `--jobs` in single-data-file mode). `--single-data-file` requires the `gpbackup_helper` binary on **every** segment (present in `cloudberry-official:2.1.0` at `$GPHOME/bin/gpbackup_helper`); the backup produces exactly **one consolidated data file per segment** (`gpbackup_<contentid>_<TS>.gz`) plus a per-segment `_toc.yaml` and the shared coordinator metadata. The operator builds a `Job` directly (not a `CronJob`).
+Verified `gpbackup` args: `--single-data-file --copy-queue-size 4`, with `--jobs` **omitted** (`gpbackup` rejects `--jobs` in single-data-file mode). `--single-data-file` requires the `gpbackup_helper` binary on **every** segment (present in `cloudberry-official:2.2.0` at `$GPHOME/bin/gpbackup_helper`); the backup produces exactly **one consolidated data file per segment** (`gpbackup_<contentid>_<TS>.gz`) plus a per-segment `_toc.yaml` and the shared coordinator metadata. The operator builds a `Job` directly (not a `CronJob`).
 
 **Full-option restore.** From the captured timestamp, `gprestoreOptions` with `jobs=4`, `redirectDb=mydb_restored`, `redirectSchema=restored`, `createDb=true`, `includeSchemas=[public, analytics]`, `includeTables=[public.users, public.orders]`, `withGlobals=false`, `withStats=true`, `runAnalyze=true`, `onErrorContinue=true`, `truncateTable=false`:
 
@@ -999,7 +1015,7 @@ Scenario 75 triggers **two** on-demand full backups of the **same** data that di
 kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario75-compression-matrix.yaml
 ```
 
-> **zstd CLI prerequisite.** zstd-compressed backups **require** the `zstd` command-line tool in the cluster image: `gpbackup` pipes each segment's `COPY` output through `zstd --compress` (`COPY … TO PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin …'`), so without the `zstd` CLI the pipe breaks with *"could not write to COPY program: Broken pipe"*. `cloudberry-official:2.1.0` now ships the `zstd` package (`gzip` is already in the base image), so both codecs work. Both backups are scoped to `--include-schema public` (the substantial `public.users` + `public.orders` data) for a meaningful comparison, and the `gpbackup_s3_plugin` runs with the CR's multipart settings (`chunksize 10MB`, `concurrency 4`) to stay stable under emulation.
+> **zstd CLI prerequisite.** zstd-compressed backups **require** the `zstd` command-line tool in the cluster image: `gpbackup` pipes each segment's `COPY` output through `zstd --compress` (`COPY … TO PROGRAM 'zstd --compress -N -c | gpbackup_s3_plugin …'`), so without the `zstd` CLI the pipe breaks with *"could not write to COPY program: Broken pipe"*. `cloudberry-official:2.2.0` now ships the `zstd` package (`gzip` is already in the base image), so both codecs work. Both backups are scoped to `--include-schema public` (the substantial `public.users` + `public.orders` data) for a meaningful comparison, and the `gpbackup_s3_plugin` runs with the CR's multipart settings (`chunksize 10MB`, `concurrency 4`) to stay stable under emulation.
 
 **gzip backup** — `gpbackupOptions{compressionType:"gzip", compressionLevel:6, includeSchemas:["public"]}`:
 
@@ -1340,7 +1356,7 @@ Set any combination of the three policies on the backup spec:
 spec:
   backup:
     enabled: true
-    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"   # must include gpbackman (ships v0.8.1)
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.2.0"   # must include the in-tree gpbackman
     retention:
       fullCount: 3            # keep the newest 3 FULL backups
       incrementalCount: 10    # keep the newest 10 INCREMENTAL backups
@@ -1367,9 +1383,11 @@ kubectl apply -f deploy/helm/cloudberry-operator/config/samples/scenario79-reten
 > and every incremental so `gpbackman` enumerates a single backup history on the
 > destination — a split folder breaks the count/age enumeration.
 
-> **`gpbackman` is provided by the backup image.** Retention cleanup runs `gpbackman` (the
-> `woblerr/gpbackman` CLI), which ships in `cloudberry-backup:2.1.0` (v0.8.1) alongside
-> `gpbackup`/`gprestore`. Use a backup image that includes it.
+> **`gpbackman` is provided by the backup image.** Retention cleanup runs `gpbackman`,
+> which is built **in-tree** from `cloudberry-backup 2.2.0` (upstream commit `81208cfb`;
+> the separate `woblerr/gpbackman` clone is retired) and ships in `cloudberry-backup:2.2.0`
+> alongside `gpbackup`/`gprestore` — all reporting `2.2.0-incubating`. Use a backup image
+> that includes it.
 
 > **Defaults.** The mutating webhook defaults `retention.fullCount: 3` and
 > `retention.maxAge: "30d"` when `backup.enabled: true` and you leave them unset; set
@@ -1609,7 +1627,7 @@ Set `destination.type: local` with the path and PVC under `destination.local`:
 spec:
   backup:
     enabled: true
-    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.4-cldb-2.1.0"
+    image: "ghcr.io/vyrodovalexey/cloudberry-k8s-backup:0.9.3-cldb-2.2.0"
     destination:
       type: local
       local:
@@ -2804,7 +2822,7 @@ metadata:
   name: my-cluster
   namespace: cloudberry-test
 spec:
-  image: "cloudberrydb/cloudberry:2.1.0"
+  image: "cloudberrydb/cloudberry:2.2.0"
   coordinator:
     storage:
       size: "5Gi"
@@ -3186,7 +3204,7 @@ Alternatively, the cluster TLS Secret (the one referenced by `auth.ssl.certSecre
          minTLSVersion: "1.2"
    ```
 
-The `scenario67` sample uses image `ghcr.io/vyrodovalexey/cloudberry-k8s-cloudberry:0.9.3-cldb-2.1.0`, `vault.authMethod: kubernetes`, and enables the per-segment postgres-exporter on every segment and mirror (`queryMonitoring.exporters.postgresExporter.segments: true` and `.mirrors: true`). The resulting pod topology is: coordinator `[cloudberry + postgres-exporter + cloudberry-query-exporter]`; standby, each segment primary, and each segment mirror `[cloudberry + postgres-exporter]`.
+The `scenario67` sample uses image `cloudberry-official:2.2.0`, `vault.authMethod: kubernetes`, and enables the per-segment postgres-exporter on every segment and mirror (`queryMonitoring.exporters.postgresExporter.segments: true` and `.mirrors: true`). The resulting pod topology is: coordinator `[cloudberry + postgres-exporter + cloudberry-query-exporter]`; standby, each segment primary, and each segment mirror `[cloudberry + postgres-exporter]`.
 
 #### Verifying SSL Configuration
 
@@ -6591,7 +6609,7 @@ skipped.
 > (`Dockerfile.cloudberry-pxf`, built from `apache/cloudberry-pxf` via `make
 > docker-build-pxf`) **and** the **`pxf`/`pxf_fdw` extensions** in the DB image
 > (the `cloudberry-official-pxf` image, `Dockerfile.cloudberry-official-pxf`,
-> `make docker-build-official-pxf`). On a stock `cloudberry-official:2.1.0` (no
+> `make docker-build-official-pxf`). On a stock `cloudberry-official:2.2.0` (no
 > PXF extension) the operator still **generates and launches** the correct
 > `pxf://` Job, but it cannot **read back** until those images are in place — an
 > image prerequisite, not a code gap.
@@ -6661,19 +6679,20 @@ skipped.
 > **All Prometheus metrics M.1–M.16 (Implemented, honesty-bounded — Scenario
 > 109).** Scenario 109 closes out the metric catalog under one rule — **every
 > emitted metric traces to a REAL source; a metric with no honest source stays
-> intentionally ABSENT and is NEVER synthesized.** Four flip to Implemented:
+> intentionally ABSENT and is NEVER synthesized.** Implemented:
 > **`cloudberry_pxf_service_up{cluster,namespace,segment_host}`** (M.1 — the
 > **per-segment** disaggregation of `cloudberry_pxf_status`, `1` healthy / `0` on a
 > killed segment from real per-segment-primary-pod `pxf` container readiness;
 > emitted only for observed hosts, never synthesized); **`cloudberry_pxf_requests_total`**
-> (M.2) + **`cloudberry_pxf_request_duration_seconds`** (M.3) — the **real**
-> `http_server_requests_*` count + latency scraped from the PXF Spring Boot Actuator
-> `/actuator/prometheus` (enabled via `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus`)
-> by a **dedicated vmagent `:5888` scrape job** — a single pod annotation can't
-> cover both the pg-exporter `:9187` and the actuator `:5888`; **label-honesty
-> caveat:** count + latency are REAL, but the `server`/`profile`/`operation` labels
-> are downgraded to the actuator-native `uri`/`method`/`status` (not honestly
-> derivable from the URI — never fabricated); and
+> (M.2) + **`cloudberry_pxf_request_duration_seconds`** (M.3) are **BLOCKED under
+> SE.5** (DEF-5 adjudication, 2026-11-15): the actuator `/actuator/prometheus`
+> endpoint stays **enabled on the sidecar** (`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,prometheus`)
+> for loopback diagnostics, but the dedicated vmagent `:5888` scrape job was
+> **removed from the monitoring chart** — the SE.5 NetworkPolicy seals cross-pod
+> ingress to PXF `:5888` (the sidecar holds rendered external-store credentials),
+> so the scrape could never succeed. **0 actuator series in VictoriaMetrics is the
+> expected steady state**; PXF health is covered operator-side by
+> `cloudberry_pxf_service_up` + `cloudberry_pxf_status`; and
 > **`cloudberry_data_loading_bytes_total{cluster,namespace,job,source_type}`**
 > (M.10 — from the real `DATALOAD_BYTES=<n>` marker computed via `wc -c` for a
 > **local gpload input source**; **omitted (honestly absent)** for
@@ -6689,8 +6708,8 @@ skipped.
 > `cloudberry_pxf_errors_total` (M.6; **folded**, not synthesized),
 > `cloudberry_pxf_active_connections` (M.7), and the 2 `cloudberry_gpfdist_*`
 > metrics (M.15/M.16; no scrapable endpoint) — which have no honest source in PXF
-> 2.1.0 / gpfdist and whose absence the Scenario 109 tests assert. (**Scenario 109
-> flipped `cloudberry_pxf_service_up`, the actuator request/latency passthrough, and
+> 2.x (incl. 2.2.0) / gpfdist and whose absence the Scenario 109 tests assert. (**Scenario 109
+> flipped `cloudberry_pxf_service_up` and
 > `cloudberry_data_loading_bytes_total` to Implemented** — see the note above.) (The **FDW-based loading path** —
 > `pxfJob.loadMethod: fdw` — is now **Implemented** in Scenario 103; see the note
 > above. Config sync across sidecars is satisfied
@@ -6860,31 +6879,29 @@ and [§Scenario 102](../specifications/12-data-loading-spec.md#scenario-102--kaf
 > and a first-class data-export Job kind stay **Planned**. See
 > [spec 12 §Scenario 99](../specifications/12-data-loading-spec.md#scenario-99--writable-external-tables--data-export).
 
-> **Known limitation — `hdfs:SequenceFile` read (PXF 2.1.0).** In the live
-> end-to-end verification, 6 of 7 PXF external writable-table profiles (s3/hdfs ×
-> text/parquet/avro) **fully round-trip** (write → read back, row counts match). The
-> seventh, **`hdfs:SequenceFile`, round-trips only on the WRITE side**: the writable
-> export succeeds and lands a valid SequenceFile in HDFS, but **reading it back
-> requires a custom Java `Writable` class** deployed onto the PXF sidecar classpath
-> (PXF must know the concrete key/value `Writable` schema to deserialize the file).
-> Without that classpath-deployed schema class the read leg fails — PXF reports
-> **"No fields in record"** (re-confirmed in the 2026-07-10 live acceptance run).
-> This is a documented **PXF 2.1.0 limitation**, not an operator defect — the
-> operator emits the correct DDL; the missing piece is the source-specific
-> `Writable` schema class.
-> Prefer `hdfs:text`/`parquet`/`avro` for a deterministic write **and** read.
+> **`hdfs:SequenceFile` — full round-trip on 2.2.0 with the `DATA_SCHEMA` prerequisite.** In the 2.1.0-era live verification the SequenceFile read leg failed with PXF's *"No fields in record"* — traced to the **missing `Writable` schema class**, not to the format itself. On PXF 2.2.0 / Cloudberry 2.2.0 all **7** writable profiles (s3/hdfs × text/parquet/avro + `hdfs:SequenceFile`) were re-proven live to **fully round-trip** (write → read back; 175,000 rows per source with exact two-direction `EXCEPT ALL` set equality = 0/0) **once the compiled `DATA-SCHEMA` class is deployed onto the PXF sidecar classpath of every segment primary** (`test/cases/Phase7fRecord.java`, compiled `--release 11` against the hadoop-2.10.2 jars extracted from the running `pxf-app-2.2.0-incubating.jar`, copied to `/pxf-base/lib`, then PXF restarted in-container — health UP in ~45 s, zero k8s container restarts).
+> **Ephemeral-class caveat:** the class is deployed into the *running* sidecar filesystem, not baked into an image or shipped via ConfigMap — a segment-pod restart or roll **loses it**, and the read leg fails again until the class is re-deployed and PXF restarted. Bake the class into a derived PXF image (or otherwise persist it) before relying on SequenceFile reads beyond a test session. Prefer `hdfs:text`/`parquet`/`avro` when you want a write **and** read cycle with no extra artifacts.
 
 #### Verified PXF external-table LOCATION syntax
 
 The following `LOCATION` patterns are the live-verified round-trip syntax
-(source of truth: `test/cases/phase7f_external_tables.sql`, run against the
-acceptance cluster) for the seven profiles. S3 locations start with the bucket
+(2.2.0 campaign verification: 175,000 rows per source, all 7 profiles,
+two-direction `EXCEPT ALL` = 0/0; probe suite over `test/cases/phase7f_external_tables.sql`
+shapes) for the seven profiles. S3 locations start with the bucket
 (`s3-datalake` is an `s3`-type PXF server pointing at MinIO with path-style
 access); HDFS locations are absolute HDFS paths against the `hadoop-cluster`
-server. `*:text` uses `FORMAT 'TEXT'`; `*:parquet`/`*:avro`/`SequenceFile` use
-`FORMAT 'CUSTOM'` with `pxfwritable_export` (write) / `pxfwritable_import`
-(read) — no explicit schema needed for parquet/avro (PXF derives it from the
-column definitions):
+server. **The FORMAT clauses are per-profile** (codified in
+[spec 12](../specifications/12-data-loading-spec.md), revision 2026-11-15 —
+the same clauses `internal/builder.PXFReadFormatClause`/`PXFWriteFormatClause`
+emit): `*:text` writes with `FORMAT 'TEXT' (delimiter ',')` and reads with
+`FORMAT 'CSV'` (the operator-emitted read shape; the older
+`FORMAT 'TEXT' (delimiter ',')` read shape still parses the same data);
+parquet/avro/SequenceFile use `FORMAT 'CUSTOM'` with `pxfwritable_export`
+(write) / `pxfwritable_import` (read) — no explicit schema needed for
+parquet/avro (PXF derives it from the column definitions). Do **not** use the
+bridge `pxfwritable_export` formatter for text-family profiles: PXF 2.2.0
+rejects the stream with `ClassCastException` (`Integer cannot be cast to
+[B` in `LineBreakAccessor`) — the text write clause is `FORMAT 'TEXT'`:
 
 ```sql
 -- s3:text (writable + readable pair over the same location)
@@ -6893,7 +6910,7 @@ CREATE WRITABLE EXTERNAL TABLE wext_s3_text (id int, name text, amount bigint, p
   FORMAT 'TEXT' (delimiter ',');
 CREATE EXTERNAL TABLE rext_s3_text (id int, name text, amount bigint, price float8)
   LOCATION ('pxf://cloudberry-data/phase7f/s3_text?PROFILE=s3:text&SERVER=s3-datalake')
-  FORMAT 'TEXT' (delimiter ',');
+  FORMAT 'CSV';
 
 -- s3:parquet / s3:avro (same shape; swap the PROFILE and path)
 CREATE WRITABLE EXTERNAL TABLE wext_s3_parquet (id int, name text, amount bigint, price float8)
@@ -6907,6 +6924,9 @@ CREATE EXTERNAL TABLE rext_s3_parquet (id int, name text, amount bigint, price f
 CREATE WRITABLE EXTERNAL TABLE wext_hdfs_text (id int, name text, amount bigint, price float8)
   LOCATION ('pxf://phase7f/hdfs_text?PROFILE=hdfs:text&SERVER=hadoop-cluster')
   FORMAT 'TEXT' (delimiter ',');
+CREATE EXTERNAL TABLE rext_hdfs_text (id int, name text, amount bigint, price float8)
+  LOCATION ('pxf://phase7f/hdfs_text?PROFILE=hdfs:text&SERVER=hadoop-cluster')
+  FORMAT 'CSV';
 
 -- hdfs:SequenceFile — REQUIRES a DATA-SCHEMA Java Writable class (see below)
 CREATE WRITABLE EXTERNAL TABLE wext_hdfs_seq (id int, name text, amount bigint, price float8)
@@ -6917,18 +6937,34 @@ CREATE EXTERNAL TABLE rext_hdfs_seq (id int, name text, amount bigint, price flo
   FORMAT 'CUSTOM' (formatter='pxfwritable_import');
 ```
 
+> **Writer file layout (2.2.0 live verification).** Each writable lands **2
+> objects per source** (one per segment primary), named
+> `<gpdb-txnid>-<queryid>_<seg>` — object names are per-transaction, contents
+> byte-deterministic across re-runs. Approximate sizes for a uniform
+> ~10.3 MB text-band payload (175k × ~61 B rows): text 10.26 MiB, parquet
+> 7.59 MiB (snappy), avro 4.70 MiB (deflate), SequenceFile 13.65 MiB
+> (uncompressed).
+
 > **`DATA-SCHEMA` caveat (SequenceFile round-trip).** `hdfs:SequenceFile` is
 > the one profile whose round-trip needs an extra artifact: the
 > `DATA-SCHEMA=<JavaClass>` LOCATION option names a custom Java `Writable`
 > class describing the record schema, and for the **read** leg the compiled
 > class must be present on the PXF sidecar classpath on every segment primary
 > (the acceptance suite ships `test/cases/Phase7fRecord.java`, compiled for
-> Java 11 and dropped into `/pxf-base/lib`). Writes can succeed without the
+> Java 11 and dropped into `/pxf-base/lib` — see the ephemeral-class caveat in
+> the SequenceFile note above). Writes can succeed without the
 > deployed class, but reads then fail with PXF's "No fields in record".
 > Two further gotchas from the live runs: directory names must not start with
 > `_` or `.` (Hadoop's hidden-file filter silently skips them, making the
 > readable table report "Input path does not exist"), and the writable/readable
 > pair must reference the **same** location string.
+
+> **Avro writer convention.** PXF's avro writer emits an all-**nullable-union**
+> schema (`["null","int"]`, `["null","string"]`, …) with the **deflate** codec —
+> readers see nullable columns even for `NOT NULL` sources, and the files
+> arrive deflate-compressed. Verified byte-exact on 2.2.0 with no fidelity loss
+> (values round-trip exactly); just don't be surprised by the nullable schema
+> when inspecting the objects.
 
 > **FDW-based loading path (Scenario 103).** Set **`pxfJob.loadMethod: fdw`** (the
 > default `external-table` keeps the transient external-table path) to load via a
@@ -6938,8 +6974,9 @@ CREATE EXTERNAL TABLE rext_hdfs_seq (id int, name text, amount bigint, price flo
 > FOR "gpadmin"` → `CREATE FOREIGN TABLE "foreign_<job>" (LIKE <target>)`, then
 > loads via `INSERT INTO <target> SELECT * FROM "foreign_<job>" [WHERE
 > <sourceFilter>]` (the foreign table stays directly queryable afterward). The
-> `FOREIGN DATA WRAPPER` is the **per-protocol** `pxf_fdw` wrapper (live-verified in
-> `cloudberry-official-pxf:2.1.0`: `s3`→`s3_pxf_fdw`, `gs`→`gs_pxf_fdw`,
+> `FOREIGN DATA WRAPPER` is the **per-protocol** `pxf_fdw` wrapper (registry scheme
+> live-verified on the 2.1.0-era `cloudberry-official-pxf` image; the `pxf_fdw` extension
+> is observed present on the 2.2.0 image: `s3`→`s3_pxf_fdw`, `gs`→`gs_pxf_fdw`,
 > `abfss`→`abfss_pxf_fdw`, `wasbs`→`wasbs_pxf_fdw`, `jdbc`→`jdbc_pxf_fdw`,
 > `hdfs`→`hdfs_pxf_fdw`, `hive`→`hive_pxf_fdw`, `hbase`→`hbase_pxf_fdw`; the
 > `format` OPTION is omitted for bare `jdbc`/`hive`). The FDW path is **EQUIVALENT**
@@ -6997,7 +7034,7 @@ CREATE EXTERNAL TABLE rext_hdfs_seq (id int, name text, amount bigint, price flo
 >   (`pxf`/`pxf_fdw`) from a **real read-only `pg_extension` probe**; **absent**
 >   when the database is unreachable **or** no PXF extensions are installed (never
 >   synthesized, never inferred from the `pxf.extensions` spec flags — on a stock
->   `cloudberry-official:2.1.0` it honestly reflects only what `pg_extension`
+>   `cloudberry-official:2.2.0` it honestly reflects only what `pg_extension`
 >   returns).
 >
 > The already-Implemented `pxf.servers` (= the configured-server count, S.2),
@@ -7054,7 +7091,7 @@ CREATE EXTERNAL TABLE rext_hdfs_seq (id int, name text, amount bigint, price flo
 >       enabled: true
 >       pxf:
 >         enabled: true
->         image: ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.3-cldb-2.1.0
+>         image: ghcr.io/vyrodovalexey/cloudberry-k8s-official-pxf:0.9.3-cldb-2.2.0
 >         dataLoaderRole: cb_dataload   # opt-in; empty ⇒ gpadmin (unchanged)
 >   ```
 >
@@ -7493,7 +7530,7 @@ spec:
         port: 9100
       cloudberryQueryExporter:
         enabled: true
-        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.3-cldb-2.1.0"
+        image: "ghcr.io/vyrodovalexey/cloudberry-k8s-query-exporter:0.9.3-cldb-2.2.0"
         port: 9188
         resources:
           requests:

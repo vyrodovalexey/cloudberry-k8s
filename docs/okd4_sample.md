@@ -13,6 +13,13 @@ uses a **scoped custom SCC** for the database pods — deliberately **not** the 
 `anyuid` — plus Vault-PKI TLS, Vault Kubernetes auth, Keycloak OIDC, and MinIO
 S3 backups.
 
+> **Version note (2026-11-17).** The image tags and versions in this walkthrough
+> (`0.9.5-cldb-2.1.0`, Cloudberry `2.1.0`) are the artifact set from the live
+> run it documents. The 2.2.0 upgrade campaign (see [CHANGELOG.md](../CHANGELOG.md))
+> explicitly excluded OKD4 scenarios, so this path has **not** been re-validated
+> against Cloudberry `2.2.0-incubating` — treat the versions as historical for
+> OKD4 until a 2.2.0 run is performed.
+
 
 ## Table of Contents
 
