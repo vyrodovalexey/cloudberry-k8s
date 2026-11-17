@@ -197,26 +197,18 @@ ARG CB_RPM_FILE=apache-cloudberry-db-incubating-2.2.0-1.el9.x86_64.rpm
 # --allowerasing: RockyLinux 9 ships curl-minimal which conflicts with the
 # full curl package (needed by the tar.gz fetch below); same pattern as
 # Dockerfile.cloudberry-pxf.
+# SECURITY (U033): full `dnf -y upgrade` — upgrades EVERY installed package
+# (base image + everything above) to its latest patched release, not a curated
+# CVE list. The prior curated list (gnupg2/gnutls/openssl/...) went stale as the
+# Rocky 9 CVE DB drifted: a rebuild picked up 67 HIGH/CRIT OS findings the list
+# didn't cover. A full upgrade self-maintains against DB drift at rebuild time.
 RUN dnf -y --allowerasing install \
         apr bash bzip2 ca-certificates curl glibc-langpack-en hostname iproute \
         keyutils krb5-libs less libevent libuuid libuv libxml2 libyaml libzstd \
         lz4 ncurses net-tools openldap openssh-clients openssh-server openssl \
         pam perl procps-ng python3 readline rsync shadow-utils sqlite sqlite-libs sudo which zlib \
         zstd && \
-    dnf -y upgrade \
-      gnupg2 \
-      expat \
-      gnutls \
-      krb5-libs \
-      libarchive \
-      libbrotli \
-      libcap \
-      libnghttp2 \
-      libxml2 \
-      openssl \
-      vim-minimal \
-      openssl-libs \
-      pam && \
+    dnf -y upgrade && \
     curl -fSL "${CB_RPM_URL}" -o /tmp/cloudberry-rpm.tar.gz && \
     tar -xzf /tmp/cloudberry-rpm.tar.gz -C /tmp && \
     rm -f /tmp/cloudberry-rpm.tar.gz && \

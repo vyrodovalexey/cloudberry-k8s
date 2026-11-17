@@ -138,6 +138,11 @@ LABEL org.opencontainers.image.title="cloudberry-database" \
       org.opencontainers.image.base.name="rockylinux/rockylinux:9.6-minimal"
 
 # Install runtime dependencies (sorted alphanumerically)
+# SECURITY (U033): full `microdnf -y upgrade` after install (official-image
+# convention: install → upgrade → clean in one layer) — upgrades EVERY
+# installed package, closing the pre-existing gap (U009: source image carried
+# 38 HIGH/CRIT OS findings; install-only never refreshed the 9.6-minimal base
+# snapshot's CVE-affected packages). Self-maintains against CVE-DB drift.
 RUN microdnf -y install \
       apr \
       bash \
@@ -176,6 +181,7 @@ RUN microdnf -y install \
       sudo \
       which \
       zlib && \
+    microdnf -y upgrade && \
     microdnf clean all && rm -rf /var/cache/yum
 
 # Create gpadmin user (UID 1000 for Kubernetes compatibility)
